@@ -14,37 +14,41 @@ in [Architecture](architecture.md).
 
 ## Adding the dependency
 
-Until the crates are published to crates.io, depend on this repository pinned
-to an exact revision:
+The crates are published — depend on the released version:
 
 ```toml
 [dependencies]
 ktesio-engine = "0.1"
 ```
 
-Pin a **full-length commit SHA**, never a branch: a pinned `rev` makes your
-build reproducible and upgrades deliberate (the engine's public surface is
+Prefer to track `main` between releases? Pin the repository to a
+**full-length commit SHA**, never a branch: a pinned `rev` makes your build
+reproducible and upgrades deliberate (the engine's public surface is
 CI-guarded against breaking changes between freezes, but a moving target is
 still a moving target).
 
-**Which SHA to pin:** the embedding surface (the `blocking()` facade plus the
-event bus) stabilized at commit `8a8b328` — story 7-3's freeze, now guarded by
-the CI semver gate against that exact baseline. Pin **any commit at or after
-it**; the newest `main` commit you are comfortable with is the right default.
-To fetch a current full SHA to pin:
+**Which SHA to pin:** the engine's current surface freeze is the epic-11
+merge commit (2026-09-14) — the CI semver gate guards the public surface
+against that exact baseline. Pin **any commit at or after it**; the newest
+`main` commit you are comfortable with is the right default. To fetch a
+current full SHA to pin:
 
 ```bash
 git rev-parse origin/main
 ```
 
-(paste the full 40-character output as your `rev`). After the publish executes
-(see [the release runbook](release-process.md#publishing-the-engine-crates)),
-switch to the versioned crates.io form — the facade you compile against does
-not change:
+(paste the full 40-character output as your `rev`). A git pin compiles
+against the IN-REPO version line — currently **0.2.0** (it carries the first
+deliberate breaking surface extension, `EngineError::ResumeUnsupported`) —
+while crates.io still serves **0.1.0**: the 0.2.0 publish is HELD pending
+the author's explicit go (see [the release
+runbook](release-process.md#publishing-the-engine-crates)). When 0.2.0
+publishes, switch to the new versioned form — the facade you compile
+against does not change:
 
 ```toml
 [dependencies]
-ktesio-engine = "0.1"
+ktesio-engine = "0.2"
 ```
 
 Two things to know before depending: the engine's minimum supported Rust is
@@ -307,8 +311,12 @@ does. Four instruments keep that statement honest:
 **Published**: `ktesio-engine` 0.1, `ktesio-adapter-api` 0.1, and
 `ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
 release v0.7.0, 2026-09-09). Depend on `ktesio-engine = "0.1"` — no git
-dependency needed. The crates are source-available (noncommercial free;
-commercial use requires the author's written approval — see the license).
+dependency needed. The engine's IN-REPO version is now **0.2.0** (the
+announced `EngineError::ResumeUnsupported` surface extension, PR #181);
+its crates.io publish is held for the author's explicit go, so `"0.1"`
+remains the correct crates.io pin until that release lands. The crates are
+source-available (noncommercial free; commercial use requires the author's
+written approval — see the license).
 
 The publish runbook's historical HELD state is retained in
 [the release process](release-process.md) decision log.

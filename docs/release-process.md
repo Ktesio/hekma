@@ -176,7 +176,7 @@ with no git/path override:
 ```bash
 cargo new /tmp/ktesio-host-probe
 cd /tmp/ktesio-host-probe
-cargo add ktesio-engine@0.1.0
+cargo add ktesio-engine@0.2.0
 cargo build
 ```
 
@@ -187,7 +187,7 @@ fire ahead of a broken publish. Same go; recorded checkpoint.
 **Step 5 — POST-PUBLISH DOCS flip (the docs-currency gate).** On `main`,
 in the same release-commit series: switch [Embedding the
 engine](embedding.md)'s dependency form from the git pin to the published
-version line (`ktesio-engine = "0.1"`) and rewrite its Availability section
+version line (`ktesio-engine = "0.2"`) and rewrite its Availability section
 from held to published; update the ONE remaining PUBLISH-HELD comment
 (`ktesio-conformance`'s, whose flag stays); move the held-block banners in
 `CHANGELOG.md` / `docs/RELEASE_NOTES.md` into their release sections per
