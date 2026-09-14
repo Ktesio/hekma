@@ -7429,6 +7429,15 @@ mod tests {
         //   and the heartbeat must stay FROZEN: no SIGCONT was delivered. The
         //   pre-AI-9 signal-first order would have woken the agent behind an
         //   errored resume.
+        //
+        // Windows runtime skips (data-driven `OsId`, NO #[cfg] — the
+        // tests/pause.rs idiom): Leg A's directory-rename injection is a
+        // sharing violation while the child holds agent.log open, and the two
+        // frozen-heartbeat probes observe a REAL suspension that Windows
+        // honestly never performs (AD-4 cooperative pause). What Windows still
+        // proves cross-platform: Leg B + the resume leg — the persist-first
+        // LEDGER semantics (the committed transition visible despite the
+        // errored append, the typed Log error) run on every OS.
         let (_state, _manifest, registry) =
             setup_pause_guaranteed("pz", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
         let name = InstanceName::new("pz").unwrap();
@@ -7436,9 +7445,7 @@ mod tests {
         sup.start(&registry, "pz").unwrap();
         assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
         let agent_log = registry.agent_output_log_path(&name);
-        let log_dir = registry.instance_log_dir(&name);
         let log_path = registry.instance_log_path(&name);
-        let held_dir = log_dir.with_extension("ai9-held");
         let wait_heartbeat = |at_least: usize| {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -7455,27 +7462,38 @@ mod tests {
         wait_heartbeat(2);
 
         // ---- Leg A: the pause fails BEFORE any persist. ----
-        std::fs::rename(&log_dir, &held_dir).unwrap();
-        std::fs::write(&log_dir, b"not a directory").unwrap();
-        let a_err = sup.pause(&registry, "pz").unwrap_err();
-        assert!(
-            matches!(&a_err, EngineError::Log { .. }),
-            "the ensure_log_dir failure must surface as a typed Log error, got {a_err:?}"
-        );
-        assert_eq!(
-            state_of(&registry, "pz"),
-            LifecycleState::Running,
-            "with the whole transition rejected, the ledger must still read running"
-        );
-        std::fs::remove_file(&log_dir).unwrap();
-        std::fs::rename(&held_dir, &log_dir).unwrap();
-        let a_before = heartbeat_lines(&agent_log);
-        std::thread::sleep(Duration::from_millis(400));
-        let a_after = heartbeat_lines(&agent_log);
-        assert!(
-            a_after > a_before,
-            "a pause rejected before any persist must NOT have signalled SIGSTOP: heartbeat {a_before} -> {a_after}"
-        );
+        // Runtime-skipped on Windows (data-driven, NO #[cfg] — the
+        // tests/pause.rs guaranteed-suspend idiom): the injection RENAMES the
+        // live log directory, which Windows refuses while the child holds
+        // agent.log / agent-stderr.log open inside it (a sharing violation —
+        // os error 5, observed on the first windows-latest CI run). What
+        // Windows misses is only this pre-persist INJECTION, not the
+        // persist-first contract: legs B + resume below run on every OS.
+        if OsId::current() != OsId::Windows {
+            let log_dir = registry.instance_log_dir(&name);
+            let held_dir = log_dir.with_extension("ai9-held");
+            std::fs::rename(&log_dir, &held_dir).unwrap();
+            std::fs::write(&log_dir, b"not a directory").unwrap();
+            let a_err = sup.pause(&registry, "pz").unwrap_err();
+            assert!(
+                matches!(&a_err, EngineError::Log { .. }),
+                "the ensure_log_dir failure must surface as a typed Log error, got {a_err:?}"
+            );
+            assert_eq!(
+                state_of(&registry, "pz"),
+                LifecycleState::Running,
+                "with the whole transition rejected, the ledger must still read running"
+            );
+            std::fs::remove_file(&log_dir).unwrap();
+            std::fs::rename(&held_dir, &log_dir).unwrap();
+            let a_before = heartbeat_lines(&agent_log);
+            std::thread::sleep(Duration::from_millis(400));
+            let a_after = heartbeat_lines(&agent_log);
+            assert!(
+                a_after > a_before,
+                "a pause rejected before any persist must NOT have signalled SIGSTOP: heartbeat {a_before} -> {a_after}"
+            );
+        }
 
         // ---- Leg B: the persist commits, the event append fails. ----
         let b_before = heartbeat_lines(&agent_log);
@@ -7514,11 +7532,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         let frozen_before = heartbeat_lines(&agent_log);
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            heartbeat_lines(&agent_log),
-            frozen_before,
-            "the probe: a successful guaranteed pause really suspends (heartbeat frozen)"
-        );
+        // Windows: pause there is an honest cooperative NO-OP (AD-4 — no
+        // guaranteed whole-process suspend exists from std), so there is no
+        // real suspension for a frozen-heartbeat probe to observe; the probe
+        // is the Unix guarantee (same data-driven skip as tests/pause.rs).
+        if OsId::current() != OsId::Windows {
+            assert_eq!(
+                heartbeat_lines(&agent_log),
+                frozen_before,
+                "the probe: a successful guaranteed pause really suspends (heartbeat frozen)"
+            );
+        }
 
         // ---- Resume leg: persist commits, append fails, NO SIGCONT. ----
         std::fs::remove_file(&log_path).unwrap();
@@ -7534,11 +7558,17 @@ mod tests {
             "persist-first resume: the committed paused-to-running transition must be visible"
         );
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            heartbeat_lines(&agent_log),
-            frozen_before,
-            "a resume whose persist committed but errored must NOT have signalled SIGCONT: the process stays suspended"
-        );
+        // The frozen-heartbeat half is Unix-only (Windows has no real
+        // suspension to stay in — see the AD-4 note above); the LEDGER half
+        // (persist committed `paused → running`, the Log error surfaced)
+        // above is the cross-platform claim.
+        if OsId::current() != OsId::Windows {
+            assert_eq!(
+                heartbeat_lines(&agent_log),
+                frozen_before,
+                "a resume whose persist committed but errored must NOT have signalled SIGCONT: the process stays suspended"
+            );
+        }
         std::fs::remove_dir(&log_path).unwrap();
 
         // Teardown: the process is SIGSTOPped (SIGTERM would only pend), so the
