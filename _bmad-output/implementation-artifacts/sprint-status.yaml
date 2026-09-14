@@ -3,7 +3,7 @@
 # project: ktesio
 # project_key: NOKEY
 # tracking_system: file-system
-# story_location: /Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts
+# story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
 
 # STATUS DEFINITIONS:
 # ==================
@@ -51,7 +51,7 @@ last_updated: 09-11-2026 22:00
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
-story_location: /Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts
+story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
 
 development_status:
   epic-1: done
@@ -1258,7 +1258,7 @@ action_items:
       retro A1, high]"
     owner: "first contract-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-2-renegotiate-on-start-fallback"
     epic: 6
     action: "Engine: call negotiate_contract_version on the legacy/launch-less start-fallback
@@ -1267,7 +1267,7 @@ action_items:
       test. [epic-6 retro B1, high]"
     owner: "first engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-3-frozen-doc-corrections"
     epic: 6
     action: "Correct frozen contract-doc errors: stdin-pipe conditionality (docs/adapter-contract.md
@@ -1277,7 +1277,7 @@ action_items:
       wording. [epic-6 retro B2-B5, med]"
     owner: "first docs-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-4-tck-hardening-batch"
     epic: 6
     action: "TCK hardening: prove subject-declared memory.dir delivery (hermes HERMES_HOME
@@ -1288,7 +1288,7 @@ action_items:
       [epic-6 retro B6-B11, med]"
     owner: "first conformance-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-5-test-fixture-consolidation"
     epic: 6
     action: "Consolidate the ~16 duplicated manifest-fixture builders (~400-500 lines
@@ -1298,7 +1298,7 @@ action_items:
       has passed. [epic-6 retro C2, med]"
     owner: "first test-heavy story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-6-docs-hygiene-batch"
     epic: 6
     action: "Docs hygiene: fix commands.md:53 glued heading, architecture.md:68 stale
@@ -1309,7 +1309,7 @@ action_items:
       D1-D7, low]"
     owner: "first docs-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-7-memory-json-partial-state"
     epic: 6
     action: "kt: memory attach --json — on a post-attach status read-back error, name
@@ -1317,7 +1317,7 @@ action_items:
       Ok(None) arm is honest). [epic-6 retro B10, low]"
     owner: "first kt-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-8-tracking-hygiene"
     epic: 6
     action: "Reconcile sprint-status epic-6 heading line (still in-progress with stale
@@ -1327,7 +1327,7 @@ action_items:
       normal edge. [epic-6 retro C1/C6/C7, low]"
     owner: "orchestrator chore"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-9-carry-forward-bind-or-retire"
     epic: 6
     action: "Bind or honestly retire the carry-forward retro items that have landed
@@ -1337,7 +1337,7 @@ action_items:
       rate across three epics. [epic-6 retro E/follow-through, process]"
     owner: "Islam prioritization"
     status: done        # CLOSED 2026-09-11 by story 11-7: all four carry-forward items (AI-63/65/66/69) carry their #168-ratified dispositions (2026-09-09, "ratify all four as recommended"), mirrored into their entries above — RETIRED-as-accepted-tradeoff / ADOPTED-as-standing-rule / RETIRED-as-subsumed / RATIFIED-mapper-pin-gate. Nothing unbound remains.
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-5-retro-item-1-memory-dir-strip-gap"
     epic: 5
     action: "memory.dir strip gap: start_inner strips the operator-set key from local
@@ -1346,14 +1346,14 @@ action_items:
       with no DC-10 notice; no test pins any layer. [epic-5 retro A1, high]"
     owner: "next engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-2-untested-refusals"
     epic: 5
     action: "Tests: strict-UTF-8 delivery refusal has no test at any layer; Windows
       symlink refusal untested (unix-only test). [epic-5 retro A4, low]"
     owner: "next test-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-3-migration-crash-atomicity"
     epic: 5
     action: "SQLite migration crash-atomicity: batch-then-stamp (user_version set
@@ -1362,7 +1362,7 @@ action_items:
       — verify and harden (BEGIN IMMEDIATE or IF NOT EXISTS). [epic-5 retro B3, med]"
     owner: "next store-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-4-registry-reverse-conflict-test"
     epic: 5
     action: "Registry-level reverse conflict test (native attached, filesystem requested)
@@ -1370,7 +1370,7 @@ action_items:
       entry direction note. [epic-5 retro A5, low]"
     owner: "next engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-5-ad18-lock-model-ratification"
     epic: 5
     action: "AD-18 fine-grained lock model (awaiting-ratification since 2026-08-27):
@@ -1378,7 +1378,7 @@ action_items:
       two-mutex model; ratify or commission the split. [epic-5 retro B5]"
     owner: "Islam"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-7-retro-item-1-homebrew-token-renewal"
     epic: 7
     action: "Renew HOMEBREW_TAP_TOKEN (fine-grained PAT, Contents:read/write on iMagdy/homebrew-tap)
@@ -1386,7 +1386,7 @@ action_items:
       the documented manual fallback. [epic-7 retro F5, ops]"
     owner: "Islam"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
   - id: "epic-7-retro-item-2-live-docs-probe"
     epic: 7
     action: "Add a scheduled CI check that the published docs site serves the newest
@@ -1394,5 +1394,5 @@ action_items:
       Sep 9) leaving 4 pages 404 while repo CI stayed green. [epic-7 retro F2, med]"
     owner: "next CI-touching story"
     status: done  # RESOLVED in story 11-5 (2026-09-11): .github/workflows/docs-probe.yml — daily cron (03 6 * * *) + workflow_dispatch, NO needs: coupling to the CI job graph; reads the page list from docs/meta.json at probe time (mirroring docs/lib/source.ts's README→/ and RELEASE_NOTES→/release-notes URL mappings), asserts HTTP 200 per page with every failure NAMED via ::error:: (never fail-fast — one run reports the whole blast radius), and asserts a content marker on the newest page so a 200-from-an-error-page cannot false-pass. Structure pinned by scripts/test_automation.py::test_docs_probe_workflow_watches_every_registered_page. (Live-fire note: at landing, the deployed site was already 404ing /agents again — the probe's first scheduled run will correctly red until the CF Pages deploy is refreshed, which is the watcher working as designed.)
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
 
