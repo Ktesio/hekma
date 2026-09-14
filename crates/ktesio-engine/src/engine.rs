@@ -54,6 +54,7 @@
 //! back re-opens the engine. The sink is engine-embedder ergonomics — it
 //! never touches the adapter-api contract.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,6 +70,7 @@ use crate::domain::{
     LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor,
     Supervisor, TransitionCause, TransitionEvent,
 };
+use crate::ports::SpawnRecord;
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
 /// `[ASSUMPTION]`). Small enough that a crash is detected promptly, large enough
@@ -564,11 +566,70 @@ impl Engine {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
             let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             let instances = registry.list()?;
+            // AI-16: ONE batched spawn-record read while the locks are held,
+            // keyed by name and threaded into `fleet_entry_for` — replacing the
+            // N+1 (one `spawn_record` query per instance). Scoped to spawn
+            // records ONLY: the other per-instance reads (usage totals /
+            // effective config / cost totals) are deliberately unchanged. A
+            // failed BATCH read falls back to the old per-instance reads (the
+            // `None` arm below) so a transient failure degrades ONE row, not
+            // the whole Fleet's runtime fields at once — the 1-6 `list`
+            // fallback, preserved row-by-row.
+            let records = match registry.list_spawn_records() {
+                Ok(records) => Some(
+                    records
+                        .into_iter()
+                        .map(|record| (record.name.clone(), record))
+                        .collect::<HashMap<InstanceName, SpawnRecord>>(),
+                ),
+                Err(_) => None,
+            };
             let entries = instances
                 .into_iter()
-                .map(|instance| Self::fleet_entry_for(&registry, &supervisor, instance))
+                .map(|instance| {
+                    Self::fleet_entry_for(&registry, &supervisor, records.as_ref(), instance)
+                })
                 .collect();
             Ok(entries)
+        })
+        .await
+    }
+
+    /// The ONE Fleet entry for `name` (AI-15) — the read `kt agent show <name>
+    /// --json` uses. Locks ONCE, resolves the instance by name through the
+    /// registry's keyed lookup (never a whole-Fleet scan), and composes the row
+    /// through the SAME [`Engine::fleet_entry_for`] `list --json` uses, so the
+    /// `show` object stays byte-identical to that instance's `list` row.
+    ///
+    /// Errors surface DIRECTLY — an unknown name is the registry's
+    /// [`RegistryError::NotFound`] and a malformed name its `InvalidName` — the
+    /// same diagnostics the human `show` path raises, instead of the old
+    /// scan-then-synthesize degradation that inherited every degradation of a
+    /// full Fleet read.
+    pub async fn fleet_entry(&self, name: &str) -> Result<FleetEntry, RegistryError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let iname = InstanceName::new(&name).map_err(|reason| RegistryError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            let instance = registry.lookup(&iname)?;
+            // The single instance's spawn record (O(1)) — the same data the
+            // batched map feeds `fleet_entry_for` for a whole-Fleet read.
+            let records: HashMap<InstanceName, SpawnRecord> = registry
+                .spawn_record(&iname)?
+                .map(|record| (record.name.clone(), record))
+                .into_iter()
+                .collect();
+            Ok(Self::fleet_entry_for(
+                &registry,
+                &supervisor,
+                Some(&records),
+                instance,
+            ))
         })
         .await
     }
@@ -582,12 +643,21 @@ impl Engine {
     fn fleet_entry_for(
         registry: &Registry,
         supervisor: &Supervisor,
+        records: Option<&HashMap<InstanceName, SpawnRecord>>,
         instance: AgentInstance,
     ) -> FleetEntry {
-        // Read the write-ahead spawn record for the restart count/policy + cause,
-        // exactly as `instance_status` does. A missing record → defaults (count 0,
-        // policy default) — this is the normal case for a never-started instance.
-        let record = registry.spawn_record(&instance.name).ok().flatten();
+        // The write-ahead spawn record for the restart count/policy + cause.
+        // `Some(map)` is the AI-16 batched read (no per-instance store query on
+        // the happy path; a record absent from a SUCCESSFUL batch is a
+        // never-started instance — defaults, no re-query). `None` means the
+        // batch read itself failed: fall back to this instance's own read so a
+        // transient batch failure degrades ONE row instead of blanking the
+        // whole Fleet's runtime fields. Either way an errored read degrades to
+        // defaults — the 1-6 `list` fallback.
+        let record = match records {
+            Some(map) => map.get(&instance.name).cloned(),
+            None => registry.spawn_record(&instance.name).unwrap_or(None),
+        };
         let restart_policy = record
             .as_ref()
             .map(|r| r.restart_policy)
@@ -970,10 +1040,23 @@ impl Engine {
     ///
     /// Validates at WRITE time first (an unknown key outside the `agent.*`
     /// pass-through namespace is rejected with the nearest key suggested), THEN
-    /// persists to the Agent Home `config.toml` through path authority. A rejected
-    /// write persists NOTHING (the instance config is byte-unchanged — AC-B). Runs
-    /// on the blocking pool like the other mutations.
-    pub async fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+    /// persists ATOMICALLY (story 11-2, AI-24 — temp file + rename, so a crash
+    /// mid-write cannot truncate the instance `config.toml`) to the Agent Home
+    /// `config.toml` through path authority. A rejected write persists NOTHING
+    /// (the instance config is byte-unchanged — AC-B). Runs on the blocking pool
+    /// like the other mutations.
+    ///
+    /// On success the returned vec carries ZERO OR MORE WARN-ONLY steering
+    /// warnings (story 11-2, AI-33 — today: a `secret:NAME` value set on a
+    /// FLAG-targeted key). A Host should render each entry on ITS diagnostic
+    /// surface (`kt` prints them to stderr); the vec is empty on the common
+    /// path, and the write is never rejected for a warned combination.
+    pub async fn set_config(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, ConfigError> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let key = key.to_string();
@@ -1283,6 +1366,14 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.fleet())
     }
 
+    /// Blocking [`Engine::fleet_entry`] (AI-15) — the single-instance Fleet
+    /// read `kt agent show <name> --json` uses. O(1) keyed lookup + the SAME
+    /// row composition as `list`; unknown names surface the registry's
+    /// `NotFound` (the CLI's exit-3 diagnostic).
+    pub fn fleet_entry(&self, name: &str) -> Result<FleetEntry, RegistryError> {
+        self.engine.rt.block_on(self.engine.fleet_entry(name))
+    }
+
     /// Blocking [`Engine::effective_capabilities`].
     pub fn effective_capabilities(
         &self,
@@ -1412,8 +1503,15 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::set_config`] (story 2-1, AC-B/AC10). The write
-    /// `kt agent config set` uses.
-    pub fn set_config(&self, name: &str, key: &str, value: &str) -> Result<(), ConfigError> {
+    /// `kt agent config set` uses. On success carries the ZERO OR MORE
+    /// WARN-ONLY steering warnings (story 11-2, AI-33) the caller renders on
+    /// its own stderr — empty on the common path.
+    pub fn set_config(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<Vec<String>, ConfigError> {
         self.engine
             .rt
             .block_on(self.engine.set_config(name, key, value))

@@ -17,12 +17,16 @@
 //! probes are accurate). The parent test then opens a NEW engine over the SAME
 //! state dir and asserts adoption / honest reconcile.
 
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ktesio_engine::{
-    AdapterRef, Engine, FleetEntry, LifecycleState, RemoveDisposition, RestartPolicy,
+    AdapterRef, DiagnosticSink, Engine, FleetEntry, LifecycleState, RemoveDisposition,
+    RestartPolicy,
 };
 use tempfile::TempDir;
 
@@ -57,6 +61,50 @@ windows = "guaranteed"
 
 [metering]
 source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
+/// The engine-observed variant of [`write_fake_manifest`] (the
+/// `observed_metering.rs` shape, copied here as this file's ONE additional
+/// manifest writer — the deferred-work-noted duplication is not grown further):
+/// `[metering] source = "engine-observed"` plus the `[config."metering.base_url"]
+/// env = "OPENAI_BASE_URL"` mapping the engine's loopback injection targets.
+fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str]) {
+    let bin = ktesio_conformance::fake_agent_bin();
+    let args_toml = args
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "{kind}"
+
+[lifecycle.start]
+exec = {exec:?}
+args = [{args_toml}]
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "engine-observed"
+
+[config."metering.base_url"]
+env = "OPENAI_BASE_URL"
 "#,
         exec = bin.to_string_lossy(),
     );
@@ -260,6 +308,218 @@ fn adoption_helper_subprocess() {
             facade.pause("nap").unwrap();
             std::process::exit(0);
         }
+        // AI-13: start `mortal` under a `never` Restart Policy, then crash. The
+        // parent adopts the live process and later kills it — the reaper's crash
+        // cause must record the UNAVAILABLE exit code (an adopted process is not
+        // the engine's child), and `never` keeps the `failed` state from being
+        // auto-restarted mid-assertion.
+        "never_survivor" => {
+            facade
+                .register_with_adapter("mortal", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade
+                .set_restart_policy("mortal", RestartPolicy::Never)
+                .unwrap();
+            facade.start("mortal").unwrap();
+            std::process::exit(0);
+        }
+        // AI-44: start `budgeted` under a cumulative token ceiling the emitted
+        // usage ALREADY crosses, wait until at least one event is durably
+        // committed, then crash. The next engine must re-evaluate budgets right
+        // after ADOPTION (the crash-gap): the breach fires at startup and the
+        // breach action lands — the instance does not keep running unconstrained
+        // just because no NEW usage event arrives.
+        // AI-44 (loop 1): the PAUSED-row variant — same budget + usage setup,
+        // then PAUSE the agent before the crash, so the next engine adopts a
+        // live SUSPENDED process whose row is already `paused` and whose
+        // committed usage already crosses the ceiling. The adoption-time
+        // re-evaluation must record the breach while the row STAYS `paused`
+        // (no strand, no fake transition, no further usage from a suspended
+        // agent).
+        "budgeted_paused_survivor" => {
+            facade
+                .register_with_adapter("napbud", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            // One emitted event is 10 in + 20 out = 30 tokens; a cumulative
+            // ceiling of 15 is crossed by the very first event.
+            facade
+                .set_config("napbud", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade.start("napbud").unwrap();
+            let db = state.join("state.db");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let count: i64 = rusqlite::Connection::open(&db)
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM usage_events e \
+                             JOIN agent_instances i ON i.id = e.instance_id \
+                             WHERE i.name = 'napbud'",
+                            [],
+                            |r| r.get(0),
+                        )
+                    })
+                    .unwrap_or(0);
+                if count >= 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "usage never committed before the crash"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The FIRST committed event already crosses the ceiling, so the
+            // breach action (default pause) lands by itself — wait for the
+            // committed paused state (deterministic, not a sleep), then crash.
+            loop {
+                let st = facade.instance_status("napbud").unwrap().instance.state;
+                if st == LifecycleState::Paused {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the breach pause never landed before the crash (state: {st})"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
+        }
+        "budgeted_survivor" => {
+            facade
+                .register_with_adapter("budgeted", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            // One emitted event is 10 input + 20 output = 30 tokens, so a
+            // cumulative ceiling of 15 is crossed by the very first event.
+            facade
+                .set_config("budgeted", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade.start("budgeted").unwrap();
+            // Deterministic (committed state, not a sleep): wait for ≥1 ledger
+            // row BEFORE the "crash", so the ledger the next engine reads
+            // provably carries over-ceiling usage.
+            let db = state.join("state.db");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let count: i64 = rusqlite::Connection::open(&db)
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM usage_events e \
+                             JOIN agent_instances i ON i.id = e.instance_id \
+                             WHERE i.name = 'budgeted'",
+                            [],
+                            |r| r.get(0),
+                        )
+                    })
+                    .unwrap_or(0);
+                if count >= 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "usage never committed before the crash"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Deterministic premise for the parent's two-run breach assertion:
+            // engine 1's OWN breach (record + pause) must land BEFORE the crash
+            // — otherwise a fast exit could race the pause and the parent would
+            // see only the adoption-run breach.
+            loop {
+                let st = facade.instance_status("budgeted").unwrap().instance.state;
+                if st == LifecycleState::Paused {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "engine-1's breach pause never landed before the crash (state: {st})"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
+        }
+        // AI-44 (loop 2): the WARN breach-action variant — the same budget +
+        // usage setup as `budgeted_survivor`, but `budget.breach_action = "warn"`,
+        // so engine 1's OWN enforcement records the breach WITHOUT transitioning
+        // (the row stays `running`). The crash leaves a live RUNNING over-budget
+        // agent; the next engine's adoption-time re-evaluation must ALSO
+        // warn-and-record — the action comes from the CONFIG, not from the
+        // breach — never a pause.
+        "budgeted_warn_survivor" => {
+            facade
+                .register_with_adapter("budgeted", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            // One emitted event is 10 input + 20 output = 30 tokens, so a
+            // cumulative ceiling of 15 is crossed by the very first event.
+            facade
+                .set_config("budgeted", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade
+                .set_config("budgeted", "budget.breach_action", "warn")
+                .unwrap();
+            facade.start("budgeted").unwrap();
+            // Deterministic (committed state, not a sleep): wait for ≥1 ledger
+            // row AND engine-1's OWN warn breach BEFORE the "crash", so the
+            // parent's two-run breach assertion provably spans both engines.
+            let db = state.join("state.db");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let count: i64 = rusqlite::Connection::open(&db)
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM usage_events e \
+                             JOIN agent_instances i ON i.id = e.instance_id \
+                             WHERE i.name = 'budgeted'",
+                            [],
+                            |r| r.get(0),
+                        )
+                    })
+                    .unwrap_or(0);
+                if count >= 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "usage never committed before the crash"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            loop {
+                let breaches = facade.budget_breach_events("budgeted").unwrap();
+                if !breaches.is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "engine-1's warn breach never landed before the crash"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(0);
+        }
+        // AI-46: start `obssurv` as an ENGINE-OBSERVED instance (engine 1 binds
+        // its loopback forward listener), then crash. The listener dies with
+        // this engine while the agent survives with its injected `base_url`
+        // still pointing at the now-dead port — the stranded-listener
+        // condition the next engine's adoption must surface.
+        "observed_survivor" => {
+            facade
+                .register_with_adapter("obssurv", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            // A valid-shaped (dead) upstream: the listener needs a URL to
+            // start; the agent makes no calls (no `--observed-calls`), so
+            // nothing ever forwards to it.
+            let dead_upstream = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let addr = l.local_addr().unwrap();
+                format!("http://{addr}")
+            };
+            facade
+                .set_config("obssurv", "metering.upstream_base_url", &dead_upstream)
+                .unwrap();
+            facade.start("obssurv").unwrap();
+            std::process::exit(0);
+        }
         // Start `clean`, then STOP it cleanly (clears the record), then exit
         // normally — a later open must NOT resurrect it.
         "clean_stop" => {
@@ -321,11 +581,14 @@ fn engine_kill_adopts_live_child_and_fails_gone_record() {
     // and a subsequent `stop` truly kills it — no orphan), and reconcile `ghost`
     // to `failed` (AI-8: no phantom `running`).
     //
-    // Runtime-skip on Windows: this asserts a child SURVIVES its parent engine's
-    // death, which needs Unix re-parenting to init; on Windows KILL_ON_JOB_CLOSE
-    // kills the child when the `run_engine1` helper exits. The gone-process →
-    // reconcile-to-`failed` adoption path IS covered on Windows by the other
-    // adoption tests. NO `#[cfg]` (this file is outside the backends allowlist).
+    // Runtime-skip on Windows (AI-29, story 11-5): this asserts a child
+    // SURVIVES its parent engine's death, which needs Unix re-parenting to
+    // init; on Windows KILL_ON_JOB_CLOSE kills the child when the `run_engine1`
+    // helper exits. The Windows-correct counterpart semantics — engine death
+    // kills the child, the record reconciles to `failed` — are asserted
+    // affirmatively ON the Windows leg by
+    // `windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed`
+    // below. NO `#[cfg]` (this file is outside the backends allowlist).
     if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
         return;
     }
@@ -402,12 +665,14 @@ fn whole_fleet_survives_a_reboot_and_reconciles_running_to_failed() {
     // survive a reboot) and opens a NEW engine over the SAME state dir. The test
     // asserts the reboot INVARIANTS, not a literal reboot.
     //
-    // Runtime-skip on Windows: the harness relies on `worker` SURVIVING the
-    // engine-1 crash (Unix re-parenting to init) before we fabricate the reboot;
-    // on Windows KILL_ON_JOB_CLOSE kills it when the `run_engine1` helper exits.
-    // The reboot INVARIANTS (running → reconcile-to-`failed` for gone processes)
-    // are covered on Windows by the other adoption tests. NO `#[cfg]` (this file
-    // is outside the backends allowlist).
+    // Runtime-skip on Windows (AI-29, story 11-5): the harness relies on
+    // `worker` SURVIVING the engine-1 crash (Unix re-parenting to init) before
+    // we fabricate the reboot; on Windows KILL_ON_JOB_CLOSE kills it when the
+    // `run_engine1` helper exits. The Windows-correct counterpart — engine
+    // death IS the reboot (every process gone), and the whole fleet's records
+    // must reconcile honestly — is asserted affirmatively ON the Windows leg
+    // by `windows_fleet_records_reconcile_after_engine_death_the_reboot_semantics`
+    // below. NO `#[cfg]` (this file is outside the backends allowlist).
     if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
         return;
     }
@@ -504,6 +769,197 @@ fn whole_fleet_survives_a_reboot_and_reconciles_running_to_failed() {
 }
 
 #[test]
+fn windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed() {
+    // AI-29 (story 11-5) — the Windows-POSITIVE NFR-1 proof, mirroring
+    // `engine_kill_adopts_live_child_and_fails_gone_record`'s Unix shape with
+    // the CORRECT Windows semantics. On Windows the agent is assigned to its
+    // engine's Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so the
+    // engine's death (the `run_engine1` helper exiting without a drop) KILLS
+    // the whole tree — a Windows engine never leaves a surviving orphan. The
+    // honest assertion is therefore the inverse of Unix: every child process
+    // is GONE after the crash, and every record it left reconciles to
+    // `failed` at the next open — NFR-1 ("no orphan survives an engine
+    // death") affirmed on Windows, not merely gated. Runs ONLY on the
+    // Windows matrix leg; the Unix siblings above carry the pointer comments.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 in a subprocess (crash semantics): start survivor + ghost, exit.
+    // The exit closes the job handles → BOTH children are killed (kill-on-close).
+    run_engine1("survivor_and_ghost", state.path(), manifest.path());
+
+    // Both children were announced in their logs, and both MUST be gone now —
+    // the Windows-correct engine-death semantics (the exact inverse of the
+    // Unix siblings' "survivor must survive" assert).
+    let survivor_pid = wait_for_agent_pid(&agent_log_path(state.path(), "survivor"));
+    let ghost_pid = wait_for_agent_pid(&agent_log_path(state.path(), "ghost"));
+    wait_until_gone(
+        survivor_pid,
+        "engine death must kill the agent (Job kill-on-close) — no Windows orphan",
+    );
+    wait_until_gone(
+        ghost_pid,
+        "engine death must kill the agent (Job kill-on-close) — no Windows orphan",
+    );
+
+    // Engine 2: open over the SAME state dir → adopt_orphans finds NO live
+    // process behind either `running` row and reconciles BOTH to `failed`
+    // (AI-8 honesty), never a phantom `running`.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    for name in ["survivor", "ghost"] {
+        let status = facade.instance_status(name).unwrap();
+        assert_eq!(
+            status.instance.state,
+            LifecycleState::Failed,
+            "a record whose process the job-close kill took must reconcile to failed ({name})"
+        );
+        let events = facade.transition_events(name).unwrap();
+        let cause = serde_json::to_string(&events.last().unwrap().cause).unwrap();
+        assert!(
+            cause.contains("orphan not found"),
+            "the reconcile cause must name the gone-process reconcile ({name}): {cause}"
+        );
+    }
+}
+
+#[test]
+fn windows_fleet_records_reconcile_after_engine_death_the_reboot_semantics() {
+    // AI-29 (story 11-5) — the reboot-fleet variant on Windows. On Unix,
+    // `whole_fleet_survives_a_reboot_and_reconciles_running_to_failed` must
+    // KILL the surviving worker out-of-band to fabricate "every process gone".
+    // On Windows that fabrication is unnecessary: the engine-1 death itself
+    // IS the reboot — the Job kill-on-close takes every agent process with
+    // it. This test asserts the SAME fleet-reboot invariants on the Windows
+    // leg, driven by the real Windows semantics: every registration survives
+    // with name/kind/home intact, the previously-running worker reconciles to
+    // `failed`, the cleanly-stopped instance stays `stopped`, the
+    // never-started one stays `registered`, the persisted policy + count are
+    // unchanged, and no orphan process remains.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 (crash semantics): register keeper/napper/worker/finished,
+    // start worker + cleanly stop finished, then exit — the job close kills
+    // `worker` (and nothing else has a process).
+    run_engine1("whole_fleet_reboot", state.path(), manifest.path());
+
+    // `worker` was announced, then killed by the engine-1 death: gone, with
+    // its `running` record still on disk.
+    let worker_pid = wait_for_agent_pid(&agent_log_path(state.path(), "worker"));
+    wait_until_gone(
+        worker_pid,
+        "the engine-1 death must take `worker` with it (Job kill-on-close)",
+    );
+
+    // "Reboot": open a NEW engine over the SAME state dir → adopt_orphans
+    // runs with ZERO live matches (every process is gone).
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+
+    // (a) every registration survives the reboot with its identity intact.
+    let fleet = facade.fleet().unwrap();
+    let mut names: Vec<&str> = fleet.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["finished", "keeper", "napper", "worker"],
+        "every registration must survive the engine death (the Windows reboot)"
+    );
+    for entry in &fleet {
+        assert!(
+            entry.agent_home.contains(entry.name.as_str()),
+            "agent home must be intact for {}",
+            entry.name.as_str()
+        );
+    }
+
+    // (b) the previously-running worker reconciles to `failed` (the
+    // job-close kill left a gone-process record — AI-8 honesty).
+    let worker = facade.instance_status("worker").unwrap();
+    assert_eq!(
+        worker.instance.state,
+        LifecycleState::Failed,
+        "the killed worker's record must reconcile to failed"
+    );
+
+    // (c) the cleanly-stopped instance stays `stopped`; the never-started one
+    // stays `registered`.
+    assert_eq!(
+        facade.instance_status("finished").unwrap().instance.state,
+        LifecycleState::Stopped,
+        "a cleanly-stopped instance must stay stopped"
+    );
+    assert_eq!(
+        facade.instance_status("keeper").unwrap().instance.state,
+        LifecycleState::Registered
+    );
+
+    // (d) the persisted Restart Policy + count are unchanged across the
+    // reopen (`napper`'s explicit `never` survived byte-intact, AD-6).
+    let napper = facade.instance_status("napper").unwrap();
+    assert_eq!(
+        napper.restart_policy,
+        RestartPolicy::Never,
+        "the per-instance restart policy must survive the engine death"
+    );
+    assert_eq!(napper.restart_count, 0, "restart count must survive intact");
+    assert_eq!(
+        facade.instance_status("keeper").unwrap().restart_policy,
+        RestartPolicy::OnFailure
+    );
+
+    // (e) no orphan process remains (the kill-on-close took the only tree).
+    assert!(
+        !pid_alive(worker_pid),
+        "no orphan process may remain after the engine death"
+    );
+}
+
+#[test]
+fn windows_paused_row_reconciles_to_failed_when_the_job_close_killed_it() {
+    // AI-29 (story 11-5) — the Windows counterpart of the AI-7 test. A
+    // `paused` row (Windows pause is cooperative best-effort — the command
+    // succeeds and commits `paused` without a hard suspension) whose process
+    // the engine-1 death's job-close kill took must reconcile to `failed` at
+    // the next open: never a phantom `paused` implying a suspension that no
+    // longer exists. The Unix AI-7 sibling asserts the LIVE-paused adoption +
+    // resume path, which only exists where pause suspends.
+    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1: start `nap`, best-effort pause it (commits `paused`), exit —
+    // the job close kills the paused process.
+    run_engine1("paused_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "nap"));
+    wait_until_gone(
+        pid,
+        "the engine-1 death must kill the paused process (Job kill-on-close)",
+    );
+
+    // Engine 2: the `paused` row with a gone process reconciles to `failed`.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let status = engine.blocking().instance_status("nap").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Failed,
+        "a paused row whose process the job-close kill took must reconcile to failed"
+    );
+}
+
+#[test]
 fn ai8_phantom_running_row_with_dead_process_reconciles_to_failed() {
     // AI-8 (honest adoption): a persisted `running` row whose process is gone at
     // open reconciles to `failed`, NOT a phantom `running`.
@@ -547,7 +1003,11 @@ fn ai7_paused_live_process_is_adopted_and_resumable() {
     // LIVE is adopted (handle re-held) so a later `resume` works. Runs on Unix
     // (guaranteed pause → SIGSTOP); skipped at RUNTIME on Windows where pause is
     // best-effort and a subprocess-suspended process model differs (the adoption
-    // path itself is identical and covered by the survivor test).
+    // path itself is identical and covered by the survivor test). The
+    // Windows-correct counterpart — a `paused` row whose process the job-close
+    // kill took with the engine reconciles to `failed`, never a phantom
+    // `paused` — is asserted on the Windows leg by
+    // `windows_paused_row_reconciles_to_failed_when_the_job_close_killed_it`.
     if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
         return;
     }
@@ -584,6 +1044,431 @@ fn ai7_paused_live_process_is_adopted_and_resumable() {
     // Teardown: stop, confirm no orphan.
     facade.stop("nap", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the resumed process");
+}
+
+#[test]
+fn ai13_adopted_process_exit_records_the_unavailable_exit_code_cause() {
+    // AI-13: an ADOPTED (non-child) process exits with `code: None` — on UNIX
+    // the engine cannot recover a non-child's exit code — so the crash cause
+    // must say "exit code unavailable — adopted process is not this engine's
+    // child", never the generic "terminated by signal" text (which would
+    // assert a signal termination it cannot prove).
+    //
+    // Windows half (the 11-1 defer, closed in story 11-5): the Windows
+    // adopted-handle poll (backends/windows reap_if_exited) reads the REAL
+    // exit code via GetExitCodeProcess, so a Windows adopted exit carries its
+    // true code in the cause and the "code unavailable" arm there means a
+    // genuinely unreadable code. That read cannot run on this Unix host, so
+    // the Windows half is proven by the cfg(windows)-hosted backend tests
+    // (spawn seam + gone-pid read) plus the cross-compile check; this Unix
+    // test pins the Unix-shaped cause text.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    // Same CI mitigation as the sibling adoption tests (#109).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 (crash semantics): start `mortal` under a `never` policy, exit.
+    run_engine1("never_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "mortal"));
+    assert!(pid_alive(pid), "mortal must survive the engine crash");
+
+    // Engine 2 adopts the live orphan (row stays `running`).
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    assert_eq!(
+        facade.instance_status("mortal").unwrap().instance.state,
+        LifecycleState::Running,
+        "the live orphan must be adopted"
+    );
+
+    // The adopted process now exits (killed out-of-band; init reaps it — no
+    // zombie). The engine's own reaper detects the exit and must record the
+    // honest adopted-exit cause.
+    kill_pid(pid);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = facade.instance_status("mortal").unwrap();
+        if status.instance.state == LifecycleState::Failed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the adopted process's exit was never crash-detected"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let events = facade.transition_events("mortal").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.new_state, LifecycleState::Failed);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("exit code unavailable"),
+        "the crash cause must record the unavailable exit code (AI-13): {cause}"
+    );
+    assert!(
+        cause.contains("not this engine's child"),
+        "the crash cause must say WHY the code is unavailable: {cause}"
+    );
+    assert!(
+        !cause.contains("terminated by signal"),
+        "the crash cause must NOT claim a signal termination it cannot prove: {cause}"
+    );
+    wait_until_gone(pid, "the adopted process must be reaped after its exit");
+}
+
+#[test]
+fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused() {
+    // AI-44 (loop 1) — the PAUSED-row case: an over-budget run that was PAUSED
+    // before the engine crashed is adopted as a live suspended process with a
+    // `paused` row. The adoption-time budget re-evaluation must still record
+    // the breach (record-first), the row must STAY `paused` (the breach action
+    // cannot re-pause an already-paused instance — the attempt is a surfaced
+    // diagnostic, never a fake transition), the agent must not be stranded
+    // (still alive, still stoppable), and a suspended agent emits no further
+    // usage.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    // Same CI mitigation as the sibling adoption tests (#109).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "5", "--linger-ms", "600000"],
+    );
+
+    run_engine1("budgeted_paused_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "napbud"));
+    assert!(pid_alive(pid), "the paused agent must survive the crash");
+
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    // The row stays `paused` (never a strand, never a fake `running`).
+    let status = facade.instance_status("napbud").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Paused,
+        "adopting an over-budget PAUSED row must keep the row paused"
+    );
+    // The breach IS recorded (FR-21 — record-first, regardless of the action) —
+    // and specifically for the ADOPTED Run: engine 1 already recorded its own
+    // crossing breach, so the AI-44 adoption-time re-evaluation is proven by a
+    // breach under the adopted Run's FRESH run id (a second distinct run).
+    let breaches = facade.budget_breach_events("napbud").unwrap();
+    assert!(
+        !breaches.is_empty(),
+        "the adoption-time re-evaluation must record the breach for a paused over-budget row"
+    );
+    let breach_runs: std::collections::HashSet<&str> =
+        breaches.iter().map(|b| b.run_id.as_str()).collect();
+    assert!(
+        breach_runs.len() >= 2,
+        "the adopted Run's own breach must be recorded (AI-44): {breaches:?}"
+    );
+    // No strand: the adopted process is alive and a stop lands cleanly.
+    assert!(pid_alive(pid), "the paused agent must still be alive");
+    let committed = {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = 'napbud'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    facade.stop("napbud", Some(Duration::from_secs(5))).unwrap();
+    wait_until_gone(pid, "stop must terminate the adopted paused process");
+    // No further usage: a suspended agent emits nothing, and the ledger count
+    // is unchanged by the adoption + stop cycle.
+    let after = {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = 'napbud'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        after, committed,
+        "no further usage may land after the breach (the agent was suspended)"
+    );
+}
+
+#[test]
+fn ai44_adopting_an_over_budget_run_enforces_the_budget() {
+    // AI-44 (the crash-gap): a run already OVER its cumulative budget when the
+    // engine crashed must be enforced at ADOPTION time — budgets re-evaluated
+    // right after adoption, so the breach fires and the action lands (pause)
+    // without waiting for a NEW usage event (which a quiet agent may never
+    // send). The ledger survived the crash; the enforcement must too.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    // Same CI mitigation as the sibling adoption tests (#109).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "5", "--linger-ms", "600000"],
+    );
+
+    // Engine 1: budget the instance BELOW one event's total (30 tokens), start
+    // it, wait for the ledger to prove an over-ceiling commit, then crash.
+    run_engine1("budgeted_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "budgeted"));
+    assert!(pid_alive(pid), "budgeted must survive the engine crash");
+
+    // Engine 2: open → adopt → budgets re-evaluated → breach + pause.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = facade.instance_status("budgeted").unwrap();
+        if status.instance.state == LifecycleState::Paused {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the adoption-time budget breach never fired (state: {})",
+            status.instance.state
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The breach is durably RECORDED (FR-21 — regardless of the action taken) —
+    // and specifically for the ADOPTED Run: engine 1 already recorded its own
+    // crossing breach, so the AI-44 adoption-time re-evaluation is proven by a
+    // breach under the adopted Run's FRESH run id (a second distinct run).
+    let breaches = facade.budget_breach_events("budgeted").unwrap();
+    assert!(
+        !breaches.is_empty(),
+        "a budget breach event must exist after adopting an over-budget run"
+    );
+    let breach_runs: std::collections::HashSet<&str> =
+        breaches.iter().map(|b| b.run_id.as_str()).collect();
+    assert!(
+        breach_runs.len() >= 2,
+        "the adopted Run's own breach must be recorded (AI-44): {breaches:?}"
+    );
+    // The agent was PAUSED (not killed): still alive, no longer emitting usage.
+    assert!(
+        pid_alive(pid),
+        "the breach pause must leave the process alive (suspended/cooperative)"
+    );
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet
+        .iter()
+        .find(|e| e.name.as_str() == "budgeted")
+        .unwrap();
+    let committed = entry.usage.cumulative_input_tokens;
+    assert!(
+        committed >= 1,
+        "the pre-crash usage must be in the ledger (committed input tokens: {committed})"
+    );
+
+    // Teardown: stop (works from paused), confirm no orphan.
+    facade
+        .stop("budgeted", Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until_gone(pid, "stop must terminate the paused over-budget process");
+}
+
+#[test]
+fn ai44_adopting_an_over_budget_warn_run_records_the_breach_without_a_transition() {
+    // AI-44 (loop 2) — the WARN variant: a genuinely RUNNING over-budget run at
+    // adoption under `budget.breach_action = "warn"`. Engine 1's own enforcement
+    // records the crossing without transitioning, and the adoption-time
+    // re-evaluation must do the SAME for the ADOPTED Run's fresh id (the action
+    // comes from the config, not from the breach): the breach is durably
+    // RECORDED (FR-21 — record-first), the row STAYS `running` (the operator
+    // chose observation, not enforcement-by-pause), and no pause/stop
+    // transition is ever recorded across the crash gap.
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    // Same CI mitigation as the sibling adoption tests (#109).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "5", "--linger-ms", "600000"],
+    );
+
+    // Engine 1: budget the instance BELOW one event's total (30 tokens) with a
+    // WARN action, start it, wait for the ledger + engine-1's own warn breach,
+    // then crash — a live RUNNING over-budget agent survives.
+    run_engine1("budgeted_warn_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "budgeted"));
+    assert!(pid_alive(pid), "budgeted must survive the engine crash");
+
+    // Engine 2: open → adopt → budgets re-evaluated → warn + record, NO
+    // transition. Deterministic gate: the breach must exist under BOTH runs
+    // (engine 1's own + the adopted Run's fresh id) before asserting.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let breaches = facade.budget_breach_events("budgeted").unwrap();
+        let breach_runs: std::collections::HashSet<&str> =
+            breaches.iter().map(|b| b.run_id.as_str()).collect();
+        if breach_runs.len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the adoption-time warn breach never fired for the adopted Run: {breach_runs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The configured WARN action transitioned NOTHING: the adopted row stays
+    // `running` ...
+    let status = facade.instance_status("budgeted").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "adopting an over-budget run under breach_action=warn must keep the row running"
+    );
+    // ... and the lifecycle log holds NO pause/stop edge across the crash gap
+    // (only engine-1's start and the adoption reconcile, never a breach-driven
+    // transition).
+    let events = facade.transition_events("budgeted").unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.new_state,
+            LifecycleState::Paused | LifecycleState::Stopping
+        )),
+        "warn must record NO pause/stop transition at adoption: {:?}",
+        events.iter().map(|e| e.new_state).collect::<Vec<_>>()
+    );
+
+    // Teardown: stop (works from running), confirm no orphan.
+    facade
+        .stop("budgeted", Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until_gone(pid, "stop must terminate the adopted over-budget process");
+}
+
+/// A `Write` adapter delegating into a shared buffer (the `diagnostic_sink.rs`
+/// shape) so the test can read the sink's captured bytes while the engine owns
+/// the boxed writer.
+struct SinkCapture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SinkCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Build the engine-named sink handle over a shared capture buffer.
+fn make_sink(shared: &Arc<Mutex<Vec<u8>>>) -> DiagnosticSink {
+    Arc::new(Mutex::new(Box::new(SinkCapture(Arc::clone(shared)))))
+}
+
+#[test]
+fn ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener() {
+    // AI-46 (story 11-3): adopting a live ENGINE-OBSERVED orphan must SAY the
+    // stranding out loud. The adopted agent's injected `base_url` still points
+    // at the PREVIOUS engine's loopback listener, which died with that engine —
+    // the engine cannot rewrite the running child's already-injected
+    // environment, so the honest fix is a diagnostic (through the story-10-2
+    // sink channel) naming the stranded observed listener and the stop→start
+    // remediation. The adoption semantics are otherwise EXACTLY unchanged: the
+    // row stays `running`, the process is re-held, and a stop still terminates
+    // it. Runs where the siblings run (Unix survival harness; same CI
+    // mitigation).
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_observed_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1 (crash semantics): start the observed instance — its loopback
+    // listener dies with this process — and leave the agent alive.
+    run_engine1("observed_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "obssurv"));
+    assert!(pid_alive(pid), "the observed agent must survive the crash");
+
+    // Engine 2 with the sink installed FROM THE FIRST MOMENT
+    // (`open_with_diagnostics` installs BEFORE orphan adoption runs), so the
+    // adoption-time diagnostic lands in the capture, never on stderr.
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&captured))
+            .unwrap();
+    let facade = engine.blocking();
+
+    // State semantics unchanged: the orphan is ADOPTED as `running`.
+    let status = facade.instance_status("obssurv").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "a live orphan must be adopted as running (unchanged by AI-46)"
+    );
+
+    // The diagnostic reached the sink and names the condition: the instance,
+    // the stranded observed listener, and the stop→start remediation.
+    // (Adoption runs inside Engine::open, so by the time the open returned the
+    // line is already out; the bounded poll only guards reordering.)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let bytes = captured.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.contains("obssurv")
+            && text.contains("stranded observed listener")
+            && text.contains("stop the instance and start it again")
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stranded-listener diagnostic never reached the sink (captured: {text})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        text.contains("[ktesio] obssurv:"),
+        "the diagnostic is a [ktesio]-prefixed engine line: {text}"
+    );
+
+    // Supervision itself has no strand: the adopted process is alive and a
+    // stop lands cleanly.
+    assert!(pid_alive(pid));
+    facade
+        .stop("obssurv", Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until_gone(pid, "stop must terminate the adopted observed process");
 }
 
 #[test]

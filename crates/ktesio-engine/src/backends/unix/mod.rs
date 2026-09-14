@@ -84,14 +84,18 @@ pub struct UnixProcess {
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
     /// The recorded process start-time token (spine AD-5) — the PID-reuse guard
-    /// carried on the handle itself. `0` means "no start-time source" (a degraded
-    /// but honest fingerprint on a host with no `process_start_time` source, or a
-    /// read that failed at spawn). For an ADOPTED process (`child: None`) this is
-    /// the LIVE start-time verified at adoption (always non-zero on the supported
-    /// Linux/macOS hosts, since `adopt` returns `None` when it cannot read one), so
-    /// [`UnixProcess::reap_if_exited`] can RE-verify it on every steady-state poll:
-    /// a bare `kill(pid, 0)` alone cannot tell an adopted agent's crash from the OS
-    /// recycling its PID to an unrelated process within a reaper interval (AI-10).
+    /// carried on the handle itself. For a SPAWNED handle this was VERIFIED at
+    /// spawn (AI-14: a failed read FAILS the spawn, so the `0` sentinel is never
+    /// written by the engine's own paths). For an ADOPTED process (`child: None`)
+    /// this is the LIVE start-time verified at adoption (always non-zero on the
+    /// supported Linux/macOS hosts, since `adopt` returns `None` when it cannot
+    /// read one), so [`UnixProcess::reap_if_exited`] can RE-verify it on every
+    /// steady-state poll: a bare `kill(pid, 0)` alone cannot tell an adopted
+    /// agent's crash from the OS recycling its PID to an unrelated process within
+    /// a reaper interval (AI-10). `0` survives ONLY as the degraded fallback for
+    /// a host with no start-time source (kept intact — the AI-10 fallback
+    /// semantics are unchanged), reachable today only via a directly constructed
+    /// handle.
     start_time: u64,
     /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
     /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
@@ -259,10 +263,71 @@ impl ProcessBackend for UnixBackend {
         let pid = child.id();
         // The child is its own group leader, so pgid == pid.
         let pgid = Pid::from_raw(pid as i32);
-        // Record the start-time for symmetry with the adopted handle (a spawned
-        // handle reaps via its owned Child, so it never relies on this for the
-        // PID-reuse guard; a read failure degrades to 0, an honest pid-only form).
-        let start_time = process_start_time(pid).unwrap_or(0);
+        // Record the start-time for the write-ahead fingerprint (AD-5). AI-14:
+        // the read is VERIFIED — a failure FAILS the spawn (fail closed) instead
+        // of recording the `start_time = 0` sentinel, which would silently
+        // downgrade every later orphan adoption to a pid-only match (the
+        // PID-reuse guard would never fire).
+        //
+        // Loop-2 hardening: the raw std `Child` does NOT kill on drop, so a
+        // failed read must kill the fresh group EXPLICITLY before returning —
+        // this child is setsid-detached, and an early return without the kill
+        // would orphan it with no handle and no record. A read that fails
+        // because the pid is ALREADY GONE is not a platform failure either:
+        // the agent exited instantly at startup, and THAT fact is surfaced.
+        // The few-attempt retry absorbs the spawn-race window (a read racing
+        // the child's own registration) without papering over a real outage.
+        let start_time = {
+            let mut token = None;
+            for attempt in 0..START_TIME_READ_ATTEMPTS {
+                match process_start_time(pid) {
+                    Some(t) => {
+                        token = Some(t);
+                        break;
+                    }
+                    None if attempt + 1 < START_TIME_READ_ATTEMPTS => {
+                        // A child that already exited will never yield a token
+                        // — bail out of the retries immediately.
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(START_TIME_READ_RETRY_DELAY);
+                    }
+                    None => {}
+                }
+            }
+            match token {
+                Some(t) => t,
+                None => {
+                    // Fail closed — but never orphan the child: SIGKILL the
+                    // group this engine just created, then reap our child.
+                    let _ = killpg(pgid, Signal::SIGKILL);
+                    let _ = child.wait();
+                    let platform_err = match verified_spawn_start_time(pid, &spec.exec) {
+                        Err(err) => err,
+                        // Unreachable: the loop above just failed this read on
+                        // every attempt.
+                        Ok(_) => unreachable!("the start-time read failed in the retry loop"),
+                    };
+                    return Err(match child.try_wait() {
+                        // The pid was ALREADY GONE: the agent exited instantly
+                        // at startup — surface that, not a platform failure.
+                        Ok(Some(_)) => BackendError::Spawn {
+                            exec: spec.exec.clone(),
+                            detail: format!(
+                                "the spawned agent exited immediately, before its process \
+                                 start-time could be read for pid {pid} — the agent failed \
+                                 at startup (check its logs); this is not a platform \
+                                 start-time-source failure"
+                            ),
+                        },
+                        // Child still alive after every attempt: the platform
+                        // genuinely has no usable start-time source.
+                        _ => platform_err,
+                    });
+                }
+            }
+        };
         // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
         // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
         // was true above (Stdio::piped() populates it; Stdio::null() never
@@ -395,12 +460,13 @@ impl ProcessBackend for UnixBackend {
     }
 
     fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint {
-        // A read failure falls back to start_time 0 (a degraded but honest
-        // fingerprint — the pid is still recorded) rather than erroring the
-        // spawn; in normal operation reading the start-time of a process we hold
-        // alive succeeds.
-        let start_time = process_start_time(handle.pid).unwrap_or(0);
-        ProcessFingerprint::new(handle.pid, start_time)
+        // The handle's OWN start-time token — VERIFIED at spawn (AI-14: the spawn
+        // FAILS when the read fails, so a spawned handle always carries a real,
+        // non-zero token) or at adoption (`adopt` returns `None` when it cannot
+        // read one). Using the held token means no second, separately-fallible
+        // read here that could silently produce a `0` sentinel on the
+        // write-ahead record, and it is byte-identical to what `spawn` verified.
+        ProcessFingerprint::new(handle.pid, handle.start_time)
     }
 
     fn adopt(
@@ -537,13 +603,47 @@ fn process_start_time(pid: u32) -> Option<u64> {
 }
 
 /// Other Unix (neither Linux nor macOS — e.g. a BSD without `libproc`): no
-/// supported start-time source. Returns `None`, yielding a degraded but honest
-/// fingerprint (pid-only). Ktesio's supported targets are Linux / macOS /
-/// Windows; this arm only keeps the backend COMPILING on other Unix.
+/// supported start-time source. Returns `None`. With AI-14's fail-closed spawn
+/// this means a host with no start-time source cannot spawn AT ALL (every spawn
+/// fails with a clear diagnostic) — the honest consequence: without a start-time
+/// token the write-ahead record's PID-reuse guard cannot work, and silently
+/// recording a pid-only fingerprint (the old `0` sentinel) would make every
+/// later adoption decision untrustworthy. Ktesio's supported targets are
+/// Linux / macOS / Windows; this arm only keeps the backend COMPILING on other
+/// Unix.
 #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
 fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }
+
+/// AI-14: resolve a just-spawned child's start-time token — the write-ahead
+/// spawn record's PID-reuse guard (AD-5) — FAILING the spawn when the read
+/// fails instead of recording the `start_time = 0` sentinel. Fail closed: a
+/// record without a real token would silently downgrade every later orphan
+/// adoption to a pid-only match (the reused-PID guard would never fire), so the
+/// engine refuses the spawn up front with a clear diagnostic naming the pid.
+/// (Loop 2: the CALLER owns the retries, the exited-instantly distinction, and
+/// killing the fresh group before surfacing this error — see the `spawn` body.)
+/// The unit is the same opaque per-OS token [`process_start_time`] reads.
+fn verified_spawn_start_time(pid: u32, exec: &str) -> Result<u64, BackendError> {
+    process_start_time(pid).ok_or_else(|| BackendError::Spawn {
+        exec: exec.to_string(),
+        detail: format!(
+            "could not read the process start-time for the spawned pid {pid} — no usable \
+             process start-time source on this platform; cannot guarantee pid-reuse safety, \
+             so refusing to record a start-time-less fingerprint (sentinel 0): the \
+             write-ahead spawn record needs the real token for orphan adoption"
+        ),
+    })
+}
+
+/// AI-14 (loop 2): how many times the spawn path attempts the start-time read
+/// before failing closed, and how long it waits between attempts — enough to
+/// absorb the spawn-race window (a read racing the child's registration in the
+/// process table) without masking a genuine platform outage for any real
+/// duration.
+const START_TIME_READ_ATTEMPTS: usize = 3;
+const START_TIME_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
 impl Drop for UnixProcess {
     /// Kill the process group on drop so a dropped handle never leaks the agent
@@ -750,6 +850,41 @@ pub fn check_secrets_file_permissions(path: &std::path::Path) -> Result<(), Secr
     } else {
         Err(crate::ports::file_permissions_error(path, mode))
     }
+}
+
+/// Copy an EXISTING target file's Unix permissions onto the freshly written
+/// `temp` BEFORE the atomic rename (story 11-2 review-1, patch 3) — so an
+/// operator-tightened mode (e.g. a hand-chmod'ed `0600 config.toml`) survives
+/// every overwrite instead of silently widening back to the process default.
+/// A target that does not exist (the first write) is a no-op — the temp keeps
+/// the process-default mode. Stat/permission ERRORS are surfaced (a failed
+/// mode copy must not silently publish a widened or narrowed file); they run
+/// before the rename, so a failure leaves the previous target untouched.
+///
+/// Lives here (the sole allowlisted `#[cfg]` home) because the mode-bit APIs
+/// are `std::os::unix`-only; the caller ([`crate::paths::write_atomic_via`])
+/// stays cfg-free. Re-exported cfg-selected from `backends/mod.rs`, exactly
+/// like [`check_secrets_file_permissions`].
+pub fn preserve_target_mode(target: &std::path::Path, temp: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(target) {
+        Ok(meta) => std::fs::set_permissions(
+            temp,
+            std::fs::Permissions::from_mode(meta.permissions().mode()),
+        ),
+        // First write: no previous mode to preserve.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
+/// POSIX `rename` replaces ANY existing non-directory target atomically and is
+/// never blocked by another process holding the target open (an open fd does
+/// not share-block a rename), so there is nothing transient to retry — errors
+/// surface immediately.
+pub fn rename_over_target(temp: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    std::fs::rename(temp, target)
 }
 
 #[cfg(test)]
@@ -1085,6 +1220,44 @@ mod tests {
 
         // Teardown via the real owner.
         let _ = backend.stop(&mut original, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn spawn_fails_closed_when_the_start_time_read_fails_ai14() {
+        // AI-14: the spawn-site start-time read is VERIFIED — a failed read
+        // FAILS the spawn with a clear Spawn diagnostic instead of recording the
+        // `start_time = 0` sentinel. Proven through the SAME resolver `spawn`
+        // uses: a pid with no readable start-time (here a pid that cannot be a
+        // live process — outside every supported host's pid range) maps to a
+        // Spawn error naming the pid, while a REAL child's read yields the
+        // non-zero token the fingerprint then carries verbatim (so the
+        // write-ahead record can never silently become pid-only).
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn");
+        let live = process_start_time(proc.pid).expect("a live child has a readable start-time");
+        assert!(
+            live > 0,
+            "the verified token is the real one, never the 0 sentinel"
+        );
+        let err = verified_spawn_start_time(u32::MAX - 1, "sleep").unwrap_err();
+        match &err {
+            BackendError::Spawn { exec, detail } => {
+                assert_eq!(exec, "sleep");
+                assert!(detail.contains("start-time"), "names the failure: {detail}");
+                assert!(detail.contains("4294967294"), "names the pid: {detail}");
+                assert!(
+                    detail.contains("sentinel 0"),
+                    "says what it refused to record: {detail}"
+                );
+            }
+            other => panic!("expected Spawn, got {other}"),
+        }
+        // The fingerprint comes from the handle's OWN verified token — identical
+        // across reads, never a second fallible read that could produce a 0.
+        assert_eq!(backend.fingerprint(&proc).start_time, live);
+        assert_eq!(backend.fingerprint(&proc), backend.fingerprint(&proc));
+        // Teardown.
+        let _ = backend.stop(&mut proc, Duration::from_secs(2));
     }
 
     #[test]

@@ -39,7 +39,13 @@ kt agent list
 kt agent list --json
 ```
 
-The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage token totals, and the Agent Home, followed by a Fleet-wide totals footer. `--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `kt agent usage` below.
+The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage totals (cumulative tokens plus — when a Rate is configured — the derived dollar cost), and the Agent Home, followed by a Fleet-wide totals footer.
+
+Both money-bearing columns are headed `Budget (tok, est. $)` and `Usage (tok, est. $)`: the `est. $` estimate qualifier lives in the HEADER because those cells are narrow and truncate — a truncated cell can never strip the label off a real dollar figure, so the cells render their dollar figures bare.
+
+The active Metering Source is deliberately **not** a human-`list` column — the compact table is the ratified 80-column design, and a Metering column there overflows the default width and truncates cells. Read the Metering Source from `kt agent show` (the detail row), `kt agent list --json` (the `metering_source` field), or `kt agent usage`.
+
+`--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `kt agent usage` below.
 
 ## `kt agent show <name> [--json]`
 
@@ -120,7 +126,7 @@ Start a registered Agent Instance.
 kt agent start my-agent
 ```
 
-On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr.
+On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr. Before the process spawns, the start seam can emit one-line engine diagnostics on stderr (or the host sink): a report of every launch environment variable the config mapping **overwrote** (the config value wins), and a warn-only report of config keys whose `secret:` cleartext was delivered into a **flag** target (visible on the process argv) — neither ever rejects the start.
 
 A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits (a note is printed to stderr). Durable supervision across separate CLI invocations is future work.
 
@@ -144,7 +150,7 @@ kt agent pause my-agent
 kt agent resume my-agent
 ```
 
-A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration.
+A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration. `resume` shares the dispatch: a **guaranteed** resume wakes the suspended process (SIGCONT), a **best-effort** resume records its qualifier, and a resume of an instance that is `paused` while the CURRENT declaration reads `unsupported` (declaration/OS drift) fails fast with a dedicated diagnostic that names the paused state and the escape hatch — `stop` works without pause support, so `kt agent stop <name> && kt agent start <name>` recovers (exit code 5, the capability-unsupported class). A guaranteed pause OR RESUME of an instance this engine session holds no process handle for (e.g. started by a prior engine whose process is gone) still transitions, but the recorded cause is the honest best-effort qualifier naming the missing handle — nothing was signalled at all, so the cause never reads as a plain "paused"/"resumed" command that a real suspension would earn; a budget-driven override in that no-handle case is wrapped in the same qualifier rather than replacing it.
 
 ## `kt agent send <name> <text>`
 
@@ -305,6 +311,12 @@ kt agent config set demo agent.api_key secret:OPENAI_KEY
 
 A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write). Setting config on a **running** instance is allowed and never touches the live process: the change takes effect on the next start (budget/cost keys are an exception — they are re-read on each usage ingestion and apply immediately).
 
+The write is **atomic**: the updated `config.toml` is written to a temporary file in the Agent Home and renamed into place, so a crash mid-write always leaves either the complete old or the complete new bytes — never a truncated file.
+
+The `<value>` position accepts a leading-dash value (e.g. `-x`, `--model-x`) **literally** — no `--` separator is required (the separator still works for callers who prefer it).
+
+**Warning (warn-only).** Setting a `secret:NAME` value on a key the agent's adapter maps to a **flag** target succeeds, but prints a warning to stderr: the resolved cleartext would ride the agent's command line, where argv is readable by other local users (`ps`, `/proc/<pid>/cmdline`). Prefer an **env** or **file** target for secret-carrying keys (see Architecture — Secrets); at **start** the same fact is reported as a one-line engine diagnostic.
+
 ## `kt agent config get <name> [<key>] [--json] [--reveal]`
 
 Read the effective (resolved) config with per-value provenance.
@@ -316,7 +328,7 @@ kt agent config get demo --json
 kt agent config get demo --reveal
 ```
 
-- `<key>` — optional; omitted prints the whole effective config. With a key, prints just that value.
+- `<key>` — optional; omitted prints the whole effective config. With a key, prints just that value. A key with no effective value is rejected on stderr with a non-zero exit. When that key has no value of its own but **is a table prefix** of effective keys (e.g. `budget` while `budget.tokens.cumulative` is set), the diagnostic names the effective child leaves (the first eight, then an ellipsis) and suggests the `get` for one of them; a key that is neither a value nor a prefix gets the plain not-found diagnostic. The same diagnostic applies in `--json` mode (stderr carries it; stdout stays clean of a partial document).
 - `--json` — emit a versioned document whose per-leaf objects carry `{ key, value, source, unvalidated }`.
 - `--reveal` — the sole explicit un-mask for `secret:` values. It re-resolves secrets **live** (environment, then the secrets file) at read time, so a revealed value may differ from what a running instance resolved at its start. It never un-masks the persisted snapshot, logs, or events.
 
@@ -360,7 +372,7 @@ Every `kt` command returns one of these numeric exit codes, so failures can be b
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
-| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe |
+| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `kt agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery) |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 
 A script branches on the code directly — no stderr parsing:

@@ -28,7 +28,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ktesio_engine::{AdapterRef, Engine, EstimateLabel, FleetListing};
+use ktesio_engine::{AdapterRef, Engine, EstimateLabel, FleetListing, RestartPolicy};
 use tempfile::TempDir;
 
 /// The token sentinels `fake_agent --emit-usage` stamps on every event.
@@ -279,4 +279,103 @@ fn an_empty_fleet_has_all_zero_totals_and_absent_dollars() {
     assert_eq!(listing.totals.total_dollars, None);
     assert_eq!(listing.totals.estimate_label, None);
     assert!(!listing.totals.dollars_partial);
+}
+
+#[test]
+fn fleet_batch_reads_spawn_records_and_each_entry_keeps_its_own_ai16() {
+    // AI-16 behavior preservation (the N+1 kill): `fleet()` now reads the
+    // write-ahead spawn records in ONE batched, lock-held query keyed by name —
+    // instead of one per-instance query — and threads the map into the row
+    // composition. With MULTIPLE instances carrying DIFFERENT records, every
+    // entry must still surface ITS OWN restart count/policy/cause (never
+    // cross-wired, never defaulted), the Fleet row for a name must equal the
+    // single-instance read (`fleet_entry`, AI-15) for the same name, and the
+    // usage/cost surfaces ride the same rows as before. Runtime fields are
+    // seeded directly in the state DB (deterministic — no live processes).
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    for name in ["aa", "bb", "cc"] {
+        facade.register(name, "mock").unwrap();
+    }
+
+    // Seed a DISTINCT spawn record per instance straight into the store.
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    for (name, count, policy, cause) in [
+        ("aa", 1, "on-failure", "crashed with code 1"),
+        ("bb", 4, "never", "crash-loop: 5 consecutive failures"),
+        ("cc", 0, "on-failure", "launched clean"),
+    ] {
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO agent_runtime \
+             (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+             VALUES (?1, 0, 0, ?2, ?3, ?4)",
+            rusqlite::params![id, policy, count, cause],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // ONE fleet read — the batched path under test.
+    let entries = facade.fleet().unwrap();
+    assert_eq!(entries.len(), 3, "one row per instance");
+    for entry in &entries {
+        let expected = match entry.name.as_str() {
+            "aa" => (1, RestartPolicy::OnFailure, Some("crashed with code 1")),
+            "bb" => (
+                4,
+                RestartPolicy::Never,
+                Some("crash-loop: 5 consecutive failures"),
+            ),
+            "cc" => (0, RestartPolicy::OnFailure, Some("launched clean")),
+            other => panic!("unexpected fleet row: {other}"),
+        };
+        assert_eq!(entry.restart_count, expected.0, "{}: own count", entry.name);
+        assert_eq!(
+            entry.restart_policy, expected.1,
+            "{}: own policy",
+            entry.name
+        );
+        assert_eq!(
+            entry.failed_cause.as_deref(),
+            expected.2,
+            "{}: own cause",
+            entry.name
+        );
+        // The single-instance read (AI-15's facade method) agrees with the
+        // batched Fleet row, field for field.
+        let single = facade
+            .fleet_entry(entry.name.as_str())
+            .unwrap_or_else(|e| panic!("fleet_entry({}) failed: {e}", entry.name));
+        assert_eq!(single.restart_count, entry.restart_count);
+        assert_eq!(single.restart_policy, entry.restart_policy);
+        assert_eq!(single.failed_cause, entry.failed_cause);
+        assert_eq!(single.state, entry.state);
+        assert_eq!(
+            single.usage.cumulative_input_tokens,
+            entry.usage.cumulative_input_tokens
+        );
+        assert_eq!(single.metering_source, entry.metering_source);
+        // AI-15 (loop 2 pin): byte-identity across ALL fields — the single-
+        // instance `show` read and the batched `list` row serialize to the
+        // IDENTICAL JSON document. The field asserts above pin the subset we
+        // care about with good failure messages; this pins the WHOLE entry, so
+        // a field added to one composition path but not the other fails here
+        // instead of drifting silently.
+        let show = serde_json::to_value(&single).unwrap();
+        let list = serde_json::to_value(entry).unwrap();
+        assert_eq!(
+            show, list,
+            "the `show` entry and its matching `list` row must be identical across \
+             ALL fields ({}): show={show} list={list}",
+            entry.name
+        );
+    }
 }

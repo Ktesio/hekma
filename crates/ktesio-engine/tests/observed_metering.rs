@@ -168,7 +168,9 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// `[config."metering.base_url"]` mapping points at env `OPENAI_BASE_URL` (so the
 /// engine injects the loopback listener URL there — AC6). The operator sets the
 /// real upstream via `metering.upstream_base_url` config (not the manifest).
-fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str]) {
+/// `config_section` appends extra TOML after the declared mappings (the
+/// `memory.rs` fixture shape) — e.g. a mapping for the reserved `memory.dir` key.
+fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str], config_section: Option<&str>) {
     let bin = ktesio_conformance::fake_agent_bin();
     let args_toml = args
         .iter()
@@ -204,8 +206,9 @@ env = "MODEL"
 
 [config."metering.base_url"]
 env = "OPENAI_BASE_URL"
-"#,
+{config_section}"#,
         exec = bin.to_string_lossy(),
+        config_section = config_section.unwrap_or(""),
     );
     std::fs::write(dir.join("adapter.toml"), body).unwrap();
 }
@@ -277,6 +280,7 @@ fn engine_observed_usage_lands_in_the_ledger_tagged_engine_observed() {
         manifest.path(),
         "obs",
         &["--observed-calls", "3", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -333,6 +337,7 @@ fn a_token_budget_enforces_on_observed_usage_and_pauses() {
         manifest.path(),
         "obsbudget",
         &["--observed-calls", "5", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -393,6 +398,7 @@ fn a_dollar_cap_enforces_on_observed_usage_labeled_estimated() {
         manifest.path(),
         "obsdollar",
         &["--observed-calls", "5", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -467,6 +473,7 @@ fn the_forwarded_api_key_never_leaks_into_any_ktesio_surface() {
         manifest.path(),
         "noleak",
         &["--observed-calls", "2", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -572,6 +579,7 @@ fn the_forwarded_api_key_never_leaks_on_the_forward_failure_path() {
         manifest.path(),
         "noleakerr",
         &["--observed-calls", "3", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -664,6 +672,7 @@ fn an_engine_observed_instance_with_no_upstream_fails_to_start_cleanly() {
         manifest.path(),
         "noup",
         &["--observed-calls", "1", "--linger-ms", "600000"],
+        None,
     );
 
     let engine = open(&state);
@@ -685,6 +694,112 @@ fn an_engine_observed_instance_with_no_upstream_fails_to_start_cleanly() {
         LifecycleState::Running,
         "a failed engine-observed start must not reach running"
     );
+}
+
+#[test]
+fn a_hand_set_memory_dir_never_reaches_an_engine_observed_start_surfaces() {
+    // Story 11-3 (A1): an engine-observed start takes the INVOCATION-OVERRIDE
+    // branch (the listener's base_url forces the config re-fold), and that
+    // re-fold re-derives the config from EVERY layer. A hand-set reserved
+    // `memory.dir` must NOT resurrect through it: with no backing attached the
+    // engine injects nothing at this key, so the only way the decoy could
+    // reach the agent is by leaking through the re-fold — it must appear in
+    // NEITHER the delivered env (the child's dump) NOR the persisted
+    // effective-config snapshot (the memory.rs honest-provenance pattern).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+
+    // The dump target lives OUTSIDE the Agent Home so the home stays pristine
+    // for the snapshot assertion below.
+    let dump = state.path().join("memory-strip.dump");
+    let dump_arg = format!("{}", dump.display());
+    // The observed manifest DECLARES a mapping for the reserved key (env
+    // `AGENT_MEMORY_DIR` — the memory.rs fixture spelling, deliberately not an
+    // engine constant), so an unstripped value WOULD be delivered.
+    write_observed_manifest(
+        manifest.path(),
+        "obsmem",
+        &["--linger-ms", "600000", "--dump", &dump_arg],
+        Some("\n[config.\"memory.dir\"]\nenv = \"AGENT_MEMORY_DIR\"\n"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    let registered = facade
+        .register_with_adapter(
+            "obsmem",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    // A valid-shaped (dead) upstream: the listener needs a URL to start; this
+    // agent makes no calls (no `--observed-calls`), so nothing ever forwards.
+    let dead_upstream = {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = l.local_addr().unwrap();
+        format!("http://{addr}")
+    };
+    facade
+        .set_config("obsmem", "metering.upstream_base_url", &dead_upstream)
+        .unwrap();
+    // THE DECOY: a hand-set value at the reserved key in the operator
+    // (instance) layer — the tests/cost.rs set_config pattern.
+    let decoy = "/tmp/ktesio-decoy-memory-dir-11-3";
+    facade.set_config("obsmem", "memory.dir", decoy).unwrap();
+    // POSITIVE CONTROL (review loop 1): an `agent.*` pass-through key set
+    // through the SAME operator layer and delivered by the SAME start — its
+    // delivery proves the (re-folded) config path is live end-to-end, so the
+    // decoy's absence below is attributable to the STRIP, not to a dead
+    // mapping or an operator layer that never reaches the child.
+    facade
+        .set_config("obsmem", "agent.PROBE_CONTROL_KEY", "control-value-11-3")
+        .unwrap();
+
+    let started = facade.start("obsmem").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Poll the committed dump (the memory.rs pattern), then assert the decoy
+    // reached NOTHING: a stripped key is a mapping no-op, so there is no
+    // AGENT_MEMORY_DIR env line at all.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dump_text = loop {
+        match std::fs::read_to_string(&dump) {
+            Ok(text) if text.contains("arg=") => break text,
+            _ => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the agent never wrote its dump at {}",
+                    dump.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert!(
+        !dump_text.contains("env=AGENT_MEMORY_DIR="),
+        "a hand-set reserved key must not be delivered as engine memory:\n{dump_text}"
+    );
+    assert!(
+        !dump_text.contains(decoy),
+        "the decoy must not reach the child's environment anywhere:\n{dump_text}"
+    );
+    assert!(
+        dump_text.contains("env=PROBE_CONTROL_KEY=control-value-11-3"),
+        "the positive control must be delivered by the same start (proves the \
+         mapping path is live and the strip is what blocked the reserved key):\n{dump_text}"
+    );
+
+    // ... and neither the key nor the value lands in the effective-config
+    // snapshot (the 3-4/5-1 honest-provenance split).
+    let snapshot =
+        std::fs::read_to_string(Path::new(&registered.agent_home).join("effective-config.json"))
+            .expect("snapshot written at start");
+    assert!(
+        !snapshot.contains("memory.dir") && !snapshot.contains(decoy),
+        "the reserved key must stay out of effective-config.json:\n{snapshot}"
+    );
+
+    facade.stop("obsmem", Some(Duration::from_secs(5))).unwrap();
 }
 
 #[test]
@@ -724,7 +839,12 @@ fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
     // (2) `engine-observed` IS a valid declaration under contract v1 — a
     // manifest declaring it REGISTERS under the frozen 1.0.0 contract.
     let observed_manifest = TempDir::new().unwrap();
-    write_observed_manifest(observed_manifest.path(), "obsok", &["--linger-ms", "1000"]);
+    write_observed_manifest(
+        observed_manifest.path(),
+        "obsok",
+        &["--linger-ms", "1000"],
+        None,
+    );
     facade
         .register_with_adapter(
             "obsok",

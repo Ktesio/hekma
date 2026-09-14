@@ -4,7 +4,26 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    # AI-37/AI-54 (story 11-5): the FULL CI — the 3-OS test matrix and the
+    # coverage job included — runs on EVERY branch push, not only main and not
+    # only PRs. The old main-only push filter meant a feature branch's
+    # commits got local-OS-only verification until the PR was opened (Epic 2's
+    # lesson: cross-OS + coverage surprises surfaced under merge pressure);
+    # this glob keeps the existing push-to-main runs AND runs the same job set
+    # on every feature-branch push (the Epic-9 precedent, now codified).
+    # Repeated pushes to the same branch collapse into one run via the
+    # concurrency group below (cancel-in-progress).
+    branches:
+      - "**"
+  schedule:
+    # Nightly full CI on the default branch (GitHub runs `schedule` there):
+    # an always-fresh cross-OS + coverage record even when nothing pushed.
+    # 07:17 UTC — off the top of the hour where scheduled jobs queue longest.
+    - cron: "17 7 * * *"
+  # Manual dispatch (the AI-37 "or nightly/manual on feat/* branches" shape):
+  # run the full job set on any ref on demand from the Actions tab / `gh
+  # workflow run`.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

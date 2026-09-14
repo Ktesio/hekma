@@ -60,6 +60,26 @@ pub use unix::check_secrets_file_permissions;
 #[cfg(windows)]
 pub use windows::check_secrets_file_permissions;
 
+// ---- Story 11-2 review-1: atomic-write filesystem glue (the cfg home) ----
+// The per-OS bits of `paths::write_atomically` (permission preservation and
+// the rename with the Windows sharing-retry), cfg-selected exactly like the
+// secrets permission check so `paths.rs` stays cfg-free.
+
+/// Preserve an existing target's permissions onto the atomic-write temp before
+/// the rename (Unix mode-bit copy; a portable no-op on Windows — see the
+/// per-backend docs).
+#[cfg(unix)]
+pub use unix::preserve_target_mode;
+#[cfg(windows)]
+pub use windows::preserve_target_mode;
+
+/// Rename the temp over the atomic-write target (immediate on Unix; one
+/// backoff-and-retry for a transient Windows sharing violation).
+#[cfg(unix)]
+pub use unix::rename_over_target;
+#[cfg(windows)]
+pub use windows::rename_over_target;
+
 #[cfg(test)]
 mod tests {
     use super::*;

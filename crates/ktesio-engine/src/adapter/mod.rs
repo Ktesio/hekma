@@ -382,15 +382,17 @@ fn start_launch_from_manifest(manifest: &Manifest) -> Option<StartLaunch> {
 /// are pure in-memory mutations of the launch that cannot fail. The supervisor
 /// maps this into its launch error surface (never a panic).
 ///
-/// ATOMICITY (accurate guarantee): the mapping is applied BEFORE the `starting`
-/// transition, so a file-render failure REJECTS the start and the instance stays
-/// in its PRIOR state (registered/stopped/failed) — the start STATE is atomic
-/// (all mapping failures reject before any state change). It is NOT a
-/// whole-filesystem atomic write: multi-file apply is not atomic across files, so
-/// a failure on a LATER file can leave an EARLIER file already rendered in the
-/// Agent Home (a harmless stale artifact the next successful start overwrites). An
-/// atomic temp-then-rename per rendered file is a deferred follow-up (same family
-/// as the existing non-atomic-write item).
+/// ATOMICITY: the mapping is applied BEFORE the `starting` transition, so a
+/// file-render failure REJECTS the start and the instance stays in its PRIOR
+/// state (registered/stopped/failed) — the start STATE is atomic (all mapping
+/// failures reject before any state change). Since story 11-2 (AI-28) each
+/// rendered file is ALSO written atomically (temp in the target's directory +
+/// one rename, via [`crate::paths::write_atomically`]): a crash mid-write can no
+/// longer truncate a previously good native config file, and a failed write
+/// leaves the previous bytes intact with no temp residue. Multi-file apply is
+/// still not atomic ACROSS files, so a failure on a LATER file can leave an
+/// EARLIER file already rendered in the Agent Home (a harmless stale artifact
+/// the next successful start overwrites).
 #[derive(Debug, Error)]
 pub enum ConfigApplyError {
     /// A FILE-target config file could not be rendered/written into the Agent
@@ -455,11 +457,30 @@ pub fn resolve_config_mapping(
     Ok(mapping)
 }
 
+/// What [`apply_config_mapping`] REPORTS back about the mapping it applied
+/// (story 11-2, AI-39). The start seam turns these facts into ONE operator
+/// diagnostic routed through `emit_diagnostic` (stderr by default, the host's
+/// story-10-2 sink when installed) — resolving the old Flag-arm TODO: the
+/// `start` seam now carries the secret-into-flag fact without new cross-boundary
+/// machinery, riding the same return path the apply already had. Returned on
+/// SUCCESS (an `Err` means the mapping did not fully apply — nothing to report).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MappingReport {
+    /// The unified keys whose RESOLVED SECRET cleartext was delivered into a
+    /// `flag` target — i.e. the keys that put cleartext on the spawned process's
+    /// argv (world-readable cross-user via `ps` / `/proc/<pid>/cmdline`), the
+    /// STRICTER exposure documented in docs/architecture.md Secrets. Empty on
+    /// the common path; the caller emits ONE naming diagnostic, warn-only (the
+    /// start still succeeds — no rejection semantics were ever ratified).
+    pub secret_flag_keys: Vec<String>,
+}
+
 /// APPLY the adapter's config mapping to a [`StartLaunch`], from the resolved
 /// [`EffectiveConfig`] (story 2-2 — the heart of AC-A/AC4/AC5/AC6). Runs at start,
 /// after the launch's exec/args/env are read from the `[lifecycle.start]`
 /// template and BEFORE the `SpawnSpec` is built, so the spawned process already
-/// reflects the mapped native config.
+/// reflects the mapped native config. On success returns the
+/// [`MappingReport`] facts the start seam surfaces as diagnostics.
 ///
 /// For every resolved leaf (`dotted key → value`), in the effective config's
 /// deterministic sorted order:
@@ -503,12 +524,13 @@ pub fn apply_config_mapping(
     effective: &EffectiveConfig,
     secrets: &std::collections::BTreeMap<String, crate::domain::SecretString>,
     home: &Path,
-) -> Result<(), ConfigApplyError> {
+) -> Result<MappingReport, ConfigApplyError> {
     // Accumulate FILE-target writes keyed by target path, so multiple keys
     // mapping into the SAME file merge into one rendered document (deterministic:
     // the effective config iterates sorted, and each file's keys are set into a
     // sorted TOML table). Rendered + written once at the end.
     let mut files: std::collections::BTreeMap<String, FileDoc> = std::collections::BTreeMap::new();
+    let mut report = MappingReport::default();
 
     for (dotted_key, resolved) in effective.iter() {
         // Secret delivery (AC9): a secret-classified leaf delivers the RESOLVED
@@ -545,12 +567,13 @@ pub fn apply_config_mapping(
                 // (documented in docs/architecture.md Secrets / AD-10) — the agent
                 // needs a usable key and Ktesio's own surfaces stay masked — but
                 // operators should prefer `env`/`file` targets for secret-carrying
-                // keys.
-                // TODO(follow-up): surface a one-time operator warning when a
-                // `secret:` leaf resolves into a `flag` target. Deferred: the `start`
-                // seam has no existing engine→CLI note channel that reaches this
-                // fact without new cross-boundary machinery (unlike pause's
-                // best-effort re-read, which reuses `effective_capabilities`).
+                // keys. The fact is REPORTED (AI-39): a resolved secret delivered
+                // here lands the key in `report.secret_flag_keys`, and the start
+                // seam emits ONE warn-only diagnostic naming it (no rejection —
+                // the argv boundary stays accepted; only the silence was a bug).
+                if secrets.contains_key(dotted_key) {
+                    report.secret_flag_keys.push(dotted_key.to_string());
+                }
                 if let Some([flag, val]) = target.render_flag_args(&value) {
                     launch.args.push(flag);
                     launch.args.push(val);
@@ -568,11 +591,14 @@ pub fn apply_config_mapping(
 
     // Render + write each accumulated file into the Agent Home (sole writer,
     // AD-6). The path was validated RELATIVE at manifest-load time; a native
-    // mapping is trusted (code-declared). Join defensively onto the home.
+    // mapping is trusted (code-declared). Join defensively onto the home. Each
+    // write is ATOMIC (story 11-2, AI-28): temp in the target's directory + one
+    // rename, so a crash mid-write cannot truncate a previously good native
+    // config file and a failed write leaves no temp residue.
     for (rel_path, doc) in files {
         write_config_file(home, &rel_path, &doc)?;
     }
-    Ok(())
+    Ok(report)
 }
 
 /// An in-progress native config FILE document being assembled by
@@ -631,10 +657,15 @@ fn set_dotted_string(table: &mut toml::value::Table, dotted_key: &str, value: St
 }
 
 /// Render `doc` into the file at `rel_path` inside the Agent `home` (the engine is
-/// the sole writer — AD-6). Creates parent directories under the home as needed. A
-/// write/serialize failure is a typed [`ConfigApplyError::FileRender`] naming the
-/// key path + detail (never a panic). `rel_path` was validated relative at
-/// manifest load; joining it onto `home` therefore stays inside the home.
+/// the sole writer — AD-6). Creates parent directories under the home as needed.
+/// The write itself is ATOMIC (story 11-2, AI-28): the body lands in a
+/// same-directory temp file ([`crate::paths::write_atomically`]) and one rename
+/// flips it over the target, so a previously rendered native config file is never
+/// observed (or left) truncated — a crash mid-write keeps the OLD bytes, and a
+/// failed write leaves no temp residue. A write/serialize failure is a typed
+/// [`ConfigApplyError::FileRender`] naming the key path + detail (never a panic).
+/// `rel_path` was validated relative at manifest load; joining it onto `home`
+/// therefore stays inside the home.
 fn write_config_file(home: &Path, rel_path: &str, doc: &FileDoc) -> Result<(), ConfigApplyError> {
     let body = doc
         .to_toml_string()
@@ -651,10 +682,12 @@ fn write_config_file(home: &Path, rel_path: &str, doc: &FileDoc) -> Result<(), C
             detail: e.to_string(),
         })?;
     }
-    std::fs::write(&full, body).map_err(|e| ConfigApplyError::FileRender {
-        key: rel_path.to_string(),
-        path: rel_path.to_string(),
-        detail: e.to_string(),
+    crate::paths::write_atomically(&full, body.as_bytes()).map_err(|e| {
+        ConfigApplyError::FileRender {
+            key: rel_path.to_string(),
+            path: rel_path.to_string(),
+            detail: e.to_string(),
+        }
     })
 }
 
@@ -1538,7 +1571,9 @@ source = "self-reported"
         // delivers its resolved CLEARTEXT as an argv token, NOT the mask and NOT the
         // reference. This is the STRICTER exposure the docs call out (argv is
         // cross-user readable via `ps`/`/proc/<pid>/cmdline`), so it is proven
-        // explicitly alongside the env path.
+        // explicitly alongside the env path. Story 11-2 (AI-39): the fact is also
+        // REPORTED back to the start seam — the report names exactly the keys that
+        // delivered cleartext into argv.
         let mapping = ConfigMapping::new().with("model", ConfigTarget::flag("--model"));
         let effective = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
         let mut secrets = std::collections::BTreeMap::new();
@@ -1548,12 +1583,20 @@ source = "self-reported"
         );
         let mut launch = empty_launch();
         let tmp = tempfile::tempdir().unwrap();
-        apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
+        let report =
+            apply_config_mapping(&mut launch, &mapping, &effective, &secrets, tmp.path()).unwrap();
         // The flag value token carries the CLEARTEXT (what the child sees in argv).
         assert_eq!(
             launch.args,
             vec!["--model".to_string(), "sk-real-key-123".to_string()],
             "a secret leaf mapped to a flag must deliver resolved cleartext into argv"
+        );
+        // Story 11-2 (AI-39): the report names the secret-into-flag key so the
+        // start seam can emit its ONE warn-only diagnostic.
+        assert_eq!(
+            report.secret_flag_keys,
+            vec!["model".to_string()],
+            "the delivered cleartext-into-argv fact must be reported"
         );
         // Sanity: neither the mask nor the raw reference reaches argv.
         assert!(
@@ -1563,6 +1606,71 @@ source = "self-reported"
         assert!(
             !launch.args.iter().any(|a| a == crate::domain::SECRET_MASK),
             "the mask must not reach argv (delivery diverges from display)"
+        );
+    }
+
+    #[test]
+    fn apply_report_is_empty_without_a_secret_flag_combination() {
+        // The AI-39 report's quiet halves: a NON-secret value on a flag target,
+        // a secret on an env target, and a secret on an unmapped key all report
+        // NOTHING — only the cleartext-into-argv combination is named.
+        let flag_mapping = ConfigMapping::new().with("model", ConfigTarget::flag("--model"));
+        let tmp = tempfile::tempdir().unwrap();
+        let mut launch = empty_launch();
+
+        // Non-secret flag delivery: no report (plain values on argv are normal).
+        let plain = effective_from_instance("model = \"gpt-4\"\n");
+        let report = apply_config_mapping(
+            &mut launch,
+            &flag_mapping,
+            &plain,
+            &no_secrets(),
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(report.secret_flag_keys.is_empty(), "plain flag is quiet");
+
+        // Secret on an ENV target: cleartext, but into the home-scoped env — quiet.
+        let env_mapping = ConfigMapping::new().with("model", ConfigTarget::env("MODEL"));
+        let secret_leaf = effective_from_instance("model = \"secret:MODEL_KEY\"\n");
+        let mut secrets = std::collections::BTreeMap::new();
+        secrets.insert(
+            "model".to_string(),
+            crate::domain::SecretString::new("sk-quiet"),
+        );
+        let mut launch = empty_launch();
+        let report = apply_config_mapping(
+            &mut launch,
+            &env_mapping,
+            &secret_leaf,
+            &secrets,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(report.secret_flag_keys.is_empty(), "env target is quiet");
+
+        // Secret on an UNMAPPED key (Decision 6 no-op, review-1 patch 8): the
+        // adapter declares NO rule for the key, so the leaf is delivered
+        // nowhere — the Flag arm is never even reached, and the report stays
+        // empty despite the resolved secret sitting in the map.
+        let unmapped_leaf = effective_from_instance("temperature = \"secret:UNMAPPED_KEY\"\n");
+        let mut unmapped_secrets = std::collections::BTreeMap::new();
+        unmapped_secrets.insert(
+            "temperature".to_string(),
+            crate::domain::SecretString::new("sk-unmapped"),
+        );
+        let mut launch = empty_launch();
+        let report = apply_config_mapping(
+            &mut launch,
+            &ConfigMapping::new(), // no rules at all
+            &unmapped_leaf,
+            &unmapped_secrets,
+            tmp.path(),
+        )
+        .unwrap();
+        assert!(
+            report.secret_flag_keys.is_empty(),
+            "an unmapped key is quiet"
         );
     }
 
@@ -1797,10 +1905,27 @@ file = { path = "../escape.toml", key = "k" }
         assert_eq!(key, "agent.toml");
         assert_eq!(path, "agent.toml");
         assert!(!detail.is_empty(), "the OS detail must be preserved");
+        // Story 11-2 (AI-28): the write goes through the atomic helper, so a
+        // failed render leaves NO temp residue in the home — the helper's temp
+        // was renamed-at (and cleaned up), never abandoned.
+        let residue: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(residue.is_empty(), "no temp residue on a failed render");
         // The blocking directory is left exactly as it was — a failed render must
         // not delete or replace whatever is already in the Agent Home.
         assert!(tmp.path().join("agent.toml").is_dir());
     }
+
+    // NOTE (review-1 patch follow-up): the "failed re-render leaves the
+    // PREVIOUS native file byte-identical" scenario moved to
+    // `crates/ktesio-engine/tests/atomic_config_writes.rs`
+    // (`apply_file_target_failed_write_leaves_the_previous_native_file_unchanged`,
+    // unix-gated: the injection needs a read-only render directory). The
+    // temp-path-planting injection this in-module test used cannot predict the
+    // review-1 collision-safe temp name (`<file>.tmp-<pid>-<tid>-<seq>`).
 
     #[test]
     fn apply_two_file_keys_where_a_prefix_collides_overwrites_to_a_table() {

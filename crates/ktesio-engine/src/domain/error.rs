@@ -280,6 +280,34 @@ pub enum EngineError {
         level: String,
     },
 
+    /// A `resume` targeted a PAUSED instance whose effective PAUSE level reads
+    /// `Unsupported` on the current OS (AI-7): the engine cannot confidently
+    /// signal the suspension awake, so the command fails fast — but the BARE
+    /// pause-unsupported diagnostic would strand the operator with no way
+    /// forward for an instance that is already `paused` (pause was allowed when
+    /// it was suspended, or the row was paused under a prior declaration/OS).
+    /// The diagnostic names the STATE (`paused`) + the adapter's pause
+    /// declaration (the level + OS the dispatch consulted) and leads with the
+    /// actionable path forward: `stop` works without pause support (it never
+    /// consults the pause level). The supported-OS resume is demoted to an
+    /// informational note (loop 2) — an operator at a CLI cannot change this
+    /// host's OS. NO state change, NO signal, NO fake success.
+    #[error(
+        "Agent Instance '{name}' is paused, but this adapter declares pause '{level}' on {os}, \
+         so resume cannot signal the suspension awake; stop the instance and start it again. \
+         The same resume does work on hosts where the adapter declares pause support \
+         (informational). See its Capability Declaration"
+    )]
+    ResumeUnsupported {
+        /// The instance the command targeted (its state is `paused` — the
+        /// transition gate guarantees it).
+        name: String,
+        /// The current OS the pause declaration was projected onto.
+        os: String,
+        /// The declared PAUSE support level for that OS (`"unsupported"`).
+        level: String,
+    },
+
     /// The agent failed to launch (AC2): the adapter/process diagnostic is
     /// PRESERVED in `detail`, the instance is left in `failed`, and no zombie
     /// remains. Names the instance.

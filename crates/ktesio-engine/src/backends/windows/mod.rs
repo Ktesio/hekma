@@ -101,6 +101,12 @@ const STILL_ACTIVE: u32 = 259;
 /// How often the graceful-stop wait polls for the process to exit.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// AI-14 (loop 2): how many times the spawn path attempts the creation-time
+/// read before failing closed, and how long it waits between attempts — enough
+/// to absorb the spawn-race window without masking a genuine platform outage.
+const START_TIME_READ_ATTEMPTS: usize = 3;
+const START_TIME_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
+
 /// A running process on Windows.
 ///
 /// For a FRESHLY SPAWNED process, `child` is `Some` and `job` owns the process
@@ -122,6 +128,16 @@ pub struct WindowsProcess {
     adopted: HANDLE,
     /// The child pid, cached for diagnostics and the 1-6 adoption fingerprint.
     pid: u32,
+    /// The verified process creation-time token (spine AD-5) — the write-ahead
+    /// fingerprint's PID-reuse guard. AI-14: captured + VERIFIED at spawn (a
+    /// failed read FAILS the spawn, so the engine's own paths never record the
+    /// `0` sentinel) or at adoption (`adopt` returns `None` when it cannot read
+    /// one). Windows adopted-handle liveness uses the opened process HANDLE (no
+    /// start-time re-check needed — parity with the Unix backend's spawned-path
+    /// reasoning), so this field exists to make [`WindowsBackend::fingerprint`]
+    /// return exactly the token the spawn/adopt verified, never a second,
+    /// separately-fallible read that could silently produce `0`.
+    start_time: u64,
     /// The child's stdin channel state (story 4.1, spine AD-12; fix pass —
     /// CRITICAL/HIGH findings, review of #79). `Live` only for a FRESHLY
     /// SPAWNED process whose declared `Capability::Interaction` was
@@ -350,6 +366,59 @@ impl ProcessBackend for WindowsBackend {
             });
         }
 
+        // AI-14: verify the child's creation-time token NOW — a failed read
+        // FAILS the spawn (fail closed) instead of recording the
+        // `start_time = 0` sentinel, which would silently downgrade every later
+        // orphan adoption to a pid-only match. Placed BEFORE the job guard
+        // release: on failure the guard's Drop closes the job, and
+        // KILL_ON_JOB_CLOSE reaps the just-spawned child — no orphan, no
+        // unrecorded process. Loop 2: a read that fails because the pid is
+        // ALREADY GONE is surfaced as an instant agent exit (not a platform
+        // failure), and the few-attempt retry absorbs the spawn-race window.
+        let start_time = {
+            let mut token = None;
+            for attempt in 0..START_TIME_READ_ATTEMPTS {
+                match process_start_time(pid) {
+                    Some(t) => {
+                        token = Some(t);
+                        break;
+                    }
+                    None if attempt + 1 < START_TIME_READ_ATTEMPTS => {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            break;
+                        }
+                        std::thread::sleep(START_TIME_READ_RETRY_DELAY);
+                    }
+                    None => {}
+                }
+            }
+            match token {
+                Some(t) => t,
+                None => {
+                    let exited_instantly = matches!(child.try_wait(), Ok(Some(_)));
+                    let detail = if exited_instantly {
+                        format!(
+                            "the spawned agent exited immediately, before its process \
+                             creation time could be read for pid {pid} — the agent failed \
+                             at startup (check its logs); this is not a platform \
+                             start-time-source failure"
+                        )
+                    } else {
+                        format!(
+                            "could not read the process creation time for the spawned pid \
+                             {pid} — no usable process start-time source on this platform; \
+                             cannot guarantee pid-reuse safety, so refusing to record a \
+                             start-time-less fingerprint (sentinel 0): the write-ahead \
+                             spawn record needs the real token for orphan adoption"
+                        )
+                    };
+                    return Err(BackendError::Spawn {
+                        exec: spec.exec.clone(),
+                        detail,
+                    });
+                }
+            }
+        };
         // Assignment succeeded — hand the job handle to the process struct.
         let job = job_guard.into_inner();
         // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
@@ -381,6 +450,7 @@ impl ProcessBackend for WindowsBackend {
             job,
             adopted: std::ptr::null_mut(),
             pid,
+            start_time,
             stdin,
             log_capture,
         })
@@ -472,10 +542,12 @@ impl ProcessBackend for WindowsBackend {
     }
 
     fn fingerprint(&self, handle: &Self::Handle) -> ProcessFingerprint {
-        // Creation time via GetProcessTimes; a read failure falls back to 0 (a
-        // degraded but honest fingerprint — the pid is still recorded).
-        let start_time = process_start_time(handle.pid).unwrap_or(0);
-        ProcessFingerprint::new(handle.pid, start_time)
+        // The handle's OWN creation-time token — VERIFIED at spawn (AI-14: the
+        // spawn FAILS when the read fails, so a spawned handle always carries a
+        // real, non-zero token) or at adoption (`adopt` returns `None` when it
+        // cannot read one). No second, separately-fallible read that could
+        // silently produce a `0` sentinel on the write-ahead record.
+        ProcessFingerprint::new(handle.pid, handle.start_time)
     }
 
     fn adopt(
@@ -531,6 +603,7 @@ impl ProcessBackend for WindowsBackend {
             job: std::ptr::null_mut(),
             adopted: h,
             pid: fingerprint.pid,
+            start_time: live_start,
             stdin: StdinState::NoPipe,
             log_capture: None,
         }))
@@ -736,4 +809,116 @@ pub fn check_secrets_file_permissions(_path: &std::path::Path) -> Result<(), Sec
     // Portable skip (option B): Windows relies on default per-user profile ACLs.
     // Never a false pass framed as a Unix-grade check; never a hard failure.
     Ok(())
+}
+
+/// "Copy" an existing target file's permissions onto the freshly written `temp`
+/// before the atomic rename (story 11-2 review-1, patch 3). Windows carries no
+/// Unix mode bits — the SAME documented portable posture as
+/// [`check_secrets_file_permissions`] above: no Unix-style check, and the fresh
+/// file takes the creating process's DEFAULT per-user-profile ACLs (the state
+/// dir lives under the user's profile, which Windows protects per-user by
+/// default). Always `Ok`; never a false pass framed as a Unix-grade copy. The
+/// `_target` is accepted for signature symmetry with the Unix backend.
+pub fn preserve_target_mode(
+    _target: &std::path::Path,
+    _temp: &std::path::Path,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
+/// Windows' `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` FAILS with a sharing
+/// violation while another process holds the target open WITHOUT
+/// `FILE_SHARE_DELETE` (editors, AV scanners, indexers). One short backoff +
+/// a single retry rides out the transient window; a PERSISTENT hold surfaces
+/// the honest error — the atomic write fails with the target untouched,
+/// where the old in-place `fs::write` would have silently overwritten (or
+/// half-written) the bytes under the reader.
+pub fn rename_over_target(temp: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    if let Ok(()) = std::fs::rename(temp, target) {
+        return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::fs::rename(temp, target)
+}
+
+#[cfg(test)]
+mod tests {
+    //! AI-14 (story 11-5) — the fail-closed spawn arm's HOSTED tests. These run
+    //! only where the Windows backend runs (the `windows-latest` matrix leg of
+    //! the CI `test` job; on a Unix host this whole module is compile-checked
+    //! only, via `cargo check --target x86_64-pc-windows-gnu`). `cfg(test)` plus
+    //! OS cfg are allowed HERE: this file is inside the boundary gate's
+    //! `crates/ktesio-engine/src/backends/` allowlist home. Together the two
+    //! tests close the 11-1 defer: the REAL-child arm proves the production
+    //! spawn's creation-time read works and yields a verified non-zero token,
+    //! and the failed-read path is pinned at the unit seam
+    //! (`process_start_time`) where it is observable without an injected fault.
+
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A `SpawnSpec` for a real child, mirroring the Unix backend test
+    /// module's helper (the capture trio `None` = the narrow don't-care
+    /// fixture; no stdin pipe — this helper never writes to the child).
+    fn spec(exec: &str, args: &[&str]) -> SpawnSpec {
+        SpawnSpec {
+            exec: exec.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: BTreeMap::new(),
+            working_dir: std::env::temp_dir(),
+            log_file: None,
+            attributed_log_path: None,
+            stderr_log_file: None,
+            instance_name: "test".to_string(),
+            pipe_stdin: false,
+        }
+    }
+
+    #[test]
+    fn spawn_of_a_real_child_verifies_a_nonzero_creation_time_and_stops_clean() {
+        // The POSITIVE half of the AI-14 fail-closed spawn arm. The production
+        // `spawn` reads the child's creation time right after the job
+        // assignment and FAILS the spawn when the read cannot be verified — so
+        // a real child's spawn SUCCEEDING is itself the proof that the read
+        // works, and the resulting fingerprint must carry a REAL (non-zero)
+        // token, never the `start_time = 0` sentinel AI-14 forbids. Uses the
+        // conformance `fake_agent` (an engine dev-dependency, off the shipping
+        // graph), lingering long enough to be polled and stopped
+        // deterministically.
+        let backend = WindowsBackend::new();
+        let agent = ktesio_conformance::fake_agent_bin();
+        let mut handle = backend
+            .spawn(&spec(&agent.to_string_lossy(), &["--linger-ms", "600000"]))
+            .expect("spawn of a real child must succeed (the creation-time read must work)");
+        let fp = backend.fingerprint(&handle);
+        assert_eq!(fp.pid, backend.pid(&handle));
+        assert!(
+            fp.start_time != 0,
+            "a spawned handle must carry the VERIFIED creation-time token, never the 0 \
+             sentinel (AI-14 fail-closed contract)"
+        );
+        // Alive now; the later stop terminates the whole job (kill-on-close).
+        assert_eq!(backend.poll(&mut handle).unwrap(), ProcessStatus::Alive);
+        let outcome = backend
+            .stop(&mut handle, Duration::from_secs(5))
+            .expect("stop the lingering agent");
+        assert!(
+            outcome.forced,
+            "a lingering agent needs the forced escalation"
+        );
+        assert!(backend.poll(&mut handle).unwrap().is_exited());
+    }
+
+    #[test]
+    fn start_time_read_fails_closed_for_an_absent_pid() {
+        // The FAILED-READ path of the AI-14 arm, pinned at the unit seam
+        // (`process_start_time`) where it is honestly observable: a pid that
+        // cannot exist on Windows (pids are 4-aligned and live far below the
+        // u32 ceiling) fails the OpenProcess query and returns None — exactly
+        // the reading the spawn arm treats as "cannot verify" and FAILS THE
+        // SPAWN on (after its bounded, spawn-race-absorbing retry), never
+        // recording a `start_time = 0` fingerprint.
+        assert_eq!(process_start_time(0xFFFF_FFFC), None);
+    }
 }

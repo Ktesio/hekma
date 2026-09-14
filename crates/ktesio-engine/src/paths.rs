@@ -51,10 +51,139 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use directories::ProjectDirs;
 
 use crate::domain::InstanceName;
+
+/// Monotonic per-process counter disambiguating atomic-write temp names inside
+/// ONE process (review-1 patch 1): combined with the pid (cross-process) and
+/// the writing thread's id, two threads writing the SAME target concurrently
+/// can never collide on a temp path. Same discipline as `domain/usage.rs`'s
+/// `RUN_NONCE` — the embed-clean audit's other named global: never read for
+/// behavior, coupled to nothing, consulted only to mint a unique name; it
+/// guarantees PER-PROCESS uniqueness only (cross-process uniqueness comes from
+/// the pid; cross-restart residue is a dead pid's litter, never a live
+/// collision).
+static TEMP_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write `bytes` to `target` ATOMICALLY (story 11-2, AI-24/AI-28): the bytes
+/// land in a temporary file in the TARGET's own directory (same filesystem, so
+/// the final rename cannot degrade into a copy), flushed to the device, and a
+/// single [`std::fs::rename`] flips the temp over the target. A process that
+/// dies at ANY point therefore leaves the target holding either the complete
+/// OLD bytes or the complete NEW bytes — never a truncated half-write — which
+/// is the durability contract every durable config write in the engine must
+/// keep (the instance `config.toml` a `config set` persists, and the native
+/// config FILE targets the start seam renders into the Agent Home).
+///
+/// The temp file is named `<target-file-name>.tmp-<pid>-<tid>-<seq>` (review-1
+/// patch 1): same directory as the target (same-FS rename), pid-suffixed so
+/// two engine processes cannot collide, and thread-id + a monotonic
+/// [`TEMP_WRITE_SEQ`] counter so two THREADS of one process overwriting the
+/// same target concurrently cannot collide either. On ANY failure (temp write,
+/// mode copy, or rename) the helper removes its temp residue best-effort — a
+/// failed write leaves the previous target bytes untouched AND no `.tmp`
+/// litter behind; the original error is returned either way (the caller maps
+/// it into its typed error shape). On success the temp no longer exists (it
+/// IS the target).
+///
+/// DURABILITY BOUNDARY (honest, review-1 patch 2): the temp is `sync_all`ed
+/// BEFORE the rename, so the content of whichever bytes survive is on the
+/// device. Process-death atomicity is guaranteed by the rename alone; POWER
+/// LOSS is best-effort at the file level — std has no portable DIRECTORY
+/// fsync, so the rename's directory entry itself is not made durable, and a
+/// power cut in the rename's window can leave either version (both complete)
+/// on disk. This is the strongest cross-platform guarantee std offers.
+///
+/// PERMISSIONS (review-1 patch 3): overwriting an EXISTING target preserves
+/// its Unix permissions — the target's mode is copied onto the temp before
+/// the flip (so a hand-tightened `0600 config.toml` survives every re-set).
+/// A target that does not exist keeps the process-default mode. On Windows
+/// the copy is a no-op (no unix mode bits — the documented portable posture).
+///
+/// WINDOWS caveat (review-1 patch 4): a rename over a target that another
+/// process holds open without `FILE_SHARE_DELETE` fails with a sharing
+/// violation; the helper retries ONCE after a short backoff (the common
+/// transient window) and then surfaces the honest error — the write FAILS
+/// with the target untouched, where the old in-place `fs::write` would have
+/// silently overwritten the bytes under the reader.
+///
+/// std-only by constraint (the spec forbids the `tempfile` dependency):
+/// `std::fs::rename` replaces an existing destination on BOTH Unix (`rename`)
+/// and Windows (`MoveFileExW` + `MOVEFILE_REPLACE_EXISTING`), so this stays
+/// inside the cross-platform std API rule — the per-OS bits live behind the
+/// [`crate::backends`] cfg home, keeping this module cfg-free. A target whose
+/// path carries no file name is a caller bug and is rejected with a typed
+/// [`std::io::Error`] instead of a panic.
+pub fn write_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = reserve_atomic_temp(target);
+    write_atomic_via(&temp, target, bytes)
+}
+
+/// Compute the temp path for the NEXT atomic write of `target`: the target's
+/// directory + `<name>.tmp-<pid>-<tid>-<seq>`, unique among this process's
+/// live writers ([`TEMP_WRITE_SEQ`]). The core is split out (below) so tests
+/// can drive a chosen temp path deterministically without racing the counter.
+fn reserve_atomic_temp(target: &Path) -> PathBuf {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let seq = TEMP_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // `ThreadId::as_u64` is still unstable, so the thread number is taken from
+    // its `ThreadId(<n>)` Debug form — only the digits reach the file name.
+    let tid: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    dir.join(format!(
+        "{file_name}.tmp-{}-{tid}-{seq}",
+        std::process::id()
+    ))
+}
+
+/// The atomic-write core ([`write_atomically`]'s composition) with the temp
+/// path chosen by the caller — crate-internal so the failure-injection tests
+/// (paths/registry/adapter) can pin a temp path deterministically instead of
+/// racing the live [`TEMP_WRITE_SEQ`] counter.
+pub(crate) fn write_atomic_via(temp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if target.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "cannot write atomically: {} names no file",
+                target.to_string_lossy()
+            ),
+        ));
+    }
+    let outcome = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(temp)?;
+        file.write_all(bytes)?;
+        // Durability boundary (see the caller's doc): flush the temp's CONTENT
+        // to the device before the flip; the directory entry itself is not
+        // fsyncable portably, so power-loss atomicity stays best-effort.
+        file.sync_all()?;
+        drop(file);
+        // Preserve an existing target's permissions across the flip (Unix; a
+        // no-op where mode bits do not exist). Runs BEFORE the rename so a
+        // mode-copy failure can never publish an un-adjusted temp.
+        crate::backends::preserve_target_mode(target, temp)?;
+        crate::backends::rename_over_target(temp, target)
+    })();
+    if outcome.is_err() {
+        // Best-effort residue cleanup: the temp must not outlive a failed
+        // write. A remove failure is swallowed — the write/rename error the
+        // caller receives is the one that matters, and the cleanup must never
+        // mask it.
+        let _ = std::fs::remove_file(temp);
+    }
+    outcome
+}
 
 /// Environment override for the state-dir base (integration-test hermeticity).
 pub const STATE_DIR_ENV: &str = "KTESIO_STATE_DIR";
@@ -300,5 +429,122 @@ mod tests {
         // (embedding/tests own it); only the env-provided base is rejected.
         let paths = EnginePaths::new(Some(PathBuf::from("relative/base"))).unwrap();
         assert_eq!(paths.state_base(), Path::new("relative/base"));
+    }
+
+    // ---- Story 11-2 (AI-24/AI-28): the shared atomic write helper ----
+
+    /// Every directory entry under `dir` whose name contains the temp marker.
+    fn temp_residue(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
+    }
+
+    #[test]
+    fn write_atomically_lands_the_bytes_and_leaves_no_temp_residue() {
+        // The success path (the ONLY path a production config write should
+        // ever take): the target holds the new bytes AND the temp is gone —
+        // it was renamed onto the target, so it cannot litter the directory.
+        // An overwrite (the common re-set path) behaves identically.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+
+        write_atomically(&target, b"first bytes").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first bytes");
+        assert!(temp_residue(tmp.path()).is_empty(), "no residue on create");
+
+        write_atomically(&target, b"second bytes").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"second bytes");
+        assert!(
+            temp_residue(tmp.path()).is_empty(),
+            "no residue on overwrite"
+        );
+    }
+
+    #[test]
+    fn write_atomically_rename_failure_leaves_the_target_and_no_temp() {
+        // Injected rename failure: a DIRECTORY occupies the target path, so the
+        // temp write succeeds but the rename cannot replace it. The error
+        // surfaces, the target is untouched, and — the AI-24 residue half — the
+        // helper's temp is cleaned up: a failed atomic write must not leave
+        // `.tmp-*` litter in the Agent Home on any path.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        std::fs::create_dir(&target).unwrap();
+
+        let err = write_atomically(&target, b"new bytes").unwrap_err();
+        assert!(!err.to_string().is_empty(), "the OS detail is preserved");
+        assert!(target.is_dir(), "the target is unchanged");
+        assert!(
+            temp_residue(tmp.path()).is_empty(),
+            "a failed rename must leave NO temp residue; found {residue:?}",
+            residue = temp_residue(tmp.path())
+        );
+    }
+
+    #[test]
+    fn write_atomically_temp_write_failure_leaves_the_target_untouched() {
+        // Injected temp-write failure: a DIRECTORY occupies a chosen temp path,
+        // driven through `write_atomic_via` (the composition core) so the test
+        // pins the temp path deterministically instead of racing the live
+        // counter. The temp write itself fails, so: the error surfaces, the
+        // target is never touched, and the helper created nothing — the planted
+        // blocker is the only `tmp-`-marked entry (the helper neither added nor
+        // removed anything).
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        let planted = tmp.path().join("config.toml.tmp-pinned");
+        std::fs::create_dir(&planted).unwrap();
+
+        let err = write_atomic_via(&planted, &target, b"new bytes").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(
+            !target.exists(),
+            "a failed temp write never touches the target"
+        );
+        // Only the planted directory remains — no helper-created file.
+        let residue = temp_residue(tmp.path());
+        assert_eq!(
+            residue,
+            vec![planted.file_name().unwrap().to_string_lossy()]
+        );
+    }
+
+    #[test]
+    fn write_atomically_concurrent_same_target_writes_are_collision_safe() {
+        // Review-1 patch 1: two THREADS overwriting the SAME target in one
+        // process — the pid + thread-id + counter temp names never collide, so
+        // both writers succeed and the published bytes are exactly ONE of the
+        // two values (never a torn interleave), with no temp residue.
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("config.toml");
+        let dir = tmp.path().to_path_buf();
+
+        let t1_target = target.clone();
+        let t1 = std::thread::spawn(move || {
+            for _ in 0..50 {
+                write_atomically(&t1_target, b"aaa-threads").unwrap();
+            }
+        });
+        let t2_target = target.clone();
+        let t2 = std::thread::spawn(move || {
+            for _ in 0..50 {
+                write_atomically(&t2_target, b"bbb-threads").unwrap();
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert!(
+            final_bytes == b"aaa-threads" || final_bytes == b"bbb-threads",
+            "the published bytes must be exactly one writer's value: {final_bytes:?}"
+        );
+        assert!(
+            temp_residue(&dir).is_empty(),
+            "100 concurrent writes must leave no temp residue"
+        );
     }
 }

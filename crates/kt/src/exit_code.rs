@@ -29,7 +29,7 @@
 //! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
 //! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict` |
-//! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentInteractionUnavailable` |
+//! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable` |
 //! | `6` | Timed out | `AgentInteractionTimedOut` |
 //!
 //! ## Why a downcast classifier (not a `CliError` enum)
@@ -56,7 +56,8 @@ use crate::error::{
     AgentCapabilityUnsupported, AgentDuplicateName, AgentInteractionTimedOut,
     AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentManifestNotFound,
     AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNotFound, AgentNotRunning,
-    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentUnknownConfigKey, AgentUnknownKind,
+    AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentUnknownConfigKey,
+    AgentUnknownKind,
 };
 
 /// The documented, stable `kt` process exit codes (story 4-3). A FROZEN v1
@@ -129,7 +130,10 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
     {
         ExitCode::InvalidState
     // 5 — unsupported capability: the Capability Declaration forbids it.
-    } else if err.is::<AgentCapabilityUnsupported>() || err.is::<AgentInteractionUnavailable>() {
+    } else if err.is::<AgentCapabilityUnsupported>()
+        || err.is::<AgentResumeUnsupported>()
+        || err.is::<AgentInteractionUnavailable>()
+    {
         ExitCode::Unsupported
     // 6 — timed out: a bounded operation exceeded its deadline.
     } else if err.is::<AgentInteractionTimedOut>() {
@@ -301,6 +305,11 @@ mod tests {
         for err in [
             boxed(AgentCapabilityUnsupported {
                 message: "unsupported".into(),
+            }),
+            // AI-7: the dedicated resume-under-unsupported-pause diagnostic joins
+            // code 5 — the same capability-unsupported class, no new number (DC-4).
+            boxed(crate::error::AgentResumeUnsupported {
+                message: "resume-unsupported".into(),
             }),
             boxed(AgentInteractionUnavailable {
                 message: "unavailable".into(),

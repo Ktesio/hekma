@@ -3,7 +3,7 @@
 # project: ktesio
 # project_key: NOKEY
 # tracking_system: file-system
-# story_location: /Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts
+# story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
 
 # STATUS DEFINITIONS:
 # ==================
@@ -47,11 +47,11 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-10-2026 23:09
+last_updated: 09-11-2026 22:00
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
-story_location: /Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts
+story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
 
 development_status:
   epic-1: done
@@ -106,13 +106,13 @@ development_status:
   10-2-host-provided-diagnostic-sink: done  # 🎉 MERGED as b590dc8 (PR #180). DiagnosticSink (opt-in, default stderr byte-identical); audit allowlist emptied with count==1 choke-point pins; rotation + panic-safety + Arc-share tested.  # 2026-09-10: DiagnosticSink (opt-in, default stderr byte-identical), both AD-12 diagnostics routed through one choke point; audit allowlist EMPTY with count==1 choke-point pins; 5 sink tests + negative teeth. 1119 tests, 95.26%.  # additive public API; removes the 2 audit allowlist entries
   10-3-event-bus-resync-and-subscriber-budget: done  # 🎉 MERGED as b590dc8 (PR #180). resync_events backfill helper (crash-window remedy, family-major, torn-tail honest) + subscriber-active budget gated (CPU 0.25pts, RSS 2MiB, p99 100ms).  # 2026-09-10: resync_events (committed-truth backfill as EngineEvents, family-major ordering, backfill-then-subscribe contract, torn-tail tolerant, cursor continuation) + subscriber-active budget GATED in the perf harness (CPU delta 0.25pts, RSS 2MiB, read-p99 100ms — ratified from observed ~zero fan-out cost). 4 integration + 7 unit tests. Deferred-work 7-2/7-5 entries resolved.  # subscribe-with-backfill helper + ratified subscriber-active budget
   epic-11: in-progress  # opened 2026-09-10 by sprint change proposal (sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved): Technical Debt & Process Cleanup — 65 retro action items organized into 7 thematic stories
-  11-1-engine-robustness-batch: backlog  # AI-4/7/8/9/12/13/14/15/16/41/44 — 11 targeted engine fixes
-  11-2-config-and-secrets-batch: backlog  # AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
-  11-3-memory-robustness-batch: backlog  # epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
-  11-4-docs-and-process-batch: backlog  # AI-18/19/21/22/25/30/34/43/45 — docs, review rules, rustdoc, docstring fixes
-  11-5-cross-platform-and-ci-batch: backlog  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
-  11-6-supervision-and-ops-decisions: backlog  # AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
-  11-7-orchestration-and-review-process: backlog  # AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
+  11-1-engine-robustness-batch: review  # AI-4/7/8/9/12/13/14/15/16/41/44 — implemented 2026-09-11: AI-12 poll-error streak → crash input (pure poll_verdict helper + streak-clear pins); AI-13 adopted exit-code-unavailable crash cause; AI-14 spawn fails closed on fingerprint-read failure (unix+windows, no start_time=0 sentinel); AI-15 Engine::fleet_entry single-instance facade + show --json uses it (NotFound → exit 3 preserved); AI-16 fleet() batched spawn-record map (N+1 killed, other per-instance reads untouched); AI-41 ledger INSERT failure parks the drain cursor + retries (dedup-key safe); AI-44 budgets re-evaluated at adoption (over-budget run enforced at Engine::open); AI-7 ResumeUnsupported CLI arm (exit 5) + rustdoc; AI-8 guaranteed-no-handle pause cause pinned; AI-9 persist-first pause order test. Battery green (fmt/clippy/test 1153/check_docs); embed_clean sink pin re-reviewed for the new AI-41 diagnostic route; uj3 shared breach assertion now per-(dimension, Run). Loop 1 review 2026-09-11: AI-12 re-derived (same-tick cross-handle corroboration systemic guard + truncated last-error cause text + cfg(test) supervisor-side poll-fault seam with both-direction wiring tests — backend-global seam rejected by the embed-clean zero-global-cell audit) + all 13 review patches applied; battery 1158 green
+  11-2-config-and-secrets-batch: review  # AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
+  11-3-memory-robustness-batch: review  # epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
+  11-4-docs-and-process-batch: review  # AI-18/19/21/22/25/30/34/43/45 — docs, review rules, rustdoc, docstring fixes
+  11-5-cross-platform-and-ci-batch: review  # AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
+  11-6-supervision-and-ops-decisions: review  # LANDED 2026-09-11, PARTIAL BY RATIFICATION: the two non-decision items closed (AI-46 via 11-3's stranded-listener diagnostic; AI-48's dependency-audit checkpoint documented in docs/embedding.md) and AI-36 was already resolved (superseded by AI-53, PR #108). AI-20 (daemon/detach) and AI-47 (HTTPS upstream + streaming parse) REMAIN OPEN awaiting Islam's product calls per the change proposal's own §6 gate — dated notes on each entry name the decision needed; surfaced in the epic-11 PR description. AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
+  11-7-orchestration-and-review-process: review  # landed 2026-09-11 (this branch, story commit follows): AI-17 residual hardening — the three semver pins scoped OUT of the file-wide test into the semver-job slice (exact count==3 comment-stripped check-release sites, probe-precedes-install ordering assertion, line-exact plain-install pin, transient-skip regex verified single-use in ci.yml so scoping loses nothing); AI-19 verify-only (adopted by 11-4, flipped done); AI-55/57/58 codified as AGENTS.md Engineering patterns (+ release-process.md AI-55 anchor); AI-56 satisfied-by-events (stale key removed ff1f669, epic-8 superseded, epics.md authoritative); epic-6-retro-item-9 closed — the four #168 verdicts mirrored into AI-63/65/66/69 (AI-63's stale part-(b) framing superseded). Reviewed by the three lenses; 10 patch-class findings applied. AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
   epic-8-retrospective: optional
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
@@ -329,7 +329,7 @@ action_items:
   - id: AI-19
     epic: 1
     owner: "review process"
-    status: open
+    status: done        # ADOPTED 2026-09-11 by story 11-4: AGENTS.md "## Engineering patterns" bullet "Deferred-as-unreachable must be proven (AI-19)" (1-5 Decision #4 lesson), restated for contributors at docs/contributing.md (Pull Requests). Story 11-7 verify-only per the ratified 11-4/11-7 split.
     severity: low
     action: "Adopt a review rule: a 'deferred-as-unreachable' no-op must be PROVEN
       unreachable across EVERY shipped surface (CLI + library + cross-lifetime) at
@@ -358,7 +358,11 @@ action_items:
       is the NFR-2 fracture point (b) would have to invert; (a) leaves it unchanged.
       Awaiting Islam's ratification + 5 open Qs (daemon start-model, per-user vs per-fleet,
       transport timing, interim --detach?, NFR-4 idle budget) — deferred to Epic 7
-      planning; does NOT block Epic 2."
+      planning; does NOT block Epic 2."    # 2026-09-11 (story 11-6): still AWAITING ISLAM'S PRODUCT CALL — the epic-11 run landed every
+    # non-decision item; this one commissions a product decision (daemon/service vs --detach vs
+    # documented-single-lifetime) and cannot close autonomously. Options restated in the action above;
+    # pick one and the implementation lands in a follow-up story.
+
   - id: AI-21
     epic: 1
     owner: "orchestrator playbook"
@@ -447,7 +451,7 @@ action_items:
   - id: AI-29
     epic: 1
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the Windows-POSITIVE tests the item asked for now run ON the windows-latest leg — tests/adoption.rs gains windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed, windows_fleet_records_reconcile_after_engine_death_the_reboot_semantics, and windows_paused_row_reconciles_to_failed_when_the_job_close_killed_it (engine death → Job kill-on-close → records reconcile to `failed`), and agent_cli.rs gains pause_after_windows_engine_death_reconciles_and_fails_honestly_windows (plus per-OS honesty notes where a Windows equivalent is meaningless: guaranteed suspension, exit code 5). The Unix-shaped tests' runtime skips now carry pointer comments to the Windows siblings. NFR-1 is affirmatively validated per-OS, not merely gated.
     severity: medium
     action: "Epic 1's SURVIVAL-path NFR-1 proofs are Unix-tested ONLY: engine_kill_adopts_live_child
       (1-6), whole_fleet_survives_a_reboot (1-7), ai7_paused, + the 2 pause CLI tests
@@ -531,7 +535,7 @@ action_items:
   - id: AI-35
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the 4 supervisor `_live` tests + the CLI secret no-leak matrix lost their Linux-only gates and run on all three legs. The observation is now a readiness HANDSHAKE (fake_agent --marker file polled before the --dump, generous bounded deadlines) instead of a fragile wall-clock spawn assumption, and the CLI test routes its start through the surviving-engine harness (with the resolver env var inherited by the re-exec'd helper), so the Windows kill-on-close after the helper exit no longer hides the startup artifacts. (fake_agent's .exe handling was already EXE_SUFFIX-correct via ktesio_conformance::fake_agent_bin; the marker flag already existed in the helper.) See AI-38 for the same landing.
     severity: medium
     action: "Epic 2's `_live` dump-observing tests are GATED Linux-only (runtime OsId
       gate): the CLI `secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it`
@@ -566,7 +570,7 @@ action_items:
   - id: AI-37
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): ci.yml's push trigger now fires for EVERY branch (`branches: ["**"]`, keeping main) so the full job set — 3-OS matrix + coverage included — runs on every feature-branch commit, plus a nightly `schedule` (cron 17 7 * * *) and `workflow_dispatch` for on-demand runs; the per-ref concurrency group collapses repeated pushes. The policy is written down in docs/testing.md's "The CI policy" section (with AI-54), and scripts/test_automation.py pins the trigger shape.
     severity: medium
     action: "Run the 3-OS CI matrix EARLIER than the epic PR (per-story, or nightly/manual
       on feat/* branches). Epic 2's local-only (macOS) verification hid BOTH the coverage
@@ -575,7 +579,7 @@ action_items:
   - id: AI-38
     epic: 2
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11), executing AI-35: the 5 `_live` tests are cross-OS robust (readiness handshake via the fake_agent --marker file, generous adaptive dump deadlines; the CLI test routed through the surviving-engine harness with env injection) and the Linux-only gates are DROPPED — verified running green on macOS locally; the windows leg runs them in CI.
     severity: medium
     action: "Make the _live tests cross-OS robust (executes AI-35): fake_agent .exe
       handling on Windows, a readiness handshake instead of a wall-clock dump-file
@@ -669,7 +673,7 @@ action_items:
   - id: AI-46
     epic: 3
     owner:
-    status: open
+    status: done        # LANDED 2026-09-11 by story 11-3 (the 11-6/11-3 overlap — implemented ONCE in 11-3 per the ratified split): adopting an engine-observed orphan now announces the stranded listener (the dead injected base_url condition) via the AD-12 diagnostic channel with the stop→start remediation, instead of the silent strand; a metering-source read failure emits its own loud ambiguity diagnostic. The honest-surfacing shape was chosen over re-launch-at-open (recorded in spec-11-3's change log); the dead port number is not recoverable (SpawnRecord carries no launch facts). docs/architecture.md's adoption-limit sentence rewritten in the same change. Test: tests/adoption.rs ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener + the embed_clean sink pin.
     severity: medium
     action: "3-4 engine-observed ADOPTION stranding: after an engine crash+restart,
       an adopted engine-observed instance still holds the OLD base_url pointing at
@@ -693,7 +697,10 @@ action_items:
       0 observed tokens → a streaming agent is effectively UNMETERED by the observed
       channel (parse stream_options.include_usage / the final SSE usage frame); (c)
       non-OpenAI provider usage schemas. Make the observed channel production-usable;
-      ties to Epic 6 adapter conformance."
+      ties to Epic 6 adapter conformance."    # 2026-09-11 (story 11-6): still AWAITING ISLAM'S PRODUCT CALL — (a) HTTPS upstream needs a TLS-client
+    # dependency decision (rustls vs the bundled-deps philosophy) and (b) streaming-response usage parsing
+    # is a scope call; neither is autonomous. The rest of the item's v1-deferral list is unchanged.
+
   - id: AI-48
     epic: 3
     owner:
@@ -793,7 +800,7 @@ action_items:
   - id: AI-54
     epic: 9
     owner: "Islam / dev-workflow docs"
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11): the practice is no longer emergent — ci.yml's triggers now implement it (push to any branch + nightly cron + workflow_dispatch on the EXISTING full 11-job set, per the Epic-9 precedent) and docs/testing.md's "The CI policy: what runs, when" section codifies it in writing (per-commit CI, the nightly, the docs probe, the concurrency dedupe). scripts/test_automation.py pins both.
     severity: medium
     action: "Codify 'full cross-OS + coverage CI on every commit of a feature branch'
       as a written, standing practice (e.g. CONTRIBUTING.md / docs/testing.md), not
@@ -806,7 +813,7 @@ action_items:
   - id: AI-55
     epic: 9
     owner: "Islam / whoever owns the review-mandate defaults"
-    status: open
+    status: done        # CODIFIED 2026-09-11 by story 11-7: AGENTS.md "## Engineering patterns" bullet "Two-pass review covers the release surface (AI-55)" (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata - primary + adversarial pass, per the 9-2 asymmetry lesson), with a one-line anchor in docs/release-process.md.
     severity: medium
     action: "Extend the two-pass (primary + adversarial) review default — currently
       scoped to money/ledger/enforcement/network stories per Epic 3 retro §6.3 — to
@@ -820,7 +827,7 @@ action_items:
   - id: AI-56
     epic: 9
     owner: "whoever opens Epic 8 next (PM/orchestrator)"
-    status: open
+    status: done        # SATISFIED-BY-EVENTS, closed 2026-09-11 by story 11-7 (no sync target remains): (a) the stale "8-1-relocate-the-install-lock-machinery-into-the-engine" key was DELETED from this tracker in ff1f669 (2026-08-24, story 5-1/PR #138); (b) Epic 8 itself closed as SUPERSEDED 2026-09-09 (Islam, option A) - see the epic-8 entry in the development_status block - so no reader will "open Epic 8 next" from this file; (c) the RATIFIED rewrite is and remains planning-artifacts/epics.md, "Story 8.1: Build the skills-provisioning foundation" (section ~:700-732 at citation time) ("Build the skills-provisioning foundation", rewritten 2026-07-14 per Story 9-3 Part B) + GitHub issue #95. Nothing was synced because nothing stale survived to sync.
     severity: low
     action: "Sync sprint-status.yaml's Story 8-1 entry (key '8-1-relocate-the-install-lock-machinery-into-the-engine'
       and its inline description) to the ratified 2026-07-14 rewrite already applied
@@ -831,7 +838,7 @@ action_items:
   - id: AI-57
     epic: 9
     owner: "Islam / orchestrator playbook"
-    status: open
+    status: done        # CODIFIED 2026-09-11 by story 11-7: AGENTS.md "## Engineering patterns" bullet "Resume interrupted subagents - never restart them (AI-57)" (re-derive state from durable artifacts; resume the NAMED agent with an explicit where-you-stopped briefing; proven on 3-2 rate-limit and the 9-2 ~10h review cutoff).
     severity: low
     action: "Document the resumable-subagent recovery flow as a standing playbook
       pattern: on a usage-limit cutoff, re-derive state from durable artifacts (task
@@ -846,7 +853,7 @@ action_items:
   - id: AI-58
     epic: 9
     owner: "Islam / Winston (architect playbook)"
-    status: open
+    status: done        # CODIFIED 2026-09-11 by story 11-7: AGENTS.md "## Engineering patterns" bullet "Architecture corrections are draft-then-ratify (AI-58)" (complete proposal touching zero real planning artifacts; human picks from bounded concrete options; agent applies the ratified choice verbatim - the AD-16/Epic-8 re-scope pattern; provenance epics.md + issue #95).
     severity: low
     action: "Name and document the draft-then-ratify pattern for architecture-decision
       corrections: architect drafts a complete proposal touching zero real planning
@@ -1005,7 +1012,15 @@ action_items:
       explicit AD in ARCHITECTURE-SPINE.md -- the current single-lock model appears
       to be an implementation fact rather than a recorded decision, which is part
       of why two stories walked into it independently. Owner: Islam / Winston (architect);
-      execution naturally Epic 7 or a dedicated resilience story."
+      execution naturally Epic 7 or a dedicated resilience story."    # 2026-09-09 #168 RATIFICATION (mirrored into this entry 2026-09-11 by story 11-7,
+    # epic-6-retro-item-9): RETIRED AS ACCEPTED TRADEOFF — Islam ratified all four recommended
+    # dispositions on issue #168. Every lock-held operation is capped by a per-op deadline (the
+    # ratified 5s send bound et al.), the shared-lock coupling is documented, and the lock split
+    # REOPENS ONLY on an observed multi-instance stall (7-5 evidence: ~0.7%/instance supervision
+    # overhead vs the 2% budget). This verdict SUPERSEDES the stale "part (b) / Owner remains
+    # Islam + Winston" framing above: there is no open part (b) decision — the tradeoff is
+    # accepted, bounded, and conditionally reopenable.
+
   - id: AI-64
     epic: 4
     owner: "Islam / whoever owns the review-mandate defaults"
@@ -1058,7 +1073,11 @@ action_items:
       incidentally, that nothing names?' That is a different question from 'does the
       fix work,' and only the first one would have found this. Epic 4 contains both
       the failure case and the success case for this rule, which is why it is worth
-      writing down now. Owner: Islam / whoever owns the review-mandate defaults."
+      writing down now. Owner: Islam / whoever owns the review-mandate defaults."    # 2026-09-09 #168 RATIFICATION (mirrored 2026-09-11 by story 11-7, epic-6-retro-item-9):
+    # ADOPTED AS A PERMANENT STANDING REVIEW RULE — value changes verify against their own
+    # tests; mechanism changes get an independent adversarial pass asking what invariant the
+    # removed mechanism provided incidentally. Applied through the epic-6/7 reviews.
+
   - id: AI-66
     epic: 4
     owner: "Dev / QA; scope as a dedicated hardening story"
@@ -1093,7 +1112,12 @@ action_items:
       before 4-3's adversarial pass gave the pattern a name. Then sweep Epics 1-3's
       suites, prioritizing fixture monoculture given that Epic 3's priced surfaces
       are the ones that were found unguarded. Owner: Dev / QA; scope as a dedicated
-      hardening story."
+      hardening story."    # 2026-09-09 #168 RATIFICATION (mirrored 2026-09-11 by story 11-7, epic-6-retro-item-9):
+    # RETIRED AS SUBSUMED — the five patterns are now structurally enforced (maximal fixtures
+    # per AI-64, the _unix convention + never-sole-guard, embed_clean unique-fragment count==1
+    # pins, flag-combination e2e matrices, literal pinning) plus continuous 3-lens review; the
+    # named open instance (StopUnconfirmed glue) is pinned.
+
   - id: AI-67
     epic: 4
     owner: "Islam (cost/tier decision)"
@@ -1184,7 +1208,12 @@ action_items:
       -- but it is an argument, not an observation. Also note the 7 _unix-suffixed
       tests that skip Windows: none is the sole guard for anything OS-independent,
       but the gap is real and now visible. Owner: Dev / QA; Islam to ratify if the
-      answer is 'the mapper pin is permanent'."
+      answer is 'the mapper pin is permanent'."    # 2026-09-09 #168 RATIFICATION (mirrored 2026-09-11 by story 11-7, epic-6-retro-item-9):
+    # RATIFIED: the mapper pin IS the permanent gate — a live D-state harness was honestly
+    # attempted (a ramdisk cannot reproduce uninterruptible I/O; a real-disk attempt was
+    # declined after two disk-fill incidents); the live-D-state e2e remains a documented
+    # known limitation.
+
   - id: AI-70
     epic: 4
     owner:
@@ -1211,7 +1240,7 @@ action_items:
   - id: AI-71
     epic:
     owner:
-    status: open
+    status: done  # RESOLVED in story 11-5 (2026-09-11) — closed with a MEASURED number, not the stale figure below. The CI-equivalent per-crate split (cargo tarpaulin --engine llvm --skip-clean --timeout 180 -p <pkg> for the exact five ci.yml crates, RUST_TEST_THREADS=1, CARGO_PROFILE_DEV_DEBUG=1, lcov merge --ignore-errors inconsistent, exact-fraction awk gate at >=95) measured on the story branch: 95.1830% (6422/6747 lines) — GATE GREEN. The stale 94.9431%/4675/4924 diagnosis below predates epics 8-11; by 2026-09-11 the workspace had grown to 6747 coverable lines, and the story branch's first honest measurement came in at 94.8718% (6401/6747) — genuinely BELOW the gate — so the story added seven targeted tests (domain/supervisor.rs: the read/observation helpers' documented-but-untested error surfaces: read_events/read_breach_events InvalidName + unreadable-log EngineError::Log mappings, read_agent_log_since's unreadable-generation error, parse_log_lines blank-line skip, read_log_lines_from's missing-vs-obstructed generation contract, Supervisor::default) covering +21 production lines at ZERO denominator cost (test-module lines are not counted), landing 95.1830%. Platform note: measured on macOS arm64; the added tests are pure lib unit tests that run identically under Linux CI, so CI's Linux measurement strictly improves by the same +21 lines (all tests also passed under tarpaulin instrumentation, including the newly un-gated _live tests — no coverage-side re-gating was needed).
     severity: high
     action: "Restore the workspace coverage gate to green: trunk's merged workspace
       coverage is 94.9431% (4675/4924 lines), below the 95% gate that NFR-3 marks
@@ -1229,7 +1258,7 @@ action_items:
       retro A1, high]"
     owner: "first contract-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-2-renegotiate-on-start-fallback"
     epic: 6
     action: "Engine: call negotiate_contract_version on the legacy/launch-less start-fallback
@@ -1238,7 +1267,7 @@ action_items:
       test. [epic-6 retro B1, high]"
     owner: "first engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-3-frozen-doc-corrections"
     epic: 6
     action: "Correct frozen contract-doc errors: stdin-pipe conditionality (docs/adapter-contract.md
@@ -1248,7 +1277,7 @@ action_items:
       wording. [epic-6 retro B2-B5, med]"
     owner: "first docs-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-4-tck-hardening-batch"
     epic: 6
     action: "TCK hardening: prove subject-declared memory.dir delivery (hermes HERMES_HOME
@@ -1259,7 +1288,7 @@ action_items:
       [epic-6 retro B6-B11, med]"
     owner: "first conformance-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-5-test-fixture-consolidation"
     epic: 6
     action: "Consolidate the ~16 duplicated manifest-fixture builders (~400-500 lines
@@ -1269,7 +1298,7 @@ action_items:
       has passed. [epic-6 retro C2, med]"
     owner: "first test-heavy story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-6-docs-hygiene-batch"
     epic: 6
     action: "Docs hygiene: fix commands.md:53 glued heading, architecture.md:68 stale
@@ -1280,7 +1309,7 @@ action_items:
       D1-D7, low]"
     owner: "first docs-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-7-memory-json-partial-state"
     epic: 6
     action: "kt: memory attach --json — on a post-attach status read-back error, name
@@ -1288,7 +1317,7 @@ action_items:
       Ok(None) arm is honest). [epic-6 retro B10, low]"
     owner: "first kt-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-8-tracking-hygiene"
     epic: 6
     action: "Reconcile sprint-status epic-6 heading line (still in-progress with stale
@@ -1298,7 +1327,7 @@ action_items:
       normal edge. [epic-6 retro C1/C6/C7, low]"
     owner: "orchestrator chore"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-9-carry-forward-bind-or-retire"
     epic: 6
     action: "Bind or honestly retire the carry-forward retro items that have landed
@@ -1307,8 +1336,8 @@ action_items:
       AI-69 (exit-code-6 permanent gate). Un-gated recommendations have a zero completion
       rate across three epics. [epic-6 retro E/follow-through, process]"
     owner: "Islam prioritization"
-    status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
+    status: done        # CLOSED 2026-09-11 by story 11-7: all four carry-forward items (AI-63/65/66/69) carry their #168-ratified dispositions (2026-09-09, "ratify all four as recommended"), mirrored into their entries above — RETIRED-as-accepted-tradeoff / ADOPTED-as-standing-rule / RETIRED-as-subsumed / RATIFIED-mapper-pin-gate. Nothing unbound remains.
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-5-retro-item-1-memory-dir-strip-gap"
     epic: 5
     action: "memory.dir strip gap: start_inner strips the operator-set key from local
@@ -1317,14 +1346,14 @@ action_items:
       with no DC-10 notice; no test pins any layer. [epic-5 retro A1, high]"
     owner: "next engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-2-untested-refusals"
     epic: 5
     action: "Tests: strict-UTF-8 delivery refusal has no test at any layer; Windows
       symlink refusal untested (unix-only test). [epic-5 retro A4, low]"
     owner: "next test-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-3-migration-crash-atomicity"
     epic: 5
     action: "SQLite migration crash-atomicity: batch-then-stamp (user_version set
@@ -1333,7 +1362,7 @@ action_items:
       — verify and harden (BEGIN IMMEDIATE or IF NOT EXISTS). [epic-5 retro B3, med]"
     owner: "next store-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-4-registry-reverse-conflict-test"
     epic: 5
     action: "Registry-level reverse conflict test (native attached, filesystem requested)
@@ -1341,7 +1370,7 @@ action_items:
       entry direction note. [epic-5 retro A5, low]"
     owner: "next engine-touching story"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-5-ad18-lock-model-ratification"
     epic: 5
     action: "AD-18 fine-grained lock model (awaiting-ratification since 2026-08-27):
@@ -1349,7 +1378,7 @@ action_items:
       two-mutex model; ratify or commission the split. [epic-5 retro B5]"
     owner: "Islam"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-7-retro-item-1-homebrew-token-renewal"
     epic: 7
     action: "Renew HOMEBREW_TAP_TOKEN (fine-grained PAT, Contents:read/write on iMagdy/homebrew-tap)
@@ -1357,13 +1386,13 @@ action_items:
       the documented manual fallback. [epic-7 retro F5, ops]"
     owner: "Islam"
     status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
   - id: "epic-7-retro-item-2-live-docs-probe"
     epic: 7
     action: "Add a scheduled CI check that the published docs site serves the newest
       registered page — the CF Pages deploy silently failed for ~2 weeks (Aug 26 -
       Sep 9) leaving 4 pages 404 while repo CI stayed green. [epic-7 retro F2, med]"
     owner: "next CI-touching story"
-    status: open
-    ref: "/Users/imagdy/dev/ktesio/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
+    status: done  # RESOLVED in story 11-5 (2026-09-11): .github/workflows/docs-probe.yml — daily cron (03 6 * * *) + workflow_dispatch, NO needs: coupling to the CI job graph; reads the page list from docs/meta.json at probe time (mirroring docs/lib/source.ts's README→/ and RELEASE_NOTES→/release-notes URL mappings), asserts HTTP 200 per page with every failure NAMED via ::error:: (never fail-fast — one run reports the whole blast radius), and asserts a content marker on the newest page so a 200-from-an-error-page cannot false-pass. Structure pinned by scripts/test_automation.py::test_docs_probe_workflow_watches_every_registered_page. (Live-fire note: at landing, the deployed site was already 404ing /agents again — the probe's first scheduled run will correctly red until the CF Pages deploy is refreshed, which is the watcher working as designed.)
+    ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
 

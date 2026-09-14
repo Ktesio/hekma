@@ -534,9 +534,9 @@ pub fn assert_pre_start_usage(usage: &UsageView) {
 
 /// The breach leg's shared assertion (§4.5): the flow arms BOTH the token
 /// ceiling and the dollar cap, sized to cross on the same event, so the
-/// committed records are EXACTLY ONE breach PER DIMENSION (the per-Run,
+/// committed records are EXACTLY ONE breach PER DIMENSION PER RUN (the per-Run,
 /// dimension-keyed idempotence latches — every post-crossing event re-ran
-/// enforcement and must have latched):
+/// enforcement and must have latched WITHIN its Run):
 ///
 /// * the TOKEN breach — scope `cumulative`, limit [`TOKEN_CEILING`],
 ///   `observed >= limit` (events 4–5 race the suspension — the honest bound),
@@ -548,7 +548,54 @@ pub fn assert_pre_start_usage(usage: &UsageView) {
 /// The TOKEN breach wins the pause (the single enforcement site evaluates
 /// token ceilings first; the dollar breach finds the instance already paused
 /// and records only) — pinned by the lifecycle assertion below.
+///
+/// **Why PER RUN, not one per dimension globally (story 11-1, AI-44):** the
+/// breach latch resets when a new Run starts (the ratified story-3-2 design —
+/// a fresh Run gets a clean latch), and AI-44 re-evaluates budgets right
+/// after ADOPTION, so a flow that adopts an already-over-budget run (the
+/// `kt` CLI flow does: `stop` adopts the paused process) legitimately records
+/// ONE token + ONE dollar breach for the SAME crossing in the new Run's
+/// latch. The detailed field assertions below run on the LOG-ORDER FIRST
+/// token breach record (the crossing the flow performed first) and on its
+/// SAME-RUN dollar counterpart (matched by that record's `run_id`) — every
+/// Run's pair, whichever run it is, is pinned to exactly one per dimension.
 pub fn assert_flow_breaches(events: &[BudgetBreachEvent]) {
+    let mut runs: Vec<&str> = events.iter().map(|b| b.run_id.as_str()).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    assert!(
+        !runs.is_empty(),
+        "at least one Run's breach pair must be recorded: {events:?}"
+    );
+    for run in &runs {
+        let tokens: Vec<&BudgetBreachEvent> = events
+            .iter()
+            .filter(|b| b.dimension == BreachDimension::Tokens && b.run_id == *run)
+            .collect();
+        let dollars: Vec<&BudgetBreachEvent> = events
+            .iter()
+            .filter(|b| b.dimension == BreachDimension::Dollars && b.run_id == *run)
+            .collect();
+        assert_eq!(
+            tokens.len(),
+            1,
+            "exactly one TOKEN breach per Run for a single crossing (run {run}); got {}: {events:?}",
+            tokens.len()
+        );
+        assert_eq!(
+            dollars.len(),
+            1,
+            "exactly one DOLLAR breach per Run for a single crossing (the independent \
+             dimension latch; run {run}); got {}: {events:?}",
+            dollars.len()
+        );
+    }
+    assert_eq!(
+        events.len(),
+        2 * runs.len(),
+        "the per-Run dimension records are the whole breach log: {events:?}"
+    );
+
     let tokens: Vec<&BudgetBreachEvent> = events
         .iter()
         .filter(|b| b.dimension == BreachDimension::Tokens)
@@ -557,25 +604,6 @@ pub fn assert_flow_breaches(events: &[BudgetBreachEvent]) {
         .iter()
         .filter(|b| b.dimension == BreachDimension::Dollars)
         .collect();
-    assert_eq!(
-        tokens.len(),
-        1,
-        "exactly one TOKEN breach for a single crossing; got {}: {events:?}",
-        tokens.len()
-    );
-    assert_eq!(
-        dollars.len(),
-        1,
-        "exactly one DOLLAR breach for a single crossing (the independent \
-         dimension latch); got {}: {events:?}",
-        dollars.len()
-    );
-    assert_eq!(
-        events.len(),
-        2,
-        "the two dimension records are the whole breach log: {events:?}"
-    );
-
     let b = tokens[0];
     assert_eq!(
         b.scope,
@@ -605,7 +633,10 @@ pub fn assert_flow_breaches(events: &[BudgetBreachEvent]) {
         "a token breach carries no dollar fields: {b:?}"
     );
 
-    let d = dollars[0];
+    let d = dollars
+        .iter()
+        .find(|x| x.run_id == b.run_id)
+        .expect("the first Run's dollar breach (pinned per-Run above)");
     assert_eq!(d.scope, BreachScope::Cumulative);
     assert_eq!(
         d.dollar_limit.map(Micros::get),

@@ -34,3 +34,4 @@ __pycache__/
 # Retrospective/build review inputs — working artifacts, never committed
 _bmad-output/implementation-artifacts/story-*-review-diff.patch
 _bmad-output/implementation-artifacts/epic-*-review-diff.patch
+cov/

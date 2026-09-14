@@ -158,7 +158,7 @@ tar -tzf target/package/ktesio-adapter-api-0.1.0.crate
 
 (Read the version off the manifest; extract the `.crate` — a plain
 `.tar.gz` — and review the file list and metadata: license file present, no
-stray files, version and description match.) Then, one at a time, each
+stray files, version and description match.) Release-surface changes (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata) get the TWO-PASS review treatment — see "Two-pass review covers the release surface (AI-55)" in `AGENTS.md`. Then, one at a time, each
 **HOLD — requires Islam's explicit go**:
 
 1. `cargo +stable publish --locked -p ktesio-adapter-api`

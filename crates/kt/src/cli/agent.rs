@@ -29,8 +29,8 @@ use crate::error::{
     AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
-    AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore, AgentUnknownConfigKey,
-    AgentUnknownKind,
+    AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
+    AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
 
@@ -414,19 +414,16 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         // Without this, `show --json` and the human `show` — which validates
         // inside `effective_capabilities` — disagreed on the same input.
         validate_instance_name(name)?;
-        // Reuse the SAME composition as `list --json` and pick the named entry, so
-        // the `show` object is byte-identical to that instance's `list` row. A
-        // missing name is the uniform not-found diagnostic (to stderr).
-        let entry = facade
-            .fleet()
-            .map_err(map_error)?
-            .into_iter()
-            .find(|e| e.name.as_str() == name)
-            .ok_or_else(|| {
-                map_error(RegistryError::NotFound {
-                    name: name.to_string(),
-                })
-            })?;
+        // AI-15: the SINGLE-INSTANCE registry lookup (`Engine::fleet_entry`) —
+        // an O(1) keyed lookup whose errors surface directly, instead of reading
+        // the whole Fleet and scanning it here (which also inherited a full
+        // Fleet read's degradations just to find one row). The entry is still
+        // composed by the same `fleet_entry_for` the list rows use, so the
+        // `show` object remains byte-identical to that instance's `list` row; a
+        // missing name surfaces the engine's own `RegistryError::NotFound` —
+        // the SAME uniform not-found diagnostic (to stderr) the old path
+        // synthesized.
+        let entry = facade.fleet_entry(name).map_err(map_error)?;
         let json = show_json(entry)?;
         println!("{json}");
         // The metering note rides on stderr (AD-12), keeping stdout pure JSON.
@@ -620,37 +617,74 @@ const EMPTY_FLEET_HINT: &str =
 /// fully labeled already; this is the `list`-surface fix.)
 const BUDGET_LIST_HEADER: &str = "Budget (tok, est. $)";
 
+/// The `kt agent list` Usage column HEADER (story 11-4, AI-45 — the Usage-side
+/// twin of [`BUDGET_LIST_HEADER`]).
+///
+/// With a Rate configured the Usage column renders a derived dollar cost next to
+/// the token totals — an ESTIMATE. The narrow Usage column truncates with `…`, so
+/// exactly like the Budget column the estimate qualifier ("est. $") lives HERE in
+/// the header (never in the truncatable cell): truncation can NEVER strip the
+/// mandated estimate qualifier off a real dollar figure and leave a bare,
+/// unlabeled dollar. The cell renders the dollar BARE ([`DollarLabel::InHeader`]);
+/// the wide `show` cell keeps its inline label ([`usage_cell_show`]).
+const USAGE_LIST_HEADER: &str = "Usage (tok, est. $)";
+
 /// Render a [`UsageView`]'s CUMULATIVE totals as a compact human cell (story 3-1
 /// tokens + story 3-3 dollars), e.g. `in 120 / out 340` or, with a Rate,
 /// `in 120 / out 340 · $0.30 (estimated)`. The dollar figure is rendered THROUGH
-/// the single currency module ([`render_dollars`], AD-8) and appears ONLY when a
-/// Rate is configured (`cumulative_dollars`/`estimate_label` present); with no Rate
-/// the cell is tokens-only (honest inert dollar view — AC-B). Kept here so `list`
-/// and `show` render the cumulative scope identically. The narrow `list` column shows
+/// the single currency module (AD-8) and appears ONLY when a Rate is configured
+/// (`cumulative_dollars`/`estimate_label` present); with no Rate the cell is
+/// tokens-only (honest inert dollar view — AC-B). Kept here so `list` and `show`
+/// render the cumulative scope identically. The narrow `list` column shows
 /// the CUMULATIVE scope only; the wide `show` Value column additionally surfaces the
 /// current-Run scope via [`usage_cell_show`] (AC8 — tokens by BOTH scopes are legible
 /// where the column can hold them; `--json` carries both on every surface).
-fn usage_cell(usage: &UsageView) -> String {
+///
+/// `dollar_label` chooses WHERE the estimate qualifier lives — the same
+/// parameterization [`budget_cell`] carries (story 11-4, AI-45: the `list` Usage
+/// column is narrow and TRUNCATES, so it renders the dollar BARE with the
+/// qualifier in the column header — [`USAGE_LIST_HEADER`] — FR-23), while the
+/// wide `show` cell keeps the label INLINE. The CELL itself therefore never
+/// carries a strippable label; the HEADER carries the qualifier and keeps it
+/// for every width that can still render the header (the column's min_width
+/// equals the header length). Examples: Inline → `in 120 / out 340 · $0.30
+/// (estimated)`; InHeader → `in 120 / out 340 · $0.30`.
+fn usage_cell(usage: &UsageView, dollar_label: DollarLabel) -> String {
     let tokens = format!(
         "in {} / out {}",
         usage.cumulative_input_tokens, usage.cumulative_output_tokens
     );
     match (usage.cumulative_dollars, usage.estimate_label) {
-        (Some(dollars), Some(label)) => format!("{tokens} · {}", render_dollars(dollars, label)),
+        (Some(dollars), label) => {
+            // The dollar renders ONE way or the other — a Some-dollars-with-
+            // no-label state (possible only in a hand-built entry: the engine
+            // derives the label from the same Rate that prices the dollars)
+            // falls back to the INLINE-labeled form rather than silently
+            // dropping a real dollar figure (surfaced-not-silent).
+            let dollar = match (label, dollar_label) {
+                (Some(_label), DollarLabel::InHeader) => render_dollars_bare(dollars),
+                // The default label is Estimated (v1's only produced kind), so
+                // the no-label fallback renders the honest inline estimate.
+                _ => render_dollars(dollars, label.unwrap_or_default()),
+            };
+            format!("{tokens} · {dollar}")
+        }
         // No Rate ⇒ tokens only (dollar view honestly inert — AC-B).
-        _ => tokens,
+        (None, _) => tokens,
     }
 }
 
 /// The `show` "Usage (tokens)" cell (story 3-5, AC8 — tokens BY SCOPE on the wide
 /// detail surface). Renders the CUMULATIVE scope (via [`usage_cell`], including the
-/// labeled dollar cost when a Rate exists) AND — when the instance has a current Run
-/// with usage — the CURRENT-RUN token scope, so BOTH scopes the AC names are legible
-/// in human `show` detail (the `--json` `FleetEntry` already carries all four token
-/// fields). A non-running / zero-current-run instance shows only the cumulative scope
-/// (the current-Run scope is an honest absence, not a fabricated `run: in 0 / out 0`).
+/// LABELED dollar cost when a Rate exists — the wide `show` column never truncates,
+/// so the inline estimate label is safe here, [`DollarLabel::Inline`]) AND — when
+/// the instance has a current Run with usage — the CURRENT-RUN token scope, so
+/// BOTH scopes the AC names are legible in human `show` detail (the `--json`
+/// `FleetEntry` already carries all four token fields). A non-running /
+/// zero-current-run instance shows only the cumulative scope (the current-Run
+/// scope is an honest absence, not a fabricated `run: in 0 / out 0`).
 fn usage_cell_show(usage: &UsageView) -> String {
-    let cumulative = usage_cell(usage);
+    let cumulative = usage_cell(usage, DollarLabel::Inline);
     let run_total = usage
         .current_run_input_tokens
         .saturating_add(usage.current_run_output_tokens);
@@ -868,25 +902,31 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     let entries = &listing.instances;
 
-    // The Metering Source rides the Fleet DETAIL (`kt agent show` + `--json`), which
-    // is where AC-C requires it "visible in Fleet listing detail"; the human `list`
-    // table keeps a compact column set (adding a Metering column here overflows the
-    // 80-col default and truncates cells), surfacing the real Usage token totals.
+    // METERING-SOURCE SPLIT (AI-43, story 11-4 — stated plainly, WHERE the value
+    // appears): the active Metering Source is surfaced on `kt agent show` (the
+    // detail row), `kt agent list --json` (the `metering_source` field), and
+    // `kt agent usage` (named + JSON forms). It is NOT a human-`list` column: the
+    // compact table is the ratified 80-col design, and a Metering column there
+    // overflows the default width and truncates cells. AC-C's "visible in Fleet
+    // listing detail" is the DETAIL surface — `show` — which is exactly where the
+    // value lives; human `list` surfaces the real Usage token totals instead.
     //
-    // The Budget column header is [`BUDGET_LIST_HEADER`] ("Budget (tok, est. $)"):
-    // it honestly names BOTH dimensions (a token budget AND an ESTIMATED dollar Cost
-    // Cap) and — crucially — carries the "est. $" estimate qualifier in the HEADER.
-    // The narrow Budget cell truncates with `…`; putting the qualifier in the header
-    // (not the cell) means truncation can NEVER strip the estimate label off a real
-    // dollar figure (FR-23/AD-8 — every rendered dollar stays labeled). The cell
-    // therefore renders the dollar value BARE (DollarLabel::InHeader).
+    // Both money-bearing headers carry their "est. $" qualifier in the HEADER, not
+    // the cell: the Budget column via [`BUDGET_LIST_HEADER`], the Usage column via
+    // [`USAGE_LIST_HEADER`] (AI-45 — the same FR-23 treatment). The narrow cells
+    // truncate with `…`, so putting the qualifier in the header means truncation
+    // can NEVER strip the estimate label off a real dollar figure (FR-23/AD-8 —
+    // every rendered dollar stays labeled). The cells therefore render the dollar
+    // value BARE (DollarLabel::InHeader).
     let columns = [
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
         ui::TableColumn::new("Restarts", 8, 10),
         ui::TableColumn::new(BUDGET_LIST_HEADER, 15, 34),
-        ui::TableColumn::new("Usage (tokens)", 14, 24),
+        // min_width = the header's own length: the qualifier survives any
+        // shrink that still renders the header at all (review loop 1).
+        ui::TableColumn::new(USAGE_LIST_HEADER, 19, 26),
         ui::TableColumn::new("Agent Home", 20, 64),
     ];
     let rows: Vec<Vec<ui::TableCell>> = entries
@@ -910,8 +950,12 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 ui::TableCell::status(entry.state.as_str()),
                 ui::TableCell::plain(entry.restart_count.to_string()),
                 budget_cell,
-                // Usage is REAL now (story 3-1): the cumulative token totals.
-                ui::TableCell::plain(usage_cell(&entry.usage)),
+                // Usage is REAL now (story 3-1): the cumulative token totals —
+                // plus, with a Rate, the derived dollar rendered BARE (AI-45): the
+                // estimate qualifier lives in the Usage column HEADER
+                // ([`USAGE_LIST_HEADER`]), whose min_width keeps it for every
+                // width that can still render the header at all.
+                ui::TableCell::plain(usage_cell(&entry.usage, DollarLabel::InHeader)),
                 ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
@@ -1474,18 +1518,29 @@ fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &st
 /// Instance config layer (story 2-1, AC-B/AC10, AD-12).
 ///
 /// Validated at WRITE time by the engine: a known unified key or an `agent.*`
-/// pass-through key is accepted and persisted to the instance `config.toml`
-/// through path authority; an unknown key OUTSIDE `agent.*` is REJECTED before
-/// anything is written (the on-disk config is byte-unchanged) and a miette
-/// diagnostic naming the offending key + the nearest valid key goes to STDERR
-/// with a non-zero exit. On success `ui::success` confirms to stdout. The value
-/// is stored verbatim — a `secret:NAME` REFERENCE is what is persisted here
-/// (story 2-4 resolves + masks it at start/read, FR-14; this write neither
-/// resolves nor echoes a secret).
+/// pass-through key is accepted and persisted (ATOMICALLY since story 11-2 —
+/// temp file + rename, so a crash mid-write cannot truncate the config) to the
+/// instance `config.toml` through path authority; an unknown key OUTSIDE
+/// `agent.*` is REJECTED before anything is written (the on-disk config is
+/// byte-unchanged) and a miette diagnostic naming the offending key + the
+/// nearest valid key goes to STDERR with a non-zero exit. On success `ui::success`
+/// confirms to stdout — and any WARN-ONLY steering warnings the engine attached
+/// (story 11-2, AI-33: today, a `secret:NAME` value on a FLAG-targeted key) are
+/// printed to STDERR first (AD-12: results → stdout, warnings → stderr); the
+/// command still exits 0 (warn-only, never a rejection). The value is stored
+/// verbatim — a `secret:NAME` REFERENCE is what is persisted here (story 2-4
+/// resolves + masks it at start/read, FR-14; this write neither resolves nor
+/// echoes a secret).
 pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
     match engine.blocking().set_config(name, key, value) {
-        Ok(()) => {
+        Ok(warnings) => {
+            // Story 11-2 (AI-33): the WARN-ONLY secret→flag steering rides the
+            // engine's return value (the registry has no diagnostic sink, and
+            // this synchronous CLI path prints it directly). stderr; exit 0.
+            for warning in warnings {
+                ui::warning(warning);
+            }
             ui::success(format!(
                 "Set {} = {} on Agent Instance {} (instance layer)",
                 key,
@@ -1520,10 +1575,11 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// so a residual deferral note would be false.
 ///
 /// SECRETS (story 2-4, AC-C/AC11): `secret:NAME` values are MASKED by default (the
-/// engine's [`ResolvedValue::display`] masks them — `kt` renders whatever the
-/// engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE un-mask: it
-/// asks the engine to re-resolve the secret leaves LIVE and overlays their
-/// cleartext into BOTH the human table and `--json` (Assumption 11 — symmetric). A
+/// engine's [`ktesio_engine::ResolvedValue::display`] masks them — `kt` renders
+/// whatever the engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE
+/// un-mask: it asks the engine to re-resolve the secret leaves LIVE and overlays
+/// their cleartext into BOTH the human table and `--json` (Assumption 11 —
+/// symmetric). A
 /// reveal resolution failure is a stderr diagnostic (mapped from
 /// [`ConfigError::SecretReveal`]), never a crash; `--reveal` NEVER touches the
 /// snapshot/logs/events.
@@ -1557,6 +1613,16 @@ pub fn config_get(
             // layer) is the honest not-found diagnostic (stderr, non-zero exit) —
             // in BOTH human and --json mode (stdout stays clean of a partial doc).
             if effective.get(key).is_none() {
+                // AI-25 (story 11-4): a valueless key that IS a prefix of effective
+                // leaves (`budget` when `budget.tokens.*` exist) is not simply
+                // unknown — it names a config TABLE. The rejection stays honest
+                // (same stderr + non-zero exit), but it now NAMES the child leaves
+                // (first [`TABLE_PREFIX_MAX_CHILDREN`], then an ellipsis) so the
+                // operator is steered to the right leaf in one step. Surfaced, not
+                // silent: the shape mismatch is a diagnostic, not a bare "no value".
+                if let Some(message) = table_prefix_diagnostic(name, key, &effective) {
+                    return Err(AgentUnknownConfigKey { message }.into());
+                }
                 return Err(AgentUnknownConfigKey {
                     message: format!(
                         "Agent Instance '{name}' has no effective value for config key '{key}'. \
@@ -1587,6 +1653,48 @@ pub fn config_get(
             Ok(())
         }
     }
+}
+
+/// How many effective child leaves the AI-25 table-prefix diagnostic names before
+/// it elides the rest (the known key families have at most a handful of leaves; a
+/// long `agent.*` subtree must not flood stderr).
+const TABLE_PREFIX_MAX_CHILDREN: usize = 8;
+
+/// The AI-25 refinement of the not-found diagnostic: when `<key>` has no value of
+/// its own but IS a dotted prefix of effective leaves (`budget` →
+/// `budget.tokens.per_run`, …), build a message that says so and NAMES the child
+/// leaves (sorted — the engine's effective map iterates deterministically; capped
+/// at [`TABLE_PREFIX_MAX_CHILDREN`] with an ellipsis). `None` when the key is not
+/// a prefix either — the caller then emits the plain unknown-key diagnostic. Pure
+/// (no engine, no I/O) so it is unit-testable in-process.
+fn table_prefix_diagnostic(name: &str, key: &str, effective: &EffectiveConfig) -> Option<String> {
+    let prefix = format!("{key}.");
+    let children: Vec<&str> = effective
+        .iter()
+        .map(|(child, _)| child.as_str())
+        .filter(|child| child.starts_with(&prefix))
+        .collect();
+    if children.is_empty() {
+        return None;
+    }
+    let named: Vec<&str> = children
+        .iter()
+        .copied()
+        .take(TABLE_PREFIX_MAX_CHILDREN)
+        .collect();
+    let elided = children.len() - named.len();
+    let suffix = if elided > 0 {
+        format!(", … (+{elided} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "Agent Instance '{name}' has no effective value for config key '{key}' — it is a \
+         config table prefix. Its effective child leaves are: {}{suffix}. Get one of them, \
+         e.g.: kt agent config get {name} {}",
+        named.join(", "),
+        named[0]
+    ))
 }
 
 /// The display string for one leaf, honoring a `--reveal` overlay (story 2-4). If
@@ -1649,11 +1757,11 @@ struct ConfigDocument {
 /// (a versioned [`ConfigDocument`]). Pure (no engine, no I/O) so it is
 /// unit-testable in-process; the CLI just prints the returned string to stdout.
 /// `only` selects a single leaf (the single-key form) or `None` for the whole
-/// config. Every value renders via the engine's ONE display path
-/// ([`ktesio_engine::EffectiveConfig::value_display`]) and every source via the
-/// engine's [`ktesio_engine::EffectiveConfig::source_label`] accessor — `kt` never
-/// re-derives either (AD-2). A serialize failure (not reachable for these plain
-/// serde structs) becomes an [`AgentIo`] diagnostic, never a panic.
+/// config. Every value renders via the engine's ONE display path — the resolved
+/// leaf's [`ktesio_engine::ResolvedValue::display`] — and every source via the
+/// winning layer tag's `as_str` ([`ktesio_engine::SourceLayer::as_str`]) — `kt`
+/// never re-derives either (AD-2). A serialize failure (not reachable for these
+/// plain serde structs) becomes an [`AgentIo`] diagnostic, never a panic.
 fn config_json(
     effective: &EffectiveConfig,
     only: Option<&str>,
@@ -2212,6 +2320,22 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // AI-7: `resume` targeted a PAUSED instance whose adapter declares PAUSE
+        // unsupported on this OS — the engine cannot signal the suspension awake,
+        // and the bare pause-unsupported diagnostic would strand an operator whose
+        // instance is ALREADY `paused`. Name the state + the declaration and give
+        // the real escape hatch (stop works without pause support) instead.
+        EngineError::ResumeUnsupported { name, os, level } => AgentResumeUnsupported {
+            message: format!(
+                "Agent Instance '{name}' is paused, but this agent declares pause '{level}' \
+                 on {os}, so resume cannot signal the suspension awake. Recovery: \
+                 kt agent stop {name} && kt agent start {name}. The same resume does work on \
+                 hosts where the adapter declares pause support (informational — this CLI \
+                 cannot change this host's OS). Inspect the Capability Declaration with: \
+                 kt agent show {name}"
+            ),
+        }
+        .into(),
         EngineError::AdapterUnresolved { name, detail } => AgentLaunchFailed {
             message: format!(
                 "Could not resolve the adapter to start Agent Instance '{name}': {detail}."
@@ -2662,6 +2786,17 @@ mod tests {
                 EngineError::CapabilityUnsupported {
                     name: "un".to_string(),
                     capability: "pause".to_string(),
+                    os: "linux".to_string(),
+                    level: "unsupported".to_string(),
+                },
+                ExitCode::Unsupported,
+            ),
+            (
+                // AI-7: the dedicated resume-under-unsupported-pause diagnostic —
+                // the same capability-unsupported class (5), never a demotion.
+                "ResumeUnsupported",
+                EngineError::ResumeUnsupported {
+                    name: "pz".to_string(),
                     os: "linux".to_string(),
                     level: "unsupported".to_string(),
                 },
@@ -3195,6 +3330,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn show_json_uses_single_instance_lookup() {
+        // AI-15: `show --json` resolves through the single-instance facade
+        // method (`Engine::fleet_entry`) — an O(1) keyed registry lookup whose
+        // errors surface directly — not a scan over the whole `fleet()`. A known
+        // name yields the SAME versioned document (the row `list` would emit);
+        // an unknown name surfaces the ENGINE's `RegistryError::NotFound`
+        // (mapped to the exit-3 diagnostic), exactly like the human path — not a
+        // silent Ok and not a usage error. Drives the real engine in-process,
+        // mirroring the list/show cover test above (holds the shared env lock).
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; set the state dir the CLI resolves.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+        }
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            engine.blocking().register("solo", "mock").unwrap();
+        }
+        // Known name: the full CLI --json path succeeds.
+        show("solo", true).unwrap();
+        // The facade method itself: one row for the known name, the engine's
+        // typed NotFound for an unknown one (the exit-3 contract's source).
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let facade = engine.blocking();
+            let entry = facade.fleet_entry("solo").unwrap();
+            assert_eq!(entry.name.as_str(), "solo", "one entry, the requested one");
+            assert_eq!(entry.kind, "mock");
+            let err = facade.fleet_entry("ghost").unwrap_err();
+            assert!(
+                matches!(err, RegistryError::NotFound { ref name } if name == "ghost"),
+                "an unknown name must surface the engine's NotFound, got {err:?}"
+            );
+            // A malformed name is the registry's InvalidName (the exit-2 path),
+            // NOT a synthesized NotFound — the M2 contract, now from the engine.
+            let err = facade.fleet_entry("Bad Name").unwrap_err();
+            assert!(
+                matches!(err, RegistryError::InvalidName { .. }),
+                "a malformed name must surface InvalidName, got {err:?}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("KTESIO_STATE_DIR");
+        }
+    }
+
     /// Build a small effective config in-process for the config_json unit tests
     /// (a known key from the instance layer + an agent.* pass-through leaf from a
     /// weaker layer), reusing the engine's public resolver.
@@ -3275,6 +3458,84 @@ mod tests {
             arr["value"],
             serde_json::json!(eff.value_display("arr").unwrap())
         );
+    }
+
+    #[test]
+    fn table_prefix_diagnostic_names_the_child_leaves_sorted_and_capped() {
+        // AI-25 (story 11-4): a valueless key that IS a prefix of effective leaves
+        // yields a diagnostic that NAMES the children (sorted — the engine map
+        // iterates deterministically), capped at [`TABLE_PREFIX_MAX_CHILDREN`] with
+        // an elision count. A key that is neither a value nor a prefix yields None
+        // (the plain unknown-key diagnostic). Built through the engine's public
+        // resolver, like the config_json unit tests.
+        use ktesio_engine::{resolve, SourceLayer};
+        let resolve_instance = |toml_text: &str| {
+            resolve([
+                ConfigLayer::empty(),
+                ConfigLayer::empty(),
+                ConfigLayer::parse(SourceLayer::Instance, "<i>", toml_text).unwrap(),
+                ConfigLayer::empty(),
+            ])
+        };
+
+        // Full list when the family fits under the cap: the child leaf is named and
+        // the remediation suggests a concrete `get`.
+        let eff_budget = resolve_instance("budget = { breach_action = \"pause\" }\n");
+        let message =
+            table_prefix_diagnostic("demo", "budget", &eff_budget).expect("budget is a prefix");
+        assert!(
+            message.contains("budget.breach_action"),
+            "the child leaf is named: {message}"
+        );
+        assert!(
+            message.contains("kt agent config get demo budget.breach_action"),
+            "the remediation suggests a concrete get: {message}"
+        );
+        assert!(
+            !message.contains('…'),
+            "nothing elided under the cap: {message}"
+        );
+
+        // An INTERMEDIATE prefix (a depth-2 key over a NESTED table — the
+        // `budget.tokens` table makes `budget.tokens.per_run` a leaf) takes
+        // the same path (review loop 1): the leaves under `budget.tokens.`
+        // are named.
+        let eff_deep = resolve_instance("[budget.tokens]\nper_run = 1000\n");
+        let message = table_prefix_diagnostic("demo", "budget.tokens", &eff_deep)
+            .expect("budget.tokens is an intermediate prefix");
+        assert!(
+            message.contains("budget.tokens.per_run"),
+            "the depth-2 prefix names its leaf: {message}"
+        );
+
+        // Over the cap: exactly TABLE_PREFIX_MAX_CHILDREN named, then the elision.
+        let nine_agent_leaves: String = (1..=9)
+            .map(|i| format!("k{i} = \"v\"\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let eff_agent = resolve_instance(&format!("[agent]\n{nine_agent_leaves}"));
+        let message =
+            table_prefix_diagnostic("demo", "agent", &eff_agent).expect("agent is a prefix");
+        assert!(
+            message.contains("… (+1 more)"),
+            "9 leaves cap at 8 named + the elision count: {message}"
+        );
+        // The rendered list holds EXACTLY the capped number of children (k9 is
+        // elided), then the ellipsis; the trailing suggestion names only k1.
+        assert!(
+            message.contains(
+                "agent.k1, agent.k2, agent.k3, agent.k4, agent.k5, agent.k6, \
+                 agent.k7, agent.k8, … (+1 more)"
+            ),
+            "exactly the capped number of children named, in sorted order: {message}"
+        );
+        assert!(
+            !message.contains("agent.k9"),
+            "the ninth leaf is elided, never named: {message}"
+        );
+
+        // Not a prefix at all → the caller's plain unknown-key diagnostic.
+        assert_eq!(table_prefix_diagnostic("demo", "modle", &eff_budget), None);
     }
 
     #[test]
@@ -3475,6 +3736,37 @@ mod tests {
             BUDGET_LIST_HEADER.contains("est. $"),
             "{BUDGET_LIST_HEADER}"
         );
+    }
+
+    #[test]
+    fn usage_cell_keeps_the_estimate_label_out_of_the_truncatable_list_cell() {
+        // AI-45 (story 11-4): the Usage column gets the SAME FR-23/AD-8 treatment
+        // the Budget column already has. The narrow `list` Usage column truncates
+        // with `…`, so it renders the derived dollar BARE (the estimate qualifier
+        // lives in the column header); the wide `show` cell keeps the inline label.
+        // Asserting both forms together is the contract test: dropping the header
+        // qualifier ([`USAGE_LIST_HEADER`]) OR leaking the label into the InHeader
+        // cell (where truncation could strip it) both fail.
+        let usage = UsageView::new(
+            ktesio_engine::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 340,
+            },
+            ktesio_engine::UsageTotals::zero(),
+        )
+        .with_dollars(Micros(300_000), Micros::ZERO, EstimateLabel::Estimated);
+
+        assert_eq!(
+            usage_cell(&usage, DollarLabel::Inline),
+            "in 120 / out 340 · $0.30 (estimated)"
+        );
+        assert_eq!(
+            usage_cell(&usage, DollarLabel::InHeader),
+            "in 120 / out 340 · $0.30"
+        );
+        // …and the qualifier the InHeader cell omits really is carried by the
+        // header that surface uses, so it is displaced, never lost.
+        assert!(USAGE_LIST_HEADER.contains("est. $"), "{USAGE_LIST_HEADER}");
     }
 
     #[test]

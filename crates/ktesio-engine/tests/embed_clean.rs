@@ -48,7 +48,7 @@
 //!    The audit's TWO historical print-site allowlist entries — the best-effort
 //!    stderr diagnostics in `domain/supervisor.rs` (the DC-10 memory-delivery
 //!    notice and the enforcement breadcrumb, both citing spine AD-12) — were
-//!    CLOSED by story 10-2, not allowlisted forever: both diagnostics now
+//!    CLOSED by story 10-2, not allowlisted forever: the pinned diagnostics now
 //!    route through the host-provided diagnostic sink (`Supervisor::
 //!    emit_diagnostic`; stderr survives only as the no-sink DEFAULT, which the
 //!    `diagnostic_sink.rs` suite proves byte-identical). The print-site
@@ -870,8 +870,8 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // in the new shape): each fragment must match EXACTLY ONE site, so a
     // removed or reworded diagnostic route — or a second direct stderr writer
     // sneaking past the print scan above — fails here. ----
-    let sink_pins: [(&str, &str, &str); 4] = [
-        // The ONE diagnostic emission choke point (both diagnostics route
+    let sink_pins: [(&str, &str, &str); 11] = [
+        // The ONE diagnostic emission choke point (every pinned diagnostic routes
         // through it; the `[ktesio] ` prefix + terminating newline live here).
         (
             "domain/supervisor.rs",
@@ -887,11 +887,77 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         ),
         // The enforcement breadcrumb's route into the sink (a breach action
         // that could not be honored, or a breach record that failed to append
-        // — an operator breadcrumb, never the record).
+        // — an operator breadcrumb, never the record). The marker is the
+        // whole single-line call, so it stays distinct from the AI-41 site
+        // below (a multi-line `format!` whose call line carries no args).
         (
             "domain/supervisor.rs",
             "self.emit_diagnostic(&format!(",
             "the enforcement breadcrumb's route into the sink",
+        ),
+        // AI-41 (story 11-1): a usage event whose ledger INSERT failed — the
+        // event was NOT counted and the drain will retry it. A NEW third
+        // diagnostic route, routed through the same `emit_diagnostic` choke
+        // point; the count was consciously re-reviewed and this site pinned
+        // by its own route line (distinct from the enforcement breadcrumb's
+        // single-line `format!` call above).
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&failure);",
+            "the AI-41 usage-commit-failure report's route into the sink",
+        ),
+        // AI-9 (story 11-1, loop 1): the SIGNAL-FAILURE breadcrumb — the
+        // transition committed but the pause/resume signal failed, so the
+        // ledger and the live process may diverge; the divergence is
+        // announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&signal_failure);",
+            "the AI-9 signal-failure divergence breadcrumb's route into the sink",
+        ),
+        // AI-12 (story 11-1, loop 1): the ENVIRONMENTAL poll-failure notice —
+        // multiple handles failing in the same tick corroborate as a
+        // backend/environment-wide condition; the no-mass-crash guard's
+        // decision is announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&environmental);",
+            "the AI-12 environmental poll-failure notice's route into the sink",
+        ),
+        // AI-41 (story 11-1, loop 1): the TERMINAL-drain loss notice — a
+        // still-failing INSERT on the final drain cannot be retried (the
+        // handle is being removed), so the loss is announced, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&loss);",
+            "the AI-41 terminal-drain loss notice's route into the sink",
+        ),
+        // AI-46 (story 11-3): the STRANDED-LISTENER adoption notice — an
+        // adopted engine-observed orphan whose injected `base_url` still
+        // points at the PREVIOUS engine's dead listener; the condition and the
+        // stop→start remediation are announced at adoption, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&strand);",
+            "the AI-46 stranded-listener adoption notice's route into the sink",
+        ),
+        // AI-27 (story 11-2): the ENV-SHADOW notice — a config-mapped env
+        // target overwrote a same-named `[lifecycle.start]` base-launch env
+        // var; the config value wins (precedence untouched) and the shadow is
+        // announced at start, never silent.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&shadow_notice);",
+            "the AI-27 env-shadow notice's route into the sink",
+        ),
+        // AI-39 (story 11-2): the SECRET-INTO-FLAG runtime notice — a resolved
+        // `secret:` leaf was delivered into a FLAG target (cleartext on argv,
+        // the accepted-but-stricter boundary); the fact is announced warn-only
+        // on every start that delivers one, never silent, never the value.
+        (
+            "domain/supervisor.rs",
+            "self.emit_diagnostic(&flag_notice);",
+            "the AI-39 secret-into-flag notice's route into the sink",
         ),
         // The stderr DEFAULT arm: with no sink installed the diagnostics go
         // to stderr byte-identically to the pre-sink engine (pinned
@@ -1042,43 +1108,61 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
             .join("; ")
     );
 
-    // ---- The named allowlist: `static RUN_NONCE: AtomicU64` in
-    // domain/usage.rs — the RunId uniqueness tie-breaker. A monotonic counter
-    // consulted ONLY inside `RunId::mint` to keep two same-nanosecond Run ids
-    // distinct; never read for behavior, never reset, never engine-coupled.
-    // It guarantees PER-PROCESS uniqueness — exactly what a multi-engine
-    // single-process host needs (the collision test's disjoint-run-id
-    // assertion proves this property); cross-process uniqueness is not
-    // claimed (separate roots keep separate ledgers). TEETH: EVERY static
-    // carrying a lock or atomic — `pub` or private — must be this ONE site,
-    // so a new `pub static FOO: AtomicU64` cannot ride a private-only
-    // exclusion. ----
+    // ---- The NAMED allowlist of process-global statics. TEETH: EVERY static
+    // carrying a lock or atomic — `pub` or private — must be one of these
+    // named sites, so a new `pub static FOO: AtomicU64` cannot ride a
+    // private-only exclusion. Each entry is the same reviewed class: a plain
+    // atomic counter, never read for behavior, never engine-coupled,
+    // guaranteeing PER-PROCESS uniqueness only (cross-process uniqueness is
+    // not claimed — separate pids / separate roots keep separate state).
+    //
+    // 1. `static RUN_NONCE: AtomicU64` (domain/usage.rs) — the RunId
+    //    uniqueness tie-breaker, consulted ONLY inside `RunId::mint` to keep
+    //    two same-nanosecond Run ids distinct (the collision test's
+    //    disjoint-run-id assertion proves the property).
+    // 2. `static TEMP_WRITE_SEQ: AtomicU64` (paths.rs, review-1 patch 1) —
+    //    the atomic-write temp-name disambiguator, consulted ONLY inside
+    //    `paths::reserve_atomic_temp` so two THREADS of one process writing
+    //    the same target concurrently cannot collide on a temp path; the pid
+    //    in the same name carries the cross-process half. ----
     let statics = scan(&src, &|line| {
         line.contains("static ")
             && (line.contains("Atomic") || line.contains("Mutex") || line.contains("RwLock"))
     });
     assert_eq!(
         statics.len(),
-        1,
-        "exactly ONE allowlisted process-global static is permitted (RUN_NONCE); a \
-         new static — `pub` or private — is exactly the collision class FR-34 \
-         forbids: {}",
+        2,
+        "exactly TWO named process-global statics are permitted (RUN_NONCE + \
+         TEMP_WRITE_SEQ); a new static — `pub` or private — is exactly the \
+         collision class FR-34 forbids and requires re-reviewing this \
+         allowlist: {}",
         statics
             .iter()
             .map(Finding::describe)
             .collect::<Vec<_>>()
             .join("; ")
     );
-    let only = &statics[0];
+    let mut homes: Vec<(&String, &String)> = statics.iter().map(|f| (&f.file, &f.text)).collect();
+    homes.sort();
     assert_eq!(
-        only.file, "domain/usage.rs",
-        "the allowlisted static's home"
+        homes.len(),
+        2,
+        "expected exactly two allowlisted statics after sorting"
     );
+    let (usage, paths) = (&homes[0], &homes[1]);
+    assert_eq!(usage.0, "domain/usage.rs", "the RUN_NONCE static's home");
     assert!(
-        only.text.contains("RUN_NONCE") && only.text.contains("AtomicU64"),
-        "the allowlisted static must still be the RUN_NONCE counter (a shape change \
+        usage.1.contains("RUN_NONCE") && usage.1.contains("AtomicU64"),
+        "the usage.rs static must still be the RUN_NONCE counter (a shape change \
          requires re-reviewing this allowlist): {}",
-        only.describe()
+        usage.1
+    );
+    assert_eq!(paths.0, "paths.rs", "the TEMP_WRITE_SEQ static's home");
+    assert!(
+        paths.1.contains("TEMP_WRITE_SEQ") && paths.1.contains("AtomicU64"),
+        "the paths.rs static must still be the TEMP_WRITE_SEQ counter (a shape change \
+         requires re-reviewing this allowlist): {}",
+        paths.1
     );
 
     // ---- No ambient/global runtime: a tokio runtime is built ONLY inside

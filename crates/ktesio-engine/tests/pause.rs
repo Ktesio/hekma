@@ -494,10 +494,179 @@ fn guaranteed_pause_without_an_in_memory_handle_is_a_no_op_transition() {
     // Pause: no handle → guaranteed transition to paused (best-effort no-op signal).
     let paused = facade.pause("svc").unwrap();
     assert_eq!(paused.state, LifecycleState::Paused);
-    // The transition was still recorded as a plain command cause (guaranteed).
+    // AI-8: the recorded cause is the HONEST best-effort qualifier naming the
+    // missing handle — never a plain `pause` command that would read as a real
+    // suspension the engine could not perform.
     let events = facade.transition_events("svc").unwrap();
     let last = events.last().unwrap();
     assert_eq!(last.new_state, LifecycleState::Paused);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("\"kind\":\"pause-best-effort\""),
+        "a guaranteed pause with no in-memory handle must record the best-effort \
+         qualifier, not a plain command: {cause}"
+    );
+    assert!(
+        cause.contains("no live process handle"),
+        "the qualifier must name the missing handle (the honest why): {cause}"
+    );
+}
+
+#[test]
+fn resume_under_an_unsupported_pause_declaration_names_the_state_and_remediation() {
+    // AI-7: `resume` on an instance that is `paused` while its adapter declares
+    // PAUSE `unsupported` on this OS fails fast with the DEDICATED
+    // ResumeUnsupported diagnostic — naming the STATE (`paused`) + the
+    // declaration (level + OS) and pointing at `stop` + `start` (the real escape
+    // hatch; stop never consults the pause level) — instead of the bare
+    // pause-unsupported error that would strand the operator. NO state change,
+    // NO event appended.
+    //
+    // The paused row is reached the honest way this scenario occurs: the row was
+    // paused under a PRIOR declaration/OS (here: forced directly in the state
+    // DB, the established pattern of
+    // `guaranteed_pause_without_an_in_memory_handle...`), while the CURRENT
+    // declaration projects `unsupported`.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // Declare pause for an OS OTHER than the current one so the current-OS
+    // projection is Unsupported.
+    let other_os = match OsId::current() {
+        OsId::Linux => "windows",
+        OsId::Macos => "windows",
+        OsId::Windows => "linux",
+        OsId::Other => "linux",
+    };
+    let bin = ktesio_conformance::fake_agent_bin();
+    let body = format!(
+        r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "unsupres"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000"]
+
+[capabilities.pause]
+{other} = "guaranteed"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+"#,
+        exec = bin.to_string_lossy(),
+        other = other_os,
+    );
+    std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "unsupres",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    // Force the row to `paused` directly in the state DB (the prior-declaration
+    // drift scenario).
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE agent_instances SET state = 'paused' WHERE name = 'unsupres'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    let before = facade.transition_events("unsupres").unwrap().len();
+
+    let err = facade.resume("unsupres").unwrap_err();
+    let msg = err.to_string();
+    // Names the STATE + the declaration (level + OS) — never a bare
+    // "cannot pause" that would strand a paused instance.
+    assert!(msg.contains("paused"), "names the state: {msg}");
+    assert!(msg.contains("unsupported"), "quotes the level: {msg}");
+    assert!(msg.contains(current_os_key()), "names the OS: {msg}");
+    // The remediation names the real escape hatch (stop + start).
+    assert!(
+        msg.contains("stop") && msg.contains("start"),
+        "names the stop/start remediation: {msg}"
+    );
+
+    // State UNCHANGED (still paused — fail fast, no fake success).
+    let listed = facade.list().unwrap();
+    let inst = listed
+        .iter()
+        .find(|i| i.name.as_str() == "unsupres")
+        .unwrap();
+    assert_eq!(
+        inst.state,
+        LifecycleState::Paused,
+        "the unsupported-declaration resume must not change state"
+    );
+    // NO transition event appended for the failed resume.
+    let after = facade.transition_events("unsupres").unwrap();
+    assert_eq!(
+        after.len(),
+        before,
+        "no event may be appended for a failed (resume-unsupported) resume"
+    );
+}
+
+#[test]
+fn guaranteed_resume_without_an_in_memory_handle_records_the_qualifier() {
+    // AI-8 (the loop-1 sibling of the guaranteed-pause-without-a-handle proof):
+    // a GUARANTEED resume of a `paused` row for which THIS engine holds no
+    // process handle still transitions — and the recorded cause must be the
+    // honest `resume-best-effort` qualifier naming the missing handle, never a
+    // plain `resume` command that would read as a performed wake-up. The row is
+    // forced to `paused` directly in the state DB (the established pattern of
+    // `guaranteed_pause_without_an_in_memory_handle...`).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_pause_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        "guaranteed",
+    );
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE agent_instances SET state = 'paused' WHERE name = 'svc'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    let resumed = facade.resume("svc").unwrap();
+    assert_eq!(resumed.state, LifecycleState::Running);
+    let events = facade.transition_events("svc").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.new_state, LifecycleState::Running);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("\"kind\":\"resume-best-effort\""),
+        "a guaranteed resume with no in-memory handle must record the best-effort \
+         qualifier, not a plain command: {cause}"
+    );
+    assert!(
+        cause.contains("no live process handle"),
+        "the qualifier must name the missing handle (the honest why): {cause}"
+    );
 }
 
 #[test]

@@ -288,6 +288,17 @@ does. Four instruments keep that statement honest:
   the facade alone and shares its assertions with the CLI suite, proving the
   library path and the CLI path behave identically
   ([the host test](https://github.com/iMagdy/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
+- **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
+  bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family),
+  check the tracing exposure: `hyper-util` links `tracing`, and its
+  connection-pool events would carry the upstream host:port and timing IF a
+  global `tracing-subscriber` were ever installed. The engine ships NO
+  subscriber (events are no-ops) and hyper's own tracing feature is OFF, so
+  today nothing is emitted; the exposure never carries the `Authorization`
+  header, body, or key. The checkpoint: any future story that installs a
+  global DEBUG/TRACE subscriber must re-audit what the HTTP stack logs at
+  that level before it ships (a model-call endpoint is operator-sensitive
+  context, even without credentials).
 - **The semver gate** — CI diffs both public crates' surfaces against their
   freeze baselines, so a breaking change cannot land unnoticed.
 

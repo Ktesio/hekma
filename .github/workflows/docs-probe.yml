@@ -1,0 +1,104 @@
+name: Docs Probe
+
+# epic-7-retro-item-2 (story 11-5): the docs site (docs.ktesio.dev, deployed
+# by Cloudflare Pages OUTSIDE this repo's CI) once silently died for ~2 weeks —
+# four pages 404'd from Aug 26 to Sep 9, 2026 while every repo CI check stayed
+# green, because nothing WATCHED the deployed site. This workflow is that
+# watcher: a scheduled probe that curls every registered docs page and fails,
+# naming the dead page, when any of them stops serving.
+#
+# Deliberately a SEPARATE workflow with no `needs:` coupling and no dependency
+# on the CI job graph: the probe must run (and fail) even when CI itself is
+# red or skipped, and CI must never be gated on the site's health.
+
+on:
+  schedule:
+    # Daily at 06:03 UTC — hours off the CI nightly (07:17 UTC) so a docs
+    # regression is caught daily and the two scheduled runs never queue
+    # together at a top-of-hour boundary.
+    - cron: "3 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe docs.ktesio.dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Probe every registered docs page for HTTP 200
+        # The page list is the SITE's own registry, read from docs/meta.json at
+        # probe time (not a hand-copied list that can drift): every entry that
+        # is a real page (the `---…---` entries are section SEPARATORS, not
+        # pages) must answer HTTP 200 at https://docs.ktesio.dev/<page>.
+        #
+        # URL mapping: docs/meta.json names SOURCE files; two special cases
+        # get non-obvious URLs, mapped by docs/lib/source.ts's `slugs()` —
+        #   * `README` is the site ROOT (`/`), not `/README`;
+        #   * `RELEASE_NOTES` serves at `/release-notes`.
+        # Those two mappings MUST be updated together with docs/lib/source.ts.
+        #
+        # Every failure is RECORDED and named (never fail-fast on the first
+        # dead page — one run must report the whole blast radius, which is
+        # exactly what the Aug 2026 incident needed). The step (and the job)
+        # fails if ANY page is not a 200.
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://docs.ktesio.dev"
+          dead=0
+          pages="$(jq -r '.pages[] | select(startswith("---") | not)' docs/meta.json)"
+          if [ -z "$pages" ]; then
+            echo "::error::docs/meta.json yielded no pages — the registry read is broken or the separators changed shape."
+            exit 1
+          fi
+          while IFS= read -r page; do
+            case "$page" in
+              README) url="$base/" ;;
+              RELEASE_NOTES) url="$base/release-notes" ;;
+              *) url="$base/$page" ;;
+            esac
+            code="$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code}' --max-time 30 "$url")" || code=000
+            if [ "$code" = "200" ]; then
+              echo "ok   $url"
+            else
+              echo "::error::docs.ktesio.dev page is DOWN: $url answered HTTP $code (expected 200). The Cloudflare Pages deploy is stale or the page was removed — redeploy the docs site (or restore the page)."
+              dead=$((dead + 1))
+            fi
+          done <<< "$pages"
+          if [ "$dead" -gt 0 ]; then
+            echo "::error::$dead of $(printf '%s\n' "$pages" | wc -l | tr -d ' ') registered docs pages are not serving HTTP 200."
+            exit 1
+          fi
+          echo "Docs probe green: every registered page serves HTTP 200."
+
+      - name: Assert the newest page serves real content (not an empty 200)
+        # A 200 alone cannot distinguish the real page from a CDN/edge error
+        # page that happens to answer 200, so the NEWEST registered page (the
+        # last entry in docs/meta.json — RELEASE_NOTES, served at
+        # /release-notes) must also carry its content marker: the page's own
+        # `<title>`/h1 text. A structurally-200-but-contentless deploy fails
+        # here. Update the marker together with the page's title (or when the
+        # newest entry in docs/meta.json changes).
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://docs.ktesio.dev/release-notes"
+          marker="Release Notes"
+          body="$(curl --silent --show-error --max-time 30 "$url")" || body=""
+          if printf '%s' "$body" | grep -q "$marker"; then
+            echo "ok   $url carries the content marker \"$marker\"."
+          else
+            echo "::error::$url answered without the \"$marker\" content marker — the page is 200 but its content is wrong/empty (stale or broken deploy)."
+            exit 1
+          fi

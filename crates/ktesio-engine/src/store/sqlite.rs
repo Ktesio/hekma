@@ -10,13 +10,26 @@
 //! Schema version is tracked with `PRAGMA user_version` (chosen over a `_meta`
 //! table for simplicity — no extra table, atomic with the connection). On open,
 //! the migrator STEPS from the DB's current `user_version` up to
-//! [`SCHEMA_VERSION`], applying each version's DDL in order and stamping the new
-//! version. Reopening an existing DB is idempotent (already at the target → no
-//! DDL runs). Story 1-6 adds v2: the `agent_runtime` write-ahead spawn-record
-//! table (AD-5/AD-6). Story 3-1 adds v3: the Usage Ledger's `sequence` ordinal
-//! column + a `UNIQUE(instance_id, run_id, sequence)` dedup index, so a replayed
-//! usage batch is a DB-level no-op (AC-A). A DB ahead of this build is refused
-//! (forward-compat guard).
+//! [`SCHEMA_VERSION`], applying each version's DDL in order. Each step is ONE
+//! `BEGIN IMMEDIATE` transaction covering BOTH the step's DDL and its
+//! `user_version` stamp (story 11-3, B3): a process death mid-step rolls the
+//! whole step back, so a crashed migration leaves the DB at the last COMPLETED
+//! version and the reopen re-runs only the steps it still needs. The CREATE
+//! statements are `IF NOT EXISTS`, so a DB frozen by the PRE-TRANSACTIONAL
+//! migrator before the last ALTER (DDL applied, stamp lost) reopens cleanly
+//! instead of dying on "table already exists" — with one stated residual
+//! boundary: a legacy freeze AFTER v3/v4's `ADD COLUMN` still fails the reopen
+//! (SQLite has no `IF NOT EXISTS` for ADD COLUMN, so the re-run dies on
+//! "duplicate column name"). That legacy state predates this migrator, is
+//! unreachable for crashes under the transactional steps, and healing it would
+//! need column probing — the fail-loud error is the honest contract (pinned by
+//! `migration_legacy_freeze_in_the_alter_window_fails_loud`). Reopening an
+//! existing DB is idempotent (already at the target → no DDL runs). Story 1-6
+//! adds v2: the `agent_runtime`
+//! write-ahead spawn-record table (AD-5/AD-6). Story 3-1 adds v3: the Usage
+//! Ledger's `sequence` ordinal column + a `UNIQUE(instance_id, run_id,
+//! sequence)` dedup index, so a replayed usage batch is a DB-level no-op
+//! (AC-A). A DB ahead of this build is refused (forward-compat guard).
 
 use std::path::Path;
 
@@ -53,7 +66,7 @@ const SCHEMA_VERSION: i64 = 5;
 /// `foreign_keys=ON` makes removing an instance clean up its ledger rows
 /// automatically.
 const SCHEMA_V1: &str = "\
-CREATE TABLE agent_instances (
+CREATE TABLE IF NOT EXISTS agent_instances (
     id           INTEGER PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
     kind         TEXT NOT NULL,
@@ -62,7 +75,7 @@ CREATE TABLE agent_instances (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
-CREATE TABLE usage_events (
+CREATE TABLE IF NOT EXISTS usage_events (
     id              INTEGER PRIMARY KEY,
     instance_id     INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,
     run_id          TEXT NOT NULL,
@@ -71,7 +84,7 @@ CREATE TABLE usage_events (
     metering_source TEXT NOT NULL,
     occurred_at     TEXT NOT NULL
 );
-CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);
+CREATE INDEX IF NOT EXISTS idx_usage_events_instance ON usage_events(instance_id);
 ";
 
 /// Schema v2 DDL (story 1-6): the write-ahead spawn-record table (spine AD-5).
@@ -84,7 +97,7 @@ CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);
 /// is supervised (`running`/`paused`); a clean stop deletes it, so a
 /// normally-stopped instance is never later adopted/failed as an orphan.
 const SCHEMA_V2: &str = "\
-CREATE TABLE agent_runtime (
+CREATE TABLE IF NOT EXISTS agent_runtime (
     id               INTEGER PRIMARY KEY,
     instance_id      INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,
     pid              INTEGER NOT NULL,
@@ -108,7 +121,7 @@ CREATE TABLE agent_runtime (
 /// so v1/v2 → v3 preserves every existing row.
 const SCHEMA_V3: &str = "\
 ALTER TABLE usage_events ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0;
-CREATE UNIQUE INDEX idx_usage_events_dedup
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_dedup
     ON usage_events(instance_id, run_id, sequence);
 ";
 
@@ -143,7 +156,7 @@ ALTER TABLE usage_events ADD COLUMN output_micros_per_1m INTEGER;
 /// `ON DELETE CASCADE` + `foreign_keys=ON` (set per-connection in `configure`)
 /// makes removing an instance drop its attachment automatically.
 const SCHEMA_V5: &str = "\
-CREATE TABLE agent_memory_backing (
+CREATE TABLE IF NOT EXISTS agent_memory_backing (
     id           INTEGER PRIMARY KEY,
     instance_id  INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,
     kind         TEXT NOT NULL,
@@ -323,31 +336,55 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
 
     // Step up one version at a time, applying each version's DDL in order. A DB
     // already at SCHEMA_VERSION runs no DDL (idempotent reopen). Each step is
-    // additive; a partially-migrated DB from a crashed migration re-runs only
-    // the steps it still needs.
+    // additive and CRASH-ATOMIC (story 11-3, B3): the step's DDL and its
+    // `user_version` stamp commit together inside one `BEGIN IMMEDIATE`
+    // transaction, so a process death mid-step rolls the whole step back and
+    // the DB stays at the last COMPLETED version — a reopened migration re-runs
+    // exactly the steps it still needs, never a half-applied one. The CREATE
+    // statements are additionally `IF NOT EXISTS`, so a DB frozen by the older
+    // batch-then-stamp migrator (DDL applied, final stamp lost — its crash
+    // window left `user_version` at 0 with the v1 objects already on disk)
+    // reopens cleanly instead of dying on "table already exists". The ADD
+    // COLUMN steps keep no such tolerance: under THIS migrator a column-already-
+    // added state is unreachable (the ALTER and its stamp commit or roll back
+    // together) — but a LEGACY freeze in the v3/v4 ALTER window (old migrator,
+    // `user_version` 0 with the column already on disk) still fails the reopen
+    // on "duplicate column name". That state predates this migrator; the
+    // fail-loud error is the documented contract (see the module doc and
+    // `migration_legacy_freeze_in_the_alter_window_fails_loud`), not a silent
+    // mis-recovery.
     if version < 1 {
-        conn.execute_batch(SCHEMA_V1).map_err(backend)?;
+        migrate_step(conn, 1, SCHEMA_V1)?;
     }
     if version < 2 {
-        conn.execute_batch(SCHEMA_V2).map_err(backend)?;
+        migrate_step(conn, 2, SCHEMA_V2)?;
     }
     if version < 3 {
-        conn.execute_batch(SCHEMA_V3).map_err(backend)?;
+        migrate_step(conn, 3, SCHEMA_V3)?;
     }
     if version < 4 {
-        conn.execute_batch(SCHEMA_V4).map_err(backend)?;
+        migrate_step(conn, 4, SCHEMA_V4)?;
     }
     if version < 5 {
-        conn.execute_batch(SCHEMA_V5).map_err(backend)?;
+        migrate_step(conn, 5, SCHEMA_V5)?;
     }
 
-    if version < SCHEMA_VERSION {
-        // pragma_update cannot bind user_version; format the constant in. It is
-        // a compile-time integer, so this is injection-safe.
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .map_err(backend)?;
-    }
     Ok(())
+}
+
+/// Apply ONE schema-version step atomically (story 11-3, B3): the step's DDL
+/// and its `user_version = to_version` stamp run inside ONE `BEGIN IMMEDIATE`
+/// transaction, so they commit together or not at all — a crash mid-step
+/// cannot leave the DDL applied with the stamp missing. The last executed step
+/// stamps [`SCHEMA_VERSION`], so a fully-migrated DB reads the target version
+/// exactly as the previous single final stamp did. `PRAGMA user_version`
+/// writes the database header through the pager and participates in the
+/// transaction like any other write.
+fn migrate_step(conn: &Connection, to_version: i64, ddl: &str) -> Result<(), StoreError> {
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;\n{ddl}\nPRAGMA user_version = {to_version};\nCOMMIT;"
+    ))
+    .map_err(backend)
 }
 
 /// Map an arbitrary `rusqlite::Error` into a backend [`StoreError`].
@@ -1608,6 +1645,96 @@ mod tests {
             .upsert_spawn_record(&record("legacy", 3, 30, 0))
             .unwrap();
         assert!(store.get_spawn_record(&name("legacy")).unwrap().is_some());
+    }
+
+    #[test]
+    fn migration_resumes_from_a_db_frozen_mid_migration() {
+        // Story 11-3 (B3): the crash window the OLD batch-then-stamp migrator
+        // had — a process death between applying the v1 batch and writing the
+        // version stamp — left a DB whose v1 objects EXIST but whose
+        // `user_version` is still the 0 default. Reopening must NOT die on
+        // "table already exists": the IF NOT EXISTS CREATEs no-op, the
+        // remaining steps apply inside their own transactions, the version
+        // stamps to the target, and the rows written before the crash survive.
+        // (Under the new per-step transaction this frozen state can no longer
+        // be PRODUCED by a crash — that is exactly the point; the test
+        // simulates the state the old engine could leave behind.)
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            // The crash simulation: the v1 DDL is on disk, the stamp is NOT —
+            // user_version stays at its 0 default.
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('frozen', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopen: the migrator resumes from 0 OVER the existing objects —
+        // no "table already exists", every step's transaction commits, and the
+        // pre-crash row survives.
+        let store = SqliteStore::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION, "the target version is stamped");
+        assert!(
+            store.get_instance(&name("frozen")).unwrap().is_some(),
+            "the row written before the crash must survive the resumed migration"
+        );
+        // The formerly-missing machinery is real and usable.
+        store
+            .upsert_spawn_record(&record("frozen", 4, 40, 0))
+            .unwrap();
+        assert!(store.get_spawn_record(&name("frozen")).unwrap().is_some());
+    }
+
+    #[test]
+    fn migration_legacy_freeze_in_the_alter_window_fails_loud() {
+        // Story 11-3 (B3, review loop 1): the ONE legacy frozen state the
+        // resumed migration cannot heal — the OLD batch-then-stamp migrator
+        // died after v3's `ALTER TABLE ... ADD COLUMN` but before its stamp, so
+        // the column is already on disk with `user_version` still 0. SQLite has
+        // no `IF NOT EXISTS` for ADD COLUMN, so the reopen FAILS LOUD on
+        // "duplicate column name" — the documented, honest contract (see the
+        // module doc): the state predates this migrator, is unreachable for
+        // crashes under the transactional steps, and the error names the real
+        // problem instead of silently mis-recovering. This test pins that
+        // boundary so a future change cannot quietly turn it into a wrong
+        // success or an obscure failure.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            // The v3 ALTER is ON DISK — the simulated legacy crash window.
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            // ... and the stamp is NOT: user_version stays 0.
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version, 0,
+                "the legacy crash window: DDL applied, stamp lost"
+            );
+        }
+        let open_result = SqliteStore::open(&db);
+        let err = open_result
+            .err()
+            .expect("the legacy ALTER-window freeze must fail loud, not silently recover");
+        let text = err.to_string();
+        assert!(
+            text.to_lowercase().contains("duplicate column"),
+            "the error must name the real problem (duplicate column), got: {text}"
+        );
     }
 
     // ---- Story 3-1: the Usage Ledger write + reads + dedup (AD-6/AD-7) ----

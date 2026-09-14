@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use ktesio_adapter_api::{
-    Capability, CapabilityDeclaration, EffectiveCapabilities, OsId, SupportLevel,
+    Capability, CapabilityDeclaration, ConfigTarget, EffectiveCapabilities, OsId, SupportLevel,
 };
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
@@ -268,16 +268,24 @@ impl Registry {
     ///
     /// Ensures the state dir exists and opens (creating + migrating) the DB.
     pub fn open(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
-        // Preserve the offending base (if one was supplied) so the diagnostic
-        // can name it instead of showing a blank path.
-        let offending = base
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("<default via {}>", crate::paths::STATE_DIR_ENV));
-        let paths = EnginePaths::new(base).map_err(|e| RegistryError::Io {
-            name: "<state-dir>".to_string(),
-            path: offending,
-            source: std::io::Error::other(e.to_string()),
+        let paths = EnginePaths::new(base).map_err(|e| {
+            // AI-4: name the ACTUAL path that failed. A rejected relative
+            // `KTESIO_STATE_DIR` carries the offending value itself — not the
+            // `<default via …>` placeholder, which describes a resolution mode,
+            // not the path the operator typed. Only the genuinely path-less
+            // failure (no env var and no platform data dir) keeps the
+            // placeholder, because there is no concrete path to name.
+            let path = match &e {
+                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
+                crate::paths::PathError::NoStateDir => {
+                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
+                }
+            };
+            RegistryError::Io {
+                name: "<state-dir>".to_string(),
+                path,
+                source: std::io::Error::other(e.to_string()),
+            }
         })?;
         // Create the state base (and thus its parent chain) before opening the
         // DB — a fresh install has no directory yet (AC1 "fresh state").
@@ -461,10 +469,19 @@ impl Registry {
              name = \"{name}\"\n",
             name = name.as_str(),
         );
-        std::fs::write(&config_path, body).map_err(|source| RegistryError::Io {
-            name: name.as_str().to_string(),
-            path: config_path.to_string_lossy().into_owned(),
-            source,
+        // ATOMIC (story 11-2 review-1, AI-24 family): this is the SAME instance
+        // `config.toml` the `set_config` write persists, so it gets the same
+        // temp-file + rename treatment — a crash mid-registration cannot leave
+        // a truncated config.toml behind. The error mapping is unchanged
+        // (RegistryError::Io naming the path); a failure here is covered by the
+        // registration rollback below (row delete + home removal), which also
+        // sweeps any residue the helper's own best-effort cleanup could miss.
+        crate::paths::write_atomically(&config_path, body.as_bytes()).map_err(|source| {
+            RegistryError::Io {
+                name: name.as_str().to_string(),
+                path: config_path.to_string_lossy().into_owned(),
+                source,
+            }
         })?;
 
         // Persist the FULL per-OS declaration + metering source (+ manifest path
@@ -968,19 +985,41 @@ impl Registry {
     /// value is stored as an ordinary TOML STRING — a `secret:NAME` REFERENCE is
     /// what is persisted here (story 2-4 resolves + masks it at start/read, FR-14;
     /// this write neither resolves nor echoes a secret).
+    ///
+    /// The persisted write is ATOMIC (story 11-2, AI-24): the serialized layer is
+    /// written to a same-directory temp file and renamed over the
+    /// instance `config.toml` ([`crate::paths::write_atomically`]), so a crash
+    /// mid-write leaves the OLD bytes — never a truncated file — and a failed
+    /// write leaves no temp residue. The error mapping is unchanged: a
+    /// write/rename failure surfaces as the same [`ConfigError::MalformedLayer`]
+    /// naming the layer + path as before.
+    ///
+    /// On SUCCESS the returned vec carries ZERO OR MORE WARN-ONLY steering
+    /// warnings (story 11-2, AI-33). The one warning today: a `secret:NAME` value
+    /// set on a key the adapter maps to a FLAG target — the resolved cleartext
+    /// would ride the process argv (world-readable cross-user), so the operator
+    /// is steered toward an env/file target. The write itself is NEVER rejected
+    /// (warning semantics were never ratified as errors); the caller (the CLI)
+    /// prints each warning to stderr. Resolution of the adapter mapping is
+    /// BEST-EFFORT: a snapshot/manifest that cannot be read simply yields no
+    /// warning — steering must never fail (or complicate) a valid write.
     pub(crate) fn set_config(
         &self,
         name: &InstanceName,
         key: &str,
         value: &str,
-    ) -> Result<(), ConfigError> {
+    ) -> Result<Vec<String>, ConfigError> {
         self.require_instance(name)?;
 
         // (1) Validate BEFORE touching disk (AC-B). A rejection returns here with
         // nothing written.
         config::validate_write(key, value)?;
 
-        // (2) Load the current instance layer, set the dotted key (deep), and
+        // (2) Compute the AI-33 steering warnings (warn-only, before the write so
+        // an Err return below can never carry a half-computed warning state).
+        let warnings = self.secret_flag_steering(name, key, value);
+
+        // (3) Load the current instance layer, set the dotted key (deep), and
         // re-serialize. All through path authority — the engine owns the path.
         // set_dotted FAILS CLOSED on a scalar-intermediate collision (patch #3),
         // BEFORE the write below, so a conflicting write leaves config unchanged.
@@ -994,12 +1033,61 @@ impl Registry {
                 path: path.to_string_lossy().into_owned(),
                 detail: format!("could not serialize the updated instance config: {e}"),
             })?;
-        std::fs::write(&path, serialized).map_err(|source| ConfigError::MalformedLayer {
-            layer: SourceLayer::Instance,
-            path: path.to_string_lossy().into_owned(),
-            detail: format!("could not write the instance config: {source}"),
+        // ATOMIC write (AI-24): temp in the target's directory + one rename, so
+        // a crash mid-write cannot truncate the instance config. The error shape
+        // is unchanged (MalformedLayer naming the layer + path).
+        crate::paths::write_atomically(&path, serialized.as_bytes()).map_err(|source| {
+            ConfigError::MalformedLayer {
+                layer: SourceLayer::Instance,
+                path: path.to_string_lossy().into_owned(),
+                detail: format!("could not write the instance config: {source}"),
+            }
         })?;
-        Ok(())
+        Ok(warnings)
+    }
+
+    /// The AI-33 set-time steering fact (story 11-2): does THIS write put a
+    /// `secret:NAME` value onto a key whose adapter mapping target is a FLAG?
+    /// Returns zero or one rendered warning (the CLI prints it to stderr).
+    ///
+    /// Only a genuine secret REFERENCE steers ([`config::secret_name`] — the same
+    /// predicate masking and resolution use, so the three can never disagree),
+    /// and only on a DOCUMENTED known key: an `agent.*` pass-through key is
+    /// delivered verbatim to an env var named by its tail regardless of any
+    /// declared rule, so a flag rule on it is never consulted and a warning
+    /// would be wrong. The key's target is learned from the adapter's declared
+    /// mapping via [`Self::adapter_launch_facts`] +
+    /// [`adapter::resolve_config_mapping`] — the same `memory_key_declared`
+    /// pattern the memory-status read uses. Both reads are BEST-EFFORT here: an
+    /// unreadable snapshot/manifest suppresses the warning (an advisory must
+    /// never fail a valid write).
+    ///
+    /// HONESTY BOUNDARY (review-1 patch 9): this warning reflects the CURRENT
+    /// manifest declaration at SET time — a manifest EDITED after registration
+    /// can change a key's target and make this warning stale in either
+    /// direction (a now-env target keeps an unneeded silence; a now-flag target
+    /// warns only at the next set). The START-time half of the steering reads
+    /// the persisted REGISTRATION snapshot — the launch/mapping the start seam
+    /// actually uses — so the runtime diagnostic always matches delivery.
+    fn secret_flag_steering(&self, name: &InstanceName, key: &str, value: &str) -> Vec<String> {
+        if config::secret_name(value).is_none() || config::pass_through_tail(key).is_some() {
+            return Vec::new();
+        }
+        let Ok((kind, manifest_path, _)) = self.adapter_launch_facts(name) else {
+            return Vec::new();
+        };
+        let Ok(mapping) = adapter::resolve_config_mapping(&kind, manifest_path.as_deref()) else {
+            return Vec::new();
+        };
+        match mapping.target(key) {
+            Some(ConfigTarget::Flag { .. }) => vec![format!(
+                "config key '{key}' holds a secret:NAME reference, but this adapter delivers \
+                 it to a FLAG target: the resolved cleartext will be passed on the agent's \
+                 command line, where argv is readable by other local users (ps, \
+                 /proc/<pid>/cmdline). Prefer an env or file target for secret-carrying keys.",
+            )],
+            _ => Vec::new(),
+        }
     }
 
     /// Persist the effective-config snapshot for an instance at START (story 2-3,
@@ -1712,8 +1800,12 @@ mod tests {
     #[test]
     fn register_rolls_back_when_config_file_cannot_be_written() {
         // Force the config *write* (not the dir creation) to fail by placing a
-        // directory where config.toml must be a file. Exercises the config
-        // write-failure Io branch and its rollback.
+        // directory where config.toml must be a file. Since story 11-2
+        // (review-1 patch 5) the config write is ATOMIC (temp + rename), so the
+        // injected failure is the RENAME failing onto the occupied path: the
+        // helper's own temp is cleaned up, the typed Io branch + its rollback
+        // run exactly as before, and the rollback sweeps the whole home — no
+        // partial config, no temp litter, nothing partial left in agents/.
         let tmp = TempDir::new().unwrap();
         let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
         let name = InstanceName::new("demo").unwrap();
@@ -1722,9 +1814,28 @@ mod tests {
         std::fs::create_dir_all(&config_as_dir).unwrap();
 
         let err = reg.register("demo", "mock").unwrap_err();
-        assert!(matches!(err, RegistryError::Io { .. }), "got {err:?}");
+        match err {
+            RegistryError::Io { name: n, path, .. } => {
+                assert_eq!(n, "demo");
+                assert!(
+                    path.ends_with("config.toml"),
+                    "the error must name the config write; path={path}"
+                );
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
         // Row rolled back.
         assert!(reg.list().unwrap().is_empty());
+        assert!(matches!(
+            reg.lookup(&name),
+            Err(RegistryError::NotFound { .. })
+        ));
+        // Nothing partial left behind: the rolled-back home is gone entirely —
+        // no half-written config.toml, no `.tmp-*` residue anywhere under it.
+        assert!(
+            !reg.paths().agent_home(&name).exists(),
+            "the registration rollback must remove the partial home"
+        );
     }
 
     #[test]
@@ -1761,11 +1872,14 @@ mod tests {
 
     #[test]
     fn open_maps_path_resolution_failure_and_names_the_base() {
-        // F8: when EnginePaths::new fails (here: a relative KTESIO_STATE_DIR),
-        // Registry::open must surface RegistryError::Io whose `path` names the
-        // offending base rather than being blank. Save/restore the shared env.
+        // F8 + AI-4: when EnginePaths::new fails (here: a relative
+        // KTESIO_STATE_DIR), Registry::open must surface RegistryError::Io whose
+        // `path` names the OFFENDING VALUE the operator supplied — not blank and
+        // not the `<default via KTESIO_STATE_DIR>` placeholder, which would hide
+        // the actual path that failed. Save/restore the shared env.
+        const OFFENDING: &str = "relative/base";
         let prev = std::env::var_os(crate::paths::STATE_DIR_ENV);
-        std::env::set_var(crate::paths::STATE_DIR_ENV, "relative/base");
+        std::env::set_var(crate::paths::STATE_DIR_ENV, OFFENDING);
         let result = Registry::open(None);
         std::env::set_var(crate::paths::STATE_DIR_ENV, ""); // neutralize before restore
         match prev {
@@ -1780,9 +1894,9 @@ mod tests {
         };
         match err {
             RegistryError::Io { path, .. } => {
-                // The diagnostic names the default-resolution context, not blank.
-                assert!(!path.is_empty(), "path must be populated (F8)");
-                assert!(path.contains(crate::paths::STATE_DIR_ENV));
+                // AI-4: the diagnostic names the actual relative path that was
+                // rejected (the source error still carries the full context).
+                assert_eq!(path, OFFENDING, "path must name the offending value");
             }
             other => panic!("expected Io from a relative env base, got {other:?}"),
         }
@@ -2432,6 +2546,115 @@ source = "self-reported"
         );
     }
 
+    // ---- Story 11-2: AI-24 (atomic set_config) + AI-33 (secret→flag steering) ----
+
+    /// Story 11-2 (AI-33): register a manifest adapter whose `[config.model]`
+    /// maps onto a FLAG target — the shape the set-time steering fires on (the
+    /// native `mock` maps `model` → env `MODEL`, the quiet path).
+    fn register_flag_target_instance(reg: &Registry, name: &str, manifest_dir: &Path) {
+        let body = format!(
+            "contract_version = \"1.0.0\"\n\n\
+             [adapter]\nkind = \"{name}\"\n\n\
+             [lifecycle.start]\nexec = \"the-agent\"\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n\n\
+             [config.model]\nflag = \"--model\"\n"
+        );
+        std::fs::write(manifest_dir.join("adapter.toml"), body).unwrap();
+        reg.register_with_adapter(name, &AdapterRef::Manifest(manifest_dir.to_path_buf()))
+            .unwrap();
+    }
+
+    // NOTE (review-1 patch 5 follow-up): the set_config WRITE-failure shape
+    // (forced write error -> old bytes intact, no temp residue, typed
+    // MalformedLayer) is pinned in
+    // `crates/ktesio-engine/tests/atomic_config_writes.rs`
+    // (`config_set_write_failure_leaves_old_bytes_and_no_temp_residue`,
+    // unix-gated: the injection needs a read-only home directory). The
+    // temp-path-planting injection this in-module test used cannot predict the
+    // review-1 collision-safe temp name (`<file>.tmp-<pid>-<tid>-<seq>`), and
+    // dir-at-target here would trip the earlier READ arm instead of the write.
+
+    #[test]
+    fn set_config_secret_on_flag_target_warns_but_succeeds() {
+        // AI-33 (the positive): a `secret:NAME` value on a FLAG-targeted key set
+        // SUCCEEDS (warn-only) and the returned warnings name the key + the
+        // argv-leak risk + the env/file alternative. The value still persists.
+        let (_tmp, reg) = open_temp();
+        let manifest = TempDir::new().unwrap();
+        register_flag_target_instance(&reg, "flgsec", manifest.path());
+        let name = InstanceName::new("flgsec").unwrap();
+
+        let warnings = reg.set_config(&name, "model", "secret:MY_SECRET").unwrap();
+        assert_eq!(warnings.len(), 1, "exactly one steering warning");
+        assert!(
+            warnings[0].contains("model"),
+            "names the key: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("FLAG"),
+            "names the flag-target leak risk: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("env") && warnings[0].contains("file"),
+            "names the env/file alternative: {}",
+            warnings[0]
+        );
+
+        // The value is persisted as the reference (the write is unaffected).
+        let eff = reg.effective_config(&name, ConfigLayer::empty()).unwrap();
+        assert_eq!(
+            eff.value("model"),
+            Some(&toml::Value::String("secret:MY_SECRET".into()))
+        );
+    }
+
+    #[test]
+    fn set_config_stays_quiet_without_a_secret_flag_combination() {
+        // AI-33 (the quiet paths — the common case must stay silent): a plain
+        // value on a flag-targeted key, a secret on an ENV-targeted key (the
+        // mock maps model → env MODEL), a secret on a pass-through key (delivered
+        // to env by tail regardless of any rule), and a secret on an unmapped
+        // documented key (Decision 6) all warn NOTHING.
+        let (_tmp, reg) = open_temp();
+        let manifest = TempDir::new().unwrap();
+        register_flag_target_instance(&reg, "flgq", manifest.path());
+        let flag_name = InstanceName::new("flgq").unwrap();
+        reg.register("mck", "mock").unwrap();
+        let mock_name = InstanceName::new("mck").unwrap();
+
+        assert!(
+            reg.set_config(&flag_name, "model", "plain-value")
+                .unwrap()
+                .is_empty(),
+            "a non-secret value on a flag target is quiet"
+        );
+        assert!(
+            reg.set_config(&mock_name, "model", "secret:QUIET_ENV")
+                .unwrap()
+                .is_empty(),
+            "a secret on an env target is quiet"
+        );
+        assert!(
+            reg.set_config(&flag_name, "agent.TAIL", "secret:QUIET_PT")
+                .unwrap()
+                .is_empty(),
+            "a secret on a pass-through key is quiet (delivered to env by tail)"
+        );
+        assert!(
+            reg.set_config(
+                &flag_name,
+                "metering.upstream_base_url",
+                "secret:QUIET_UNMAPPED"
+            )
+            .unwrap()
+            .is_empty(),
+            "a secret on a known key the adapter maps NOWHERE is quiet (Decision 6 no-op)"
+        );
+    }
+
     #[test]
     fn set_config_agent_pass_through_key_round_trips_verbatim() {
         // AC7: an agent.* key writes successfully and round-trips verbatim at the
@@ -3020,6 +3243,48 @@ source = "self-reported"
         assert_eq!(
             reg.memory_status("demo").unwrap().unwrap().kind,
             MemoryBackingKind::Filesystem
+        );
+    }
+
+    #[test]
+    fn attaching_filesystem_over_an_attached_native_backing_is_rejected_symmetrically() {
+        // A5 (story 11-3): the REVERSE conflict direction — a `native` backing
+        // attached, `filesystem` requested. Symmetric to the forward case
+        // above: the same typed error naming attached/requested, and NOTHING
+        // mutates — the native row stands and the rejected request creates no
+        // managed directory (the side effects run only after every fallible
+        // check passes).
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        reg.attach_memory("demo", MemoryBackingKind::Native)
+            .unwrap();
+        let err = reg
+            .attach_memory("demo", MemoryBackingKind::Filesystem)
+            .unwrap_err();
+        match &err {
+            RegistryError::MemoryBackingKindConflict {
+                name,
+                attached,
+                requested,
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(attached, "native");
+                assert_eq!(requested, "filesystem");
+            }
+            other => panic!("expected MemoryBackingKindConflict, got {other:?}"),
+        }
+        // The original attachment stands untouched ...
+        assert_eq!(
+            reg.memory_status("demo").unwrap().unwrap().kind,
+            MemoryBackingKind::Native
+        );
+        // ... and no managed directory was created by the rejected request.
+        assert!(
+            !reg.paths()
+                .agent_home(&InstanceName::new("demo").unwrap())
+                .join(crate::paths::MEMORY_DIR)
+                .exists(),
+            "a rejected conflict must not create the managed directory"
         );
     }
 

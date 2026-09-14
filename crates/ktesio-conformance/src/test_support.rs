@@ -536,11 +536,13 @@ pub fn fake_agent_bin_in(hop: BinDir) -> PathBuf {
 /// the output that flag was supposed to produce burn their deadlines and report
 /// a timing-shaped failure that has nothing to do with timing.
 ///
-/// The guard therefore lives in `.github/workflows/ci.yml`, in BOTH jobs that
-/// run these tests (`test` and `coverage`): `rm -f target/debug/fake_agent*`
-/// followed by an explicit `cargo build -p ktesio-conformance --bin fake_agent`
-/// before the suite. `scripts/test_automation.py` asserts both jobs still carry
-/// it. Any NEW job that spawns agents must carry it too.
+/// The guard therefore lives in `.github/workflows/ci.yml`, in EVERY job that
+/// spawns agents: the `test` and `coverage` jobs (`rm -f target/debug/fake_agent
+/// target/debug/fake_agent.exe` followed by an explicit `cargo build -p
+/// ktesio-conformance --bin fake_agent` before the suite) and the
+/// `perf-budgets` job (the same rm + rebuild pair against `target/release/`,
+/// where the harness resolves the helper). `scripts/test_automation.py` asserts
+/// all three still carry it. Any NEW job that spawns agents must carry it too.
 ///
 /// Kept a plain runtime path computation — no OS-conditional compilation (the
 /// executable suffix comes from [`std::env::consts::EXE_SUFFIX`], a runtime

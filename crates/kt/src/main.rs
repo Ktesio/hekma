@@ -112,7 +112,7 @@ enum Commands {
 enum AgentCommands {
     /// Register a new Agent Instance under a unique name
     Register {
-        /// Fleet-unique instance name (^[a-z0-9][a-z0-9_-]*$)
+        /// Fleet-unique instance name (`^[a-z0-9][a-z0-9_-]*$`)
         name: String,
         /// Native adapter kind (e.g. mock). Mutually exclusive with --manifest.
         #[arg(
@@ -271,7 +271,12 @@ enum ConfigCommands {
         /// Config key (a known unified key, or an `agent.*` pass-through key)
         key: String,
         /// Value to set (stored verbatim; a `secret:NAME` reference is resolved +
-        /// masked at start/read, FR-14 — the reference is what is stored here)
+        /// masked at start/read, FR-14 — the reference is what is stored here).
+        /// Accepts a value starting with `-`/`--` (e.g. `-x`) LITERALLY — clap
+        /// does not intercept it as a flag (story 11-2, AI-26; mirrors `send`'s
+        /// `text`), so the `--` separator is optional rather than mandatory
+        /// (it still works for callers who prefer it).
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
     /// Get an Agent Instance's effective (resolved) config value(s) with per-value source

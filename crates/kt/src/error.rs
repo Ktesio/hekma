@@ -124,6 +124,21 @@ pub struct AgentCapabilityUnsupported {
     pub message: String,
 }
 
+/// AI-7: `resume` targeted a PAUSED instance whose adapter declares PAUSE
+/// unsupported on this OS — the engine cannot confidently signal the suspension
+/// awake. A dedicated diagnostic (not the bare pause-unsupported one) because
+/// the instance is already `paused`: the bare diagnostic would strand the
+/// operator with no way forward. The message names the state + the declaration
+/// and gives the escape hatch (`stop` works without pause support). Classified
+/// as exit `5` (Unsupported capability) — the same class as
+/// [`AgentCapabilityUnsupported`], no new exit-code number (DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::resume_unsupported))]
+pub struct AgentResumeUnsupported {
+    pub message: String,
+}
+
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
 #[diagnostic(code(ktesio::agent::unknown_config_key))]
