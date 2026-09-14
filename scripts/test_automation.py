@@ -483,21 +483,23 @@ class ReleaseDocsTests(unittest.TestCase):
             ci,
         )
         # Story 7-4 arms the SAME mechanism for ktesio-engine, against a
-        # DIFFERENT honest freeze point: the embedding-surface freeze
-        # 8a8b328 (story 7-3), NOT the contract freeze 4119db3 — the engine's
-        # unpublished surface legitimately grew after the contract froze (the
-        # freeze itself added `LaunchResolveError::ContractIncompatible`, and
-        # a 4119db3 baseline fails two major lints on that honest history),
-        # so the engine's embedding surface freezes at 7-3's commit. Both
+        # DIFFERENT honest freeze point (NOT the contract freeze 4119db3 —
+        # the engine's unpublished surface legitimately grew after the
+        # contract froze; a 4119db3 baseline fails major lints on that
+        # honest history). Current baseline: bee7d48, the epic-11 merge
+        # (2026-09-14) — the first deliberate post-freeze surface extension
+        # (`EngineError::ResumeUnsupported`, AI-7, announced in PR #181)
+        # superseded the embedding-surface freeze (armed at 7-3's 8a8b328,
+        # pinned to 12f3aab per the main-history constraint). Both
         # baseline revs get the cat-file resolvability check so a history
         # rewrite is a CLEAR infra error. Maintenance: bump all four pins
         # (two here, two in ci.yml) together at the next deliberate freeze.
         self.assertIn(
             "cargo +stable semver-checks check-release -p ktesio-engine "
-            "--baseline-rev 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755",
+            "--baseline-rev bee7d4876d70957399b1d97bcf4347883b47da58",
             ci,
         )
-        self.assertIn("git cat-file -e 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755^{commit}", ci)
+        self.assertIn("git cat-file -e bee7d4876d70957399b1d97bcf4347883b47da58^{commit}", ci)
         # The baseline lookup needs full history: the semver job's checkout
         # must override the default shallow clone. Scoped to the SEMVER JOB
         # BLOCK ONLY (up to the next job heading): a `fetch-depth: 0` in some

@@ -524,11 +524,11 @@ jobs:
           # The armed in-repo baseline guard (#160, epic-6 retro A1; engine arm
           # in story 7-4) diffs TWO frozen surfaces against their freeze
           # commits: ktesio-adapter-api against the contract-v1 freeze commit
-          # 4119db3, and ktesio-engine against the embedding-surface freeze
-          # commit 8a8b328 (see the baseline comment below for why the two
-          # SHAs differ). The default shallow clone cannot resolve a
-          # historical rev, so this job fetches full history for the baseline
-          # lookups.
+          # 4119db3, and ktesio-engine against the epic-11 surface-extension
+          # freeze commit bee7d48 (see the baseline comment below for why the
+          # two SHAs differ, and for the freeze history). The default shallow
+          # clone cannot resolve a historical rev, so this job fetches full
+          # history for the baseline lookups.
           fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
@@ -627,16 +627,20 @@ jobs:
           # TWO baselines, two honest freeze points:
           # * ktesio-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
           #   contract surface has been frozen since story 6-6.
-          # * ktesio-engine @ 8a8b328 — the EMBEDDING-surface freeze (stories
-          #   7-1/7-2/7-3 landed; story 7-4 arms the guard). Deliberately NOT
-          #   4119db3: the engine's surface was legitimately still growing when
-          #   the contract froze (the freeze itself added the
-          #   `LaunchResolveError::ContractIncompatible` variant to an engine
-          #   error enum, and the lifecycle/events stories reshaped more) — the
-          #   engine was `publish = false` throughout, so those were allowed
-          #   evolution, and a 4119db3 baseline would red CI on that honest
-          #   history. The embedding surface the hosts see freezes at 7-3's
-          #   commit instead. Same mechanism, same pins, same bump procedure.
+          # * ktesio-engine @ bee7d48 — the epic-11 merge (2026-09-14, PR
+          #   #181): the first deliberate post-freeze surface extension
+          #   (`EngineError::ResumeUnsupported`, AI-7 — announced in the PR)
+          #   defines the new freeze point. Supersedes the EMBEDDING-surface
+          #   freeze (armed at 7-3's 8a8b328, later pinned to 12f3aab per the
+          #   main-history constraint below). That freeze was itself
+          #   Deliberately-NOT-4119db3: the engine's surface was legitimately
+          #   still growing when the contract froze (the freeze itself added
+          #   the `LaunchResolveError::ContractIncompatible` variant to an
+          #   engine error enum, and the lifecycle/events stories reshaped
+          #   more) — the engine was `publish = false` throughout, so those
+          #   were allowed evolution, and a 4119db3 baseline would red CI on
+          #   that honest history. Same mechanism, same pins, same bump
+          #   procedure.
           #
           # Maintenance: at the next deliberate freeze (a contract-v2 freeze
           # for adapter-api, or an announced engine major), update the SHAs
@@ -652,8 +656,8 @@ jobs:
             exit 1
           }
           cargo +stable semver-checks check-release -p ktesio-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
-          git cat-file -e 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755^{commit} || {
-            echo "::error::semver baseline rev 8a8b328… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
+          git cat-file -e bee7d4876d70957399b1d97bcf4347883b47da58^{commit} || {
+            echo "::error::semver baseline rev bee7d48… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
             exit 1
           }
 
@@ -663,7 +667,7 @@ jobs:
           # check reds every post-merge run (8a8b328 was a branch-only commit and
           # did exactly that). Bump baselines only to main-history revs at
           # deliberate freeze points, together with scripts/test_automation.py.
-          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev 12f3aabfadcd9a6c18c03837dbd2778b1e9f5755
+          cargo +stable semver-checks check-release -p ktesio-engine --baseline-rev bee7d4876d70957399b1d97bcf4347883b47da58
           for crate in ktesio-engine ktesio-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
