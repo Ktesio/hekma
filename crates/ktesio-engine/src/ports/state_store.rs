@@ -45,6 +45,17 @@ pub struct SpawnRecord {
     /// The last-known transition cause label (e.g. the crash detail), used when
     /// reconciling a non-adopted record to `failed`. `None` if not yet set.
     pub last_known_cause: Option<String>,
+    /// Story 12-1 AMENDMENT (review loop 1): whether the spawn was DETACHED
+    /// (`kt agent start --detach`). Detached-ness is a CROSS-LIFETIME property:
+    /// it rides this record so every later `adopt()` re-holds the handle
+    /// DISARMED (Unix: Drop skips the group kill; Windows: the handle never
+    /// kills at drop anyway), and a benign intervening command's engine exit
+    /// leaves the detached agent alive. Without the flag on the record, the
+    /// first benign command after a detached start would kill the agent at its
+    /// engine exit — the exact known-bad state the amendment closes. `false`
+    /// keeps the story 1-6 adoption semantics byte-for-byte (the adopting
+    /// engine owns what it re-holds and tears it down at ITS clean exit).
+    pub detach: bool,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.

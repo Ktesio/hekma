@@ -48,7 +48,11 @@ The `hermes` builtin launches the real Hermes gateway by the bare executable nam
 
 A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. A later, separate `kt agent list` then reports the instance as `failed` because the supervised process is gone.
 
-This is expected today — durable supervision across separate CLI invocations is future work (a supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+This is expected for the plain start. If you want the agent to keep running across commands, start it with `kt agent start --detach`: the agent survives the command's exit and the next `kt` command re-adopts it. Between commands a detached agent is *not* supervised — no crash detection, no budget enforcement, no usage/event delivery — so if the agent dies in that window, the next command reconciles the row honestly to `failed` instead of restarting it. If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+
+## `start --detach` Refused ("cannot be started with --detach")
+
+A detached start of an `engine-observed` instance is refused before anything changes: the engine-observed channel's loopback forward listener lives inside the starting command, so a detached start would leave the agent pointing at a listener that dies with the command — its model calls would then hit a dead port. Start the instance without `--detach` (the in-command supervision keeps the listener alive), or switch the adapter's metering source to `self-reported` if the instance must detach. This failure exits with code 5 and changes no state.
 
 ## Invalid Lifecycle Transition
 

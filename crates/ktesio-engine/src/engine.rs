@@ -813,6 +813,25 @@ impl Engine {
         .await
     }
 
+    /// Start a registered Agent Instance DETACHED (story 12-1): the child's
+    /// handle is disarmed at spawn so it survives THIS engine session's exit;
+    /// the next engine open re-adopts it via the existing fingerprint path.
+    /// An `engine-observed` instance is refused before any side effect
+    /// ([`EngineError::DetachRefused`]). The caller owes the operator the
+    /// honest enforcement-window statement (no crash detection / budget
+    /// enforcement / event delivery between commands) — the `kt` CLI states
+    /// it on `--help` and its stderr notice.
+    pub async fn start_detached(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.start_detached(&registry, &name)
+        })
+        .await
+    }
+
     /// Stop a running Agent Instance (AC3/AC4).
     ///
     /// Transitions `running → stopping`, requests graceful shutdown via the
@@ -1387,6 +1406,11 @@ impl Blocking<'_> {
     /// Blocking [`Engine::start`].
     pub fn start(&self, name: &str) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.start(name))
+    }
+
+    /// Blocking [`Engine::start_detached`] (story 12-1).
+    pub fn start_detached(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.engine.rt.block_on(self.engine.start_detached(name))
     }
 
     /// Blocking [`Engine::stop`].

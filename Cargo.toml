@@ -46,17 +46,43 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync
 # block (server + client + http1); `hyper-util` provides the tokio glue (the
 # legacy client for the outbound forward leg + the auto/graceful server conn);
 # `http-body-util` + `bytes` collect/relay request/response bodies faithfully.
-# NFR-8 architecture justification: this is the SINGLE new HTTP dependency family
-# for the engine-observed interception point — no heavier web framework, and NO
-# TLS stack (v1 forwards to an HTTP upstream; an HTTPS upstream is a documented
-# deferral, keeping the tree lean + free of a system-OpenSSL/ring C build, in the
-# same spirit as bundling SQLite). All build cleanly on MSRV 1.96.1 (verified).
-# Referenced by ktesio-engine ONLY (the listener is engine-internal, AD-2; kt
-# never sees it) — a normal external edge, unaffected by the AD-2 boundary gate.
+# NFR-8 architecture justification (REWRITTEN story 12-3): this is the SINGLE
+# new HTTP dependency family for the engine-observed interception point — no
+# heavier web framework. The TLS stack (below) is VENDORED rustls+ring: no
+# system TLS library (no OpenSSL/native-tls/security-framework), matching the
+# dependency philosophy that already bundled SQLite and that `kt`→`ureq`
+# already paid into (one rustls+ring pair unifies across the whole workspace —
+# verify with `cargo tree -p ktesio-engine -e normal | grep -E "rustls|ring"`).
+# All build cleanly on MSRV 1.96.1. Referenced by ktesio-engine ONLY (the
+# listener is engine-internal, AD-2; kt never sees it) — a normal external
+# edge, unaffected by the AD-2 boundary gate.
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
+# Story 12-3 (AI-47a ratified option i): the engine-observed listener dials
+# `https://` upstreams DIRECTLY — the local-TLS-hop deferral is replaced by a
+# working forward over a VENDORED TLS stack. `hyper-rustls` is the hyper-native
+# TLS connector (both schemes through one client: `.https_or_http()`),
+# `rustls` is the TLS implementation, `webpki-roots` the vendored root store —
+# NO system TLS dependency anywhere (native-tls/OpenSSL rejected: Linux OpenSSL
+# variance violates the philosophy; ring's C+asm is a vendored build like the
+# bundled SQLite, degree not kind). `default-features = false` keeps
+# aws-lc-rs (a CMake/haskell build) OUT and selects the `ring` provider —
+# the SAME rustls+ring pair `kt`→`ureq` already ships, so the tree holds ONE
+# copy of each (the feature-hygiene gate greps `cargo tree`). The `logging`
+# feature stays OFF: rustls/hyper-rustls never emit tracing here (the AI-48
+# tracing-exposure note in docs/embedding.md covers the checkpoint). The
+# engine names rustls DIRECTLY only to build the `ClientConfig` (production
+# webpki-roots default + the test seam) and the TLS upstream test server. The
+# `native-tokio` feature is deliberately OFF: in hyper-rustls 0.27 it no longer
+# gates the tokio runtime (tokio is the default) — it only pulls
+# `rustls-native-certs` (system trust-store lookup, plus its macOS
+# security-framework dep), which the engine never uses (roots are vendored
+# webpki-roots), so the tree stays free of system-trust surfaces.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "1"
 # Engine state store (AD-6): bundled SQLite, no system dependency.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).
@@ -92,3 +118,8 @@ tempfile = "3"
 # network/user probe features (and their windows/objc2 stacks) stay out of
 # the dev build.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Story 12-3: the self-signed test root for the TLS upstream test (the in-crate
+# https+SSE composition test). DEV-DEPENDENCY ONLY — never a shipping artifact,
+# NFR-8's runtime-lean policy is untouched. rcgen's default `ring` backend is
+# the SAME ring provider the TLS stack above ships, so no extra C build.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

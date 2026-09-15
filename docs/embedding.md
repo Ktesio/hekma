@@ -67,6 +67,7 @@ surface `kt` uses. The capabilities you will reach for first:
 | `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
+| `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle (story 12-1); refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
 | `resync_events` / `Blocking::resync_events` | Backfill the committed events a subscriber missed (below). |
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
@@ -76,6 +77,22 @@ surface `kt` uses. The capabilities you will reach for first:
 
 Every method returns a typed `Result` — the engine reports partial failures
 with a reason and a remediation instead of panicking.
+
+### The detached-start host duty (story 12-1)
+
+`start_detached` spawns a supervised agent whose handle is **disarmed**: your
+engine's exit — and the exit of every later engine that re-adopts it from the
+write-ahead record — leaves the process alive, until an explicit
+`stop`. That survival is the feature, and it has a cost the engine states but
+cannot itself cover: **between engine lifetimes there is no crash detection, no
+budget enforcement, and no event delivery** — supervision is command-scoped.
+A host that starts agents detached owes its operators the same honesty: keep
+the enforcement window visible wherever the option is offered, and remember
+that a detached instance's usage ledger only advances while some engine holds
+it. `start_detached` is refused outright (`EngineError::DetachRefused`) for
+engine-observed instances, because their loopback metering listener lives
+inside the starting engine and would strand the agent's `base_url` on a dead
+port — start those without detaching.
 
 ## The event bus
 
@@ -285,14 +302,19 @@ does. Four instruments keep that statement honest:
   library path and the CLI path behave identically
   ([the host test](https://github.com/iMagdy/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
 - **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
-  bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family),
+  bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family, and
+  since story 12-3 the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),
   check the tracing exposure: `hyper-util` links `tracing`, and its
   connection-pool events would carry the upstream host:port and timing IF a
   global `tracing-subscriber` were ever installed. The engine ships NO
   subscriber (events are no-ops) and hyper's own tracing feature is OFF, so
   today nothing is emitted; the exposure never carries the `Authorization`
-  header, body, or key. The checkpoint: any future story that installs a
-  global DEBUG/TRACE subscriber must re-audit what the HTTP stack logs at
+  header, body, or key. The new TLS crates keep the same silence by
+  configuration: hyper-rustls's `logging` feature is OFF (no tracing surface
+  linked), rustls logs only through the `log` facade at debug/trace levels —
+  and the engine installs no logger, so those calls are no-ops. The checkpoint: any future story that installs a
+  global DEBUG/TRACE subscriber must re-audit what the HTTP **and TLS** stacks
+  log at
   that level before it ships (a model-call endpoint is operator-sensitive
   context, even without credentials).
 - **The semver gate** — CI diffs both public crates' surfaces against their

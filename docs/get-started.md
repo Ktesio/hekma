@@ -123,7 +123,7 @@ kt agent stop my-agent --timeout 10
 
 `pause` is honest per-OS: a guaranteed pause suspends the process, a best-effort pause proceeds cooperatively and prints a visible note, and an unsupported pause fails fast quoting the Capability Declaration. `stop` requests a graceful shutdown and escalates to a forced kill after the window (`--timeout`, default 30s).
 
-> **Supervision boundary:** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. Durable supervision across separate CLI invocations is future work (a supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+> **Supervision boundary:** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits. To keep the agent running across commands, start it with `kt agent start --detach` — the agent survives the command's exit and the next `kt` command re-adopts it; between commands it is *not* supervised (no crash detection, no budget enforcement, no usage/event delivery — supervision is command-scoped). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
 ## Manage secrets
 

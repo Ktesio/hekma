@@ -362,8 +362,9 @@ pub enum EngineError {
 
     /// The `engine-observed` loopback forward listener could not START at `start`
     /// (story 3-4, FR-19/AD-7). Reasons: no configured upstream provider URL
-    /// (`metering.upstream_base_url` unset), a non-http/https upstream (v1
-    /// HTTP-only), a loopback bind failure, or no engine runtime handle to spawn on.
+    /// (`metering.upstream_base_url` unset), a non-http/https upstream (12-3:
+    /// https IS accepted; other schemes are refused), a loopback bind failure, or
+    /// no engine runtime handle to spawn on.
     /// The listener starts BEFORE the `starting` transition, so a failure FAILS the
     /// start cleanly — the instance stays in its prior state, NO half-launch
     /// (mirroring the snapshot/secret failures). `detail` carries the underlying
@@ -375,6 +376,25 @@ pub enum EngineError {
         /// The instance whose observed listener failed to start.
         name: String,
         /// The underlying listener reason (traffic-free — never a body/header/key).
+        detail: String,
+    },
+
+    /// A DETACHED start (`kt agent start --detach`, story 12-1) was requested
+    /// for an instance whose configuration cannot be detached. v1's single
+    /// refusal: an `engine-observed` instance — its loopback forward listener
+    /// lives inside the starting command, so a detached start would inject a
+    /// `base_url` that dies with the command and strand the agent's model
+    /// traffic on a dead port. The refusal fires BEFORE any side effect (no
+    /// transition, no listener, no spawn — the instance keeps its prior state),
+    /// and `detail` names the why + the remediation. Distinct from
+    /// [`EngineError::ObservedMetering`]: nothing failed to start — the
+    /// detachment itself is what is refused.
+    #[error("Agent Instance '{name}' cannot be started with --detach: {detail}")]
+    DetachRefused {
+        /// The instance whose detached start was refused.
+        name: String,
+        /// The why + remediation (names the engine-observed listener lifetime;
+        /// no traffic, no secret).
         detail: String,
     },
 

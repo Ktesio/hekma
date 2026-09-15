@@ -29,7 +29,7 @@
 //! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
 //! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict` |
-//! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable` |
+//! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable`, `AgentDetachRefused` (story 12-1: a detached start of an engine-observed instance — the operation cannot be done for this instance) |
 //! | `6` | Timed out | `AgentInteractionTimedOut` |
 //!
 //! ## Why a downcast classifier (not a `CliError` enum)
@@ -53,7 +53,7 @@
 // code-1 diagnostics all fall through the catch-all arm (so they are NOT named in
 // `classify`), and are imported inside the test module where they are constructed.
 use crate::error::{
-    AgentCapabilityUnsupported, AgentDuplicateName, AgentInteractionTimedOut,
+    AgentCapabilityUnsupported, AgentDetachRefused, AgentDuplicateName, AgentInteractionTimedOut,
     AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentManifestNotFound,
     AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNotFound, AgentNotRunning,
     AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentUnknownConfigKey,
@@ -133,6 +133,11 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
     } else if err.is::<AgentCapabilityUnsupported>()
         || err.is::<AgentResumeUnsupported>()
         || err.is::<AgentInteractionUnavailable>()
+        // Story 12-1: a detached start of an engine-observed instance is
+        // refused before any side effect — the operation cannot be done for
+        // this instance (its loopback listener dies with the command), the
+        // same "unsupported for this instance" class as the capability arms.
+        || err.is::<AgentDetachRefused>()
     {
         ExitCode::Unsupported
     // 6 — timed out: a bounded operation exceeded its deadline.
@@ -313,6 +318,12 @@ mod tests {
             }),
             boxed(AgentInteractionUnavailable {
                 message: "unavailable".into(),
+            }),
+            // Story 12-1: the detached-start refusal joins code 5 — "cannot be
+            // done for this instance" (its engine-observed listener dies with
+            // the command), the same unsupported class, no new number (DC-4).
+            boxed(AgentDetachRefused {
+                message: "detach-refused".into(),
             }),
         ] {
             assert_eq!(

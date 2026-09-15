@@ -181,6 +181,22 @@ pub struct AgentStopUnconfirmed {
     pub message: String,
 }
 
+/// Story 12-1: a detached start (`kt agent start --detach`) was requested for
+/// an instance whose configuration cannot be detached — v1's single refusal is
+/// the `engine-observed` metering channel, whose loopback forward listener
+/// lives inside the starting command and would strand the agent's model traffic
+/// on a dead port the moment the command exits. The engine refuses before any
+/// side effect (no transition, no listener, no spawn), and the message carries
+/// the why + the remediation. Classified as exit `5` (Unsupported) — the
+/// operation cannot be done for this instance, the same class as a
+/// capability-unsupported command; no new exit-code number was minted (DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(ktesio::agent::detach_refused))]
+pub struct AgentDetachRefused {
+    pub message: String,
+}
+
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
 #[diagnostic(code(ktesio::agent::memory_hot_swap))]
