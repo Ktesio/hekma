@@ -46,6 +46,13 @@ The tag workflow updates the GitHub Release immediately and then opens a pull re
 > - **Ratified subscriber-active budgets** (story 10-3): the perf-budgets harness gains a subscriber-overhead addendum with three hard gates on the one-active-subscriber deltas vs the zero-subscriber baseline — CPU Δ ≤ 0.25 percentage points, RSS Δ ≤ 2 MiB, read-p99 Δ ≤ 100 ms per running instance (strict locally; the documented ×1.5 shared-runner tolerance in CI) — ratified from measured deltas recorded in [Testing](testing.md#performance-budgets-nfr-4-story-75).
 > - **Audit teeth**: the embed-clean audit pins the sink plumbing count==1 (the emission choke point, both routes into it, the single stderr default arm) and its stdio-reach scan covers fully-qualified, bare imported-path, and hand-written `_print` write forms — a stdio write via an imported path cannot evade the single-writer count.
 
+> **ktesio-engine 0.2.0 — the library's first breaking release (published 2026-09-15, Islam's explicit go; announced ahead in PR #181).**
+> The engine's crate version moves 0.1.0 → 0.2.0 to carry the epic-11 surface extension that the CI semver gate flagged (its first real firing — first against the in-repo freeze baseline, then against the PUBLISHED 0.1.0 baseline once the crates.io release-to-release loop armed):
+>
+> - **`EngineError::ResumeUnsupported` is a NEW variant on the exhaustive `EngineError` enum** (AI-7, story 11-1): a `resume` on a PAUSED instance whose adapter declares pause `unsupported` for the current OS fails fast with a DEDICATED diagnostic — it names the state, the adapter's pause declaration, and the escape hatch (`stop` works without pause support) — instead of the bare pause-unsupported error that would strand the operator. Downstream `match`es over `EngineError` in host code need the new arm (or a `_` wildcard); NOTHING else on the engine surface moved (semver-checked release-to-release against published 0.1.0, and against the in-repo freeze baseline `bee7d48` on every push).
+> - Hosts on the crates.io pin move `ktesio-engine = "0.1"` → `"0.2"`; the git-pin alternative is unchanged (see [Embedding the engine](embedding.md)).
+> - `ktesio-adapter-api` and `ktesio-adapters-hermes` are unchanged at 0.1.0 — no republish.
+
 ## v0.6.0
 
 Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.

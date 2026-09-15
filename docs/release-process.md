@@ -234,6 +234,26 @@ widen a gate or an allowlist to make a baseline pass.
   crates.io; release v0.7.0 is published with all platform binaries.
 - **Semver-baseline retire-or-keep:** open by default — KEEP until revisited
   at the second published release, per the flip note above.
+- **Publish go (engine 0.2.0):** GRANTED 2026-09-15 — Islam's explicit go in
+  the ktesio.dev working session ("Release engine 0.2.0"), scoped to the
+  ENGINE crate publish (steps 1–5) only: the tag (step 6 — the `ktesio` CLI
+  release, binaries, GitHub Release, Homebrew sweep) is NOT opened by this
+  go. Context: the gate forced the version (the crates.io release-to-release
+  loop armed on main after `4e12ef8` and correctly demanded a bump for
+  `EngineError::ResumeUnsupported`; the source bump landed as `d087ed0` with
+  the AI-55 two-pass record). Steps executed: package + tarball review
+  (two-pass), `cargo +stable publish --locked -p ktesio-engine`, the
+  from-crates.io host probe, and the step-5 docs flip. adapter-api and
+  adapters-hermes stay at 0.1.0 (surfaces unchanged, semver-checked).
+- **Semver-baseline retire-or-keep — DECIDED: KEEP (2026-09-15, at the
+  second published release as scheduled).** The in-repo freeze baselines
+  (adapter-api @ 4119db3, engine @ bee7d48) stay as fast pre-publish guards:
+  they run on every push, depend on no registry, and catch breaks BEFORE a
+  publish attempt. The crates.io release-to-release loop proved itself in
+  its first week — it armed on main and forced the 0.2.0 bump for the
+  announced `ResumeUnsupported` extension exactly as designed. Two
+  independent guards with different jobs (pre-publish vs release-to-release);
+  neither was widened to make a baseline pass.
 
 ## Homebrew
 
