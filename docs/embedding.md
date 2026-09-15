@@ -326,7 +326,7 @@ does. Four instruments keep that statement honest:
 — see the [changelog](../CHANGELOG.md) banner), `ktesio-adapter-api` 0.1, and
 `ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
 release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15). Depend on
-`ktesio-engine = "0.2"` — no git dependency needed. The crates are
+`ktesio-engine = "0.2"` — no git dependency needed. The engine's IN-REPO version is now **0.3.0** (the epic-12 detached-start surface — see the changelog banner); its crates.io publish is held for the author's explicit go, so `"0.2"` remains the correct crates.io pin until that release lands. The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
 

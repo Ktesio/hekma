@@ -55,6 +55,15 @@ The tag workflow updates the GitHub Release immediately and then opens a pull re
 > - **Ratified subscriber-active budgets** (story 10-3): the perf-budgets harness gains a subscriber-overhead addendum with three hard gates on the one-active-subscriber deltas vs the zero-subscriber baseline — CPU Δ ≤ 0.25 percentage points, RSS Δ ≤ 2 MiB, read-p99 Δ ≤ 100 ms per running instance (strict locally; the documented ×1.5 shared-runner tolerance in CI) — ratified from measured deltas recorded in [Testing](testing.md#performance-budgets-nfr-4-story-75).
 > - **Audit teeth**: the embed-clean audit pins the sink plumbing count==1 (the emission choke point, both routes into it, the single stderr default arm) and its stdio-reach scan covers fully-qualified, bare imported-path, and hand-written `_print` write forms — a stdio write via an imported path cannot evade the single-writer count.
 
+
+> **ktesio-engine 0.3.0 — the epic-12 breaking release (in-repo; crates.io publish HELD pending Islam's go).**
+> The engine's crate version moves 0.2.0 → 0.3.0 to carry story 12-1's detached-start surface — the CI semver gate's crates.io loop flagged all three against the published 0.2.0 (its second real firing):
+>
+> - **`EngineError::DetachRefused` is a NEW variant on the exhaustive `EngineError` enum**: a `--detach` start of an engine-observed instance is refused with a named reason (its loopback metering listener dies with the CLI command — the same loud strand as adoption), never a silent fallback to attached. Host `match`es over `EngineError` need the new arm (or a `_` wildcard).
+> - **`SpawnRecord` gains the pub field `detach`** — exhaustive struct literals over `SpawnRecord` in host code need the new field.
+> - **`ProcessBackend::adopt` takes a second parameter (`detached: bool`)** — port-trait implementors must update the signature (the Windows backend's adopted shape is inherently drop-disarmed; the Unix backend uses the flag to re-hold a detached record's handle with its Drop disarmed).
+> - Hosts on the crates.io pin stay on `ktesio-engine = "0.2"` until the 0.3.0 publish executes (Islam's explicit go per docs/release-process.md); the git-pin alternative already compiles against 0.3.0.
+
 > **ktesio-engine 0.2.0 — the library's first breaking release (published 2026-09-15, Islam's explicit go; announced ahead in PR #181).**
 > The engine's crate version moves 0.1.0 → 0.2.0 to carry the epic-11 surface extension that the CI semver gate flagged (its first real firing — first against the in-repo freeze baseline, then against the PUBLISHED 0.1.0 baseline once the crates.io release-to-release loop armed):
 >
