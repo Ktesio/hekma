@@ -766,8 +766,10 @@ fn run_kt_agent_bounded(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn kt");
-    // Reader threads accumulate each stream so a partial transcript
-    // survives the kill (the pipes would otherwise deadlock the wait).
+    // Reader threads accumulate each stream INCREMENTALLY (per-chunk append
+    // under the lock) so the partial transcript is readable at any moment —
+    // the timeout path must NEVER depend on pipe EOF (a grandchild inheriting
+    // the pipe, or a half-dead kt, can hold it open indefinitely).
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
     let stdout_buf = Arc::new(Mutex::new(String::new()));
@@ -775,17 +777,31 @@ fn run_kt_agent_bounded(
     let t_out = {
         let buf = Arc::clone(&stdout_buf);
         std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stdout_pipe.read_to_string(&mut s);
-            *buf.lock().unwrap() = s;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&chunk[..n])),
+                }
+            }
         })
     };
     let t_err = {
         let buf = Arc::clone(&stderr_buf);
         std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = stderr_pipe.read_to_string(&mut s);
-            *buf.lock().unwrap() = s;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr_pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&chunk[..n])),
+                }
+            }
         })
     };
     let started = std::time::Instant::now();
@@ -798,13 +814,27 @@ fn run_kt_agent_bounded(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    // On timeout, KILL FIRST: the reader threads block in read_to_string
-    // until the pipes EOF, and the pipes only EOF when kt dies — joining
-    // (or dumping) before the kill deadlocks the harness itself (the first
-    // draft's dump never printed for exactly that reason).
+    // On timeout, KILL kt, give the pipes a 1s grace to EOF, then read the
+    // incremental buffers under the lock. The reader threads are NEVER
+    // joined on this path: if a grandchild inherited the pipes they stay
+    // blocked until the test process dies, and joining deadlocked the first
+    // harness draft. On the normal path EOF is immediate, so the joins
+    // return instantly and the buffers are complete.
     let timed_out = status.is_none();
     if timed_out {
         let _ = child.kill();
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let kt_gone = child.try_wait().map(|s| s.is_some()).unwrap_or(false);
+        println!(
+            "KT HUNG after {:?}: args={:?} kt_alive_at_kill=true kt_dead_after_kill={} \n\
+             ---- kt partial stdout ----\n{}\n\
+             ---- kt partial stderr ----\n{}",
+            bound,
+            args,
+            kt_gone,
+            stdout_buf.lock().unwrap(),
+            stderr_buf.lock().unwrap()
+        );
     }
     let _ = t_out.join();
     let _ = t_err.join();
@@ -819,29 +849,16 @@ fn run_kt_agent_bounded(
             timed_out: false,
             alive_at_kill: false,
         },
-        None => {
-            let alive = child.kill().is_err(); // kill succeeds => was alive
-                                               // The forensic dump goes to STDOUT: nextest's timeout capture
-                                               // shows only stdout — a panic message (stderr) is invisible.
-            println!(
-                "KT HUNG after {:?}: args={:?} still_alive_at_kill={}\n                 ---- kt partial stdout ----\n{}\n                 ---- kt partial stderr ----\n{}",
-                bound,
-                args,
-                alive,
-                stdout_buf.lock().unwrap(),
-                stderr_buf.lock().unwrap()
-            );
-            BoundedKt {
-                run: KtRun {
-                    success: false,
-                    code: None,
-                    stdout: stdout_buf.lock().unwrap().clone(),
-                    stderr: stderr_buf.lock().unwrap().clone(),
-                },
-                timed_out: true,
-                alive_at_kill: alive,
-            }
-        }
+        None => BoundedKt {
+            run: KtRun {
+                success: false,
+                code: None,
+                stdout: stdout_buf.lock().unwrap().clone(),
+                stderr: stderr_buf.lock().unwrap().clone(),
+            },
+            timed_out: true,
+            alive_at_kill: true,
+        },
     }
 }
 
