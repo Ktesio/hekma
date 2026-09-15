@@ -71,7 +71,8 @@
 //! documented `GetProcessTimes` (a `FILETIME`, folded to a u64 of 100ns ticks) —
 //! stable per process, different across a PID reuse. [`WindowsBackend::adopt`]
 //! re-opens a live pid with `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
-//! PROCESS_TERMINATE)` and compares its creation time to the recorded
+//! PROCESS_TERMINATE | PROCESS_SYNCHRONIZE)` and compares its creation time to
+//! the recorded
 //! fingerprint (the PID-reuse guard); a match yields an ADOPTED handle that holds
 //! the process HANDLE (no Job — the process is already running and may already be
 //! in one), so a subsequent `stop` uses `TerminateProcess` on that handle. No
@@ -92,7 +93,8 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
-    CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    CREATE_NEW_PROCESS_GROUP, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 
 use crate::ports::{
@@ -661,12 +663,24 @@ impl ProcessBackend for WindowsBackend {
         // escalation is a property of the SPAWNING engine's handle; this
         // parity boundary is shared by every adopted Windows instance).
         let _ = detached;
-        // Open the pid for query + terminate. A gone pid → OpenProcess fails →
-        // Ok(None). Then compare the CURRENT creation time to the recorded one
-        // (the PID-reuse guard, AD-5): a mismatch → a different process → Ok(None).
+        // Open the pid for query + terminate + SYNCHRONIZE. A gone pid →
+        // OpenProcess fails → Ok(None). Then compare the CURRENT creation time
+        // to the recorded one (the PID-reuse guard, AD-5): a mismatch → a
+        // different process → Ok(None).
+        //
+        // The SYNCHRONIZE right is NOT optional here (story 12-1 review fix,
+        // found by `a_detached_spawn_survives_drop_and_stops_in_process` on
+        // the windows-latest leg): `reap_if_exited`'s adopted branch confirms
+        // death with `WaitForSingleObject(handle, 0)`, and a handle opened
+        // without SYNCHRONIZE answers WAIT_FAILED on EVERY call — so stop's
+        // `TerminateProcess` succeeded while `confirm_death` could never
+        // observe the death, deterministically reporting `StopUnconfirmed`
+        // for every adopted stop (the child DID die; the confirmation was
+        // blind). The exit-code-probe fallback in `reap_if_exited` keeps the
+        // branch correct even for a handle opened without the right.
         let h = unsafe {
             OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
                 0,
                 fingerprint.pid,
             )
@@ -775,7 +789,11 @@ impl WindowsProcess {
                     detail: e.to_string(),
                 }),
             },
-            // Adopted: liveness via the opened process handle.
+            // Adopted: liveness via the opened process handle. The PRIMARY
+            // signal is the wait (valid when the handle holds SYNCHRONIZE —
+            // see `adopt`); the exit-code probe below is the fallback for a
+            // handle that answers WAIT_FAILED (no SYNCHRONIZE), so death
+            // confirmation never depends on the wait right alone.
             None => {
                 if self.adopted.is_null() {
                     // No handle at all — treat as gone (defensive; not normally
@@ -783,7 +801,7 @@ impl WindowsProcess {
                     return Ok(ProcessStatus::Exited { code: None });
                 }
                 let waited = unsafe { WaitForSingleObject(self.adopted, 0) };
-                if waited == WAIT_OBJECT_0 {
+                if waited != WAIT_OBJECT_0 {
                     let mut code: u32 = 0;
                     let ok = unsafe { GetExitCodeProcess(self.adopted, &mut code) };
                     if ok != 0 && code != STILL_ACTIVE {
@@ -791,9 +809,16 @@ impl WindowsProcess {
                             code: Some(code as i32),
                         });
                     }
-                    return Ok(ProcessStatus::Exited { code: None });
+                    return Ok(ProcessStatus::Alive);
                 }
-                Ok(ProcessStatus::Alive)
+                let mut code: u32 = 0;
+                let ok = unsafe { GetExitCodeProcess(self.adopted, &mut code) };
+                if ok != 0 && code != STILL_ACTIVE {
+                    return Ok(ProcessStatus::Exited {
+                        code: Some(code as i32),
+                    });
+                }
+                return Ok(ProcessStatus::Exited { code: None });
             }
         }
     }
