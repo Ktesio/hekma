@@ -9,7 +9,7 @@ mod helpers;
 
 use std::path::Path;
 
-use helpers::{run_kt_agent, run_kt_agent_with_env, TestContext};
+use helpers::{run_kt_agent, run_kt_agent_with_env, KtRun, TestContext};
 use ktesio_conformance::test_support::{current_os_key, ManifestFixture};
 use ktesio_conformance::uj3;
 use ktesio_engine::{Engine, FleetEntry, LifecycleState, UsageView};
@@ -728,6 +728,105 @@ fn wait_for_agent_pid(state_dir: &Path, name: &str) -> u32 {
     }
 }
 
+/// Run `kt` with a HARD WALL-CLOCK BOUND and a forensic dump on timeout
+/// (the 12-1 detach test's Windows hang triage): on timeout the child is
+/// killed and the harness reports whether kt was STILL ALIVE, its partial
+/// stdout/stderr so far (did the engine finish the work? did the notice
+/// print?), and the agent's marker state — turning an opaque nextest
+/// `>240s` timeout into a one-run diagnosis. Bounded legs only; the rest
+/// of the file keeps the plain [`helpers::run_kt_agent`].
+/// The per-leg wall-clock bound for the detach test's forensic harness:
+/// comfortably above any honest leg (register/start/list/stop each run in
+/// seconds) and far below nextest's own 240s timeout, so the dump lands
+/// while the CI leg still has runway.
+const LEG_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const REGISTER_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
+struct BoundedKt {
+    run: helpers::KtRun,
+    timed_out: bool,
+    alive_at_kill: bool,
+}
+
+fn run_kt_agent_bounded(
+    args: &[&str],
+    working_dir: &Path,
+    state_dir: &Path,
+    bound: std::time::Duration,
+) -> BoundedKt {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        .args(args)
+        .current_dir(working_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn kt");
+    // Reader threads accumulate each stream so a partial transcript
+    // survives the kill (the pipes would otherwise deadlock the wait).
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let t_out = {
+        let buf = Arc::clone(&stdout_buf);
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stdout_pipe.read_to_string(&mut s);
+            *buf.lock().unwrap() = s;
+        })
+    };
+    let t_err = {
+        let buf = Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr_pipe.read_to_string(&mut s);
+            *buf.lock().unwrap() = s;
+        })
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait kt") {
+            break Some(status);
+        }
+        if started.elapsed() >= bound {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _ = t_out.join();
+    let _ = t_err.join();
+    match status {
+        Some(status) => BoundedKt {
+            run: KtRun {
+                success: status.success(),
+                code: status.code(),
+                stdout: stdout_buf.lock().unwrap().clone(),
+                stderr: stderr_buf.lock().unwrap().clone(),
+            },
+            timed_out: false,
+            alive_at_kill: false,
+        },
+        None => {
+            let alive = child.kill().is_err(); // kill succeeds => was alive
+            BoundedKt {
+                run: KtRun {
+                    success: false,
+                    code: None,
+                    stdout: stdout_buf.lock().unwrap().clone(),
+                    stderr: stderr_buf.lock().unwrap().clone(),
+                },
+                timed_out: true,
+                alive_at_kill: alive,
+            }
+        }
+    }
+}
+
 #[test]
 fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // Story 12-1, the acceptance criterion AT THE CLI, cross-OS: `kt agent
@@ -746,7 +845,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
     println!("detach-leg: entering register");
-    run_kt_agent(
+    let reg = run_kt_agent_bounded(
         &[
             "agent",
             "register",
@@ -756,6 +855,12 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         ],
         &ctx.project_dir,
         state_dir,
+        REGISTER_BOUND,
+    );
+    assert!(
+        !reg.timed_out,
+        "register leg hung: alive_at_kill={} stdout={} stderr={}",
+        reg.alive_at_kill, reg.run.stdout, reg.run.stderr
     );
     println!("detach-leg: register returned");
     // Orphan guard: from the detached start until the stop leg lands, any
@@ -767,48 +872,61 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         timeout_arg: "5".to_string(),
         armed: true,
     };
-    let run = run_kt_agent(
+    let run = run_kt_agent_bounded(
         &["agent", "start", "detachy", "--detach"],
         &ctx.project_dir,
         state_dir,
+        LEG_BOUND,
     );
-    println!("detach-leg: start returned success={}", run.success);
+    println!("detach-leg: start returned success={}", run.run.success);
     assert!(
-        run.success,
-        "detached start should exit 0; stderr={}",
-        run.stderr
+        !run.timed_out,
+        "THE START LEG HUNG (kt alive at kill={}): kt stdout={}\nkt stderr={}\n\
+         if `running` printed, the ENGINE finished and kt's exit path blocks;\n\
+         if not, the start itself never completed",
+        run.alive_at_kill, run.run.stdout, run.run.stderr
     );
-    assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
+    assert!(
+        run.run.success,
+        "detached start should exit 0; stderr={}",
+        run.run.stderr
+    );
+    assert!(
+        run.run.stdout.contains("running"),
+        "stdout={}",
+        run.run.stdout
+    );
     // The DETACHED notice: the enforcement-window honesty (a hard AC), on
     // stderr only.
     assert!(
-        run.stderr.contains("detached:"),
+        run.run.stderr.contains("detached:"),
         "the detached notice must go to stderr; stderr={}",
-        run.stderr
+        run.run.stderr
     );
     assert!(
-        run.stderr
+        run.run
+            .stderr
             .contains("keeps running after this command exits")
-            && run.stderr.contains("re-adopts"),
+            && run.run.stderr.contains("re-adopts"),
         "the notice must state the survival + re-adoption; stderr={}",
-        run.stderr
+        run.run.stderr
     );
     for window in ["crash detection", "budget enforcement"] {
         assert!(
-            run.stderr.contains(&format!("no {window}")),
+            run.run.stderr.contains(&format!("no {window}")),
             "the notice must name the enforcement window `{window}`; stderr={}",
-            run.stderr
+            run.run.stderr
         );
     }
     assert!(
-        run.stderr.contains("no usage/event delivery"),
+        run.run.stderr.contains("no usage/event delivery"),
         "the notice must name the event-delivery window; stderr={}",
-        run.stderr
+        run.run.stderr
     );
     assert!(
-        !run.stdout.contains("detached:"),
+        !run.run.stdout.contains("detached:"),
         "the notice must not leak onto stdout; stdout={}",
-        run.stdout
+        run.run.stdout
     );
     // The child is ALIVE after the command exited (the disarm held).
     let pid = wait_for_agent_pid(state_dir, "detachy");
@@ -825,17 +943,22 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // Object carries no kill-on-close, so the benign command's engine exit
     // kills nothing.
     println!("detach-leg: pid={} announced; entering list", pid);
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
-    println!("detach-leg: list returned success={}", list.success);
+    let list = run_kt_agent_bounded(&["agent", "list"], &ctx.project_dir, state_dir, LEG_BOUND);
+    println!("detach-leg: list returned success={}", list.run.success);
     assert!(
-        list.success,
-        "the benign `kt agent list` should succeed; stderr={}",
-        list.stderr
+        !list.timed_out,
+        "THE LIST LEG HUNG (kt alive at kill={}): stdout={} stderr={}",
+        list.alive_at_kill, list.run.stdout, list.run.stderr
     );
     assert!(
-        list.stdout.contains("detachy"),
+        list.run.success,
+        "the benign `kt agent list` should succeed; stderr={}",
+        list.run.stderr
+    );
+    assert!(
+        list.run.stdout.contains("detachy"),
         "the benign command should see the adopted instance; stdout={}",
-        list.stdout
+        list.run.stdout
     );
     assert!(
         pid_alive(pid),
@@ -845,14 +968,28 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // The NEXT command re-adopts the live process and stops it for real —
     // stop keeps working on the adopted detached handle.
     println!("detach-leg: entering stop");
-    let stop = run_kt_agent(&["agent", "stop", "detachy"], &ctx.project_dir, state_dir);
-    println!("detach-leg: stop returned success={}", stop.success);
-    assert!(
-        stop.success,
-        "stop should adopt + stop; stderr={}",
-        stop.stderr
+    let stop = run_kt_agent_bounded(
+        &["agent", "stop", "detachy"],
+        &ctx.project_dir,
+        state_dir,
+        LEG_BOUND,
     );
-    assert!(stop.stdout.contains("stopped"), "stdout={}", stop.stdout);
+    println!("detach-leg: stop returned success={}", stop.run.success);
+    assert!(
+        !stop.timed_out,
+        "THE STOP LEG HUNG (kt alive at kill={}): stdout={} stderr={}",
+        stop.alive_at_kill, stop.run.stdout, stop.run.stderr
+    );
+    assert!(
+        stop.run.success,
+        "stop should adopt + stop; stderr={}",
+        stop.run.stderr
+    );
+    assert!(
+        stop.run.stdout.contains("stopped"),
+        "stdout={}",
+        stop.run.stdout
+    );
     orphan_guard.disarm();
     // Deterministic (bounded) no-orphan proof.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
