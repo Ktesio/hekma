@@ -756,6 +756,7 @@ fn run_kt_agent_bounded(
 ) -> BoundedKt {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
+    println!("harness: entered, args={:?}", args);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
         .args(args)
         .current_dir(working_dir)
@@ -812,8 +813,16 @@ fn run_kt_agent_bounded(
         if started.elapsed() >= bound {
             break None;
         }
+        if started.elapsed().as_secs() % 10 == 0 {
+            println!(
+                "harness: tick {}s, kt exited={:?}",
+                started.elapsed().as_secs(),
+                child.try_wait().map(|s| s.is_some())
+            );
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
+    println!("harness: loop exited, timed_out={}", status.is_none());
     // On timeout, KILL kt, give the pipes a 1s grace to EOF, then read the
     // incremental buffers under the lock. The reader threads are NEVER
     // joined on this path: if a grandchild inherited the pipes they stay
