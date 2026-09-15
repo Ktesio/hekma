@@ -770,6 +770,10 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         &ctx.project_dir,
         state_dir,
     );
+    eprintln!(
+        "detach-leg: start --detach returned success={}",
+        run.success
+    );
     assert!(
         run.success,
         "detached start should exit 0; stderr={}",
@@ -821,7 +825,9 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // killer.) Runs affirmatively on Windows too: the detached spawn's Job
     // Object carries no kill-on-close, so the benign command's engine exit
     // kills nothing.
+    eprintln!("detach-leg: pid={} announced; entering list leg", pid);
     let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    eprintln!("detach-leg: list returned success={}", list.success);
     assert!(
         list.success,
         "the benign `kt agent list` should succeed; stderr={}",
@@ -839,7 +845,9 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     );
     // The NEXT command re-adopts the live process and stops it for real —
     // stop keeps working on the adopted detached handle.
+    eprintln!("detach-leg: entering stop leg");
     let stop = run_kt_agent(&["agent", "stop", "detachy"], &ctx.project_dir, state_dir);
+    eprintln!("detach-leg: stop returned success={}", stop.success);
     assert!(
         stop.success,
         "stop should adopt + stop; stderr={}",
