@@ -3,7 +3,7 @@
 
 Parses _bmad-output/planning-artifacts/epics.md (source of truth), then:
   1. ensures the BMAD label set exists
-  2. ensures the "Ktesio" GitHub Project exists (owner iMagdy) and is linked
+  2. ensures the "Ktesio" GitHub Project exists (owner Ktesio) and is linked
   3. creates one issue per epic and per story (skips ones whose exact title already exists)
   4. adds every issue to the project
   5. rewrites each epic issue body with a task list linking its story issues
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 EPICS = ROOT / "_bmad-output/planning-artifacts/epics.md"
 MAP_FILE = Path(__file__).resolve().parent / "github-sync-map.json"
 REPO = "Ktesio/ktesio"
-OWNER = "iMagdy"
+OWNER = "Ktesio"
 PROJECT_TITLE = "Ktesio"
 
 LABELS = [
