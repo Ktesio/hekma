@@ -486,20 +486,22 @@ class ReleaseDocsTests(unittest.TestCase):
         # DIFFERENT honest freeze point (NOT the contract freeze 4119db3 —
         # the engine's unpublished surface legitimately grew after the
         # contract froze; a 4119db3 baseline fails major lints on that
-        # honest history). Current baseline: bee7d48, the epic-11 merge
-        # (2026-09-14) — the first deliberate post-freeze surface extension
-        # (`EngineError::ResumeUnsupported`, AI-7, announced in PR #181)
-        # superseded the embedding-surface freeze (armed at 7-3's 8a8b328,
-        # pinned to 12f3aab per the main-history constraint). Both
-        # baseline revs get the cat-file resolvability check so a history
-        # rewrite is a CLEAR infra error. Maintenance: bump all four pins
-        # (two here, two in ci.yml) together at the next deliberate freeze.
+        # honest history). Current baseline: 49da96b, the epic-12 merge
+        # (2026-09-15) — the latest deliberate post-freeze surface
+        # extension (`EngineError::DetachRefused` + `SpawnSpec.detach`,
+        # announced in PR #184; the prior extension was epic-11's
+        # `EngineError::ResumeUnsupported`, AI-7, PR #181) superseded the
+        # embedding-surface freeze (armed at 7-3's 8a8b328, pinned to
+        # 12f3aab per the main-history constraint). Both baseline revs get
+        # the cat-file resolvability check so a history rewrite is a CLEAR
+        # infra error. Maintenance: bump all four pins (two here, two in
+        # ci.yml) together at the next deliberate freeze.
         self.assertIn(
             "cargo +stable semver-checks check-release -p ktesio-engine "
-            "--baseline-rev bee7d4876d70957399b1d97bcf4347883b47da58",
+            "--baseline-rev 49da96b6f1c695edd6afd379526deba42cf6da60",
             ci,
         )
-        self.assertIn("git cat-file -e bee7d4876d70957399b1d97bcf4347883b47da58^{commit}", ci)
+        self.assertIn("git cat-file -e 49da96b6f1c695edd6afd379526deba42cf6da60^{commit}", ci)
         # The baseline lookup needs full history: the semver job's checkout
         # must override the default shallow clone. Scoped to the SEMVER JOB
         # BLOCK ONLY (up to the next job heading): a `fetch-depth: 0` in some
