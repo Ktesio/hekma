@@ -745,6 +745,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+    println!("detach-leg: entering register");
     run_kt_agent(
         &[
             "agent",
@@ -756,6 +757,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         &ctx.project_dir,
         state_dir,
     );
+    println!("detach-leg: register returned");
     // Orphan guard: from the detached start until the stop leg lands, any
     // failure must not leak the lingering agent (drop = best-effort stop).
     let mut orphan_guard = StopOrphanOnDrop {
@@ -770,10 +772,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         &ctx.project_dir,
         state_dir,
     );
-    eprintln!(
-        "detach-leg: start --detach returned success={}",
-        run.success
-    );
+    println!("detach-leg: start returned success={}", run.success);
     assert!(
         run.success,
         "detached start should exit 0; stderr={}",
@@ -825,9 +824,9 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // killer.) Runs affirmatively on Windows too: the detached spawn's Job
     // Object carries no kill-on-close, so the benign command's engine exit
     // kills nothing.
-    eprintln!("detach-leg: pid={} announced; entering list leg", pid);
+    println!("detach-leg: pid={} announced; entering list", pid);
     let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
-    eprintln!("detach-leg: list returned success={}", list.success);
+    println!("detach-leg: list returned success={}", list.success);
     assert!(
         list.success,
         "the benign `kt agent list` should succeed; stderr={}",
@@ -845,9 +844,9 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     );
     // The NEXT command re-adopts the live process and stops it for real —
     // stop keeps working on the adopted detached handle.
-    eprintln!("detach-leg: entering stop leg");
+    println!("detach-leg: entering stop");
     let stop = run_kt_agent(&["agent", "stop", "detachy"], &ctx.project_dir, state_dir);
-    eprintln!("detach-leg: stop returned success={}", stop.success);
+    println!("detach-leg: stop returned success={}", stop.success);
     assert!(
         stop.success,
         "stop should adopt + stop; stderr={}",
