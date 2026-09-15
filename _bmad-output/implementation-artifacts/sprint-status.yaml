@@ -115,6 +115,11 @@ development_status:
   11-5-cross-platform-and-ci-batch: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). AI-29/35/37/38/54/71 — survival parity, _live robustness, matrix timing, docs probe, coverage gate
   11-6-supervision-and-ops-decisions: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). LANDED 2026-09-11, PARTIAL BY RATIFICATION: the two non-decision items closed (AI-46 via 11-3's stranded-listener diagnostic; AI-48's dependency-audit checkpoint documented in docs/embedding.md) and AI-36 was already resolved (superseded by AI-53, PR #108). AI-20 (daemon/detach) and AI-47 (HTTPS upstream + streaming parse) REMAIN OPEN awaiting Islam's product calls per the change proposal's own §6 gate — dated notes on each entry name the decision needed; surfaced in the epic-11 PR description. AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
   11-7-orchestration-and-review-process: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). landed 2026-09-11 (this branch, story commit follows): AI-17 residual hardening — the three semver pins scoped OUT of the file-wide test into the semver-job slice (exact count==3 comment-stripped check-release sites, probe-precedes-install ordering assertion, line-exact plain-install pin, transient-skip regex verified single-use in ci.yml so scoping loses nothing); AI-19 verify-only (adopted by 11-4, flipped done); AI-55/57/58 codified as AGENTS.md Engineering patterns (+ release-process.md AI-55 anchor); AI-56 satisfied-by-events (stale key removed ff1f669, epic-8 superseded, epics.md authoritative); epic-6-retro-item-9 closed — the four #168 verdicts mirrored into AI-63/65/66/69 (AI-63's stale part-(b) framing superseded). Reviewed by the three lenses; 10 patch-class findings applied. AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
+  epic-12: backlog  # opened 2026-09-15 by Islam's ratification (recommended across the board) of ai-20-ai-47-product-calls-2026-09-15.md — durable detach + the production-usable observed channel (AI-20 + AI-47 + retro F3 fold)
+  12-1-detached-start-survives-cli-exit-via-adoption: backlog  # AI-20 ratified option (b) — kt agent start --detach via the AD-5 adoption path; refuses engine-observed instances; honest enforcement-window docs
+  12-2-streaming-usage-parse-include-usage-terminal-frame: backlog  # AI-47(b) — listener requests stream_options.include_usage, parses the terminal SSE usage frame into ParsedUsage; SSE stub cases in observed_metering
+  12-3-rustls-tls-upstream-for-observed-metering: backlog  # AI-47(a) — metering.upstream_base_url accepts https:// via vendored rustls+ring; supply-chain/boundary teeth updated
+  12-4-observed-drain-durability-cursor-retry-skip: backlog  # retro F3 fold — the observed drain gets the AI-41 treatment: park + bounded retry + loud SKIPPED instead of silent loss under store failure
   epic-8-retrospective: optional
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
@@ -341,7 +346,7 @@ action_items:
   - id: AI-20
     epic: 1
     owner:
-    status: open
+    status: done  # 2026-09-15 DECIDED — Islam ratified "recommended across the board" (ai-20-ai-47-product-calls-2026-09-15.md): option (b) kt agent start --detach (adoption-path durability; enforcement windows documented honestly; detach v1 REFUSES engine-observed instances). Implementation commissioned as epic-12 story 12-1; engine-as-daemon (a) recorded as the deliberate future epic; this ITEM closes as a decision.
     severity: medium
     action: "PRODUCT DECISION (needs Islam + architect): daemon/detach for durable
       cross-CLI-command supervision. `kt agent start` does NOT persist an agent across
@@ -688,7 +693,7 @@ action_items:
   - id: AI-47
     epic: 3
     owner:
-    status: open
+    status: done  # 2026-09-15 DECIDED — Islam ratified "recommended across the board" (ai-20-ai-47-product-calls-2026-09-15.md): (a) rustls+ring vendored TLS (bundled-SQLite precedent settles the no-C-build question), (b) streaming include_usage parse LANDS FIRST (works on today's HTTP path), (c) provider schemas defer behind a parse seam; the stranded observed-drain defer (epic-11 retro F3) folds in. Implementation commissioned as epic-12 stories 12-2 → 12-3 → 12-4; this ITEM closes as a decision.
     severity: medium
     action: "3-4 engine-observed PRODUCTION-usability gaps (v1 deferrals, all honest
       today): (a) HTTPS upstream — v1 forwards HTTP only; an https:// upstream is

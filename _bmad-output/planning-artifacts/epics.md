@@ -171,6 +171,10 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
 
+### Epic 12: Durable Detach & the Production-Usable Observed Channel
+An Operator can detach a start from the CLI's lifetime (the agent survives via the adoption path), and the engine-observed metering channel works against real providers: streamed completions are metered (the `include_usage` terminal frame), HTTPS upstreams dial directly (vendored rustls), and a store outage degrades the observed drain loudly with a bounded-skip instead of wedging or silently losing. Opened 2026-09-15 by Islam's ratification (recommended across the board) of ai-20-ai-47-product-calls-2026-09-15.md.
+**FRs covered:** FR-19 amendment (observed-channel production usability; no new FR numbers — this epic lands ratified follow-ups)
+
 ### Epic 8: Provision Skills and Migrate Legacy Users
 
 > **(2026-09-09 — CLOSED AS SUPERSEDED by Islam's decision, option A):** the skills-provisioning premise was overtaken by the project pivot. Epic 9 removed the legacy skills-manager surface and repositioned Ktesio as an agent runner, so skills provisioning is no longer a Ktesio capability. The stories below are RETIRED WITHOUT DEVELOPMENT (8-4 was already self-marked superseded; 8-5's install-channel concern is carried by the release process and `scripts/public` installers). Definitions retained for the record. GitHub issues #95-99 closed 2026-09-09.
@@ -907,3 +911,38 @@ exposure documentation.
 
 ### Story 11.7: Orchestration & review process batch
 test_automation pins, review rules adoption, sprint-status sync, playbook patterns.
+
+
+## Epic 12: Durable Detach & the Production-Usable Observed Channel
+
+> **(2026-09-15 — OPENED by Islam's ratification, "recommended across the board", of
+> `ai-20-ai-47-product-calls-2026-09-15.md`.)** AI-20 and AI-47 — the two product calls
+> epic-11's §6 gated — decided: detach via the adoption path (option b), streaming usage
+> parse lands before the rustls TLS upstream, provider schemas defer behind a parse seam,
+> and the stranded observed-drain defer (epic-11 retro F3) folds in as 12-4. Execution
+> order: 12-1 (independent, highest user-facing value) → 12-2 → 12-3 → 12-4.
+
+### Story 12.1: Detached start survives the CLI exit (AI-20, ratified option b)
+`kt agent start --detach` persists `running` and drops the handle WITHOUT the process-group
+kill — the agent survives the CLI exit and the next command adopts it through the existing
+AD-5 fingerprint path. Detach v1 REFUSES engine-observed instances with an explanatory
+error (their loopback listener dies with the command — the same loud strand as adoption);
+enforcement windows (no crash detection / budget enforcement / event delivery between
+commands) are documented honestly in `--help` + the stderr notice.
+
+### Story 12.2: Streaming usage parse (AI-47b)
+The forward listener requests `stream_options.include_usage` on forwarded stream requests
+and parses the terminal SSE usage frame into the same `ParsedUsage` choke point (O(1)
+line-scanner; the injected `stream_options` documented as an upstream-visible
+modification); the observed_metering std-only upstream stub gains SSE cases.
+
+### Story 12.3: HTTPS upstream via vendored rustls+ring (AI-47a)
+`metering.upstream_base_url` accepts `https://` (rustls+ring, vendored — no system TLS
+dependency; the bundled-SQLite C-build precedent settled the philosophy question). The
+start-time `https://` refusal error is replaced by a working forward; supply-chain teeth
+(audit/boundary review) updated for the new dependency tree.
+
+### Story 12.4: Observed-drain durability (retro F3 fold)
+The observed drain gets the AI-41 treatment the self-reported channel has: park + bounded
+retry + the loud SKIPPED diagnostic instead of silent best-effort loss under store failure
+(closes the deferred-work entry routed "→ 11-6", stranded by 11-6's partial landing).

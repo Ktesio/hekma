@@ -2,7 +2,7 @@
 type: product-decision-proposal
 date: 2026-09-15
 author: ZCode (operating the architect seat) per AI-58 draft-then-ratify, for Islam
-status: awaiting-ratification  # touches ZERO real planning artifacts; applied only after Islam picks from the bounded options
+status: RATIFIED 2026-09-15 — Islam: "recommended across the board" (all five picks: AI-20=(b) detach; TLS=(i) rustls+ring; streaming parse=yes-first; provider schemas=defer; drain durability=fold). Applied same day: epics.md Epic 12 (stories 12-1..12-4 in the ratified order), sprint tracker (AI-20/AI-47 closed as decisions, epic-12 keys), deferred-work routing, architecture.md + design-doc roadmap annotations.
 decides: "AI-20 (daemon/detach for durable cross-CLI supervision) + AI-47 (engine-observed production gaps: TLS, streaming parse, provider schemas) + the stranded observed-channel defer (epic-11 retro F3)"
 inputDocuments:
   - _bmad-output/implementation-artifacts/sprint-status.yaml (AI-20, AI-47 entries)

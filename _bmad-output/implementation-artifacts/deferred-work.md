@@ -123,3 +123,4 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-11-1-engine-robustness-batch.md`
   summary: Engine-observed usage channel remains lossy under store failure (drain_observed_for is deliberately best-effort; no cursor, no retry) — governance/billing durability incomplete for un-cooperative agents.
   evidence: Blind-hunter finding from the 11-1 review (2026-09-11); durability design for the observed channel needs a product/ops call → 11-6.
+  routed: epic-12 story 12-4 (2026-09-15) — Islam ratified the AI-20/AI-47 proposal set ("recommended across the board"); the observed-drain durability folds into the epic-12 batch as its closing story (the AI-41 treatment: park + bounded retry + loud SKIPPED). `resolved:` lands when 12-4 ships.
