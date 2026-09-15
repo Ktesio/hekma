@@ -845,8 +845,22 @@ fn run_kt_agent_bounded(
             stderr_buf.lock().unwrap()
         );
     }
-    let _ = t_out.join();
-    let _ = t_err.join();
+    // kt has exited (or been killed) — give the readers a short grace to
+    // see EOF, then PROCEED WITHOUT THEM. On windows-latest this harness
+    // proved the pipes never EOF after a detached start even though kt is
+    // DEAD: the surviving detached agent ends up holding kt's stdio pipe
+    // write-ends, so a plain join deadlocks. (`std` spawns with a handle
+    // list restricted to the child's own three stdio handles, so this leak
+    // is unexpected and is recorded as a story 12-1 production follow-up —
+    // a script that captures `kt agent start --detach` output would hang
+    // until the agent exits.) The leaked readers die with the test process;
+    // the incremental buffers already hold kt's full transcript.
+    let grace = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !(t_out.is_finished() && t_err.is_finished()) && std::time::Instant::now() < grace {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::mem::forget(t_out);
+    std::mem::forget(t_err);
     match status {
         Some(status) => BoundedKt {
             run: KtRun {
