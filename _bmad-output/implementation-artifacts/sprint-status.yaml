@@ -47,11 +47,12 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: 09-11-2026 22:00
+last_updated: 09-15-2026 03:19
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
-story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
+story_location: 
+  /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
 
 development_status:
   epic-1: done
@@ -106,6 +107,7 @@ development_status:
   10-2-host-provided-diagnostic-sink: done  # 🎉 MERGED as b590dc8 (PR #180). DiagnosticSink (opt-in, default stderr byte-identical); audit allowlist emptied with count==1 choke-point pins; rotation + panic-safety + Arc-share tested.  # 2026-09-10: DiagnosticSink (opt-in, default stderr byte-identical), both AD-12 diagnostics routed through one choke point; audit allowlist EMPTY with count==1 choke-point pins; 5 sink tests + negative teeth. 1119 tests, 95.26%.  # additive public API; removes the 2 audit allowlist entries
   10-3-event-bus-resync-and-subscriber-budget: done  # 🎉 MERGED as b590dc8 (PR #180). resync_events backfill helper (crash-window remedy, family-major, torn-tail honest) + subscriber-active budget gated (CPU 0.25pts, RSS 2MiB, p99 100ms).  # 2026-09-10: resync_events (committed-truth backfill as EngineEvents, family-major ordering, backfill-then-subscribe contract, torn-tail tolerant, cursor continuation) + subscriber-active budget GATED in the perf harness (CPU delta 0.25pts, RSS 2MiB, read-p99 100ms — ratified from observed ~zero fan-out cost). 4 integration + 7 unit tests. Deferred-work 7-2/7-5 entries resolved.  # subscribe-with-backfill helper + ratified subscriber-active budget
   epic-11: done  # 🎉 COMPLETE 2026-09-14: MERGED to main as bee7d48 (PR #181, epic-11 squash) — all 7 stories landed; the engine semver baseline was bumped to bee7d48 as the ratified post-merge follow-up; AI-20/AI-47 remain OPEN awaiting Islam's product calls. Opened 2026-09-10 by sprint change proposal (sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved): Technical Debt & Process Cleanup — 65 retro action items organized into 7 thematic stories
+  epic-11-retrospective: done
   11-1-engine-robustness-batch: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). AI-4/7/8/9/12/13/14/15/16/41/44 — implemented 2026-09-11: AI-12 poll-error streak → crash input (pure poll_verdict helper + streak-clear pins); AI-13 adopted exit-code-unavailable crash cause; AI-14 spawn fails closed on fingerprint-read failure (unix+windows, no start_time=0 sentinel); AI-15 Engine::fleet_entry single-instance facade + show --json uses it (NotFound → exit 3 preserved); AI-16 fleet() batched spawn-record map (N+1 killed, other per-instance reads untouched); AI-41 ledger INSERT failure parks the drain cursor + retries (dedup-key safe); AI-44 budgets re-evaluated at adoption (over-budget run enforced at Engine::open); AI-7 ResumeUnsupported CLI arm (exit 5) + rustdoc; AI-8 guaranteed-no-handle pause cause pinned; AI-9 persist-first pause order test. Battery green (fmt/clippy/test 1153/check_docs); embed_clean sink pin re-reviewed for the new AI-41 diagnostic route; uj3 shared breach assertion now per-(dimension, Run). Loop 1 review 2026-09-11: AI-12 re-derived (same-tick cross-handle corroboration systemic guard + truncated last-error cause text + cfg(test) supervisor-side poll-fault seam with both-direction wiring tests — backend-global seam rejected by the embed-clean zero-global-cell audit) + all 13 review patches applied; battery 1158 green. Post-review CI fix b2cfe75 (2026-09-14, proven on the PR's windows-latest legs): the AI-9 test's Leg-A directory-rename injection and both frozen-heartbeat probes are data-driven-OsId runtime skips on Windows (tests/pause.rs idiom — the rename is a sharing violation while the child holds agent.log open; AD-4 cooperative pause means no real suspension to probe), while the persist-first LEDGER legs (B + resume) run on every OS
   11-2-config-and-secrets-batch: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). AI-24/26/27/28/33/39 — atomic writes, env shadowing, secret-to-flag
   11-3-memory-robustness-batch: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). epic-5-retro items 1/3/4 + AI-46 — strip gap, migration atomicity, reverse-conflict test, adoption stranding
@@ -1396,3 +1398,129 @@ action_items:
     status: done  # RESOLVED in story 11-5 (2026-09-11): .github/workflows/docs-probe.yml — daily cron (03 6 * * *) + workflow_dispatch, NO needs: coupling to the CI job graph; reads the page list from docs/meta.json at probe time (mirroring docs/lib/source.ts's README→/ and RELEASE_NOTES→/release-notes URL mappings), asserts HTTP 200 per page with every failure NAMED via ::error:: (never fail-fast — one run reports the whole blast radius), and asserts a content marker on the newest page so a 200-from-an-error-page cannot false-pass. Structure pinned by scripts/test_automation.py::test_docs_probe_workflow_watches_every_registered_page. (Live-fire note: at landing, the deployed site was already 404ing /agents again — the probe's first scheduled run will correctly red until the CF Pages deploy is refreshed, which is the watcher working as designed.)
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-7-retro-2026-09-10.md"
 
+  - id: "epic-11-retro-item-1-fix-unix-spawn-diagnostic-inversion"
+    epic: 11
+    action: "Fix the unix spawn fail-closed diagnostic inversion (L1): the killpg/wait
+      reaps the child BEFORE the try_wait distinction, so exited-instantly always
+      fires and the platform-failure arm is dead (backends/unix/mod.rs:301-327; Windows
+      mirror is correct). Capture the retry-loop outcome before the kill; seam-test
+      both arms at the spawn site. [epic-11 retro L1, MED]"
+    owner: "next engine-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-2-verify-loop2-invariants-cap-skip-pins"
+    epic: 11
+    action: "Verify the loop-2 invariants (L2+L3): test the AI-12 40-tick environmental
+      cap (escalation once, crash credit resumes), test the AI-41 bounded-park SKIP
+      path (SKIPPED diagnostic + cursor advance), and add embed-clean count==1 pins
+      for the &skip/&escalation/&unclear diagnostic routes. [epic-11 retro L2/L3,
+      MED]"
+    owner: "next engine-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-3-agents-coverage-gate-sentence"
+    epic: 11
+    action: "Correct AGENTS.md:34-35 coverage-gate wording (names cargo tarpaulin
+      --workspace --fail-under 95; the real gate is the 11-5 per-crate split + lcov
+      merge + exact-fraction comparison — link docs/testing.md). [epic-11 retro L5,
+      LOW]"
+    owner: "next docs-touching change"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-4-recovery-session-verification-bar-pattern"
+    epic: 11
+    action: "Canonize the recovery-session verification bar as an AGENTS.md Engineering
+      pattern (AI-57 sibling): a session resuming a dead session's review loop applies
+      its patches at the SAME evidence bar (test + pin), and the commissioning loop
+      re-runs over the recovery work. Root cause of L1-L3. [epic-11 retro process
+      lesson]"
+    owner: "next process-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-5-windows-parity-adoption-tests"
+    epic: 11
+    action: "Windows-positive twins for the AI-44 x3 + AI-46 adoption tests (they
+      runtime-skip Windows; the harness is Windows-capable; the survival-test twins
+      are the template). [epic-11 retro L4, LOW]"
+    owner: "next Windows-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-6-semver-job-collect-both-layers"
+    epic: 11
+    action: "Optional: semver CI job collects BOTH layer findings (in-repo baseline
+      + crates.io loop) before exiting — the sequential fail-fast masked the crates.io
+      version-bump finding for the PR's whole life. [epic-11 retro F2, LOW]"
+    owner: "next CI-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-7-supervisor-split-study"
+    epic: 11
+    action: "supervisor.rs split study: production 4437 + tests 3671 lines, +36% in
+      epic-11; the next engine epic spec stage should propose a deliberate module
+      boundary instead of accreting. [epic-11 retro F-agg2, LOW]"
+    owner: "next engine epic"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-1-fix-unix-spawn-diagnostic-inversion"
+    epic: 11
+    action: "Fix the unix spawn fail-closed diagnostic inversion (L1): the killpg/wait
+      reaps the child BEFORE the try_wait distinction, so exited-instantly always
+      fires and the platform-failure arm is dead (backends/unix/mod.rs:301-327; Windows
+      mirror is correct). Capture the retry-loop outcome before the kill; seam-test
+      both arms at the spawn site. [epic-11 retro L1, MED]"
+    owner: "next engine-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-2-verify-loop2-invariants-cap-skip-pins"
+    epic: 11
+    action: "Verify the loop-2 invariants (L2+L3): test the AI-12 40-tick environmental
+      cap (escalation once, crash credit resumes), test the AI-41 bounded-park SKIP
+      path (SKIPPED diagnostic + cursor advance), and add embed-clean count==1 pins
+      for the &skip/&escalation/&unclear diagnostic routes. [epic-11 retro L2/L3,
+      MED]"
+    owner: "next engine-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-3-agents-coverage-gate-sentence"
+    epic: 11
+    action: "Correct AGENTS.md:34-35 coverage-gate wording (names cargo tarpaulin
+      --workspace --fail-under 95; the real gate is the 11-5 per-crate split + lcov
+      merge + exact-fraction comparison - link docs/testing.md). [epic-11 retro L5,
+      LOW]"
+    owner: "next docs-touching change"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-4-recovery-session-verification-bar-pattern"
+    epic: 11
+    action: "Canonize the recovery-session verification bar as an AGENTS.md Engineering
+      pattern (AI-57 sibling): a session resuming a dead session review loop applies
+      its patches at the SAME evidence bar (test + pin), and the commissioning loop
+      re-runs over the recovery work. Root cause of L1-L3. [epic-11 retro process
+      lesson]"
+    owner: "next process-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-5-windows-parity-adoption-tests"
+    epic: 11
+    action: "Windows-positive twins for the AI-44 x3 + AI-46 adoption tests (they
+      runtime-skip Windows; the harness is Windows-capable; the survival-test twins
+      are the template). [epic-11 retro L4, LOW]"
+    owner: "next Windows-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-6-semver-job-collect-both-layers"
+    epic: 11
+    action: "Optional: semver CI job collects BOTH layer findings (in-repo baseline
+      + crates.io loop) before exiting - the sequential fail-fast masked the crates.io
+      version-bump finding for the PR whole life. [epic-11 retro F2, LOW]"
+    owner: "next CI-touching story"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-11-retro-item-7-supervisor-split-study"
+    epic: 11
+    action: "supervisor.rs split study: production 4437 + tests 3671 lines, +36 percent
+      in epic-11; the next engine epic spec stage should propose a deliberate module
+      boundary instead of accreting. [epic-11 retro F-agg2, LOW]"
+    owner: "next engine epic"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
