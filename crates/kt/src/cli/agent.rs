@@ -24,8 +24,8 @@ use ktesio_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible, AgentDuplicateName,
-    AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
+    AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible, AgentDetachRefused,
+    AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
     AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
@@ -1102,7 +1102,8 @@ fn render_usage_instance(entry: &FleetEntry) {
     ui::print_table(&title, &columns, &rows);
 }
 
-/// `kt agent start <name>` — start a registered Agent Instance (AC1/AC2).
+/// `kt agent start <name> [--detach]` — start a registered Agent Instance
+/// (AC1/AC2).
 ///
 /// Opens the engine, drives `start` through the blocking facade, and prints the
 /// new Lifecycle State (`running`) to stdout on success. On a launch failure the
@@ -1110,22 +1111,31 @@ fn render_usage_instance(entry: &FleetEntry) {
 /// diagnostic goes to stderr (AC2). Output discipline (AD-12): result → stdout,
 /// diagnostics/notices → stderr.
 ///
-/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5): the engine
-/// supervises the started process only for the lifetime of THIS engine session.
-/// Because the backend kills the process group / job on handle drop, a
-/// standalone `kt agent start <name>` stops the agent when this CLI process
-/// exits cleanly — the persisted `running` row then outlives the live process.
-/// Story 1-6 delivers CRASH recovery: if the engine CRASHES (no clean drop), a
-/// surviving process is re-adopted on the next `Engine::open` (by pid +
-/// start-time fingerprint) and crashes are detected + handled by the Restart
-/// Policy. It does NOT make a cleanly-exited standalone `kt agent start` leave a
-/// durably-supervised process across separate CLI invocations — that remains
-/// future work. To keep the operator honest at the point of pain, the success
-/// path prints a one-line notice to STDERR (never stdout — existing tests assert
-/// the stdout result line).
-pub fn start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5): without
+/// `--detach`, the engine supervises the started process only for the lifetime
+/// of THIS engine session. Because the backend kills the process group / job on
+/// handle drop, a standalone `kt agent start <name>` stops the agent when this
+/// CLI process exits cleanly — the persisted `running` row then outlives the
+/// live process. Story 1-6 delivers CRASH recovery: if the engine CRASHES (no
+/// clean drop), a surviving process is re-adopted on the next `Engine::open`
+/// (by pid + start-time fingerprint) and crashes are detected + handled by the
+/// Restart Policy. The stderr notice states this and points at `--detach`.
+///
+/// DETACHED START (`--detach`, story 12-1): the child's handle is disarmed at
+/// spawn, so it survives this command's exit and the next `kt` command
+/// re-adopts it via the existing fingerprint path. The notice flips to the
+/// ratified ENFORCEMENT-WINDOW honesty (a hard AC): between commands there is
+/// NO crash detection, NO budget enforcement, and NO event delivery. An
+/// `engine-observed` instance is refused by the engine before any side effect
+/// ([`EngineError::DetachRefused`] → `AgentDetachRefused`).
+pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
-    match engine.blocking().start(name) {
+    let attempt = if detach {
+        engine.blocking().start_detached(name)
+    } else {
+        engine.blocking().start(name)
+    };
+    match attempt {
         Ok(instance) => {
             ui::success(format!(
                 "Started Agent Instance {}",
@@ -1133,14 +1143,28 @@ pub fn start(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             ));
             // Command result to stdout: the new Lifecycle State.
             println!("{}", instance.state);
-            // Honest single-lifetime notice to STDERR (AD-12: notices → stderr,
-            // never stdout). A clean CLI exit stops the agent; durable supervision
-            // across separate CLI invocations is future work.
-            ui::note(
-                "the started process is supervised only for this engine session \
-                 and stops when this command exits; durable supervision across \
-                 separate CLI invocations is future work.",
-            );
+            if detach {
+                // Story 12-1 — the detached enforcement-window notice to
+                // STDERR (AD-12: notices → stderr, never stdout). States what
+                // is NOT supervised between commands (crash detection, budget
+                // enforcement, event delivery) and how the next command
+                // reattaches — the same honesty `--help` carries.
+                ui::note(
+                    "detached: the agent keeps running after this command exits, and the \
+                     next `kt` command re-adopts it. Until then it is NOT supervised: no \
+                     crash detection, no budget enforcement, and no usage/event delivery \
+                     happen between commands (supervision is command-scoped).",
+                );
+            } else {
+                // Honest single-lifetime notice to STDERR (AD-12: notices →
+                // stderr, never stdout). A clean CLI exit stops the agent;
+                // `--detach` is the way to keep it running across commands.
+                ui::note(
+                    "the started process is supervised only for this engine session \
+                     and stops when this command exits; start it with --detach to keep \
+                     it running across commands.",
+                );
+            }
             Ok(())
         }
         Err(err) => Err(map_engine_error(err)),
@@ -2383,6 +2407,18 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 12-1 (AC2): `start --detach` was refused for an engine-observed
+        // instance — its loopback forward listener dies with the command, so a
+        // detached start would strand the agent's model traffic on a dead port.
+        // The engine refused BEFORE any side effect (the instance keeps its prior
+        // state); the detail carries the why + the remediation.
+        EngineError::DetachRefused { name, detail } => AgentDetachRefused {
+            message: format!(
+                "Agent Instance '{name}' cannot be started with --detach: {detail}. Nothing \
+                 was changed."
+            ),
+        }
+        .into(),
         EngineError::Backend { name, source } => AgentIo {
             message: format!("Process control failed for Agent Instance '{name}': {source}."),
         }
@@ -2799,6 +2835,16 @@ mod tests {
                     name: "pz".to_string(),
                     os: "linux".to_string(),
                     level: "unsupported".to_string(),
+                },
+                ExitCode::Unsupported,
+            ),
+            (
+                // Story 12-1: the detached-start refusal — the same
+                // unsupported-for-this-instance class (5), never a demotion.
+                "DetachRefused",
+                EngineError::DetachRefused {
+                    name: "obs".to_string(),
+                    detail: "its loopback listener dies with the command".to_string(),
                 },
                 ExitCode::Unsupported,
             ),

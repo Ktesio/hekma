@@ -56,7 +56,7 @@ use crate::ports::{
 /// `agent_memory_backing` table — one Memory Backing attachment row per instance
 /// as TYPED columns (never a JSON blob, DC-2), UNIQUE on the instance FK with
 /// `ON DELETE CASCADE`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -162,6 +162,23 @@ CREATE TABLE IF NOT EXISTS agent_memory_backing (
     kind         TEXT NOT NULL,
     attached_at  TEXT NOT NULL
 );
+";
+
+/// Schema v6 DDL (story 12-1 AMENDMENT, review loop 1): the spawn record's
+/// detached-ness flag.
+///
+/// ADDITIVE over the frozen `agent_runtime` columns: one INTEGER boolean
+/// column (`0`/`1`, `NOT NULL` with `DEFAULT 0` so pre-v6 rows read as the
+/// supervised, non-detached shape they were — review round 2 fixed this
+/// comment, which wrongly said "nullable"; the DDL was always NOT NULL).
+/// Detached-ness must RIDE THE RECORD because it
+/// is a cross-lifetime property: every later engine open re-adopts the live
+/// detached process and must re-hold the handle DISARMED, or the first benign
+/// intervening command's engine exit would kill the agent (the durable-detach
+/// promise, story 12-1). No column is renamed/removed, so v1..v5 → v6 preserves
+/// every row.
+const SCHEMA_V6: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN detached INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -367,6 +384,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 5 {
         migrate_step(conn, 5, SCHEMA_V5)?;
+    }
+    if version < 6 {
+        migrate_step(conn, 6, SCHEMA_V6)?;
     }
 
     Ok(())
@@ -820,13 +840,15 @@ impl StateStore for SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO agent_runtime \
-                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
+                  detached) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
                  restart_count = excluded.restart_count, \
-                 last_known_cause = excluded.last_known_cause",
+                 last_known_cause = excluded.last_known_cause, \
+                 detached = excluded.detached",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -834,6 +856,7 @@ impl StateStore for SqliteStore {
                     record.restart_policy.as_str(),
                     record.restart_count as i64,
                     record.last_known_cause,
+                    record.detach as i64,
                 ],
             )
             .map_err(backend)?;
@@ -858,7 +881,8 @@ impl StateStore for SqliteStore {
         };
         self.conn
             .query_row(
-                "SELECT pid, start_time, restart_policy, restart_count, last_known_cause \
+                "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
+                 detached \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -874,7 +898,7 @@ impl StateStore for SqliteStore {
             .conn
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
-                 r.last_known_cause \
+                 r.last_known_cause, r.detached \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1003,8 +1027,8 @@ impl StateStore for SqliteStore {
 }
 
 /// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
-/// restart_policy, restart_count, last_known_cause` columns), decoding the
-/// policy wire form and clamping the integer columns into domain types.
+/// restart_policy, restart_count, last_known_cause, detached` columns), decoding
+/// the policy wire form and clamping the integer columns into domain types.
 fn row_to_spawn_record(
     name: InstanceName,
     row: &rusqlite::Row<'_>,
@@ -1014,6 +1038,7 @@ fn row_to_spawn_record(
     let policy_raw: String = row.get("restart_policy").map_err(backend)?;
     let restart_count: i64 = row.get("restart_count").map_err(backend)?;
     let last_known_cause: Option<String> = row.get("last_known_cause").map_err(backend)?;
+    let detached: i64 = row.get("detached").map_err(backend)?;
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1025,6 +1050,7 @@ fn row_to_spawn_record(
         restart_policy,
         restart_count: restart_count.max(0) as u32,
         last_known_cause,
+        detach: detached != 0,
     })
 }
 
@@ -1374,6 +1400,7 @@ mod tests {
             restart_policy: RestartPolicy::OnFailure,
             restart_count: count,
             last_known_cause: None,
+            detach: false,
         }
     }
 
@@ -1395,6 +1422,28 @@ mod tests {
         store.clear_spawn_record(&name("demo")).unwrap();
         assert!(store.get_spawn_record(&name("demo")).unwrap().is_none());
         store.clear_spawn_record(&name("demo")).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn spawn_record_detached_flag_round_trips() {
+        // Story 12-1 AMENDMENT (review loop 1): the record carries the spawn's
+        // detached-ness, and it survives the DB round-trip BOTH ways — this is
+        // the durable input every later `adopt()` reads to re-hold the handle
+        // DISARMED. A `false` flag (the pre-12-1 supervised shape) round-trips
+        // in the sibling test; this pins the `true` arm.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("away", "mock", "/x/agents/away"))
+            .unwrap();
+        let mut rec = record("away", 111, 222, 0);
+        rec.detach = true;
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("away")).unwrap().unwrap();
+        assert!(back.detach, "the detached flag must ride the record");
+        // And through the LIST path (the reconcile input on engine open).
+        let listed = store.list_spawn_records().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].detach, "the list path keeps the detached flag");
     }
 
     #[test]
@@ -2413,16 +2462,19 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: migrator steps 4 → 5; user_version == 5 and every prior row survives.
+        // Reopen: migrator steps 4 → 5 → 6 (each additive); user_version ==
+        // 6 and every prior row survives.
         let store = SqliteStore::open(&db).unwrap();
         // PINNED LITERAL (AI-66 #5): assert the actual version, never the
         // constant the migrator stamps from — comparing to SCHEMA_VERSION would
-        // pass even if the stamp and the constant drifted together.
+        // pass even if the stamp and the constant drifted together. (The v6
+        // step, story 12-1 AMENDMENT, is the current last step; bump this
+        // literal when the next additive step lands.)
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -2441,6 +2493,73 @@ mod tests {
                 .unwrap()
                 .map(|b| b.kind),
             Some(MemoryBackingKind::Filesystem)
+        );
+    }
+
+    #[test]
+    fn migration_v5_db_upgrades_to_v6_preserving_records() {
+        // Story 12-1 AMENDMENT: a DB written at schema v5 (agent_runtime
+        // without the `detached` column) upgrades to v6 on open — the additive
+        // ALTER lands with DEFAULT 0, so every pre-existing spawn record
+        // reads as the supervised (non-detached) shape it was, and a record
+        // written AFTER the migration round-trips the flag. Mirrors the
+        // v4→v5 test.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.execute_batch("PRAGMA user_version = 5").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count) \
+                 VALUES (?1, 42, 77, 'on-failure', 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: migrator steps 5 → 6; the legacy record survives and its
+        // (absent) detach flag reads as `false` — the pre-detach shape.
+        let store = SqliteStore::open(&db).unwrap();
+        let record = store
+            .get_spawn_record(&name("legacy"))
+            .unwrap()
+            .expect("the legacy spawn record survives the v6 migration");
+        assert!(
+            !record.detach,
+            "a pre-v6 record is NOT detached (DEFAULT 0)"
+        );
+        assert_eq!(record.fingerprint, ProcessFingerprint::new(42, 77));
+        // And a post-migration record carries the flag both ways.
+        let mut rec = record.clone();
+        rec.detach = true;
+        store.upsert_spawn_record(&rec).unwrap();
+        assert!(
+            store
+                .get_spawn_record(&name("legacy"))
+                .unwrap()
+                .unwrap()
+                .detach,
+            "a post-v6 record round-trips the detached flag"
         );
     }
 

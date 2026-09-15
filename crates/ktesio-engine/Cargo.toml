@@ -52,11 +52,16 @@ tokio = { workspace = true }
 # justification). Engine-INTERNAL (AD-2 — the listener lives in `src/metering/`,
 # never crosses to kt). Portable async networking — NO OS cfg (the listener is in
 # the engine CORE, not `backends/`; the OS-cfg gate stays green). Builds on MSRV
-# 1.96.1 (verified). Lean: server + client + http1, NO TLS (HTTP upstream v1).
+# 1.96.1 (verified). Lean: server + client + http1. Story 12-3 adds the TLS leg:
+# `https://` upstreams dial VENDORED rustls+ring (no system TLS; ONE
+# rustls+ring pair unifies with kt→ureq — see the workspace deps comment).
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 # Unix ProcessBackend (AD-4): dedicated process groups (setpgid) + signal
 # delivery to the group (SIGTERM/SIGKILL via killpg). Target-gated so it is only
@@ -79,6 +84,10 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # Hermetic temp base dir for engine unit + integration tests.
 tempfile = { workspace = true }
+# Story 12-3 (TLS test only): the self-signed root the https+SSE composition
+# test mints. DEV-ONLY — never a shipping artifact (the workspace dep comment
+# carries the full justification).
+rcgen = { workspace = true }
 # Test-only: the reusable conformance mock adapter + scripted fake agent. This
 # is a DEV dependency ONLY — a normal edge would be transitive into `kt` and
 # trip the AD-2 boundary gate (which excludes dev-deps). The shipping engine

@@ -118,17 +118,20 @@ Dollar fields are **omitted entirely** when no Rate is configured (`cumulative_d
 
 With no instances registered, the Fleet form still emits a valid document (all-zero totals) and prints a short registration hint to stderr, so an empty Fleet is never mistaken for instances that consumed nothing.
 
-## `kt agent start <name>`
+## `kt agent start <name> [--detach]`
 
 Start a registered Agent Instance.
 
 ```bash
 kt agent start my-agent
+kt agent start my-agent --detach
 ```
 
 On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr. Before the process spawns, the start seam can emit one-line engine diagnostics on stderr (or the host sink): a report of every launch environment variable the config mapping **overwrote** (the config value wins), and a warn-only report of config keys whose `secret:` cleartext was delivered into a **flag** target (visible on the process argv) — neither ever rejects the start.
 
-A standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits (a note is printed to stderr). Durable supervision across separate CLI invocations is future work.
+Without `--detach`, the started process is supervised only for that command's lifetime and stops when the command exits (a note is printed to stderr). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+
+`--detach` keeps the agent running after the command exits: the process handle is disarmed at spawn, and the next `kt` command re-adopts the surviving process through the existing pid + start-time fingerprint path. The detached start prints a notice to stderr naming the honest **enforcement window**: between commands the agent is **not supervised** — no crash detection, no budget enforcement, and no usage/event delivery happen until the next command adopts it (supervision is command-scoped). Two further facts are pinned by design: a detached start refuses `engine-observed` instances (exit code 5) before anything changes — their loopback listener dies with the starting command, which would strand the agent's model traffic on a dead port — and a detached child is spawned with stdin closed regardless of its declared interaction level (`send` on it fails with the adopted-instance diagnostic after re-adoption, as for any adopted process).
 
 ## `kt agent stop <name> [--timeout <secs>]`
 
@@ -151,6 +154,8 @@ kt agent resume my-agent
 ```
 
 A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration. `resume` shares the dispatch: a **guaranteed** resume wakes the suspended process (SIGCONT), a **best-effort** resume records its qualifier, and a resume of an instance that is `paused` while the CURRENT declaration reads `unsupported` (declaration/OS drift) fails fast with a dedicated diagnostic that names the paused state and the escape hatch — `stop` works without pause support, so `kt agent stop <name> && kt agent start <name>` recovers (exit code 5, the capability-unsupported class). A guaranteed pause OR RESUME of an instance this engine session holds no process handle for (e.g. started by a prior engine whose process is gone) still transitions, but the recorded cause is the honest best-effort qualifier naming the missing handle — nothing was signalled at all, so the cause never reads as a plain "paused"/"resumed" command that a real suspension would earn; a budget-driven override in that no-handle case is wrapped in the same qualifier rather than replacing it.
+
+One interaction with detach is worth knowing: pause a `--detach`ed agent and then let the command exit, and the agent stays SIGSTOP-frozen and unsupervised between commands — frozen (no work) but also unwatched (no crash detection, no enforcement, no event delivery) until some later command holds it again; a later `kt agent resume <name>` wakes it, and `kt agent stop <name>` is always available.
 
 ## `kt agent send <name> <text>`
 
@@ -372,7 +377,7 @@ Every `kt` command returns one of these numeric exit codes, so failures can be b
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
-| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `kt agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery) |
+| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `kt agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `kt agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `kt agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 
 A script branches on the code directly — no stderr parsing:

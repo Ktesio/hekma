@@ -58,6 +58,9 @@ struct UpstreamStub {
     /// Set once the stub has seen the sentinel API key in a forwarded request
     /// (proves the proxy relays the auth header faithfully upstream).
     saw_sentinel_key: Arc<AtomicBool>,
+    /// Set once the stub has seen the engine-INJECTED `stream_options.include_usage`
+    /// in a forwarded request BODY (story 12-2: the upstream-visible injection).
+    saw_include_usage: Arc<AtomicBool>,
     /// How many completion requests the stub has served.
     served: Arc<AtomicU64>,
     /// Flips to stop the accept loop on drop.
@@ -85,10 +88,12 @@ fn start_upstream_stub() -> UpstreamStub {
     assert!(addr.ip().is_loopback(), "stub must be loopback");
     let base_url = format!("http://{addr}");
     let saw_sentinel_key = Arc::new(AtomicBool::new(false));
+    let saw_include_usage = Arc::new(AtomicBool::new(false));
     let served = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     let thread_saw = Arc::clone(&saw_sentinel_key);
+    let thread_inject = Arc::clone(&saw_include_usage);
     let thread_served = Arc::clone(&served);
     let thread_stop = Arc::clone(&stop);
     thread::spawn(move || {
@@ -97,60 +102,110 @@ fn start_upstream_stub() -> UpstreamStub {
                 break;
             }
             let Ok(mut stream) = stream else { continue };
-            serve_one(&mut stream, &thread_saw, &thread_served);
+            serve_one(&mut stream, &thread_saw, &thread_inject, &thread_served);
         }
     });
 
     UpstreamStub {
         base_url,
         saw_sentinel_key,
+        saw_include_usage,
         served,
         stop,
     }
 }
 
-/// Serve ONE upstream request: read the request head (headers) + any body, note
-/// whether the sentinel API key was forwarded (faithful relay proof), and write a
-/// FIXED OpenAI-compatible completion response with the known `usage`.
-fn serve_one(stream: &mut TcpStream, saw_sentinel: &AtomicBool, served: &AtomicU64) {
+/// Serve ONE upstream request: read the request head (headers) + the declared
+/// Content-Length body, note whether the sentinel API key was forwarded
+/// (faithful relay proof), and answer:
+/// * a `"stream": true` body (story 12-2) gets a `text/event-stream` SSE
+///   response — null intermediates, the terminal `usage` frame, `[DONE]` — the
+///   OpenAI streaming shape the engine's include_usage injection asks for;
+/// * any other body gets the FIXED OpenAI-compatible JSON completion with the
+///   known `usage` (the original story-3-4 shape, unchanged).
+fn serve_one(
+    stream: &mut TcpStream,
+    saw_sentinel: &AtomicBool,
+    saw_include_usage: &AtomicBool,
+    served: &AtomicU64,
+) {
     // Read the request head (up to the blank line) + drain the declared body length,
     // so the socket is consumed before we respond (a well-behaved HTTP peer).
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     // Read until we have the header terminator (\r\n\r\n) or the peer stalls.
-    loop {
-        let head_end = find_subsequence(&buf, b"\r\n\r\n");
-        if head_end.is_some() {
-            break;
+    let head_end = loop {
+        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+            break pos;
         }
         match stream.read(&mut tmp) {
-            Ok(0) => break,
+            Ok(0) => break buf.len(),
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(_) => break,
+            Err(_) => break buf.len(),
         }
         if buf.len() > 64 * 1024 {
-            break; // defensive cap
+            break buf.len(); // defensive cap
+        }
+    };
+    // Drain the declared body (best-effort: a head without a Content-Length has none).
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    if let Some(cl) = head
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        let mut have = buf.len() - head_end - 4;
+        while have < cl {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    have += n;
+                }
+                Err(_) => break,
+            }
         }
     }
-    let head = String::from_utf8_lossy(&buf);
+    let raw = String::from_utf8_lossy(&buf);
     // The faithful-relay proof: the sentinel API key the agent sent must arrive here
     // (the proxy forwarded the Authorization header verbatim upstream).
-    if head.contains(SENTINEL_API_KEY) {
+    if raw.contains(SENTINEL_API_KEY) {
         saw_sentinel.store(true, Ordering::SeqCst);
     }
+    // The story-12-2 proof: the forwarded BODY carries the engine-injected
+    // stream_options.include_usage (the upstream-visible modification).
+    if raw.contains("\"stream_options\"") && raw.contains("\"include_usage\"") {
+        saw_include_usage.store(true, Ordering::SeqCst);
+    }
 
-    // A FIXED OpenAI-compatible completion body with the known usage.
-    let body = format!(
-        r#"{{"id":"chatcmpl-stub","object":"chat.completion","model":"gpt-observed",
+    let response = if raw.contains(r#""stream":true"#) || raw.contains(r#""stream": true"#) {
+        // STORY 12-2: the streaming shape — `text/event-stream` with null
+        // intermediates, the TERMINAL usage frame (what the engine's injected
+        // include_usage asks for), and the `[DONE]` sentinel.
+        let sse = format!(
+            "data: {{\"id\":\"chatcmpl-stub\",\"choices\":[{{\"delta\":{{\"content\":\"he\"}}}}],\"usage\":null}}\n\n\
+             data: {{\"id\":\"chatcmpl-stub\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{STUB_PROMPT_TOKENS},\"completion_tokens\":{STUB_COMPLETION_TOKENS},\"total_tokens\":{total}}}}}\n\n\
+             data: [DONE]\n\n",
+            total = STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS,
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}",
+        )
+    } else {
+        // A FIXED OpenAI-compatible completion body with the known usage (the
+        // story-3-4 non-streaming shape).
+        let body = format!(
+            r#"{{"id":"chatcmpl-stub","object":"chat.completion","model":"gpt-observed",
 "choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}],
 "usage":{{"prompt_tokens":{STUB_PROMPT_TOKENS},"completion_tokens":{STUB_COMPLETION_TOKENS},"total_tokens":{total}}}}}"#,
-        total = STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS,
-    );
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        len = body.len(),
-    );
+            total = STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS,
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+            len = body.len(),
+        )
+    };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
     served.fetch_add(1, Ordering::SeqCst);
@@ -322,6 +377,77 @@ fn engine_observed_usage_lands_in_the_ledger_tagged_engine_observed() {
     assert_eq!(entry.metering_source, "engine-observed");
 
     let _ = facade.stop("obs", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_streamed_completion_is_metered_end_to_end_through_the_terminal_sse_frame() {
+    // Story 12-2, the END-TO-END proof: the agent's completion calls carry
+    // `"stream": true` (and no stream_options of their own); the forwarded
+    // request arrives at the upstream WITH the engine-injected
+    // `stream_options.include_usage`; the upstream answers with the SSE stream
+    // shape; and the TERMINAL usage frame lands in the ledger exactly once per
+    // streamed call — budgets would enforce on it (same choke point, proven by
+    // the sibling tests).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let stub = start_upstream_stub();
+
+    // 2 STREAMING observed calls (the fake_agent sets stream:true and carries
+    // no stream_options — the injection is the only way usage can arrive).
+    write_observed_manifest(
+        manifest.path(),
+        "obsstream",
+        &["--observed-stream-calls", "2", "--linger-ms", "600000"],
+        None,
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "obsstream",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_config("obsstream", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+
+    facade.start("obsstream").unwrap();
+
+    // Exactly 2 observed events commit — one per STREAMED call (the null
+    // intermediate frames never become ledger rows).
+    let count = wait_for_observed_rows(state.path(), "obsstream", 2, Duration::from_secs(30));
+    assert_eq!(
+        count, 2,
+        "exactly one ledger event per streamed completion (terminal frame only)"
+    );
+
+    // The stub served the forwarded streaming calls AND saw the injected
+    // include_usage (the upstream-visible modification, proven end to end).
+    assert!(
+        stub.saw_include_usage.load(Ordering::SeqCst),
+        "the forwarded streaming request must carry the injected stream_options.include_usage"
+    );
+
+    // The streamed counts are exact (the terminal frame's totals, K=2).
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet
+        .iter()
+        .find(|e| e.name.as_str() == "obsstream")
+        .unwrap();
+    assert_eq!(
+        entry.usage.cumulative_input_tokens,
+        2 * STUB_PROMPT_TOKENS,
+        "the terminal SSE frame's input tokens landed exactly"
+    );
+    assert_eq!(
+        entry.usage.cumulative_output_tokens,
+        2 * STUB_COMPLETION_TOKENS,
+        "the terminal SSE frame's output tokens landed exactly"
+    );
+
+    let _ = facade.stop("obsstream", Some(Duration::from_secs(5)));
 }
 
 #[test]

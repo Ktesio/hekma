@@ -113,6 +113,14 @@
 //!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
 //!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
 //!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
+//! * `--observed-stream-calls <N>` (story 12-2)  the STREAMING sibling of
+//!   `--observed-calls`: each POST body sets `"stream": true` (no
+//!   `stream_options` of its own — the engine's listener injects
+//!   `include_usage`), and the call DISCARDS the SSE response like any real
+//!   streaming client would. The upstream stub (and the engine) sees a
+//!   streaming request whose usage arrives only in the terminal SSE frame —
+//!   the end-to-end vehicle proving streamed completions are metered. Pure
+//!   `std`, NO OS-cfg.
 //! * `--sniff-stdin-at-startup` (story 4-1 fix pass, HIGH finding, review of
 //!   #79)  BEFORE announcing readiness (before the ready line, before
 //!   `--marker`, before anything else), synchronously BLOCK reading ONE line
@@ -190,6 +198,10 @@ struct Opts {
     /// to the test upstream stub and skims the `usage` out of the response. `0` =
     /// no observed calls (the default; existing self-reported tests unaffected).
     observed_calls: u64,
+    /// The STREAMING sibling (story 12-2): `<N>` completion POSTs whose body sets
+    /// `"stream": true` (the agent carries no `stream_options` of its own — the
+    /// engine's listener injects `include_usage`). `0` = none (the default).
+    observed_stream_calls: u64,
     /// The `Authorization: Bearer <value>` the observed calls carry (story 3-4
     /// no-leak test): a sentinel API key the proxy must relay UPSTREAM faithfully but
     /// leak into NONE of ktesio's surfaces. `None` = no auth header sent.
@@ -246,6 +258,7 @@ fn parse() -> Opts {
     let mut usage_output_tokens = None;
     let mut final_usage_no_newline = false;
     let mut observed_calls = 0;
+    let mut observed_stream_calls = 0;
     let mut observed_auth = None;
     let mut echo_stdin = false;
     let mut sniff_stdin_at_startup = false;
@@ -277,6 +290,23 @@ fn parse() -> Opts {
             "--observed-calls" => {
                 if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     observed_calls = n;
+                }
+            }
+            "--observed-stream-calls" => {
+                // Review round 2: a missing or non-numeric value must FAIL
+                // FAST (stderr + exit 2) — silently treating it as 0 would
+                // make a mistyped e2e fixture assert an empty ledger for the
+                // wrong reason (the agent never streamed) instead of the
+                // behavior under test.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) => observed_stream_calls = n,
+                    None => {
+                        eprintln!(
+                            "fake_agent: --observed-stream-calls requires a non-negative \
+                             integer argument (got missing or non-numeric value)"
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
             "--observed-auth" => {
@@ -367,6 +397,7 @@ fn parse() -> Opts {
         usage_output_tokens,
         final_usage_no_newline,
         observed_calls,
+        observed_stream_calls,
         observed_auth,
         echo_stdin,
         sniff_stdin_at_startup,
@@ -509,7 +540,7 @@ fn main() {
     // forward listener relays each to the upstream stub and skims `usage` into the
     // ledger. Readiness-gated (AFTER the ready line) + count-bounded, so the test waits
     // for the KNOWN committed observed-row count, not a wall clock. Pure `std` HTTP.
-    if opts.observed_calls > 0 {
+    if opts.observed_calls > 0 || opts.observed_stream_calls > 0 {
         // The base_url the engine injected. Absent → nothing to call (a
         // misconfiguration the test would catch as zero committed rows); announce it
         // to stderr as a diagnostic and skip (never crash).
@@ -520,6 +551,14 @@ fn main() {
                     // asserts on committed rows, not on this loop). A small pause lets
                     // the ~250ms reaper drain the observed queue between calls.
                     let _ = post_completion(base_url.trim(), opts.observed_auth.as_deref());
+                    sleep(Duration::from_millis(20));
+                }
+                // Story 12-2: the streaming variant — same endpoint, a `"stream": true`
+                // body, and the SSE response discarded unread (the usage the engine
+                // meters arrives in the terminal SSE frame).
+                for _ in 0..opts.observed_stream_calls {
+                    let _ =
+                        post_streaming_completion(base_url.trim(), opts.observed_auth.as_deref());
                     sleep(Duration::from_millis(20));
                 }
             }
@@ -695,6 +734,59 @@ fn post_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
     stream.flush()?;
     // Read the whole response and discard it (the engine skims `usage` on its side;
     // the agent just needs a faithful response, which we do not inspect here).
+    let mut sink = Vec::new();
+    let _ = stream.read_to_end(&mut sink);
+    Ok(())
+}
+
+/// The story-12-2 STREAMING sibling of [`post_completion`]: ONE minimal
+/// OpenAI-compatible completion POST whose body sets `"stream": true` — and,
+/// deliberately, NO `stream_options` of its own (the engine's listener injects
+/// `include_usage`; the agent must not carry one or the injection is skipped).
+/// The SSE response is drained and discarded like any real streaming client
+/// would. Pure `std`, NO OS-cfg; same best-effort contract as the sibling.
+#[cfg(not(tarpaulin_include))]
+fn post_streaming_completion(base_url: &str, auth: Option<&str>) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    // The same authority parse the sibling uses (`http://<host>:<port>` → authority).
+    let authority = base_url
+        .strip_prefix("http://")
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty authority",
+        ));
+    }
+
+    // The streaming request shape: `"stream": true`, NO stream_options (the
+    // engine's injection is what adds it).
+    let body =
+        br#"{"model":"gpt-observed","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let auth_header = match auth {
+        Some(key) => format!("Authorization: Bearer {key}\r\n"),
+        None => String::new(),
+    };
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\n\
+         Host: {authority}\r\n\
+         {auth_header}\
+         Content-Type: application/json\r\n\
+         Content-Length: {len}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        len = body.len(),
+    );
+
+    let mut stream = TcpStream::connect(authority)?;
+    stream.write_all(request.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()?;
     let mut sink = Vec::new();
     let _ = stream.read_to_end(&mut sink);
     Ok(())

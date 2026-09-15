@@ -144,6 +144,14 @@ enum AgentCommands {
     Start {
         /// Name of the Agent Instance to start
         name: String,
+        /// Detach: keep the agent running after this command exits; the next
+        /// `kt` command re-adopts it. HONEST ENFORCEMENT WINDOW (ratified
+        /// 12-1): between commands there is NO crash detection, NO budget
+        /// enforcement, and NO event delivery — supervision is command-scoped.
+        /// Refused for engine-observed instances (their loopback listener dies
+        /// with this command).
+        #[arg(long)]
+        detach: bool,
     },
     /// Stop a running Agent Instance (graceful, then forced after the window)
     Stop {
@@ -344,7 +352,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 cli::agent::DispositionArg::from_flags(delete, retain),
                 force,
             ),
-            AgentCommands::Start { name } => cli::agent::start(&name),
+            AgentCommands::Start { name, detach } => cli::agent::start(&name, detach),
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),

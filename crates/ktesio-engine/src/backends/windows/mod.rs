@@ -1,12 +1,18 @@
 //! The Windows [`ProcessBackend`] (spine AD-4) — one Job Object per instance.
 //!
-//! Each Agent Instance is spawned and then assigned to its OWN Job Object
-//! configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Stopping terminates the
-//! whole job with `TerminateJobObject`, which kills EVERY process in the job —
-//! the parent agent and any child processes it spawned — the Windows equivalent
-//! of the Unix process-group kill behind AC3 "no process of the instance
-//! survives". Closing the job handle (on drop) also kills the tree, so a dropped
-//! handle never leaks processes.
+//! Every Agent Instance is spawned and then assigned to its OWN Job Object. An
+//! ATTACHED (supervised) spawn configures the job with
+//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: stopping terminates the whole job with
+//! `TerminateJobObject`, which kills EVERY process in the job — the parent agent
+//! and any child processes it spawned — the Windows equivalent of the Unix
+//! process-group kill behind AC3 "no process of the instance survives"; closing
+//! the job handle (on drop) also kills the tree, so a dropped handle never leaks
+//! processes. A DETACHED spawn (story 12-1 AMENDMENT, `kt agent start --detach`)
+//! gets the SAME job but WITHOUT kill-on-close: the job exists purely so a
+//! `stop` escalation's `TerminateJobObject` still reaches the whole tree
+//! (descendants included — parity with Unix `killpg`), while closing the handle
+//! at engine exit kills NOTHING and the child survives to be re-adopted via the
+//! unchanged fingerprint path.
 //!
 //! This module is the allowlisted home for OS-conditional code (it is
 //! `#[cfg(windows)]`-gated at its `mod` declaration in `backends/mod.rs`). It
@@ -109,19 +115,28 @@ const START_TIME_READ_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// A running process on Windows.
 ///
-/// For a FRESHLY SPAWNED process, `child` is `Some` and `job` owns the process
-/// tree (kill-on-close). For an ADOPTED process (story 1-6, re-acquired on engine
-/// start), `child` is `None`, `job` is null, and `adopted` holds a process HANDLE
-/// opened via `OpenProcess` (for liveness + `TerminateProcess`) — this engine is
-/// not the parent, so it holds no reap-able [`Child`] and did not create a job.
-/// Dropping either form releases its OS handles; a spawned handle also kills the
-/// tree via the job's kill-on-close.
+/// For a FRESHLY SPAWNED ATTACHED process, `child` is `Some` and `job` owns the
+/// process tree (kill-on-close configured). For an ADOPTED process (story 1-6,
+/// re-acquired on engine start), `child` is `None`, `job` is null, and
+/// `adopted` holds a process HANDLE opened via `OpenProcess` (for liveness +
+/// `TerminateProcess`) — this engine is not the parent, so it holds no reap-able
+/// [`Child`] and did not create a job. For a DETACHED spawned process (story
+/// 12-1 AMENDMENT), `child` is `Some` and `job` is NON-null but carries NO
+/// kill-on-close — the job exists only so a `stop` escalation's
+/// `TerminateJobObject` reaches the whole tree (descendants included, parity
+/// with the Unix process-group kill); closing the job handle at drop or engine
+/// exit kills NOTHING (no kill-on-close), which IS the disarm that lets the
+/// child survive to be re-adopted. Dropping any form releases its OS handles;
+/// only the ATTACHED job'd form kills the tree (via kill-on-close).
 pub struct WindowsProcess {
     /// The owned child handle if THIS engine spawned the process (drives
     /// waits/exit-code). `None` for an adopted process (not our child).
     child: Option<Child>,
-    /// The Job Object handle (owns the process tree; kill-on-close configured)
-    /// for a spawned process; null for an adopted one.
+    /// The Job Object handle for a spawned process — kill-on-close CONFIGURED
+    /// for an attached spawn (the supervised no-survivor guarantee), created
+    /// WITHOUT kill-on-close for a detached spawn (story 12-1 AMENDMENT: it
+    /// exists only as the `stop` escalation's tree-kill target); null for an
+    /// adopted one.
     job: HANDLE,
     /// The opened process HANDLE for an ADOPTED process (liveness +
     /// TerminateProcess); null for a spawned one (which uses its Child/job).
@@ -175,16 +190,28 @@ impl Drop for WindowsProcess {
     /// addition. Purely local bookkeeping; the agent process's crash
     /// resilience comes entirely from the raw capture files being direct,
     /// engine-independent OS redirects, never from this signal.
+    ///
+    /// Story 12-1 AMENDMENT (review loop 1): a DETACHED spawned handle (child
+    /// `Some`, job non-null WITHOUT kill-on-close, adopted null) drops WITHOUT
+    /// killing anything — closing a job that never had kill-on-close armed
+    /// terminates nothing, and a bare `Child` drop never terminates the
+    /// process, which is precisely the disarm that lets the child outlive this
+    /// engine and be re-adopted later. (The pre-amendment draft reached the
+    /// same disarm by creating NO job at all — that variant also disarmed the
+    /// `stop` escalation's descendant reach, which the job-without-kill-on-
+    /// close shape restores.)
     fn drop(&mut self) {
         if let Some(capture) = &self.log_capture {
             capture.signal_stop();
         }
-        // Spawned: closing the job handle kills the tree (kill-on-close), then
-        // release it. Adopted: SIGKILL-equivalent is not applied on drop for a
-        // process we merely re-opened (parity with Unix would kill it; but on
-        // Windows an adopted process has no job, and the cross-lifetime handle is
-        // dropped at engine shutdown — we terminate it in `stop`, and on drop we
-        // only release the opened handle so we do not leak it). Best-effort.
+        // Spawned ATTACHED: closing the job handle kills the tree
+        // (kill-on-close), then releases it. Spawned DETACHED: the same close
+        // only RELEASES the job (no kill-on-close — the disarm). Adopted:
+        // SIGKILL-equivalent is not applied on drop for a process we merely
+        // re-opened (parity with Unix would kill it; but on Windows an adopted
+        // process has no job, and the cross-lifetime handle is dropped at
+        // engine shutdown — we terminate it in `stop`, and on drop we only
+        // release the opened handle so we do not leak it). Best-effort.
         if !self.job.is_null() {
             unsafe {
                 CloseHandle(self.job);
@@ -218,8 +245,29 @@ impl ProcessBackend for WindowsBackend {
     type Handle = WindowsProcess;
 
     fn spawn(&self, spec: &SpawnSpec) -> Result<Self::Handle, BackendError> {
-        // Create the Job Object first and configure kill-on-close so that even a
-        // dropped handle (or a crash of the engine) tears down the tree.
+        // EVERY spawn — attached or DETACHED — gets a Job Object, and the child
+        // is assigned to it (story 12-1 AMENDMENT, review loop 1). What differs
+        // is ONE limit flag:
+        //
+        // * ATTACHED: `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is armed, so a
+        //   dropped handle (or a crash of the engine) tears down the tree —
+        //   the supervised no-survivor guarantee.
+        // * DETACHED: the job is created with NO limits — kill-on-close is
+        //   deliberately never armed, so closing the job handle at engine exit
+        //   (or a Drop) kills NOTHING and the child survives to be re-adopted.
+        //   The job still exists so a `stop` escalation can
+        //   `TerminateJobObject` the WHOLE tree — parent AND descendants —
+        //   exactly like the Unix backend's process-group kill. The first
+        //   (reverted) draft skipped the job entirely for detached spawns;
+        //   that leaked descendants on a detached force-stop (terminate only
+        //   reaches the direct child via `TerminateProcess`) — the platform-
+        //   asymmetric gap this closes. There is no breakaway needed: the
+        //   child never LEAVES the job; the job just never kills it on close.
+        //
+        // The trade stays honest and documented: until re-adoption a detached
+        // child has no crash detection / enforcement, and a hard engine crash
+        // cannot reap it (no kill-on-close) — adoption is the recovery, exactly
+        // as on Unix.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             return Err(BackendError::Spawn {
@@ -227,11 +275,17 @@ impl ProcessBackend for WindowsBackend {
                 detail: format!("CreateJobObjectW failed (os error {})", last_error()),
             });
         }
-        // Wrap the job handle in a guard so any early return closes it.
-        let job_guard = JobGuard { job };
+        // Wrap the job handle in a guard so any early return closes it. For a
+        // DETACHED job, closing kills nothing (no kill-on-close) — the guard is
+        // purely a handle-leak guard there; for an ATTACHED job it also reaps
+        // the just-spawned child (which is exactly the fail-closed behavior the
+        // early returns want).
+        let guard = JobGuard { job };
 
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if !spec.detach {
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        }
         let ok = unsafe {
             SetInformationJobObject(
                 job,
@@ -348,33 +402,53 @@ impl ProcessBackend for WindowsBackend {
 
         // Assign the child to the job immediately (before it does meaningful
         // work). From here, the child and every descendant it spawns are in the
-        // job and die with a TerminateJobObject / job-handle close (AC3).
-        let child_handle = child.as_raw_handle() as HANDLE;
-        let assigned = unsafe { AssignProcessToJobObject(job, child_handle) };
-        if assigned == 0 {
-            let detail = format!(
-                "AssignProcessToJobObject failed (os error {})",
-                last_error()
-            );
-            // Kill the child we just created so nothing leaks, then fail.
-            unsafe {
-                TerminateJobObject(job, 1);
+        // job: an ATTACHED job kills them at TerminateJobObject/job-handle
+        // close (AC3); a DETACHED job only ever dies by an explicit
+        // `TerminateJobObject` from `stop` — the handle close at engine exit
+        // kills nothing (no kill-on-close), which IS the detach disarm.
+        let job = {
+            let child_handle = child.as_raw_handle() as HANDLE;
+            let assigned = unsafe { AssignProcessToJobObject(guard.job, child_handle) };
+            if assigned == 0 {
+                let detail = format!(
+                    "AssignProcessToJobObject failed (os error {})",
+                    last_error()
+                );
+                // Kill the child we just created so nothing leaks — EXPLICITLY
+                // via the owned child handle (review round 2): the assignment
+                // FAILED, so the child is in NO job, and neither
+                // `TerminateJobObject` (which kills MEMBERS of the job) nor
+                // the attached job's kill-on-close (fired by the guard's Drop,
+                // also members-only) can reach a process that never joined.
+                // This holds for BOTH shapes — attached and detached — so the
+                // kill does not branch on `spec.detach`. There is no test seam
+                // for this branch: `AssignProcessToJobObject` is a raw FFI call
+                // three lines after the spawn, with no injectable indirection
+                // (std::process::Command exposes no pre-assign hook), so the
+                // failure cannot be forced from a hosted test — the branch is
+                // kept minimal and reviewed instead.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BackendError::Spawn {
+                    exec: spec.exec.clone(),
+                    detail,
+                });
             }
-            return Err(BackendError::Spawn {
-                exec: spec.exec.clone(),
-                detail,
-            });
-        }
+            // Assignment succeeded — release the job handle from its guard.
+            guard.into_inner()
+        };
 
         // AI-14: verify the child's creation-time token NOW — a failed read
         // FAILS the spawn (fail closed) instead of recording the
         // `start_time = 0` sentinel, which would silently downgrade every later
-        // orphan adoption to a pid-only match. Placed BEFORE the job guard
-        // release: on failure the guard's Drop closes the job, and
-        // KILL_ON_JOB_CLOSE reaps the just-spawned child — no orphan, no
-        // unrecorded process. Loop 2: a read that fails because the pid is
-        // ALREADY GONE is surfaced as an instant agent exit (not a platform
-        // failure), and the few-attempt retry absorbs the spawn-race window.
+        // orphan adoption to a pid-only match. Placed BEFORE the handle is
+        // returned: on failure the ATTACHED job's kill-on-close reaps the
+        // just-spawned child when the handle closes below — and a DETACHED
+        // job (no kill-on-close) has its child killed EXPLICITLY in that same
+        // fail-closed branch — so no orphan, no unrecorded process, either
+        // shape. Loop 2: a read that fails because the pid is ALREADY GONE is
+        // surfaced as an instant agent exit (not a platform failure), and the
+        // few-attempt retry absorbs the spawn-race window.
         let start_time = {
             let mut token = None;
             for attempt in 0..START_TIME_READ_ATTEMPTS {
@@ -412,6 +486,20 @@ impl ProcessBackend for WindowsBackend {
                              spawn record needs the real token for orphan adoption"
                         )
                     };
+                    // The job handle was released from its guard right after a
+                    // successful assignment, so the fail-closed path must do
+                    // the guard's old cleanup itself. The ATTACHED job reaps
+                    // its tree at handle close (kill-on-close). The DETACHED
+                    // job has NO kill-on-close (that is the whole disarm), so
+                    // its child is killed EXPLICITLY here — either way the
+                    // just-spawned child is never leaked.
+                    if spec.detach {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    unsafe {
+                        CloseHandle(job);
+                    }
                     return Err(BackendError::Spawn {
                         exec: spec.exec.clone(),
                         detail,
@@ -419,8 +507,6 @@ impl ProcessBackend for WindowsBackend {
                 }
             }
         };
-        // Assignment succeeded — hand the job handle to the process struct.
-        let job = job_guard.into_inner();
         // Capture the piped stdin now, for a FRESHLY SPAWNED handle only
         // (story 4.1) — `child.stdin` is `Some` exactly when `spec.pipe_stdin`
         // was true above (Stdio::piped() populates it; Stdio::null() never
@@ -479,9 +565,14 @@ impl ProcessBackend for WindowsBackend {
             sleep(STOP_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
         }
 
-        // Escalate. Spawned: terminate the whole job (kills parent + descendants).
-        // Adopted (no job, no child): terminate the opened process HANDLE with
-        // TerminateProcess.
+        // Escalate. Spawned (attached OR detached — story 12-1 AMENDMENT):
+        // terminate the whole job, which kills the parent AND every descendant
+        // it spawned after assignment — the Windows parity with the Unix
+        // process-group kill. (The reverted first draft sent a detached spawn
+        // down a direct-child `TerminateProcess` arm, which stranded its
+        // descendants — the job-without-kill-on-close shape exists precisely
+        // so this one arm covers both.) Adopted (no job, no child): terminate
+        // the opened process HANDLE with `TerminateProcess`.
         if !handle.job.is_null() {
             let ok = unsafe { TerminateJobObject(handle.job, 1) };
             if ok == 0 {
@@ -553,7 +644,23 @@ impl ProcessBackend for WindowsBackend {
     fn adopt(
         &self,
         fingerprint: &ProcessFingerprint,
+        detached: bool,
     ) -> Result<Option<Self::Handle>, BackendError> {
+        // `detached` (story 12-1 AMENDMENT, review loop 1): the record's
+        // detach flag. On Windows the DISARM is inherent to the adopted shape
+        // — this handle holds only an opened process HANDLE, and its Drop
+        // NEVER terminates anything (it releases handles; see `Drop for
+        // WindowsProcess`) — so the flag needs no field here. It is still
+        // accepted (and named) because the port is the cross-OS contract: the
+        // Unix backend re-holds a detached record's handle with its Drop
+        // disarmed, and this backend's adopted shape is ALREADY drop-disarmed.
+        // What the flag does NOT change on Windows either way: `stop` on the
+        // adopted detached handle works via `TerminateProcess` on the
+        // re-opened direct process (there is no documented way to re-open the
+        // spawn-time Job Object from a bare pid — the job's kill-descendants
+        // escalation is a property of the SPAWNING engine's handle; this
+        // parity boundary is shared by every adopted Windows instance).
+        let _ = detached;
         // Open the pid for query + terminate. A gone pid → OpenProcess fails →
         // Ok(None). Then compare the CURRENT creation time to the recorded one
         // (the PID-reuse guard, AD-5): a mismatch → a different process → Ok(None).
@@ -872,6 +979,7 @@ mod tests {
             stderr_log_file: None,
             instance_name: "test".to_string(),
             pipe_stdin: false,
+            detach: false,
         }
     }
 
@@ -920,5 +1028,56 @@ mod tests {
         // SPAWN on (after its bounded, spawn-race-absorbing retry), never
         // recording a `start_time = 0` fingerprint.
         assert_eq!(process_start_time(0xFFFF_FFFC), None);
+    }
+
+    #[test]
+    fn a_detached_spawn_survives_drop_and_stops_in_process() {
+        // Story 12-1 AMENDMENT (Windows half): a DETACHED spawn creates a Job
+        // Object WITHOUT kill-on-close, so dropping the handle (closing the
+        // job) does NOT kill the child — it survives to be re-adopted via the
+        // unchanged fingerprint path. Stop still works in-process: the
+        // escalation terminates the whole JOB (`TerminateJobObject`), reaching
+        // descendants exactly like the Unix process-group kill — the parity
+        // the no-job first draft lost.
+        let backend = WindowsBackend::new();
+        let agent = ktesio_conformance::fake_agent_bin();
+        let mut detached_spec = spec(&agent.to_string_lossy(), &["--linger-ms", "600000"]);
+        detached_spec.detach = true;
+        let handle = backend.spawn(&detached_spec).expect("detached spawn");
+        let pid = backend.pid(&handle);
+        let fp = backend.fingerprint(&handle);
+        assert!(
+            fp.start_time != 0,
+            "a detached spawn still verifies the AD-5 creation-time token"
+        );
+        // The disarm: drop the handle → the child must still be alive.
+        drop(handle);
+        sleep(Duration::from_millis(100));
+        assert!(
+            process_start_time(pid).is_some(),
+            "a detached handle's drop must NOT kill the child (story 12-1)"
+        );
+        // The recovery path: adoption re-holds the surviving child (the same
+        // OpenProcess + creation-time path — the disarm is inherent to the
+        // adopted shape, whose Drop only releases handles), and stop
+        // terminates through the adopted handle.
+        let adopter = WindowsBackend::new();
+        let mut adopted = adopter
+            .adopt(&fp, true)
+            .expect("adopt call ok")
+            .expect("the surviving detached child must be adoptable");
+        assert_eq!(
+            adopter.poll(&mut adopted).unwrap(),
+            ProcessStatus::Alive,
+            "the re-held detached child is alive"
+        );
+        let outcome = adopter
+            .stop(&mut adopted, Duration::from_secs(5))
+            .expect("stop the adopted detached child");
+        assert!(
+            outcome.forced,
+            "a lingering agent needs the forced escalation"
+        );
+        assert!(adopter.poll(&mut adopted).unwrap().is_exited());
     }
 }

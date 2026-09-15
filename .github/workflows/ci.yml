@@ -425,6 +425,42 @@ jobs:
             exit 1
           fi
           echo "Boundary gate green: internal edges are exactly the allowlisted ktesio-engine / ktesio-adapter-api / ktesio-adapters-hermes."
+      - name: Enforce the one-rustls/ring TLS invariant (story 12-3, NFR-8)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The TLS philosophy is ONE vendored rustls+ring across the WHOLE
+          # workspace (no system TLS, no openssl/native-tls, no second copy of
+          # rustls or ring drifting in via a transitive dep, no aws-lc-sys
+          # provider). This is the CI TEETH for that invariant: the WORKSPACE
+          # graph (kt + ktesio-engine + the adapter crates — review round 2
+          # widened the scan from engine-only, so a TLS crate smuggled in via
+          # kt or an adapter cannot slip past an engine-scoped gate) must
+          # carry EXACTLY ONE `rustls` package and EXACTLY ONE `ring`
+          # package, and NO system-TLS binding may appear at all.
+          # (`grep -oE` + `sort -u` dedups the tree's repeated renders of the
+          # same package under different parents; the `── <name> v` shape
+          # matches the package token exactly, so `hyper-rustls` /
+          # `rustls-pki-types` / `rustls-webpki` do not count as `rustls`.)
+          tree="$(cargo +stable tree --workspace -e normal)"
+          echo "$tree"
+          rustls_copies="$(printf '%s\n' "$tree" | grep -oE '── rustls v[0-9.]+' | sort -u)" || true
+          ring_copies="$(printf '%s\n' "$tree" | grep -oE '── ring v[0-9.]+' | sort -u)" || true
+          echo "rustls copies: $rustls_copies"
+          echo "ring copies:   $ring_copies"
+          if [ "$(printf '%s\n' "$rustls_copies" | grep -c . )" -ne 1 ]; then
+            echo "::error::Expected exactly ONE rustls package in the workspace graph (NFR-8: one vendored rustls), found: $rustls_copies"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$ring_copies" | grep -c . )" -ne 1 ]; then
+            echo "::error::Expected exactly ONE ring provider package in the workspace graph (NFR-8: one vendored ring), found: $ring_copies"
+            exit 1
+          fi
+          if printf '%s\n' "$tree" | grep -qE '── (aws-lc|openssl|native-tls|schannel|security-framework)'; then
+            echo "::error::Forbidden TLS binding (aws-lc/openssl/native-tls/schannel/security-framework) found in the workspace graph (NFR-8: no system TLS, the vendored rustls+ring pair only)."
+            exit 1
+          fi
+          echo "TLS invariant gate green: exactly one rustls + one ring, no system-TLS binding, workspace-wide."
       - name: Enforce OS-conditional code location (engine backends only)
         shell: bash
         run: |
@@ -651,6 +687,15 @@ jobs:
           # gate. The cat-file checks below keep a history-rewrite/GC failure
           # a CLEAR error instead of a confusing semver-checks resolution
           # abort.
+          #
+          # EPIC-12 NOTE (announced surface extension): this PR adds the
+          # `EngineError::DetachRefused` variant (story 12-1's refusal, the
+          # `ResumeUnsupported` precedent), so the engine baseline
+          # `enum_variant_added` lint WILL red against bee7d48 until the
+          # baseline moves. At merge time, bump the ktesio-engine baseline
+          # (here AND in scripts/test_automation.py) to this epic's
+          # main-history merge commit — the same post-merge step PR #181 did
+          # for its own extension.
           git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit} || {
             echo "::error::semver baseline rev 4119db37… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
             exit 1
@@ -699,6 +744,66 @@ jobs:
           key: ${{ runner.os }}-cargo-semver-checks-bin-${{ steps.semver_version.outputs.version }}
           path: |
             ~/.cargo/bin
+
+  audit:
+    name: audit
+    # Story 12-3: the supply-chain teeth for the new TLS dependency family
+    # (hyper-rustls/rustls/webpki-roots/ring). `cargo audit` scans Cargo.lock
+    # against the RustSec Advisory Database and FAILS the job on a known
+    # vulnerability (a finding is either fixed or carries a documented,
+    # reviewed waiver in audit.toml — an undocumented ignore is not an option).
+    # Same conventions as the other tool installs in this file: SHA-pinned
+    # checkout, source install via `cargo install --locked`, guarded by
+    # `command -v` + a binary cache (AI-1/AI-23) so a fresh runner does not
+    # rebuild the scanner every time.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Date-stamp the scanner cache key
+        id: audit_key
+        run: echo "stamp=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Cache cargo-audit binary
+        id: audit_cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          # Persist the source-installed cargo-audit (~several minutes of
+          # build) so scans stay cheap — but the key is DATE-STAMPED (review
+          # loop 1, patch bundle): the constant key this replaces could freeze
+          # a months-old scanner binary forever, because the `command -v`
+          # guard skipped the install on every cache hit — the scheduled
+          # re-scan ran, but the SCANNER never refreshed. Now a same-day run
+          # hits the exact key (cheap, no rebuild), and the first run of each
+          # new day misses it and forces a fresh install below, so the scanner
+          # binary is at most ~1 day old when it reads the advisory database.
+          key: ${{ runner.os }}-cargo-audit-bin-${{ steps.audit_key.outputs.stamp }}
+          path: |
+            ~/.cargo/bin
+          restore-keys: ${{ runner.os }}-cargo-audit-bin-
+      - name: Install cargo-audit
+        # Install (or refresh) unless TODAY'S cache restored a WORKING binary:
+        # a same-day exact-key hit with a runnable `cargo audit --version`
+        # skips the rebuild; anything else — a new day (the date-stamped key
+        # misses, so the scanner refreshes) or a CORRUPT/truncated cached
+        # binary (review round 2: the version probe fails, so the cache
+        # self-heals instead of failing the job) — rebuilds with `--force`
+        # (cargo install otherwise refuses to overwrite a visible binary).
+        run: |
+          if [ "${{ steps.audit_cache.outputs.cache-hit }}" = "true" ] && cargo audit --version >/dev/null 2>&1; then
+            echo "cargo-audit restored from today's cache and runnable; skipping the rebuild."
+          else
+            cargo +stable install cargo-audit --locked --force
+          fi
+          cargo audit --version
+      - name: Scan the lockfile (RustSec advisories)
+        # Non-interactive, machine-readable-ish summary. Fails (nonzero exit)
+        # on any vulnerability finding → fix it or add a REVIEWED waiver to
+        # audit.toml (with a reason + a tracking note); never an undocumented
+        # ignore.
+        run: cargo audit
 
   msrv:
     name: msrv

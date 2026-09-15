@@ -131,7 +131,32 @@ pub struct SpawnSpec {
     /// unblocks, yet is reported `running` (readiness here is just "the
     /// process didn't exit immediately"), a silent deadlock with no error
     /// signal anywhere.
+    ///
+    /// Story 12-1 note: the supervisor FORCE-CLEARS this to `false` for a
+    /// detached spawn (see [`SpawnSpec::detach`]) — a stdin pipe's write end
+    /// would be held by the soon-to-exit spawning CLI, so a detached child is
+    /// spawned with `Stdio::null()` stdin unconditionally (no EPIPE strand);
+    /// after re-adoption `send` fails with the ordinary adopted-instance
+    /// interaction error, exactly as an adopted handle always has.
     pub pipe_stdin: bool,
+    /// Whether this spawn is DETACHED (story 12-1) — the spawn-time mode whose
+    /// handle is DISARMED so the child survives the spawning engine's exit.
+    ///
+    /// Detach is a SPAWN-TIME property, never a post-hoc disown (AI-20 option
+    /// b): the backend builds the handle differently from the first moment. On
+    /// Unix the child already runs in its own session (`setsid`, `pgid == pid`),
+    /// so a detached `UnixProcess` simply SKIPS the Drop kill-on-drop (stop /
+    /// pause / resume still work in-process via `killpg` on the pgid). On
+    /// Windows the Job Object (whose `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is
+    /// the only thing that would kill the child at handle-drop) is NOT created
+    /// and the child is NOT assigned to one — kill-on-close never exists, so
+    /// nothing has to be undone mid-flight (no breakaway, no Job redesign —
+    /// the fracture-prone path the epic's research flagged). The
+    /// write-ahead fingerprint machinery (AD-5) is UNCHANGED: a detached spawn
+    /// still records its verified `{pid, start-time}` so the next engine open
+    /// re-adopts the surviving child through the EXISTING fingerprint path.
+    /// `false` (every pre-12-1 caller) keeps today's kill-on-drop guarantee.
+    pub detach: bool,
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -1162,6 +1187,15 @@ pub trait ProcessBackend {
     ///   by a DIFFERENT process whose start-time differs — the PID-reuse guard);
     ///   the caller reconciles the record to `failed`.
     ///
+    /// `detached` is the spawn record's detach flag (story 12-1 AMENDMENT,
+    /// review loop 1): detached-ness is a CROSS-LIFETIME property, so an adopted
+    /// handle for a detached spawn must be re-held DISARMED — Unix: the
+    /// handle's Drop skips the process-group kill, so the engine's clean exit
+    /// leaves the agent alive; Windows: an adopted handle never kills at drop
+    /// (it only releases its handles), which IS the disarm. `false` keeps the
+    /// story 1-6 semantics exactly: the adopting engine owns what it re-holds
+    /// and tears it down at its own clean exit.
+    ///
     /// Re-acquisition keeps the OS specifics (how to re-open a live PID, verify
     /// its start-time, and re-establish group/job control) inside `backends/`.
     /// An adopted handle must remain signal-able / stoppable as its original
@@ -1169,8 +1203,11 @@ pub trait ProcessBackend {
     /// Sync (called via `spawn_blocking`). Reports [`BackendError::Control`]
     /// (op `"adopt"`) only on an unexpected syscall failure — a plain "no live
     /// match" is `Ok(None)`, not an error.
-    fn adopt(&self, fingerprint: &ProcessFingerprint)
-        -> Result<Option<Self::Handle>, BackendError>;
+    fn adopt(
+        &self,
+        fingerprint: &ProcessFingerprint,
+        detached: bool,
+    ) -> Result<Option<Self::Handle>, BackendError>;
 
     /// Whether this handle holds a live stdin pipe it can write to right now
     /// (story 4.1, AC-D). `true` only for a FRESHLY SPAWNED handle whose
@@ -1304,6 +1341,7 @@ mod tests {
             stderr_log_file: None,
             instance_name: "x".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         let b = a.clone();
         assert_eq!(a, b);

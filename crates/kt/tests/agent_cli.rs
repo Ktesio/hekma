@@ -609,14 +609,15 @@ fn start_prints_running_state_and_exits_zero() {
 
 #[test]
 fn start_prints_single_lifetime_notice_to_stderr_only() {
-    // LOW-1: the success path is honest about single-lifetime supervision — a
-    // standalone `kt agent start` kills the agent when the CLI exits cleanly, and
-    // durable supervision across SEPARATE CLI invocations is future work (story
-    // 1-6 delivered crash recovery, NOT clean-exit cross-command survival). That
-    // caveat is printed as a one-line NOTICE to STDERR (AD-12: results → stdout,
-    // notices → stderr), and the stdout result line (`running`) is UNCHANGED.
-    // This asserts both halves so a future change that either drops the notice or
-    // leaks it onto stdout is caught.
+    // LOW-1, story-12-1 flip: the success path of a PLAIN `kt agent start` is
+    // honest about single-lifetime supervision — a standalone `kt agent start`
+    // kills the agent when the CLI exits cleanly, and the notice now names the
+    // shipped escape hatch (`--detach`) instead of the stale "future work"
+    // claim (detach EXISTS since 12-1; the plain path's behavior is unchanged).
+    // The caveat is printed as a one-line NOTICE to STDERR (AD-12: results →
+    // stdout, notices → stderr), and the stdout result line (`running`) is
+    // UNCHANGED. This asserts both halves so a future change that either drops
+    // the notice or leaks it onto stdout is caught.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -638,8 +639,7 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
     // stdout result line is unchanged (still shows `running`).
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
     // The notice is on stderr and states the honest boundary (supervised only for
-    // this engine session; cross-invocation durability is future work). It must
-    // NOT promise cross-CLI durable supervision as delivered.
+    // this engine session; stops when the command exits) and points at --detach.
     assert!(
         run.stderr
             .contains("supervised only for this engine session"),
@@ -647,15 +647,26 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
         run.stderr
     );
     assert!(
-        run.stderr.contains("future work"),
-        "notice must state durable cross-invocation supervision is future work; stderr={}",
+        run.stderr.contains("stops when this command exits"),
+        "notice must state the clean-exit stop; stderr={}",
         run.stderr
     );
-    // It must NOT claim durable cross-CLI supervision arrives with 1-6 (that was
-    // the false promise this fix removes).
     assert!(
-        !run.stderr.contains("across CLI invocations arrives"),
-        "notice must not promise cross-CLI durable supervision as delivered; stderr={}",
+        run.stderr.contains("--detach"),
+        "notice must point at the shipped --detach escape hatch; stderr={}",
+        run.stderr
+    );
+    // The stale "future work" claim must NOT resurface (detach shipped in 12-1).
+    assert!(
+        !run.stderr.contains("future work"),
+        "notice must not claim durable supervision is future work anymore; stderr={}",
+        run.stderr
+    );
+    // It must NOT claim durable cross-CLI supervision for the PLAIN path
+    // (without --detach the agent still stops at exit).
+    assert!(
+        !run.stderr.contains("keeps running after this command"),
+        "the plain-start notice must not promise detached survival; stderr={}",
         run.stderr
     );
     // The notice must NOT leak onto stdout (AD-12: stdout is the result only).
@@ -663,6 +674,313 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
         !run.stdout
             .contains("supervised only for this engine session"),
         "notice must not appear on stdout; stdout={}",
+        run.stdout
+    );
+}
+
+/// Whether a pid is alive — the data-driven, cfg-free liveness probe (the
+/// `adoption.rs` convention: branch on the runtime OS id and shell out; NO
+/// `#[cfg]` — this file is outside the engine-backends allowlist).
+fn pid_alive(pid: u32) -> bool {
+    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        return match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        };
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Read the pid the `fake_agent` announced (`ready pid=<n>`) from its
+/// agent.log under `state_dir`.
+fn wait_for_agent_pid(state_dir: &Path, name: &str) -> u32 {
+    let log = state_dir
+        .join("agents")
+        .join(name)
+        .join("logs")
+        .join("agent.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&log) {
+            if let Some(line) = contents.lines().find(|l| l.contains("ready pid=")) {
+                if let Some(idx) = line.find("pid=") {
+                    if let Ok(pid) = line[idx + 4..].trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent pid never announced in {}",
+            log.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
+    // Story 12-1, the acceptance criterion AT THE CLI, cross-OS: `kt agent
+    // start --detach` exits 0 printing `running`; the stderr notice carries
+    // the ratified enforcement-window honesty (no crash detection / budget
+    // enforcement / event delivery between commands) and NOT the
+    // single-lifetime wording; the child is ALIVE after the command exits;
+    // a BENIGN intervening command (`kt agent list` — the 12-1 AMENDMENT leg)
+    // adopts the child DISARMED and leaves it alive at its exit; and a later
+    // `kt agent stop` re-adopts the live process and lands the terminal state
+    // — no orphan left. On Windows this is affirmatively possible for the
+    // first time (a detached spawn's Job Object carries no kill-on-close, so
+    // engine exits kill nothing), so there is deliberately NO `_unix` suffix.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "detachy",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // Orphan guard: from the detached start until the stop leg lands, any
+    // failure must not leak the lingering agent (drop = best-effort stop).
+    let mut orphan_guard = StopOrphanOnDrop {
+        name: "detachy",
+        working_dir: ctx.project_dir.as_path(),
+        state_dir,
+        timeout_arg: "5".to_string(),
+        armed: true,
+    };
+    let run = run_kt_agent(
+        &["agent", "start", "detachy", "--detach"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        run.success,
+        "detached start should exit 0; stderr={}",
+        run.stderr
+    );
+    assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
+    // The DETACHED notice: the enforcement-window honesty (a hard AC), on
+    // stderr only.
+    assert!(
+        run.stderr.contains("detached:"),
+        "the detached notice must go to stderr; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("keeps running after this command exits")
+            && run.stderr.contains("re-adopts"),
+        "the notice must state the survival + re-adoption; stderr={}",
+        run.stderr
+    );
+    for window in ["crash detection", "budget enforcement"] {
+        assert!(
+            run.stderr.contains(&format!("no {window}")),
+            "the notice must name the enforcement window `{window}`; stderr={}",
+            run.stderr
+        );
+    }
+    assert!(
+        run.stderr.contains("no usage/event delivery"),
+        "the notice must name the event-delivery window; stderr={}",
+        run.stderr
+    );
+    assert!(
+        !run.stdout.contains("detached:"),
+        "the notice must not leak onto stdout; stdout={}",
+        run.stdout
+    );
+    // The child is ALIVE after the command exited (the disarm held).
+    let pid = wait_for_agent_pid(state_dir, "detachy");
+    assert!(
+        pid_alive(pid),
+        "the detached child must be alive after `kt agent start --detach` exited"
+    );
+    // 12-1 AMENDMENT (review loop 1): a BENIGN intervening command must not
+    // kill the detached agent. `kt agent list` opens the engine, adopt_orphans
+    // re-holds the live child DISARMED (the record's detach flag), and the
+    // command exits — the agent must STILL be alive afterward. (The
+    // pre-amendment hardcoded disarmed=false made this exact command the
+    // killer.) Runs affirmatively on Windows too: the detached spawn's Job
+    // Object carries no kill-on-close, so the benign command's engine exit
+    // kills nothing.
+    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(
+        list.success,
+        "the benign `kt agent list` should succeed; stderr={}",
+        list.stderr
+    );
+    assert!(
+        list.stdout.contains("detachy"),
+        "the benign command should see the adopted instance; stdout={}",
+        list.stdout
+    );
+    assert!(
+        pid_alive(pid),
+        "the benign `kt agent list` exit must NOT kill the detached agent \
+         (12-1 AMENDMENT: detached-ness rides the record)"
+    );
+    // The NEXT command re-adopts the live process and stops it for real —
+    // stop keeps working on the adopted detached handle.
+    let stop = run_kt_agent(&["agent", "stop", "detachy"], &ctx.project_dir, state_dir);
+    assert!(
+        stop.success,
+        "stop should adopt + stop; stderr={}",
+        stop.stderr
+    );
+    assert!(stop.stdout.contains("stopped"), "stdout={}", stop.stdout);
+    orphan_guard.disarm();
+    // Deterministic (bounded) no-orphan proof.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while pid_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-adopted detached process must be gone after the stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn start_detach_of_an_engine_observed_instance_is_refused_with_exit_code_5() {
+    // Story 12-1, the refusal at the CLI: `start --detach` on an
+    // `engine-observed` manifest exits non-zero with the dedicated diagnostic
+    // (why: the loopback listener dies with the command; remediation: start
+    // without --detach), and the instance is left UNTOUCHED (still
+    // `registered` — the refusal fired before any side effect).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    // The `engine-observed` manifest shape (the quoted dotted key — the same
+    // TOML the engine test helpers' `write_observed_manifest` writers emit):
+    // `[metering] source = "engine-observed"` + the `[config."metering.base_url"]`
+    // env mapping the engine's loopback injection targets.
+    let m = ctx.project_dir.join("obs-detach-adapter");
+    std::fs::create_dir_all(&m).unwrap();
+    let bin = ktesio_conformance::fake_agent_bin();
+    std::fs::write(
+        m.join("adapter.toml"),
+        format!(
+            r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "obsdet"
+[lifecycle.start]
+exec = {exec:?}
+args = ["--linger-ms", "600000"]
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+[metering]
+source = "engine-observed"
+[config."metering.base_url"]
+env = "OPENAI_BASE_URL"
+"#,
+            exec = bin.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    run_kt_agent(
+        &[
+            "agent",
+            "register",
+            "obsdet",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_kt_agent(
+        &["agent", "start", "obsdet", "--detach"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !run.success,
+        "a detached start of an engine-observed instance must be refused; stdout={}",
+        run.stdout
+    );
+    assert!(run.stderr.contains("--detach"), "stderr={}", run.stderr);
+    assert!(
+        run.stderr.contains("listener"),
+        "the refusal must name the listener lifetime; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("without --detach"),
+        "the refusal must carry the remediation; stderr={}",
+        run.stderr
+    );
+    // Exit code 5 (the Unsupported class) — the documented, frozen entry.
+    assert_eq!(
+        run.code,
+        Some(5),
+        "DetachRefused classifies as Unsupported (5); stderr={}",
+        run.stderr
+    );
+    // No side effect: the instance is still `registered` (a `show` reports it).
+    let show = run_kt_agent(&["agent", "show", "obsdet"], &ctx.project_dir, state_dir);
+    assert!(show.success, "show should work; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("registered"),
+        "the refusal must leave the instance registered; stdout={}",
+        show.stdout
+    );
+}
+
+#[test]
+fn start_help_carries_the_enforcement_window_honesty() {
+    // The 12-1 patch bundle (review loop 1): the enforcement-window honesty is
+    // a HARD AC on the HELP surface too, not only the runtime stderr notice —
+    // an operator deciding whether to pass `--detach` must see its cost
+    // BEFORE running it. `kt agent start --help` renders the flag's help text,
+    // which must therefore state every between-commands window (no crash
+    // detection / no budget enforcement / no event delivery) and the
+    // engine-observed refusal.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let run = run_kt_agent(
+        &["agent", "start", "--help"],
+        &ctx.project_dir,
+        state.project_dir.as_path(),
+    );
+    assert!(run.success, "--help must exit 0; stderr={}", run.stderr);
+    let help = run.stdout.to_lowercase();
+    assert!(
+        help.contains("detach"),
+        "the help must document the --detach flag; stdout={}",
+        run.stdout
+    );
+    for window in ["crash detection", "budget enforcement", "event delivery"] {
+        assert!(
+            help.contains(&format!("no {window}")),
+            "the --detach help must name the enforcement window `{window}`; \
+             stdout={}",
+            run.stdout
+        );
+    }
+    assert!(
+        help.contains("refused"),
+        "the help must state the engine-observed refusal; stdout={}",
         run.stdout
     );
 }

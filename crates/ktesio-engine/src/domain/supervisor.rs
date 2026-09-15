@@ -128,6 +128,19 @@ const MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS: u32 = 40;
 /// per offset, then the skip note).
 const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
 
+/// Story 12-4 AMENDMENT (review loop 1): how many minted events the observed
+/// drain's pending park buffer may hold at once. During a store outage EVERY
+/// reaper tick (~250ms cadence) mints MORE events than it can commit, so
+/// without a cap the parked buffer would grow for as long as the outage lasts
+/// — unbounded engine memory for an unbounded outage. When a park would exceed
+/// this cap, the OLDEST parked events are DROPPED (billing honesty: the ledger
+/// keeps its order-faithful sequence) and the loss is announced LOUDLY with the
+/// count — surfaced-not-silent, never a quiet truncation. The value is generous
+/// (each parked event is two token counts + a sequence ordinal — a few dozen
+/// bytes), so the cap only bites in a genuine, sustained outage; the 3-attempt
+/// SKIP bound above is the per-event counterpart of this whole-buffer bound.
+const OBSERVED_PARK_MAX_EVENTS: usize = 1024;
+
 /// A scheduled restart of a crashed instance (story 1-6, AC4). Returned by
 /// [`Supervisor::poll_once`] for each crashed `on-failure` instance that has not
 /// hit the crash-loop threshold; the engine cadence sleeps [`RestartPlan::delay`]
@@ -245,9 +258,11 @@ enum CrashInput {
     PersistentPollFailure { sole_handle: bool },
 }
 
-/// How [`Supervisor::drain_usage_for`] treats the tail of the agent-output log
-/// (story 3-1 under-count fix, H1) — the difference is whether a final line that
-/// lacks a trailing newline is consumed now.
+/// How [`Supervisor::drain_usage_for`] (and, story 12-4, the observed sibling
+/// [`Supervisor::drain_observed_for`]) treats a drain — the difference is
+/// whether a failure can be retried by a later pass: MidRun parks and retries
+/// (bounded), Terminal announces the loss (no next pass). For the log-tail
+/// drain it ALSO decides whether a final newline-less line is consumed now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DrainMode {
     /// The process is (believed) still alive — the reaper cadence. Consume only up
@@ -470,6 +485,27 @@ fn plan_follow(bytes: &[u8], cursor: u64) -> FollowPlan {
     }
 }
 
+/// The parked OBSERVED events pending a ledger commit (story 12-4) — the
+/// observed channel's analog of the self-reported drain's byte cursor. The
+/// queue has no byte offset, so the parked identity is the minted events
+/// THEMSELVES: the buffer carries the exact [`ParsedUsage`] values that failed
+/// to commit (NEVER re-minted on retry — re-minting would hand out fresh
+/// `sequence` ordinals and break the dedup key stability the retry depends
+/// on), with the FRONT event's minted `sequence` as the attempt-counting
+/// identity (the analog of the self-reported "same offset" check: a different
+/// front resets the streak).
+#[derive(Debug, Clone)]
+struct ObservedPending {
+    /// The minted `sequence` of the FRONT parked event — the attempt-counting
+    /// identity (a different front resets the bounded-retry streak).
+    front_sequence: u64,
+    /// The exact minted events awaiting commit, in original (queue) order.
+    /// Capped at [`OBSERVED_PARK_MAX_EVENTS`]: a longer tail drops its OLDEST
+    /// events with a loud overflow diagnostic (the 12-4 AMENDMENT bound —
+    /// never unbounded memory during a store outage, never a silent loss).
+    events: Vec<ParsedUsage>,
+}
+
 /// The in-memory supervision state for ONE running Agent Instance (story 3-1).
 ///
 /// Beyond the process [`Handle`](backends::Handle) the supervisor has always held,
@@ -499,6 +535,17 @@ struct Supervised {
     /// with a loud diagnostic, so a permanently poisoned row cannot wedge the
     /// cursor (and silently strand every later usage event for the Run) forever.
     usage_park_attempts: Option<(u64, u32)>,
+    /// Story 12-4: the OBSERVED channel's park — `Some((pending, attempts))`
+    /// while a store error keeps minted-but-uncommitted observed events parked
+    /// (the analog of `usage_park_attempts`, which is the SELF-REPORTED
+    /// channel's park). `pending.events` are the exact [`ParsedUsage`] values
+    /// awaiting commit (retried as-is — never re-minted, so the dedup keys are
+    /// stable); `attempts` counts consecutive failed passes at the SAME front
+    /// event (a different front resets the streak); past
+    /// [`USAGE_PARK_MAX_ATTEMPTS`] the poisoned front event is SKIPPED with a
+    /// loud diagnostic and the rest keep counting. Dropped with the instance
+    /// at the terminal transition (a terminal failure announces the loss).
+    observed_park: Option<(ObservedPending, u32)>,
     /// The per-Run breach LATCH (story 3-2 idempotence fix; story 3-3 keyed by
     /// dimension): the set of `(dimension, scope)` pairs that have ALREADY fired a
     /// breach for THIS Run. Enforcement (`enforce_budget`) runs on EVERY committed
@@ -881,7 +928,36 @@ impl Supervisor {
     /// plain [`TransitionCause::AdapterReady`], and the write-ahead spawn record's
     /// restart count is RESET to 0 (a clean run resets the count, AC4).
     pub fn start(&mut self, registry: &Registry, name: &str) -> Result<AgentInstance, EngineError> {
-        self.start_inner(registry, name, None)
+        self.start_inner(registry, name, None, false)
+    }
+
+    /// Start a registered Agent Instance DETACHED (story 12-1): the spawned
+    /// child's handle is DISARMED at spawn so the child survives THIS engine
+    /// session's exit, and the next engine open re-adopts it through the
+    /// EXISTING write-ahead fingerprint path (AD-5 — nothing about the record,
+    /// the fingerprint, or the adoption machinery changes).
+    ///
+    /// Ratified v1 REFUSALS + HONEST WINDOW (AI-20 option b; the epic's
+    /// enforcement-window honesty is a hard AC, not a nicety):
+    /// * An `engine-observed` instance is refused BEFORE any side effect (no
+    ///   transition, no listener, no spawn): the loopback forward listener
+    ///   would die with this command, stranding the agent's model traffic on a
+    ///   dead port — the same loud strand adoption already surfaces. The error
+    ///   names why + the remediation (start without `--detach`).
+    /// * A detached self-reported instance is supervised ONLY while THIS
+    ///   command runs: between commands there is NO crash detection, NO budget
+    ///   enforcement, and NO event delivery. The caller (the CLI) must state
+    ///   that window on `--help` and in its stderr notice.
+    /// * The child is spawned with stdin NULL regardless of the declared
+    ///   interaction level (a pipe's write end would die with this CLI — an
+    ///   EPIPE strand); after re-adoption `send` fails with the ordinary
+    ///   adopted-instance interaction error.
+    pub fn start_detached(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+    ) -> Result<AgentInstance, EngineError> {
+        self.start_inner(registry, name, None, true)
     }
 
     /// The shared start path (AC1/AC2 + the 1-6 write-ahead record commit).
@@ -910,6 +986,7 @@ impl Supervisor {
         registry: &Registry,
         name: &str,
         restart: Option<(u32, Duration)>,
+        detach: bool,
     ) -> Result<AgentInstance, EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
@@ -948,6 +1025,29 @@ impl Supervisor {
         let metering_source = registry
             .metering_source(&name)
             .map_err(registry_to_engine)?;
+
+        // Story 12-1 — the DETACHED REFUSAL for engine-observed instances,
+        // BEFORE ANY SIDE EFFECT (no `starting` transition, no loopback
+        // listener, no spawn — every fallible step below still lies ahead, so
+        // the instance keeps its prior state). A detached observed instance is
+        // structurally broken: the loopback forward listener lives inside THIS
+        // engine process, so a detached start would inject a `base_url` whose
+        // server dies the moment the CLI exits — the agent's model calls would
+        // then hit a dead port (the loud stranded-listener condition adoption
+        // already announces). Refuse with the why + the remediation; a
+        // self-reported instance detaches fine (no listener to strand).
+        if detach && metering_source == "engine-observed" {
+            return Err(EngineError::DetachRefused {
+                name: name.as_str().to_string(),
+                detail: "the instance meters via the engine-observed channel, whose loopback \
+                         forward listener lives inside the starting command — detaching would \
+                         leave the agent pointed at a listener that dies with the command. \
+                         Start it without --detach (the in-command supervision keeps the \
+                         listener alive), or switch the adapter's metering source to \
+                         self-reported."
+                    .to_string(),
+            });
+        }
 
         // Read the effective (current-OS) Capability::Interaction level (story
         // 4.1 fix pass, HIGH finding — review of #79) to decide whether THIS
@@ -1262,7 +1362,19 @@ impl Supervisor {
             // `log_file`/`attributed_log_path` (all three Some together).
             stderr_log_file: Some(registry.agent_stderr_log_path(&name)),
             instance_name: name.as_str().to_string(),
-            pipe_stdin,
+            // Story 12-1: a DETACHED spawn is never given a stdin pipe — the
+            // pipe's write end would be held by this soon-to-exit CLI, and a
+            // child writing to (or a later engine sending into) a dead peer's
+            // pipe is an EPIPE strand. `Stdio::null()` gives the child an
+            // immediate, honest EOF instead; after re-adoption `send` fails
+            // with the ordinary adopted-instance interaction error (an adopted
+            // handle has no recoverable pipe either), which is exactly the
+            // behavior the spec's I/O matrix pins.
+            pipe_stdin: pipe_stdin && !detach,
+            // The spawn-time disarm flag (see the port's `SpawnSpec::detach`
+            // docs): the Unix handle skips its Drop killpg; the Windows spawn
+            // never creates/assigns the kill-on-close Job Object.
+            detach,
         };
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
@@ -1297,11 +1409,38 @@ impl Supervisor {
             restart_policy: policy,
             restart_count,
             last_known_cause: None,
+            // Story 12-1 AMENDMENT (review loop 1): detached-ness RIDES THE
+            // RECORD — it is a cross-lifetime property, so every later
+            // `adopt_orphans` reads it and re-holds the handle DISARMED. This
+            // is the durable-detach promise across N commands, not just the
+            // first.
+            detach,
         };
         if let Err(e) = registry.write_spawn_record(&record) {
-            // Persisting the record failed: kill the just-spawned process (drop
-            // the handle → group/job kill) and land the instance in `failed` so
-            // we never supervise an unrecorded process (AD-5 safety).
+            // Persisting the record failed: kill the just-spawned process and
+            // land the instance in `failed` so we never leave an unrecorded
+            // process behind (AD-5 safety).
+            //
+            // Review round 2: `drop(handle)` alone only tears the process down
+            // when the handle is ATTACHED (drop = group/job kill). A DETACHED
+            // handle is DISARMED — its Drop deliberately kills nothing — so a
+            // detached start whose record commit fails would LEAK a live,
+            // unrecorded process. The teardown is therefore explicit on the
+            // detach path: a short graceful window through the backend stop
+            // (which still works on a detached handle — the pgid/job is
+            // unchanged), then the drop releases whatever remains.
+            //
+            // AUDIT of the other post-spawn error paths in this function (why
+            // this is the ONLY fix site): between `spawn` and this commit the
+            // sole fallible step is `watch_startup`, whose failure branch runs
+            // only when the process ALREADY exited (reaped by the poll —
+            // nothing survives, detached or not); every `?` after the commit
+            // happens once the record is DURABLE, so a dropped detached
+            // handle there leaves a recorded (adoptable) process, not an
+            // unrecorded one.
+            if detach {
+                let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+            }
             drop(handle);
             return Err(self.fail_launch_detail(
                 registry,
@@ -1356,6 +1495,8 @@ impl Supervisor {
                 metering_source,
                 usage_cursor,
                 usage_park_attempts: None,
+                // Story 12-4: a fresh Run starts with no parked observed events.
+                observed_park: None,
                 // A fresh Run starts with an EMPTY breach latch (story 3-2): the
                 // run_id was just minted, so no scope has fired for it yet. This is
                 // how the latch RESETS per Run — a persistently-over-cumulative agent
@@ -1399,7 +1540,26 @@ impl Supervisor {
         attempt: u32,
         waited: Duration,
     ) -> Result<AgentInstance, EngineError> {
-        self.start_inner(registry, name, Some((attempt, waited)))
+        // Review round 2: a RESTART of a DETACHED agent must stay detached.
+        // The write-ahead record survives the crash (only a clean stop clears
+        // it), so it is the durable source of the spawn's detached-ness — read
+        // it BEFORE `start_inner` rewrites the record. Dropping the flag here
+        // (the pre-patch hardcoded `false`) would silently restart the agent
+        // ATTACHED and downgrade the record, killing the agent at this
+        // engine's clean exit — the exact surprise `--detach` promises away.
+        // A missing/unreadable record falls back to the supervised (attached)
+        // default, matching how the pre-12-1 records read.
+        let instance_name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        let detach = registry
+            .spawn_record(&instance_name)
+            .ok()
+            .flatten()
+            .map(|record| record.detach)
+            .unwrap_or(false);
+        self.start_inner(registry, name, Some((attempt, waited)), detach)
     }
 
     /// Stop a running Agent Instance (AC3/AC4).
@@ -1573,8 +1733,10 @@ impl Supervisor {
         // Drain any final ENGINE-OBSERVED usage still queued before the listener is
         // torn down (story 3-4): a completion the proxy parsed just before the stop
         // must land, not be lost when the `Supervised` (and its listener) is dropped
-        // below. Best-effort, mirroring the self-reported terminal drain.
-        self.drain_observed_for(registry, &name);
+        // below. TERMINAL mode (story 12-4): a commit failure here announces the
+        // loss — there is no next pass — and any parked buffer dies with the
+        // instance.
+        self.drain_observed_for(registry, &name, DrainMode::Terminal);
 
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
@@ -2625,8 +2787,9 @@ impl Supervisor {
             // Drain any final ENGINE-OBSERVED usage still queued before the crashed
             // instance's listener is torn down (story 3-4): a completion parsed just
             // before the crash must land, not be lost when the `Supervised` is
-            // removed below. Best-effort, mirroring the self-reported terminal drain.
-            self.drain_observed_for(registry, &name);
+            // removed below. TERMINAL mode (story 12-4): a commit failure here
+            // announces the loss — no next pass.
+            self.drain_observed_for(registry, &name, DrainMode::Terminal);
 
             // Read the store state: only an instance the store still shows
             // running/paused is an UNREQUESTED crash. A `stopping` (operator
@@ -2919,7 +3082,12 @@ impl Supervisor {
             if record.fingerprint.pid == 0 {
                 continue;
             }
-            match self.backend.adopt(&record.fingerprint) {
+            // The record's detach flag (story 12-1 AMENDMENT) decides HOW the
+            // handle is re-held: a detached spawn's handle comes back DISARMED
+            // (its Drop does not kill), so this engine's clean exit leaves the
+            // agent alive for the command after it; a supervised spawn's
+            // handle keeps the story 1-6 kill-on-drop guarantee.
+            match self.backend.adopt(&record.fingerprint, record.detach) {
                 Ok(Some(handle)) => {
                     // Live match: re-hold the handle. State stays as persisted
                     // (running/paused). AI-7: a paused process is now resumable.
@@ -2963,6 +3131,9 @@ impl Supervisor {
                             metering_source: metering_source.clone(),
                             usage_cursor,
                             usage_park_attempts: None,
+                            // Story 12-4: an adopted instance starts with no parked
+                            // observed events (its prior engine's park died with it).
+                            observed_park: None,
                             // The adopted instance opens a NEW Run (the pre-crash
                             // run_id died with the crashed engine), so its breach latch
                             // starts empty too (story 3-2).
@@ -3439,7 +3610,7 @@ impl Supervisor {
                 let mut committed_count = 0usize;
                 for usage in &parsed {
                     if self
-                        .ingest_usage(registry, name, &run_id, &metering_source, usage)
+                        .ingest_usage(registry, name, &run_id, &metering_source, usage, mode)
                         .is_ok()
                     {
                         committed_count += 1;
@@ -3527,7 +3698,7 @@ impl Supervisor {
     fn drain_observed_all(&mut self, registry: &Registry) {
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         for name in names {
-            self.drain_observed_for(registry, &name);
+            self.drain_observed_for(registry, &name, DrainMode::MidRun);
         }
     }
 
@@ -3543,13 +3714,26 @@ impl Supervisor {
     /// `engine-observed` source. NO new ledger writer, NO new enforcement path — the
     /// SAME choke point stamps + records + enforces (so 3-2 budgets + 3-3 caps apply
     /// unchanged). A `self-reported` instance (no `observed_source`/`observed_listener`)
-    /// is a no-op. Best-effort: a lock hiccup skips this pass, never a crash.
-    fn drain_observed_for(&mut self, registry: &Registry, name: &InstanceName) {
-        // Read the Run context + drain the queue under the instance's held state.
-        // Collect the pushed counts + mint the per-Run sequence for each FIRST (a
-        // short critical section), then ingest OUTSIDE the borrow so `ingest_usage`
-        // can take `&mut self`.
-        let (run_id, metering_source, minted) = match self.running.get(name) {
+    /// is a no-op.
+    ///
+    /// **Story 12-4 — the AI-41 treatment for the observed channel (durability
+    /// under store failure):** a commit failure PARKS the un-committed minted
+    /// events (in [`Supervised::observed_park`]) and RETRIES the EXACT same
+    /// `ParsedUsage` values on the next pass — never re-minted, so the dedup
+    /// keys are stable and an already-committed neighbor re-drifts safely into
+    /// the DB dedup (a `DuplicateReplay`, never a double-count). The retry is
+    /// BOUNDED: after [`USAGE_PARK_MAX_ATTEMPTS`] consecutive failed passes at
+    /// the SAME front event, that event is SKIPPED with a loud diagnostic and
+    /// the events behind it keep counting (surfaced-not-silent: an announced
+    /// loss, never a silent drop, never a wedged drain). In the TERMINAL mode
+    /// (stop / crash-reap) there IS no next pass — the loss is announced
+    /// explicitly and the parked buffer dies with the instance. The mode is the
+    /// [`DrainMode`] analog of the self-reported drain's.
+    fn drain_observed_for(&mut self, registry: &Registry, name: &InstanceName, mode: DrainMode) {
+        // Read the Run context; park-retry first, then drain the queue, all under
+        // the instance's held state (a short critical section). Ingest happens
+        // OUTSIDE the borrow so `ingest_usage` can take `&mut self`.
+        let (run_id, metering_source, events) = match self.running.get(name) {
             Some(s) => {
                 // Only an observed instance has both a listener (its queue) + a source
                 // (the sequence minter). A self-reported instance skips (no-op).
@@ -3558,38 +3742,167 @@ impl Supervisor {
                 else {
                     return;
                 };
-                let queue = listener.queue();
-                // Drain the queue: take every pushed pair (the lock is held only for
-                // the swap). A poisoned/failed lock is a best-effort skip.
-                let drained: Vec<(u64, u64)> = match queue.lock() {
+                // 12-4: retry any PARKED events FIRST, preserving order — the exact
+                // same `ParsedUsage` values as the failed pass (never re-minted).
+                let mut events = s
+                    .observed_park
+                    .as_ref()
+                    .map(|(pending, _)| pending.events.clone())
+                    .unwrap_or_default();
+                // Then drain the NEW queue entries and mint their per-Run sequences.
+                // A poisoned queue lock is a best-effort skip of the DRAIN — any
+                // parked events still retry below, and the queued pairs stay queued
+                // for the next pass (never silently lost).
+                let drained: Vec<(u64, u64)> = match listener.queue().lock() {
                     Ok(mut q) => q.drain(..).collect(),
-                    Err(_) => return,
+                    Err(_) => Vec::new(),
                 };
-                if drained.is_empty() {
+                for (input, output) in drained {
+                    events.push(source.mint(input, output));
+                }
+                if events.is_empty() {
                     return;
                 }
-                // Mint the per-Run ParsedUsage for each observed completion (the
-                // engine stamps `sequence`; the agent supplies none).
-                let minted: Vec<ParsedUsage> = drained
-                    .into_iter()
-                    .map(|(input, output)| source.mint(input, output))
-                    .collect();
-                (s.run_id.clone(), s.metering_source.clone(), minted)
+                (s.run_id.clone(), s.metering_source.clone(), events)
             }
             None => return,
         };
         // Ingest each observed event through the SAME single choke point (stamps the
         // Run id + `engine-observed` source + timestamp, records, and enforces).
-        //
-        // AI-41 scope note — deliberately BEST-EFFORT here (the result is
-        // intentionally dropped): unlike the self-reported drain there is no read
-        // cursor to park — the queue has ALREADY been drained above, so a failed
-        // INSERT cannot be re-parked and retried from a byte offset. The failure is
-        // still REPORTED (`ingest_usage` emits the diagnostic), never silent; the
-        // event's loss is bounded to this one observed completion.
-        for usage in &minted {
-            let _ = self.ingest_usage(registry, name, &run_id, &metering_source, usage);
+        // Story 12-4: break on the FIRST store error — later events cannot leapfrog
+        // the failed one (billing honesty: the ledger sequence stays order-faithful).
+        let mut committed_count = 0usize;
+        for usage in &events {
+            if self
+                .ingest_usage(registry, name, &run_id, &metering_source, usage, mode)
+                .is_ok()
+            {
+                committed_count += 1;
+            } else {
+                break;
+            }
         }
+        if committed_count == events.len() {
+            // Every event durable (or a recognized duplicate replay): the park
+            // clears.
+            if let Some(s) = self.running.get_mut(name) {
+                s.observed_park = None;
+            }
+        } else if mode == DrainMode::Terminal {
+            // 12-4, the terminal arm: there IS no next pass — the handle (and any
+            // parked buffer) is dropped right after. Announce the loss explicitly,
+            // never a silent drop and never a false retry claim, and drop the park
+            // (no phantom retry state survives the instance). (The local is
+            // deliberately NOT named `loss`: the embed-clean audit pins
+            // `emit_diagnostic(&loss)` to the ONE AI-41 self-reported site, and a
+            // duplicate marker would read as a route regression.)
+            let lost = events.len() - committed_count;
+            let observed_loss = format!(
+                "{}: {lost} observed usage event(s) could not be committed to the Usage \
+                 Ledger and are LOST — this is the terminal drain (the process is dead or \
+                 the handle is being removed, and any parked buffer is dropped with it), \
+                 so they cannot be retried",
+                name.as_str(),
+            );
+            self.emit_diagnostic(&observed_loss);
+            if let Some(s) = self.running.get_mut(name) {
+                s.observed_park = None;
+            }
+        } else {
+            // 12-4, the bounded MIDRUN park: park the un-committed tail (including
+            // the failed front) and count the attempt against the SAME front event.
+            // The 12-4 AMENDMENT cap runs FIRST — a store outage keeps minting
+            // events every tick, so the tail itself must be bounded (overflow
+            // drops the OLDEST with a loud diagnostic; see the helper).
+            let remaining: Vec<ParsedUsage> =
+                self.cap_observed_park_buffer(name, events[committed_count..].to_vec());
+            if remaining.is_empty() {
+                // The cap dropped EVERYTHING (a backlog larger than the whole
+                // buffer, loudly announced by the helper): no park state
+                // survives this pass — never a phantom one-front buffer.
+                if let Some(s) = self.running.get_mut(name) {
+                    s.observed_park = None;
+                }
+                return;
+            }
+            let front_sequence = remaining[0].sequence;
+            let attempts = match self
+                .running
+                .get(name)
+                .and_then(|s| s.observed_park.as_ref())
+            {
+                Some((pending, n)) if pending.front_sequence == front_sequence => n + 1,
+                // A different front event resets the streak (the cursor-analog).
+                _ => 1,
+            };
+            if attempts >= USAGE_PARK_MAX_ATTEMPTS {
+                // The front event is poisoned beyond the dedup key's reach: SKIP it
+                // LOUDLY and keep counting the rest (an announced loss — billing
+                // honesty cuts both ways — never a wedged drain). The events BEHIND
+                // the skipped front park again with a fresh streak (their front
+                // changed), so they retry on the next pass.
+                let rest: Vec<ParsedUsage> = remaining[1..].to_vec();
+                let skip = format!(
+                    "{}: an observed usage event (sequence {front_sequence}) failed to \
+                     commit on {attempts} consecutive drains and is SKIPPED (not \
+                     counted) — the rest of the Run's observed usage keeps counting; \
+                     investigate the Usage Ledger store",
+                    name.as_str(),
+                );
+                self.emit_diagnostic(&skip);
+                if let Some(s) = self.running.get_mut(name) {
+                    let next_front = rest.first().map(|next| next.sequence);
+                    s.observed_park = next_front.map(|front_sequence| {
+                        (
+                            ObservedPending {
+                                front_sequence,
+                                events: rest.clone(),
+                            },
+                            1,
+                        )
+                    });
+                }
+            } else if let Some(s) = self.running.get_mut(name) {
+                s.observed_park = Some((
+                    ObservedPending {
+                        front_sequence,
+                        events: remaining,
+                    },
+                    attempts,
+                ));
+            }
+        }
+    }
+
+    /// Story 12-4 AMENDMENT (review loop 1): bound the observed pending-park
+    /// buffer to [`OBSERVED_PARK_MAX_EVENTS`]. Returns the events to park; when
+    /// the tail exceeds the cap, the OLDEST events are dropped (the ledger's
+    /// order-faithful sequence discipline cuts both ways: the newest events are
+    /// the ones still reachable for retry) and the loss is announced LOUDLY —
+    /// the count, the dropped sequence range, the why, and the remediation —
+    /// never a silent truncation, never unbounded engine memory during a store
+    /// outage.
+    fn cap_observed_park_buffer(
+        &mut self,
+        name: &InstanceName,
+        mut events: Vec<ParsedUsage>,
+    ) -> Vec<ParsedUsage> {
+        let overflow = events.len().saturating_sub(OBSERVED_PARK_MAX_EVENTS);
+        if overflow > 0 {
+            let dropped = events.drain(..overflow).collect::<Vec<_>>();
+            let first = dropped.first().map(|e| e.sequence).unwrap_or(0);
+            let last = dropped.last().map(|e| e.sequence).unwrap_or(0);
+            let overflow_note = format!(
+                "{}: {overflow} parked observed usage event(s) (sequences {first}..{last}) \
+                 were DROPPED and are NOT counted — the pending buffer is capped at \
+                 {OBSERVED_PARK_MAX_EVENTS} events while the Usage Ledger store keeps \
+                 failing, so the oldest un-committed events had to go; investigate the \
+                 store outage",
+                name.as_str(),
+            );
+            self.emit_diagnostic(&overflow_note);
+        }
+        events
     }
 
     /// THE ledger-commit choke point (story 3-1, spine AD-7) — the SOLE writer of
@@ -3605,12 +3918,21 @@ impl Supervisor {
     /// delivered on the event bus since story 7-2).
     ///
     /// **AI-41 — a store error is REPORTED, never silently dropped:** the method
-    /// returns the failure (`Err`) so the self-reported drain can PARK its cursor
+    /// returns the failure so the self-reported drain can PARK its cursor
     /// and retry the event on the next pass (the observed drain reports + skips —
     /// it has no cursor). A diagnostic is emitted through the AD-12 sink either
     /// way, so dropped usage is always VISIBLE. Usage ingestion still never
     /// crashes the supervisor or a lifecycle op (the ledger is advisory to the
     /// RUN, not gating it) — honest reporting, not a panic.
+    ///
+    /// **12-4 AMENDMENT (review loop 1) — the diagnostic is MODE-aware:** the
+    /// `mode` the CALLER is draining under decides what the failure text may
+    /// honestly claim. A `MidRun` caller WILL re-attempt, so the text says the
+    /// event "is parked for retry on the next drain". A `Terminal` caller
+    /// (stop / crash-reap) has NO next pass — its text says the event is LOST
+    /// and will NOT be retried — because a terminal diagnostic that promised a
+    /// retry would contradict the adjacent LOST notice and lie to the operator
+    /// (surfaced-not-silent means the surface must also be TRUE).
     ///
     /// **The AD-7 single-writer invariant lives here:** no other code path may call
     /// `record_usage_event`.
@@ -3637,6 +3959,7 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
         parsed: &ParsedUsage,
+        mode: DrainMode,
     ) -> Result<Option<UsageUpdateEvent>, super::error::RegistryError> {
         let event = assemble_usage_event(
             parsed,
@@ -3677,20 +4000,35 @@ impl Supervisor {
             // NOT run (AC5 — no new total, no new breach).
             Ok(RecordOutcome::DuplicateReplay) => Ok(None),
             // AI-41: a store error must never SILENTLY drop the event. Report it
-            // (diagnostic + Err) so the self-reported drain parks its cursor and
-            // retries this exact event on the next pass; the observed drain
-            // reports + skips (it has no cursor). Never a supervisor crash.
+            // (diagnostic + Err) so the drains can park and retry the exact same
+            // event on the next pass — the self-reported drain (its byte cursor)
+            // since AI-41, and the OBSERVED drain (its pending buffer) since story
+            // 12-4. Never a supervisor crash.
             Err(err) => {
-                // Caller-factual (AI-41, loop 1): this text states only the fact
-                // (not counted). It must NOT claim a retry — the observed-channel
-                // caller has no cursor and never retries; the self-reported
-                // MidRun drain's park-and-retry is behavior, and its Terminal
-                // case emits its own explicit loss note below.
-                let failure = format!(
-                    "{}: a usage event could not be committed to the Usage Ledger: {err} — \
-                     it was NOT counted",
-                    name.as_str(),
-                );
+                // Caller-factual (AI-41 loop 1; MODE-aware per the 12-4
+                // AMENDMENT): a MIDRUN drain will really retry, so the text
+                // says the event is parked for the next pass and not counted
+                // until that commit succeeds (it does not claim the retry can
+                // never fail — the bound skips loudly). A TERMINAL drain has
+                // NO next pass, so its text must never claim "parked for
+                // retry" (that would contradict the adjacent LOST notice) —
+                // it names the loss and the why instead.
+                let failure = if mode == DrainMode::Terminal {
+                    format!(
+                        "{}: a usage event could not be committed to the Usage Ledger: \
+                         {err} — this is the terminal drain (the process is dead or the \
+                         handle is being removed), so the event is LOST and will NOT be \
+                         retried",
+                        name.as_str(),
+                    )
+                } else {
+                    format!(
+                        "{}: a usage event could not be committed to the Usage Ledger: {err} — \
+                         it is parked for retry on the next drain and is NOT counted until \
+                         that commit succeeds",
+                        name.as_str(),
+                    )
+                };
                 self.emit_diagnostic(&failure);
                 Err(err)
             }
@@ -6920,6 +7258,204 @@ mod tests {
         );
     }
 
+    // ---- Story 12-1: detached start — the refusal + the in-process shape ----
+
+    /// Write an `engine-observed` manifest (the `adoption.rs` shape) whose start
+    /// exec is `fake_agent` + `args`.
+    fn write_observed_manifest(dir: &Path, kind: &str, args: &[&str]) {
+        let bin = ktesio_conformance::fake_agent_bin();
+        let args_toml = args
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let body = format!(
+            "contract_version = \"1.0.0\"\n\n\
+             [adapter]\nkind = \"{kind}\"\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"engine-observed\"\n\n\
+             [config.\"metering.base_url\"]\nenv = \"OPENAI_BASE_URL\"\n",
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effect() {
+        // Story 12-1 (the AC): `start_detached` on an `engine-observed`
+        // manifest refuses BEFORE ANY SIDE EFFECT — no `starting` transition,
+        // no loopback listener, no spawn, no write-ahead record (a refusal
+        // must not leave a phantom `running` row or a live half-start). The
+        // error names WHY (the listener dies with the command) + the
+        // remediation. The handle-less supervisor suffices: the refusal fires
+        // before the listener would ever need a runtime.
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_observed_manifest(manifest.path(), "obsdetach", &["--linger-ms", "600000"]);
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        registry
+            .register_with_adapter(
+                "obsdetach",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let err = sup.start_detached(&registry, "obsdetach").unwrap_err();
+        match &err {
+            EngineError::DetachRefused { name, detail } => {
+                assert_eq!(name, "obsdetach");
+                assert!(
+                    detail.contains("listener") && detail.contains("dies with the command"),
+                    "the refusal must name the listener-lifetime why: {detail}"
+                );
+                assert!(
+                    detail.contains("without --detach"),
+                    "the refusal must carry the remediation: {detail}"
+                );
+            }
+            other => panic!("expected DetachRefused, got {other:?}"),
+        }
+        // NO side effects: the row is still `registered`, and no write-ahead
+        // spawn record exists (nothing was spawned or half-started).
+        let instance = registry
+            .lookup(&InstanceName::new("obsdetach").unwrap())
+            .unwrap();
+        assert_eq!(
+            instance.state,
+            LifecycleState::Registered,
+            "the refusal must leave the prior state untouched"
+        );
+        assert!(
+            registry
+                .spawn_record(&InstanceName::new("obsdetach").unwrap())
+                .unwrap()
+                .is_none(),
+            "the refusal must not leave a write-ahead spawn record"
+        );
+        // And a NON-detached start of the same instance is NOT refused by this
+        // arm (it proceeds to the listener path — here the handle-less
+        // supervisor's ObservedMetering failure, which proves the refusal is
+        // detach-specific, not a general observed-start blocker).
+        let err2 = sup.start(&registry, "obsdetach").unwrap_err();
+        assert!(
+            matches!(err2, EngineError::ObservedMetering { .. }),
+            "a plain start of the observed instance must not hit DetachRefused, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn detached_start_of_a_self_reported_instance_runs_and_stops_in_process() {
+        // Story 12-1: a self-reported instance detaches fine (no listener to
+        // strand): it starts to `running`, the write-ahead record is committed
+        // (the re-adoption input — detach must NOT clear or skip it), and
+        // stop/pause keep working IN-PROCESS for as long as this supervisor
+        // holds the (disarmed) handle. The survival-across-exit half is proven
+        // end-to-end in tests/adoption.rs; this pins the in-process contract.
+        let (_state, _manifest, registry) = setup_fake("detachproc", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("detachproc").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        let instance = sup.start_detached(&registry, "detachproc").unwrap();
+        assert_eq!(instance.state, LifecycleState::Running);
+        assert!(
+            registry.spawn_record(&name).unwrap().is_some(),
+            "a detached start must still commit the write-ahead record (adoption input)"
+        );
+        let stopped = sup
+            .stop(&registry, "detachproc", Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(stopped.state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn a_detached_start_force_clears_the_stdin_pipe_despite_guaranteed_interaction() {
+        // Review round 2 (verification gap): the detached stdin force-clear
+        // (`pipe_stdin && !detach` in `start_inner`) had NO test — the backend
+        // unit tests pre-clear the flag on their specs, so the supervisor's
+        // clear was never observed end to end. The premise: a manifest that
+        // DECLARES guaranteed interaction (an ATTACHED start would get a live
+        // pipe). With `--detach` the pipe is force-cleared before the spawn,
+        // so the observable is a HARD send failure — the no-pipe
+        // `InteractionUnavailable`, never a silent write into a dead pipe and
+        // never an EPIPE strand (the story 12-1 I/O matrix row).
+        let (state, _manifest, registry) =
+            setup_pause_guaranteed("detstdin", &["--linger-ms", "600000"]);
+        let _ = state;
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start_detached(&registry, "detstdin").unwrap();
+        let err = sup
+            .send_input(&registry, "detstdin", "hello\n")
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::InteractionUnavailable { detail, .. }
+                if detail.contains("no live stdin pipe")),
+            "a detached start must hold NO stdin pipe even on a guaranteed-interaction \
+             manifest; got {err:?}"
+        );
+        sup.stop(&registry, "detstdin", Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_crashed_detached_agent_restarts_detached_and_the_record_keeps_the_flag() {
+        // Review round 2 (behavioral): `restart` used to hardcode the spawn's
+        // detach flag to `false` — a crashed DETACHED agent restarted
+        // ATTACHED, and the rewritten record silently downgraded
+        // detach=true→false, so the next engine exit would kill the agent the
+        // operator asked to survive. The restart must read the flag off the
+        // surviving record and pass it through: the restarted agent stays
+        // detached and the record still carries detach=true. (A real crash is
+        // simulated with `--crash-after-ms` — NOT a stop, which would CLEAR
+        // the record and make the fallback-to-attached read vacuous.)
+        let (_state, _manifest, registry) =
+            // 450ms: AFTER the 300ms readiness window (an earlier crash is a
+            // launch failure, not a post-start crash — see
+            // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`).
+            setup_fake("detachrestart", &["--crash-after-ms", "450"]);
+        let name = InstanceName::new("detachrestart").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start_detached(&registry, "detachrestart").unwrap();
+        assert!(
+            registry.spawn_record(&name).unwrap().unwrap().detach,
+            "premise: the detached start recorded detach=true"
+        );
+
+        // The agent crashes on its own; the reaper lands the honest
+        // `running → failed` transition and the record SURVIVES (a crash is
+        // not a clean stop — the record is the restart's input).
+        std::thread::sleep(Duration::from_millis(700));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            sup.poll_once(&registry);
+            if sup.running.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the crash was never reaped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            registry.spawn_record(&name).unwrap().unwrap().detach,
+            "the crash must leave the record (and its detach flag) intact"
+        );
+
+        // The Restart Policy restart: the flag comes off the record, the
+        // restarted spawn stays detached, and the rewritten record KEEPS it.
+        let instance = sup
+            .restart(&registry, "detachrestart", 1, Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(instance.state, LifecycleState::Running);
+        let record = registry.spawn_record(&name).unwrap().unwrap();
+        assert!(
+            record.detach,
+            "the RESTARTED record must still carry detach=true (the flag survives the \
+             crash-restart, never silently downgraded)"
+        );
+        // And the restarted instance is stoppable in-process like any
+        // detached handle (control ops are not disarmed — only the drop is).
+        sup.stop(&registry, "detachrestart", Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+
     // ---- Story 4-1: `send_input` — narrow branches best exercised as
     // Supervisor-level unit tests (no reaper/Engine involved), complementing
     // the AC-level proofs in `crates/ktesio-engine/tests/interaction.rs`. ----
@@ -7766,6 +8302,463 @@ mod tests {
         );
         // Teardown.
         sup.stop(&registry, "ledger", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    // ---- Story 12-4: the OBSERVED drain's park + bounded retry + loud skip ----
+
+    /// Give the supervisor's (already-started, self-reported) instance a REAL
+    /// observed listener + source — the 12-4 drain tests push `(input, output)`
+    /// pairs into the listener's queue directly (no model traffic needed) and
+    /// drive `drain_observed_for` synchronously. The listener points at a dead
+    /// upstream (nothing ever forwards); its accept-loop task lives on the
+    /// returned runtime (kept alive by the caller for the test's duration).
+    fn attach_observed_channel(
+        sup: &mut Supervisor,
+        registry: &Registry,
+        name: &str,
+    ) -> (
+        tokio::runtime::Runtime,
+        crate::metering::listener::ObservedQueue,
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("test runtime for the observed listener");
+        let dead_upstream = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let listener = ObservedListener::start(rt.handle(), dead_upstream).expect("listener start");
+        let queue = listener.queue();
+        let inst = InstanceName::new(name).unwrap();
+        let s = sup.running.get_mut(&inst).expect("supervised entry");
+        s.observed_listener = Some(listener);
+        s.observed_source = Some(crate::ports::ObservedUsageSource::new());
+        s.metering_source = "engine-observed".to_string();
+        // Silence the unused-registry lint; the registry read keeps the signature
+        // symmetric with the drain call sites.
+        let _ = registry;
+        (rt, queue)
+    }
+
+    /// The FULL `usage_events` schema (table + every index, tables first) read
+    /// from the live DB — the repair fixture the fault-injection drops and
+    /// restores (the AI-41 park test's exact technique, shared).
+    fn usage_events_schema(db: &Path) -> Vec<(String, String)> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, sql FROM sqlite_master \
+                 WHERE tbl_name = 'usage_events' AND sql IS NOT NULL \
+                 ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap();
+        let schema: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
+        drop(stmt);
+        schema
+    }
+
+    /// The minted `sequence` ordinals of `name`'s committed ledger rows —
+    /// proves the retried events kept their ORIGINAL sequences (never re-minted).
+    fn ledger_sequences(state: &Path, name: &str) -> Vec<i64> {
+        let conn = rusqlite::Connection::open(state.join("state.db")).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.sequence FROM usage_events e \
+                 JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1 \
+                 ORDER BY e.sequence",
+            )
+            .unwrap();
+        let rows = stmt.query_map([name], |r| r.get::<_, i64>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn an_observed_drain_parks_and_retries_the_same_minted_events() {
+        // Story 12-4 (the observed AI-41): a store failure MIDRUN parks the
+        // minted events; the retry commits the EXACT same events — the same
+        // minted `sequence` ordinals (never re-minted, the dedup-key stability
+        // the design pins) — and the park clears once everything is durable.
+        let (state, _manifest, registry) = setup_fake("obspark", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("obspark").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "obspark").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obspark");
+        let db = state.path().join("state.db");
+
+        // Two observed completions; then the store dies.
+        queue.lock().unwrap().push_back((10, 20));
+        queue.lock().unwrap().push_back((11, 22));
+        let schema = usage_events_schema(&db);
+        assert!(
+            schema
+                .iter()
+                .any(|(t, sql)| t == "index" && sql.contains("CREATE UNIQUE INDEX")),
+            "fixture premise: a UNIQUE dedup index exists on usage_events"
+        );
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE usage_events", []).unwrap();
+        drop(conn);
+
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        {
+            let s = sup.running.get(&name).unwrap();
+            let (pending, attempts) = s.observed_park.as_ref().expect("the drain must park");
+            assert_eq!(*attempts, 1, "first failure: attempt streak 1");
+            assert_eq!(
+                pending.front_sequence, 0,
+                "the front event's minted sequence"
+            );
+            assert_eq!(
+                pending.events.len(),
+                2,
+                "both minted events park (the queue has no byte cursor)"
+            );
+        }
+        assert!(
+            sink_text(&sink).contains("parked for retry"),
+            "the failure diagnostic must reach the diagnostic sink"
+        );
+
+        // Repair (FULL schema incl. the dedup index) and retry.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (_kind, sql) in &schema {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "obspark"),
+            (2, 21),
+            "the retried events commit exactly once"
+        );
+        assert_eq!(
+            ledger_sequences(state.path(), "obspark"),
+            vec![0, 1],
+            "the retry kept the ORIGINAL minted sequences (never re-minted)"
+        );
+        let s = sup.running.get(&name).unwrap();
+        assert!(
+            s.observed_park.is_none(),
+            "the park clears once every event is durable"
+        );
+        sup.stop(&registry, "obspark", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_observed_partial_failure_parks_only_the_uncommitted_tail() {
+        // Break-on-first-error: the FIRST event of a pass commits, the SECOND
+        // fails (a trigger RAISEs from the second row on) — only the FAILED
+        // event parks (discrete events need no block re-drift), and after the
+        // repair the retry adds exactly the missing one (no double-count).
+        let (state, _manifest, registry) = setup_fake("obspart", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("obspart").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "obspart").unwrap();
+        let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obspart");
+        let db = state.path().join("state.db");
+
+        queue.lock().unwrap().push_back((10, 20));
+        queue.lock().unwrap().push_back((11, 22));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TRIGGER obs_fail_second BEFORE INSERT ON usage_events \
+             WHEN (SELECT COUNT(*) FROM usage_events) >= 1 \
+             BEGIN SELECT RAISE(ABORT, 'injected second-insert fault'); END;",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "obspart"),
+            (1, 10),
+            "the first event commits, the second fails"
+        );
+        {
+            let s = sup.running.get(&name).unwrap();
+            let (pending, attempts) = s.observed_park.as_ref().expect("the failure parks");
+            assert_eq!(
+                pending.events.len(),
+                1,
+                "only the UNCOMMITTED event parks — the committed one is never retried"
+            );
+            assert_eq!(pending.front_sequence, 1, "the front is the second event");
+            assert_eq!(*attempts, 1);
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TRIGGER obs_fail_second", []).unwrap();
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "obspart"),
+            (2, 21),
+            "the retry adds exactly the missing event (no double-count)"
+        );
+        let s = sup.running.get(&name).unwrap();
+        assert!(s.observed_park.is_none(), "the park clears");
+        sup.stop(&registry, "obspart", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_observed_poisoned_event_is_skipped_loudly_after_the_bound() {
+        // The bounded park: an event the store PERMANENTLY rejects (a trigger
+        // keyed on its token count) parks 1→2→3 times, then is SKIPPED with a
+        // loud diagnostic while the events behind it keep counting — an
+        // announced loss, never a wedged drain, never a silent drop.
+        let (state, _manifest, registry) = setup_fake("obsskip", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("obsskip").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "obsskip").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obsskip");
+        let db = state.path().join("state.db");
+
+        queue.lock().unwrap().push_back((42, 1)); // the poisoned event
+        queue.lock().unwrap().push_back((7, 2));
+        queue.lock().unwrap().push_back((8, 3));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TRIGGER obs_poison BEFORE INSERT ON usage_events \
+             WHEN NEW.input_tokens = 42 \
+             BEGIN SELECT RAISE(ABORT, 'injected permanent fault'); END;",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Passes 1 and 2: the drain parks at the poisoned front.
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        {
+            let s = sup.running.get(&name).unwrap();
+            let (pending, attempts) = s.observed_park.as_ref().unwrap();
+            assert_eq!(
+                *attempts, 2,
+                "two consecutive failed passes at the same front"
+            );
+            assert_eq!(pending.front_sequence, 0);
+            assert_eq!(
+                pending.events.len(),
+                3,
+                "nothing committed, nothing skipped yet"
+            );
+        }
+        // Pass 3 hits the bound: the poisoned front is SKIPPED loudly; the two
+        // healthy events park behind it with a FRESH streak (a new front).
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert!(
+            sink_text(&sink).contains("SKIPPED (not counted)"),
+            "the skip must be announced loudly"
+        );
+        assert!(
+            sink_text(&sink).contains("sequence 0"),
+            "the skip names the poisoned event's minted sequence"
+        );
+        {
+            let s = sup.running.get(&name).unwrap();
+            let (pending, attempts) = s.observed_park.as_ref().unwrap();
+            assert_eq!(
+                pending.front_sequence, 1,
+                "the new front is the second event"
+            );
+            assert_eq!(pending.events.len(), 2, "the healthy events keep counting");
+            assert_eq!(*attempts, 1, "a different front resets the streak");
+        }
+        assert_eq!(
+            ledger_totals(state.path(), "obsskip"),
+            (0, 0),
+            "nothing committed yet (the healthy events are parked, not dropped)"
+        );
+
+        // Remove the fault: the healthy events commit on the next pass; the
+        // skipped one is NOT resurrected (an announced loss stays lost).
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TRIGGER obs_poison", []).unwrap();
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "obsskip"),
+            (2, 15),
+            "the healthy events landed; the skipped event's 42 tokens are gone (announced)"
+        );
+        let s = sup.running.get(&name).unwrap();
+        assert!(s.observed_park.is_none());
+        sup.stop(&registry, "obsskip", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_oversized_observed_park_drops_the_oldest_events_loudly() {
+        // The 12-4 AMENDMENT cap: a store outage keeps minting events every
+        // tick, so the pending park buffer must be BOUNDED
+        // (OBSERVED_PARK_MAX_EVENTS) — never unbounded engine memory. When the
+        // cap bites, the OLDEST parked events are dropped and the loss is
+        // announced LOUDLY (count + sequence range + remediation) — a capped
+        // loss, never a silent truncation; the newest events keep their park.
+        let (state, _manifest, registry) = setup_fake("obscap", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("obscap").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "obscap").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obscap");
+        let db = state.path().join("state.db");
+
+        // MORE events than the cap, all minted in one drain while the store
+        // is dead: the buffer can hold only OBSERVED_PARK_MAX_EVENTS of them.
+        let total = OBSERVED_PARK_MAX_EVENTS + 2;
+        for i in 0..total {
+            queue.lock().unwrap().push_back((1, i as u64));
+        }
+        let schema = usage_events_schema(&db);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE usage_events", []).unwrap();
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+
+        // The park holds EXACTLY the cap — the two OLDEST events (sequences
+        // 0 and 1) were dropped, loudly.
+        {
+            let s = sup.running.get(&name).unwrap();
+            let (pending, attempts) = s.observed_park.as_ref().expect("the drain still parks");
+            assert_eq!(
+                pending.events.len(),
+                OBSERVED_PARK_MAX_EVENTS,
+                "the park buffer is capped, never unbounded"
+            );
+            assert_eq!(
+                pending.front_sequence, 2,
+                "the two oldest minted events (0, 1) were the dropped ones"
+            );
+            assert_eq!(*attempts, 1, "a first failed pass at the (new) front");
+        }
+        let text = sink_text(&sink);
+        assert!(
+            text.contains("2 parked observed usage event(s)"),
+            "the overflow must be announced with the dropped COUNT: {text}"
+        );
+        assert!(
+            text.contains("sequences 0..1"),
+            "the overflow diagnostic names the dropped sequence range: {text}"
+        );
+        assert!(
+            text.contains("NOT counted"),
+            "the dropped events are honestly not-counted, never silently held: {text}"
+        );
+
+        // Repair: the capped survivors commit with their ORIGINAL minted
+        // sequences (the cap never re-mints), the dropped two stay lost.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (_kind, sql) in &schema {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_sequences(state.path(), "obscap").len(),
+            OBSERVED_PARK_MAX_EVENTS,
+            "exactly the capped survivors landed"
+        );
+        assert_eq!(
+            ledger_sequences(state.path(), "obscap")[0],
+            2,
+            "the survivors kept their original sequences (the dropped two are gone)"
+        );
+        let s = sup.running.get(&name).unwrap();
+        assert!(s.observed_park.is_none());
+        sup.stop(&registry, "obscap", Some(Duration::from_millis(200)))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_terminal_observed_drain_failure_announces_the_loss_without_a_retry_claim() {
+        // The TERMINAL arm: a commit failure on the stop/reap drain is LOST —
+        // announced explicitly (with the why and no retry claim), never a silent
+        // drop and never a false "will retry". Any buffer a PRIOR MidRun pass
+        // parked is dropped with the instance (the terminal pass makes no new
+        // park and rescues nothing once the drain itself failed).
+        let (state, _manifest, registry) = setup_fake("obslost", &["--linger-ms", "600000"]);
+        let name = InstanceName::new("obslost").unwrap();
+        let mut sup = Supervisor::with_backoff(fast_backoff());
+        sup.start(&registry, "obslost").unwrap();
+        let sink = install_capture_sink(&mut sup);
+        let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obslost");
+        let db = state.path().join("state.db");
+
+        // (1) Store UP: event A commits immediately.
+        queue.lock().unwrap().push_back((30, 40));
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(ledger_totals(state.path(), "obslost"), (1, 30));
+
+        // (2) Store DIES: event B parks on the MidRun pass.
+        queue.lock().unwrap().push_back((3, 4));
+        let schema = usage_events_schema(&db);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE usage_events", []).unwrap();
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert!(sup.running.get(&name).unwrap().observed_park.is_some());
+
+        // (3) The TERMINAL drain (store still dead): B's failure is announced
+        // as LOST — not retried, not a bounded skip — and B does NOT survive
+        // into a new park. The 12-4 AMENDMENT: NO diagnostic on this path may
+        // claim "parked for retry" — the shared ingest-failure text is
+        // mode-aware, and the absence is asserted, not assumed (a terminal
+        // diagnostic promising a retry would contradict the LOST notice). The
+        // assertion scopes to the TERMINAL pass's own lines: the earlier
+        // MidRun pass's "parked for retry" line is honest history (that drain
+        // really did park), so only the delta may not contain the claim.
+        let before_terminal = sink_text(&sink).len();
+        sup.drain_observed_for(&registry, &name, DrainMode::Terminal);
+        let text = sink_text(&sink)[before_terminal..].to_string();
+        assert!(
+            text.contains("are LOST"),
+            "the terminal loss must be announced: {text}"
+        );
+        assert!(
+            text.contains("cannot be retried"),
+            "the loss notice must not claim a retry: {text}"
+        );
+        assert!(
+            !text.contains("parked for retry"),
+            "NO terminal diagnostic may claim the parked event will be retried \
+             (the 12-4 AMENDMENT mode-aware text): {text}"
+        );
+        assert!(
+            !text.contains("SKIPPED"),
+            "the terminal loss is not a bounded skip: {text}"
+        );
+        assert!(
+            sup.running.get(&name).unwrap().observed_park.is_none(),
+            "the parked buffer is dropped with the instance (no phantom retry state)"
+        );
+
+        // (4) Repair: a later pass finds nothing to re-add — the lost event
+        // stays lost (announced). (The DROP TABLE fixture also wiped A's row,
+        // so the repaired ledger starts empty; the point is that B is never
+        // resurrected.)
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for (_kind, sql) in &schema {
+            conn.execute(sql, []).unwrap();
+        }
+        drop(conn);
+        sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
+        assert_eq!(
+            ledger_totals(state.path(), "obslost"),
+            (0, 0),
+            "B was announced lost and is never resurrected by a later pass"
+        );
+        sup.stop(&registry, "obslost", Some(Duration::from_millis(200)))
             .unwrap();
     }
 

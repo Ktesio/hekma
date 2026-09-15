@@ -145,7 +145,7 @@ kt agent resume my-agent
 kt agent stop my-agent --timeout 10   # graceful, then a forced kill after the window
 ```
 
-> **Supervision boundary (current behavior):** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits; durable supervision across separate CLI invocations is future work (the supervising daemon is a later epic). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+> **Supervision boundary (current behavior):** a standalone `kt agent start` supervises the process only for that command's lifetime and stops it when the command exits; start it with `kt agent start --detach` to keep the agent running across commands (the next `kt` command re-adopts it; between commands it is not supervised — no crash detection, no budget enforcement, no usage/event delivery). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
 ## Commands
 

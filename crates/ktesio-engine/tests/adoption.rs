@@ -520,6 +520,28 @@ fn adoption_helper_subprocess() {
             facade.start("obssurv").unwrap();
             std::process::exit(0);
         }
+        // Story 12-1: start `detachee` DETACHED, then let the engine drop
+        // CLEANLY (no crash simulation — the disarm makes clean-exit survival
+        // possible on ALL THREE OSes for the first time: on Unix the Drop
+        // skips the killpg; on Windows the spawn-time Job Object carries no
+        // kill-on-close, so closing the engine's handles kills nothing). The
+        // next engine open must re-adopt the surviving child through the
+        // unchanged fingerprint path — and (12-1 AMENDMENT) the record's
+        // detach flag makes EVERY later adoption re-hold it disarmed too.
+        "detached_survivor" => {
+            facade
+                .register_with_adapter("detachee", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade.start_detached("detachee").unwrap();
+            // Return NORMALLY from the helper test: `engine` then drops (the
+            // clean CLI-exit shape). `std::process::exit` would skip every
+            // destructor and model a crash instead — NOT what this mode
+            // proves. A returning test exits 0, so the parent's status check
+            // still holds. (The `#[allow]` keeps clippy's needless-return
+            // lint off the load-bearing early return.)
+            #[allow(clippy::needless_return)]
+            return;
+        }
         // Start `clean`, then STOP it cleanly (clears the record), then exit
         // normally — a later open must NOT resurrect it.
         "clean_stop" => {
@@ -650,6 +672,96 @@ fn engine_kill_adopts_live_child_and_fails_gone_record() {
     wait_until_gone(
         survivor_pid,
         "stop on the adopted instance must terminate its process (no orphan left)",
+    );
+}
+
+#[test]
+fn detached_start_survives_a_clean_engine_exit_and_the_next_engine_adopts() {
+    // Story 12-1, THE acceptance criterion, end to end: a self-reported agent
+    // started with `start_detached` survives the spawning engine's CLEAN exit
+    // (the CLI drop — NOT a crash), the write-ahead record remains, and the
+    // next engine open re-adopts the live child with usage continuity — after
+    // which a stop truly terminates it (no orphan).
+    //
+    // 12-1 AMENDMENT (review loop 1): detached-ness RIDES THE RECORD, so the
+    // adopted handle is re-held DISARMED. The test now proves the FULL
+    // durable-detach promise across N commands: a BENIGN intervening command
+    // (engine 2 adopts via its `Engine::open`, reads the status — the `kt
+    // agent list` shape — then drops) must leave the agent ALIVE at its exit;
+    // only the explicit stop (engine 3) terminates it. The pre-amendment
+    // hardcoded disarmed=false killed the agent on engine 2's drop.
+    //
+    // CROSS-OS BY DESIGN (why there is deliberately NO `_unix` suffix): the
+    // old cross-lifetime harness needed crash semantics that Windows cannot
+    // simulate (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE); detach removes exactly
+    // that limitation — a detached Windows spawn keeps its Job Object WITHOUT
+    // kill-on-close, so a clean engine drop leaves the child alive there too.
+    // This test therefore runs affirmatively on all three OS legs.
+    //
+    // Temporary CI mitigation (#109): the re-exec + surviving-orphan harness
+    // deadlocks on the x86-64 ubuntu GitHub runner ONLY (see the sibling tests).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    // Engine 1: register, start DETACHED, drop the engine cleanly, exit 0 —
+    // precisely what `kt agent start --detach` does.
+    run_engine1("detached_survivor", state.path(), manifest.path());
+
+    // The child is ALIVE after the clean exit (the disarm held), and the
+    // record it left is the re-adoption input.
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "detachee"));
+    assert!(
+        pid_alive(pid),
+        "the detached child must survive the spawning engine's clean exit"
+    );
+
+    // "The next command" (BENIGN): open a NEW engine over the SAME state dir —
+    // `Engine::open` runs adopt_orphans, which must re-acquire the live child
+    // via the unchanged {pid, start-time} fingerprint — read the status (the
+    // `kt agent list`/`show` shape), and EXIT. The adopted handle is DISARMED
+    // (the record's detach flag), so this engine's drop must NOT kill the
+    // agent.
+    {
+        let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        let adopted = facade.instance_status("detachee").unwrap();
+        assert_eq!(
+            adopted.instance.state,
+            LifecycleState::Running,
+            "the re-adopted detached instance stays running (usage continuity)"
+        );
+        // `facade` borrows `engine`; both drop here — the benign command's
+        // clean engine exit.
+    }
+    assert!(
+        pid_alive(pid),
+        "the benign intervening command's engine exit must NOT kill the \
+         adopted detached agent (12-1 AMENDMENT: the disarm rides the record)"
+    );
+
+    // "The command after that": a THIRD engine re-adopts the still-alive
+    // agent, and an explicit stop truly terminates it (no orphan) — stop
+    // keeps working on an adopted DETACHED handle.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    let re_adopted = facade.instance_status("detachee").unwrap();
+    assert_eq!(
+        re_adopted.instance.state,
+        LifecycleState::Running,
+        "the still-alive detached agent is re-adopted by the third engine"
+    );
+    // The re-held handle truly controls the process: a stop terminates it.
+    let stopped = facade
+        .stop("detachee", Some(Duration::from_secs(5)))
+        .unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    wait_until_gone(
+        pid,
+        "stop on the re-adopted detached instance must terminate it (no orphan)",
     );
 }
 

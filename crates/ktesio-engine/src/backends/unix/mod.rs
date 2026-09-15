@@ -122,6 +122,17 @@ pub struct UnixProcess {
     /// FILES, which the agent process itself keeps writing to directly
     /// (never through any engine-held handle) for as long as it lives.
     log_capture: Option<LogCapture>,
+    /// Story 12-1: whether this handle is DETACHED — the spawn-time disarm
+    /// that makes the child survive this handle's drop. `true` only for a
+    /// freshly spawned handle built from a `SpawnSpec` with `detach: true`;
+    /// `false` for every ordinary spawn AND every adopted handle (adoption
+    /// re-holds a process for THIS engine's supervision, and its kill-on-drop
+    /// no-survivor guarantee is unchanged). When `true`, [`Drop for
+    /// UnixProcess`] skips the group SIGKILL — the child was already given its
+    /// own session at spawn (`setsid`, `pgid == pid`), so nothing else is
+    /// needed for it to outlive us; stop/pause/resume still work in-process
+    /// via `killpg` for as long as this handle is held.
+    detached: bool,
 }
 
 /// The Unix process backend (AD-4).
@@ -361,6 +372,7 @@ impl ProcessBackend for UnixBackend {
             start_time,
             stdin,
             log_capture,
+            detached: spec.detach,
         })
     }
 
@@ -472,6 +484,7 @@ impl ProcessBackend for UnixBackend {
     fn adopt(
         &self,
         fingerprint: &ProcessFingerprint,
+        detached: bool,
     ) -> Result<Option<Self::Handle>, BackendError> {
         // The PID-reuse guard (AD-5): a live pid whose CURRENT start-time equals
         // the recorded one is the SAME process → adopt it. A gone pid, or one
@@ -517,6 +530,18 @@ impl ProcessBackend for UnixBackend {
             start_time: live_start,
             stdin: StdinState::NoPipe,
             log_capture: None,
+            // Story 12-1 AMENDMENT (review loop 1): detached-ness RIDES THE
+            // RECORD — an adopted handle for a detached spawn is re-held
+            // DISARMED (Drop skips the group kill), exactly like its spawning
+            // handle was. This is what makes detach durable across N commands:
+            // a benign intervening command (`kt agent list`/`show`/…) adopts
+            // the agent and, at ITS engine exit, must leave it alive — the
+            // pre-amendment hardcoded `false` killed the agent on that first
+            // benign exit. A non-detached record keeps the story 1-6
+            // no-survivor guarantee byte-for-byte (the adopting engine owns
+            // what it re-holds). Either way, stop/pause/resume still work
+            // in-process via the unchanged pgid (== pid).
+            detached,
         }))
     }
 
@@ -658,6 +683,19 @@ impl Drop for UnixProcess {
     /// cannot `wait` a non-child (the OS/init reaps it); this keeps the
     /// no-survivor guarantee across engine restarts.
     ///
+    /// Story 12-1 — the DETACHED disarm: a handle spawned with
+    /// [`SpawnSpec::detach`] set SKIPS the group SIGKILL (and the child wait),
+    /// so the child survives this engine's clean exit and the next engine open
+    /// re-adopts it through the unchanged fingerprint path (the write-ahead
+    /// record was committed before the handle was ever treated as supervised).
+    /// The child already leads its own session (`setsid`, `pgid == pid`), so
+    /// dropping without the kill leaves it running re-parented to init — that
+    /// survival is the entire point of the detached start, and adoption is the
+    /// documented recovery. The tailer-stop signal below still fires (local
+    /// bookkeeping, process-independent). If the detached child ALREADY exited,
+    /// we still reap our own child (best-effort `try_wait`) so a short-lived
+    /// detached start never leaves a zombie in its spawning process.
+    ///
     /// Fix pass (review of #80): ALSO signals the output-capture pipeline's
     /// background tailer thread to stop (one final catch-up pass, then
     /// exit) — unconditionally, regardless of whether the process itself
@@ -671,6 +709,13 @@ impl Drop for UnixProcess {
     fn drop(&mut self) {
         if let Some(capture) = &self.log_capture {
             capture.signal_stop();
+        }
+        // Story 12-1: the detached disarm — no group kill on drop. Reap only.
+        if self.detached {
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.try_wait();
+            }
+            return;
         }
         // If already reaped/exited, nothing to do; otherwise SIGKILL the group.
         if let Ok(ProcessStatus::Alive) = self.reap_if_exited() {
@@ -918,6 +963,7 @@ mod tests {
             // helper spawns with a live stdin pipe, matching what they
             // already assumed.
             pipe_stdin: true,
+            detach: false,
         }
     }
 
@@ -1025,6 +1071,110 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_handle_drops_without_killing_and_stays_fingerprint_adoptable() {
+        // Story 12-1 (Unix half): a detached spawn's handle is DISARMED —
+        // dropping it does NOT killpg the group, so the child survives the
+        // spawning engine's exit (the whole point of `start --detach`) and the
+        // verified fingerprint remains adoptable by the next engine. The
+        // re-adopt-then-STOP half of the flow is proven end-to-end in
+        // `tests/adoption.rs::detached_start_survives_a_clean_engine_exit_and_the_next_engine_adopts`
+        // (where the spawning process exits, mirroring the real CLI); here we
+        // prove the disarm + adoptability in-process, across a SECOND
+        // adoption: the 12-1 AMENDMENT makes detached-ness a handle property
+        // that survives re-holding.
+        let backend = UnixBackend::new();
+        // A LONG-LIVED child: this test ends with an explicit stop on the
+        // re-adopted handle, and `sleep 2`-style self-exit would race the
+        // cleanup (an exited pid that the OS recycles mid-test makes the stop's
+        // signal hit an unrelated process — EPERM noise, not the disarm).
+        let mut detached_spec = spec("sleep", &["600"]);
+        detached_spec.pipe_stdin = false;
+        detached_spec.detach = true;
+        let proc = backend.spawn(&detached_spec).expect("spawn detached sleep");
+        let pid = proc.pid;
+        let fp = backend.fingerprint(&proc);
+        assert!(fp.start_time > 0, "detached spawn still verifies AD-5");
+        // The disarm: drop the handle → the child must still be alive.
+        drop(proc);
+        assert!(
+            pid_is_alive(pid),
+            "a detached handle's drop must NOT kill the child (story 12-1)"
+        );
+        // The recovery input: the next engine's `adopt` re-acquires the live
+        // child via the unchanged {pid, start-time} fingerprint. The record
+        // says DETACHED (12-1 AMENDMENT), so the re-held handle must come back
+        // DISARMED too.
+        let adopter = UnixBackend::new();
+        let mut adopted = adopter
+            .adopt(&fp, true)
+            .expect("adopt call ok")
+            .expect("the surviving detached child must be adoptable");
+        assert_eq!(
+            adopter.poll(&mut adopted).unwrap(),
+            ProcessStatus::Alive,
+            "the re-held detached child is alive"
+        );
+        // 12-1 AMENDMENT pin: dropping the ADOPTED detached handle must NOT
+        // kill the child either — a benign intervening command's engine exit
+        // leaves the agent alive for the command after it. (`adopted`'s
+        // `detached` flag came from the adopt argument above; its Drop reads
+        // that flag, so this is the exact cross-lifetime disarm.)
+        drop(adopted);
+        assert!(
+            pid_is_alive(pid),
+            "an ADOPTED detached handle's drop must also NOT kill the child \
+             (the benign-command survival, 12-1 AMENDMENT)"
+        );
+        // Control pin: stop STILL works on an adopted detached handle (a fresh
+        // adopt — the one above was consumed by the drop pin).
+        let mut again = adopter
+            .adopt(&fp, true)
+            .expect("adopt call ok")
+            .expect("the still-surviving detached child is re-adoptable");
+        // The stop terminates the agent through the re-held detached handle.
+        // The RESULT is intentionally NOT asserted here (the file's `let _ =
+        // adopter.stop` convention, see
+        // `adopt_reacquires_a_live_matching_process_and_can_stop_it`): this
+        // TEST process is the child's parent (the disarmed first drop skipped
+        // its wait), so on macOS the SIGTERM leaves an unreaped ZOMBIE whose
+        // group answers the escalation's killpg with EPERM — a test-context
+        // artifact. In production the adopting engine is a DIFFERENT process
+        // and the killed agent re-parents to init, so `stop` returns cleanly.
+        // What the amendment needs is the EFFECT: the agent is dead (asserted
+        // below via ps), and the full stop-works-on-adopted-detached-handle
+        // behavior is proven cross-process by tests/adoption.rs's detached-
+        // survivor e2e and the CLI suite's stop leg.
+        let _ = adopter.stop(&mut again, Duration::from_millis(500));
+        let stat = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "stop on the adopted detached handle must terminate the agent \
+             (ps stat = '{stat}')"
+        );
+    }
+
+    #[test]
+    fn a_detached_handle_still_stops_in_process_before_any_drop() {
+        // Story 12-1: stop/pause/resume keep working on a detached handle for
+        // as long as THIS engine holds it (the pgid is unchanged — detach only
+        // disarms the DROP, not the control operations).
+        let backend = UnixBackend::new();
+        let mut detached_spec = spec("sleep", &["600"]);
+        detached_spec.pipe_stdin = false;
+        detached_spec.detach = true;
+        let mut proc = backend.spawn(&detached_spec).expect("spawn detached");
+        let outcome = backend
+            .stop(&mut proc, Duration::from_secs(5))
+            .expect("in-process stop of a detached handle");
+        assert!(!outcome.forced);
+        assert!(backend.poll(&mut proc).unwrap().is_exited());
+    }
+
+    #[test]
     fn fingerprint_is_stable_across_reads_for_the_same_process() {
         // AD-5: the fingerprint must be STABLE for a live process (two reads
         // agree) so a write-ahead record can be reconciled later. On the
@@ -1059,7 +1209,7 @@ mod tests {
 
         // Adopt via a fresh backend (the OS re-acquisition path).
         let adopter = UnixBackend::new();
-        let adopted = adopter.adopt(&fp).expect("adopt call ok");
+        let adopted = adopter.adopt(&fp, false).expect("adopt call ok");
         let mut adopted = adopted.expect("a live matching process must be adopted");
         assert_eq!(adopter.pid(&adopted), fp.pid);
         assert_eq!(adopter.poll(&mut adopted).unwrap(), ProcessStatus::Alive);
@@ -1105,7 +1255,7 @@ mod tests {
         }
         // Give the OS a moment to fully release the pid.
         sleep(Duration::from_millis(50));
-        let adopted = backend.adopt(&fp).expect("adopt call ok");
+        let adopted = backend.adopt(&fp, false).expect("adopt call ok");
         assert!(adopted.is_none(), "a gone pid must not be adopted");
     }
 
@@ -1121,7 +1271,7 @@ mod tests {
         // Only meaningful where a real start-time source exists.
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             let forged = ProcessFingerprint::new(real.pid, real.start_time.wrapping_add(1));
-            let adopted = backend.adopt(&forged).expect("adopt call ok");
+            let adopted = backend.adopt(&forged, false).expect("adopt call ok");
             assert!(
                 adopted.is_none(),
                 "a start-time mismatch (PID reuse) must not be adopted"
@@ -1158,7 +1308,7 @@ mod tests {
         // A genuine adopted handle (correct start-time) polls Alive.
         let adopter = UnixBackend::new();
         let mut adopted = adopter
-            .adopt(&fp)
+            .adopt(&fp, false)
             .expect("adopt call ok")
             .expect("a live matching process must be adopted");
         assert_eq!(
@@ -1178,6 +1328,7 @@ mod tests {
             start_time: fp.start_time.wrapping_add(1),
             stdin: StdinState::NoPipe,
             log_capture: None,
+            detached: false,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -1211,6 +1362,7 @@ mod tests {
             start_time: 0, // no recorded token → bare-liveness fallback
             stdin: StdinState::NoPipe,
             log_capture: None,
+            detached: false,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -1386,6 +1538,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         s.env.clear();
 
@@ -1549,6 +1702,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             pipe_stdin: true,
+            detach: false,
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
             stderr_log_file: Some(dir.path().join("stderr.raw")),
@@ -1654,6 +1808,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
         let backend = UnixBackend::new();
@@ -1702,6 +1857,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         s.env.clear();
 
@@ -1752,7 +1908,7 @@ mod tests {
         let fp = backend.fingerprint(&proc);
         let adopter = UnixBackend::new();
         let adopted = adopter
-            .adopt(&fp)
+            .adopt(&fp, false)
             .expect("adopt call ok")
             .expect("a live matching process must be adopted");
         assert!(
@@ -1778,7 +1934,7 @@ mod tests {
         let fp = backend.fingerprint(&proc);
         let adopter = UnixBackend::new();
         let mut adopted = adopter
-            .adopt(&fp)
+            .adopt(&fp, false)
             .expect("adopt call ok")
             .expect("a live matching process must be adopted");
         let err = adopter.write_stdin(&mut adopted, b"x\n").unwrap_err();
@@ -1821,6 +1977,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         let mut proc = backend
             .spawn(&s)
@@ -1879,6 +2036,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            detach: false,
         };
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
 
@@ -1955,6 +2113,7 @@ mod tests {
             stderr_log_file: Some(stderr_raw.clone()),
             instance_name: "dual".to_string(),
             pipe_stdin: false,
+            detach: false,
         };
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
@@ -2041,13 +2200,14 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: false,
+            detach: false,
         };
         let mut original = backend.spawn(&s).expect("spawn sleep with capture");
         assert!(backend.log_capture(&original).is_some());
         let fp = backend.fingerprint(&original);
         let adopter = UnixBackend::new();
         let adopted = adopter
-            .adopt(&fp)
+            .adopt(&fp, false)
             .expect("adopt call ok")
             .expect("a live matching process must be adopted");
         assert!(

@@ -101,10 +101,11 @@ pub const BUDGET_DOLLARS_CUMULATIVE_KEY: &str = "budget.dollars.cumulative";
 /// The engine-namespace config key for the ENGINE-OBSERVED upstream provider base
 /// URL (story 3-4, FR-19/AD-7). The OPERATOR sets it to the agent's REAL
 /// OpenAI-compatible provider endpoint (e.g. `"http://127.0.0.1:1234"` for a local
-/// gateway); the engine's loopback forward listener FORWARDS observed traffic
+/// gateway, or an `https://` hosted provider since story 12-3's vendored
+/// rustls+ring); the engine's loopback forward listener FORWARDS observed traffic
 /// there. Absent → an `engine-observed` instance cannot start its listener (a
-/// typed start error naming this key), since there is nowhere to forward. v1 is
-/// HTTP-only (an `https://` upstream is a documented deferral). ENGINE-INTERNAL
+/// typed start error naming this key), since there is nowhere to forward.
+/// ENGINE-INTERNAL
 /// config — it does NOT touch the Adapter Contract surface (no `CONTRACT_VERSION`
 /// bump), exactly like the budget/cost keys.
 pub const METERING_UPSTREAM_BASE_URL_KEY: &str = "metering.upstream_base_url";
@@ -960,8 +961,8 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
 /// endpoint the loopback listener forwards to. Returns the trimmed string value of
 /// [`METERING_UPSTREAM_BASE_URL_KEY`], or `None` when unset / not a string /
 /// empty. A secret-classified value is NOT a URL → `None` (defensive; the URL is
-/// not a secret). The listener validates it is a usable `http://…` URL at start
-/// (v1 HTTP-only); this only reads the leaf.
+/// not a secret). The listener validates it is a usable `http://` or `https://`
+/// URL at start (12-3: https dials vendored rustls+ring); this only reads the leaf.
 pub fn resolve_upstream_base_url(effective: &EffectiveConfig) -> Option<String> {
     let value = effective.value(METERING_UPSTREAM_BASE_URL_KEY)?;
     match value {

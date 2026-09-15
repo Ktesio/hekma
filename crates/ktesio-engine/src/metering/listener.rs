@@ -41,12 +41,38 @@
 //! (`src/metering/`), NOT in `backends/`, and the OS-cfg grep gate stays green.
 //! Teardown is a portable tokio task-abort, not an OS concern.
 //!
-//! ## v1 scope (documented deferrals)
+//! ## Streaming metering (story 12-2) — the ONE deliberate relay caveat
 //!
-//! * HTTP upstream only — an HTTPS upstream is a documented deferral (no TLS stack
-//!   in v1, keeping the dep tree lean; see the workspace Cargo.toml). The test
-//!   upstream stub is loopback HTTP, so every AC is proven over HTTP.
-//! * Non-streaming `usage` parse only ([`super::parse`] streaming deferral).
+//! The relay is faithful in everything the AGENT asked for, with exactly one
+//! documented, upstream-visible modification: on a forwarded STREAMING request
+//! (`POST` to a path ending `/chat/completions` + a JSON body already setting
+//! `"stream": true`), the listener injects `"stream_options":
+//! {"include_usage": true}` so the provider emits the terminal usage frame —
+//! without it, streamed completions would go unmetered entirely. The PATH gate
+//! (story 12-2 AMENDMENT) keeps the modification scoped to the only endpoint
+//! whose responses the parse seam understands: any OTHER streaming endpoint is
+//! forwarded UNMODIFIED (providers reject `stream_options` elsewhere with a
+//! 400 — metering must never break the call it meters). Scope honesty: outside
+//! the gate usage is not REQUESTED — it is not unmeterable, because the
+//! response parse routes on CONTENT-TYPE, not path, so usage a provider sends
+//! unprompted on any metered response is still parsed and recorded. If the
+//! request already
+//! carries a `stream_options` object, the agent's own choice is respected and
+//! nothing is injected; a malformed body is forwarded UNMODIFIED. The response
+//! side routes on content-type: an `text/event-stream` body is scanned for the
+//! terminal SSE usage frame ([`super::parse::parse_openai_sse_usage`]), any
+//! other body is skimmed as one JSON completion
+//! ([`super::parse::parse_openai_usage`]) — both funnel into the SAME
+//! [`ObservedQueue`]. This modification is a surface fact an operator can
+//! observe upstream (documented in the metering design doc), not a hidden
+//! rewrite.
+//!
+//! ## Scope (was v1 deferrals; 12-2/12-3 landed)
+//!
+//! * Streaming `usage` parse: LANDED (story 12-2, the injection above + the SSE
+//!   scanner seam in [`super::parse`]).
+//! * HTTPS upstreams: LANDED via vendored rustls+ring (story 12-3) — the client
+//!   connector handles both schemes (see `default_forward_client`).
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -64,7 +90,59 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 
-use super::parse::parse_openai_usage;
+use super::parse::{parse_openai_sse_usage, parse_openai_usage};
+
+/// The outbound forward client type (story 12-3): hyper-util's legacy client
+/// over a `hyper-rustls` HTTPS connector. The connector routes by scheme —
+/// `http://` upstreams dial plain TCP exactly as before; `https://` upstreams
+/// handshake TLS through the VENDORED rustls+ring stack (no system TLS). One
+/// client type for both schemes, so the relay logic never branches on TLS.
+type ForwardClient = Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Full<Bytes>,
+>;
+
+/// The PRODUCTION TLS client configuration (story 12-3): the vendored
+/// `webpki-roots` public CA store — NO system trust store is read (the
+/// no-system-dependency philosophy; identical roots on all three OSes, and the
+/// same vendored-roots choice `kt`→`ureq` already ships). Named + injectable so
+/// the TLS test can substitute a config trusting a self-signed root (see
+/// [`ObservedListener::start_with_tls_config`]).
+/// The vendored PRODUCTION root store (webpki-roots — the no-system-TLS
+/// philosophy, matching ureq's choice). Extracted from
+/// [`default_tls_config`] (review round 2) so a unit test can observe the
+/// store DIRECTLY: an accidentally-empty root store would compile, pass every
+/// in-suite test (whose https legs trust a custom self-signed root instead),
+/// and still fail every PRODUCTION https forward at handshake — the one
+/// failure mode the injection/seam tests structurally cannot catch.
+fn default_root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn default_tls_config() -> Arc<rustls::ClientConfig> {
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(default_root_store())
+            .with_no_client_auth(),
+    )
+}
+
+/// Build the outbound forward client for a given TLS config (story 12-3 test
+/// seam): `https_or_http()` makes ONE connector handle BOTH upstream schemes,
+/// so a test can point the listener at an `https://` upstream with a
+/// self-signed-root-trusting config and prove the full composition (TLS +
+/// streaming + metering) while production always calls through
+/// [`default_tls_config`].
+fn forward_client(tls: Arc<rustls::ClientConfig>) -> ForwardClient {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config((*tls).clone())
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
 
 /// The MAXIMUM size (bytes) of a single request OR response body this transparent
 /// proxy will BUFFER before failing the relay cleanly (story 3-4 hardening).
@@ -140,14 +218,17 @@ pub enum ListenerError {
         addr: SocketAddr,
     },
 
-    /// The configured upstream base URL is not a usable HTTP URL (empty, or not
-    /// parseable as an `http://…` authority). Carries a STATIC reason only — NEVER
+    /// The configured upstream base URL is not a usable HTTP(S) URL (empty, or
+    /// not an `http://`/`https://` authority). Carries a STATIC reason only — NEVER
     /// the URL itself (an operator-configured base URL is not a secret, but keeping
-    /// errors traffic-free is the uniform no-leak discipline). v1 is HTTP-only; an
-    /// `https://` upstream is a documented deferral surfaced here.
-    #[error("the engine-observed upstream base URL is not a usable http:// URL: {reason}")]
+    /// errors traffic-free is the uniform no-leak discipline). `https://` upstreams
+    /// are SUPPORTED since story 12-3 (vendored rustls+ring); any other scheme
+    /// (`ftp://`, a bare host) is refused here.
+    #[error(
+        "the engine-observed upstream base URL is not a usable http:// or https:// URL: {reason}"
+    )]
     BadUpstream {
-        /// A static reason (empty / not-http / unparseable) — no URL echoed.
+        /// A static reason (empty / bad scheme / unparseable) — no URL echoed.
         reason: String,
     },
 }
@@ -183,9 +264,10 @@ impl ObservedListener {
     /// Binds `127.0.0.1:0` (ephemeral, loopback ONLY — the engine computes the
     /// address; it is never adapter/operator-supplied), verifies the resolved
     /// address is loopback (AC-B — refuse a non-loopback bind), validates the
-    /// `upstream` is a usable `http://…` URL (v1 HTTP-only), and spawns the accept
-    /// loop on `handle`. Returns the [`ObservedListener`] carrying the resolved
-    /// `http://127.0.0.1:<port>` base URL to inject.
+    /// `upstream` is a usable `http://` or `https://` URL (story 12-3: HTTPS
+    /// upstreams dial vendored rustls+ring with the `webpki-roots` CA store),
+    /// and spawns the accept loop on `handle`. Returns the [`ObservedListener`]
+    /// carrying the resolved `http://127.0.0.1:<port>` base URL to inject.
     ///
     /// `handle` is the engine's runtime handle (the supervisor runs on the blocking
     /// pool, so it cannot use `Handle::current`; the engine threads its handle in).
@@ -193,8 +275,20 @@ impl ObservedListener {
     /// loopback bind), so `start` stays a plain sync call the supervisor's sync
     /// start path can make.
     pub fn start(handle: &Handle, upstream: String) -> Result<ObservedListener, ListenerError> {
-        // Validate the upstream is a usable http:// URL BEFORE binding (fail fast,
-        // no listener leak). v1 HTTP-only — reject https:// with a documented reason.
+        Self::start_with_tls_config(handle, upstream, default_tls_config())
+    }
+
+    /// [`ObservedListener::start`] with an EXPLICIT TLS client config (story
+    /// 12-3 test seam): the TLS test substitutes a config trusting its own
+    /// self-signed root, proving the https + streaming + metering composition.
+    /// Production uses [`start`](Self::start) (webpki-roots default).
+    pub(crate) fn start_with_tls_config(
+        handle: &Handle,
+        upstream: String,
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Result<ObservedListener, ListenerError> {
+        // Validate the upstream is a usable http(s):// URL BEFORE binding
+        // (fail fast, no listener leak).
         validate_upstream(&upstream)?;
 
         // Bind 127.0.0.1:0 (loopback, OS-picked ephemeral port). The bind is a fast
@@ -222,7 +316,12 @@ impl ObservedListener {
         // Spawn the accept loop on the engine runtime. It is aborted on drop
         // (teardown at the terminal transition — bounded to the Run).
         let task_queue = Arc::clone(&queue);
-        let task = handle.spawn(accept_loop(listener, upstream, task_queue));
+        let task = handle.spawn(accept_loop(
+            listener,
+            upstream,
+            task_queue,
+            forward_client(tls),
+        ));
 
         Ok(ObservedListener {
             base_url,
@@ -264,10 +363,10 @@ impl Drop for ObservedListener {
     }
 }
 
-/// Validate the upstream base URL is a usable `http://…` URL (v1 HTTP-only).
-/// Rejects an empty / non-http / unparseable value with a STATIC reason (no URL
-/// echoed — the uniform no-leak discipline). An `https://` upstream is a
-/// documented v1 deferral surfaced as [`ListenerError::BadUpstream`].
+/// Validate the upstream base URL is a usable `http://` or `https://` URL
+/// (story 12-3: HTTPS accepted — it dials through the vendored rustls+ring
+/// connector). Rejects an empty / other-scheme / unparseable value with a
+/// STATIC reason (no URL echoed — the uniform no-leak discipline).
 fn validate_upstream(upstream: &str) -> Result<(), ListenerError> {
     let trimmed = upstream.trim();
     if trimmed.is_empty() {
@@ -275,16 +374,9 @@ fn validate_upstream(upstream: &str) -> Result<(), ListenerError> {
             reason: "the upstream base URL is empty (set `metering.upstream_base_url`)".to_string(),
         });
     }
-    if trimmed.starts_with("https://") {
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(ListenerError::BadUpstream {
-            reason: "an https:// upstream is not supported in v1 (HTTP-only; HTTPS is a \
-                     documented deferral)"
-                .to_string(),
-        });
-    }
-    if !trimmed.starts_with("http://") {
-        return Err(ListenerError::BadUpstream {
-            reason: "the upstream base URL must start with http://".to_string(),
+            reason: "the upstream base URL must start with http:// or https://".to_string(),
         });
     }
     // Confirm it parses as a URI authority (a hyper Uri). Do NOT echo the URL.
@@ -300,13 +392,19 @@ fn validate_upstream(upstream: &str) -> Result<(), ListenerError> {
 /// socket and serve it with a per-connection HTTP/1 server that forwards to the
 /// upstream. Runs until the task is aborted (teardown). An accept error is a
 /// best-effort skip (the loop continues) — never a crash.
-async fn accept_loop(listener: TcpListener, upstream: String, queue: ObservedQueue) {
-    // One shared forward client (connection pooling to the upstream). The legacy
-    // client is the lean hyper-util outbound leg; it carries a `Full<Bytes>` body
-    // (we buffer the request body to forward it faithfully). NO TLS connector — v1
-    // is HTTP-only (a documented deferral).
-    let client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+async fn accept_loop(
+    listener: TcpListener,
+    upstream: String,
+    queue: ObservedQueue,
+    client: ForwardClient,
+) {
+    // One shared forward client (connection pooling to the upstream). The
+    // legacy client is the lean hyper-util outbound leg; it carries a
+    // `Full<Bytes>` body (we buffer the request body to forward it faithfully).
+    // Since story 12-3 the connector is TLS-capable: `https://` upstreams
+    // handshake through vendored rustls+ring, `http://` upstreams dial plain
+    // TCP — one client, scheme-routed, no branching in the relay logic.
+    let client = client;
 
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -341,13 +439,18 @@ async fn accept_loop(listener: TcpListener, upstream: String, queue: ObservedQue
 
 /// Forward ONE request to the upstream and relay the response back FAITHFULLY
 /// (status + headers + body — a transparent proxy), skimming the OpenAI `usage`
-/// object out of the response body into the observed queue (story 3-4).
+/// out of the response body into the observed queue (story 3-4; story 12-2 adds
+/// the streaming route).
 ///
 /// FAITHFUL RELAY (the hard part — a proxy that mangles the response breaks the
 /// agent): the request's method, path+query, and headers are forwarded verbatim to
 /// the upstream; the upstream's status, headers, and body are returned to the agent
 /// verbatim. The body is BUFFERED (collected) so it can be BOTH relayed back AND
 /// parsed for `usage` — the parse reads a copy, the agent gets the exact bytes.
+/// The ONE documented exception is the story-12-2 injection: a STREAMING request
+/// to a chat-completions path gets `"stream_options": {"include_usage": true}`
+/// added (see the module docs — best-effort, path- + body-shape-gated, and
+/// skipped entirely when the agent already set its own `stream_options`).
 ///
 /// FAILURE DISCIPLINE (AC5): an upstream/forward error is relayed to the agent as
 /// an HONEST HTTP error (`502 Bad Gateway`), NEVER a fabricated success and NEVER a
@@ -357,7 +460,7 @@ async fn accept_loop(listener: TcpListener, upstream: String, queue: ObservedQue
 async fn forward(
     req: Request<Incoming>,
     upstream: String,
-    client: Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>,
+    client: ForwardClient,
     queue: ObservedQueue,
 ) -> Response<Full<Bytes>> {
     // Build the upstream URI: <upstream authority> + the request's path-and-query,
@@ -377,7 +480,21 @@ async fn forward(
         // the cap) — an honest 502, no traffic echoed, no unbounded alloc.
         return bad_gateway();
     };
-    let req_bytes = collected.to_bytes();
+    // Story 12-2: the include_usage injection — best-effort and gated on the
+    // chat-completions PATH + body shape (a malformed body is forwarded
+    // unmodified; a non-streaming request is never touched; any OTHER
+    // streaming endpoint is forwarded UNMODIFIED — the 12-2 AMENDMENT path
+    // gate, since a provider 400 on injected `stream_options` would break the
+    // call being metered). The Content-Length header was already stripped
+    // below (hop-by-hop), so hyper reframes the outbound body length for the
+    // (possibly re-serialized) bytes — no length fixup is needed.
+    let mut req_bytes = collected.to_bytes();
+    inject_include_usage(
+        &parts.method,
+        parts.uri.path(),
+        &parts.headers,
+        &mut req_bytes,
+    );
 
     let mut builder = Request::builder().method(parts.method).uri(uri);
     // Forward the request headers VERBATIM (including Authorization — the agent's
@@ -417,11 +534,20 @@ async fn forward(
         Err(_) => return bad_gateway(),
     };
 
-    // Skim `usage` out of the (buffered) response body → the observed queue. A miss
-    // (no `usage`, malformed, streamed) is a silent skip — best-effort to the RUN,
-    // the agent still gets its faithful response below. ONLY the two integer counts
-    // enter the queue (no body/header/key ever leaves the proxy).
-    if let Some((input, output)) = parse_openai_usage(&res_collected) {
+    // Skim `usage` out of the (buffered) response body → the observed queue,
+    // routed by content-type (story 12-2): an SSE stream is scanned for its
+    // TERMINAL usage frame; anything else is parsed as one JSON completion. A miss
+    // (no `usage`, malformed, a stream without the terminal frame) is a silent
+    // skip — best-effort to the RUN, the agent still gets its faithful response
+    // below. ONLY the two integer counts enter the queue (no body/header/key ever
+    // leaves the proxy).
+    if is_sse(&res_parts.headers) {
+        if let Some((input, output)) = parse_openai_sse_usage(&res_collected) {
+            if let Ok(mut q) = queue.lock() {
+                q.push_back((input, output));
+            }
+        }
+    } else if let Some((input, output)) = parse_openai_usage(&res_collected) {
         if let Ok(mut q) = queue.lock() {
             q.push_back((input, output));
         }
@@ -437,6 +563,105 @@ async fn forward(
     *response.status_mut() = res_parts.status;
     *response.headers_mut() = res_parts.headers;
     response
+}
+
+/// Whether the response headers declare a Server-Sent-Events body — the
+/// content-type route that selects the terminal-frame SSE scanner (story 12-2).
+/// Matched on the media type, case-insensitively; an absent/unparseable
+/// content-type is "not SSE" (the JSON completion parse then applies, which is
+/// the safe default: it skips cleanly on anything that is not one JSON object).
+fn is_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+/// The story-12-2 REQUEST INJECTION: on a forwarded STREAMING completion request,
+/// add `"stream_options": {"include_usage": true}` so the provider emits the
+/// terminal SSE usage frame (which [`super::parse::parse_openai_sse_usage`] then
+/// parses). Best-effort and deliberately narrow — the injection happens ONLY when:
+/// * the method is `POST` (the OpenAI completion shape), and
+/// * the request PATH ends `/chat/completions` (story 12-2 AMENDMENT, review
+///   loop 1: the SAME surface whose response shape
+///   [`super::parse::parse_openai_usage`]/[`super::parse::parse_openai_sse_usage`]
+///   understand — any other streaming endpoint (embeddings, completions,
+///   provider-specific routes) rejects `stream_options` with a 400, so the
+///   injection there would BREAK the call it meters), and
+/// * the request declares a JSON content-type, and
+/// * the body parses as a JSON OBJECT that already sets `"stream": true`
+///   (never fabricating a stream on a non-streaming request), and
+/// * the body carries NO `stream_options` key (the agent's own choice wins —
+///   if it explicitly asked for NO usage frame, that is respected).
+///
+/// "Outside the path gate" means usage is not REQUESTED there — nothing is
+/// injected — but it does NOT mean unmeterable: the RESPONSE parse routes on
+/// content-type, not path, so any usage the provider sends unprompted on a
+/// metered response is still parsed and recorded (see review round 2's
+/// wording fix). Any other shape — a malformed body, a non-object, a GET, any
+/// other path — leaves the body UNMODIFIED (the relay stays faithful; the
+/// metering miss is the accepted, lower-bound-honest cost). The
+/// re-serialization is the house lenient-parse round-trip: field ORDER may
+/// change on the wire (providers do not care), the CONTENT does not. Mutates
+/// `req_bytes` in place when the injection lands; returns nothing (the
+/// injection is silent — the observable fact is documented upstream-visible,
+/// not logged traffic).
+fn inject_include_usage(
+    method: &hyper::Method,
+    path: &str,
+    headers: &HeaderMap,
+    req_bytes: &mut Bytes,
+) {
+    if method != hyper::Method::POST {
+        return;
+    }
+    // Story 12-2 AMENDMENT (review loop 1): the PATH gate. Mirrors the parse
+    // scope — only `/chat/completions` responses are read for usage, so only
+    // those requests are modified. Exact-suffix match on the URI path (the
+    // query string is not part of `path()`); no trailing-slash leniency (the
+    // OpenAI surface is `/…/chat/completions`, and inventing extra accepted
+    // shapes would widen the modified-request surface).
+    if !path.ends_with("/chat/completions") {
+        return;
+    }
+    let is_json = headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        return;
+    }
+    // Lenient parse (the same house style the response parse uses): a body that
+    // does not parse as a JSON object is forwarded unmodified.
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(req_bytes) else {
+        return;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    // Gate on the agent's OWN streaming intent.
+    if !obj
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Respect an existing stream_options — never overwrite the agent's choice.
+    if obj.contains_key("stream_options") {
+        return;
+    }
+    obj.insert(
+        "stream_options".to_string(),
+        serde_json::json!({ "include_usage": true }),
+    );
+    // A serialization failure (not reachable for a Value) leaves the original
+    // body in place — best-effort, never a relay failure.
+    if let Ok(serialized) = serde_json::to_vec(&value) {
+        *req_bytes = Bytes::from(serialized);
+    }
 }
 
 /// Is `name` an RFC 7230 §6.1 hop-by-hop header (which a proxy must not forward)?
@@ -554,17 +779,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_https_or_non_http_upstream_is_refused() {
-        // v1 HTTP-only: an empty, https://, or non-http upstream is a hard start
-        // error (no listener leaked), with a STATIC reason (no URL echoed).
+    fn an_empty_or_other_scheme_upstream_is_refused() {
+        // Story 12-3: `https://` is now ACCEPTED; an empty, a foreign-scheme
+        // (`ftp://`), or scheme-less upstream is still a hard start error (no
+        // listener leaked), with a STATIC reason (no URL echoed).
         let rt = test_runtime();
-        for bad in [
-            "",
-            "   ",
-            "https://api.openai.com",
-            "ftp://x",
-            "api.openai.com",
-        ] {
+        for bad in ["", "   ", "ftp://x", "api.openai.com", "wss://x"] {
             // Match on the error WITHOUT unwrap_err (which would require the Ok type
             // `ObservedListener` to be Debug — we deliberately do NOT derive Debug on
             // it, so the listener can never be debug-printed into a log, no-leak).
@@ -584,6 +804,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_default_root_store_is_non_empty() {
+        // Review round 2: the PRODUCTION trust roots must be observable.
+        // Every in-suite https test dials through a CUSTOM self-signed-root
+        // config (the injectable seam), so an accidentally-empty
+        // `default_root_store()` would pass the whole suite while every real
+        // https forward failed at handshake. This no-I/O pin makes that
+        // failure mode a test failure instead of a production outage: the
+        // vendored webpki-roots store carries its well-known root count.
+        let roots = default_root_store();
+        assert!(
+            roots.len() > 100,
+            "the vendored root store must carry the webpki-roots set, got {} roots",
+            roots.len()
+        );
+    }
+
+    #[test]
+    fn an_https_upstream_is_accepted_and_the_listener_starts() {
+        // Story 12-3: the https:// upstream is accepted — the listener starts
+        // (bind + accept loop) and dials it over vendored rustls+ring at forward
+        // time. The full https + streaming + metering composition (with a
+        // self-signed root) is proven by
+        // `an_https_upstream_streams_and_meters_end_to_end_through_rustls` below.
+        // (Review round 2 renamed this test: it asserts a SUCCESSFUL https
+        // start — the old `…names_the_scheme_in_its_error_surface_only` name
+        // described the pre-12-3 refusal this test replaced.)
+        let rt = test_runtime();
+        let listener =
+            ObservedListener::start(rt.handle(), "https://127.0.0.1:9".to_string()).unwrap();
+        assert!(listener.base_url().starts_with("http://127.0.0.1:"));
     }
 
     #[test]
@@ -618,20 +871,160 @@ mod tests {
     }
 
     #[test]
-    fn https_upstream_names_the_documented_deferral() {
-        // The https:// deferral is surfaced honestly (a clear v1 reason), not a
-        // generic parse error.
-        let rt = test_runtime();
-        let err =
-            match ObservedListener::start(rt.handle(), "https://api.openai.com/v1".to_string()) {
-                Err(e) => e,
-                Ok(_) => panic!("an https:// upstream must be refused in v1"),
-            };
-        assert!(err.to_string().contains("https"), "names https: {err}");
-        assert!(
-            err.to_string().contains("v1"),
-            "names the v1 deferral: {err}"
+    fn an_https_upstream_streams_and_meters_end_to_end_through_rustls() {
+        // Story 12-3, the composition proof: a SELF-SIGNED-ROOT `https://`
+        // upstream (rustls server on a std thread), reached by the listener's
+        // vendored-rustls client through an injected ClientConfig trusting that
+        // root — and the FULL streaming metering path composes across TLS: the
+        // injected include_usage rides the encrypted request, the terminal SSE
+        // usage frame comes back encrypted, and the two integer counts land in
+        // the queue. No system trust store is consulted on either side.
+        use std::io::{Read as _, Write as _};
+
+        // (1) Mint the self-signed root + leaf (rcgen, dev-only). The SAN list
+        // carries the literal IP we dial (the client verifies the URI host
+        // against the certificate's SANs — include `127.0.0.1`, not just a name).
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("self-signed cert");
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
         );
+        // (2) The TLS upstream server: a std thread running a BLOCKING rustls
+        // handshake + relay (no tokio needed server-side; no extra dep).
+        let tls_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let upstream_url = format!("https://{tls_addr}");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server cert");
+        let server_join = std::thread::spawn(move || {
+            let (stream, _) = tls_listener.accept().expect("tls upstream accept");
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let conn =
+                rustls::ServerConnection::new(Arc::new(server_config)).expect("server connection");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            // Read the (decrypted) forwarded request head + body.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 512];
+            let head_end = loop {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+                match tls.read(&mut tmp) {
+                    Ok(0) => break buf.len(),
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break buf.len(),
+                }
+                if buf.len() > 32 * 1024 {
+                    break buf.len();
+                }
+            };
+            // Drain the declared body.
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+            if let Some(cl) = head
+                .split("\r\n")
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                let mut have = buf.len() - head_end - 4;
+                while have < cl {
+                    match tls.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            have += n;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            // The INJECTION proof: the decrypted forwarded request carries the
+            // injected stream_options (and the agent's own stream flag).
+            let raw = String::from_utf8_lossy(&buf);
+            assert!(
+                raw.contains("\"stream_options\"") && raw.contains("\"include_usage\""),
+                "the forwarded TLS request must carry the injected include_usage: {raw}"
+            );
+            // Answer with the SSE streaming shape (encrypted by rustls on write).
+            let sse = "data: {\"choices\":[],\"usage\":null}\n\n\
+                       data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":11}}\n\n\
+                       data: [DONE]\n\n";
+            let _ = tls.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse}"
+                )
+                .as_bytes(),
+            );
+            let _ = tls.flush();
+            // Close the TLS session CLEANLY (close_notify + flush): a rustls
+            // CLIENT treats EOF without close_notify as a truncated stream
+            // (UnexpectedEof), so the test server must speak the full TLS
+            // close-down a real provider would.
+            tls.conn.send_close_notify();
+            let _ = tls.flush();
+        });
+
+        // (3) The listener with an INJECTED ClientConfig trusting the self-signed
+        // root (the test seam; production defaults to webpki-roots instead).
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust the self-signed root");
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let rt = test_runtime();
+        let listener =
+            ObservedListener::start_with_tls_config(rt.handle(), upstream_url, tls_config)
+                .expect("https upstream listener");
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+
+        // (4) Drive a streaming request through the listener → TLS upstream.
+        let agent_body = br#"{"model":"gpt-observed","stream":true,"messages":[]}"#;
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+            len = agent_body.len(),
+        );
+        let req = format!("{req}{}", std::str::from_utf8(agent_body).unwrap());
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth_for_thread, &req))
+            .join()
+            .unwrap();
+        server_join.join().unwrap();
+
+        // The SSE response is relayed faithfully to the agent…
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 200") && resp_text.contains("data: [DONE]"),
+            "the TLS-relayed SSE body must reach the agent faithfully: {resp_text}"
+        );
+        // …and the TERMINAL usage frame metered through TLS into the queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(q) = queue.lock() {
+                if let Some(&(input, output)) = q.front() {
+                    assert_eq!((input, output), (9, 11), "usage metered over TLS");
+                    assert_eq!(q.len(), 1, "exactly one event for the streamed call");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "usage was never metered over the TLS upstream"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -682,10 +1075,12 @@ mod tests {
     }
 
     /// A tiny in-test upstream stub on a thread: bind `127.0.0.1:0`, answer ONE
-    /// request with the given raw HTTP response bytes, and record the request head
-    /// it saw. Pure `std` — the in-crate analogue of the integration upstream stub,
-    /// so the forward + relay + parse path is exercised IN THE TEST PROCESS (tarpaulin
-    /// attributes it). Returns `(base_url, join_handle_yielding_the_request_head)`.
+    /// request with the given raw HTTP response bytes, and record the FULL raw
+    /// request it saw (head + Content-Length-delimited body — story 12-2's
+    /// injection proof needs the forwarded body). Pure `std` — the in-crate
+    /// analogue of the integration upstream stub, so the forward + relay + parse
+    /// path is exercised IN THE TEST PROCESS (tarpaulin attributes it). Returns
+    /// `(base_url, join_handle_yielding_the_raw_request)`.
     fn spawn_oneshot_upstream(
         response: &'static [u8],
     ) -> (String, std::thread::JoinHandle<String>) {
@@ -696,11 +1091,14 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("upstream accept");
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            // Read the request head (up to the blank line).
+            // Read the request head (up to the blank line), then any body the
+            // head's Content-Length declares.
             let mut buf = Vec::new();
             let mut tmp = [0u8; 512];
+            let mut head_end = None;
             loop {
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    head_end = Some(pos);
                     break;
                 }
                 match stream.read(&mut tmp) {
@@ -710,6 +1108,27 @@ mod tests {
                 }
                 if buf.len() > 32 * 1024 {
                     break;
+                }
+            }
+            let head_end = head_end.unwrap_or(buf.len());
+            // Drain the declared body (best-effort: a head without a body is the
+            // historical shape the older stubs answered).
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+            if let Some(cl) = head
+                .split("\r\n")
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            {
+                let mut have = buf.len() - head_end - 4;
+                while have < cl {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            have += n;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             let _ = std::io::Write::write_all(&mut stream, response);
@@ -1008,6 +1427,313 @@ mod tests {
         assert!(
             !resp_text.contains(SENTINEL),
             "the 502 error path must not echo any of the oversize body"
+        );
+    }
+
+    // ---- Story 12-2: the streaming route (injection + SSE terminal frame) ----
+
+    #[test]
+    fn inject_include_usage_is_narrow_and_respects_the_agent() {
+        // The injection gate, driven directly (pure, no I/O): lands ONLY on
+        // POST + a chat-completions PATH + JSON + an object already setting
+        // stream:true without stream_options; every other shape — including
+        // any other streaming ENDPOINT (the 12-2 AMENDMENT path gate) — is
+        // forwarded unmodified.
+        let post = hyper::Method::POST;
+        let get = hyper::Method::GET;
+        let chat = "/v1/chat/completions";
+        let json_headers = |_body: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_str("application/json").unwrap(),
+            );
+            h
+        };
+        let mut plain = HeaderMap::new();
+        plain.insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_str("text/plain").unwrap(),
+        );
+
+        // (a) the landing shape: stream_options appears with include_usage.
+        let mut body = Bytes::from_static(br#"{"model":"gpt","stream":true,"messages":[]}"#);
+        inject_include_usage(&post, chat, &json_headers(""), &mut body);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["stream_options"]["include_usage"],
+            serde_json::json!(true),
+            "the injection must land on the streaming shape: {doc}"
+        );
+        assert_eq!(doc["stream"], serde_json::json!(true));
+        assert_eq!(doc["model"], serde_json::json!("gpt"));
+
+        // (b) an EXISTING stream_options is respected (agent's choice wins).
+        let mut body =
+            Bytes::from_static(br#"{"stream":true,"stream_options":{"include_usage":false}}"#);
+        inject_include_usage(&post, chat, &json_headers(""), &mut body);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["stream_options"]["include_usage"],
+            serde_json::json!(false),
+            "an existing stream_options must never be overwritten: {doc}"
+        );
+
+        // (c) a NON-streaming request is never modified.
+        let mut body = Bytes::from_static(br#"{"model":"gpt"}"#);
+        inject_include_usage(&post, chat, &json_headers(""), &mut body);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap()
+                .get("stream_options")
+                .is_none(),
+            "a non-streaming request must not be touched"
+        );
+
+        // (d) a malformed body / non-JSON content-type / GET are untouched.
+        for (method, headers, raw) in [
+            (&post, &plain, &br#"{"stream":true}"#[..]),
+            (&get, &json_headers(""), &br#"{"stream":true}"#[..]),
+            (&post, &json_headers(""), &br#"not json{"stream":true}"#[..]),
+            (&post, &json_headers(""), &br#"[1,2,3]"#[..]),
+        ] {
+            let mut body = Bytes::copy_from_slice(raw);
+            inject_include_usage(method, chat, headers, &mut body);
+            assert_eq!(
+                &body[..],
+                raw,
+                "shape must be forwarded unmodified: {method} {raw:?}"
+            );
+        }
+
+        // (e) 12-2 AMENDMENT: the PATH gate. A streaming POST+JSON body on any
+        // NON-chat-completions endpoint is forwarded UNMODIFIED — a provider
+        // would 400 the injected `stream_options` there, and metering must
+        // never break the call it meters.
+        for other_path in [
+            "/v1/completions",
+            "/v1/embeddings",
+            "/v1/chat/completions/extra",
+            "/v1/audio/transcriptions",
+        ] {
+            let raw = br#"{"model":"gpt","stream":true}"#;
+            let mut body = Bytes::from_static(raw);
+            inject_include_usage(&post, other_path, &json_headers(""), &mut body);
+            assert_eq!(
+                &body[..],
+                &raw[..],
+                "a streaming request to `{other_path}` must be forwarded unmodified \
+                 (the 12-2 AMENDMENT path gate)"
+            );
+        }
+        // The gate is a SUFFIX match on the path — the OpenAI surface's real
+        // shape (any version prefix, the exact terminal segment) lands.
+        for chat_path in [
+            "/chat/completions",
+            "/v1/chat/completions",
+            "/openai/v2/chat/completions",
+        ] {
+            let mut body = Bytes::from_static(br#"{"stream":true}"#);
+            inject_include_usage(&post, chat_path, &json_headers(""), &mut body);
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                doc.get("stream_options").is_some(),
+                "`{chat_path}` is a chat-completions request and must be injected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streamed_completion_is_injected_metered_and_relayed_faithfully() {
+        // The story-12-2 in-process proof: an agent POSTs `"stream": true`
+        // through the listener; the FORWARDED body carries the injected
+        // `stream_options.include_usage` (the stub asserts it); the upstream's
+        // SSE response — null intermediates + a terminal usage frame — is
+        // RELAYED back faithfully AND its terminal usage lands in the queue.
+        let sse_body = "data: {\"id\":\"1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n\
+                        data: {\"id\":\"1\",\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":58,\"total_tokens\":100}}\n\n\
+                        data: [DONE]\n\n";
+        let response: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(response);
+
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+
+        let agent_body = br#"{"model":"gpt-observed","stream":true,"messages":[]}"#;
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+            len = agent_body.len(),
+        );
+        let req = format!("{req}{}", std::str::from_utf8(agent_body).unwrap());
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth_for_thread, &req))
+            .join()
+            .unwrap();
+        let forwarded = upstream_join.join().unwrap();
+
+        // The FORWARDED request carries the injection (upstream-visible by design).
+        assert!(
+            forwarded.contains("stream_options"),
+            "the forwarded streaming body must carry the injected stream_options: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("include_usage"),
+            "include_usage must be requested: {forwarded}"
+        );
+        // The agent's own fields survive the round-trip.
+        assert!(
+            forwarded.contains("\"stream\":true"),
+            "the agent's stream flag survives: {forwarded}"
+        );
+
+        // The SSE response is relayed to the agent FAITHFULLY.
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 200"),
+            "status relayed: {resp_text}"
+        );
+        assert!(
+            resp_text.contains("data: [DONE]"),
+            "the SSE body must be relayed faithfully: {resp_text}"
+        );
+
+        // The TERMINAL usage frame landed in the observed queue (exactly one
+        // event; the null intermediate contributed nothing).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(q) = queue.lock() {
+                if let Some(&(input, output)) = q.front() {
+                    assert_eq!((input, output), (42, 58), "the terminal frame's usage");
+                    assert_eq!(q.len(), 1, "exactly ONE event per streamed completion");
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "usage was never pushed from the SSE terminal frame"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn an_sse_response_without_a_terminal_usage_frame_skips_silently() {
+        // Lower-bound honesty: a stream WITHOUT a terminal usage frame (the
+        // provider honoring a no-usage stream_options, or an error stream) is
+        // a silent skip — relayed faithfully, nothing queued, never a
+        // fabricated zero.
+        let sse_body = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+        let response: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{sse_body}"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(response);
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let agent_body = br#"{"model":"gpt-observed","stream":true,"messages":[]}"#;
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+            len = agent_body.len(),
+        );
+        let req = format!("{req}{}", std::str::from_utf8(agent_body).unwrap());
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth_for_thread, &req))
+            .join()
+            .unwrap();
+        let _ = upstream_join.join();
+        // Relayed faithfully…
+        assert!(String::from_utf8_lossy(&resp).contains("data: [DONE]"));
+        // …but nothing was metered (a bounded grace window; a push would be a
+        // fabricated count from a usage-less stream).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a usage-less stream must NOT fabricate counts"
+        );
+    }
+
+    #[test]
+    fn a_streaming_request_to_another_endpoint_is_forwarded_unmodified() {
+        // The 12-2 AMENDMENT path gate, end to end through `forward`: a
+        // streaming POST to a NON-chat-completions endpoint is relayed
+        // BYTE-FAITHFULLY — no injected `stream_options` (a provider would 400
+        // it and metering would have broken the call it meters). The response
+        // still relays faithfully; nothing is metered (the accepted,
+        // lower-bound-honest cost outside the parse seam's scope).
+        let plain_body = "{\"id\":\"1\",\"object\":\"text_completion\",\"usage\":null}";
+        let response: &'static [u8] = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{plain_body}"
+            )
+            .into_bytes()
+            .into_boxed_slice(),
+        );
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(response);
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+
+        let agent_body = br#"{"model":"gpt","stream":true,"prompt":"hi"}"#;
+        let req = format!(
+            "POST /v1/completions HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+            len = agent_body.len(),
+        );
+        let req = format!("{req}{}", std::str::from_utf8(agent_body).unwrap());
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth_for_thread, &req))
+            .join()
+            .unwrap();
+        let forwarded = upstream_join.join().unwrap();
+
+        // The upstream saw the EXACT body — no stream_options anywhere.
+        assert!(
+            !forwarded.contains("stream_options"),
+            "a non-chat-completions streaming request must be forwarded UNMODIFIED: \
+             {forwarded}"
+        );
+        assert!(
+            forwarded.contains("\"prompt\":\"hi\""),
+            "the agent's own body survives verbatim: {forwarded}"
+        );
+        // …and the response still relays faithfully to the agent.
+        assert!(
+            String::from_utf8_lossy(&resp).contains("text_completion"),
+            "the relay stays faithful: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        // Nothing was metered either: outside the chat-completions scope the
+        // usage parse is not the contract (bounded grace window, per the
+        // sibling tests — a push here would mean the gate leaked).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a non-chat-completions streaming call must not enqueue usage"
         );
     }
 }
