@@ -18,7 +18,7 @@ The crates are published — depend on the released version:
 
 ```toml
 [dependencies]
-ktesio-engine = "0.1"
+ktesio-engine = "0.2"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -37,19 +37,11 @@ current full SHA to pin:
 git rev-parse origin/main
 ```
 
-(paste the full 40-character output as your `rev`). A git pin compiles
-against the IN-REPO version line — currently **0.2.0** (it carries the first
-deliberate breaking surface extension, `EngineError::ResumeUnsupported`) —
-while crates.io still serves **0.1.0**: the 0.2.0 publish is HELD pending
-the author's explicit go (see [the release
-runbook](release-process.md#publishing-the-engine-crates)). When 0.2.0
-publishes, switch to the new versioned form — the facade you compile
-against does not change:
-
-```toml
-[dependencies]
-ktesio-engine = "0.2"
-```
+(paste the full 40-character output as your `rev`). The published and
+in-repo forms compile against the same facade — see the [changelog](
+../CHANGELOG.md) banner for what moved in 0.2.0
+(`EngineError::ResumeUnsupported`; exhaustive `match`es over `EngineError`
+need the new arm).
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
@@ -308,13 +300,11 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-**Published**: `ktesio-engine` 0.1, `ktesio-adapter-api` 0.1, and
+**Published**: `ktesio-engine` 0.2 (breaking: `EngineError::ResumeUnsupported`
+— see the [changelog](../CHANGELOG.md) banner), `ktesio-adapter-api` 0.1, and
 `ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
-release v0.7.0, 2026-09-09). Depend on `ktesio-engine = "0.1"` — no git
-dependency needed. The engine's IN-REPO version is now **0.2.0** (the
-announced `EngineError::ResumeUnsupported` surface extension, PR #181);
-its crates.io publish is held for the author's explicit go, so `"0.1"`
-remains the correct crates.io pin until that release lands. The crates are
+release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15). Depend on
+`ktesio-engine = "0.2"` — no git dependency needed. The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
 

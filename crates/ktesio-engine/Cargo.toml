@@ -7,13 +7,11 @@ description = "Ktesio agent-runner engine; its public API is the Embedding Inter
 license-file.workspace = true
 homepage.workspace = true
 repository.workspace = true
-# PUBLISHED (first release 2026-09-09: ktesio-engine 0.1.0 on crates.io; the
-# runbook's HELD gate was lifted with Islam's explicit go). The 0.2.0 line
-# above carries the FIRST deliberate breaking surface extension
-# (`EngineError::ResumeUnsupported`, AI-7 — announced in PR #181, 2026-09-14);
-# its crates.io publish is HELD pending Islam's go (docs/release-process.md).
-# Publication actions always require that explicit go — never flip, tag, or
-# publish autonomously.
+# PUBLISHED (first release 2026-09-09: ktesio-engine 0.1.0; 0.2.0 published
+# 2026-09-15 on Islam's explicit go — the breaking `EngineError::
+# ResumeUnsupported` extension, announced in PR #181 and gated by the CI
+# semver job). Publication actions always require that explicit go — never
+# flip, tag, or publish autonomously (docs/release-process.md).
 
 [dependencies]
 ktesio-adapter-api = { workspace = true }
