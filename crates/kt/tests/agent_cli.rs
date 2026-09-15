@@ -813,6 +813,16 @@ fn run_kt_agent_bounded(
         },
         None => {
             let alive = child.kill().is_err(); // kill succeeds => was alive
+                                               // The forensic dump goes to STDOUT: nextest's timeout capture
+                                               // shows only stdout — a panic message (stderr) is invisible.
+            println!(
+                "KT HUNG after {:?}: args={:?} still_alive_at_kill={}\n                 ---- kt partial stdout ----\n{}\n                 ---- kt partial stderr ----\n{}",
+                bound,
+                args,
+                alive,
+                stdout_buf.lock().unwrap(),
+                stderr_buf.lock().unwrap()
+            );
             BoundedKt {
                 run: KtRun {
                     success: false,
