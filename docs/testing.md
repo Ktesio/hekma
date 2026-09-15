@@ -101,7 +101,7 @@ A third-party adapter crate adds `ktesio-conformance` as a **dev-dependency** â€
 # report-shape change would break your build without you moving. Update the
 # pin deliberately.
 [dev-dependencies]
-ktesio-conformance = { git = "https://github.com/iMagdy/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
+ktesio-conformance = { git = "https://github.com/Ktesio/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
 ```
 
 Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) â€” the `tests/third_party_manifest.rs` file in `ktesio-conformance` is the exact third-party shape.

@@ -12,10 +12,10 @@ use crate::error::SelfUpdateFailed;
 use crate::install_channel::{detect_install_channel, CommandProbe, InstallChannel};
 use crate::ui;
 
-const TAP: &str = "imagdy/tap/ktesio";
+const TAP: &str = "ktesio/tap/ktesio";
 const CRATE: &str = "ktesio";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/iMagdy/ktesio/releases/latest";
-const RELEASE_BASE_URL: &str = "https://github.com/iMagdy/ktesio/releases/download";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/ktesio/releases/latest";
+const RELEASE_BASE_URL: &str = "https://github.com/Ktesio/ktesio/releases/download";
 
 #[cfg(not(tarpaulin_include))]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

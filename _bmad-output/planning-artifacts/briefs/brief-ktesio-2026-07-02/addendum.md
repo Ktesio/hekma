@@ -70,7 +70,7 @@ Implication: "memory wiring" is a spectrum from "attach a vector store" to "dele
 For migration/deprecation planning in the PRD. Source: repo `README.md`, `docs/architecture.md`, `Cargo.toml`, `AGENTS.md` (all read 2026-07-02).
 
 - **What it is today:** a Rust single-binary CLI (`kt`) — an *agent-skills package manager*. Installs/shares reusable skill directories from git into `.agents/skills/`, tracked by a small `skills.json` manifest and reproducible `skills.lock`; searches skills.sh listings; publish/upgrade/doctor/uninstall commands. ~12.5k LOC.
-- **Distribution:** crates.io (`cargo install ktesio`), Homebrew (`imagdy/tap/ktesio`), install script at cli.ktesio.dev, GitHub Releases. License: PolyForm Noncommercial 1.0.0.
+- **Distribution:** crates.io (`cargo install ktesio`), Homebrew (`ktesio/tap/ktesio`), install script at cli.ktesio.dev, GitHub Releases. License: PolyForm Noncommercial 1.0.0.
 - **Existing modules (src/):** `main.rs` (clap dispatch), `cli/` (handlers), `manifest.rs`, `lockfile.rs`, `git.rs`, `install_target.rs`, `install_channel.rs`, `skills_sh.rs`, `skill.rs`, `discovery.rs`, `ui.rs`, `error.rs` (miette), `update_check.rs`. Stack: clap, miette, indicatif, serde, ureq, dialoguer.
 - **Reusable for the pivot (likely):** the CLI scaffold (clap dispatch, `--help`/`--version`), terminal UX layer (`ui.rs`), miette diagnostics, git wrapper, cross-platform packaging/distribution, the `kt` binary name and release/CI machinery. The git-native distribution model may also inform how *adapters* or *agents* are fetched.
 - **Being demoted/retired:** the skills manifest/lockfile/publish/search domain — unless skills map onto agent provisioning (open question #6).

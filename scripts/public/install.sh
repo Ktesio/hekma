@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-REPO="iMagdy/ktesio"
-TAP="imagdy/tap/ktesio"
+REPO="Ktesio/ktesio"
+TAP="ktesio/tap/ktesio"
 CRATE="ktesio"
 BIN="kt"
 LATEST_RELEASE_URL="https://api.github.com/repos/${REPO}/releases/latest"

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 
-REPO = "iMagdy/ktesio"
+REPO = "Ktesio/ktesio"
 FORMULA_CLASS = "Ktesio"
 DESCRIPTION = (
     "Run AI agents like services: supervise their lifecycle, meter real "

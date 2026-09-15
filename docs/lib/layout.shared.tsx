@@ -2,7 +2,7 @@ import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 
 export function baseOptions(): BaseLayoutProps {
   return {
-    githubUrl: 'https://github.com/iMagdy/ktesio',
+    githubUrl: 'https://github.com/Ktesio/ktesio',
     links: [
       {
         active: 'url',

@@ -51,7 +51,7 @@ where
 
     if command_probe.command_exists("brew")
         && (command_probe.command_succeeds("brew", &["list", "--formula", "ktesio"])
-            || command_probe.command_succeeds("brew", &["list", "--formula", "imagdy/tap/ktesio"]))
+            || command_probe.command_succeeds("brew", &["list", "--formula", "ktesio/tap/ktesio"]))
     {
         return InstallChannel::Homebrew;
     }
@@ -145,7 +145,7 @@ mod tests {
     fn test_detect_install_channel_uses_homebrew_formula_probe() {
         let probe = FakeProbe::default()
             .with_command("brew")
-            .with_success("brew", &["list", "--formula", "imagdy/tap/ktesio"]);
+            .with_success("brew", &["list", "--formula", "ktesio/tap/ktesio"]);
         let channel =
             detect_install_channel_with_env(Path::new("/usr/local/bin/kt"), None, None, &probe);
 

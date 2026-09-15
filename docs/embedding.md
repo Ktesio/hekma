@@ -245,7 +245,7 @@ The contract, in five rules:
 ## The quickstart example
 
 A complete, runnable host lives at
-[`crates/ktesio-engine/examples/embedding-quickstart.rs`](https://github.com/iMagdy/ktesio/blob/main/crates/ktesio-engine/examples/embedding-quickstart.rs).
+[`crates/ktesio-engine/examples/embedding-quickstart.rs`](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/examples/embedding-quickstart.rs).
 Run it from the repository root:
 
 ```bash
@@ -291,7 +291,7 @@ does. Four instruments keep that statement honest:
   edges of the shipped CLI's graph (`cargo tree`), so `kt` cannot quietly grow
   a dependency on anything but the engine, the adapter-contract types, and the
   built-in hermes adapter; a future internal crate fails the gate
-  automatically ([the workflow](https://github.com/iMagdy/ktesio/blob/main/.github/workflows/ci.yml)).
+  automatically ([the workflow](https://github.com/Ktesio/ktesio/blob/main/.github/workflows/ci.yml)).
 - **The facade audits** — the embed-clean suites prove `kt` consumes only the
   blocking facade (no async APIs, no runtime of its own) and that every async
   method has a blocking counterpart, with no TTY, prompt, or global-state
@@ -300,7 +300,7 @@ does. Four instruments keep that statement honest:
   register → configure → cap → start → breach → pause → stop journey through
   the facade alone and shares its assertions with the CLI suite, proving the
   library path and the CLI path behave identically
-  ([the host test](https://github.com/iMagdy/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
+  ([the host test](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
 - **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
   bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family, and
   since story 12-3 the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),

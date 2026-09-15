@@ -4,7 +4,7 @@
 
 # Ktesio
 
-[![CI](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml/badge.svg)](https://github.com/iMagdy/ktesio/actions/workflows/ci.yml)
+[![CI](https://github.com/Ktesio/ktesio/actions/workflows/ci.yml/badge.svg)](https://github.com/Ktesio/ktesio/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/ktesio.svg)](https://crates.io/crates/ktesio)
 [![License](https://img.shields.io/badge/license-Ktesio%20NC--Attribution%201.0.0-blue.svg)](LICENSE)
 
@@ -51,13 +51,15 @@ cargo install ktesio
 Or with Homebrew:
 
 ```bash
-brew install imagdy/tap/ktesio
+brew install ktesio/tap/ktesio
 ```
 
-You can also download a release archive from [GitHub Releases](https://github.com/iMagdy/ktesio/releases), unpack it, and place `kt` on your `PATH`, or build from source:
+> Upgrading from the previous `imagdy/tap` location? Run `brew untap imagdy/tap && brew install ktesio/tap/ktesio` once — the tap now lives in the Ktesio org.
+
+You can also download a release archive from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), unpack it, and place `kt` on your `PATH`, or build from source:
 
 ```bash
-git clone https://github.com/iMagdy/ktesio.git
+git clone https://github.com/Ktesio/ktesio.git
 cd ktesio
 cargo install --path .
 ```
@@ -179,7 +181,7 @@ If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a
 # The kit is not published to a registry yet — depend on it by git until
 # then (a workspace-relative path like `../ktesio-conformance` only works
 # inside this repository; a git dependency works for any third party):
-ktesio-conformance = { git = "https://github.com/iMagdy/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
+ktesio-conformance = { git = "https://github.com/Ktesio/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
 ```
 
 ```rust

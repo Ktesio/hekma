@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/iMagdy/ktesio/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/ktesio/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 60 * 60;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 

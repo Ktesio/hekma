@@ -853,7 +853,7 @@ So that I am told the tool became an agent runner and where to migrate, instead 
 
 ## Tracking
 
-Synced to GitHub 2026-07-02: Project [Ktesio #5](https://github.com/users/iMagdy/projects/5) (linked to iMagdy/ktesio) · epics = issues #55–#62 · stories = issues #63–#99 (issue titles carry the BMAD keys; bodies mirror this file and are BMAD-managed — edit here, re-run the sync script). Full key→issue map: `_bmad-output/implementation-artifacts/github-sync-map.json`. Sync tool: `_bmad-output/implementation-artifacts/github_sync.py` (idempotent).
+Synced to GitHub 2026-07-02: Project [Ktesio #5](https://github.com/users/iMagdy/projects/5) (linked to Ktesio/ktesio) · epics = issues #55–#62 · stories = issues #63–#99 (issue titles carry the BMAD keys; bodies mirror this file and are BMAD-managed — edit here, re-run the sync script). Full key→issue map: `_bmad-output/implementation-artifacts/github-sync-map.json`. Sync tool: `_bmad-output/implementation-artifacts/github_sync.py` (idempotent).
 
 
 ## Epic 10: Consolidate & Harden the Embedding Surface

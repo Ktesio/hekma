@@ -18,7 +18,7 @@ curl -fsSL https://cli.ktesio.dev/install.sh | sh
 Or build from source:
 
 ```bash
-git clone https://github.com/iMagdy/ktesio.git
+git clone https://github.com/Ktesio/ktesio.git
 cd ktesio
 cargo install --path .
 ```

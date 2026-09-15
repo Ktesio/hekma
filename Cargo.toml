@@ -17,8 +17,8 @@ edition = "2021"
 # `rust-version.workspace = true`.
 rust-version = "1.96.1"
 license-file = "LICENSE"
-homepage = "https://github.com/iMagdy/ktesio"
-repository = "https://github.com/iMagdy/ktesio"
+homepage = "https://github.com/Ktesio/ktesio"
+repository = "https://github.com/Ktesio/ktesio"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

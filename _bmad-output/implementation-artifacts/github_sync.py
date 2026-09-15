@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EPICS = ROOT / "_bmad-output/planning-artifacts/epics.md"
 MAP_FILE = Path(__file__).resolve().parent / "github-sync-map.json"
-REPO = "iMagdy/ktesio"
+REPO = "Ktesio/ktesio"
 OWNER = "iMagdy"
 PROJECT_TITLE = "Ktesio"
 

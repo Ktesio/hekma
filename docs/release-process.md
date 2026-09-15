@@ -203,7 +203,7 @@ needs). **HOLD — requires Islam's explicit go.** If it did NOT land:
 re-run the release workflow first (its crates.io publish step skips
 already-published artifacts, so reruns are safe); only if that fails, render
 the formula with `python3 scripts/generate_homebrew_formula.py` and push it
-to `iMagdy/homebrew-tap` manually, recording the manual push in the decision
+to `Ktesio/homebrew-tap` manually, recording the manual push in the decision
 log.
 
 ### The semver-gate flip at first publish
@@ -221,15 +221,15 @@ widen a gate or an allowlist to make a baseline pass.
 ### Decision log
 
 - **Publish go:** GRANTED 2026-09-09 — Islam's explicit go recorded on the release-tracking issue
-  [#176](https://github.com/iMagdy/ktesio/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
+  [#176](https://github.com/Ktesio/ktesio/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
   kt/tag v0.7.0, #168 dispositions ratified in the same decision round). Steps 0–7 executed by the
   orchestrator same day. The one-time name check returned 200 for all three names — reconciled as
   Islam's OWN v0.0.1 placeholder reservations (created 2026-07-03, owners verified = iMagdy), so
   the publishes supersede his own placeholders.
 - **Step 7 tap push — MANUAL (2026-09-09):** the workflow's tap checkout failed on auth (the
-  `HOMEBREW_TAP_TOKEN` secret no longer fetches `iMagdy/homebrew-tap` — expired/rotated token;
+  `HOMEBREW_TAP_TOKEN` secret no longer fetches `Ktesio/homebrew-tap` — expired/rotated token;
   renew the secret before the next release). Executed the documented fallback: formula rendered
-  locally from the v0.7.0 checksums and pushed manually to `iMagdy/homebrew-tap` (53dadf0).
+  locally from the v0.7.0 checksums and pushed manually to `Ktesio/homebrew-tap` (53dadf0).
   Everything else in steps 0–7 ran clean; `ktesio` 0.7.0 and the three library crates are live on
   crates.io; release v0.7.0 is published with all platform binaries.
 - **Semver-baseline retire-or-keep:** open by default — KEEP until revisited
@@ -266,7 +266,7 @@ Formula/ktesio.rb
 to:
 
 ```text
-iMagdy/homebrew-tap
+Ktesio/homebrew-tap
 ```
 
 Configure these repository settings before publishing a tag:
@@ -291,7 +291,7 @@ automation-focused `scripts/` directory.
 Pages configuration:
 
 - Project: `ktesio-cli`
-- Repository: `iMagdy/ktesio`
+- Repository: `Ktesio/ktesio`
 - Production branch: `main`
 - Build command: `exit 0`
 - Output directory: `scripts/public`

@@ -773,7 +773,7 @@ class InstallerScriptTests(unittest.TestCase):
     def test_install_sh_prefers_homebrew_for_new_installs(self) -> None:
         result = self.run_install_sh({"KTESIO_INSTALL_TEST_HAS_BREW": "1"})
 
-        self.assertIn("DRY RUN: brew install imagdy/tap/ktesio", result.stdout)
+        self.assertIn("DRY RUN: brew install ktesio/tap/ktesio", result.stdout)
 
     def test_install_sh_uses_cargo_when_homebrew_is_unavailable(self) -> None:
         result = self.run_install_sh({"KTESIO_INSTALL_TEST_HAS_CARGO": "1"})
@@ -800,7 +800,7 @@ class InstallerScriptTests(unittest.TestCase):
                 }
             )
 
-        self.assertIn("DRY RUN: brew upgrade imagdy/tap/ktesio", result.stdout)
+        self.assertIn("DRY RUN: brew upgrade ktesio/tap/ktesio", result.stdout)
 
     def test_install_sh_updates_existing_cargo_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

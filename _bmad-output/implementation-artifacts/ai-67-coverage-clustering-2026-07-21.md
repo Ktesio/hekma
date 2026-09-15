@@ -4,7 +4,7 @@
 - **Opened:** 2026-07-21
 - **Status:** Concluded — root cause identified, confidence HIGH
 - **Mode:** READ-ONLY diagnostic. No workflow/source/config edits; no CI triggers (only read-only `gh` log reads).
-- **Repo:** iMagdy/ktesio @ main
+- **Repo:** Ktesio/ktesio @ main
 
 ## Hand-off Brief (15-second read)
 

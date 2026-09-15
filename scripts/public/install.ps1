@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "iMagdy/ktesio"
+$Repo = "Ktesio/ktesio"
 $Crate = "ktesio"
 $Bin = "kt.exe"
 $LatestReleaseUrl = "https://api.github.com/repos/$Repo/releases/latest"

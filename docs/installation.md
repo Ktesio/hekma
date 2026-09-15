@@ -27,7 +27,7 @@ irm https://cli.ktesio.dev/install.ps1 | iex
 
 The installer preserves an existing Ktesio install channel when it can:
 
-- Homebrew installs are updated with `brew upgrade imagdy/tap/ktesio`.
+- Homebrew installs are updated with `brew upgrade ktesio/tap/ktesio`. If you installed from the older `imagdy/tap` location, migrate once with `brew untap imagdy/tap && brew install ktesio/tap/ktesio`.
 - Cargo installs are updated with `cargo install ktesio --force`.
 - Manual binary installs are replaced in their existing writable directory.
 
@@ -53,7 +53,7 @@ a directory that is not on `PATH`, it prints the directory to add.
 ## Install from source
 
 ```bash
-git clone https://github.com/iMagdy/ktesio.git
+git clone https://github.com/Ktesio/ktesio.git
 cd ktesio
 cargo install --path .
 ```
@@ -75,7 +75,7 @@ The crates.io package is named `ktesio`; it installs the `kt` binary.
 
 ## Install from a release
 
-Download the archive for your platform from [GitHub Releases](https://github.com/iMagdy/ktesio/releases), then unpack it and place the `kt` binary on your `PATH`.
+Download the archive for your platform from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), then unpack it and place the `kt` binary on your `PATH`.
 
 Release archives use this naming pattern:
 
@@ -91,7 +91,7 @@ Each release also includes `.sha256` files and an aggregate checksum file.
 After a release is published to the Homebrew tap:
 
 ```bash
-brew install imagdy/tap/ktesio
+brew install ktesio/tap/ktesio
 ```
 
 The formula installs the prebuilt macOS or Linux release archive for your platform.
@@ -118,7 +118,7 @@ Set `KTESIO_NO_UPDATE_CHECK=1` to skip automatic update checks.
 How to remove Ktesio depends on the install channel:
 
 ```bash
-brew uninstall imagdy/tap/ktesio   # Homebrew installs
+brew uninstall ktesio/tap/ktesio   # Homebrew installs
 cargo uninstall ktesio             # Cargo installs
 ```
 

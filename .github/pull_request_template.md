@@ -15,5 +15,5 @@ Note: a bare `cargo` runs the repo's MSRV pin (`rust-toolchain.toml` → Rust 1.
 
 - [ ] I kept the change focused.
 - [ ] I updated tests or docs where behavior changed.
-- [ ] I have read and agree to the [Contributor License Agreement](https://github.com/iMagdy/ktesio/blob/main/CLA.md).
+- [ ] I have read and agree to the [Contributor License Agreement](https://github.com/Ktesio/ktesio/blob/main/CLA.md).
 - [ ] Security-sensitive changes were reviewed with extra care.
