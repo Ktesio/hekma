@@ -798,6 +798,14 @@ fn run_kt_agent_bounded(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
+    // On timeout, KILL FIRST: the reader threads block in read_to_string
+    // until the pipes EOF, and the pipes only EOF when kt dies — joining
+    // (or dumping) before the kill deadlocks the harness itself (the first
+    // draft's dump never printed for exactly that reason).
+    let timed_out = status.is_none();
+    if timed_out {
+        let _ = child.kill();
+    }
     let _ = t_out.join();
     let _ = t_err.join();
     match status {
