@@ -813,7 +813,7 @@ fn run_kt_agent_bounded(
         if started.elapsed() >= bound {
             break None;
         }
-        if started.elapsed().as_secs() % 10 == 0 {
+        if started.elapsed().as_secs().is_multiple_of(10) {
             println!(
                 "harness: tick {}s, kt exited={:?}",
                 started.elapsed().as_secs(),
