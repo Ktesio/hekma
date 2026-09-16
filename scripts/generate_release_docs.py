@@ -128,7 +128,7 @@ def render_release_body(tag: str, previous_tag: str | None, commits: list[Commit
     lines = [
         f"# Hemaka {tag}",
         "",
-        "Install the archive for your platform, unpack it, and place `kt` on your PATH.",
+        "Install the archive for your platform, unpack it, and place `hemaka` and `maka` on your PATH.",
         "",
         "## Downloads",
         "",

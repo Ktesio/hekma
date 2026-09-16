@@ -181,7 +181,7 @@ impl CapabilityDeclaration {
 
     /// Project the whole declaration onto a single OS (spine AD-4 "effective").
     ///
-    /// Returns the current-OS view the engine persists and `kt` renders: every
+    /// Returns the current-OS view the engine persists and `hemaka` renders: every
     /// declared capability paired with its support level on `os`.
     pub fn effective(&self, os: OsId) -> EffectiveCapabilities {
         let entries = self
@@ -195,7 +195,7 @@ impl CapabilityDeclaration {
 
 /// The Capability Declaration projected onto one OS (AD-4 "effective").
 ///
-/// This is what the engine persists with an Agent Instance and what `kt`
+/// This is what the engine persists with an Agent Instance and what `hemaka`
 /// renders. It is a flat list of (capability, support-level) for a single
 /// [`OsId`], deterministically ordered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

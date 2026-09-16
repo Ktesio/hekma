@@ -9,11 +9,11 @@
 //!
 //! ## The `blocking()` facade (FR-34 / FR-31 / story 7-3 seed)
 //!
-//! Sync callers — `kt` today — drive the engine through [`Engine::blocking`],
+//! Sync callers — `hemaka` today — drive the engine through [`Engine::blocking`],
 //! which returns a [`Blocking`] view whose methods are the sync equivalents,
-//! each `runtime.block_on(async_method(..))`. `kt` stays a synchronous binary
+//! each `runtime.block_on(async_method(..))`. `hemaka` stays a synchronous binary
 //! (no `#[tokio::main]`); a Host with its OWN runtime (story 7-1/7-3) calls the
-//! async methods directly. This story covers exactly the commands `kt` uses
+//! async methods directly. This story covers exactly the commands `hemaka` uses
 //! today (register / remove / list / effective-capabilities) plus `start` /
 //! `stop`; the FULL facade + the embedding proof are 7-1/7-3.
 //!
@@ -318,10 +318,10 @@ impl Engine {
         handle.abort_handle()
     }
 
-    /// A synchronous facade over the async API for non-async callers (`kt`).
+    /// A synchronous facade over the async API for non-async callers (`hemaka`).
     ///
     /// Each [`Blocking`] method is `runtime.block_on(async_method(..))`. See the
-    /// module docs for why `kt` uses this instead of becoming an async binary.
+    /// module docs for why `hemaka` uses this instead of becoming an async binary.
     pub fn blocking(&self) -> Blocking<'_> {
         Blocking { engine: self }
     }
@@ -450,7 +450,7 @@ impl Engine {
     /// [`Supervisor::stop`] path, which terminates the whole process group/job,
     /// drops the handle, and CLEARS the write-ahead spawn record — and only THEN
     /// deletes the row. This closes the NFR-1 counterexample the story-1-2 `remove`
-    /// docstring deferred to 1.4/1.6: without it, `kt agent remove <live> --force`
+    /// docstring deferred to 1.4/1.6: without it, `hemaka agent remove <live> --force`
     /// deleted the record while the process kept running, and because the
     /// write-ahead record was gone a later engine crash left a TRUE unsupervised
     /// orphan no future engine could adopt.
@@ -529,7 +529,7 @@ impl Engine {
     }
 
     /// The whole Fleet as serializable [`FleetEntry`] rows (story 1-7, FR-4 /
-    /// AD-14). This is the read `kt agent list [--json]` uses.
+    /// AD-14). This is the read `hemaka agent list [--json]` uses.
     ///
     /// Composes the existing reads in ONE blocking pass: [`Registry::list`]
     /// (ordered by name) plus, per instance, the same runtime status
@@ -550,7 +550,7 @@ impl Engine {
     /// aggregation RULE lives in the engine `domain`
     /// ([`FleetTotals::from_entries`](crate::domain::FleetTotals::from_entries)), and
     /// the CLI triggers it over these engine-provided rows via `FleetListing::new`, so
-    /// `kt` stays a thin renderer that never sums the ledger or derives dollars itself.
+    /// `hemaka` stays a thin renderer that never sums the ledger or derives dollars itself.
     ///
     /// The current-Run token totals come from the supervisor's live Run id (held in
     /// memory for a running instance), so `fleet()` locks the supervisor too — a
@@ -595,7 +595,7 @@ impl Engine {
         .await
     }
 
-    /// The ONE Fleet entry for `name` (AI-15) — the read `kt agent show <name>
+    /// The ONE Fleet entry for `name` (AI-15) — the read `hemaka agent show <name>
     /// --json` uses. Locks ONCE, resolves the instance by name through the
     /// registry's keyed lookup (never a whole-Fleet scan), and composes the row
     /// through the SAME [`Engine::fleet_entry_for`] `list --json` uses, so the
@@ -770,7 +770,7 @@ impl Engine {
             // dollar cost when a Rate is configured (story 3-3). `metering_source` is
             // surfaced too. The Fleet-WIDE sum across these rows is `FleetTotals`
             // (story 3-5), composed by the CLI via `FleetListing::new` (AD-2 — the
-            // aggregation rule is engine-domain; `kt` triggers it over these rows).
+            // aggregation rule is engine-domain; `hemaka` triggers it over these rows).
             usage,
             metering_source,
             agent_home: instance.agent_home,
@@ -778,7 +778,7 @@ impl Engine {
     }
 
     /// The effective (current-OS) Capability Declaration for a registered
-    /// instance (AC1 "visible for the instance"). `kt agent show` renders this.
+    /// instance (AC1 "visible for the instance"). `hemaka agent show` renders this.
     pub async fn effective_capabilities(
         &self,
         name: &str,
@@ -819,7 +819,7 @@ impl Engine {
     /// An `engine-observed` instance is refused before any side effect
     /// ([`EngineError::DetachRefused`]). The caller owes the operator the
     /// honest enforcement-window statement (no crash detection / budget
-    /// enforcement / event delivery between commands) — the `kt` CLI states
+    /// enforcement / event delivery between commands) — the `hemaka` CLI states
     /// it on `--help` and its stderr notice.
     pub async fn start_detached(&self, name: &str) -> Result<AgentInstance, EngineError> {
         let inner = Arc::clone(&self.inner);
@@ -914,7 +914,7 @@ impl Engine {
 
     /// The per-instance runtime status (story 1-6, AC9): Lifecycle State +
     /// effective Restart Policy + restart count + (for `failed`) the last-known
-    /// cause. This is the read `kt agent list`/`show` uses to surface the restart
+    /// cause. This is the read `hemaka agent list`/`show` uses to surface the restart
     /// count and, for a failed instance, the failed cause + active policy.
     ///
     /// Failed-cause precedence (AC9 requires the cause for ANY `failed` instance):
@@ -993,7 +993,7 @@ impl Engine {
     }
 
     /// The effective (resolved) unified config for an instance (story 2-1,
-    /// spine AD-9, AC-A / AC10). This is the read `kt agent config get` uses.
+    /// spine AD-9, AC-A / AC10). This is the read `hemaka agent config get` uses.
     ///
     /// Loads the four layers through path authority and folds them with the pure
     /// resolver (engine defaults < kind defaults < instance `config.toml` <
@@ -1027,11 +1027,11 @@ impl Engine {
 
     /// Reveal the resolved cleartext of every `secret:NAME` leaf for a
     /// `config get --reveal` read (story 2-4, AC-C/AC11). Returns the dotted key →
-    /// REVEALED cleartext string for the secret leaves ONLY; `kt` overlays them onto
+    /// REVEALED cleartext string for the secret leaves ONLY; `hemaka` overlays them onto
     /// the (masked) effective config to un-mask exactly those leaves. The engine
-    /// re-resolves secrets LIVE (env → the 0600 file); `kt` never resolves secrets
+    /// re-resolves secrets LIVE (env → the 0600 file); `hemaka` never resolves secrets
     /// itself (AD-2). A resolution failure is a typed [`ConfigError::SecretReveal`]
-    /// (a stderr diagnostic in `kt`, never a crash). This NEVER touches the
+    /// (a stderr diagnostic in `hemaka`, never a crash). This NEVER touches the
     /// snapshot/logs/events — it is a read-only path. Runs on the blocking pool.
     pub async fn reveal_secrets(
         &self,
@@ -1055,7 +1055,7 @@ impl Engine {
     }
 
     /// Set one unified-config key on an instance's INSTANCE layer (story 2-1,
-    /// spine AD-9, AC-B / AC10). This is the write `kt agent config set` uses.
+    /// spine AD-9, AC-B / AC10). This is the write `hemaka agent config set` uses.
     ///
     /// Validates at WRITE time first (an unknown key outside the `agent.*`
     /// pass-through namespace is rejected with the nearest key suggested), THEN
@@ -1068,7 +1068,7 @@ impl Engine {
     /// On success the returned vec carries ZERO OR MORE WARN-ONLY steering
     /// warnings (story 11-2, AI-33 — today: a `secret:NAME` value set on a
     /// FLAG-targeted key). A Host should render each entry on ITS diagnostic
-    /// surface (`kt` prints them to stderr); the vec is empty on the common
+    /// surface (`hemaka` prints them to stderr); the vec is empty on the common
     /// path, and the write is never rejected for a warned combination.
     pub async fn set_config(
         &self,
@@ -1096,7 +1096,7 @@ impl Engine {
 
     /// Attach a Memory Backing of `kind` to an Agent Instance (story 5-1,
     /// FR-15 / spine AD-11). The engine creates the managed directory inside the
-    /// Agent Home (path authority — the returned path IS the engine's, `kt`
+    /// Agent Home (path authority — the returned path IS the engine's, `hemaka`
     /// never constructs it) and persists the attachment; the descriptor is
     /// handed to the adapter at next start via the reserved unified-config key.
     ///
@@ -1280,7 +1280,7 @@ impl Engine {
     /// AC-A) — a ONE-SHOT full read of whatever is currently retained (the
     /// current generation plus any rotated predecessors), in on-disk append
     /// order (AC-G). This is the FIRST CLI-facing consumer of this shape
-    /// (`kt agent logs`) — an unregistered name fails
+    /// (`hemaka agent logs`) — an unregistered name fails
     /// [`EngineError::NotFound`] (see
     /// [`Supervisor::read_agent_log`]'s docs for the full existence-check
     /// rationale, a deliberate improvement over
@@ -1299,7 +1299,7 @@ impl Engine {
         .await
     }
 
-    /// A cursor-based follow read (story 4-2, AC-B/AC-C/AC-H) — `kt agent
+    /// A cursor-based follow read (story 4-2, AC-B/AC-C/AC-H) — `hemaka agent
     /// logs --follow`'s poll loop drives this in a loop with the previously
     /// returned cursor. See [`Supervisor::read_agent_log_since`]'s docs for
     /// the cursor semantics (current-generation-only) and the
@@ -1340,7 +1340,7 @@ impl Engine {
 ///
 /// Obtained via [`Engine::blocking`]. Each method blocks the calling thread on
 /// the engine's runtime until the async operation completes. This is precisely
-/// the surface `kt` drives.
+/// the surface `hemaka` drives.
 pub struct Blocking<'a> {
     engine: &'a Engine,
 }
@@ -1380,13 +1380,13 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::fleet`] (story 1-7, FR-4). The Fleet as serializable
-    /// [`FleetEntry`] rows — what `kt agent list [--json]` renders.
+    /// [`FleetEntry`] rows — what `hemaka agent list [--json]` renders.
     pub fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
         self.engine.rt.block_on(self.engine.fleet())
     }
 
     /// Blocking [`Engine::fleet_entry`] (AI-15) — the single-instance Fleet
-    /// read `kt agent show <name> --json` uses. O(1) keyed lookup + the SAME
+    /// read `hemaka agent show <name> --json` uses. O(1) keyed lookup + the SAME
     /// row composition as `list`; unknown names surface the registry's
     /// `NotFound` (the CLI's exit-3 diagnostic).
     pub fn fleet_entry(&self, name: &str) -> Result<FleetEntry, RegistryError> {
@@ -1515,7 +1515,7 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::effective_config`] (story 2-1, AC-A/AC10). The read
-    /// `kt agent config get` uses.
+    /// `hemaka agent config get` uses.
     pub fn effective_config(
         &self,
         name: &str,
@@ -1527,7 +1527,7 @@ impl Blocking<'_> {
     }
 
     /// Blocking [`Engine::set_config`] (story 2-1, AC-B/AC10). The write
-    /// `kt agent config set` uses. On success carries the ZERO OR MORE
+    /// `hemaka agent config set` uses. On success carries the ZERO OR MORE
     /// WARN-ONLY steering warnings (story 11-2, AI-33) the caller renders on
     /// its own stderr — empty on the common path.
     pub fn set_config(

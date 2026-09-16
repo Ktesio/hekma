@@ -194,7 +194,7 @@ pub struct Interaction {
 
 /// Why a manifest is invalid (spine AD-3; `thiserror`, never `miette`).
 ///
-/// Every message NAMES the failing section or the invalid value (AC2), so `kt`
+/// Every message NAMES the failing section or the invalid value (AC2), so `hemaka`
 /// can render a diagnostic quoting it and the engine can map it to a
 /// `RegistryError` variant.
 #[derive(Debug, Error)]
