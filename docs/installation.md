@@ -16,13 +16,13 @@ Hemaka is a Rust CLI. It works on macOS, Linux, and Windows with no runtime depe
 On macOS or Linux:
 
 ```bash
-curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | sh
 ```
 
 On Windows with PowerShell:
 
 ```powershell
-irm https://cli.hemaka.dev/hemaka/install.ps1 | iex
+irm https://cli.ktesio.dev/hemaka/install.ps1 | iex
 ```
 
 The installer preserves an existing Hemaka install channel when it can:
@@ -38,9 +38,9 @@ Cargo, then a prebuilt GitHub Release binary.
 Installer overrides:
 
 ```bash
-KTESIO_INSTALL_METHOD=binary curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
-KTESIO_INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
-KTESIO_INSTALL_DRY_RUN=1 curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_METHOD=binary sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_DIR="$HOME/.local/bin" sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_DRY_RUN=1 sh
 ```
 
 `KTESIO_INSTALL_METHOD` accepts `auto`, `brew`, `cargo`, or `binary` on macOS
@@ -54,7 +54,7 @@ a directory that is not on `PATH`, it prints the directory to add.
 
 ```bash
 git clone https://github.com/Ktesio/ktesio.git
-cd hemaka
+cd ktesio
 cargo install --path .
 ```
 
@@ -71,11 +71,11 @@ hemaka --help
 cargo install hemaka
 ```
 
-The crates.io package is named `hemaka`; it installs the `hemaka` binary.
+The crates.io package is named `hemaka`; it installs the `hemaka` and `maka` binaries.
 
 ## Install from a release
 
-Download the archive for your platform from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), then unpack it and place the `hemaka` binary on your `PATH`.
+Download the archive for your platform from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), then unpack it and place the `hemaka` and `maka` binaries on your `PATH`.
 
 Release archives use this naming pattern:
 
@@ -122,7 +122,7 @@ brew uninstall ktesio/tap/hemaka   # Homebrew installs
 cargo uninstall hemaka             # Cargo installs
 ```
 
-For a manual release install, delete the `hemaka` binary from the directory it was
+For a manual release install, delete the `hemaka` and `maka` binaries from the directory it was
 installed into.
 
 Uninstalling removes the binary only. Hemaka's own state is untouched: the state

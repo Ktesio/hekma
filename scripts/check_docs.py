@@ -77,7 +77,7 @@ KT_COMMANDS = {
     "help",
     "agent",
 }
-# `kt agent` owns its own subcommand tree (crates/kt/src/main.rs `AgentCommands`).
+# `hemaka agent` owns its own subcommand tree (crates/hemaka/src/lib.rs `AgentCommands`).
 # Model it the same way as the top level — an allowlist per nesting level — so the
 # agent-runner surface validates without a blanket bypass.
 AGENT_COMMANDS = {
@@ -231,7 +231,7 @@ def validate_agent_subcommands(
     rest: list[str],
     errors: list[str],
 ) -> None:
-    """Validate the `kt agent` subcommand tree (crates/kt/src/main.rs `AgentCommands`
+    """Validate the `kt agent` subcommand tree (crates/hemaka/src/lib.rs `AgentCommands`
     / `ConfigCommands`), mirroring the top-level allowlist at each nesting level.
 
     `rest` is the tokens AFTER `kt agent`. A flag-only tail (e.g. `kt agent --help`)

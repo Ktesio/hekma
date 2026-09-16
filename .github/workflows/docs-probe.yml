@@ -128,6 +128,30 @@ jobs:
           fi
           echo "Legacy redirect probe green: every legacy page 3xx-redirects to $canonical."
 
+      - name: Probe the canonical installer URLs (cli.ktesio.dev)
+        # The v0.8.0 install commands point at cli.ktesio.dev/hemaka/install.sh|.ps1
+        # (served by the ktesio-cli Pages project from scripts/public/; the
+        # /hemaka/ routes are _redirects rewrites in that directory, so they
+        # go live with the merge deploy). Both the new URLs and the LEGACY
+        # root URLs must keep serving.
+        shell: bash
+        run: |
+          set -euo pipefail
+          for url in \
+            "https://cli.ktesio.dev/hemaka/install.sh" \
+            "https://cli.ktesio.dev/hemaka/install.ps1" \
+            "https://cli.ktesio.dev/install.sh" \
+            "https://cli.ktesio.dev/install.ps1"; do
+            code="$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code}' --max-time 30 "$url")" || code=000
+            if [ "$code" = "200" ]; then
+              echo "ok   $url"
+            else
+              echo "::error::installer URL is DOWN: $url answered HTTP $code (expected 200). The cli.ktesio.dev Pages deploy is stale or the _redirects rewrites are missing."
+              exit 1
+            fi
+          done
+
       - name: Assert the newest page serves real content (not an empty 200)
         # A 200 alone cannot distinguish the real page from a CDN/edge error
         # page that happens to answer 200, so the NEWEST registered page (the

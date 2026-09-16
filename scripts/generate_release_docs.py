@@ -130,9 +130,20 @@ def render_release_body(tag: str, previous_tag: str | None, commits: list[Commit
         "",
         "Install the archive for your platform, unpack it, and place `hemaka` and `maka` on your PATH.",
         "",
-        "## Downloads",
-        "",
     ]
+    # v0.8.0+ (the Hemaka rename): every release body points kt users at
+    # the migration guide — the old self-updater cannot reach these
+    # releases by design (no compatibility window, ratified 2026-09-16).
+    if semver_key(tag) is not None and semver_key(tag) >= (0, 8, 0):
+        lines += [
+            "> **Coming from `kt` (Ktesio ≤ 0.7.0)?** Your data directory is "
+            "untouched and `kt self-update` cannot reach this release by "
+            "design — re-run the installer (or `cargo install hemaka "
+            "--force` / `brew upgrade ktesio/tap/hemaka`). See the "
+            "[migration guide](https://hemaka.ktesio.dev/migration).",
+            "",
+        ]
+    lines += ["## Downloads", ""]
     lines.extend(render_asset_table(tag))
     lines += ["", "## Changes", "", f"Comparison: {compare}", ""]
     lines.extend(render_commit_sections(commits))

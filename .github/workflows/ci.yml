@@ -386,7 +386,7 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Check kt against its declared crate graph
+      - name: Check hemaka against its declared crate graph
         # Explicit +stable (see fmt job): boundary gate runs on latest stable; the
         # root rust-toolchain.toml pins only local bare cargo. MSRV floor: `msrv` job.
         run: cargo +stable check -p hemaka

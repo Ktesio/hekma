@@ -47,9 +47,20 @@ FLOOR_VERSIONS="${FLOOR_VERSIONS:-v0.1.1 v0.2.0 v0.3.0 v0.3.1 v0.4.0 v0.5.0 v0.6
 REPO="Ktesio/ktesio"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+BUILD_TMP="$(mktemp -d)"
+trap 'rm -rf "$WORK" "$BUILD_TMP"' EXIT
 
 fail() { echo "::error::$*" >&2; exit 1; }
+
+# Scheduled-run guard: if the latest release carries no hemaka-* assets
+# (pre-v0.8.0), there is nothing to migrate TO — exit 0 with a notice so
+# the weekly cron stays green in the merge->tag window instead of failing
+# on a missing artifact. Manual dispatches still run the full matrix.
+latest_assets="$(curl -fsSL --retry 3 "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"name": *"hemaka-[^"]*"' | head -1 || true)"
+if [ -z "$latest_assets" ] && [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+  echo "notice: latest release has no hemaka-* assets yet (pre-v0.8.0); nothing to migrate to. Exiting green."
+  exit 0
+fi
 
 verify_sha256() {
   local file="$1" sum_file="$2" expected actual

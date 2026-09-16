@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use flate2::read::GzDecoder;
@@ -548,26 +548,58 @@ impl BinaryInstaller for FileBinaryInstaller {
             ));
         }
 
+        // TWO-PHASE replace, to shrink the partial-failure window: write
+        // EVERY temp first, then flip ALL renames (the CURRENT executable
+        // last — on Windows a rename over the running image is the most
+        // likely failure, and doing it last means both new binaries are
+        // already on disk if it fails). A mid-sequence rename failure still
+        // leaves a mixed pair — impossible to make atomic across two files
+        // with std — but the error names EVERY binary's state so the
+        // operator knows exactly what to re-run instead of guessing.
+        let mut staged: Vec<(&'static str, PathBuf)> = Vec::new();
         for (name, binary) in binaries {
-            let target_path = install_dir.join(name);
             let temp_path =
                 install_dir.join(format!(".{name}.self-update-{}.tmp", std::process::id()));
-
             if let Err(error) = write_replacement(&temp_path, binary) {
                 let _ = fs::remove_file(&temp_path);
+                for (_, leftover) in &staged {
+                    let _ = fs::remove_file(leftover);
+                }
                 return Err(error);
             }
+            staged.push((name, temp_path));
+        }
 
-            if let Err(error) = fs::rename(&temp_path, &target_path) {
-                let _ = fs::remove_file(&temp_path);
-                return Err(format!(
-                    "Could not replace {}: {error}",
+        // Rename the CURRENT executable's entry last: on Windows a rename
+        // over the running image is the most likely failure, and doing it
+        // last means both new binaries are already on disk if it fails.
+        // Stable sort: `false` (not the current exe) sorts first.
+        let current_name = current_exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string);
+        staged.sort_by_key(|(name, _)| Some(*name) == current_name.as_deref());
+
+        let mut failures: Vec<String> = Vec::new();
+        for (name, temp_path) in &staged {
+            let target_path = install_dir.join(name);
+            if let Err(error) = fs::rename(temp_path, &target_path) {
+                let _ = fs::remove_file(temp_path);
+                failures.push(format!(
+                    "could not replace {}: {error}",
                     target_path.display()
                 ));
             }
         }
-
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let replaced: Vec<&str> = staged.iter().map(|(name, _)| *name).collect();
+        Err(format!(
+            "self-update partially failed (replaced: [{}]): {}",
+            replaced.join(", "),
+            failures.join("; ")
+        ))
     }
 }
 
@@ -1185,6 +1217,45 @@ mod tests {
                 0o755
             );
         }
+    }
+
+    #[cfg(not(tarpaulin_include))]
+    #[test]
+    fn test_file_binary_installer_second_rename_failure_is_reported_per_binary() {
+        // Failure injection mirroring the atomic-write tests: a non-empty
+        // DIRECTORY occupies the second binary's target path, so the first
+        // rename (hemaka) succeeds and the second (maka) cannot. The
+        // contract: the FIRST binary is already updated (two-phase replace
+        // minimized the window), the error names the partial state so the
+        // operator knows exactly what to re-run — never a generic failure
+        // that hides which binary was replaced.
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe = dir.path().join("hemaka");
+        fs::write(&exe, b"old hemaka binary").unwrap();
+        let blocker = dir.path().join("maka");
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("occupier"), b"x").unwrap();
+
+        let error = FileBinaryInstaller
+            .replace_current_binaries(
+                &exe,
+                &[
+                    ("hemaka", b"new hemaka binary".to_vec()),
+                    ("maka", b"new maka binary".to_vec()),
+                ],
+            )
+            .unwrap_err();
+
+        assert!(
+            error.contains("partially failed"),
+            "error must name the partial state: {error}"
+        );
+        assert!(
+            error.contains("maka"),
+            "error must name the failed binary: {error}"
+        );
+        // hemaka (renamed before the failure) holds the NEW bytes.
+        assert_eq!(fs::read(&exe).unwrap(), b"new hemaka binary");
     }
 
     #[cfg(not(tarpaulin_include))]

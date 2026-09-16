@@ -89,13 +89,13 @@ directory to add.
 Run a dry run to see the selected path without installing:
 
 ```bash
-KTESIO_INSTALL_DRY_RUN=1 curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_DRY_RUN=1 sh
 ```
 
 Then either add the printed directory to `PATH` or choose an existing directory:
 
 ```bash
-KTESIO_INSTALL_DIR="$HOME/.local/bin" curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 ## Installer Reports an Unsupported OS or Architecture

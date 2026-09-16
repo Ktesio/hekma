@@ -35,13 +35,13 @@ under either name.
 Install on macOS or Linux:
 
 ```bash
-curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | sh
 ```
 
 Install on Windows with PowerShell:
 
 ```powershell
-irm https://cli.hemaka.dev/hemaka/install.ps1 | iex
+irm https://cli.ktesio.dev/hemaka/install.ps1 | iex
 ```
 
 New macOS and Linux installs prefer Homebrew, then Cargo, then a prebuilt GitHub
@@ -73,7 +73,7 @@ You can also download a release archive from [GitHub Releases](https://github.co
 
 ```bash
 git clone https://github.com/Ktesio/ktesio.git
-cd hemaka
+cd ktesio
 cargo install --path .
 ```
 

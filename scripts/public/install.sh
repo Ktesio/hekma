@@ -430,6 +430,18 @@ install_with_binary() {
 
   say "Installed Hemaka to $install_dir/$BIN and $install_dir/$MAKA"
   note_retired_kt "$install_dir/$LEGACY_BIN"
+  # Explicit method=binary over what detection says is a cargo-channel
+  # install leaves the cargo-managed kt in place — say so visibly rather
+  # than letting ~/.cargo/bin/kt linger unexplained.
+  if [ -n "$existing_path" ]; then
+    cargo_home="${CARGO_HOME:-}"
+    if [ -z "$cargo_home" ] && [ -n "${HOME:-}" ]; then
+      cargo_home="$HOME/.cargo"
+    fi
+    if [ -n "$cargo_home" ] && path_starts_with "$existing_path" "$cargo_home/bin"; then
+      warn "an explicit binary-method install left the cargo-managed kt at $existing_path; run 'cargo uninstall ktesio' to remove it"
+    fi
+  fi
   if ! dir_is_on_path "$install_dir"; then
     warn "$install_dir is not on PATH. Add it before running hemaka."
   fi

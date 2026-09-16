@@ -12,14 +12,14 @@ This guide runs an agent through Hemaka end to end: register it, budget it, insp
 Install the `hemaka` binary (see the [installation guide](installation.md) for every channel):
 
 ```bash
-curl -fsSL https://cli.hemaka.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | sh
 ```
 
 Or build from source:
 
 ```bash
 git clone https://github.com/Ktesio/ktesio.git
-cd hemaka
+cd ktesio
 cargo install --path .
 ```
 

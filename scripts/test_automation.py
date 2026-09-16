@@ -71,6 +71,15 @@ class ReleaseDocsTests(unittest.TestCase):
         # `brew install|upgrade ktesio` resolves to hemaka.
         self.assertIn('renames["ktesio"] = "hemaka"', workflow)
         self.assertIn("git -C homebrew-tap add Formula/hemaka.rb formula_renames.json", workflow)
+        # The rename ENGAGES only when the old formula file is gone (brew
+        # consults formula_renames.json solely then) — the workflow must
+        # delete Formula/ktesio.rb in the same tap commit.
+        self.assertIn(
+            "git -C homebrew-tap rm --ignore-unmatch Formula/ktesio.rb", workflow
+        )
+        # M4 ordering guard: the CLI publish waits for the hemaka-* library
+        # chain to be live on crates.io.
+        self.assertIn("for lib in hemaka-adapter-api hemaka-adapters-hermes hemaka-engine; do", workflow)
         self.assertIn('--output homebrew-tap/Formula/hemaka.rb', workflow)
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("oras-project/setup-oras", workflow)

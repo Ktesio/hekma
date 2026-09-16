@@ -1,0 +1,6 @@
+# Cloudflare Pages redirects/rewrites for the installer host (cli.ktesio.dev).
+# The canonical v0.8.0+ installer URLs add the /hemaka/ prefix while the
+# physical files stay at the served root (single source, no duplication):
+# 200 = rewrite (serve the target's content AT the source path).
+/hemaka/install.sh /install.sh 200
+/hemaka/install.ps1 /install.ps1 200

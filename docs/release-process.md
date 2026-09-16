@@ -154,7 +154,7 @@ review the exact tarball that would be uploaded:
 
 ```bash
 cargo package --no-verify -p hemaka-adapter-api
-tar -tzf target/package/hemaka-adapter-api-0.1.0.crate
+tar -tzf target/package/hemaka-adapter-api-0.2.0.crate
 ```
 
 (Read the version off the manifest; extract the `.crate` — a plain
@@ -177,7 +177,7 @@ with no git/path override:
 ```bash
 cargo new /tmp/hemaka-host-probe
 cd /tmp/hemaka-host-probe
-cargo add hemaka-engine@0.3.0
+cargo add hemaka-engine@0.4.0
 cargo build
 ```
 
@@ -243,17 +243,23 @@ widen a gate or an allowlist to make a baseline pass.
   loop armed on main after `4e12ef8` and correctly demanded a bump for
   `EngineError::ResumeUnsupported`; the source bump landed as `d087ed0` with
   the AI-55 two-pass record). Steps executed: package + tarball review
-  (two-pass), `cargo +stable publish --locked -p hemaka-engine`, the
+  (two-pass), `cargo +stable publish --locked -p ktesio-engine`, the
   from-crates.io host probe, and the step-5 docs flip. adapter-api and
   adapters-hermes stay at 0.1.0 (surfaces unchanged, semver-checked).
 - **Publish go (engine 0.3.0):** GRANTED 2026-09-16 — Islam's explicit go in
   the ktesio.dev working session ("Let's go with the publish"), same scoped
   shape as the 0.2.0 go: the ENGINE crate publish only (package + two-pass
-  tarball review, `cargo +stable publish --locked -p hemaka-engine`, the
+  tarball review, `cargo +stable publish --locked -p ktesio-engine`, the
   from-crates.io host probe, the docs flip); the tag (step 6) is NOT opened.
   Context: the gate forced the version (the crates.io loop's second firing —
   epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
   against the published 0.2.0; the source bump landed as `394e660`).
+- **hemaka-* first publishes — PENDING (not yet executed).** The renamed
+  crates (`hemaka-adapter-api` 0.2.0, `hemaka-adapters-hermes` 0.2.0,
+  `hemaka-engine` 0.4.0) have ZERO published versions as of this writing;
+  their publishes are steps of the v0.8.0 cutover (spec §5), each on its
+  own go, BEFORE the tag. The historical entries above document the
+  KTESIO-named publishes.
 - **Hemaka rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
   recorded in docs/proposals/hemaka-migration-spec-draft.md): product Hemaka;
   binaries `hemaka` + `maka`; `kt` dropped (clean break, D7); crate `hemaka`
@@ -302,7 +308,7 @@ Configure these repository settings before publishing a tag:
 - `HOMEBREW_TAP_REPOSITORY` variable: optional `owner/repo` override. Defaults to `<release-owner>/homebrew-tap`.
 - `HOMEBREW_TAP_BRANCH` variable: optional target branch override. Defaults to `main`.
 
-The generated formula installs the prebuilt macOS or Linux archive for the user's platform and declares `git` as a runtime dependency.
+The generated formula installs the prebuilt macOS or Linux archive for the user's platform and ships the prebuilt archive for the user's platform.
 
 ## Installer Hosting
 
@@ -329,7 +335,11 @@ repository. The installer endpoint should be configured through the Pages
 custom-domain flow before relying on DNS records alone.
 
 The installer binary fallback resolves the latest GitHub Release, downloads the
-matching archive and `.sha256` file, verifies the checksum, and installs `kt`.
+matching archive and `.sha256` file, verifies the checksum, and installs `hemaka` + `maka`.
+The canonical v0.8.0+ installer URLs add the `/hemaka/` prefix
+(`cli.ktesio.dev/hemaka/install.sh|.ps1`); `scripts/public/_redirects` makes
+those routes rewrites of the root files (single source, no duplication), and
+the legacy root URLs keep serving.
 Keep the asset names below stable or update `scripts/public/install.sh`,
 `scripts/public/install.ps1`, and the installer tests in the same change.
 

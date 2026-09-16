@@ -34,8 +34,12 @@ new_name="$4"
 fixture_src="$5"
 
 root="$(git rev-parse --show-toplevel)"
-worktree="$(mktemp -d)"
-cleanup() { git worktree remove --force "$worktree" >/dev/null 2>&1 || true; }
+base="$(mktemp -d)"
+worktree="$base/worktree"
+cleanup() {
+  git worktree remove --force "$worktree" >/dev/null 2>&1 || true
+  rm -rf "$base"
+}
 trap cleanup EXIT
 
 git -C "$root" cat-file -e "${baseline_rev}^{commit}" || {
@@ -55,10 +59,13 @@ if [ -z "$old_dir" ] || [ ! -d "$old_dir" ]; then
   exit 1
 fi
 
+BUILD_DIR_BASE="$base/builds"
+mkdir -p "$BUILD_DIR_BASE"
+
 build_variant() {
   local base="$1" name="$2" crate_path="$3" label="$4"
   local build_dir
-  build_dir="$(mktemp -d)/consumer"
+  build_dir="$BUILD_DIR_BASE/$label/consumer"
   mkdir -p "$build_dir/src"
   cp "$fixture_src" "$build_dir/src/main.rs"
   cat > "$build_dir/Cargo.toml" <<EOF

@@ -20,19 +20,19 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-            binary: kt
+            
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
-            binary: kt.exe
+            
           - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
-            binary: kt
+            
           - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-            binary: kt
+            
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -120,6 +120,17 @@ jobs:
             exit 1
           fi
           user_agent="hemaka-release-workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; release automation)"
+          # Ordering guard: `hemaka` depends on the published hemaka-*
+          # libraries; the tag workflow must not run ahead of the library
+          # publishes (release-process runbook step order). Fail with a
+          # clear remediation instead of a dependency-verification abort.
+          for lib in hemaka-adapter-api hemaka-adapters-hermes hemaka-engine; do
+            lib_status="$(curl --silent --show-error --user-agent "$user_agent" --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${lib}")" || lib_status=000
+            if [ "$lib_status" != "200" ]; then
+              echo "::error::${lib} is not on crates.io yet (HTTP ${lib_status}). The v0.8.0 runbook publishes the hemaka-* libraries BEFORE the tag; execute those steps first (docs/release-process.md)."
+              exit 1
+            fi
+          done
           status="$(curl --silent --show-error --user-agent "$user_agent" --output /tmp/crate-version.json --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate_name}/${crate_version}")"
           case "$status" in
             200)
@@ -223,6 +234,13 @@ jobs:
           renames["ktesio"] = "hemaka"
           path.write_text(json.dumps(renames, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           renames_py
+          # The rename only ENGAGES if the old formula file is gone — brew
+          # consults formula_renames.json solely when the old path no longer
+          # exists. Leaving ktesio.rb beside hemaka.rb would keep TWO live
+          # formulae (brew install ktesio would keep resolving to the stale
+          # 0.7.0 file and legacy kegs would never migrate on upgrade).
+          # --ignore-unmatch keeps release reruns idempotent.
+          git -C homebrew-tap rm --ignore-unmatch Formula/ktesio.rb
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C homebrew-tap add Formula/hemaka.rb formula_renames.json
