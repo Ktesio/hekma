@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/ktesio-banner.png" alt="Ktesio banner: run AI agents like services — supervise, meter, and budget them" width="100%">
+  <img src="docs/assets/nomarch-banner.jpg" alt="Nomarch banner: run agents as supervised services — an open-source project by Ktesio" width="100%">
 </p>
 
 # Ktesio
