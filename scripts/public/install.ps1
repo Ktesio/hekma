@@ -1,11 +1,31 @@
 $ErrorActionPreference = "Stop"
 
+# Hemaka installer (a Ktesio project). Installs the `hemaka` + `maka`
+# binaries; detects an existing Hemaka OR legacy `kt` install and migrates
+# it along its original install channel. A retired `kt` is never deleted
+# silently — a visible note names it.
 $Repo = "Ktesio/ktesio"
-$Crate = "ktesio"
-$Bin = "kt.exe"
+$Crate = "hemaka"
+$Bin = "hemaka.exe"
+$Maka = "maka.exe"
+$LegacyBin = "kt.exe"
 $LatestReleaseUrl = "https://api.github.com/repos/$Repo/releases/latest"
 $ReleaseBaseUrl = "https://github.com/$Repo/releases/download"
-$Method = if ($env:KTESIO_INSTALL_METHOD) { $env:KTESIO_INSTALL_METHOD } else { "auto" }
+
+function First-Env([string]$Forward, [string]$Legacy) {
+    if ($null -ne (Get-Item Env:$Forward -ErrorAction SilentlyContinue) -and
+        -not [string]::IsNullOrWhiteSpace((Get-Item Env:$Forward).Value)) {
+        return (Get-Item Env:$Forward).Value
+    }
+    if ($null -ne (Get-Item Env:$Legacy -ErrorAction SilentlyContinue) -and
+        -not [string]::IsNullOrWhiteSpace((Get-Item Env:$Legacy).Value)) {
+        return (Get-Item Env:$Legacy).Value
+    }
+    return $null
+}
+
+$Method = First-Env "HEMAKA_INSTALL_METHOD" "KTESIO_INSTALL_METHOD"
+if (-not $Method) { $Method = "auto" }
 
 function Write-Info($Message) {
     Write-Host $Message
@@ -28,7 +48,8 @@ function Test-Truthy($Value) {
 }
 
 function Test-DryRun {
-    return Test-Truthy $env:KTESIO_INSTALL_DRY_RUN
+    $dry = First-Env "HEMAKA_INSTALL_DRY_RUN" "KTESIO_INSTALL_DRY_RUN"
+    return Test-Truthy $dry
 }
 
 function Test-Command($Name) {
@@ -39,7 +60,7 @@ function Test-Command($Name) {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-function Find-ExistingKt {
+function Find-ExistingBinary {
     if ($null -ne $env:KTESIO_INSTALL_TEST_KT_PATH) {
         if ($env:KTESIO_INSTALL_TEST_KT_PATH.Length -gt 0) {
             return $env:KTESIO_INSTALL_TEST_KT_PATH
@@ -47,18 +68,32 @@ function Find-ExistingKt {
         return $null
     }
 
-    $command = Get-Command "kt.exe" -ErrorAction SilentlyContinue
-    if ($null -eq $command) {
-        $command = Get-Command "kt" -ErrorAction SilentlyContinue
+    # hemaka first, then the retired kt (either name, with or without .exe).
+    foreach ($name in @("hemaka.exe", "hemaka", "kt.exe", "kt")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($null -ne $command) {
+            return $command.Source
+        }
     }
-    if ($null -eq $command) {
-        return $null
-    }
-
-    return $command.Source
+    return $null
 }
 
-function Test-KtesioBinary($Path) {
+function Test-HemakaBinary($Path) {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $output = & $Path --version 2>$null
+        # Both shipped binaries report the shared identity: "hemaka <v>".
+        return "$output" -match '^hemaka v?[0-9]'
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-LegacyKtBinary($Path) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
         return $false
     }
@@ -70,6 +105,10 @@ function Test-KtesioBinary($Path) {
     catch {
         return $false
     }
+}
+
+function Test-OwnedBinary($Path) {
+    return (Test-HemakaBinary $Path) -or (Test-LegacyKtBinary $Path)
 }
 
 function Get-ExistingMethod($Path) {
@@ -98,22 +137,25 @@ function Install-WithCargo {
     }
 
     Invoke-OrDryRun "cargo" @("install", $Crate, "--force")
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+    Note-RetiredKt (Join-Path (Join-Path $cargoHome "bin") $LegacyBin)
 }
 
 function Get-DefaultInstallDir {
-    if ($env:KTESIO_INSTALL_DIR) {
-        return $env:KTESIO_INSTALL_DIR
+    $override = First-Env "HEMAKA_INSTALL_DIR" "KTESIO_INSTALL_DIR"
+    if ($override) {
+        return $override
     }
 
     if ($env:LOCALAPPDATA) {
-        return Join-Path $env:LOCALAPPDATA "ktesio\bin"
+        return Join-Path $env:LOCALAPPDATA "hemaka\bin"
     }
 
     if ($env:USERPROFILE) {
-        return Join-Path $env:USERPROFILE ".ktesio\bin"
+        return Join-Path $env:USERPROFILE ".hemaka\bin"
     }
 
-    Fail "KTESIO_INSTALL_DIR is required when LOCALAPPDATA and USERPROFILE are not set."
+    Fail "HEMAKA_INSTALL_DIR (or KTESIO_INSTALL_DIR) is required when LOCALAPPDATA and USERPROFILE are not set."
 }
 
 function Test-DirOnPath($Dir) {
@@ -121,15 +163,26 @@ function Test-DirOnPath($Dir) {
     return $parts -contains $Dir
 }
 
-function Get-InstallTarget($ExistingPath) {
-    if ($env:KTESIO_INSTALL_DIR) {
-        $installDir = $env:KTESIO_INSTALL_DIR
+function Note-RetiredKt($RetiredPath) {
+    if ((Test-Path -LiteralPath $RetiredPath) -and (Test-LegacyKtBinary $RetiredPath)) {
+        Write-WarningMessage "the retired kt binary was left at $RetiredPath - Hemaka 0.8.0 replaced it with hemaka + maka; remove it manually when ready"
     }
-    elseif ($ExistingPath) {
-        $installDir = Split-Path -Parent $ExistingPath
-    }
-    else {
-        $installDir = Get-DefaultInstallDir
+}
+
+function Get-InstallTarget {
+    param($ExistingPath)
+
+    $installDir = First-Env "HEMAKA_INSTALL_DIR" "KTESIO_INSTALL_DIR"
+    if (-not $installDir) {
+        if ($ExistingPath) {
+            # Reuse the legacy install directory (e.g. ...\ktesio\bin) so
+            # hemaka lands beside the retired kt instead of in a second
+            # location on PATH.
+            $installDir = Split-Path -Parent $ExistingPath
+        }
+        else {
+            $installDir = Get-DefaultInstallDir
+        }
     }
 
     if (Test-Path -LiteralPath $installDir) {
@@ -142,43 +195,44 @@ function Get-InstallTarget($ExistingPath) {
         New-Item -ItemType Directory -Force -Path $installDir | Out-Null
     }
 
-    $target = Join-Path $installDir $Bin
-    if ((Test-Path -LiteralPath $target) -and -not (Test-KtesioBinary $target)) {
-        Fail "Refusing to overwrite non-Ktesio executable at $target."
+    foreach ($name in @($Bin, $Maka, $LegacyBin)) {
+        $target = Join-Path $installDir $name
+        if ((Test-Path -LiteralPath $target) -and -not (Test-OwnedBinary $target)) {
+            Fail "Refusing to overwrite non-Ktesio executable at $target."
+        }
     }
 
-    return $target
+    return $installDir
 }
 
 function Get-LatestReleaseTag {
-    $release = Invoke-RestMethod -Uri $LatestReleaseUrl -Headers @{ "User-Agent" = "ktesio-installer" }
+    $release = Invoke-RestMethod -Uri $LatestReleaseUrl -Headers @{ "User-Agent" = "hemaka-installer" }
     if (-not $release.tag_name) {
-        Fail "Could not resolve the latest Ktesio release tag from GitHub."
+        Fail "Could not resolve the latest Hemaka release tag from GitHub."
     }
 
     return $release.tag_name
 }
 
 function Install-WithBinary($ExistingPath) {
-    $targetPath = Get-InstallTarget $ExistingPath
-    $installDir = Split-Path -Parent $targetPath
+    $installDir = Get-InstallTarget $ExistingPath
 
     $arch = if ($env:KTESIO_INSTALL_TEST_ARCH) { $env:KTESIO_INSTALL_TEST_ARCH } else { $env:PROCESSOR_ARCHITECTURE }
     if ($arch -notin @("AMD64", "x86_64")) {
-        Fail "No prebuilt Ktesio binary is available for Windows/$arch. Install Rust and run: cargo install ktesio --force"
+        Fail "No prebuilt Hemaka binary is available for Windows/$arch. Install Rust and run: cargo install hemaka --force"
     }
 
     $target = "x86_64-pc-windows-msvc"
     if (Test-DryRun) {
-        Write-Info "DRY RUN: install prebuilt $target to $targetPath"
+        Write-Info "DRY RUN: install prebuilt $target ($Bin + $Maka) to $installDir"
         if (-not (Test-DirOnPath $installDir)) {
-            Write-WarningMessage "$installDir is not on PATH. Add it before running kt."
+            Write-WarningMessage "$installDir is not on PATH. Add it before running hemaka."
         }
         return
     }
 
     $tag = Get-LatestReleaseTag
-    $asset = "ktesio-$tag-$target.zip"
+    $asset = "hemaka-$tag-$target.zip"
     $assetUrl = "$ReleaseBaseUrl/$tag/$asset"
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
@@ -188,7 +242,7 @@ function Install-WithBinary($ExistingPath) {
         $checksumFile = Join-Path $tmpDir "$asset.sha256"
         $packageDir = Join-Path $tmpDir "package"
 
-        Write-Info "Downloading Ktesio $tag for $target..."
+        Write-Info "Downloading Hemaka $tag for $target..."
         Invoke-WebRequest -Uri $assetUrl -OutFile $archive
         Invoke-WebRequest -Uri "$assetUrl.sha256" -OutFile $checksumFile
 
@@ -199,17 +253,20 @@ function Install-WithBinary($ExistingPath) {
         }
 
         Expand-Archive -LiteralPath $archive -DestinationPath $packageDir -Force
-        $binary = Get-ChildItem -LiteralPath $packageDir -Recurse -File -Filter $Bin | Select-Object -First 1
-        if ($null -eq $binary) {
-            Fail "Release archive did not contain $Bin."
+        foreach ($name in @($Bin, $Maka)) {
+            $binary = Get-ChildItem -LiteralPath $packageDir -Recurse -File -Filter $name | Select-Object -First 1
+            if ($null -eq $binary) {
+                Fail "Release archive did not contain $name."
+            }
+            Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $installDir $name) -Force
         }
 
-        Copy-Item -LiteralPath $binary.FullName -Destination $targetPath -Force
-        Write-Info "Installed Ktesio to $targetPath"
+        Write-Info "Installed Hemaka to $(Join-Path $installDir $Bin) and $(Join-Path $installDir $Maka)"
+        Note-RetiredKt (Join-Path $installDir $LegacyBin)
         if (-not (Test-DirOnPath $installDir)) {
-            Write-WarningMessage "$installDir is not on PATH. Add it before running kt."
+            Write-WarningMessage "$installDir is not on PATH. Add it before running hemaka."
         }
-        & $targetPath --version
+        & (Join-Path $installDir $Bin) --version
     }
     finally {
         Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -217,10 +274,10 @@ function Install-WithBinary($ExistingPath) {
 }
 
 function Install-Auto {
-    $existing = Find-ExistingKt
+    $existing = Find-ExistingBinary
     if ($existing) {
-        if (-not (Test-KtesioBinary $existing)) {
-            Fail "Refusing to overwrite non-Ktesio kt command at $existing."
+        if (-not (Test-OwnedBinary $existing)) {
+            Fail "Refusing to overwrite non-Ktesio command at $existing."
         }
 
         $existingMethod = Get-ExistingMethod $existing
@@ -242,20 +299,20 @@ function Install-Auto {
 }
 
 if ($Method -notin @("auto", "cargo", "binary")) {
-    Fail "KTESIO_INSTALL_METHOD must be one of: auto, cargo, binary."
+    Fail "HEMAKA_INSTALL_METHOD (or KTESIO_INSTALL_METHOD) must be one of: auto, cargo, binary."
 }
 
-$existingKt = Find-ExistingKt
-if ($existingKt -and -not (Test-KtesioBinary $existingKt)) {
-    Fail "Refusing to overwrite non-Ktesio kt command at $existingKt."
+$existingBinary = Find-ExistingBinary
+if ($existingBinary -and -not (Test-OwnedBinary $existingBinary)) {
+    Fail "Refusing to overwrite non-Ktesio command at $existingBinary."
 }
 
 switch ($Method) {
     "auto" { Install-Auto }
     "cargo" { Install-WithCargo }
     "binary" {
-        if ($existingKt -and (Get-ExistingMethod $existingKt) -eq "manual") {
-            Install-WithBinary $existingKt
+        if ($existingBinary -and (Get-ExistingMethod $existingBinary) -eq "manual") {
+            Install-WithBinary $existingBinary
         }
         else {
             Install-WithBinary $null
