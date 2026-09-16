@@ -48,7 +48,7 @@
 //! ([`Engine::open_with_diagnostics`]) or any time later
 //! ([`Engine::with_diagnostics`] / [`Blocking::with_diagnostics`]); the
 //! diagnostics then route to the sink, receiving the exact bytes (same
-//! `[ktesio] `-prefixed text, one line each) stderr would have received.
+//! `[hemaka] `-prefixed text, one line each) stderr would have received.
 //! Installing REPLACES any earlier sink (rotation) and is one-way — there is
 //! no uninstall back to the stderr default; a host that wants the default
 //! back re-opens the engine. The sink is engine-embedder ergonomics — it
@@ -331,7 +331,7 @@ impl Engine {
     ///
     /// The engine's two operational diagnostics — the DC-10 memory-delivery
     /// notice and the enforcement breadcrumb — then route to `sink` instead of
-    /// stderr, receiving the exact bytes (same `[ktesio] `-prefixed text, one
+    /// stderr, receiving the exact bytes (same `[hemaka] `-prefixed text, one
     /// `\n`-terminated line per diagnostic) stderr would have received. With
     /// no sink installed (the [`Engine::open`] default) the diagnostics keep
     /// their historical stderr behavior, byte-identical. See

@@ -1,6 +1,6 @@
 [package]
 name = "hemaka-engine"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Ktesio agent-runner engine; its public API is the Embedding Interface"

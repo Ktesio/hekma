@@ -91,8 +91,16 @@ fn display_version(tag: &str) -> String {
     tag.trim().trim_start_matches('v').trim().to_string()
 }
 
+/// Opt-out for the passive update check — the LEGACY name, preserved
+/// unchanged through the Hemaka rename (v0.8.0) so existing environments
+/// keep suppressing checks.
+const UPDATE_OPT_OUT_ENV_LEGACY: &str = "KTESIO_NO_UPDATE_CHECK";
+/// Opt-out, forward-looking alias (v0.8.0+). EITHER truthy name disables
+/// the check; neither ever re-enables it.
+const UPDATE_OPT_OUT_ENV: &str = "HEMAKA_NO_UPDATE_CHECK";
+
 fn automatic_checks_enabled() -> bool {
-    !truthy_env("KTESIO_NO_UPDATE_CHECK") && !truthy_env("CI")
+    !truthy_env(UPDATE_OPT_OUT_ENV_LEGACY) && !truthy_env(UPDATE_OPT_OUT_ENV) && !truthy_env("CI")
 }
 
 fn truthy_env(name: &str) -> bool {
@@ -216,7 +224,7 @@ impl ReleaseTransport for UreqReleaseTransport {
             .agent
             .get(LATEST_RELEASE_URL)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("ktesio/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("hemaka/", env!("CARGO_PKG_VERSION")))
             .call()
             .map_err(|error| error.to_string())?;
 
@@ -446,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn test_default_cache_file_uses_ktesio_leaf() {
+    fn test_default_cache_file_uses_legacy_ktesio_leaf() {
         let path = default_cache_file();
 
         assert_eq!(
@@ -467,10 +475,10 @@ mod tests {
         env::set_var(name, "");
         assert!(non_empty_env_path(name).is_none());
 
-        env::set_var(name, "/tmp/ktesio-cache");
+        env::set_var(name, "/tmp/hemaka-cache");
         assert_eq!(
             non_empty_env_path(name),
-            Some(PathBuf::from("/tmp/ktesio-cache"))
+            Some(PathBuf::from("/tmp/hemaka-cache"))
         );
 
         env::remove_var(name);
@@ -481,9 +489,11 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let original_ci = env::var_os("CI");
         let original_opt_out = env::var_os("KTESIO_NO_UPDATE_CHECK");
+        let original_alias = env::var_os("HEMAKA_NO_UPDATE_CHECK");
 
         env::remove_var("CI");
         env::remove_var("KTESIO_NO_UPDATE_CHECK");
+        env::remove_var("HEMAKA_NO_UPDATE_CHECK");
         assert!(automatic_checks_enabled());
 
         env::set_var("CI", "true");
@@ -496,8 +506,18 @@ mod tests {
         env::set_var("KTESIO_NO_UPDATE_CHECK", "false");
         assert!(automatic_checks_enabled());
 
+        // The forward-looking alias disables checks on its own, and EITHER
+        // truthy name wins even when the other is explicitly "false".
+        env::remove_var("KTESIO_NO_UPDATE_CHECK");
+        env::set_var("HEMAKA_NO_UPDATE_CHECK", "1");
+        assert!(!automatic_checks_enabled());
+
+        env::set_var("KTESIO_NO_UPDATE_CHECK", "false");
+        assert!(!automatic_checks_enabled());
+
         restore_env("CI", original_ci);
         restore_env("KTESIO_NO_UPDATE_CHECK", original_opt_out);
+        restore_env("HEMAKA_NO_UPDATE_CHECK", original_alias);
     }
 
     #[test]
@@ -506,20 +526,20 @@ mod tests {
         let original_xdg = env::var_os("XDG_CACHE_HOME");
         let original_home = env::var_os("HOME");
 
-        env::set_var("XDG_CACHE_HOME", "/tmp/ktesio-xdg-cache");
-        env::set_var("HOME", "/tmp/ktesio-home");
+        env::set_var("XDG_CACHE_HOME", "/tmp/hemaka-xdg-cache");
+        env::set_var("HOME", "/tmp/hemaka-home");
         assert_eq!(
             user_cache_dir(),
-            Some(PathBuf::from("/tmp/ktesio-xdg-cache"))
+            Some(PathBuf::from("/tmp/hemaka-xdg-cache"))
         );
 
         env::remove_var("XDG_CACHE_HOME");
         #[cfg(target_os = "macos")]
-        let expected_home_cache = PathBuf::from("/tmp/ktesio-home")
+        let expected_home_cache = PathBuf::from("/tmp/hemaka-home")
             .join("Library")
             .join("Caches");
         #[cfg(all(unix, not(target_os = "macos")))]
-        let expected_home_cache = PathBuf::from("/tmp/ktesio-home").join(".cache");
+        let expected_home_cache = PathBuf::from("/tmp/hemaka-home").join(".cache");
         #[cfg(windows)]
         let expected_home_cache = user_cache_dir().unwrap();
         assert_eq!(user_cache_dir(), Some(expected_home_cache));

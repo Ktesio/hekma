@@ -1,4 +1,4 @@
-//! `kt agent register | remove | list` — thin CLI over the engine's
+//! `hemaka agent register | remove | list` — thin CLI over the engine's
 //! synchronous registration API (spine AD-2, CLI-first gate).
 //!
 //! This module holds NO domain logic and constructs NO paths: the engine is
@@ -8,7 +8,7 @@
 //! and a list to observe results), satisfying the CLI-first gate.
 //!
 //! Errors: the engine returns `thiserror` [`RegistryError`]; we translate them
-//! into `miette` diagnostics with remediation hints (miette lives in `kt`
+//! into `miette` diagnostics with remediation hints (miette lives in `hemaka`
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
@@ -118,7 +118,7 @@ impl AdapterArg {
     }
 }
 
-/// `kt agent register <name> (--kind <kind> | --manifest <path>)`.
+/// `hemaka agent register <name> (--kind <kind> | --manifest <path>)`.
 ///
 /// Opens the engine (default state dir, or `KTESIO_STATE_DIR`), resolves +
 /// validates the adapter, registers the instance, and prints the engine-computed
@@ -140,7 +140,7 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
 
             // Surface the effective per-OS Capability Declaration (AC1). Read it
             // back from the just-persisted snapshot so what we print is exactly
-            // what `kt agent show` will render.
+            // what `hemaka agent show` will render.
             match engine.effective_capabilities(instance.name.as_str()) {
                 Ok(caps) => render_capabilities(instance.name.as_str(), &caps),
                 // A render read-back failure must not fail a successful
@@ -155,10 +155,10 @@ pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::err
     }
 }
 
-/// The `kt agent show <name> --json` document (story 1-7, AD-14).
+/// The `hemaka agent show <name> --json` document (story 1-7, AD-14).
 ///
 /// A versioned wrapper carrying the SAME [`FLEET_SCHEMA_VERSION`] as the
-/// `list --json` [`FleetListing`] (so `kt --json` speaks ONE schema, AD-14) plus
+/// `list --json` [`FleetListing`] (so `hemaka --json` speaks ONE schema, AD-14) plus
 /// the single instance's [`FleetEntry`]. Presentation-only — the engine owns the
 /// domain types; this wraps one entry with the shared schema version for the
 /// `show` surface.
@@ -180,7 +180,7 @@ impl ShowDocument {
     }
 }
 
-/// The `kt agent usage <name> --json` document (story 4-3, FR-22/FR-26, AD-14).
+/// The `hemaka agent usage <name> --json` document (story 4-3, FR-22/FR-26, AD-14).
 ///
 /// A versioned wrapper mirroring [`ShowDocument`] exactly, carrying the named
 /// instance's [`UsageView`] — the SAME snapshot type already embedded at
@@ -214,7 +214,7 @@ impl UsageDocument {
     }
 }
 
-/// The Fleet-wide `kt agent usage --json` document (no name — story 4-3, FR-22).
+/// The Fleet-wide `hemaka agent usage --json` document (no name — story 4-3, FR-22).
 ///
 /// The no-name counterpart of [`UsageDocument`], carrying the engine-computed
 /// [`FleetTotals`] aggregate — the SAME type already embedded at
@@ -252,7 +252,7 @@ impl FleetUsageDocument {
 /// announced edit the freeze policy allows, never silent drift.
 const MEMORY_SCHEMA_VERSION: u32 = 1;
 
-/// The `kt agent memory attach --json` document (story 6-6, AD-14).
+/// The `hemaka agent memory attach --json` document (story 6-6, AD-14).
 ///
 /// Carries the attached backing's full typed read: the kind and guarantee
 /// level in their snake_case wire forms (`filesystem`/`native`,
@@ -279,10 +279,10 @@ struct MemoryAttachDocument {
     declared: bool,
 }
 
-/// The `kt agent memory detach --json` document (story 6-6, AD-14). The
+/// The `hemaka agent memory detach --json` document (story 6-6, AD-14). The
 /// detachment is metadata-only, so the document is intentionally minimal: the
 /// versioned confirmation that NOTHING is attached anymore. It deliberately
-/// carries NO path — `kt` never constructs the managed-directory name itself
+/// carries NO path — `hemaka` never constructs the managed-directory name itself
 /// (DC-1), and after a detach the engine reports no attachment to quote.
 #[derive(Serialize)]
 struct MemoryDetachDocument {
@@ -359,7 +359,7 @@ fn fleet_usage_json(totals: FleetTotals) -> Result<String, Box<dyn std::error::E
 /// Reject a MALFORMED Agent Instance name before a command that resolves the
 /// instance by scanning the Fleet ever looks it up (fix pass, M2).
 ///
-/// Most `kt` commands (`logs`, `stop`, `pause`, the human `show`, …) pass the raw
+/// Most `hemaka` commands (`logs`, `stop`, `pause`, the human `show`, …) pass the raw
 /// name into an engine call that validates it internally — `InstanceName::new`
 /// inside `Supervisor::read_agent_log` / `Registry::effective_capabilities` — so a
 /// name like `"Bad Name"` surfaces as [`RegistryError::InvalidName`] → exit `2`
@@ -367,7 +367,7 @@ fn fleet_usage_json(totals: FleetTotals) -> Result<String, Box<dyn std::error::E
 /// linear `find` over `fleet()` and then SYNTHESIZE [`RegistryError::NotFound`],
 /// which reported the same malformed input as exit `3`. Validating here — through
 /// the engine's PUBLIC [`hemaka_engine::InstanceName`] newtype, the SAME rule the
-/// engine applies internally, so `kt` re-derives nothing (AD-2) — makes the code
+/// engine applies internally, so `hemaka` re-derives nothing (AD-2) — makes the code
 /// uniformly `2` for every command.
 fn validate_instance_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     hemaka_engine::InstanceName::new(name)
@@ -390,7 +390,7 @@ fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Er
     .into()
 }
 
-/// `kt agent show <name> [--json]` — render an instance's effective Capability
+/// `hemaka agent show <name> [--json]` — render an instance's effective Capability
 /// Declaration (AC1 "visible for the instance") plus its runtime status (story
 /// 1-6, AC9): the current Lifecycle State, the active Restart Policy, the restart
 /// count, the REAL story-3-1 Usage token totals + the REAL story-3-2 Token Budget
@@ -562,7 +562,7 @@ fn render_capabilities(name: &str, caps: &EffectiveCapabilities) {
     ui::print_table(&title, &columns, &rows);
 }
 
-/// `kt agent remove <name> [--delete|--retain] [--force]`.
+/// `hemaka agent remove <name> [--delete|--retain] [--force]`.
 pub fn remove(
     name: &str,
     disposition: DispositionArg,
@@ -603,9 +603,9 @@ const METERING_NOTE: &str =
 /// nothing. `list` prints it to stdout in human mode (`ui::info`) and to stderr
 /// under `--json`; `usage` routes it to stderr in BOTH modes (AD-12).
 const EMPTY_FLEET_HINT: &str =
-    "No Agent Instances registered yet. Register one with: kt agent register <name> --kind <kind>";
+    "No Agent Instances registered yet. Register one with: hemaka agent register <name> --kind <kind>";
 
-/// The `kt agent list` Budget column HEADER (story 3-3, FR-23/AD-8).
+/// The `hemaka agent list` Budget column HEADER (story 3-3, FR-23/AD-8).
 ///
 /// Honestly names BOTH dimensions the column now shows — a token budget AND an
 /// ESTIMATED dollar Cost Cap — and carries the estimate qualifier ("est. $") in the
@@ -617,7 +617,7 @@ const EMPTY_FLEET_HINT: &str =
 /// fully labeled already; this is the `list`-surface fix.)
 const BUDGET_LIST_HEADER: &str = "Budget (tok, est. $)";
 
-/// The `kt agent list` Usage column HEADER (story 11-4, AI-45 — the Usage-side
+/// The `hemaka agent list` Usage column HEADER (story 11-4, AI-45 — the Usage-side
 /// twin of [`BUDGET_LIST_HEADER`]).
 ///
 /// With a Rate configured the Usage column renders a derived dollar cost next to
@@ -766,7 +766,7 @@ fn budget_cell(budget: Option<&BudgetView>, dollar_label: DollarLabel) -> String
 }
 
 /// Render a dollar `remaining/cap` pair THROUGH the single currency module (AD-8)
-/// — e.g. `$0.20/$0.50 (estimated)`. The SOLE currency formatting in `kt` routes
+/// — e.g. `$0.20/$0.50 (estimated)`. The SOLE currency formatting in `hemaka` routes
 /// through the currency module: the `remaining` value ALWAYS uses the module's
 /// bare-value form ([`render_dollars_bare`]); the `cap` uses [`render_dollars`]
 /// (inline label) or [`render_dollars_bare`] (label in the header) per
@@ -803,7 +803,7 @@ fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
     }
 }
 
-/// Render the Fleet-WIDE total footer for the human `kt agent list` (story 3-5,
+/// Render the Fleet-WIDE total footer for the human `hemaka agent list` (story 3-5,
 /// AC-A/AC-B/AC5/AC7 — FR-22/FR-23). Summarizes the [`FleetTotals`] the engine
 /// composed over the rows: total input/output tokens (always present — zero-not-
 /// absent), and the total derived dollars THROUGH the single currency module
@@ -814,7 +814,7 @@ fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
 ///   instances unpriced)` — the honest lower-bound note (AC5, SM-C3), NAMING how many
 ///   metered-but-unpriced rows the dollar sum omits so the reader knows the total's
 ///   basis (AC7). `N` is [`FleetTotals::unpriced_count`], computed by the engine
-///   `domain` aggregate (`kt` only renders it, with the singular "1 instance unpriced").
+///   `domain` aggregate (`hemaka` only renders it, with the singular "1 instance unpriced").
 /// * NO instance has a Rate: the token total + an honest `—` dollar marker (AC4/AC5),
 ///   NEVER a fabricated `$0.00`.
 ///
@@ -858,14 +858,14 @@ fn fleet_total_footer(totals: &FleetTotals) -> String {
     format!("Fleet total: {tokens} · {dollars}")
 }
 
-/// `kt agent list [--json]` — render the Fleet (FR-4).
+/// `hemaka agent list [--json]` — render the Fleet (FR-4).
 ///
 /// Human mode prints a table: Name, Kind, State, Restarts (story 1-6), the REAL
 /// story-3-2 Token Budget column (ceilings + remaining + Breach Action, or `—`
 /// when un-budgeted) + the REAL story-3-1 Usage token totals, and the Agent Home;
 /// one stderr note explains the
 /// metering boundary (AD-12: result → stdout, note → stderr). `--json` mode writes a single versioned
-/// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
+/// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `hemaka --json`
 /// serializes the same struct the Host event stream will publish). Freshness
 /// (≤2s, AC6) is structural: each invocation opens the engine and reads live
 /// persisted state via [`hemaka_engine::Engine::fleet`] — there is no cache, so
@@ -878,7 +878,7 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // the Fleet-WIDE `totals`, computed PURELY from those rows by the engine `domain`
     // (`FleetListing::new` → `FleetTotals::from_entries`). Both the `--json` document
     // and the human footer read the SAME computed aggregate — one read pass, no second
-    // ledger query, `kt` never sums the ledger itself (AD-2).
+    // ledger query, `hemaka` never sums the ledger itself (AD-2).
     let listing = FleetListing::new(entries);
 
     if json {
@@ -903,9 +903,9 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let entries = &listing.instances;
 
     // METERING-SOURCE SPLIT (AI-43, story 11-4 — stated plainly, WHERE the value
-    // appears): the active Metering Source is surfaced on `kt agent show` (the
-    // detail row), `kt agent list --json` (the `metering_source` field), and
-    // `kt agent usage` (named + JSON forms). It is NOT a human-`list` column: the
+    // appears): the active Metering Source is surfaced on `hemaka agent show` (the
+    // detail row), `hemaka agent list --json` (the `metering_source` field), and
+    // `hemaka agent usage` (named + JSON forms). It is NOT a human-`list` column: the
     // compact table is the ratified 80-col design, and a Metering column there
     // overflows the default width and truncates cells. AC-C's "visible in Fleet
     // listing detail" is the DETAIL surface — `show` — which is exactly where the
@@ -971,7 +971,7 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `kt agent usage [<name>] [--json]` — a focused, scriptable read of the Usage
+/// `hemaka agent usage [<name>] [--json]` — a focused, scriptable read of the Usage
 /// Ledger (story 4-3, FR-22/FR-26).
 ///
 /// The two scopes FR-22 names, mirroring `show` (named) / `list` (Fleet-wide):
@@ -1102,7 +1102,7 @@ fn render_usage_instance(entry: &FleetEntry) {
     ui::print_table(&title, &columns, &rows);
 }
 
-/// `kt agent start <name> [--detach]` — start a registered Agent Instance
+/// `hemaka agent start <name> [--detach]` — start a registered Agent Instance
 /// (AC1/AC2).
 ///
 /// Opens the engine, drives `start` through the blocking facade, and prints the
@@ -1114,7 +1114,7 @@ fn render_usage_instance(entry: &FleetEntry) {
 /// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5): without
 /// `--detach`, the engine supervises the started process only for the lifetime
 /// of THIS engine session. Because the backend kills the process group / job on
-/// handle drop, a standalone `kt agent start <name>` stops the agent when this
+/// handle drop, a standalone `hemaka agent start <name>` stops the agent when this
 /// CLI process exits cleanly — the persisted `running` row then outlives the
 /// live process. Story 1-6 delivers CRASH recovery: if the engine CRASHES (no
 /// clean drop), a surviving process is re-adopted on the next `Engine::open`
@@ -1122,7 +1122,7 @@ fn render_usage_instance(entry: &FleetEntry) {
 /// Restart Policy. The stderr notice states this and points at `--detach`.
 ///
 /// DETACHED START (`--detach`, story 12-1): the child's handle is disarmed at
-/// spawn, so it survives this command's exit and the next `kt` command
+/// spawn, so it survives this command's exit and the next `hemaka` command
 /// re-adopts it via the existing fingerprint path. The notice flips to the
 /// ratified ENFORCEMENT-WINDOW honesty (a hard AC): between commands there is
 /// NO crash detection, NO budget enforcement, and NO event delivery. An
@@ -1151,7 +1151,7 @@ pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>>
                 // reattaches — the same honesty `--help` carries.
                 ui::note(
                     "detached: the agent keeps running after this command exits, and the \
-                     next `kt` command re-adopts it. Until then it is NOT supervised: no \
+                     next `hemaka` command re-adopts it. Until then it is NOT supervised: no \
                      crash detection, no budget enforcement, and no usage/event delivery \
                      happen between commands (supervision is command-scoped).",
                 );
@@ -1171,7 +1171,7 @@ pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>>
     }
 }
 
-/// `kt agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
+/// `hemaka agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
 /// (AC3/AC4).
 ///
 /// Opens the engine and drives `stop` through the blocking facade with the
@@ -1195,7 +1195,7 @@ pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::er
     }
 }
 
-/// `kt agent pause <name>` — pause a running Agent Instance with honest, per-OS
+/// `hemaka agent pause <name>` — pause a running Agent Instance with honest, per-OS
 /// semantics (AC2/AC3/AC6 — "surfaced not silent").
 ///
 /// Drives `pause` through the blocking facade. On success prints the new state
@@ -1227,7 +1227,7 @@ pub fn pause(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `kt agent resume <name>` — resume a paused Agent Instance (AC2/AC6).
+/// `hemaka agent resume <name>` — resume a paused Agent Instance (AC2/AC6).
 ///
 /// The symmetric counterpart of [`pause`]: prints the new state (`running`) to
 /// stdout, and if pause is best-effort on this OS emits the resume qualifier note
@@ -1250,7 +1250,7 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// `kt agent send <name> <text>` — send text input to a running Agent
+/// `hemaka agent send <name> <text>` — send text input to a running Agent
 /// Instance's native input channel (story 4.1, FR-24).
 ///
 /// Drives `send_input` through the blocking facade. Unlike `pause`/`resume`,
@@ -1276,7 +1276,7 @@ pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// How often `kt agent logs --follow` polls for new output (story 4-2,
+/// How often `hemaka agent logs --follow` polls for new output (story 4-2,
 /// Assumption 7) — a reasonable default left unspecified by any source
 /// document, mirroring `STOP_POLL_INTERVAL`'s existing precedent
 /// (`backends/unix/mod.rs`) of a hardcoded short interval rather than a
@@ -1289,9 +1289,9 @@ const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// writes `output.log`'s engine line SYNCHRONOUSLY now (fix pass, H1 — no
 /// background writer thread/channel is involved anymore), but it does so
 /// AFTER first persisting the new state to the DB (`registry.set_state`) —
-/// two separate steps within the SAME call, not one atomic unit. `kt agent
+/// two separate steps within the SAME call, not one atomic unit. `hemaka agent
 /// logs --follow` runs in a SEPARATE process from whatever transitions the
-/// instance (e.g. a concurrent `kt agent stop`), so it can observe the NEW
+/// instance (e.g. a concurrent `hemaka agent stop`), so it can observe the NEW
 /// state via `instance_status` (step one) a moment before that OTHER
 /// process has finished the engine-line write (step two) — a real,
 /// cross-process race, distinct from (and independent of) the reader/tailer
@@ -1305,11 +1305,11 @@ const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// How often the final-drain retry (above) re-polls while waiting.
 const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// `kt agent logs <name> [--follow]` — read retained logs, optionally
+/// `hemaka agent logs <name> [--follow]` — read retained logs, optionally
 /// following live output (story 4-2, FR-25, spine AD-12).
 ///
 /// One-shot: dumps every currently-retained [`LogLine`] to stdout (this IS
-/// the command's result — AD-12's "stdout of kt is command output"
+/// the command's result — AD-12's "stdout of hemaka is command output"
 /// convention) and returns. `--follow` (AC-B/AC-C): after that initial dump
 /// (mirroring `docker logs -f`'s "show existing, then keep streaming"
 /// convention), loops on [`LOGS_FOLLOW_POLL_INTERVAL`] calling
@@ -1334,7 +1334,7 @@ const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Output discipline holds in BOTH modes (DC-3): stdout stays pure NDJSON while
 /// the rotation notice and the follow-exit note ride on stderr (AD-12).
 ///
-/// A downstream consumer that STOPS READING (`kt agent logs --json | head -5`)
+/// A downstream consumer that STOPS READING (`hemaka agent logs --json | head -5`)
 /// ends the command CLEANLY with exit `0` in every mode — one-shot, `--follow`,
 /// human, or JSON (fix pass, M1: see [`emit_log_lines`]). It is not an error; the
 /// consumer got what it asked for, and a `--follow` loop stops rather than
@@ -1408,7 +1408,7 @@ fn human_log_line(line: &LogLine) -> String {
 /// Whether the stdout consumer is still reading, as observed by [`emit_log_lines`]
 /// (fix pass, M1).
 ///
-/// A closed downstream pipe (`kt agent logs --json | head -5`) is NOT an error: the
+/// A closed downstream pipe (`hemaka agent logs --json | head -5`) is NOT an error: the
 /// consumer got what it asked for. It IS, however, a reason to stop — a `--follow`
 /// loop that kept polling and writing into a dead pipe would spin forever with
 /// nowhere to put its output.
@@ -1429,7 +1429,7 @@ enum EmitOutcome {
 ///
 /// **Broken-pipe discipline (fix pass, M1).** Writes go through a held
 /// [`std::io::StdoutLock`] rather than `println!`, because `println!` PANICS on a
-/// write error and Rust ignores `SIGPIPE` — so `kt agent logs --json | head -5`
+/// write error and Rust ignores `SIGPIPE` — so `hemaka agent logs --json | head -5`
 /// used to abort with exit `101`, a code outside the frozen table `docs/commands.md`
 /// documents. An [`std::io::ErrorKind::BrokenPipe`] is therefore reported as
 /// [`EmitOutcome::PipeClosed`], which the caller turns into a clean `Ok(())` (exit
@@ -1494,7 +1494,7 @@ fn log_line_json(line: &LogLine) -> Result<String, Box<dyn std::error::Error>> {
 fn note_if_rotated(next_cursor: u64, prior_cursor: u64, name: &str) {
     if next_cursor < prior_cursor {
         ui::note(format!(
-            "output rotated; a small window may be missing from the live tail — `kt agent logs {name}` \
+            "output rotated; a small window may be missing from the live tail — `hemaka agent logs {name}` \
              (without --follow) re-reads everything currently retained"
         ));
     }
@@ -1516,7 +1516,7 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// Capability Declaration and, if pause is [`SupportLevel::BestEffort`] on the
 /// current OS, print a one-line qualifier NOTE to STDERR (AD-12: notices →
 /// stderr, never stdout). This is the RECOMMENDED best-effort detection (a cheap
-/// extra read via the same `effective_capabilities` mechanism `kt agent show`
+/// extra read via the same `effective_capabilities` mechanism `hemaka agent show`
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
@@ -1538,7 +1538,7 @@ fn note_if_best_effort(facade: &hemaka_engine::Blocking<'_>, name: &str, op: &st
     }
 }
 
-/// `kt agent config set <name> <key> <value>` — write one key to the Agent
+/// `hemaka agent config set <name> <key> <value>` — write one key to the Agent
 /// Instance config layer (story 2-1, AC-B/AC10, AD-12).
 ///
 /// Validated at WRITE time by the engine: a known unified key or an `agent.*`
@@ -1577,7 +1577,7 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
     }
 }
 
-/// `kt agent config get <name> [<key>] [--json]` — read the EFFECTIVE (resolved)
+/// `hemaka agent config get <name> [<key>] [--json]` — read the EFFECTIVE (resolved)
 /// config WITH per-value provenance (story 2-1 read + story 2-3 provenance,
 /// AC10/AC-A/AC3/AC4, AD-12/AD-9).
 ///
@@ -1588,7 +1588,7 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// `--json`) a single versioned document to stdout and nothing else there. Each
 /// value NAMES its source layer (`engine-default` / `kind-default` / `instance` /
 /// `invocation-override`), read from the [`hemaka_engine::SourceLayer`] tag the
-/// engine records per leaf (AD-2: `kt` never re-derives it). Deep-resolved via the
+/// engine records per leaf (AD-2: `hemaka` never re-derives it). Deep-resolved via the
 /// engine (engine defaults < kind defaults < instance < invocation overrides); a
 /// key set at the instance layer overrides the same key at a lower layer, every
 /// time (FR-11). No invocation overrides are supplied here (a plain read).
@@ -1599,7 +1599,7 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// so a residual deferral note would be false.
 ///
 /// SECRETS (story 2-4, AC-C/AC11): `secret:NAME` values are MASKED by default (the
-/// engine's [`hemaka_engine::ResolvedValue::display`] masks them — `kt` renders
+/// engine's [`hemaka_engine::ResolvedValue::display`] masks them — `hemaka` renders
 /// whatever the engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE
 /// un-mask: it asks the engine to re-resolve the secret leaves LIVE and overlays
 /// their cleartext into BOTH the human table and `--json` (Assumption 11 —
@@ -1620,7 +1620,7 @@ pub fn config_get(
         .map_err(map_config_error)?;
 
     // With --reveal, ask the ENGINE for the resolved cleartext of the secret leaves
-    // (kt never resolves secrets itself, AD-2). A live-resolution failure surfaces
+    // (hemaka never resolves secrets itself, AD-2). A live-resolution failure surfaces
     // as a stderr diagnostic (never a crash). Without --reveal, an empty overlay
     // leaves every secret masked via the engine's display().
     let revealed = if reveal {
@@ -1650,7 +1650,7 @@ pub fn config_get(
                 return Err(AgentUnknownConfigKey {
                     message: format!(
                         "Agent Instance '{name}' has no effective value for config key '{key}'. \
-                         List the effective config with: kt agent config get {name}"
+                         List the effective config with: hemaka agent config get {name}"
                     ),
                 }
                 .into());
@@ -1715,7 +1715,7 @@ fn table_prefix_diagnostic(name: &str, key: &str, effective: &EffectiveConfig) -
     Some(format!(
         "Agent Instance '{name}' has no effective value for config key '{key}' — it is a \
          config table prefix. Its effective child leaves are: {}{suffix}. Get one of them, \
-         e.g.: kt agent config get {name} {}",
+         e.g.: hemaka agent config get {name} {}",
         named.join(", "),
         named[0]
     ))
@@ -1737,7 +1737,7 @@ fn leaf_display(
     }
 }
 
-/// The `kt agent config get --json` document (story 2-3, AC4 / AD-12).
+/// The `hemaka agent config get --json` document (story 2-3, AC4 / AD-12).
 ///
 /// A versioned wrapper — its own `schema_version` (this surface had NO prior
 /// `--json`; recorded Decision 4) — carrying each resolved leaf as
@@ -1783,7 +1783,7 @@ struct ConfigDocument {
 /// `only` selects a single leaf (the single-key form) or `None` for the whole
 /// config. Every value renders via the engine's ONE display path — the resolved
 /// leaf's [`hemaka_engine::ResolvedValue::display`] — and every source via the
-/// winning layer tag's `as_str` ([`hemaka_engine::SourceLayer::as_str`]) — `kt`
+/// winning layer tag's `as_str` ([`hemaka_engine::SourceLayer::as_str`]) — `hemaka`
 /// never re-derives either (AD-2). A serialize failure (not reachable for these
 /// plain serde structs) becomes an [`AgentIo`] diagnostic, never a panic.
 fn config_json(
@@ -1797,7 +1797,7 @@ fn config_json(
         .map(|(key, resolved)| ConfigLeaf {
             key: key.clone(),
             // The engine renders the value (the ONE display path — AC8), which
-            // MASKS a secret by default, so `kt` needs no `toml` dep and cannot leak
+            // MASKS a secret by default, so `hemaka` needs no `toml` dep and cannot leak
             // (AD-2/AD-10). `--reveal` overlays the engine-resolved cleartext for a
             // secret leaf (AC-C) — the SOLE way machine-readable output carries an
             // unmasked secret; a non-secret leaf is never in the overlay.
@@ -1821,7 +1821,7 @@ fn config_json(
 /// "Validated" column for a leaf that skipped known-key validation — i.e. a leaf
 /// under the `agent.*` pass-through namespace. A validated (known) key shows the
 /// affirmative marker. The marker is DERIVED from the pass-through prefix via the
-/// engine's [`EffectiveConfig::is_unvalidated`] accessor (so `kt` owns no config
+/// engine's [`EffectiveConfig::is_unvalidated`] accessor (so `hemaka` owns no config
 /// internals — AD-2), NOT from a new persisted field; the full per-value source
 /// layer stays Epic 2.3.
 const UNVALIDATED_MARKER: &str = "unvalidated";
@@ -1834,7 +1834,7 @@ const VALIDATED_MARKER: &str = "validated";
 /// **unvalidated** (it bypassed known-key validation, AC-B/AC7); a known key is
 /// marked validated. The "Source" column shows the winning [`hemaka_engine::SourceLayer`]
 /// label (`engine-default` / `kind-default` / `instance` / `invocation-override`),
-/// read per leaf from the engine's `source` tag (AD-2: `kt` never re-derives it).
+/// read per leaf from the engine's `source` tag (AD-2: `hemaka` never re-derives it).
 /// An empty effective config prints a plain info line rather than an empty table.
 ///
 /// `revealed` (story 2-4, AC-C) overlays the engine-resolved cleartext for a secret
@@ -1860,14 +1860,14 @@ fn render_effective_config(
         .iter()
         .map(|(key, resolved)| {
             // The marker is derived from the `agent.*` pass-through prefix via the
-            // engine accessor (AD-2: `kt` never re-implements the boundary). A
+            // engine accessor (AD-2: `hemaka` never re-implements the boundary). A
             // pass-through leaf is "unvalidated"; a known key is "validated".
             let marker = if effective.is_unvalidated(key) {
                 ui::TableCell::muted(UNVALIDATED_MARKER)
             } else {
                 ui::TableCell::plain(VALIDATED_MARKER)
             };
-            // The engine renders the value (no `toml::Value` in `kt` — AD-2),
+            // The engine renders the value (no `toml::Value` in `hemaka` — AD-2),
             // masking a secret by default; --reveal overlays the resolved cleartext.
             let value = match revealed.get(key.as_str()) {
                 Some(cleartext) => cleartext.clone(),
@@ -1878,7 +1878,7 @@ fn render_effective_config(
                 ui::TableCell::plain(value),
                 marker,
                 // The source layer is READ from the engine tag (story 2-3, FR-13);
-                // `kt` never re-derives it (AD-2).
+                // `hemaka` never re-derives it (AD-2).
                 ui::TableCell::muted(resolved.source.as_str()),
             ]
         })
@@ -1886,7 +1886,7 @@ fn render_effective_config(
     ui::print_table(&title, &columns, &rows);
 }
 
-/// `kt agent memory attach <name> --kind <kind> [--json]` — attach a Memory
+/// `hemaka agent memory attach <name> --kind <kind> [--json]` — attach a Memory
 /// Backing to an Agent Instance (story 5-1, FR-15, spine AD-11; `native`
 /// behavior is story 5-2).
 ///
@@ -1898,7 +1898,7 @@ fn render_effective_config(
 /// engine does everything else through path authority: it creates the managed
 /// directory inside the Agent Home for `filesystem` (for `native` nothing is
 /// created — the delegation is metadata) and persists the attachment; this
-/// command only displays the path the ENGINE returned (DC-1 — `kt` never joins
+/// command only displays the path the ENGINE returned (DC-1 — `hemaka` never joins
 /// "memory" itself). Human mode (A-3/DC-6): a confirmation naming the
 /// instance, the kind, its NFR-7 guarantee sentence, and the managed path on
 /// stdout; diagnostics on stderr (AD-12).
@@ -1940,7 +1940,7 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
     };
     if json {
         // The DC-10 delivery fact + the typed guarantee, read back from the
-        // engine (kt re-derives neither — AD-2). JSON-only: the human path
+        // engine (hemaka re-derives neither — AD-2). JSON-only: the human path
         // below must not gain an extra engine round-trip (or a new failure
         // mode) just because the wire surface exists. Right after a
         // successful attach the backing exists, so `None` is unreachable in
@@ -1951,7 +1951,7 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
                 return Err(AgentIo {
                     message: format!(
                         "Attached the Memory Backing to '{name}', but the engine reports no \
-                         attachment; re-run kt agent memory attach {name} --kind {kind} --json."
+                         attachment; re-run hemaka agent memory attach {name} --kind {kind} --json."
                     ),
                 }
                 .into())
@@ -2018,13 +2018,13 @@ fn attach_readback_failed(name: &str, kind: &str, err: &RegistryError) -> AgentI
         message: format!(
             "Attached the Memory Backing to '{name}', but reading the attachment back failed: \
              {err}. The attachment REMAINS attached (nothing was rolled back) — re-run \
-             `kt agent memory attach {name} --kind {kind} --json` (a same-kind re-attach is an \
-             idempotent success) or undo it with `kt agent memory detach {name}`."
+             `hemaka agent memory attach {name} --kind {kind} --json` (a same-kind re-attach is an \
+             idempotent success) or undo it with `hemaka agent memory detach {name}`."
         ),
     }
 }
 
-/// `kt agent memory detach <name> [--json]` — detach an Agent Instance's Memory
+/// `hemaka agent memory detach <name> [--json]` — detach an Agent Instance's Memory
 /// Backing (story 5-1). METADATA ONLY: the managed directory and its contents
 /// remain on disk (operator data is never silently deleted); a later re-attach
 /// re-adopts them. Same terminal-state guard as attach — no hot-swap, no force
@@ -2064,7 +2064,7 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
         ConfigError::UnknownKey { .. } => AgentUnknownConfigKey {
             message: format!(
                 "{err}. Set a known unified key, or use the agent.* pass-through namespace for \
-                 agent-native extras (e.g. kt agent config set <name> agent.<key> <value>)."
+                 agent-native extras (e.g. hemaka agent config set <name> agent.<key> <value>)."
             ),
         }
         .into(),
@@ -2088,7 +2088,7 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
         .into(),
         ConfigError::NotFound { name } => AgentNotFound {
             message: format!(
-                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+                "No Agent Instance named '{name}' is registered. List the Fleet with: hemaka agent list"
             ),
         }
         .into(),
@@ -2136,7 +2136,7 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
 /// the platform data dir — the engine remains the sole path authority. The
-/// engine owns its tokio runtime; `kt` drives it through the blocking facade.
+/// engine owns its tokio runtime; `hemaka` drives it through the blocking facade.
 fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
     Engine::open(None).map_err(map_error)
 }
@@ -2148,7 +2148,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         RegistryError::DuplicateName { name } => AgentDuplicateName {
             message: format!(
                 "An Agent Instance named '{name}' already exists. Choose a different name, \
-                 or remove the existing instance with: kt agent remove {name}"
+                 or remove the existing instance with: hemaka agent remove {name}"
             ),
         }
         .into(),
@@ -2162,14 +2162,14 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         .into(),
         RegistryError::NotFound { name } => AgentNotFound {
             message: format!(
-                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+                "No Agent Instance named '{name}' is registered. List the Fleet with: hemaka agent list"
             ),
         }
         .into(),
         RegistryError::RunningRequiresForce { name } => AgentRunningRequiresForce {
             message: format!(
                 "Agent Instance '{name}' is running. Stop it first, or pass --force to remove \
-                 it anyway: kt agent remove {name} --delete --force"
+                 it anyway: hemaka agent remove {name} --delete --force"
             ),
         }
         .into(),
@@ -2205,7 +2205,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' left an orphaned registry row: its Agent Home could not \
                  be created ({home_error}) and the automatic rollback also failed \
-                 ({rollback_error}). Remove the stale entry with: kt agent remove {name} --force"
+                 ({rollback_error}). Remove the stale entry with: hemaka agent remove {name} --force"
             ),
         }
         .into(),
@@ -2252,7 +2252,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         RegistryError::NoMeteringSource { adapter } => AgentNoMeteringSource {
             message: format!(
                 "Adapter '{adapter}' declares no viable Metering Source. Add a `[metering]` \
-                 section with source = \"self-reported\" or \"engine-observed\" — Ktesio rejects \
+                 section with source = \"self-reported\" or \"engine-observed\" — Hemaka rejects \
                  adapters with no metering source."
             ),
         }
@@ -2272,7 +2272,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped. \
                  Attach/detach need a terminal state (registered, stopped, or failed). Bring it \
-                 to a terminal state first: kt agent stop {name} from running or paused"
+                 to a terminal state first: hemaka agent stop {name} from running or paused"
             ),
         }
         .into(),
@@ -2283,7 +2283,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         } => AgentMemoryKindConflict {
             message: format!(
                 "Agent Instance '{name}' already has a '{attached}' Memory Backing attached; \
-                 detach it before attaching '{requested}': kt agent memory detach {name}"
+                 detach it before attaching '{requested}': hemaka agent memory detach {name}"
             ),
         }
         .into(),
@@ -2303,7 +2303,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
     match err {
         EngineError::NotFound { name } => AgentNotFound {
             message: format!(
-                "No Agent Instance named '{name}' is registered. List the Fleet with: kt agent list"
+                "No Agent Instance named '{name}' is registered. List the Fleet with: hemaka agent list"
             ),
         }
         .into(),
@@ -2318,7 +2318,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // AC4: the ONE uniform invalid-transition class, identical for every
         // adapter (it comes from the shared transition table).
         EngineError::InvalidTransition(inner) => AgentInvalidTransition {
-            message: format!("{inner}. Check the instance's current state with: kt agent list"),
+            message: format!("{inner}. Check the instance's current state with: hemaka agent list"),
         }
         .into(),
         // AC2: the adapter/process diagnostic is preserved verbatim; the instance
@@ -2331,7 +2331,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         }
         .into(),
         // AC3: pause is UNSUPPORTED on this OS — fail fast QUOTING the declaration
-        // (the level + OS) and pointing at `kt agent show`. No state changed.
+        // (the level + OS) and pointing at `hemaka agent show`. No state changed.
         EngineError::CapabilityUnsupported {
             name,
             capability,
@@ -2340,7 +2340,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         } => AgentCapabilityUnsupported {
             message: format!(
                 "Agent Instance '{name}' cannot {capability}: this agent declares {capability} \
-                 '{level}' on {os}. Inspect its Capability Declaration with: kt agent show {name}"
+                 '{level}' on {os}. Inspect its Capability Declaration with: hemaka agent show {name}"
             ),
         }
         .into(),
@@ -2353,10 +2353,10 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' is paused, but this agent declares pause '{level}' \
                  on {os}, so resume cannot signal the suspension awake. Recovery: \
-                 kt agent stop {name} && kt agent start {name}. The same resume does work on \
+                 hemaka agent stop {name} && hemaka agent start {name}. The same resume does work on \
                  hosts where the adapter declares pause support (informational — this CLI \
                  cannot change this host's OS). Inspect the Capability Declaration with: \
-                 kt agent show {name}"
+                 hemaka agent show {name}"
             ),
         }
         .into(),
@@ -2429,21 +2429,21 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         //
         // M2 fix (review of #79): the remediation VERB must match the
         // instance's ACTUAL state. A `paused` instance's correct remediation
-        // is `kt agent resume` — suggesting `kt agent start` there hits a
+        // is `hemaka agent resume` — suggesting `hemaka agent start` there hits a
         // SECOND, confusing `InvalidTransition` error (start only accepts
         // registered/stopped/failed), not a helpful fix. Every other
         // NOT-running state (registered/starting/stopping/stopped/failed)
         // keeps the original `start` remediation.
         EngineError::NotRunning { name, state } => {
             let remediation = if state == "paused" {
-                format!("resume it with: kt agent resume {name}")
+                format!("resume it with: hemaka agent resume {name}")
             } else {
-                format!("start it first with: kt agent start {name}")
+                format!("start it first with: hemaka agent start {name}")
             };
             AgentNotRunning {
                 message: format!(
                     "Agent Instance '{name}' is not running (current state: {state}); \
-                     {remediation}. List the Fleet with: kt agent list"
+                     {remediation}. List the Fleet with: hemaka agent list"
                 ),
             }
             .into()
@@ -2458,7 +2458,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
                  cross-invocation interaction needs a persistent engine session (planned for a \
-                 future release); within a single `kt` process/embedding session this works."
+                 future release); within a single `hemaka` process/embedding session this works."
             ),
         }
         .into(),
@@ -2473,7 +2473,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "Agent Instance '{name}' is not draining its input within {timeout_secs}s and \
                  may be stuck. Its interaction channel is now unavailable for the rest of this \
-                 session; restart it for a fresh one: kt agent stop {name} && kt agent start \
+                 session; restart it for a fresh one: hemaka agent stop {name} && hemaka agent start \
                  {name}"
             ),
         }
@@ -2491,7 +2491,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
                 "Agent Instance '{name}' was sent SIGKILL but has not been confirmed dead \
                  within {timeout_secs}s; it may be stuck in an OS-level I/O wait (for example, \
                  disk pressure). It remains in the 'stopping' state. Try again with: \
-                 kt agent stop {name} — this will not re-block if it is still stuck, and will \
+                 hemaka agent stop {name} — this will not re-block if it is still stuck, and will \
                  succeed once the process actually exits (which may require relieving disk \
                  pressure or waiting for the stuck I/O to resolve)."
             ),
@@ -2557,7 +2557,7 @@ mod tests {
         let dup = map_error(RegistryError::DuplicateName {
             name: "demo".into(),
         });
-        assert!(dup.to_string().contains("kt agent remove demo"));
+        assert!(dup.to_string().contains("hemaka agent remove demo"));
 
         let running = map_error(RegistryError::RunningRequiresForce {
             name: "live".into(),
@@ -2573,7 +2573,7 @@ mod tests {
         let missing = map_error(RegistryError::NotFound {
             name: "ghost".into(),
         });
-        assert!(missing.to_string().contains("kt agent list"));
+        assert!(missing.to_string().contains("hemaka agent list"));
 
         let io = map_error(RegistryError::Io {
             name: "demo".into(),
@@ -2597,7 +2597,7 @@ mod tests {
         });
         let orphan_msg = orphan.to_string();
         assert!(orphan_msg.contains("orphaned registry row"));
-        assert!(orphan_msg.contains("kt agent remove demo --force"));
+        assert!(orphan_msg.contains("hemaka agent remove demo --force"));
 
         // Store errors surface as a state-store diagnostic.
         let store = map_error(RegistryError::Store(
@@ -2612,7 +2612,7 @@ mod tests {
         // the rule from the engine's message verbatim, and adds the
         // retarget-the-manifest remediation. The rule literal below is pinned
         // against the REAL message in the engine's
-        // `incompatible_major_fails_naming_both_versions_and_the_rule` (kt
+        // `incompatible_major_fails_naming_both_versions_and_the_rule` (hemaka
         // depends on the engine's surface, not the adapter-api crate
         // directly), so text drift fails there first.
         let detail = "incompatible adapter contract: manifest declares 2.1.0, engine speaks \
@@ -2664,11 +2664,11 @@ mod tests {
         );
         assert!(msg.contains("boom"), "carries the underlying cause: {msg}");
         assert!(
-            msg.contains("kt agent memory attach demo --kind filesystem --json"),
+            msg.contains("hemaka agent memory attach demo --kind filesystem --json"),
             "gives the re-run remediation: {msg}"
         );
         assert!(
-            msg.contains("kt agent memory detach demo"),
+            msg.contains("hemaka agent memory detach demo"),
             "gives the undo remediation: {msg}"
         );
     }
@@ -2754,8 +2754,8 @@ mod tests {
         // `EngineError::InteractionTimedOut`'s CLI rendering CANNOT be
         // exercised that way at all — a genuinely stuck write needs a LIVE
         // pipe, which only exists within the SAME engine session that
-        // spawned it, but a single `kt agent send` invocation opens its OWN
-        // fresh `Engine` and exits after one call; a SEPARATE `kt agent
+        // spawned it, but a single `hemaka agent send` invocation opens its OWN
+        // fresh `Engine` and exits after one call; a SEPARATE `hemaka agent
         // send` reaching an instance a prior invocation started can only do
         // so via `adopt_orphans`, which NEVER carries a live pipe (mirrors
         // the story's OWN Task 8 Deviation 1 finding for
@@ -2771,7 +2771,7 @@ mod tests {
         assert!(msg.contains("stuck"), "names the instance: {msg}");
         assert!(msg.contains('5'), "names the bound: {msg}");
         assert!(
-            msg.contains("kt agent stop stuck") && msg.contains("kt agent start stuck"),
+            msg.contains("hemaka agent stop stuck") && msg.contains("hemaka agent start stuck"),
             "points at a restart for a fresh channel: {msg}"
         );
         assert!(
@@ -3020,7 +3020,7 @@ mod tests {
             "states the instance's actual (non-terminal) state honestly: {msg}"
         );
         assert!(
-            msg.contains("kt agent stop stuck"),
+            msg.contains("hemaka agent stop stuck"),
             "points at retrying stop rather than a generic remediation: {msg}"
         );
     }
@@ -3534,7 +3534,7 @@ mod tests {
             "the child leaf is named: {message}"
         );
         assert!(
-            message.contains("kt agent config get demo budget.breach_action"),
+            message.contains("hemaka agent config get demo budget.breach_action"),
             "the remediation suggests a concrete get: {message}"
         );
         assert!(
@@ -3864,7 +3864,7 @@ mod tests {
 
     #[test]
     fn a_broken_stdout_pipe_stops_cleanly_while_a_real_io_failure_still_diagnoses() {
-        // Fix-pass M1 contract: `kt agent logs --json | head -5` must exit 0. Rust
+        // Fix-pass M1 contract: `hemaka agent logs --json | head -5` must exit 0. Rust
         // ignores SIGPIPE and `println!` PANICS on a write error, which produced
         // exit 101 — a code outside the FROZEN table in docs/commands.md. The
         // BrokenPipe arm is what keeps that promise, and it must NOT swallow other
@@ -3963,7 +3963,7 @@ mod tests {
         // FR-14 (story 2-4, AC-C/AC11): `config get --reveal` re-resolves secrets
         // LIVE, and a resolution failure is a stderr diagnostic — never a crash and
         // never a leak. The engine's detail is contracted to name the NAME and the
-        // resolvers tried but no value; `kt` appends the remediation. This test
+        // resolvers tried but no value; `hemaka` appends the remediation. This test
         // pins the leak half explicitly: a value that happened to be in scope must
         // not appear in the rendered diagnostic, and the message must tell the user
         // the two places a secret can come from.

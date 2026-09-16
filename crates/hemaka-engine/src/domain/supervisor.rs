@@ -617,7 +617,7 @@ struct Supervised {
 /// path is byte-identical to the pre-sink behavior).
 ///
 /// Each diagnostic arrives as ONE full line — the message text as it appears
-/// on stderr today, `[ktesio] ` prefixed, `\n` terminated — so a sink
+/// on stderr today, `[hemaka] ` prefixed, `\n` terminated — so a sink
 /// receiving a diagnostic receives the exact bytes the default stderr path
 /// would have emitted. Write failures are swallowed (the diagnostics are
 /// best-effort by contract, AD-12 — a broken or closed host writer must never
@@ -860,10 +860,10 @@ impl Supervisor {
     /// Emit ONE engine diagnostic (story 10-2) — the engine's ONLY diagnostic
     /// emission choke point. With a sink installed the line goes to the sink;
     /// with none it goes to STDERR, byte-identical to the pre-sink behavior
-    /// (same `[ktesio] `-prefixed wording, one line, AD-12's "diagnostics ride
+    /// (same `[hemaka] `-prefixed wording, one line, AD-12's "diagnostics ride
     /// the engine log / stderr, NEVER `kt` stdout").
     ///
-    /// The `[ktesio] ` marker prefix and the terminating `\n` are added HERE,
+    /// The `[hemaka] ` marker prefix and the terminating `\n` are added HERE,
     /// in one place, so the sink receives the exact bytes the stderr default
     /// would have emitted — same message text as today, one line per
     /// diagnostic.
@@ -897,7 +897,7 @@ impl Supervisor {
     /// took the supervisor lock would deadlock.
     fn emit_diagnostic(&self, message: &str) {
         let mut line = String::with_capacity(message.len() + 10);
-        line.push_str("[ktesio] ");
+        line.push_str("[hemaka] ");
         line.push_str(message);
         line.push('\n');
         match &self.diagnostics {

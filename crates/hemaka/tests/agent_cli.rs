@@ -1,6 +1,6 @@
-//! Integration tests for `kt agent register | remove | list`.
+//! Integration tests for `hemaka agent register | remove | list`.
 //!
-//! These drive the real `kt` binary (via `CARGO_BIN_EXE_kt`) with
+//! These drive the real `hemaka` binary (via `CARGO_BIN_EXE_hemaka`) with
 //! `KTESIO_STATE_DIR` pinned to a `TempDir`, so no test ever touches the real
 //! user data dir. They assert the CLI contract: exit codes, the Agent Home
 //! path on stdout, and diagnostics on stderr.
@@ -9,7 +9,7 @@ mod helpers;
 
 use std::path::Path;
 
-use helpers::{run_kt_agent, run_kt_agent_with_env, KtRun, TestContext};
+use helpers::{run_hemaka_agent, run_hemaka_agent_with_env, KtRun, TestContext};
 use hemaka_conformance::test_support::{current_os_key, ManifestFixture};
 use hemaka_conformance::uj3;
 use hemaka_engine::{Engine, FleetEntry, LifecycleState, UsageView};
@@ -35,7 +35,7 @@ fn force_state_running(state_dir: &Path, name: &str) {
 
 /// Start an instance via a SEPARATE, leaked engine subprocess (crash semantics)
 /// so the spawned `fake_agent` SURVIVES the command's exit and can be adopted by
-/// the next `kt` invocation (story 1-6). A normal `kt agent start` cleanly drops
+/// the next `hemaka` invocation (story 1-6). A normal `hemaka agent start` cleanly drops
 /// its engine, which kills the process (the single-lifetime `Drop`), so pause on
 /// a later invocation would honestly reconcile the dead-process row to `failed`.
 /// To exercise real pause-on-a-LIVE-adopted-instance the process must genuinely
@@ -113,7 +113,7 @@ fn register_prints_home_path_and_exits_zero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -129,7 +129,7 @@ fn register_prints_home_path_and_exits_zero() {
     );
     assert!(home.join("config.toml").is_file());
     // The success confirmation is a command result (stdout), consistent with
-    // every other `kt` command's `ui::success` usage. AD-12 reserves stderr for
+    // every other `hemaka` command's `ui::success` usage. AD-12 reserves stderr for
     // diagnostics/notices; a completed-successfully confirmation is not one.
     assert!(run.stdout.contains("Registered"));
     // AC1: the effective per-OS Capability Declaration is surfaced on stdout
@@ -150,7 +150,7 @@ fn duplicate_registration_exits_nonzero_with_diagnostic() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let first = run_kt_agent(
+    let first = run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -158,7 +158,7 @@ fn duplicate_registration_exits_nonzero_with_diagnostic() {
     assert!(first.success);
 
     // Re-register the same NAME (kind must resolve, so reuse `mock`).
-    let second = run_kt_agent(
+    let second = run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -170,7 +170,7 @@ fn duplicate_registration_exits_nonzero_with_diagnostic() {
         "stderr={}",
         second.stderr
     );
-    assert!(second.stderr.contains("kt agent remove demo"));
+    assert!(second.stderr.contains("hemaka agent remove demo"));
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn register_hermes_kind_plumbs_through_the_cli_and_surfaces_in_list() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "gw", "--kind", "hermes"],
         &ctx.project_dir,
         state_dir,
@@ -209,7 +209,7 @@ fn register_hermes_kind_plumbs_through_the_cli_and_surfaces_in_list() {
     assert!(home.join("adapter.json").is_file(), "snapshot persisted");
 
     // The kind surfaces verbatim in `list --json`.
-    let listed = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let listed = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         listed.success,
         "list --json should exit 0; stderr={}",
@@ -234,7 +234,7 @@ fn invalid_name_exits_nonzero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "Bad_Name", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -250,18 +250,18 @@ fn list_shows_registered_instances() {
     let state_dir = state.project_dir.as_path();
 
     // Empty Fleet first.
-    let empty = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let empty = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(empty.success);
     assert!(
         empty.stdout.contains("No Agent Instances") || empty.stderr.contains("No Agent Instances")
     );
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "alpha", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let listed = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let listed = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(listed.success);
     assert!(listed.stdout.contains("alpha"), "stdout={}", listed.stdout);
     assert!(listed.stdout.contains("Fleet"));
@@ -273,7 +273,7 @@ fn remove_delete_removes_home() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -281,7 +281,7 @@ fn remove_delete_removes_home() {
     let home = state_dir.join("agents").join("demo");
     assert!(home.is_dir());
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "remove", "demo", "--delete"],
         &ctx.project_dir,
         state_dir,
@@ -300,7 +300,7 @@ fn remove_retain_keeps_home() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -308,7 +308,7 @@ fn remove_retain_keeps_home() {
     let home = state_dir.join("agents").join("demo");
 
     // Default (no flag) retains; be explicit here to assert the flag path.
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "remove", "demo", "--retain"],
         &ctx.project_dir,
         state_dir,
@@ -327,7 +327,7 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "live", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -336,7 +336,7 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
     force_state_running(state_dir, "live");
 
     // Without --force: refused, non-zero, diagnostic to stderr.
-    let refused = run_kt_agent(
+    let refused = run_hemaka_agent(
         &["agent", "remove", "live", "--delete"],
         &ctx.project_dir,
         state_dir,
@@ -351,11 +351,11 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
         refused.stderr
     );
     // Instance still present.
-    let still = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let still = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(still.stdout.contains("live"));
 
     // With --force: succeeds.
-    let forced = run_kt_agent(
+    let forced = run_hemaka_agent(
         &["agent", "remove", "live", "--delete", "--force"],
         &ctx.project_dir,
         state_dir,
@@ -369,7 +369,7 @@ fn remove_running_without_force_exits_nonzero_and_with_force_succeeds() {
     assert!(!home.exists());
 }
 
-// ---- Story 1.3: manifest adapters + `kt agent show` ----
+// ---- Story 1.3: manifest adapters + `hemaka agent show` ----
 
 /// A complete valid `adapter.toml` for a manifest-adapter directory fixture.
 const VALID_MANIFEST: &str = r#"
@@ -415,7 +415,7 @@ fn register_manifest_exits_zero_and_shows_capabilities() {
     let state_dir = state.project_dir.as_path();
     let m = manifest_dir(&ctx.project_dir, VALID_MANIFEST);
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -450,7 +450,7 @@ fn register_invalid_manifest_exits_nonzero_naming_section() {
     let body = VALID_MANIFEST.replace("[metering]\nsource = \"self-reported\"\n", "");
     let m = manifest_dir(&ctx.project_dir, &body);
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -472,7 +472,7 @@ fn register_manifest_not_found_exits_nonzero() {
     let state_dir = state.project_dir.as_path();
     let missing = ctx.project_dir.join("no-such-dir");
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -497,7 +497,7 @@ fn register_unknown_kind_exits_nonzero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "x", "--kind", "no-such-kind"],
         &ctx.project_dir,
         state_dir,
@@ -517,7 +517,7 @@ fn register_requires_kind_or_manifest() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
     // Neither --kind nor --manifest → clap rejects before the engine runs.
-    let run = run_kt_agent(&["agent", "register", "x"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "register", "x"], &ctx.project_dir, state_dir);
     assert!(!run.success, "register with no adapter flag should fail");
 }
 
@@ -527,12 +527,12 @@ fn show_renders_effective_capabilities() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let show = run_kt_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should exit 0; stderr={}", show.stderr);
     assert!(
         show.stdout.contains("Capabilities for demo"),
@@ -548,7 +548,7 @@ fn show_unknown_instance_exits_nonzero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let show = run_kt_agent(&["agent", "show", "ghost"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "ghost"], &ctx.project_dir, state_dir);
     assert!(!show.success, "show of a missing instance should fail");
     assert!(
         show.stderr.contains("No Agent Instance named 'ghost'"),
@@ -557,7 +557,7 @@ fn show_unknown_instance_exits_nonzero() {
     );
 }
 
-// ---- Story 1.4: `kt agent start` / `kt agent stop` ----
+// ---- Story 1.4: `hemaka agent start` / `hemaka agent stop` ----
 
 /// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent`,
 /// interaction `guaranteed` on all three OSes. The TOML body is the SHARED
@@ -565,10 +565,10 @@ fn show_unknown_instance_exits_nonzero() {
 /// `hemaka_conformance::test_support` states the manifest shape ONCE); this
 /// wrapper only keeps the fixture's `fake-agent-adapter` subdirectory name.
 /// The locator behind it is the SHARED `hemaka_conformance::fake_agent_bin`:
-/// the running kt integration-test binary resolves its own
+/// the running hemaka integration-test binary resolves its own
 /// `target/<profile>/deps/` sibling — the same profile dir the old local
-/// `CARGO_BIN_EXE_kt`-anchored copy named — so that copy was duplication,
-/// not a distinct seam (the `CARGO_BIN_EXE_kt` seam for RUNNING kt is
+/// `CARGO_BIN_EXE_hemaka`-anchored copy named — so that copy was duplication,
+/// not a distinct seam (the `CARGO_BIN_EXE_hemaka` seam for RUNNING hemaka is
 /// separate and stays).
 fn fake_agent_manifest(dir: &Path, args: &[&str]) -> std::path::PathBuf {
     let m = dir.join("fake-agent-adapter");
@@ -580,9 +580,9 @@ fn start_prints_running_state_and_exits_zero() {
     // AC1 at the CLI: register a manifest agent, start it → the new state
     // `running` is printed to stdout and the exit code is 0.
     //
-    // NOTE (single-lifetime boundary): each `kt` invocation is its own engine
+    // NOTE (single-lifetime boundary): each `hemaka` invocation is its own engine
     // lifetime; the started process is cleaned up on exit (kill-on-drop). A
-    // separate `kt agent stop` cannot re-attach to it (orphan adoption is story
+    // separate `hemaka agent stop` cannot re-attach to it (orphan adoption is story
     // 1-6). This test asserts the START contract; the full start→stop→no-survivor
     // proof lives in the engine's single-lifetime lifecycle integration test.
     let ctx = TestContext::new();
@@ -590,7 +590,7 @@ fn start_prints_running_state_and_exits_zero() {
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
 
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -601,7 +601,7 @@ fn start_prints_running_state_and_exits_zero() {
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
     assert!(run.success, "start should exit 0; stderr={}", run.stderr);
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Started"), "stdout={}", run.stdout);
@@ -609,8 +609,8 @@ fn start_prints_running_state_and_exits_zero() {
 
 #[test]
 fn start_prints_single_lifetime_notice_to_stderr_only() {
-    // LOW-1, story-12-1 flip: the success path of a PLAIN `kt agent start` is
-    // honest about single-lifetime supervision — a standalone `kt agent start`
+    // LOW-1, story-12-1 flip: the success path of a PLAIN `hemaka agent start` is
+    // honest about single-lifetime supervision — a standalone `hemaka agent start`
     // kills the agent when the CLI exits cleanly, and the notice now names the
     // shipped escape hatch (`--detach`) instead of the stale "future work"
     // claim (detach EXISTS since 12-1; the plain path's behavior is unchanged).
@@ -623,7 +623,7 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
 
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -634,7 +634,7 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
     assert!(run.success, "start should exit 0; stderr={}", run.stderr);
     // stdout result line is unchanged (still shows `running`).
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
@@ -728,13 +728,13 @@ fn wait_for_agent_pid(state_dir: &Path, name: &str) -> u32 {
     }
 }
 
-/// Run `kt` with a HARD WALL-CLOCK BOUND and a forensic dump on timeout
+/// Run `hemaka` with a HARD WALL-CLOCK BOUND and a forensic dump on timeout
 /// (the 12-1 detach test's Windows hang triage): on timeout the child is
-/// killed and the harness reports whether kt was STILL ALIVE, its partial
+/// killed and the harness reports whether hemaka was STILL ALIVE, its partial
 /// stdout/stderr so far (did the engine finish the work? did the notice
 /// print?), and the agent's marker state — turning an opaque nextest
 /// `>240s` timeout into a one-run diagnosis. Bounded legs only; the rest
-/// of the file keeps the plain [`helpers::run_kt_agent`].
+/// of the file keeps the plain [`helpers::run_hemaka_agent`].
 /// The per-leg wall-clock bound for the detach test's forensic harness:
 /// comfortably above any honest leg (register/start/list/stop each run in
 /// seconds) and far below nextest's own 240s timeout, so the dump lands
@@ -748,7 +748,7 @@ struct BoundedKt {
     alive_at_kill: bool,
 }
 
-fn run_kt_agent_bounded(
+fn run_hemaka_agent_bounded(
     args: &[&str],
     working_dir: &Path,
     state_dir: &Path,
@@ -757,7 +757,7 @@ fn run_kt_agent_bounded(
     use std::io::Read;
     use std::sync::{Arc, Mutex};
     println!("harness: entered, args={:?}", args);
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hemaka"))
         .args(args)
         .current_dir(working_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
@@ -766,11 +766,11 @@ fn run_kt_agent_bounded(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn kt");
+        .expect("spawn hemaka");
     // Reader threads accumulate each stream INCREMENTALLY (per-chunk append
     // under the lock) so the partial transcript is readable at any moment —
     // the timeout path must NEVER depend on pipe EOF (a grandchild inheriting
-    // the pipe, or a half-dead kt, can hold it open indefinitely).
+    // the pipe, or a half-dead hemaka, can hold it open indefinitely).
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
     let stdout_buf = Arc::new(Mutex::new(String::new()));
@@ -807,7 +807,7 @@ fn run_kt_agent_bounded(
     };
     let started = std::time::Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait kt") {
+        if let Some(status) = child.try_wait().expect("try_wait hemaka") {
             break Some(status);
         }
         if started.elapsed() >= bound {
@@ -815,7 +815,7 @@ fn run_kt_agent_bounded(
         }
         if started.elapsed().as_secs().is_multiple_of(10) {
             println!(
-                "harness: tick {}s, kt exited={:?}",
+                "harness: tick {}s, hemaka exited={:?}",
                 started.elapsed().as_secs(),
                 child.try_wait().map(|s| s.is_some())
             );
@@ -823,7 +823,7 @@ fn run_kt_agent_bounded(
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
     println!("harness: loop exited, timed_out={}", status.is_none());
-    // On timeout, KILL kt, give the pipes a 1s grace to EOF, then read the
+    // On timeout, KILL hemaka, give the pipes a 1s grace to EOF, then read the
     // incremental buffers under the lock. The reader threads are NEVER
     // joined on this path: if a grandchild inherited the pipes they stay
     // blocked until the test process dies, and joining deadlocked the first
@@ -833,28 +833,28 @@ fn run_kt_agent_bounded(
     if timed_out {
         let _ = child.kill();
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        let kt_gone = child.try_wait().map(|s| s.is_some()).unwrap_or(false);
+        let hemaka_gone = child.try_wait().map(|s| s.is_some()).unwrap_or(false);
         println!(
-            "KT HUNG after {:?}: args={:?} kt_alive_at_kill=true kt_dead_after_kill={} \n\
-             ---- kt partial stdout ----\n{}\n\
-             ---- kt partial stderr ----\n{}",
+            "KT HUNG after {:?}: args={:?} hemaka_alive_at_kill=true hemaka_dead_after_kill={} \n\
+             ---- hemaka partial stdout ----\n{}\n\
+             ---- hemaka partial stderr ----\n{}",
             bound,
             args,
-            kt_gone,
+            hemaka_gone,
             stdout_buf.lock().unwrap(),
             stderr_buf.lock().unwrap()
         );
     }
-    // kt has exited (or been killed) — give the readers a short grace to
+    // hemaka has exited (or been killed) — give the readers a short grace to
     // see EOF, then PROCEED WITHOUT THEM. On windows-latest this harness
-    // proved the pipes never EOF after a detached start even though kt is
-    // DEAD: the surviving detached agent ends up holding kt's stdio pipe
+    // proved the pipes never EOF after a detached start even though hemaka is
+    // DEAD: the surviving detached agent ends up holding hemaka's stdio pipe
     // write-ends, so a plain join deadlocks. (`std` spawns with a handle
     // list restricted to the child's own three stdio handles, so this leak
     // is unexpected and is recorded as a story 12-1 production follow-up —
-    // a script that captures `kt agent start --detach` output would hang
+    // a script that captures `hemaka agent start --detach` output would hang
     // until the agent exits.) The leaked readers die with the test process;
-    // the incremental buffers already hold kt's full transcript.
+    // the incremental buffers already hold hemaka's full transcript.
     let grace = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !(t_out.is_finished() && t_err.is_finished()) && std::time::Instant::now() < grace {
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -887,14 +887,14 @@ fn run_kt_agent_bounded(
 
 #[test]
 fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
-    // Story 12-1, the acceptance criterion AT THE CLI, cross-OS: `kt agent
+    // Story 12-1, the acceptance criterion AT THE CLI, cross-OS: `hemaka agent
     // start --detach` exits 0 printing `running`; the stderr notice carries
     // the ratified enforcement-window honesty (no crash detection / budget
     // enforcement / event delivery between commands) and NOT the
     // single-lifetime wording; the child is ALIVE after the command exits;
-    // a BENIGN intervening command (`kt agent list` — the 12-1 AMENDMENT leg)
+    // a BENIGN intervening command (`hemaka agent list` — the 12-1 AMENDMENT leg)
     // adopts the child DISARMED and leaves it alive at its exit; and a later
-    // `kt agent stop` re-adopts the live process and lands the terminal state
+    // `hemaka agent stop` re-adopts the live process and lands the terminal state
     // — no orphan left. On Windows this is affirmatively possible for the
     // first time (a detached spawn's Job Object carries no kill-on-close, so
     // engine exits kill nothing), so there is deliberately NO `_unix` suffix.
@@ -903,7 +903,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
     println!("detach-leg: entering register");
-    let reg = run_kt_agent_bounded(
+    let reg = run_hemaka_agent_bounded(
         &[
             "agent",
             "register",
@@ -930,7 +930,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
         timeout_arg: "5".to_string(),
         armed: true,
     };
-    let run = run_kt_agent_bounded(
+    let run = run_hemaka_agent_bounded(
         &["agent", "start", "detachy", "--detach"],
         &ctx.project_dir,
         state_dir,
@@ -939,8 +939,8 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     println!("detach-leg: start returned success={}", run.run.success);
     assert!(
         !run.timed_out,
-        "THE START LEG HUNG (kt alive at kill={}): kt stdout={}\nkt stderr={}\n\
-         if `running` printed, the ENGINE finished and kt's exit path blocks;\n\
+        "THE START LEG HUNG (hemaka alive at kill={}): hemaka stdout={}\nkt stderr={}\n\
+         if `running` printed, the ENGINE finished and hemaka's exit path blocks;\n\
          if not, the start itself never completed",
         run.alive_at_kill, run.run.stdout, run.run.stderr
     );
@@ -990,10 +990,10 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     let pid = wait_for_agent_pid(state_dir, "detachy");
     assert!(
         pid_alive(pid),
-        "the detached child must be alive after `kt agent start --detach` exited"
+        "the detached child must be alive after `hemaka agent start --detach` exited"
     );
     // 12-1 AMENDMENT (review loop 1): a BENIGN intervening command must not
-    // kill the detached agent. `kt agent list` opens the engine, adopt_orphans
+    // kill the detached agent. `hemaka agent list` opens the engine, adopt_orphans
     // re-holds the live child DISARMED (the record's detach flag), and the
     // command exits — the agent must STILL be alive afterward. (The
     // pre-amendment hardcoded disarmed=false made this exact command the
@@ -1001,16 +1001,16 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     // Object carries no kill-on-close, so the benign command's engine exit
     // kills nothing.
     println!("detach-leg: pid={} announced; entering list", pid);
-    let list = run_kt_agent_bounded(&["agent", "list"], &ctx.project_dir, state_dir, LEG_BOUND);
+    let list = run_hemaka_agent_bounded(&["agent", "list"], &ctx.project_dir, state_dir, LEG_BOUND);
     println!("detach-leg: list returned success={}", list.run.success);
     assert!(
         !list.timed_out,
-        "THE LIST LEG HUNG (kt alive at kill={}): stdout={} stderr={}",
+        "THE LIST LEG HUNG (hemaka alive at kill={}): stdout={} stderr={}",
         list.alive_at_kill, list.run.stdout, list.run.stderr
     );
     assert!(
         list.run.success,
-        "the benign `kt agent list` should succeed; stderr={}",
+        "the benign `hemaka agent list` should succeed; stderr={}",
         list.run.stderr
     );
     assert!(
@@ -1020,13 +1020,13 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     );
     assert!(
         pid_alive(pid),
-        "the benign `kt agent list` exit must NOT kill the detached agent \
+        "the benign `hemaka agent list` exit must NOT kill the detached agent \
          (12-1 AMENDMENT: detached-ness rides the record)"
     );
     // The NEXT command re-adopts the live process and stops it for real —
     // stop keeps working on the adopted detached handle.
     println!("detach-leg: entering stop");
-    let stop = run_kt_agent_bounded(
+    let stop = run_hemaka_agent_bounded(
         &["agent", "stop", "detachy"],
         &ctx.project_dir,
         state_dir,
@@ -1035,7 +1035,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     println!("detach-leg: stop returned success={}", stop.run.success);
     assert!(
         !stop.timed_out,
-        "THE STOP LEG HUNG (kt alive at kill={}): stdout={} stderr={}",
+        "THE STOP LEG HUNG (hemaka alive at kill={}): stdout={} stderr={}",
         stop.alive_at_kill, stop.run.stdout, stop.run.stderr
     );
     assert!(
@@ -1100,7 +1100,7 @@ env = "OPENAI_BASE_URL"
         ),
     )
     .unwrap();
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -1111,7 +1111,7 @@ env = "OPENAI_BASE_URL"
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "start", "obsdet", "--detach"],
         &ctx.project_dir,
         state_dir,
@@ -1140,7 +1140,7 @@ env = "OPENAI_BASE_URL"
         run.stderr
     );
     // No side effect: the instance is still `registered` (a `show` reports it).
-    let show = run_kt_agent(&["agent", "show", "obsdet"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "obsdet"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should work; stderr={}", show.stderr);
     assert!(
         show.stdout.contains("registered"),
@@ -1154,13 +1154,13 @@ fn start_help_carries_the_enforcement_window_honesty() {
     // The 12-1 patch bundle (review loop 1): the enforcement-window honesty is
     // a HARD AC on the HELP surface too, not only the runtime stderr notice —
     // an operator deciding whether to pass `--detach` must see its cost
-    // BEFORE running it. `kt agent start --help` renders the flag's help text,
+    // BEFORE running it. `hemaka agent start --help` renders the flag's help text,
     // which must therefore state every between-commands window (no crash
     // detection / no budget enforcement / no event delivery) and the
     // engine-observed refusal.
     let ctx = TestContext::new();
     let state = TestContext::new();
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "start", "--help"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -1203,7 +1203,7 @@ contract_version = "1.0.0"
 [adapter]
 kind = "bad"
 [lifecycle.start]
-exec = "ktesio-no-such-binary-cli-1-4"
+exec = "hemaka-no-such-binary-cli-1-4"
 [capabilities.interaction]
 linux = "guaranteed"
 macos = "guaranteed"
@@ -1214,7 +1214,7 @@ source = "self-reported"
     )
     .unwrap();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -1225,7 +1225,7 @@ source = "self-reported"
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
     assert!(!run.success, "start of a bad exec should exit non-zero");
     assert!(
         run.stderr.contains("failed to launch"),
@@ -1233,12 +1233,12 @@ source = "self-reported"
         run.stderr
     );
     assert!(
-        run.stderr.contains("ktesio-no-such-binary-cli-1-4"),
+        run.stderr.contains("hemaka-no-such-binary-cli-1-4"),
         "diagnostic preserved; stderr={}",
         run.stderr
     );
     // The instance is now `failed`.
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(list.stdout.contains("failed"), "stdout={}", list.stdout);
 }
 
@@ -1252,12 +1252,12 @@ fn stop_on_stopped_returns_uniform_invalid_transition() {
     let state_dir = state.project_dir.as_path();
 
     // Native builtin.
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "nat", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "stop", "nat"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "stop", "nat"], &ctx.project_dir, state_dir);
     assert!(!run.success, "stop on registered should exit non-zero");
     assert!(
         run.stderr.contains("cannot stop"),
@@ -1271,7 +1271,7 @@ fn start_unknown_instance_exits_nonzero() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    let run = run_kt_agent(&["agent", "start", "ghost"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "start", "ghost"], &ctx.project_dir, state_dir);
     assert!(!run.success, "start of a missing instance should fail");
     assert!(run.stderr.contains("ghost"), "stderr={}", run.stderr);
 }
@@ -1283,12 +1283,12 @@ fn stop_accepts_timeout_flag() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "svc", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "stop", "svc", "--timeout", "5"],
         &ctx.project_dir,
         state_dir,
@@ -1297,7 +1297,7 @@ fn stop_accepts_timeout_flag() {
     assert!(run.stderr.contains("cannot stop"), "stderr={}", run.stderr);
 }
 
-// ---- Story 1.5: `kt agent pause` / `kt agent resume` (AC6) ----
+// ---- Story 1.5: `hemaka agent pause` / `hemaka agent resume` (AC6) ----
 
 /// Write a `fake_agent` manifest whose CURRENT-OS pause level is `pause_level`
 /// (interaction `guaranteed` on all three OSes). The TOML body is the SHARED
@@ -1317,7 +1317,7 @@ fn fake_agent_manifest_with_pause(
 
 #[test]
 fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
-    // AC6 + AC1 at the CLI (Unix guaranteed): `kt agent pause` on a genuinely
+    // AC6 + AC1 at the CLI (Unix guaranteed): `hemaka agent pause` on a genuinely
     // LIVE instance prints the new state `paused` to stdout with exit 0 and NO
     // best-effort qualifier. Runtime-skip on Windows (guaranteed pause is
     // Unix-only); NO cfg — data-driven skip.
@@ -1331,13 +1331,13 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
     // later pause fails honestly — is asserted by
     // `pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`.
     //
-    // NOTE (single-lifetime CLI boundary, story 1-6): each `kt` command is a
+    // NOTE (single-lifetime CLI boundary, story 1-6): each `hemaka` command is a
     // short-lived engine whose handle Drop kills the process on the command's
     // clean exit (the story-1-4 single-lifetime safety net; durable
     // cross-invocation supervision remains future work — orphan ADOPTION here
     // covers the engine-CRASH case, proven in `tests/adoption.rs`). So this test
     // proves the pause command's CLI WIRING against a live adopted instance; it
-    // does NOT chain a follow-up `kt agent resume` (the paused process does not
+    // does NOT chain a follow-up `hemaka agent resume` (the paused process does not
     // survive the pause command's clean drop). The pause/resume SEMANTICS —
     // including resume after a real SIGSTOP within one engine lifetime — are
     // covered by the engine integration tests in `tests/pause.rs`.
@@ -1352,7 +1352,7 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
         &["--heartbeat-ms", "50", "--linger-ms", "600000"],
         "guaranteed",
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -1365,10 +1365,10 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
     );
     // Start via a surviving (crashed-engine) subprocess so the process is
     // genuinely LIVE when the pause command adopts it (story 1-6). A plain
-    // `kt agent start` would kill it on the command's clean engine drop.
+    // `hemaka agent start` would kill it on the command's clean engine drop.
     start_via_surviving_engine(state_dir, "svc");
 
-    let paused = run_kt_agent(&["agent", "pause", "svc"], &ctx.project_dir, state_dir);
+    let paused = run_hemaka_agent(&["agent", "pause", "svc"], &ctx.project_dir, state_dir);
     assert!(
         paused.success,
         "guaranteed pause should exit 0; stderr={}",
@@ -1385,7 +1385,7 @@ fn pause_prints_paused_state_and_exits_zero_guaranteed_unix() {
 
     // Teardown: the pause command's clean drop already killed the SIGSTOP'd
     // process; a `stop` here settles the row (idempotent, no survivor).
-    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }
 
 #[test]
@@ -1395,7 +1395,7 @@ fn pause_after_windows_engine_death_reconciles_and_fails_honestly_windows() {
     // Windows the surviving-engine helper's child is killed the moment the
     // helper exits (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — cross-lifetime
     // survival genuinely cannot be simulated), so the one Windows-real pause
-    // scenario is the one that follows an engine death: the `kt agent pause`
+    // scenario is the one that follows an engine death: the `hemaka agent pause`
     // command opens an engine over the state dir, adoption finds the gone
     // process behind the `running` row and reconciles it to `failed` (AI-8),
     // and the pause then fails fast with the uniform invalid-transition
@@ -1410,7 +1410,7 @@ fn pause_after_windows_engine_death_reconciles_and_fails_honestly_windows() {
     let state_dir = state.project_dir.as_path();
     let m =
         fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "best-effort");
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "be", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -1466,7 +1466,7 @@ fn pause_after_windows_engine_death_reconciles_and_fails_honestly_windows() {
 
     // The pause command must surface the honest reconciled-to-`failed`
     // invalid transition, on stderr, with a non-zero exit.
-    let paused = run_kt_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
+    let paused = run_hemaka_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
     assert!(
         !paused.success,
         "pause after the reconciled engine death must exit non-zero; stdout={}",
@@ -1491,7 +1491,7 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     // outside the backends allowlist). This test drives the story-1-6 cross-
     // process adoption harness (`start_via_surviving_engine`): a subprocess
     // starts the agent and exits WITHOUT a graceful stop so the child re-parents
-    // and survives, then a separate `kt` command adopts it live. That survival
+    // and survives, then a separate `hemaka` command adopts it live. That survival
     // relies on Unix re-parenting to init; on Windows JOB_OBJECT_LIMIT_KILL_ON_
     // JOB_CLOSE kills the child when the helper exits, so the next `Engine::open`
     // adoption reconciles the row to `failed` and pause can't run. Cross-lifetime
@@ -1513,16 +1513,16 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     let state_dir = state.project_dir.as_path();
     let m =
         fake_agent_manifest_with_pause(&ctx.project_dir, &["--linger-ms", "600000"], "best-effort");
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "be", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
     );
     // Start via a surviving (crashed-engine) subprocess so the process is live
-    // when pause adopts it (story 1-6); a plain `kt agent start` kills it on exit.
+    // when pause adopts it (story 1-6); a plain `hemaka agent start` kills it on exit.
     start_via_surviving_engine(state_dir, "be");
 
-    let paused = run_kt_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
+    let paused = run_hemaka_agent(&["agent", "pause", "be"], &ctx.project_dir, state_dir);
     assert!(
         paused.success,
         "best-effort pause should exit 0; stderr={}",
@@ -1544,7 +1544,7 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     );
 
     // Teardown.
-    run_kt_agent(&["agent", "stop", "be"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "be"], &ctx.project_dir, state_dir);
 }
 
 #[test]
@@ -1572,7 +1572,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     }
     // AC3 + AC6 at the CLI: a pause that is `unsupported` on this OS fails fast
     // with a non-zero exit and a diagnostic (on STDERR) that QUOTES the
-    // declaration (names pause, the OS, the level) and points at `kt agent show`.
+    // declaration (names pause, the OS, the level) and points at `hemaka agent show`.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -1591,7 +1591,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         .guaranteed_on_all_oses("interaction")
         .write(&m);
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -1601,7 +1601,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // the UNSUPPORTED diagnostic, not a reconciled-to-failed transition error.
     start_via_surviving_engine(state_dir, "un");
 
-    let paused = run_kt_agent(&["agent", "pause", "un"], &ctx.project_dir, state_dir);
+    let paused = run_hemaka_agent(&["agent", "pause", "un"], &ctx.project_dir, state_dir);
     assert!(
         !paused.success,
         "unsupported pause must exit non-zero; stdout={}",
@@ -1628,20 +1628,20 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         paused.stderr
     );
     assert!(
-        paused.stderr.contains("kt agent show un"),
-        "stderr must point at kt agent show; stderr={}",
+        paused.stderr.contains("hemaka agent show un"),
+        "stderr must point at hemaka agent show; stderr={}",
         paused.stderr
     );
     // Fail-fast made NO transition to `paused`: the pause command exited
     // non-zero WITHOUT persisting a pause. (We do not re-check the state via a
-    // follow-up `kt` command here: each command's clean engine drop kills the
+    // follow-up `hemaka` command here: each command's clean engine drop kills the
     // adopted process, and the next command's honest adoption would then
     // reconcile the gone process to `failed` — a single-lifetime CLI artifact,
     // NOT a pause side effect. The no-persist guarantee of the unsupported
     // fail-fast is proven at the engine level in `tests/pause.rs`.)
 
     // Teardown.
-    run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
 }
 
 #[test]
@@ -1651,12 +1651,12 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "nat", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "pause", "nat"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "pause", "nat"], &ctx.project_dir, state_dir);
     assert!(!run.success, "pause on registered should exit non-zero");
     assert!(
         run.stderr.contains("cannot pause"),
@@ -1665,7 +1665,7 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     );
 }
 
-// ---- Story 4-1: `kt agent send <name> <text>` (AC-A, AC-B, AC-C) ----
+// ---- Story 4-1: `hemaka agent send <name> <text>` (AC-A, AC-B, AC-C) ----
 
 /// Write a `fake_agent` manifest whose CURRENT-OS interaction level is
 /// `interaction_level` (mirrors `fake_agent_manifest_with_pause`; NO pause
@@ -1702,7 +1702,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     // pause only needs the pgid/PID, which adoption fully restores), but for
     // `send` it is structurally impossible to succeed: `start_via_surviving_engine`
     // starts the agent in a SEPARATE helper subprocess that exits without
-    // dropping its engine, so the SEPARATE `kt agent send` invocation this
+    // dropping its engine, so the SEPARATE `hemaka agent send` invocation this
     // test drives NECESSARILY reaches the instance only via `adopt_orphans`
     // — and an adopted handle NEVER carries a recoverable stdin pipe (AC-D,
     // Task 1's `adopt()`), on Unix or Windows alike (this is not an OS
@@ -1717,7 +1717,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     // session holds"). So this test instead proves the CLI-level surfacing
     // of AC-D's honest failure (genuinely new coverage: the
     // `AgentInteractionUnavailable` diagnostic's rendering through the real
-    // `kt` binary, which no other test exercises) — never
+    // `hemaka` binary, which no other test exercises) — never
     // `CapabilityUnsupported`, never a silent success, and NO input
     // delivered. AC-A's single-session happy path (exit 0 + delivered input)
     // is fully proven at the engine level by
@@ -1741,7 +1741,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
         &["--echo-stdin", "--linger-ms", "600000"],
         "guaranteed",
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -1756,7 +1756,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     // genuinely LIVE when the send command's SEPARATE engine adopts it.
     start_via_surviving_engine(state_dir, "svc");
 
-    let sent = run_kt_agent(
+    let sent = run_hemaka_agent(
         &["agent", "send", "svc", "hello"],
         &ctx.project_dir,
         state_dir,
@@ -1818,7 +1818,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     );
 
     // Teardown: stop the adopted process so no orphan remains.
-    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }
 
 #[test]
@@ -1854,7 +1854,7 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         .capability_on_os("interaction", other, "guaranteed")
         .write(&m);
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "un", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -1864,7 +1864,7 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // the UNSUPPORTED diagnostic, not a reconciled-to-failed transition error.
     start_via_surviving_engine(state_dir, "un");
 
-    let sent = run_kt_agent(
+    let sent = run_hemaka_agent(
         &["agent", "send", "un", "hello"],
         &ctx.project_dir,
         state_dir,
@@ -1894,8 +1894,8 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
         sent.stderr
     );
     assert!(
-        sent.stderr.contains("kt agent show un"),
-        "stderr must point at kt agent show; stderr={}",
+        sent.stderr.contains("hemaka agent show un"),
+        "stderr must point at hemaka agent show; stderr={}",
         sent.stderr
     );
 
@@ -1907,7 +1907,7 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     );
 
     // Teardown.
-    run_kt_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "un"], &ctx.project_dir, state_dir);
 }
 
 #[test]
@@ -1920,12 +1920,12 @@ fn send_on_registered_instance_is_not_running() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "nat", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "send", "nat", "hello"],
         &ctx.project_dir,
         state_dir,
@@ -1964,7 +1964,7 @@ fn send_text_that_looks_like_help_flag_is_sent_literally_not_intercepted_as_cli_
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let sent = run_kt_agent(
+    let sent = run_hemaka_agent(
         &["agent", "send", "ghost", "--help"],
         &ctx.project_dir,
         state_dir,
@@ -1987,11 +1987,11 @@ fn send_text_that_looks_like_help_flag_is_sent_literally_not_intercepted_as_cli_
         sent.stderr
     );
 
-    // The hyphen-value parse problem (`kt agent send x "-5 degrees"` used to
+    // The hyphen-value parse problem (`hemaka agent send x "-5 degrees"` used to
     // be a clap parse error) is likewise fixed: a leading-hyphen text value
     // reaches the ordinary send logic instead of a clap "unexpected
     // argument" failure.
-    let sent2 = run_kt_agent(
+    let sent2 = run_hemaka_agent(
         &["agent", "send", "ghost", "-5 degrees"],
         &ctx.project_dir,
         state_dir,
@@ -2029,20 +2029,20 @@ fn force_state_paused(state_dir: &Path, name: &str) {
 fn send_on_a_paused_instance_is_not_running_with_resume_remediation_not_start() {
     // M2 fix: `NotRunning`'s remediation must match the instance's ACTUAL
     // state. Before the fix, the message UNCONDITIONALLY said "start it
-    // first with: kt agent start <name>" even for a `paused` instance —
+    // first with: hemaka agent start <name>" even for a `paused` instance —
     // but `start` on a paused instance hits `InvalidTransition` (a SECOND,
-    // confusing error), since the correct remediation is `kt agent resume`.
+    // confusing error), since the correct remediation is `hemaka agent resume`.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "pz", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     force_state_paused(state_dir, "pz");
 
-    let sent = run_kt_agent(
+    let sent = run_hemaka_agent(
         &["agent", "send", "pz", "hello"],
         &ctx.project_dir,
         state_dir,
@@ -2062,12 +2062,12 @@ fn send_on_a_paused_instance_is_not_running_with_resume_remediation_not_start() 
         sent.stderr
     );
     assert!(
-        sent.stderr.contains("kt agent resume pz"),
+        sent.stderr.contains("hemaka agent resume pz"),
         "the remediation must point at resume for a paused instance; stderr={}",
         sent.stderr
     );
     assert!(
-        !sent.stderr.contains("kt agent start pz"),
+        !sent.stderr.contains("hemaka agent start pz"),
         "must NOT suggest start (which would hit a second, confusing \
          InvalidTransition error on a paused instance); stderr={}",
         sent.stderr
@@ -2108,18 +2108,18 @@ fn seed_failed_with_record(state_dir: &Path, name: &str, policy: &str, count: u3
 
 #[test]
 fn list_surfaces_the_restart_count_column() {
-    // AC9: `kt agent list` surfaces the per-instance restart count.
+    // AC9: `hemaka agent list` surfaces the per-instance restart count.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "svc", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     seed_failed_with_record(state_dir, "svc", "on-failure", 3, "crashed with code 1");
 
-    let list = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(list.success, "list should exit 0; stderr={}", list.stderr);
     // The Restarts column header + the seeded count 3 are rendered (stdout).
     assert!(
@@ -2138,12 +2138,12 @@ fn list_surfaces_the_restart_count_column() {
 
 #[test]
 fn show_surfaces_restart_count_policy_and_failed_cause() {
-    // AC9: `kt agent show` on a failed instance surfaces the restart count, the
+    // AC9: `hemaka agent show` on a failed instance surfaces the restart count, the
     // active Restart Policy, and the failed cause (result → stdout).
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "svc", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -2156,7 +2156,7 @@ fn show_surfaces_restart_count_policy_and_failed_cause() {
         "crash-loop: 5 consecutive failures reached",
     );
 
-    let show = run_kt_agent(&["agent", "show", "svc"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "svc"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should exit 0; stderr={}", show.stderr);
     // Runtime status block: state + policy + count.
     assert!(
@@ -2186,7 +2186,7 @@ fn show_surfaces_restart_count_policy_and_failed_cause() {
 fn show_surfaces_a_launch_error_failed_cause() {
     // F-Med-3 (AC9): a LAUNCH-ERROR `failed` instance has no write-ahead spawn
     // record (the `starting→failed` launch error returns before the record is
-    // written), yet `kt agent show` must still surface the failed cause — via the
+    // written), yet `hemaka agent show` must still surface the failed cause — via the
     // engine's event-log fallback. Register a manifest whose exec does not exist,
     // start it (fails to launch), then `show` must print the launch diagnostic.
     let ctx = TestContext::new();
@@ -2201,7 +2201,7 @@ contract_version = "1.0.0"
 kind = "bad"
 
 [lifecycle.start]
-exec = "ktesio-no-such-binary-cli-med3"
+exec = "hemaka-no-such-binary-cli-med3"
 
 [capabilities.interaction]
 linux = "guaranteed"
@@ -2212,7 +2212,7 @@ windows = "guaranteed"
 source = "self-reported"
 "#;
     std::fs::write(m.join("adapter.toml"), body).unwrap();
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -2224,16 +2224,16 @@ source = "self-reported"
         state_dir,
     );
     // Start fails to launch (exit non-zero) and lands the instance `failed`.
-    let start = run_kt_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
+    let start = run_hemaka_agent(&["agent", "start", "bad"], &ctx.project_dir, state_dir);
     assert!(!start.success, "start of a bad exec should exit non-zero");
 
-    let show = run_kt_agent(&["agent", "show", "bad"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "bad"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should exit 0; stderr={}", show.stderr);
     // The runtime status shows `failed`, and the failed cause (the preserved
     // launch diagnostic naming the missing exec) is surfaced on stdout.
     assert!(show.stdout.contains("failed"), "stdout={}", show.stdout);
     assert!(
-        show.stdout.contains("ktesio-no-such-binary-cli-med3"),
+        show.stdout.contains("hemaka-no-such-binary-cli-med3"),
         "show must surface the launch-error failed cause (AC9); stdout={}",
         show.stdout
     );
@@ -2241,7 +2241,7 @@ source = "self-reported"
 
 #[test]
 fn start_restarts_a_failed_instance() {
-    // AC3 at the CLI: `kt agent start` restarts a `failed` instance (the 1-6
+    // AC3 at the CLI: `hemaka agent start` restarts a `failed` instance (the 1-6
     // transition row `failed → starting` permits it). Seed a `failed` instance
     // backed by a real `fake_agent` manifest, then start it → running.
     let ctx = TestContext::new();
@@ -2274,7 +2274,7 @@ source = "self-reported"
     );
     std::fs::write(manifest_dir.project_dir.join("adapter.toml"), body).unwrap();
     let manifest_path = manifest_dir.project_dir.to_string_lossy().to_string();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "svc", "--manifest", &manifest_path],
         &ctx.project_dir,
         state_dir,
@@ -2288,8 +2288,8 @@ source = "self-reported"
     .unwrap();
     drop(conn);
 
-    // `kt agent start` on a failed instance restarts it → running (exit 0).
-    let start = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    // `hemaka agent start` on a failed instance restarts it → running (exit 0).
+    let start = run_hemaka_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
     assert!(
         start.success,
         "start on a failed instance should restart it (exit 0); stderr={}",
@@ -2298,12 +2298,12 @@ source = "self-reported"
     assert!(start.stdout.contains("running"), "stdout={}", start.stdout);
 
     // Teardown: stop it so the process does not linger.
-    run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
 }
 
 #[test]
 fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
-    // Story 1-7 (AC5/AC9) + story 3-1 (AC-C/AC11): `kt agent list --json` writes ONE
+    // Story 1-7 (AC5/AC9) + story 3-1 (AC-C/AC11): `hemaka agent list --json` writes ONE
     // parseable JSON document to stdout (and NOTHING non-JSON there), carrying a
     // top-level schema_version + per-instance objects whose `budget` is the honest
     // JSON `null` seed (budgets are 3-2) while `usage` is a REAL token-totals object
@@ -2312,13 +2312,13 @@ fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "alpha", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         run.success,
         "list --json should exit 0; stderr={}",
@@ -2390,7 +2390,7 @@ fn list_json_on_empty_fleet_is_a_valid_empty_document() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         run.success,
         "empty list --json should exit 0; stderr={}",
@@ -2421,13 +2421,13 @@ fn human_list_shows_the_budget_column_and_real_usage_columns() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "alpha", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
     // The columns are present (headers): a Budget column (story 3-3 renamed it from
     // "Budget (tokens)" to "Budget (tok, est. $)") + Usage (real). The header may
@@ -2447,7 +2447,7 @@ fn human_list_shows_the_budget_column_and_real_usage_columns() {
     // header carries the SAME estimate qualifier ("est. $") the Budget header
     // carries — both money-bearing columns label their dollars in the header, so
     // truncation can never strip the label off a cell.
-    let wide = run_kt_agent_with_env(
+    let wide = run_hemaka_agent_with_env(
         &["agent", "list"],
         &ctx.project_dir,
         state_dir,
@@ -2468,20 +2468,20 @@ fn human_list_shows_the_budget_column_and_real_usage_columns() {
 
 #[test]
 fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
-    // Story 1-7 (AC5) + story 3-1: `kt agent show <name> --json` writes ONE JSON
+    // Story 1-7 (AC5) + story 3-1: `hemaka agent show <name> --json` writes ONE JSON
     // document to stdout: { schema_version, instance: <the same FleetEntry shape> },
     // `budget` the honest null seed and `usage` a real token-totals object. The
     // metering note is on stderr.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "alpha", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "show", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -2531,13 +2531,13 @@ fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "alpha", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(&["agent", "show", "alpha"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "show", "alpha"], &ctx.project_dir, state_dir);
     assert!(run.success, "show should exit 0; stderr={}", run.stderr);
     assert!(run.stdout.contains("Budget"), "stdout={}", run.stdout);
     assert!(run.stdout.contains("Usage"), "stdout={}", run.stdout);
@@ -2557,7 +2557,7 @@ fn human_show_surfaces_the_budget_row_and_real_usage_rows() {
     assert!(run.stderr.contains("Usage Ledger"), "stderr={}", run.stderr);
 }
 
-// ---- Story 6-3: the UJ-1 governance journey through documented kt commands ----
+// ---- Story 6-3: the UJ-1 governance journey through documented hemaka commands ----
 
 #[test]
 fn uj1_governance_journey_through_documented_cli_commands() {
@@ -2583,7 +2583,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
     let state_dir = state.project_dir.as_path();
 
     // (1) Register the hermes instance.
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &["agent", "register", "gw", "--kind", "hermes"],
         &ctx.project_dir,
         state_dir,
@@ -2598,7 +2598,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
         ("cost.rate.output", "1.00"),
         ("budget.dollars.cumulative", "0.00009"),
     ] {
-        let set = run_kt_agent(
+        let set = run_hemaka_agent(
             &["agent", "config", "set", "gw", key, value],
             &ctx.project_dir,
             state_dir,
@@ -2612,7 +2612,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
 
     // (3) `show --json`: the governed shape — budget populated, usage real
     // (zero tokens), metering_source honest.
-    let show = run_kt_agent(
+    let show = run_hemaka_agent(
         &["agent", "show", "gw", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -2653,7 +2653,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
     assert_eq!(usage["estimate_label"], serde_json::json!("estimated"));
 
     // (4) `usage <name> --json`: the focused surface over the SAME data.
-    let uj = run_kt_agent(
+    let uj = run_hemaka_agent(
         &["agent", "usage", "gw", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -2678,13 +2678,13 @@ fn uj1_governance_journey_through_documented_cli_commands() {
     // (5) The no-Rate twin: dollars only with a Rate. A second hermes
     // instance with NO cost.rate.* renders the honest inert cost cell —
     // `—` (no fabricated $0.00) — while the metering source stays honest.
-    let reg2 = run_kt_agent(
+    let reg2 = run_hemaka_agent(
         &["agent", "register", "free", "--kind", "hermes"],
         &ctx.project_dir,
         state_dir,
     );
     assert!(reg2.success, "register free: stderr={}", reg2.stderr);
-    let ufree = run_kt_agent(&["agent", "usage", "free"], &ctx.project_dir, state_dir);
+    let ufree = run_hemaka_agent(&["agent", "usage", "free"], &ctx.project_dir, state_dir);
     assert!(ufree.success, "usage free: stderr={}", ufree.stderr);
     assert!(
         ufree.stdout.contains("Metering source"),
@@ -2710,7 +2710,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
     );
 }
 
-// ---- Story 7-1: the UJ-3 journey through documented kt commands ----
+// ---- Story 7-1: the UJ-3 journey through documented hemaka commands ----
 
 /// The re-exec entry for the UJ-3 journey's breach leg (mirrors
 /// `agent_cli_start_helper_subprocess` above). It runs ONLY when BOTH env
@@ -2726,7 +2726,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
 /// own facade read — the paused-entry leg is proven on BOTH paths), and only
 /// then exits WITHOUT dropping the engine (crash semantics): the suspended
 /// `fake_agent` survives, re-parents to init, and stays adoptable by the next
-/// documented `kt agent stop`.
+/// documented `hemaka agent stop`.
 #[test]
 fn agent_cli_uj3_breach_helper_subprocess() {
     let Ok(name) = std::env::var("KTESIO_CLI_UJ3_BREACH_HELPER") else {
@@ -2791,7 +2791,7 @@ fn start_via_uj3_breach_helper(state_dir: &Path, name: &str) {
 /// Best-effort orphan guard for the journey's breach leg: between the helper's
 /// crash-style exit and the stop leg, ANY failure would leak the SIGSTOP'd
 /// `fake_agent` (a 10-minute linger) as a real orphan. Drop runs the
-/// documented `kt agent stop <name> --timeout 0` unless disarmed — best-effort,
+/// documented `hemaka agent stop <name> --timeout 0` unless disarmed — best-effort,
 /// never panicking in Drop (a guard stop on an already-dead instance is a
 /// harmless error, and a Drop panic would mask the test's own failure). The
 /// guard lives in the PARENT test process, so it fires even if the helper
@@ -2816,7 +2816,7 @@ impl StopOrphanOnDrop<'_> {
 impl Drop for StopOrphanOnDrop<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = run_kt_agent(
+            let _ = run_hemaka_agent(
                 &["agent", "stop", self.name, "--timeout", &self.timeout_arg],
                 self.working_dir,
                 self.state_dir,
@@ -2830,11 +2830,11 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // Story 7-1 (FR-31), the behavioral-identity half: the SAME UJ-3 flow the
     // library host test (`crates/hemaka-engine/tests/uj3_library_host.rs`)
     // drives through the engine's `Blocking` facade is driven here through
-    // DOCUMENTED `kt` commands only — register --manifest, config set,
+    // DOCUMENTED `hemaka` commands only — register --manifest, config set,
     // config get, show --json / usage --json, stop — and EVERY assertion comes
     // from the SHARED `hemaka_conformance::uj3` module (the expectations are
     // pinned once; neither suite re-states them). The two suites drive
-    // DIFFERENT roots (this one: the `KTESIO_STATE_DIR`-pinned kt harness home;
+    // DIFFERENT roots (this one: the `KTESIO_STATE_DIR`-pinned hemaka harness home;
     // the host: its own temp engine root); the shared module asserts on
     // OBSERVED reads, never on paths.
     //
@@ -2847,9 +2847,9 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // there, not re-tested; §4.7 is the manifest contract itself; §4.9 and
     // §4.10 are out of scope (epic 8/9).
     //
-    // SINGLE-LIFETIME CLI BOUNDARY (the documented `kt agent start` contract):
-    // a standalone `kt agent start` kills the process on the command's clean
-    // engine drop, and ANY intervening `kt` command that adopts a live process
+    // SINGLE-LIFETIME CLI BOUNDARY (the documented `hemaka agent start` contract):
+    // a standalone `hemaka agent start` kills the process on the command's clean
+    // engine drop, and ANY intervening `hemaka` command that adopts a live process
     // kills it on ITS clean drop too — so a live agent cannot be read across
     // separate CLI invocations by construction. The flow therefore reads the
     // instance at the safe points — before the start (no process), from the
@@ -2887,7 +2887,7 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // (1) §4.1/§4.7 register through the SHARED fixture manifest (contract v1,
     // per-OS declaration, self-reported metering, the `model` → env mapping).
     let manifest_dir = uj3::write_flow_manifest(&ctx.project_dir.join("uj3-flow"));
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -2903,7 +2903,7 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // (2) §4.3/§4.5 configure: the SHARED key/value pairs (the same writes the
     // host test performs through `Blocking::set_config`).
     for (key, value) in uj3::flow_config_pairs() {
-        let set = run_kt_agent(
+        let set = run_hemaka_agent(
             &["agent", "config", "set", name, key, value],
             &ctx.project_dir,
             state_dir,
@@ -2918,7 +2918,7 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // (3) §4.3 read back with provenance: the configured `model` leaf resolves
     // at the pinned layer. The SAME shared assertion the host test feeds from
     // `effective_config`.
-    let cfg = run_kt_agent(
+    let cfg = run_hemaka_agent(
         &["agent", "config", "get", name, uj3::MODEL_KEY, "--json"],
         &ctx.project_dir,
         state_dir,
@@ -2963,7 +2963,7 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // lands the terminal state. The SHARED zero window (a SIGSTOP'd process
     // cannot act on SIGTERM — the graceful window would always fully elapse),
     // the same value the host facade passes.
-    let stop = run_kt_agent(
+    let stop = run_hemaka_agent(
         &[
             "agent",
             "stop",
@@ -2998,13 +2998,13 @@ fn uj3_governance_journey_through_documented_cli_commands_unix() {
     uj3::assert_paused_transition_budget_exceeded(&uj3::read_transition_events(state_dir, name));
 }
 
-/// Run the documented `kt agent show <name> --json` and parse the instance row
+/// Run the documented `hemaka agent show <name> --json` and parse the instance row
 /// back into the engine's `FleetEntry` — the SAME serde shape the host test's
 /// facade read returns. The document's `schema_version` is asserted against
 /// the engine's pinned Fleet constant (AD-14: "one schema, two consumers" is
 /// PINNED here, not merely serde-tolerated).
 fn show_entry(ctx: &TestContext, state_dir: &Path, name: &str) -> FleetEntry {
-    let show = run_kt_agent(
+    let show = run_hemaka_agent(
         &["agent", "show", name, "--json"],
         &ctx.project_dir,
         state_dir,
@@ -3021,13 +3021,13 @@ fn show_entry(ctx: &TestContext, state_dir: &Path, name: &str) -> FleetEntry {
         .unwrap_or_else(|e| panic!("show --json instance is not a FleetEntry: {e}\n{doc}"))
 }
 
-/// Run the documented `kt agent usage <name> --json` and parse the usage
+/// Run the documented `hemaka agent usage <name> --json` and parse the usage
 /// object back into the engine's `UsageView`. The named usage document
 /// carries the SAME Fleet `schema_version` as `list`/`show` (it serializes
 /// the same fleet domain types) — asserted against the engine's pinned
 /// constant, never a local literal.
 fn usage_view(ctx: &TestContext, state_dir: &Path, name: &str) -> UsageView {
-    let usage = run_kt_agent(
+    let usage = run_hemaka_agent(
         &["agent", "usage", name, "--json"],
         &ctx.project_dir,
         state_dir,
@@ -3054,12 +3054,12 @@ fn config_set_rejects_a_malformed_rate_value_with_a_diagnostic() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let bad = run_kt_agent(
+    let bad = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3082,7 +3082,7 @@ fn config_set_rejects_a_malformed_rate_value_with_a_diagnostic() {
         bad.stderr
     );
     // Sub-micro precision is likewise rejected.
-    let submicro = run_kt_agent(
+    let submicro = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3112,13 +3112,13 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     // Both directions → a supplied Rate; a cumulative dollar cap.
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3130,7 +3130,7 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3142,7 +3142,7 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3156,7 +3156,7 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
     );
 
     // --json: integer micros + label, NO `$` string.
-    let json = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let json = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         json.success,
         "list --json should exit 0; stderr={}",
@@ -3194,7 +3194,7 @@ fn rate_and_cap_render_labeled_dollars_in_list_json_and_human() {
     // the narrow `list` cells render dollars BARE — the `(estimated)` qualifier
     // lives in the headers; the untruncated `show` surface asserts the inline
     // label — see `show_of_a_rated_instance_surfaces_a_labeled_cost_row`.)
-    let human = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let human = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(human.success, "list should exit 0; stderr={}", human.stderr);
     assert!(
         human.stdout.contains('$'),
@@ -3221,7 +3221,7 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -3233,14 +3233,14 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
         ("cost.rate.output", "15.00"),
         ("budget.dollars.cumulative", "5.00"),
     ] {
-        run_kt_agent(
+        run_hemaka_agent(
             &["agent", "config", "set", "priced", key, value],
             &ctx.project_dir,
             state_dir,
         );
     }
 
-    let human = run_kt_agent_with_env(
+    let human = run_hemaka_agent_with_env(
         &["agent", "list"],
         &ctx.project_dir,
         state_dir,
@@ -3315,12 +3315,12 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3332,7 +3332,7 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3345,7 +3345,7 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
         state_dir,
     );
     // A cumulative dollar cap too, so the Budget row renders a dollar Cost Cap pair.
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3358,7 +3358,7 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
         state_dir,
     );
 
-    let show = run_kt_agent(&["agent", "show", "priced"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "priced"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should exit 0; stderr={}", show.stderr);
     assert!(
         show.stdout.contains("Cost (estimated)"),
@@ -3391,13 +3391,13 @@ fn show_of_a_no_rate_instance_says_dollar_features_are_inert() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "norate", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let show = run_kt_agent(&["agent", "show", "norate"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "norate"], &ctx.project_dir, state_dir);
     assert!(show.success, "show should exit 0; stderr={}", show.stderr);
     assert!(
         show.stdout.contains("dollar features inert"),
@@ -3418,27 +3418,27 @@ fn show_of_a_no_rate_instance_says_dollar_features_are_inert() {
 
 #[test]
 fn list_json_carries_a_fleet_totals_object_bumped_to_schema_2() {
-    // Story 3-5 (AC-A/AC9): `kt agent list --json` carries a top-level `totals` object
+    // Story 3-5 (AC-A/AC9): `hemaka agent list --json` carries a top-level `totals` object
     // and the Fleet document version is bumped 1 → 2 (additive). With one Rate'd
     // instance at zero usage, the token totals are 0 and the dollar total is a labeled
     // $0 (a Rate exists ⇒ nothing partial). Integer micros + label on the wire; NO `$`.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
-        run_kt_agent(
+        run_hemaka_agent(
             &["agent", "config", "set", "priced", key, value],
             &ctx.project_dir,
             state_dir,
         );
     }
 
-    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         run.success,
         "list --json should exit 0; stderr={}",
@@ -3478,25 +3478,25 @@ fn list_json_totals_carry_the_partial_flag_field() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "free", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
-        run_kt_agent(
+        run_hemaka_agent(
             &["agent", "config", "set", "priced", key, value],
             &ctx.project_dir,
             state_dir,
         );
     }
 
-    let run = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(run.success, "stderr={}", run.stderr);
     let doc: serde_json::Value = serde_json::from_str(&run.stdout).unwrap();
     // Two instances aggregated; the `priced` one has a Rate (dollar total present +
@@ -3513,26 +3513,26 @@ fn list_json_totals_carry_the_partial_flag_field() {
 
 #[test]
 fn human_list_renders_the_fleet_total_footer() {
-    // AC-A/AC-B: the human `kt agent list` renders a Fleet-wide total footer on stdout.
+    // AC-A/AC-B: the human `hemaka agent list` renders a Fleet-wide total footer on stdout.
     // A Rate'd instance ⇒ the footer carries a labeled dollar total THROUGH the currency
     // module (a `$` figure + the estimate label); the footer names the token totals too.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "priced", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     for (key, value) in [("cost.rate.input", "3.00"), ("cost.rate.output", "15.00")] {
-        run_kt_agent(
+        run_hemaka_agent(
             &["agent", "config", "set", "priced", key, value],
             &ctx.project_dir,
             state_dir,
         );
     }
 
-    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
     // The footer is on stdout (command output, AD-12).
     assert!(
@@ -3561,13 +3561,13 @@ fn human_list_footer_no_rate_shows_dash_not_zero_dollars() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "norate", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "list"], &ctx.project_dir, state_dir);
     assert!(run.success, "list should exit 0; stderr={}", run.stderr);
     assert!(
         run.stdout.contains("Fleet total:"),
@@ -3588,7 +3588,7 @@ fn human_list_footer_no_rate_shows_dash_not_zero_dollars() {
     );
 }
 
-// ---- Story 2-1: `kt agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
+// ---- Story 2-1: `hemaka agent config set` / `get` (AC10, AC-B, AC7, AD-12) ----
 
 #[test]
 fn config_set_then_get_shows_the_value_on_stdout() {
@@ -3597,13 +3597,13 @@ fn config_set_then_get_shows_the_value_on_stdout() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
@@ -3612,7 +3612,7 @@ fn config_set_then_get_shows_the_value_on_stdout() {
     assert!(set.stdout.contains("Set"), "stdout={}", set.stdout);
 
     // Single-key get: the bare value on stdout.
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "model"],
         &ctx.project_dir,
         state_dir,
@@ -3625,7 +3625,7 @@ fn config_set_then_get_shows_the_value_on_stdout() {
     );
 
     // Whole-config get: a Key/Value table on stdout, provenance note on stderr.
-    let get_all = run_kt_agent(
+    let get_all = run_hemaka_agent(
         &["agent", "config", "get", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -3664,13 +3664,13 @@ fn config_get_effective_is_empty_before_any_set() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -3695,18 +3695,18 @@ fn config_set_instance_value_is_read_back() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "claude-opus"],
         &ctx.project_dir,
         state_dir,
     );
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "model"],
         &ctx.project_dir,
         state_dir,
@@ -3725,12 +3725,12 @@ fn config_set_child_under_scalar_fails_closed() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "agent.a", "v1"],
         &ctx.project_dir,
         state_dir,
@@ -3738,7 +3738,7 @@ fn config_set_child_under_scalar_fails_closed() {
     let config_path = state_dir.join("agents").join("demo").join("config.toml");
     let before = std::fs::read(&config_path).unwrap();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "config", "set", "demo", "agent.a.b", "v2"],
         &ctx.project_dir,
         state_dir,
@@ -3767,7 +3767,7 @@ fn config_set_unknown_key_is_rejected_with_suggestion_and_config_unchanged() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
@@ -3777,7 +3777,7 @@ fn config_set_unknown_key_is_rejected_with_suggestion_and_config_unchanged() {
     let before = std::fs::read(&config_path).expect("read config before");
 
     // `modle` is a near-miss for the known key `model`.
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "config", "set", "demo", "modle", "gpt-4"],
         &ctx.project_dir,
         state_dir,
@@ -3809,13 +3809,13 @@ fn config_set_agent_pass_through_key_round_trips_verbatim() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3833,7 +3833,7 @@ fn config_set_agent_pass_through_key_round_trips_verbatim() {
         set.stderr
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "agent.custom_flag"],
         &ctx.project_dir,
         state_dir,
@@ -3855,14 +3855,14 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
     // Bare leading-dash value: no `--` needed.
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &["agent", "config", "set", "demo", "agent.dash_flag", "-x"],
         &ctx.project_dir,
         state_dir,
@@ -3877,7 +3877,7 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
         "must not be rejected as a clap parse error; stderr={}",
         set.stderr
     );
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "agent.dash_flag"],
         &ctx.project_dir,
         state_dir,
@@ -3889,7 +3889,7 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
     );
 
     // A double-dash VALUE also parses literally now.
-    let set2 = run_kt_agent(
+    let set2 = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3906,7 +3906,7 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
         "a `--`-prefixed value must exit 0; stdout={} stderr={}",
         set2.stdout, set2.stderr
     );
-    let get2 = run_kt_agent(
+    let get2 = run_hemaka_agent(
         &["agent", "config", "get", "demo", "agent.dash_flag2"],
         &ctx.project_dir,
         state_dir,
@@ -3918,7 +3918,7 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
     );
 
     // The classic `--` separator form still works.
-    let set3 = run_kt_agent(
+    let set3 = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -3936,7 +3936,7 @@ fn config_set_accepts_leading_dash_values_without_the_dashdash_separator() {
         "the `--` separator form must still work; stdout={} stderr={}",
         set3.stdout, set3.stderr
     );
-    let get3 = run_kt_agent(
+    let get3 = run_hemaka_agent(
         &["agent", "config", "get", "demo", "agent.dash_flag3"],
         &ctx.project_dir,
         state_dir,
@@ -3960,7 +3960,7 @@ fn config_set_secret_on_a_flag_targeted_key_warns_on_stderr_but_exits_zero() {
     let state_dir = state.project_dir.as_path();
     let manifest_body = format!("{VALID_MANIFEST}\n[config.model]\nflag = \"--model\"\n");
     let m = manifest_dir(&ctx.project_dir, &manifest_body);
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -3977,7 +3977,7 @@ fn config_set_secret_on_a_flag_targeted_key_warns_on_stderr_but_exits_zero() {
         reg.stderr
     );
 
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &["agent", "config", "set", "flg", "model", "secret:MY_SECRET"],
         &ctx.project_dir,
         state_dir,
@@ -4011,12 +4011,12 @@ fn config_set_secret_on_a_flag_targeted_key_warns_on_stderr_but_exits_zero() {
 
     // The quiet control: the same secret on an ENV-targeted (mock's `model`)
     // instance warns NOTHING.
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "envq", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let quiet = run_kt_agent(
+    let quiet = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4048,7 +4048,7 @@ fn config_get_unknown_instance_exits_nonzero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "config", "get", "ghost"],
         &ctx.project_dir,
         state_dir,
@@ -4078,12 +4078,12 @@ fn config_get_table_prefix_exits_nonzero_and_names_the_child_leaves() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4097,7 +4097,7 @@ fn config_get_table_prefix_exits_nonzero_and_names_the_child_leaves() {
     );
 
     // The table prefix: non-zero exit, nothing on stdout, children named on stderr.
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "config", "get", "demo", "budget"],
         &ctx.project_dir,
         state_dir,
@@ -4125,7 +4125,7 @@ fn config_get_table_prefix_exits_nonzero_and_names_the_child_leaves() {
 
     // A key that is NEITHER a value NOR a prefix keeps the plain unknown-key
     // diagnostic — no children named, because none exist.
-    let unknown = run_kt_agent(
+    let unknown = run_hemaka_agent(
         &["agent", "config", "get", "demo", "cost"],
         &ctx.project_dir,
         state_dir,
@@ -4149,7 +4149,7 @@ fn config_get_table_prefix_exits_nonzero_and_names_the_child_leaves() {
     );
 
     // The leaf path is unchanged: the exact key with a value still prints it.
-    let leaf = run_kt_agent(
+    let leaf = run_hemaka_agent(
         &["agent", "config", "get", "demo", "budget.tokens.cumulative"],
         &ctx.project_dir,
         state_dir,
@@ -4176,24 +4176,24 @@ fn config_get_marks_agent_pass_through_leaf_unvalidated_and_known_key_validated(
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     // A known key (validated) and an agent.* pass-through key (unvalidated).
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -4241,18 +4241,18 @@ fn config_get_known_key_only_shows_no_unvalidated_marker() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -4286,18 +4286,18 @@ fn config_get_human_shows_source_column_with_the_winning_layer() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -4332,23 +4332,23 @@ fn config_get_json_emits_source_per_leaf_on_stdout() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "agent.custom_flag", "on"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -4389,18 +4389,18 @@ fn config_get_single_key_json_emits_just_that_leaf() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "demo", "model", "claude-opus"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let get = run_kt_agent(
+    let get = run_hemaka_agent(
         &["agent", "config", "get", "demo", "model", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -4421,7 +4421,7 @@ fn config_get_persists_effective_config_snapshot_at_start() {
     // effective-config snapshot (effective-config.json) into the Agent Home,
     // carrying model=<v> tagged `instance`. Uses a live `fake_agent` manifest (the
     // builtin `mock` is inert — its start rejects before the snapshot write), and
-    // reads the Agent Home path from `register`'s stdout (path authority — kt
+    // reads the Agent Home path from `register`'s stdout (path authority — hemaka
     // never constructs it). The started process is cleaned up on this CLI exit
     // (kill-on-drop), so no separate stop is needed.
     let ctx = TestContext::new();
@@ -4429,7 +4429,7 @@ fn config_get_persists_effective_config_snapshot_at_start() {
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
 
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -4455,12 +4455,12 @@ fn config_get_persists_effective_config_snapshot_at_start() {
         .trim()
         .to_string();
 
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "snapcli", "model", "gpt-4o"],
         &ctx.project_dir,
         state_dir,
     );
-    let start = run_kt_agent(&["agent", "start", "snapcli"], &ctx.project_dir, state_dir);
+    let start = run_hemaka_agent(&["agent", "start", "snapcli"], &ctx.project_dir, state_dir);
     assert!(
         start.success,
         "start should exit 0; stderr={}",
@@ -4498,26 +4498,26 @@ fn config_get_persists_effective_config_snapshot_at_start() {
 
 const SECRET_SENTINEL: &str = "s3cr3t-sentinel-VALUE-xyz";
 
-/// A `kt` run with ONE extra environment variable set on the child (so the env
-/// SecretResolver can resolve `secret:NAME` at start). Mirrors `run_kt_agent` but
-/// adds `env(key, value)`; the child `kt` process inherits it, and the engine it
+/// A `hemaka` run with ONE extra environment variable set on the child (so the env
+/// SecretResolver can resolve `secret:NAME` at start). Mirrors `run_hemaka_agent` but
+/// adds `env(key, value)`; the child `hemaka` process inherits it, and the engine it
 /// spawns reads it via `std::env::var`. Local to the secret tests (the shared
 /// helper does not need a general env knob).
-fn run_kt_agent_env(
+fn run_hemaka_agent_env(
     args: &[&str],
     working_dir: &Path,
     state_dir: &Path,
     env_key: &str,
     env_val: &str,
 ) -> (bool, String, String) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hemaka"))
         .args(args)
         .current_dir(working_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
         .env("KTESIO_STATE_DIR", state_dir)
         .env(env_key, env_val)
         .output()
-        .expect("Failed to execute kt");
+        .expect("Failed to execute hemaka");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -4576,7 +4576,7 @@ fn read_tree_text(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
 #[test]
 fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     // THE no-leak matrix (AC-B, the security heart of FR-14/NFR-6), end-to-end
-    // through the real `kt` binary:
+    // through the real `hemaka` binary:
     //   - a `secret:MODEL_KEY` leaf resolves (env resolver) to a sentinel cleartext;
     //   - the sentinel REACHES the adapter's native mechanism (env=MODEL=<sentinel>
     //     in the --dump file) — the value is USABLE (AC9 delivery);
@@ -4588,8 +4588,8 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     //
     // Cross-OS (AI-35/AI-38, story 11-5): this test used to be runtime-gated
     // Linux-only because its POSITIVE-delivery half observed the one-shot
-    // `kt agent start`'s agent — a process that macOS CI never let become
-    // observable and that Windows' kill-on-close reaps the instant `kt`
+    // `hemaka agent start`'s agent — a process that macOS CI never let become
+    // observable and that Windows' kill-on-close reaps the instant `hemaka`
     // exits. Both legs now run it, via two commissioned fixes: the start
     // goes through the `start_via_surviving_engine` harness (the agent is
     // provably launched by the helper's engine before the helper exits — on
@@ -4615,7 +4615,7 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &marker);
 
     // Register + set `model = secret:NAME` (the reference is what is stored).
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -4634,7 +4634,7 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
         .expect("register stdout names the home")
         .trim()
         .to_string();
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4717,7 +4717,7 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     }
 
     // (NO-LEAK) `config get --json` (default, no --reveal) masks the secret.
-    let get_json = run_kt_agent(
+    let get_json = run_hemaka_agent(
         &["agent", "config", "get", "sek", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -4739,7 +4739,7 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     );
 
     // (NO-LEAK) The human `config get` table masks too (same display path).
-    let get_human = run_kt_agent(
+    let get_human = run_hemaka_agent(
         &["agent", "config", "get", "sek"],
         &ctx.project_dir,
         state_dir,
@@ -4753,7 +4753,7 @@ fn secret_reaches_the_adapter_but_never_leaks_and_reveal_shows_it() {
     // (REVEAL) `config get --json --reveal` re-resolves LIVE and DOES carry the
     // sentinel — the sole un-mask (AC-C). Needs the resolver var in the env for
     // the read (the explicit single-run env helper sets it for this child).
-    let (rok, rout, rerr) = run_kt_agent_env(
+    let (rok, rout, rerr) = run_hemaka_agent_env(
         &["agent", "config", "get", "sek", "--json", "--reveal"],
         &ctx.project_dir,
         state_dir,
@@ -4793,7 +4793,7 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
     let dump = ctx.project_dir.join("agent.dump");
     let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &dump.with_extension("marker"));
 
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -4806,7 +4806,7 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
     );
     assert!(reg.success, "register failed; stderr={}", reg.stderr);
     // A secret leaf (agent.token) + a plain leaf (agent.mode).
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4818,14 +4818,14 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
         &ctx.project_dir,
         state_dir,
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "one", "agent.mode", "fast"],
         &ctx.project_dir,
         state_dir,
     );
 
     // Default single-key --json masks the secret leaf.
-    let masked = run_kt_agent(
+    let masked = run_hemaka_agent(
         &["agent", "config", "get", "one", "agent.token", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -4836,7 +4836,7 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
     assert_eq!(d["entries"][0]["value"], serde_json::json!("secret:****"));
 
     // --reveal on the single secret leaf shows only its cleartext.
-    let (rok, rout, _e) = run_kt_agent_env(
+    let (rok, rout, _e) = run_hemaka_agent_env(
         &[
             "agent",
             "config",
@@ -4857,7 +4857,7 @@ fn secret_single_key_reveal_shows_only_that_leaf_and_default_masks() {
     assert_eq!(d["entries"][0]["value"], serde_json::json!(SECRET_SENTINEL));
 
     // --reveal on a NON-secret leaf is a harmless no-op: the plain value.
-    let (pok, pout, _e) = run_kt_agent_env(
+    let (pok, pout, _e) = run_hemaka_agent_env(
         &[
             "agent",
             "config",
@@ -4889,7 +4889,7 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
     let dump = ctx.project_dir.join("agent.dump");
     let m = fake_agent_manifest_secret_env(&ctx.project_dir, &dump, &dump.with_extension("marker"));
 
-    let reg = run_kt_agent(
+    let reg = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -4908,7 +4908,7 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
         .expect("register stdout names the home")
         .trim()
         .to_string();
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4922,7 +4922,7 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
     );
 
     // Start WITHOUT the env var → unresolved → non-zero, diagnostic names the NAME.
-    let start = run_kt_agent(
+    let start = run_hemaka_agent(
         &["agent", "start", "noresolve"],
         &ctx.project_dir,
         state_dir,
@@ -4944,7 +4944,7 @@ fn unresolved_secret_rejects_the_start_with_a_diagnostic_and_no_state_change() {
     // And `agent list --json` still shows it as `registered` (never
     // `running`/`failed` from a half-launch). Assert on the JSON `state` field —
     // deterministic committed state, not the width-dependent human table.
-    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     let doc: serde_json::Value = serde_json::from_str(&list.stdout)
         .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
     let state = doc["instances"][0]["state"].as_str().unwrap_or("");
@@ -4965,13 +4965,13 @@ fn budget_config_keys_set_and_surface_in_list_json() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
     // Set a cumulative budget + a non-default action.
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -4988,7 +4988,7 @@ fn budget_config_keys_set_and_surface_in_list_json() {
         "set budget should exit 0; stderr={}",
         set.stderr
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -5001,7 +5001,7 @@ fn budget_config_keys_set_and_surface_in_list_json() {
         state_dir,
     );
 
-    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     assert!(
         list.success,
         "list --json should exit 0; stderr={}",
@@ -5025,7 +5025,7 @@ fn budget_config_keys_set_and_surface_in_list_json() {
     // on a narrow terminal, so match a stable prefix; the exact values are asserted
     // on --json above. `show` uses a wider Value column, so assert the full cell
     // there for the action + remaining.
-    let show = run_kt_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "demo"], &ctx.project_dir, state_dir);
     assert!(
         show.stdout.contains("cum 5000/5000") && show.stdout.contains("stop"),
         "human show must render the full token budget cell; stdout=\n{}",
@@ -5040,13 +5040,13 @@ fn an_unbudgeted_instance_shows_the_honest_absent_budget() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "bare", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     let doc: serde_json::Value = serde_json::from_str(&list.stdout)
         .unwrap_or_else(|e| panic!("list --json not JSON: {e}\n{}", list.stdout));
     assert_eq!(
@@ -5059,7 +5059,7 @@ fn an_unbudgeted_instance_shows_the_honest_absent_budget() {
     // The human show shows the `—` absence in the budget cell. (Story 3-3 renamed
     // the `show` row "Budget (tokens)" → "Budget" since it now covers tokens AND the
     // dollar Cost Cap.)
-    let human = run_kt_agent(&["agent", "show", "bare"], &ctx.project_dir, state_dir);
+    let human = run_hemaka_agent(&["agent", "show", "bare"], &ctx.project_dir, state_dir);
     assert!(
         human.stdout.contains("Budget") && human.stdout.contains('—'),
         "human show must render the honest absent budget; stdout=\n{}",
@@ -5075,13 +5075,13 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "demo", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let bad_num = run_kt_agent(
+    let bad_num = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -5100,7 +5100,7 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
         bad_num.stderr
     );
 
-    let bad_action = run_kt_agent(
+    let bad_action = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -5123,7 +5123,7 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
     );
 
     // Nothing was persisted: the budget is still absent in --json.
-    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
     let doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
     assert_eq!(
         doc["instances"][0]["budget"],
@@ -5133,14 +5133,14 @@ fn a_malformed_budget_value_is_rejected_at_write_time() {
     );
 }
 
-// ---- Story 4-2: `kt agent logs <name> [--follow]` (AC-A, AC-B, AC-H) ----
+// ---- Story 4-2: `hemaka agent logs <name> [--follow]` (AC-A, AC-B, AC-H) ----
 
 #[test]
 fn logs_reads_retained_output_after_the_instance_stops_unix() {
     // AC-A: register, start via the surviving-engine harness (so real
     // content genuinely accrues before that starting session exits), stop
-    // it via a SEPARATE `kt agent stop` invocation (which must first adopt
-    // the still-live orphan), then a THIRD, separate `kt agent logs`
+    // it via a SEPARATE `hemaka agent stop` invocation (which must first adopt
+    // the still-live orphan), then a THIRD, separate `hemaka agent logs`
     // invocation reads the complete retained history — the common case,
     // and (unlike 4.1's `send`) expected to succeed even across a clean
     // process boundary, since a stopped instance's log file needs no live
@@ -5156,7 +5156,7 @@ fn logs_reads_retained_output_after_the_instance_stops_unix() {
         &["--heartbeat-ms", "40", "--linger-ms", "600000"],
         "guaranteed",
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -5169,14 +5169,14 @@ fn logs_reads_retained_output_after_the_instance_stops_unix() {
     );
     start_via_surviving_engine(state_dir, "svc");
 
-    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    let stopped = run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
     assert!(
         stopped.success,
         "stop of the adopted instance should exit 0; stderr={}",
         stopped.stderr
     );
 
-    let logs = run_kt_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
+    let logs = run_hemaka_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
     assert!(logs.success, "logs should exit 0; stderr={}", logs.stderr);
     assert!(
         logs.stdout.contains("[agent-out]"),
@@ -5200,11 +5200,11 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
     // AC-H at the CLI layer — the mirror image of 4.1's AC-D CLI test
     // (`send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix`):
     // THERE, `send` on this SAME kind of instance exits non-zero
-    // (`InteractionUnavailable`); HERE, `kt agent logs --follow` reads the
+    // (`InteractionUnavailable`); HERE, `hemaka agent logs --follow` reads the
     // pre-crash captured history with NO error and exits CLEANLY once the
     // instance transitions out of running — proving AC-H (no live
     // handle/daemon needed to read/follow an adopted instance) together
-    // with AC-C (a clean, non-hanging exit) through the real `kt` binary.
+    // with AC-C (a clean, non-hanging exit) through the real `hemaka` binary.
     //
     // RENAMED (fix pass, L3, review of #80) from
     // `logs_follow_on_an_adopted_running_instance_streams_new_output`: the
@@ -5250,7 +5250,7 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
         &["--heartbeat-ms", "40", "--linger-ms", "600000"],
         "guaranteed",
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -5263,11 +5263,11 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
     );
     start_via_surviving_engine(state_dir, "svc");
 
-    // Spawn `kt agent logs svc --follow` in the BACKGROUND (not
-    // `run_kt_agent`, which blocks for full completion) so the main thread
+    // Spawn `hemaka agent logs svc --follow` in the BACKGROUND (not
+    // `run_hemaka_agent`, which blocks for full completion) so the main thread
     // can stop the instance concurrently and observe the follow process
     // exit cleanly on its own.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hemaka"))
         .args(["agent", "logs", "svc", "--follow"])
         .current_dir(&ctx.project_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
@@ -5275,12 +5275,12 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn kt agent logs --follow");
+        .expect("spawn hemaka agent logs --follow");
 
     // Give follow a moment to complete its initial one-shot dump and enter
     // its poll loop, then stop the instance from a SEPARATE process.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    let stopped = run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
     assert!(
         stopped.success,
         "stop of the adopted instance should exit 0; stderr={}",
@@ -5296,7 +5296,7 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "kt agent logs --follow must not hang after the instance stops"
+            "hemaka agent logs --follow must not hang after the instance stops"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
@@ -5341,12 +5341,12 @@ fn logs_on_a_never_started_instance_is_empty_not_an_error() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "register", "nat", "--kind", "mock"],
         &ctx.project_dir,
         state_dir,
     );
-    let run = run_kt_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
     assert!(
         run.success,
         "logs on a never-started instance should exit 0; stderr={}",
@@ -5369,7 +5369,7 @@ fn logs_on_an_unregistered_name_is_not_found() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    let run = run_kt_agent(&["agent", "logs", "ghost"], &ctx.project_dir, state_dir);
+    let run = run_hemaka_agent(&["agent", "logs", "ghost"], &ctx.project_dir, state_dir);
     assert!(
         !run.success,
         "logs on an unregistered name should exit non-zero"
@@ -5385,7 +5385,7 @@ fn logs_on_an_unregistered_name_is_not_found() {
 // Story 4-3 — COMPATIBILITY SURFACE TESTS (FR-26, PRD §7, DC-5/DC-6)
 // ===========================================================================
 //
-// These are THE compatibility gate for `kt`'s two machine-facing contracts:
+// These are THE compatibility gate for `hemaka`'s two machine-facing contracts:
 // the `--json` wire shapes and the numeric exit codes. They run in the
 // `test` CI job (`cargo nextest run --workspace --all-targets`) on all three
 // OSes, so an unannounced change fails CI everywhere.
@@ -5416,7 +5416,7 @@ fn logs_on_an_unregistered_name_is_not_found() {
 // by design — it compares the `hemaka-engine` *Rust* public API. It does NOT
 // see serialized JSON (a `#[serde(rename)]` that silently renames a wire
 // field PASSES semver-checks) and it does not see process exit codes at all.
-// It also never inspects the `kt` binary crate, where the CLI-local documents
+// It also never inspects the `hemaka` binary crate, where the CLI-local documents
 // (`ShowDocument`/`UsageDocument`/`FleetUsageDocument`/`ConfigDocument`) and
 // the exit-code classifier live. So these assertions — not semver-checks —
 // are what make an unannounced wire/exit-code change fail CI.
@@ -5528,7 +5528,7 @@ const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
 // The MEMORY documents — story 6-6, THE ONE ANNOUNCED KEY-SET EDIT
 // ---------------------------------------------------------------------------
 //
-// Epic 5 shipped `kt agent memory attach|detach` human-output-only, deferring
+// Epic 5 shipped `hemaka agent memory attach|detach` human-output-only, deferring
 // the wire surface to Epic 6 with Story 5-1's DC-6 "ONE intentional announced
 // key-set edit" obligation attached (epics.md:614-618). Contract v1's freeze
 // lands it here, in the SAME change that tags 1.0.0, announced in the
@@ -5583,7 +5583,7 @@ fn assert_frozen_keys(value: &serde_json::Value, expected: &[&str], what: &str) 
 fn registered_mock(name: &str) -> (TestContext, TestContext) {
     let ctx = TestContext::new();
     let state = TestContext::new();
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", name, "--kind", "mock"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5613,7 +5613,7 @@ fn priced_instance(name: &str) -> (TestContext, TestContext) {
         ("budget.dollars.per_run", "1.50"),
         ("budget.dollars.cumulative", "25.00"),
     ] {
-        let set = run_kt_agent(
+        let set = run_hemaka_agent(
             &["agent", "config", "set", name, key, value],
             &ctx.project_dir,
             state_dir,
@@ -5637,7 +5637,7 @@ fn list_json_document_key_set_and_schema_version_are_frozen() {
     // FleetEntry rows and a FleetTotals aggregate. Freezes FleetListing +
     // FleetEntry + UsageView + FleetTotals in one real-wire assertion.
     let (ctx, state) = registered_mock("alpha");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "list", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5663,7 +5663,7 @@ fn list_json_document_key_set_and_schema_version_are_frozen() {
 fn show_json_document_key_set_and_schema_version_are_frozen() {
     // `show --json` = ShowDocument { schema_version, instance: FleetEntry }.
     let (ctx, state) = registered_mock("alpha");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "show", "alpha", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5689,7 +5689,7 @@ fn usage_json_named_document_key_set_and_schema_version_are_frozen() {
     // document (NOT NDJSON: usage is a snapshot, not a stream), riding the
     // SHARED FLEET_SCHEMA_VERSION because it serializes fleet-domain content.
     let (ctx, state) = registered_mock("alpha");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "usage", "alpha", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5714,7 +5714,7 @@ fn usage_json_fleet_document_key_set_and_schema_version_are_frozen() {
     // Story 4-3 net-new: `usage --json` (no name) = FleetUsageDocument
     // { schema_version, totals: FleetTotals } — the Fleet-wide scope FR-22 names.
     let (ctx, state) = registered_mock("alpha");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "usage", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5735,8 +5735,8 @@ fn usage_json_totals_equal_the_list_json_totals_exactly() {
     // documents must carry byte-identical totals.
     let (ctx, state) = registered_mock("alpha");
     let state_dir = state.project_dir.as_path();
-    let list = run_kt_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
-    let usage = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    let list = run_hemaka_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir);
+    let usage = run_hemaka_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
     // Fix pass (L5): assert the exit code BEFORE parsing, so a regression that
     // makes either command fail reports as a code mismatch naming stderr, rather
     // than an opaque `from_str().unwrap()` serde panic on empty stdout.
@@ -5750,7 +5750,7 @@ fn usage_json_totals_equal_the_list_json_totals_exactly() {
         "usage --json totals must equal list --json totals exactly",
     );
     // And the named form's usage object equals that instance's `list` row usage.
-    let named = run_kt_agent(
+    let named = run_hemaka_agent(
         &["agent", "usage", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -5774,7 +5774,7 @@ fn usage_on_an_empty_fleet_prints_guidance_on_stderr_and_stays_pure_json() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
 
-    let human = run_kt_agent(&["agent", "usage"], &ctx.project_dir, state_dir);
+    let human = run_hemaka_agent(&["agent", "usage"], &ctx.project_dir, state_dir);
     assert_eq!(human.code, Some(0), "stderr={}", human.stderr);
     assert!(
         human.stderr.contains("No Agent Instances registered yet"),
@@ -5782,7 +5782,7 @@ fn usage_on_an_empty_fleet_prints_guidance_on_stderr_and_stays_pure_json() {
         human.stderr
     );
 
-    let json = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    let json = run_hemaka_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
     assert_eq!(json.code, Some(0), "stderr={}", json.stderr);
     assert!(
         json.stderr.contains("No Agent Instances registered yet"),
@@ -5802,7 +5802,7 @@ fn budget_view_key_set_is_frozen_on_the_json_wire() {
     // dollar fields stay absent (skip_serializing_if) — the frozen minimal set.
     let (ctx, state) = registered_mock("alpha");
     let state_dir = state.project_dir.as_path();
-    let set = run_kt_agent(
+    let set = run_hemaka_agent(
         &[
             "agent",
             "config",
@@ -5820,7 +5820,7 @@ fn budget_view_key_set_is_frozen_on_the_json_wire() {
         set.stderr
     );
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "show", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -5856,7 +5856,7 @@ fn list_json_priced_shape_key_sets_are_frozen() {
     // With a Rate + both Cost Cap scopes configured, the maximal key-sets of all
     // three types serialize and are frozen here.
     let (ctx, state) = priced_instance("alpha");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "list", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -5916,7 +5916,7 @@ fn show_and_usage_json_priced_shape_key_sets_are_frozen() {
     let (ctx, state) = priced_instance("alpha");
     let state_dir = state.project_dir.as_path();
 
-    let show = run_kt_agent(
+    let show = run_hemaka_agent(
         &["agent", "show", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -5936,7 +5936,7 @@ fn show_and_usage_json_priced_shape_key_sets_are_frozen() {
         "BudgetView (priced)",
     );
 
-    let named = run_kt_agent(
+    let named = run_hemaka_agent(
         &["agent", "usage", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -5955,7 +5955,7 @@ fn show_and_usage_json_priced_shape_key_sets_are_frozen() {
         "UsageView (priced)",
     );
 
-    let fleet = run_kt_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
+    let fleet = run_hemaka_agent(&["agent", "usage", "--json"], &ctx.project_dir, state_dir);
     assert_eq!(fleet.code, Some(0), "stderr={}", fleet.stderr);
     let fleet_doc: serde_json::Value = serde_json::from_str(&fleet.stdout)
         .unwrap_or_else(|e| panic!("stdout not pure JSON: {e}\n{}", fleet.stdout));
@@ -5988,13 +5988,13 @@ fn config_get_json_document_key_set_and_schema_version_are_frozen() {
     // its OWN constant (1) — `config get` is not fleet-domain content.
     let (ctx, state) = registered_mock("alpha");
     let state_dir = state.project_dir.as_path();
-    run_kt_agent(
+    run_hemaka_agent(
         &["agent", "config", "set", "alpha", "model", "gpt-4"],
         &ctx.project_dir,
         state_dir,
     );
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "config", "get", "alpha", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -6020,8 +6020,8 @@ fn config_get_json_document_key_set_and_schema_version_are_frozen() {
 
 #[test]
 fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_the_rule() {
-    // FR-30 end-to-end at the REAL `kt` binary (the independent pass found the
-    // kt-side negotiation proof was unit-only): registering a manifest whose
+    // FR-30 end-to-end at the REAL `hemaka` binary (the independent pass found the
+    // hemaka-side negotiation proof was unit-only): registering a manifest whose
     // contract major differs from the engine's exits 1, the diagnostic names
     // BOTH versions and quotes the compatibility rule, stdout stays EMPTY
     // (diagnostics ride stderr, AD-12), and nothing is registered.
@@ -6034,7 +6034,7 @@ fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_th
     );
     let m = manifest_dir(&ctx.project_dir, &manifest);
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "register", "m", "--manifest", m.to_str().unwrap()],
         &ctx.project_dir,
         state_dir,
@@ -6063,7 +6063,7 @@ fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_th
     );
 
     // The instance genuinely does not exist (the load was refused, not half-done).
-    let show = run_kt_agent(&["agent", "show", "m"], &ctx.project_dir, state_dir);
+    let show = run_hemaka_agent(&["agent", "show", "m"], &ctx.project_dir, state_dir);
     assert_eq!(show.code, Some(3), "stdout={}", show.stdout);
 }
 
@@ -6079,7 +6079,7 @@ fn memory_attach_json_document_key_set_and_schema_version_are_frozen() {
     let (ctx, state) = registered_mock("demo");
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent",
             "memory",
@@ -6145,7 +6145,7 @@ fn memory_attach_json_native_shape_is_frozen() {
     let (ctx, state) = registered_mock("nat");
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent", "memory", "attach", "nat", "--kind", "native", "--json",
         ],
@@ -6175,19 +6175,19 @@ fn memory_attach_json_native_shape_is_frozen() {
 #[test]
 fn memory_detach_json_document_key_set_and_schema_version_are_frozen() {
     // The detach document is intentionally minimal: the versioned confirmation
-    // that nothing is attached anymore. No path — kt never constructs the
+    // that nothing is attached anymore. No path — hemaka never constructs the
     // managed-directory name itself (DC-1), and after a detach the engine
     // reports no attachment to quote.
     let (ctx, state) = registered_mock("demo");
     let state_dir = state.project_dir.as_path();
-    let attach = run_kt_agent(
+    let attach = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
     );
     assert_eq!(attach.code, Some(0), "stderr={}", attach.stderr);
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "detach", "demo", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -6219,7 +6219,7 @@ fn memory_json_errors_stay_diagnostics_and_do_not_emit_documents() {
         ],
         vec!["agent", "memory", "detach", "ghost", "--json"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state.project_dir.as_path());
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state.project_dir.as_path());
         assert_eq!(run.code, Some(3), "args={args:?}; stderr={}", run.stderr);
         assert!(
             run.stdout.is_empty(),
@@ -6228,7 +6228,7 @@ fn memory_json_errors_stay_diagnostics_and_do_not_emit_documents() {
         );
     }
     // A malformed name exits 2 (usage), also document-free.
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent", "memory", "attach", "Bad Name", "--kind", "native", "--json",
         ],
@@ -6252,7 +6252,7 @@ fn logs_json_on_an_empty_log_emits_zero_stdout_lines_not_an_empty_document() {
     // The NDJSON empty case: no retained output ⇒ NOTHING on stdout (not `[]`,
     // not `{}`), and still a clean exit 0. Cross-OS (no process spawn needed).
     let (ctx, state) = registered_mock("nat");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "logs", "nat", "--json"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -6266,7 +6266,7 @@ fn logs_json_on_an_empty_log_emits_zero_stdout_lines_not_an_empty_document() {
 }
 
 /// The ATTRIBUTED output log the engine's capture thread appends to and
-/// `kt agent logs` reads back — `<state>/agents/<name>/logs/output.log`, JSON
+/// `hemaka agent logs` reads back — `<state>/agents/<name>/logs/output.log`, JSON
 /// Lines (one serialized `LogLine` per line). Distinct from the raw, legacy
 /// `agent.log` next to it (see [`agent_log_path`]).
 fn attributed_output_log_path(state_dir: &Path, name: &str) -> std::path::PathBuf {
@@ -6368,7 +6368,7 @@ fn logs_json_wire_shape_is_frozen_ndjson_on_every_os() {
         ],
     );
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "logs", "nat", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -6391,7 +6391,7 @@ fn logs_json_wire_shape_is_frozen_ndjson_on_every_os() {
         run.stdout
     );
     // And the human form reports the SAME lines in the SAME order.
-    let human = run_kt_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
+    let human = run_hemaka_agent(&["agent", "logs", "nat"], &ctx.project_dir, state_dir);
     let human_texts: Vec<String> = human
         .stdout
         .lines()
@@ -6432,7 +6432,7 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
     // committed output while the child is still running.
     let out_path = ctx.project_dir.join("follow-stdout.ndjson");
     let err_path = ctx.project_dir.join("follow-stderr.txt");
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hemaka"))
         .args(["agent", "logs", "nat", "--follow", "--json"])
         .current_dir(&ctx.project_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
@@ -6440,7 +6440,7 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
         .stdout(std::fs::File::create(&out_path).expect("create follow stdout file"))
         .stderr(std::fs::File::create(&err_path).expect("create follow stderr file"))
         .spawn()
-        .expect("spawn kt agent logs --follow --json");
+        .expect("spawn hemaka agent logs --follow --json");
 
     // POLL for the backlog to be committed to stdout (the determinism rule: never
     // sleep to await state). Once ANY line is visible the one-shot read has
@@ -6478,7 +6478,7 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
         }
         assert!(
             std::time::Instant::now() < exit_deadline,
-            "kt agent logs --follow --json must not hang on a non-running instance"
+            "hemaka agent logs --follow --json must not hang on a non-running instance"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
@@ -6509,10 +6509,10 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
 
 #[test]
 fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
-    // Fix pass (M1): `kt agent logs --json | head -5` used to PANIC. Rust ignores
+    // Fix pass (M1): `hemaka agent logs --json | head -5` used to PANIC. Rust ignores
     // SIGPIPE, so `println!` hit `ErrorKind::BrokenPipe`, unwrapped, and aborted
     // with exit 101 — a code outside the frozen table `docs/commands.md`
-    // documents ("Every `kt` command returns one of these numeric exit codes").
+    // documents ("Every `hemaka` command returns one of these numeric exit codes").
     // A closed downstream pipe is not an error: the consumer got what it asked
     // for, so the command now ends cleanly with 0.
     //
@@ -6537,7 +6537,7 @@ fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
         if json {
             args.push("--json");
         }
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kt"))
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hemaka"))
             .args(&args)
             .current_dir(&ctx.project_dir)
             .env("KTESIO_NO_UPDATE_CHECK", "1")
@@ -6545,12 +6545,12 @@ fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn kt agent logs");
+            .expect("spawn hemaka agent logs");
         // Close the read end at once — every subsequent child write fails with
         // BrokenPipe, exactly as `| head -5` does once head has its lines.
         drop(child.stdout.take());
 
-        let status = child.wait().expect("wait for kt agent logs");
+        let status = child.wait().expect("wait for hemaka agent logs");
         assert_eq!(
             status.code(),
             Some(0),
@@ -6592,7 +6592,7 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
         &["--heartbeat-ms", "40", "--linger-ms", "600000"],
         "guaranteed",
     );
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -6604,14 +6604,14 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
         state_dir,
     );
     start_via_surviving_engine(state_dir, "svc");
-    let stopped = run_kt_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
+    let stopped = run_hemaka_agent(&["agent", "stop", "svc"], &ctx.project_dir, state_dir);
     assert!(
         stopped.success,
         "stop should succeed; stderr={}",
         stopped.stderr
     );
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "logs", "svc", "--json"],
         &ctx.project_dir,
         state_dir,
@@ -6659,7 +6659,7 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
 
     // APPEND ORDER: the NDJSON `text` sequence equals the human form's sequence
     // (same read, same order — never re-sorted by the whole-second `at`).
-    let human = run_kt_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
+    let human = run_hemaka_agent(&["agent", "logs", "svc"], &ctx.project_dir, state_dir);
     let human_texts: Vec<String> = human
         .stdout
         .lines()
@@ -6680,7 +6680,7 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
 // The exhaustive diagnostic→code mapping (including code 5 and code 6, whose
 // triggering conditions need a live/stuck child process) is pinned
 // deterministically and cross-OS by the classifier unit tests in
-// `crates/kt/src/exit_code.rs`. The tests below prove the OTHER half: that the
+// `crates/hemaka/src/exit_code.rs`. The tests below prove the OTHER half: that the
 // classifier is actually WIRED to the process exit status through `main`, for
 // each condition reachable without a real spawned agent.
 
@@ -6688,7 +6688,7 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
 fn a_successful_read_command_exits_with_the_success_code() {
     let ctx = TestContext::new();
     let state = TestContext::new();
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "list"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -6706,7 +6706,7 @@ fn agent_show_missing_instance_exits_with_the_not_found_code() {
         vec!["agent", "usage", "ghost"],
         vec!["agent", "logs", "ghost"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(3),
@@ -6721,7 +6721,7 @@ fn a_missing_manifest_exits_with_the_not_found_code() {
     let ctx = TestContext::new();
     let state = TestContext::new();
     let missing = ctx.project_dir.join("no-such-adapter-dir");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -6763,7 +6763,7 @@ fn invalid_invocations_exit_with_the_usage_code() {
         ("clap missing adapter", vec!["agent", "register", "z"]),
     ];
     for (what, args) in cases {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(2),
@@ -6795,7 +6795,7 @@ fn a_malformed_instance_name_exits_with_the_usage_code_on_every_read_command() {
             vec!["agent", "logs", bad],
             vec!["agent", "stop", bad],
         ] {
-            let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+            let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
             assert_eq!(
                 run.code,
                 Some(2),
@@ -6810,7 +6810,7 @@ fn a_malformed_instance_name_exits_with_the_usage_code_on_every_read_command() {
         vec!["agent", "usage", "ghost", "--json"],
         vec!["agent", "show", "ghost", "--json"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(3),
@@ -6831,7 +6831,7 @@ fn an_operation_on_a_wrong_state_instance_exits_with_the_invalid_state_code() {
         vec!["agent", "pause", "alpha"],
         vec!["agent", "resume", "alpha"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(4),
@@ -6854,7 +6854,7 @@ fn an_internal_failure_exits_with_the_general_code() {
         "contract_version = \"1.0.0\"\n[adapter]\nkind = \"x\"\n",
     )
     .unwrap();
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -6880,7 +6880,7 @@ fn help_and_version_still_exit_zero() {
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
     for args in [vec!["--help"], vec!["--version"], vec!["agent", "--help"]] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(0),
@@ -6890,7 +6890,7 @@ fn help_and_version_still_exit_zero() {
     }
 }
 
-// ---- Story 5-1: `kt agent memory attach | detach` ----
+// ---- Story 5-1: `hemaka agent memory attach | detach` ----
 //
 // DC-1 note: this file NEVER joins the managed directory's name itself — the
 // path arrives printed on stdout FROM the engine, and tests assert against that
@@ -6928,7 +6928,7 @@ fn memory_attach_prints_the_engine_managed_path_and_creates_it() {
     let (ctx, state) = registered_mock("demo");
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
@@ -6976,7 +6976,7 @@ fn memory_attach_prints_the_engine_managed_path_and_creates_it() {
     );
 
     // Re-attaching the SAME kind is an idempotent success (A-6).
-    let again = run_kt_agent(
+    let again = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
@@ -6989,7 +6989,7 @@ fn memory_attach_prints_the_engine_managed_path_and_creates_it() {
     );
 
     // Detaching reports metadata-only semantics on stdout.
-    let detach = run_kt_agent(
+    let detach = run_hemaka_agent(
         &["agent", "memory", "detach", "demo"],
         &ctx.project_dir,
         state_dir,
@@ -7012,7 +7012,7 @@ fn an_unknown_memory_kind_exits_with_the_usage_code() {
     // accepted values (story 5-2 widened the accepted set to filesystem+native;
     // the diagnostic tracks the set).
     let (ctx, state) = registered_mock("demo");
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "teleporting"],
         &ctx.project_dir,
         state.project_dir.as_path(),
@@ -7034,7 +7034,7 @@ fn memory_attach_native_is_metadata_only_and_states_the_delegation_boundary() {
     let (ctx, state) = registered_mock("nat");
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "nat", "--kind", "native"],
         &ctx.project_dir,
         state_dir,
@@ -7077,7 +7077,7 @@ fn memory_attach_native_is_metadata_only_and_states_the_delegation_boundary() {
 
     // Idempotent re-attach of the same kind succeeds (A-6) and still creates
     // nothing.
-    let again = run_kt_agent(
+    let again = run_hemaka_agent(
         &["agent", "memory", "attach", "nat", "--kind", "native"],
         &ctx.project_dir,
         state_dir,
@@ -7097,7 +7097,7 @@ fn memory_attach_filesystem_states_the_managed_directory_guarantee() {
     let (ctx, state) = registered_mock("fs");
     let state_dir = state.project_dir.as_path();
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "fs", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
@@ -7128,7 +7128,7 @@ fn a_malformed_name_on_memory_commands_exits_with_the_usage_code() {
         ],
         vec!["agent", "memory", "detach", "Bad Name"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(2),
@@ -7148,7 +7148,7 @@ fn memory_commands_on_an_unregistered_instance_exit_with_the_not_found_code() {
         vec!["agent", "memory", "attach", "ghost", "--kind", "filesystem"],
         vec!["agent", "memory", "detach", "ghost"],
     ] {
-        let run = run_kt_agent(&args, &ctx.project_dir, state_dir);
+        let run = run_hemaka_agent(&args, &ctx.project_dir, state_dir);
         assert_eq!(
             run.code,
             Some(3),
@@ -7167,7 +7167,7 @@ fn memory_attach_and_detach_on_a_running_instance_exit_with_the_invalid_state_co
     let state_dir = state.project_dir.as_path();
     force_state_running(state_dir, "live");
 
-    let attach = run_kt_agent(
+    let attach = run_hemaka_agent(
         &["agent", "memory", "attach", "live", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
@@ -7179,7 +7179,7 @@ fn memory_attach_and_detach_on_a_running_instance_exit_with_the_invalid_state_co
         attach.stderr
     );
 
-    let detach = run_kt_agent(
+    let detach = run_hemaka_agent(
         &["agent", "memory", "detach", "live"],
         &ctx.project_dir,
         state_dir,
@@ -7194,7 +7194,7 @@ fn attaching_a_different_kind_than_the_attached_one_exits_with_the_invalid_state
     let state_dir = state.project_dir.as_path();
     force_attach_kind(state_dir, "demo", "native");
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
@@ -7216,7 +7216,7 @@ fn attaching_native_over_an_attached_filesystem_exits_with_the_invalid_state_cod
     let state_dir = state.project_dir.as_path();
     force_attach_kind(state_dir, "demo", "filesystem");
 
-    let run = run_kt_agent(
+    let run = run_hemaka_agent(
         &["agent", "memory", "attach", "demo", "--kind", "native"],
         &ctx.project_dir,
         state_dir,
@@ -7240,7 +7240,7 @@ fn a_start_with_an_attached_but_unmapped_memory_backing_says_so_and_still_succee
     let state_dir = state.project_dir.as_path();
     let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
 
-    run_kt_agent(
+    run_hemaka_agent(
         &[
             "agent",
             "register",
@@ -7251,14 +7251,14 @@ fn a_start_with_an_attached_but_unmapped_memory_backing_says_so_and_still_succee
         &ctx.project_dir,
         state_dir,
     );
-    let attach = run_kt_agent(
+    let attach = run_hemaka_agent(
         &["agent", "memory", "attach", "svc", "--kind", "filesystem"],
         &ctx.project_dir,
         state_dir,
     );
     assert_eq!(attach.code, Some(0), "stderr={}", attach.stderr);
 
-    let start = run_kt_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
+    let start = run_hemaka_agent(&["agent", "start", "svc"], &ctx.project_dir, state_dir);
     assert_eq!(
         start.code,
         Some(0),

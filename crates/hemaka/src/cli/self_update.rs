@@ -12,15 +12,15 @@ use crate::error::SelfUpdateFailed;
 use crate::install_channel::{detect_install_channel, CommandProbe, InstallChannel};
 use crate::ui;
 
-const TAP: &str = "ktesio/tap/ktesio";
-const CRATE: &str = "ktesio";
+const TAP: &str = "ktesio/tap/hemaka";
+const CRATE: &str = "hemaka";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/ktesio/releases/latest";
 const RELEASE_BASE_URL: &str = "https://github.com/Ktesio/ktesio/releases/download";
 
 #[cfg(not(tarpaulin_include))]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let exe_path = std::env::current_exe().map_err(|error| SelfUpdateFailed {
-        message: format!("Could not locate current kt executable: {error}"),
+        message: format!("Could not locate current hemaka executable: {error}"),
     })?;
     let runner = SystemCommandRunner;
     let release_client = UreqReleaseClient::new();
@@ -57,7 +57,12 @@ impl Platform {
 struct ReleaseTarget {
     triple: &'static str,
     extension: &'static str,
-    binary_name: &'static str,
+    /// EVERY binary the release archive carries. The manual self-update
+    /// replaces all of them beside the current executable: running as
+    /// `maka` must still refresh `hemaka` (and vice versa), because an
+    /// update that refreshed only the invoked name would strand the
+    /// sibling binary at the old version.
+    binary_names: &'static [&'static str],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,7 +81,11 @@ trait ReleaseClient {
 }
 
 trait BinaryInstaller {
-    fn replace_current_exe(&self, current_exe: &Path, binary: &[u8]) -> Result<(), String>;
+    fn replace_current_binaries(
+        &self,
+        current_exe: &Path,
+        binaries: &[(&'static str, Vec<u8>)],
+    ) -> Result<(), String>;
 }
 
 fn run_with_dependencies<R, C, B>(
@@ -123,14 +132,14 @@ where
             runner
                 .run_command("brew", &["upgrade", TAP])
                 .map_err(self_update_error)?;
-            ui::success("Updated Ktesio with Homebrew.");
+            ui::success("Updated Hemaka with Homebrew.");
             Ok(SelfUpdateOutcome::Updated(channel))
         }
         InstallChannel::Cargo => {
             runner
                 .run_command("cargo", &["install", CRATE, "--force"])
                 .map_err(self_update_error)?;
-            ui::success("Updated Ktesio with Cargo.");
+            ui::success("Updated Hemaka with Cargo.");
             Ok(SelfUpdateOutcome::Updated(channel))
         }
         InstallChannel::Manual => update_manual_binary(
@@ -159,19 +168,19 @@ where
         .map_err(self_update_error)?;
     if !is_newer_version(current_version, &latest_tag) {
         ui::success(format!(
-            "Ktesio is already up to date ({}).",
+            "Hemaka is already up to date ({}).",
             display_version(&latest_tag)
         ));
         return Ok(SelfUpdateOutcome::AlreadyCurrent);
     }
 
     let target = release_target(platform)?;
-    let asset = format!("ktesio-{latest_tag}-{}.{}", target.triple, target.extension);
+    let asset = format!("hemaka-{latest_tag}-{}.{}", target.triple, target.extension);
     let asset_url = format!("{RELEASE_BASE_URL}/{latest_tag}/{asset}");
     let checksum_url = format!("{asset_url}.sha256");
 
     ui::info(format!(
-        "Downloading Ktesio {latest_tag} for {}.",
+        "Downloading Hemaka {latest_tag} for {}.",
         target.triple
     ));
     let archive = release_client
@@ -182,42 +191,47 @@ where
         .map_err(self_update_error)?;
     verify_checksum(&archive, &checksum, &asset)?;
 
-    let binary = extract_binary(&archive, &target)?;
+    let binaries = extract_binaries(&archive, &target)?;
     installer
-        .replace_current_exe(current_exe, &binary)
+        .replace_current_binaries(current_exe, &binaries)
         .map_err(self_update_error)?;
     ui::success(format!(
-        "Updated Ktesio to {}.",
+        "Updated Hemaka to {}.",
         display_version(&latest_tag)
     ));
     Ok(SelfUpdateOutcome::Updated(InstallChannel::Manual))
 }
+
+/// The two shipped binaries on Unix targets.
+const UNIX_BINARIES: &[&str] = &["hemaka", "maka"];
+/// The two shipped binaries on Windows.
+const WINDOWS_BINARIES: &[&str] = &["hemaka.exe", "maka.exe"];
 
 fn release_target(platform: &Platform) -> Result<ReleaseTarget, SelfUpdateFailed> {
     match (platform.os.as_str(), platform.arch.as_str()) {
         ("macos", "x86_64") => Ok(ReleaseTarget {
             triple: "x86_64-apple-darwin",
             extension: "tar.gz",
-            binary_name: "kt",
+            binary_names: UNIX_BINARIES,
         }),
         ("macos", "aarch64") => Ok(ReleaseTarget {
             triple: "aarch64-apple-darwin",
             extension: "tar.gz",
-            binary_name: "kt",
+            binary_names: UNIX_BINARIES,
         }),
         ("linux", "x86_64") => Ok(ReleaseTarget {
             triple: "x86_64-unknown-linux-gnu",
             extension: "tar.gz",
-            binary_name: "kt",
+            binary_names: UNIX_BINARIES,
         }),
         ("windows", "x86_64") => Ok(ReleaseTarget {
             triple: "x86_64-pc-windows-msvc",
             extension: "zip",
-            binary_name: "kt.exe",
+            binary_names: WINDOWS_BINARIES,
         }),
         _ => Err(SelfUpdateFailed {
             message: format!(
-                "No prebuilt Ktesio binary is available for {}/{}. Install Rust and run: cargo install ktesio --force",
+                "No prebuilt Hemaka binary is available for {}/{}. Install Rust and run: cargo install hemaka --force",
                 platform.os, platform.arch
             ),
         }),
@@ -253,17 +267,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn extract_binary(archive: &[u8], target: &ReleaseTarget) -> Result<Vec<u8>, SelfUpdateFailed> {
+fn extract_binaries(
+    archive: &[u8],
+    target: &ReleaseTarget,
+) -> Result<Vec<(&'static str, Vec<u8>)>, SelfUpdateFailed> {
+    let mut found: Vec<(&'static str, Vec<u8>)> = Vec::new();
     match target.extension {
-        "tar.gz" => extract_from_tar_gz(archive, target.binary_name),
-        "zip" => extract_from_zip(archive, target.binary_name),
-        extension => Err(SelfUpdateFailed {
-            message: format!("Unsupported release archive extension: {extension}"),
-        }),
+        "tar.gz" => extract_from_tar_gz(archive, target.binary_names, &mut found)?,
+        "zip" => extract_from_zip(archive, target.binary_names, &mut found)?,
+        extension => {
+            return Err(SelfUpdateFailed {
+                message: format!("Unsupported release archive extension: {extension}"),
+            })
+        }
     }
+    // EVERY declared binary must be present: a partial install would leave
+    // `hemaka`/`maka` on different versions.
+    let missing: Vec<&str> = target
+        .binary_names
+        .iter()
+        .filter(|name| !found.iter().any(|(found_name, _)| found_name == *name))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(SelfUpdateFailed {
+            message: format!("Release archive did not contain {}.", missing.join(", ")),
+        });
+    }
+    Ok(found)
 }
 
-fn extract_from_tar_gz(archive: &[u8], binary_name: &str) -> Result<Vec<u8>, SelfUpdateFailed> {
+/// If `file_name` names one of the `wanted` release binaries, return its
+/// declared static name.
+fn wanted_binary_name(file_name: Option<&str>, wanted: &[&'static str]) -> Option<&'static str> {
+    let file_name = file_name?;
+    wanted
+        .iter()
+        .find(|candidate| file_name == **candidate)
+        .copied()
+}
+
+fn extract_from_tar_gz(
+    archive: &[u8],
+    wanted: &[&'static str],
+    found: &mut Vec<(&'static str, Vec<u8>)>,
+) -> Result<(), SelfUpdateFailed> {
     let decoder = GzDecoder::new(Cursor::new(archive));
     let mut archive = tar::Archive::new(decoder);
     let entries = archive.entries().map_err(|error| SelfUpdateFailed {
@@ -277,25 +325,25 @@ fn extract_from_tar_gz(archive: &[u8], binary_name: &str) -> Result<Vec<u8>, Sel
         let path = entry.path().map_err(|error| SelfUpdateFailed {
             message: format!("Could not read release archive entry path: {error}"),
         })?;
-        if path.file_name().and_then(|name| name.to_str()) == Some(binary_name) {
+        if let Some(name) = wanted_binary_name(path.file_name().and_then(|n| n.to_str()), wanted) {
             let mut binary = Vec::new();
             entry
                 .read_to_end(&mut binary)
                 .map_err(|error| SelfUpdateFailed {
-                    message: format!(
-                        "Could not extract {binary_name} from release archive: {error}"
-                    ),
+                    message: format!("Could not extract {name} from release archive: {error}"),
                 })?;
-            return Ok(binary);
+            found.push((name, binary));
         }
     }
 
-    Err(SelfUpdateFailed {
-        message: format!("Release archive did not contain {binary_name}."),
-    })
+    Ok(())
 }
 
-fn extract_from_zip(archive: &[u8], binary_name: &str) -> Result<Vec<u8>, SelfUpdateFailed> {
+fn extract_from_zip(
+    archive: &[u8],
+    wanted: &[&'static str],
+    found: &mut Vec<(&'static str, Vec<u8>)>,
+) -> Result<(), SelfUpdateFailed> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(archive)).map_err(|error| SelfUpdateFailed {
             message: format!("Could not read release archive: {error}"),
@@ -306,21 +354,17 @@ fn extract_from_zip(archive: &[u8], binary_name: &str) -> Result<Vec<u8>, SelfUp
             message: format!("Could not read release archive entry: {error}"),
         })?;
         let path = Path::new(file.name());
-        if path.file_name().and_then(|name| name.to_str()) == Some(binary_name) {
+        if let Some(name) = wanted_binary_name(path.file_name().and_then(|n| n.to_str()), wanted) {
             let mut binary = Vec::new();
             file.read_to_end(&mut binary)
                 .map_err(|error| SelfUpdateFailed {
-                    message: format!(
-                        "Could not extract {binary_name} from release archive: {error}"
-                    ),
+                    message: format!("Could not extract {name} from release archive: {error}"),
                 })?;
-            return Ok(binary);
+            found.push((name, binary));
         }
     }
 
-    Err(SelfUpdateFailed {
-        message: format!("Release archive did not contain {binary_name}."),
-    })
+    Ok(())
 }
 
 fn is_newer_version(current_version: &str, latest_tag: &str) -> bool {
@@ -445,7 +489,7 @@ impl ReleaseClient for UreqReleaseClient {
             .agent
             .get(LATEST_RELEASE_URL)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("ktesio/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("hemaka/", env!("CARGO_PKG_VERSION")))
             .call()
             .map_err(|error| error.to_string())?;
 
@@ -489,37 +533,38 @@ struct FileBinaryInstaller;
 
 #[cfg(not(tarpaulin_include))]
 impl BinaryInstaller for FileBinaryInstaller {
-    fn replace_current_exe(&self, current_exe: &Path, binary: &[u8]) -> Result<(), String> {
+    fn replace_current_binaries(
+        &self,
+        current_exe: &Path,
+        binaries: &[(&'static str, Vec<u8>)],
+    ) -> Result<(), String> {
         let install_dir = current_exe
             .parent()
             .ok_or_else(|| "Could not find current executable directory.".to_string())?;
         if !current_exe.is_file() {
             return Err(format!(
-                "Refusing to replace missing kt executable at {}.",
+                "Refusing to replace missing hemaka executable at {}.",
                 current_exe.display()
             ));
         }
 
-        let file_name = current_exe
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| "Current executable path is not valid UTF-8.".to_string())?;
-        let temp_path = install_dir.join(format!(
-            ".{file_name}.self-update-{}.tmp",
-            std::process::id()
-        ));
+        for (name, binary) in binaries {
+            let target_path = install_dir.join(name);
+            let temp_path =
+                install_dir.join(format!(".{name}.self-update-{}.tmp", std::process::id()));
 
-        if let Err(error) = write_replacement(&temp_path, binary) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
+            if let Err(error) = write_replacement(&temp_path, binary) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
 
-        if let Err(error) = fs::rename(&temp_path, current_exe) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(format!(
-                "Could not replace {}: {error}",
-                current_exe.display()
-            ));
+            if let Err(error) = fs::rename(&temp_path, &target_path) {
+                let _ = fs::remove_file(&temp_path);
+                return Err(format!(
+                    "Could not replace {}: {error}",
+                    target_path.display()
+                ));
+            }
         }
 
         Ok(())
@@ -646,9 +691,13 @@ mod tests {
         }
     }
 
+    /// One recorded manual-update install: the current exe plus every
+    /// (binary name, bytes) pair handed to the installer.
+    type FakeReplacement = (PathBuf, Vec<(&'static str, Vec<u8>)>);
+
     #[derive(Default)]
     struct FakeBinaryInstaller {
-        replacements: RefCell<Vec<(PathBuf, Vec<u8>)>>,
+        replacements: RefCell<Vec<FakeReplacement>>,
         failure: Option<String>,
     }
 
@@ -662,13 +711,17 @@ mod tests {
     }
 
     impl BinaryInstaller for FakeBinaryInstaller {
-        fn replace_current_exe(&self, current_exe: &Path, binary: &[u8]) -> Result<(), String> {
+        fn replace_current_binaries(
+            &self,
+            current_exe: &Path,
+            binaries: &[(&'static str, Vec<u8>)],
+        ) -> Result<(), String> {
             if let Some(failure) = &self.failure {
                 return Err(failure.clone());
             }
             self.replacements
                 .borrow_mut()
-                .push((current_exe.to_path_buf(), binary.to_vec()));
+                .push((current_exe.to_path_buf(), binaries.to_vec()));
             Ok(())
         }
     }
@@ -684,27 +737,49 @@ mod tests {
         }
     }
 
+    /// The release payloads the manual updater must install: BOTH shipped
+    /// binaries (the archive carries both; one invocation replaces both).
+    fn unix_release_payloads(hemaka: Vec<u8>, maka: Vec<u8>) -> Vec<(&'static str, Vec<u8>)> {
+        vec![("hemaka", hemaka), ("maka", maka)]
+    }
+
+    fn windows_release_payloads(hemaka: Vec<u8>, maka: Vec<u8>) -> Vec<(&'static str, Vec<u8>)> {
+        vec![("hemaka.exe", hemaka), ("maka.exe", maka)]
+    }
+
     fn tar_gz_with_binary(name: &str, bytes: &[u8]) -> Vec<u8> {
+        tar_gz_with_binaries(&[(name, bytes)])
+    }
+
+    fn tar_gz_with_binaries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = GzEncoder::new(Vec::new(), Compression::default());
         let mut archive = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_mode(0o755);
-        header.set_size(bytes.len() as u64);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, name, Cursor::new(bytes))
-            .unwrap();
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o755);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, Cursor::new(bytes))
+                .unwrap();
+        }
         let encoder = archive.into_inner().unwrap();
         encoder.finish().unwrap()
     }
 
     fn zip_with_binary(name: &str, bytes: &[u8]) -> Vec<u8> {
+        zip_with_binaries(&[(name, bytes)])
+    }
+
+    fn zip_with_binaries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
         let mut archive = zip::ZipWriter::new(cursor);
-        archive
-            .start_file(name, zip::write::SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(bytes).unwrap();
+        for (name, bytes) in entries {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
         archive.finish().unwrap().into_inner()
     }
 
@@ -726,7 +801,7 @@ mod tests {
         let installer = FakeBinaryInstaller::default();
 
         let outcome = run_with_dependencies(
-            Path::new("/opt/homebrew/Cellar/ktesio/0.3.1/bin/kt"),
+            Path::new("/opt/homebrew/Cellar/hemaka/0.3.1/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &runner,
@@ -754,7 +829,7 @@ mod tests {
 
         let outcome = run_with_channel(
             InstallChannel::Cargo,
-            Path::new("/Users/alice/.cargo/bin/kt"),
+            Path::new("/Users/alice/.cargo/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &runner,
@@ -779,7 +854,7 @@ mod tests {
         );
         let error = run_with_channel(
             InstallChannel::Cargo,
-            Path::new("/Users/alice/.cargo/bin/kt"),
+            Path::new("/Users/alice/.cargo/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &runner,
@@ -793,11 +868,15 @@ mod tests {
 
     #[test]
     fn test_self_update_manual_downloads_verifies_and_replaces_binary() {
-        let binary = b"new kt binary";
-        let archive = tar_gz_with_binary("kt", binary);
+        let payloads =
+            unix_release_payloads(b"new hemaka binary".to_vec(), b"new maka binary".to_vec());
+        let archive = tar_gz_with_binaries(&[
+            ("hemaka", b"new hemaka binary"),
+            ("maka", b"new maka binary"),
+        ]);
         let checksum = format!("{}  archive.tar.gz\n", sha256_hex(&archive));
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -806,7 +885,7 @@ mod tests {
 
         let outcome = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -817,19 +896,28 @@ mod tests {
 
         assert_eq!(outcome, SelfUpdateOutcome::Updated(InstallChannel::Manual));
         assert_eq!(release.urls.borrow().as_slice(), &[asset_url, checksum_url]);
+        // BOTH shipped binaries are handed to the installer in one shot —
+        // a manual update must never strand `maka` (or `hemaka`) at the
+        // old version.
         assert_eq!(
             installer.replacements.borrow().as_slice(),
-            &[(PathBuf::from("/usr/local/bin/kt"), binary.to_vec())]
+            &[(PathBuf::from("/usr/local/bin/hemaka"), payloads)]
         );
     }
 
     #[test]
     fn test_self_update_manual_windows_downloads_zip_asset() {
-        let binary = b"windows kt binary";
-        let archive = zip_with_binary("kt.exe", binary);
+        let payloads = windows_release_payloads(
+            b"windows hemaka binary".to_vec(),
+            b"windows maka binary".to_vec(),
+        );
+        let archive = zip_with_binaries(&[
+            ("hemaka.exe", b"windows hemaka binary"),
+            ("maka.exe", b"windows maka binary"),
+        ]);
         let checksum = format!("{}  archive.zip\n", sha256_hex(&archive));
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-pc-windows-msvc.zip");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-pc-windows-msvc.zip");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -838,7 +926,7 @@ mod tests {
 
         let outcome = run_with_channel(
             InstallChannel::Manual,
-            Path::new("C:/Users/Alice/bin/kt.exe"),
+            Path::new("C:/Users/Alice/bin/hemaka.exe"),
             "0.3.1",
             &platform("windows", "x86_64"),
             &FakeRunner::default(),
@@ -851,17 +939,21 @@ mod tests {
         assert_eq!(release.urls.borrow().as_slice(), &[asset_url, checksum_url]);
         assert_eq!(
             installer.replacements.borrow().as_slice(),
-            &[(PathBuf::from("C:/Users/Alice/bin/kt.exe"), binary.to_vec())]
+            &[(PathBuf::from("C:/Users/Alice/bin/hemaka.exe"), payloads)]
         );
     }
 
     #[test]
     fn test_self_update_manual_detection_wrapper_updates_binary() {
-        let binary = b"new kt binary";
-        let archive = tar_gz_with_binary("kt", binary);
+        let payloads =
+            unix_release_payloads(b"new hemaka binary".to_vec(), b"new maka binary".to_vec());
+        let archive = tar_gz_with_binaries(&[
+            ("hemaka", b"new hemaka binary"),
+            ("maka", b"new maka binary"),
+        ]);
         let checksum = format!("{}  archive.tar.gz\n", sha256_hex(&archive));
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -869,7 +961,7 @@ mod tests {
         let installer = FakeBinaryInstaller::default();
 
         let outcome = run_with_dependencies(
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -881,7 +973,7 @@ mod tests {
         assert_eq!(outcome, SelfUpdateOutcome::Updated(InstallChannel::Manual));
         assert_eq!(
             installer.replacements.borrow().as_slice(),
-            &[(PathBuf::from("/usr/local/bin/kt"), binary.to_vec())]
+            &[(PathBuf::from("/usr/local/bin/hemaka"), payloads)]
         );
     }
 
@@ -889,7 +981,7 @@ mod tests {
     fn test_self_update_manual_latest_release_failure_is_returned() {
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -906,7 +998,7 @@ mod tests {
         let release = FakeReleaseClient::new("v0.4.0");
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -920,10 +1012,13 @@ mod tests {
 
     #[test]
     fn test_self_update_manual_replace_failure_is_returned() {
-        let archive = tar_gz_with_binary("kt", b"new kt binary");
+        let archive = tar_gz_with_binaries(&[
+            ("hemaka", b"new hemaka binary"),
+            ("maka", b"new maka binary"),
+        ]);
         let checksum = format!("{}  archive.tar.gz\n", sha256_hex(&archive));
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -931,7 +1026,7 @@ mod tests {
 
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -945,9 +1040,9 @@ mod tests {
 
     #[test]
     fn test_self_update_manual_checksum_mismatch_fails() {
-        let archive = tar_gz_with_binary("kt", b"new kt binary");
+        let archive = tar_gz_with_binary("hemaka", b"new hemaka binary");
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -958,7 +1053,7 @@ mod tests {
 
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -972,7 +1067,7 @@ mod tests {
 
     #[test]
     fn test_verify_checksum_rejects_invalid_checksum_file() {
-        let error = verify_checksum(b"archive", b"not-a-sha", "ktesio.tar.gz").unwrap_err();
+        let error = verify_checksum(b"archive", b"not-a-sha", "hemaka.tar.gz").unwrap_err();
 
         assert!(error.message.contains("valid SHA-256"));
     }
@@ -981,7 +1076,7 @@ mod tests {
     fn test_self_update_manual_unsupported_target_fails_with_cargo_hint() {
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "aarch64"),
             &FakeRunner::default(),
@@ -990,8 +1085,8 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.message.contains("No prebuilt Ktesio binary"));
-        assert!(error.message.contains("cargo install ktesio --force"));
+        assert!(error.message.contains("No prebuilt Hemaka binary"));
+        assert!(error.message.contains("cargo install hemaka --force"));
     }
 
     #[test]
@@ -1001,7 +1096,7 @@ mod tests {
 
         let outcome = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -1017,11 +1112,17 @@ mod tests {
 
     #[test]
     fn test_self_update_manual_newer_prerelease_updates_release() {
-        let binary = b"release candidate kt binary";
-        let archive = tar_gz_with_binary("kt", binary);
+        let payloads = unix_release_payloads(
+            b"release candidate hemaka binary".to_vec(),
+            b"release candidate maka binary".to_vec(),
+        );
+        let archive = tar_gz_with_binaries(&[
+            ("hemaka", b"release candidate hemaka binary"),
+            ("maka", b"release candidate maka binary"),
+        ]);
         let checksum = format!("{}  archive.tar.gz\n", sha256_hex(&archive));
         let asset_url = format!(
-            "{RELEASE_BASE_URL}/v0.4.0-rc.1/ktesio-v0.4.0-rc.1-x86_64-unknown-linux-gnu.tar.gz"
+            "{RELEASE_BASE_URL}/v0.4.0-rc.1/hemaka-v0.4.0-rc.1-x86_64-unknown-linux-gnu.tar.gz"
         );
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0-rc.1")
@@ -1031,7 +1132,7 @@ mod tests {
 
         let outcome = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -1044,22 +1145,32 @@ mod tests {
         assert_eq!(release.urls.borrow().as_slice(), &[asset_url, checksum_url]);
         assert_eq!(
             installer.replacements.borrow().as_slice(),
-            &[(PathBuf::from("/usr/local/bin/kt"), binary.to_vec())]
+            &[(PathBuf::from("/usr/local/bin/hemaka"), payloads)]
         );
     }
 
     #[cfg(not(tarpaulin_include))]
     #[test]
-    fn test_file_binary_installer_replaces_current_exe() {
+    fn test_file_binary_installer_replaces_both_binaries() {
         let dir = tempfile::TempDir::new().unwrap();
-        let exe = dir.path().join("kt");
-        fs::write(&exe, b"old kt binary").unwrap();
+        let exe = dir.path().join("hemaka");
+        fs::write(&exe, b"old hemaka binary").unwrap();
+        // `maka` may not exist yet (first update after a rename-era
+        // install); the installer creates it beside the current exe.
+        let maka = dir.path().join("maka");
 
         FileBinaryInstaller
-            .replace_current_exe(&exe, b"new kt binary")
+            .replace_current_binaries(
+                &exe,
+                &[
+                    ("hemaka", b"new hemaka binary".to_vec()),
+                    ("maka", b"new maka binary".to_vec()),
+                ],
+            )
             .unwrap();
 
-        assert_eq!(fs::read(&exe).unwrap(), b"new kt binary");
+        assert_eq!(fs::read(&exe).unwrap(), b"new hemaka binary");
+        assert_eq!(fs::read(&maka).unwrap(), b"new maka binary");
 
         #[cfg(unix)]
         {
@@ -1069,6 +1180,10 @@ mod tests {
                 fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
                 0o755
             );
+            assert_eq!(
+                fs::metadata(&maka).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
     }
 
@@ -1076,13 +1191,13 @@ mod tests {
     #[test]
     fn test_file_binary_installer_rejects_missing_exe() {
         let dir = tempfile::TempDir::new().unwrap();
-        let exe = dir.path().join("missing-kt");
+        let exe = dir.path().join("missing-hemaka");
 
         let error = FileBinaryInstaller
-            .replace_current_exe(&exe, b"new kt binary")
+            .replace_current_binaries(&exe, &[("hemaka", b"new hemaka binary".to_vec())])
             .unwrap_err();
 
-        assert!(error.contains("Refusing to replace missing kt executable"));
+        assert!(error.contains("Refusing to replace missing hemaka executable"));
     }
 
     #[test]
@@ -1114,48 +1229,70 @@ mod tests {
                 .triple,
             "x86_64-pc-windows-msvc"
         );
+        // Every target carries BOTH shipped binaries.
+        for os_arch in [
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("linux", "x86_64"),
+        ] {
+            assert_eq!(
+                release_target(&platform(os_arch.0, os_arch.1))
+                    .unwrap()
+                    .binary_names,
+                &["hemaka", "maka"],
+                "unix target {os_arch:?} must ship hemaka + maka"
+            );
+        }
+        assert_eq!(
+            release_target(&platform("windows", "x86_64"))
+                .unwrap()
+                .binary_names,
+            &["hemaka.exe", "maka.exe"]
+        );
     }
 
     #[test]
     fn test_extract_binary_reports_missing_binary() {
-        let archive = tar_gz_with_binary("not-kt", b"nope");
-        let error = extract_binary(
+        let archive = tar_gz_with_binary("not-hemaka", b"nope");
+        let error = extract_binaries(
             &archive,
             &ReleaseTarget {
                 triple: "x86_64-unknown-linux-gnu",
                 extension: "tar.gz",
-                binary_name: "kt",
+                binary_names: &["hemaka", "maka"],
             },
         )
         .unwrap_err();
 
-        assert!(error.message.contains("did not contain kt"));
+        assert!(error.message.contains("did not contain hemaka"));
+        assert!(error.message.contains("maka"));
     }
 
     #[test]
     fn test_extract_zip_reports_missing_binary() {
-        let archive = zip_with_binary("not-kt.exe", b"nope");
-        let error = extract_binary(
+        let archive = zip_with_binary("not-hemaka.exe", b"nope");
+        let error = extract_binaries(
             &archive,
             &ReleaseTarget {
                 triple: "x86_64-pc-windows-msvc",
                 extension: "zip",
-                binary_name: "kt.exe",
+                binary_names: &["hemaka.exe", "maka.exe"],
             },
         )
         .unwrap_err();
 
-        assert!(error.message.contains("did not contain kt.exe"));
+        assert!(error.message.contains("did not contain hemaka.exe"));
+        assert!(error.message.contains("maka.exe"));
     }
 
     #[test]
     fn test_extract_zip_reports_invalid_archive() {
-        let error = extract_binary(
+        let error = extract_binaries(
             b"not a zip archive",
             &ReleaseTarget {
                 triple: "x86_64-pc-windows-msvc",
                 extension: "zip",
-                binary_name: "kt.exe",
+                binary_names: &["hemaka.exe", "maka.exe"],
             },
         )
         .unwrap_err();
@@ -1165,12 +1302,12 @@ mod tests {
 
     #[test]
     fn test_extract_binary_rejects_unknown_archive_extension() {
-        let error = extract_binary(
+        let error = extract_binaries(
             b"archive",
             &ReleaseTarget {
                 triple: "x86_64-example",
                 extension: "tar.xz",
-                binary_name: "kt",
+                binary_names: &["hemaka", "maka"],
             },
         )
         .unwrap_err();
@@ -1182,12 +1319,12 @@ mod tests {
 
     #[test]
     fn test_extract_tar_gz_reports_invalid_archive() {
-        let error = extract_binary(
+        let error = extract_binaries(
             b"not a gzip archive",
             &ReleaseTarget {
                 triple: "x86_64-unknown-linux-gnu",
                 extension: "tar.gz",
-                binary_name: "kt",
+                binary_names: &["hemaka", "maka"],
             },
         )
         .unwrap_err();
@@ -1214,33 +1351,38 @@ mod tests {
     #[test]
     fn test_truncated_tar_gz_download_fails_instead_of_yielding_a_partial_binary() {
         // A download cut short mid-transfer still has a readable gzip/tar HEADER,
-        // so the entry for `kt` is found and extraction begins — the failure only
+        // so the entry for `hemaka` is found and extraction begins — the failure only
         // surfaces while reading the entry BODY. The contract that matters is that
         // this is an ERROR, not a short read: returning the bytes received so far
         // would hand `replace_current_exe` a truncated executable and brick the
-        // user's `kt`. (The checksum gate would also catch this, but only because
+        // user's `hemaka`. (The checksum gate would also catch this, but only because
         // extraction refused to invent a body first — both layers must hold.)
         let target = ReleaseTarget {
             triple: "x86_64-unknown-linux-gnu",
             extension: "tar.gz",
-            binary_name: "kt",
+            binary_names: &["hemaka", "maka"],
         };
-        let full = tar_gz_with_binary("kt", &incompressible_binary(64 * 1024));
+        let payload = incompressible_binary(64 * 1024);
+        let full = tar_gz_with_binaries(&[("hemaka", &payload), ("maka", &payload)]);
         let truncated = full[..full.len() / 4].to_vec();
 
-        let error = extract_binary(&truncated, &target).unwrap_err();
+        let error = extract_binaries(&truncated, &target).unwrap_err();
 
         assert!(
-            error.message.contains("Could not extract kt"),
+            error.message.contains("Could not extract hemaka"),
             "{}",
             error.message
         );
-        // Sanity: the SAME archive intact extracts fine, so the failure is the
-        // truncation and not a broken fixture.
-        assert_eq!(
-            extract_binary(&full, &target).unwrap(),
-            incompressible_binary(64 * 1024)
-        );
+        // Sanity: the SAME archive intact extracts BOTH binaries fine, so the
+        // failure is the truncation and not a broken fixture.
+        let extracted = extract_binaries(&full, &target).unwrap();
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted
+            .iter()
+            .any(|(name, bytes)| *name == "hemaka" && bytes == &payload));
+        assert!(extracted
+            .iter()
+            .any(|(name, bytes)| *name == "maka" && bytes == &payload));
     }
 
     #[test]
@@ -1249,30 +1391,32 @@ mod tests {
         // container's own integrity check. A bit flipped in the compressed data
         // leaves the central directory (and therefore `by_index`) intact, so the
         // corruption can ONLY be caught while reading the entry out. Extraction
-        // must fail rather than return silently-wrong bytes for `kt.exe`.
+        // must fail rather than return silently-wrong bytes for `hemaka.exe`.
         let target = ReleaseTarget {
             triple: "x86_64-pc-windows-msvc",
             extension: "zip",
-            binary_name: "kt.exe",
+            binary_names: &["hemaka.exe", "maka.exe"],
         };
         let payload = incompressible_binary(32 * 1024);
-        let mut archive = zip_with_binary("kt.exe", &payload);
+        let mut archive = zip_with_binaries(&[("hemaka.exe", &payload), ("maka.exe", &payload)]);
         // Flip a bit well inside the local file DATA (past the 30-byte local
         // header + the file name), leaving the trailing central directory whole.
         let corrupt_at = archive.len() / 2;
         archive[corrupt_at] ^= 0xFF;
 
-        let error = extract_binary(&archive, &target).unwrap_err();
+        let error = extract_binaries(&archive, &target).unwrap_err();
 
         assert!(
-            error.message.contains("Could not extract kt.exe"),
+            error.message.contains("Could not extract"),
             "{}",
             error.message
         );
-        assert_eq!(
-            extract_binary(&zip_with_binary("kt.exe", &payload), &target).unwrap(),
-            payload
-        );
+        let intact = extract_binaries(
+            &zip_with_binaries(&[("hemaka.exe", &payload), ("maka.exe", &payload)]),
+            &target,
+        )
+        .unwrap();
+        assert!(intact.iter().all(|(_, bytes)| bytes == &payload));
     }
 
     #[test]
@@ -1283,9 +1427,9 @@ mod tests {
         // only the error message (as the mismatch test does) would still pass if
         // someone moved the verification AFTER the install — this pins the
         // installer as untouched.
-        let archive = tar_gz_with_binary("kt", b"tampered kt binary");
+        let archive = tar_gz_with_binary("hemaka", b"tampered hemaka binary");
         let asset_url =
-            format!("{RELEASE_BASE_URL}/v0.4.0/ktesio-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
+            format!("{RELEASE_BASE_URL}/v0.4.0/hemaka-v0.4.0-x86_64-unknown-linux-gnu.tar.gz");
         let checksum_url = format!("{asset_url}.sha256");
         let release = FakeReleaseClient::new("v0.4.0")
             .with_download(&asset_url, archive)
@@ -1297,7 +1441,7 @@ mod tests {
 
         let error = run_with_channel(
             InstallChannel::Manual,
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             "0.3.1",
             &platform("linux", "x86_64"),
             &FakeRunner::default(),
@@ -1322,14 +1466,14 @@ mod tests {
         // looks like a security incident rather than a formatting nit.
         let archive = b"release archive bytes";
         let digest = sha256_hex(archive);
-        let uppercase = format!("{}  ktesio.tar.gz\n", digest.to_ascii_uppercase());
+        let uppercase = format!("{}  hemaka.tar.gz\n", digest.to_ascii_uppercase());
 
-        verify_checksum(archive, uppercase.as_bytes(), "ktesio.tar.gz").unwrap();
+        verify_checksum(archive, uppercase.as_bytes(), "hemaka.tar.gz").unwrap();
 
         // A digest of the right SHAPE but the wrong value is still rejected, so the
         // case-insensitivity above is not masking a "anything 64 hex chars" hole.
-        let wrong = format!("{}  ktesio.tar.gz\n", "A".repeat(64));
-        let error = verify_checksum(archive, wrong.as_bytes(), "ktesio.tar.gz").unwrap_err();
+        let wrong = format!("{}  hemaka.tar.gz\n", "A".repeat(64));
+        let error = verify_checksum(archive, wrong.as_bytes(), "hemaka.tar.gz").unwrap_err();
         assert!(error.message.contains("Checksum verification failed"));
     }
 }

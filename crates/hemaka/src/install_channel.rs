@@ -44,14 +44,14 @@ where
 
     if components
         .windows(2)
-        .any(|window| window[0] == "Cellar" && window[1] == "ktesio")
+        .any(|window| window[0] == "Cellar" && window[1] == "hemaka")
     {
         return InstallChannel::Homebrew;
     }
 
     if command_probe.command_exists("brew")
-        && (command_probe.command_succeeds("brew", &["list", "--formula", "ktesio"])
-            || command_probe.command_succeeds("brew", &["list", "--formula", "ktesio/tap/ktesio"]))
+        && (command_probe.command_succeeds("brew", &["list", "--formula", "hemaka"])
+            || command_probe.command_succeeds("brew", &["list", "--formula", "ktesio/tap/hemaka"]))
     {
         return InstallChannel::Homebrew;
     }
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_detect_install_channel_prefers_homebrew_cellar_path() {
         let channel = detect_install_channel_with_env(
-            Path::new("/opt/homebrew/Cellar/ktesio/0.3.1/bin/kt"),
+            Path::new("/opt/homebrew/Cellar/hemaka/0.3.1/bin/hemaka"),
             None,
             None,
             &FakeProbe::default(),
@@ -145,9 +145,9 @@ mod tests {
     fn test_detect_install_channel_uses_homebrew_formula_probe() {
         let probe = FakeProbe::default()
             .with_command("brew")
-            .with_success("brew", &["list", "--formula", "ktesio/tap/ktesio"]);
+            .with_success("brew", &["list", "--formula", "ktesio/tap/hemaka"]);
         let channel =
-            detect_install_channel_with_env(Path::new("/usr/local/bin/kt"), None, None, &probe);
+            detect_install_channel_with_env(Path::new("/usr/local/bin/hemaka"), None, None, &probe);
 
         assert_eq!(channel, InstallChannel::Homebrew);
     }
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn test_detect_install_channel_wrapper_falls_back_when_path_missing() {
         let channel = detect_install_channel(
-            Path::new("/definitely/not/a/real/ktesio/bin/kt"),
+            Path::new("/definitely/not/a/real/hemaka/bin/hemaka"),
             &FakeProbe::default(),
         );
 
@@ -168,9 +168,9 @@ mod tests {
         let original_cargo_home = env::var_os("CARGO_HOME");
         let dir = tempfile::TempDir::new().unwrap();
         let cargo_home = dir.path().join("cargo-home");
-        let exe = cargo_home.join("bin").join("kt");
+        let exe = cargo_home.join("bin").join("hemaka");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, b"kt").unwrap();
+        std::fs::write(&exe, b"hemaka").unwrap();
 
         env::set_var("CARGO_HOME", cargo_home.canonicalize().unwrap());
         let channel = detect_install_channel(&exe, &FakeProbe::default());
@@ -182,13 +182,13 @@ mod tests {
     #[test]
     fn test_detect_install_channel_uses_cargo_home_and_home_default() {
         let custom = detect_install_channel_with_env(
-            Path::new("/custom/cargo/bin/kt"),
+            Path::new("/custom/cargo/bin/hemaka"),
             Some(PathBuf::from("/custom/cargo")),
             None,
             &FakeProbe::default(),
         );
         let default_home = detect_install_channel_with_env(
-            Path::new("/Users/alice/.cargo/bin/kt"),
+            Path::new("/Users/alice/.cargo/bin/hemaka"),
             None,
             Some(PathBuf::from("/Users/alice")),
             &FakeProbe::default(),
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn test_detect_install_channel_falls_back_to_manual() {
         let channel = detect_install_channel_with_env(
-            Path::new("/usr/local/bin/kt"),
+            Path::new("/usr/local/bin/hemaka"),
             None,
             None,
             &FakeProbe::default(),

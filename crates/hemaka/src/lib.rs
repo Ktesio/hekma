@@ -18,18 +18,18 @@ const HELP_FOOTER: &str = concat!(
 
 const SELF_UPDATE_AFTER_HELP: &str = "\
 Details:
-  Updates the kt binary using the current install channel. Homebrew installs run
+  Updates the hemaka binary using the current install channel. Homebrew installs run
   brew upgrade, Cargo installs run cargo install --force, and manual binary
   installs download and verify the latest GitHub Release archive.
 
 Example:
-  kt self-update";
+  hemaka self-update";
 
 const AGENT_AFTER_HELP: &str = "\
 Details:
   An agent is a third-party program you run — a personal agent such as Hermes
   Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI —
-  that kt launches, supervises, meters, and budgets as a process.
+  that hemaka launches, supervises, meters, and budgets as a process.
   Manages Agent Instances in the Fleet. register creates an isolated Agent Home
   under a unique name from a native adapter (--kind) or a manifest adapter
   (--manifest <dir-or-file>), validating its Capability Declaration and Metering
@@ -59,26 +59,26 @@ Details:
   print it unmasked. Removing a running instance requires --force.
 
 Examples:
-  kt agent register demo --kind mock
-  kt agent register my-agent --manifest ./my-agent
-  kt agent start my-agent
-  kt agent pause my-agent
-  kt agent resume my-agent
-  kt agent stop my-agent --timeout 10
-  kt agent show demo
-  kt agent list
-  kt agent list --json
-  kt agent config set demo model gpt-4
-  kt agent config set demo agent.api_key secret:OPENAI_KEY
-  kt agent config get demo
-  kt agent config get demo model
-  kt agent config get demo --json
-  kt agent config get demo --reveal
-  kt agent remove demo --delete";
+  hemaka agent register demo --kind mock
+  hemaka agent register my-agent --manifest ./my-agent
+  hemaka agent start my-agent
+  hemaka agent pause my-agent
+  hemaka agent resume my-agent
+  hemaka agent stop my-agent --timeout 10
+  hemaka agent show demo
+  hemaka agent list
+  hemaka agent list --json
+  hemaka agent config set demo model gpt-4
+  hemaka agent config set demo agent.api_key secret:OPENAI_KEY
+  hemaka agent config get demo
+  hemaka agent config get demo model
+  hemaka agent config get demo --json
+  hemaka agent config get demo --reveal
+  hemaka agent remove demo --delete";
 
 #[derive(Parser)]
 #[command(
-    name = "kt",
+    name = "hemaka",
     version,
     about = "Run AI agents like services — supervise, meter, and budget them",
     after_help = HELP_FOOTER
@@ -90,10 +90,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Update the kt binary
+    /// Update the hemaka binary
     #[command(
         name = "self-update",
-        about = "Update the kt binary",
+        about = "Update the hemaka binary",
         after_help = SELF_UPDATE_AFTER_HELP
     )]
     SelfUpdate,
@@ -145,7 +145,7 @@ enum AgentCommands {
         /// Name of the Agent Instance to start
         name: String,
         /// Detach: keep the agent running after this command exits; the next
-        /// `kt` command re-adopts it. HONEST ENFORCEMENT WINDOW (ratified
+        /// `hemaka` command re-adopts it. HONEST ENFORCEMENT WINDOW (ratified
         /// 12-1): between commands there is NO crash detection, NO budget
         /// enforcement, and NO event delivery — supervision is command-scoped.
         /// Refused for engine-observed instances (their loopback listener dies
@@ -180,8 +180,8 @@ enum AgentCommands {
     /// silently intercepted as this CLI's own help (which used to print
     /// help and exit 0 without sending anything — a caller checking only
     /// the exit code would wrongly believe the send succeeded). A caller
-    /// that genuinely wants help for `send` gets it from `kt agent --help`
-    /// or `kt agent send` with a missing argument's error text.
+    /// that genuinely wants help for `send` gets it from `hemaka agent --help`
+    /// or `hemaka agent send` with a missing argument's error text.
     #[command(disable_help_flag = true)]
     Send {
         /// Name of the Agent Instance to send input to
@@ -245,7 +245,7 @@ enum AgentCommands {
 enum MemoryCommands {
     /// Attach a Memory Backing to an Agent Instance (requires a terminal state —
     /// no hot-swap). `filesystem` creates the managed directory inside the Agent
-    /// Home; `native` records the delegation (Ktesio guarantees only Agent Home
+    /// Home; `native` records the delegation (Hemaka guarantees only Agent Home
     /// persistence) and creates nothing.
     Attach {
         /// Name of the Agent Instance
@@ -306,23 +306,12 @@ enum ConfigCommands {
     },
 }
 
+/// Run one CLI invocation: parse args, maybe emit the passive update
+/// notice, dispatch the subcommand. Shared by BOTH shipped binaries
+/// (`hemaka`, the primary name, and `maka`, the short alias) — they are
+/// the same program, so there is exactly one CLI implementation.
 #[cfg(not(tarpaulin_include))]
-fn main() {
-    if let Err(err) = run_cli() {
-        // Classify the boxed diagnostic into the documented, stable numeric exit
-        // code (story 4-3, FR-26 / PRD §7) BEFORE it is consumed by `ui::error`.
-        // clap's own usage/parse errors already exit `2` and `--help`/`--version`
-        // exit `0` from inside `Cli::parse()`, so they never reach here; this maps
-        // only the runtime diagnostics, with any unmapped error falling to `1`
-        // (preserving the pre-4-3 behavior). See `exit_code::classify`.
-        let code = exit_code::classify(err.as_ref());
-        ui::error(err);
-        std::process::exit(code.code());
-    }
-}
-
-#[cfg(not(tarpaulin_include))]
-fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     if should_check_for_updates(&cli.command) {
@@ -391,6 +380,19 @@ fn should_check_for_updates(command: &Option<Commands>) -> bool {
     matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate))
 }
 
+/// Classify a returned diagnostic into the documented, stable numeric exit
+/// code (story 4-3, FR-26 / PRD §7), print it, and terminate the process.
+/// clap's own usage/parse errors already exit `2` and `--help`/`--version`
+/// exit `0` from inside `Cli::parse()`, so they never reach here; this maps
+/// only the runtime diagnostics, with any unmapped error falling to `1`
+/// (preserving the pre-4-3 behavior). See `exit_code::classify`.
+#[cfg(not(tarpaulin_include))]
+pub fn handle_error_and_exit(err: Box<dyn std::error::Error>) -> ! {
+    let code = exit_code::classify(err.as_ref());
+    ui::error(err);
+    std::process::exit(code.code());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,12 +409,12 @@ mod tests {
         assert!(cmd.find_subcommand("self-update").is_some());
         assert!(cmd.find_subcommand("agent").is_some());
         // Single canonical Fleet surface (Epic 9): every retired skill-manager
-        // command is ABSENT at the TOP LEVEL, so `kt agent list`/`show` is the one
+        // command is ABSENT at the TOP LEVEL, so `hemaka agent list`/`show` is the one
         // canonical way to list/show the Fleet. These are top-level lookups on
         // `Cli::command()`, which only sees `agent` + `self-update`; `list`/`show`/
-        // `remove` remain valid `kt agent` SUBcommands, so this MUST stay a
+        // `remove` remain valid `hemaka agent` SUBcommands, so this MUST stay a
         // top-level check — never a recursive/agent-tree search (that would
-        // false-fail against the live `kt agent list`/`show`/`remove`).
+        // false-fail against the live `hemaka agent list`/`show`/`remove`).
         for retired in [
             "init",
             "install",
@@ -435,7 +437,7 @@ mod tests {
     #[test]
     fn test_cli_identity_is_agent_framed_not_skills() {
         // Epic 9 rebrand: the top-level clap identity and the crate description
-        // present Ktesio as the agent runner, with no skills-package-manager
+        // present Hemaka as the agent runner, with no skills-package-manager
         // framing (mirrors `test_cli_help_includes_license_and_repository`).
         let about = Cli::command()
             .get_about()
@@ -490,24 +492,29 @@ mod tests {
     fn test_agent_config_parse() {
         // Story 2-1: `config set <name> <key> <value>` and
         // `config get <name> [key]` parse (a nested subcommand).
-        assert!(
-            Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model", "gpt-4"]).is_ok()
-        );
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "hemaka", "agent", "config", "set", "demo", "model", "gpt-4"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "config", "get", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "config", "get", "demo", "model"]).is_ok());
         // Story 2-3: `config get` accepts `--json` (whole config or single key).
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "--json"]).is_ok());
         assert!(
-            Cli::try_parse_from(["kt", "agent", "config", "get", "demo", "model", "--json"])
-                .is_ok()
+            Cli::try_parse_from(["hemaka", "agent", "config", "get", "demo", "--json"]).is_ok()
         );
+        assert!(Cli::try_parse_from([
+            "hemaka", "agent", "config", "get", "demo", "model", "--json"
+        ])
+        .is_ok());
         // set requires all three positional args.
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo", "model"]).is_err());
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "set", "demo"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hemaka", "agent", "config", "set", "demo", "model"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["hemaka", "agent", "config", "set", "demo"]).is_err());
         // get requires at least a name.
-        assert!(Cli::try_parse_from(["kt", "agent", "config", "get"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "config", "get"]).is_err());
         // config requires a subcommand.
-        assert!(Cli::try_parse_from(["kt", "agent", "config"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "config"]).is_err());
     }
 
     #[test]
@@ -515,7 +522,7 @@ mod tests {
         // Story 5-1: `memory attach <name> --kind <kind>` and `memory detach
         // <name>` parse (a nested subcommand, mirroring `config`).
         assert!(Cli::try_parse_from([
-            "kt",
+            "hemaka",
             "agent",
             "memory",
             "attach",
@@ -524,22 +531,27 @@ mod tests {
             "filesystem"
         ])
         .is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "memory", "detach", "demo"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "memory", "detach", "demo"]).is_ok());
         // attach requires --kind.
-        assert!(Cli::try_parse_from(["kt", "agent", "memory", "attach", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "memory", "attach", "demo"]).is_err());
         // attach requires a name.
-        assert!(
-            Cli::try_parse_from(["kt", "agent", "memory", "attach", "--kind", "filesystem"])
-                .is_err()
-        );
+        assert!(Cli::try_parse_from([
+            "hemaka",
+            "agent",
+            "memory",
+            "attach",
+            "--kind",
+            "filesystem"
+        ])
+        .is_err());
         // detach requires a name.
-        assert!(Cli::try_parse_from(["kt", "agent", "memory", "detach"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "memory", "detach"]).is_err());
         // memory requires a subcommand.
-        assert!(Cli::try_parse_from(["kt", "agent", "memory"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "memory"]).is_err());
         // The kind value is NOT validated by clap (an unknown token is a runtime
         // usage diagnostic, exit 2 — pinned in the agent_cli integration tests).
         assert!(Cli::try_parse_from([
-            "kt", "agent", "memory", "attach", "demo", "--kind", "bogus"
+            "hemaka", "agent", "memory", "attach", "demo", "--kind", "bogus"
         ])
         .is_ok());
     }
@@ -547,35 +559,37 @@ mod tests {
     #[test]
     fn test_agent_start_stop_parse() {
         // `start <name>` and `stop <name> [--timeout <secs>]` parse.
-        assert!(Cli::try_parse_from(["kt", "agent", "start", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "10"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "start", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "stop", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "stop", "svc", "--timeout", "10"]).is_ok());
         // start requires a name.
-        assert!(Cli::try_parse_from(["kt", "agent", "start"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "start"]).is_err());
         // --timeout must be a number.
-        assert!(Cli::try_parse_from(["kt", "agent", "stop", "svc", "--timeout", "abc"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hemaka", "agent", "stop", "svc", "--timeout", "abc"]).is_err()
+        );
     }
 
     #[test]
     fn test_agent_list_and_show_accept_json_flag() {
         // Story 1-7: `--json` is ADDED to the Agent `list`/`show` subcommands
         // (they took none before). Bare forms and the `--json` forms both parse.
-        assert!(Cli::try_parse_from(["kt", "agent", "list"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "list", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "show", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "show", "svc", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "list", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "show", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "show", "svc", "--json"]).is_ok());
         // `show --json` still requires a name.
-        assert!(Cli::try_parse_from(["kt", "agent", "show", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "show", "--json"]).is_err());
     }
 
     #[test]
     fn test_agent_pause_resume_parse() {
         // `pause <name>` and `resume <name>` parse (story 1-5).
-        assert!(Cli::try_parse_from(["kt", "agent", "pause", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "resume", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "pause", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "resume", "svc"]).is_ok());
         // Both require a name.
-        assert!(Cli::try_parse_from(["kt", "agent", "pause"]).is_err());
-        assert!(Cli::try_parse_from(["kt", "agent", "resume"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "pause"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "resume"]).is_err());
     }
 
     #[test]
@@ -583,11 +597,11 @@ mod tests {
         // `send <name> <text>` parses (story 4-1); a multi-word text is a
         // single quoted positional, mirroring `config set`'s per-value
         // positional convention.
-        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc", "hi"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc", "hello there"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "send", "svc", "hi"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "send", "svc", "hello there"]).is_ok());
         // Missing text, or missing both, is a clap error.
-        assert!(Cli::try_parse_from(["kt", "agent", "send", "svc"]).is_err());
-        assert!(Cli::try_parse_from(["kt", "agent", "send"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "send", "svc"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "send"]).is_err());
     }
 
     #[test]
@@ -595,7 +609,7 @@ mod tests {
         // M1 fix (review of #79): a `text` value starting with a hyphen must
         // parse as a LITERAL value, not be rejected as an unrecognized flag
         // and not be silently swallowed as this CLI's own `--help`/`-h`.
-        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "-5 degrees"])
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "send", "x", "-5 degrees"])
             .expect("a hyphen-leading text value must parse, not error");
         let Some(Commands::Agent {
             command: AgentCommands::Send { name, text },
@@ -611,7 +625,7 @@ mod tests {
         // `Parser::parse()` renders by printing help and exiting 0 — NOTHING
         // sent, yet a caller checking only the exit code believed it
         // succeeded). It must now parse OK with the literal value retained.
-        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "--help"])
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "send", "x", "--help"])
             .expect("--help as a text value must not be intercepted as CLI help");
         let Some(Commands::Agent {
             command: AgentCommands::Send { name, text },
@@ -623,7 +637,7 @@ mod tests {
         assert_eq!(text, "--help");
 
         // `-h` (the short form) must be treated identically.
-        let parsed = Cli::try_parse_from(["kt", "agent", "send", "x", "-h"])
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "send", "x", "-h"])
             .expect("-h as a text value must not be intercepted as CLI help");
         let Some(Commands::Agent {
             command: AgentCommands::Send { text, .. },
@@ -638,17 +652,19 @@ mod tests {
     fn test_agent_logs_parse() {
         // `logs <name>` and `logs <name> --follow`/`-f` parse (story 4-2), plus
         // `logs <name> --json` and the `--follow --json` combination (story 4-3).
-        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--follow"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "logs", "svc", "--follow", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "logs", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "--follow"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "-f"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "--follow", "--json"]).is_ok()
+        );
         // Missing name is a clap error.
-        assert!(Cli::try_parse_from(["kt", "agent", "logs"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "logs"]).is_err());
 
         // The bare form defaults follow AND json to false; --follow/-f sets follow,
         // --json sets json.
-        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc"]).unwrap();
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "logs", "svc"]).unwrap();
         let Some(Commands::Agent {
             command: AgentCommands::Logs { name, follow, json },
         }) = parsed.command
@@ -659,7 +675,7 @@ mod tests {
         assert!(!follow);
         assert!(!json);
 
-        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc", "-f"]).unwrap();
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "-f"]).unwrap();
         let Some(Commands::Agent {
             command: AgentCommands::Logs { follow, json, .. },
         }) = parsed.command
@@ -669,7 +685,7 @@ mod tests {
         assert!(follow);
         assert!(!json);
 
-        let parsed = Cli::try_parse_from(["kt", "agent", "logs", "svc", "--json"]).unwrap();
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "logs", "svc", "--json"]).unwrap();
         let Some(Commands::Agent {
             command: AgentCommands::Logs { json, .. },
         }) = parsed.command
@@ -683,13 +699,13 @@ mod tests {
     fn test_agent_usage_parse() {
         // Story 4-3: `usage` (Fleet-wide), `usage <name>`, and either with `--json`
         // all parse — the optional positional name mirrors `show`/`list`'s duality.
-        assert!(Cli::try_parse_from(["kt", "agent", "usage"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "usage", "svc"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "usage", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["kt", "agent", "usage", "svc", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "usage"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "usage", "svc"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "usage", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "usage", "svc", "--json"]).is_ok());
 
         // No name → None (the Fleet-wide form); a name → Some.
-        let parsed = Cli::try_parse_from(["kt", "agent", "usage", "--json"]).unwrap();
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "usage", "--json"]).unwrap();
         let Some(Commands::Agent {
             command: AgentCommands::Usage { name, json },
         }) = parsed.command
@@ -699,7 +715,7 @@ mod tests {
         assert_eq!(name, None);
         assert!(json);
 
-        let parsed = Cli::try_parse_from(["kt", "agent", "usage", "svc"]).unwrap();
+        let parsed = Cli::try_parse_from(["hemaka", "agent", "usage", "svc"]).unwrap();
         let Some(Commands::Agent {
             command: AgentCommands::Usage { name, json },
         }) = parsed.command
@@ -713,16 +729,19 @@ mod tests {
     #[test]
     fn test_agent_register_requires_kind_or_manifest() {
         // Neither flag → clap error (required_unless_present).
-        assert!(Cli::try_parse_from(["kt", "agent", "register", "demo"]).is_err());
+        assert!(Cli::try_parse_from(["hemaka", "agent", "register", "demo"]).is_err());
         // --kind alone parses.
-        assert!(Cli::try_parse_from(["kt", "agent", "register", "demo", "--kind", "mock"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["hemaka", "agent", "register", "demo", "--kind", "mock"]).is_ok()
+        );
         // --manifest alone parses.
         assert!(
-            Cli::try_parse_from(["kt", "agent", "register", "demo", "--manifest", "./a"]).is_ok()
+            Cli::try_parse_from(["hemaka", "agent", "register", "demo", "--manifest", "./a"])
+                .is_ok()
         );
         // Both together → conflict error.
         assert!(Cli::try_parse_from([
-            "kt",
+            "hemaka",
             "agent",
             "register",
             "demo",
@@ -746,7 +765,7 @@ mod tests {
         // Drift guard: HELP_FOOTER prints the license title as a literal
         // (Cargo exposes no CARGO_PKG_LICENSE under `license-file`). If the
         // shipped LICENSE is ever retitled, this fails CI instead of
-        // `kt --help` silently advertising a license the repo no longer
+        // `hemaka --help` silently advertising a license the repo no longer
         // ships. The title must appear in the binding text below the
         // separator, not just the non-binding preface.
         let license = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../LICENSE"));
@@ -766,14 +785,14 @@ mod tests {
 
     #[test]
     fn test_cli_without_subcommand_is_allowed_for_help_display() {
-        let cli = Cli::try_parse_from(["kt"]).expect("bare kt should parse");
+        let cli = Cli::try_parse_from(["hemaka"]).expect("bare hemaka should parse");
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn test_subcommand_help_includes_details_and_examples() {
         for (command, detail) in [
-            ("self-update", "Updates the kt binary"),
+            ("self-update", "Updates the hemaka binary"),
             ("agent", "Manages Agent Instances"),
         ] {
             let mut cmd = Cli::command();
@@ -789,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_self_update_skips_passive_update_check() {
-        let cli = Cli::try_parse_from(["kt", "self-update"]).expect("self-update should parse");
+        let cli = Cli::try_parse_from(["hemaka", "self-update"]).expect("self-update should parse");
 
         assert!(!should_check_for_updates(&cli.command));
     }

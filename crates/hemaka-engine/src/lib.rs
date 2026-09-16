@@ -55,7 +55,7 @@
 //! wrapped) via [`Engine::open_with_diagnostics`] (in place before any
 //! supervision work) or [`Engine::with_diagnostics`] /
 //! [`Blocking::with_diagnostics`] (install or rotate later); the diagnostics
-//! then route to the sink, receiving the exact bytes — same `[ktesio] `
+//! then route to the sink, receiving the exact bytes — same `[hemaka] `
 //! prefixed text, one newline-terminated line each — stderr would have
 //! received. The sink is engine-embedder ergonomics only: the adapter-api
 //! contract is untouched.

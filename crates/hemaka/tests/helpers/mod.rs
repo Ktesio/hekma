@@ -22,7 +22,7 @@ impl TestContext {
     }
 }
 
-/// Full result of a `kt` invocation, including the exit-success flag and the
+/// Full result of a `hemaka` invocation, including the exit-success flag and the
 /// NUMERIC exit code.
 ///
 /// This never collapses a non-zero exit into an `Err` — agent tests need to
@@ -33,36 +33,36 @@ impl TestContext {
 pub struct KtRun {
     pub success: bool,
     /// The numeric process exit code (story 4-3, DC-5/DC-6) — the documented,
-    /// stable `kt` contract (`0` success · `1` general · `2` usage · `3` not-found
+    /// stable `hemaka` contract (`0` success · `1` general · `2` usage · `3` not-found
     /// · `4` invalid-state · `5` unsupported-capability · `6` timed-out). `None`
     /// only when the process was killed by a signal without producing a code,
-    /// which no `kt` test path expects.
+    /// which no `hemaka` test path expects.
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
 
-/// Run `kt` with `KTESIO_STATE_DIR` pinned to `state_dir` so the engine never
+/// Run `hemaka` with `KTESIO_STATE_DIR` pinned to `state_dir` so the engine never
 /// touches the real user data dir. Also sets `KTESIO_NO_UPDATE_CHECK=1`.
 ///
 /// Returns the full [`KtRun`] regardless of exit status.
 #[allow(dead_code)]
-pub fn run_kt_agent(args: &[&str], working_dir: &Path, state_dir: &Path) -> KtRun {
-    run_kt_agent_with_env(args, working_dir, state_dir, &[])
+pub fn run_hemaka_agent(args: &[&str], working_dir: &Path, state_dir: &Path) -> KtRun {
+    run_hemaka_agent_with_env(args, working_dir, state_dir, &[])
 }
 
-/// Like [`run_kt_agent`], but with EXTRA environment variables layered on (e.g.
+/// Like [`run_hemaka_agent`], but with EXTRA environment variables layered on (e.g.
 /// `COLUMNS` to force a narrow terminal so the table renderer truncates cells — the
 /// FR-23 `list`-surface truncation test needs a deterministic width, independent of
 /// the runner's real terminal size).
 #[allow(dead_code)]
-pub fn run_kt_agent_with_env(
+pub fn run_hemaka_agent_with_env(
     args: &[&str],
     working_dir: &Path,
     state_dir: &Path,
     extra_env: &[(&str, &str)],
 ) -> KtRun {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kt"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hemaka"));
     command
         .args(args)
         .current_dir(working_dir)
@@ -71,7 +71,7 @@ pub fn run_kt_agent_with_env(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().expect("Failed to execute kt");
+    let output = command.output().expect("Failed to execute hemaka");
 
     KtRun {
         success: output.status.success(),

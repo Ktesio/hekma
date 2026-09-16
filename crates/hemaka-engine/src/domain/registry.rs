@@ -277,6 +277,11 @@ impl Registry {
             // placeholder, because there is no concrete path to name.
             let path = match &e {
                 crate::paths::PathError::RelativeStateDir { value } => value.clone(),
+                crate::paths::PathError::ConflictingStateDir { alias, .. } => {
+                    // Both env names set with different values: name the
+                    // alias value (the message itself quotes both).
+                    alias.to_string_lossy().into_owned()
+                }
                 crate::paths::PathError::NoStateDir => {
                     format!("<default via {}>", crate::paths::STATE_DIR_ENV)
                 }

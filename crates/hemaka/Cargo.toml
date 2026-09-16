@@ -1,7 +1,9 @@
 [package]
-# crates.io package name stays "ktesio" for install continuity (FR-39);
-# "kt" is the directory/colloquial name and the shipped binary name.
-name = "ktesio"
+# Hemaka (a Ktesio project) — v0.8.0 rename of the `ktesio` crate (frozen
+# at 0.7.0 on crates.io; preserved, never yanked). The package ships TWO
+# binaries: `hemaka` (primary) and `maka` (short alias) — both standalone
+# entry points to the same CLI implementation.
+name = "hemaka"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,8 +16,12 @@ keywords = ["agent", "ai", "supervisor", "metering", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
-name = "kt"
+name = "hemaka"
 path = "src/main.rs"
+
+[[bin]]
+name = "maka"
+path = "src/bin/maka.rs"
 
 [dependencies]
 hemaka-engine = { workspace = true }

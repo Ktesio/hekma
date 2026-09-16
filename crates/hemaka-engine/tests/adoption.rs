@@ -1570,8 +1570,8 @@ fn ai46_adopting_an_engine_observed_instance_surfaces_the_stranded_listener() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(
-        text.contains("[ktesio] obssurv:"),
-        "the diagnostic is a [ktesio]-prefixed engine line: {text}"
+        text.contains("[hemaka] obssurv:"),
+        "the diagnostic is a [hemaka]-prefixed engine line: {text}"
     );
 
     // Supervision itself has no strand: the adopted process is alive and a

@@ -24,11 +24,11 @@
 //! * **No-sink default is byte-identical to today** — a subprocess re-exec of
 //!   this test binary (the `adoption.rs` pattern; std cannot capture a
 //!   process's own stderr) runs the SAME flow with no sink and the parent
-//!   asserts the child's captured stderr carries exactly the two `[ktesio]`
+//!   asserts the child's captured stderr carries exactly the two `[hemaka]`
 //!   lines and nothing else — same wording, same stream, one line each.
 //! * **With a sink installed, stderr stays silent** — the sink-mode child
 //!   drives the same flow with the sink installed; the parent asserts the
-//!   child's stderr contains no `[ktesio]` line at all while the sink's
+//!   child's stderr contains no `[hemaka]` line at all while the sink's
 //!   captured bytes (relayed via a file) equal the expected pair exactly.
 //! * **The contract corners the docs promise** (the Epic-10 hardening):
 //!   mid-flight ROTATION splits the diagnostics across the two sinks (sink A
@@ -120,11 +120,11 @@ fn write_unmapped_manifest(dir: &Path) -> PathBuf {
 }
 
 /// The exact expected DC-10 notice LINE for an engine-reported managed dir
-/// (the choke point emits `[ktesio] ` + this text + a terminating '\n').
+/// (the choke point emits `[hemaka] ` + this text + a terminating '\n').
 /// Shared by the byte-exact suites and the rotation/Arc-sharing suites.
 fn expected_notice_line(dir: &Path) -> String {
     format!(
-        "[ktesio] {NOTICE_INSTANCE}: a 'filesystem' Memory Backing is attached (managed \
+        "[hemaka] {NOTICE_INSTANCE}: a 'filesystem' Memory Backing is attached (managed \
          directory: {}), but this adapter declares no config mapping for the reserved key \
          'memory.dir', so the agent will NOT receive the path. Add [config.\"memory.dir\"] \
          env = \"...\" to its manifest to deliver it.",
@@ -135,7 +135,7 @@ fn expected_notice_line(dir: &Path) -> String {
 /// The exact expected enforcement-breadcrumb LINE for the transition-gate
 /// error the enforcement path received (same emission shape as above).
 fn expected_breadcrumb_line(pause_err: &EngineError) -> String {
-    format!("[ktesio] {BREADCRUMB_INSTANCE}: budget breach pause could not be honored: {pause_err}")
+    format!("[hemaka] {BREADCRUMB_INSTANCE}: budget breach pause could not be honored: {pause_err}")
 }
 
 /// Drive BOTH diagnostics through their real production paths on ONE engine
@@ -701,7 +701,7 @@ fn read_expected_lines(expected: &Path) -> Vec<String> {
 fn without_a_sink_both_diagnostics_reach_stderr_byte_identical() {
     // The acceptance row "given no sink … stderr output is byte-identical to
     // today's": the child runs the REAL flow with no sink; the parent asserts
-    // the child's stderr carries EXACTLY the two `[ktesio]` diagnostic lines —
+    // the child's stderr carries EXACTLY the two `[hemaka]` diagnostic lines —
     // same wording, same stream, one line each, nothing else engine-emitted.
     let root = TempDir::new().expect("helper root");
     let (stderr, expected, _captured) = run_helper("default", root.path());
@@ -710,7 +710,7 @@ fn without_a_sink_both_diagnostics_reach_stderr_byte_identical() {
 
     let engine_lines: Vec<&str> = stderr
         .lines()
-        .filter(|l| l.starts_with("[ktesio]"))
+        .filter(|l| l.starts_with("[hemaka]"))
         .collect();
     assert_eq!(
         engine_lines,
@@ -724,7 +724,7 @@ fn without_a_sink_both_diagnostics_reach_stderr_byte_identical() {
 fn with_a_sink_installed_stderr_stays_silent() {
     // The acceptance row "given a sink installed … stderr stays silent": the
     // child installs the sink AT OPEN and drives the same flow; the parent
-    // asserts NO `[ktesio]` line reached the child's stderr while the relayed
+    // asserts NO `[hemaka]` line reached the child's stderr while the relayed
     // sink bytes equal the expected pair exactly.
     let root = TempDir::new().expect("helper root");
     let (stderr, expected, captured) = run_helper("sink", root.path());
@@ -732,7 +732,7 @@ fn with_a_sink_installed_stderr_stays_silent() {
     assert_eq!(lines.len(), 2, "the child pins exactly two diagnostics");
 
     assert!(
-        !stderr.contains("[ktesio]"),
+        !stderr.contains("[hemaka]"),
         "with a sink installed the engine must not write the diagnostics to \
          stderr: stderr=\n{stderr}"
     );

@@ -26,7 +26,7 @@ pub fn error(message: impl Display) {
 /// Print an informational NOTICE to stderr (AD-12: results → stdout,
 /// diagnostics/notices → stderr). A notice is neither a warning nor an error —
 /// it is a neutral, dimmed "note:" line (e.g. the single-lifetime supervision
-/// caveat on `kt agent start`).
+/// caveat on `hemaka agent start`).
 pub fn note(message: impl Display) {
     eprintln!("{}", note_text(message));
 }
@@ -41,7 +41,7 @@ pub(crate) fn update_notice(current_version: &str, latest_version: &str) {
 
 pub(crate) fn update_notice_text(current_version: &str, latest_version: &str) -> String {
     format!(
-        "{} Ktesio {latest_version} is available (current {current_version}). Update: kt self-update",
+        "{} Hemaka {latest_version} is available (current {current_version}). Update: hemaka self-update",
         warning_text("Update available:")
     )
 }
@@ -341,7 +341,7 @@ mod tests {
         assert!(notice.contains("Update available"));
         assert!(notice.contains("0.3.0"));
         assert!(notice.contains("0.4.0"));
-        assert!(notice.contains("kt self-update"));
+        assert!(notice.contains("hemaka self-update"));
         assert!(!notice.contains("cargo install"));
         assert!(!notice.contains("brew upgrade"));
         assert!(!notice.contains("github.com"));

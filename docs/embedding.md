@@ -220,7 +220,7 @@ engine.blocking().with_diagnostics(sink);
 The contract, in five rules:
 
 1. **Exact texts.** Each diagnostic arrives as one full line — the same
-   `[ktesio] `-prefixed text stderr would have received, `\n`-terminated. A
+   `[hemaka] `-prefixed text stderr would have received, `\n`-terminated. A
    sink that mirrors its input reproduces the default output byte-for-byte.
 2. **Opt-in, additive — and one-way.** Installing nothing changes nothing;
    the default path is pinned by CI as byte-identical to the historical

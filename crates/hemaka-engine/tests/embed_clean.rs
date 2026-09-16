@@ -93,7 +93,7 @@
 //!    `now_or_never`) — matched against comment- and string-cleaned code
 //!    lines — and positively drives `.blocking()` on a code line; the "no
 //!    tokio dependency" claim is pinned structurally by asserting
-//!    `crates/kt/Cargo.toml` declares no tokio edge. The full build-level
+//!    `crates/hemaka/Cargo.toml` declares no tokio edge. The full build-level
 //!    boundary proof remains story 7-4's.
 //!
 //! ## Determinism posture (the house style, shared)
@@ -872,7 +872,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // sneaking past the print scan above — fails here. ----
     let sink_pins: [(&str, &str, &str); 11] = [
         // The ONE diagnostic emission choke point (every pinned diagnostic routes
-        // through it; the `[ktesio] ` prefix + terminating newline live here).
+        // through it; the `[hemaka] ` prefix + terminating newline live here).
         (
             "domain/supervisor.rs",
             "fn emit_diagnostic(&self",
@@ -1394,11 +1394,11 @@ fn every_public_async_engine_entry_point_has_a_blocking_facade_counterpart() {
 #[test]
 fn kt_consumes_the_engine_only_through_the_blocking_facade() {
     let kt_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../kt/src")
+        .join("../hemaka/src")
         .canonicalize()
-        .expect("kt's src tree sits beside the engine crate in the workspace");
+        .expect("the hemaka CLI's src tree sits beside the engine crate in the workspace");
 
-    // kt is a synchronous binary: it structurally cannot await an engine
+    // The CLI is a synchronous binary: it structurally cannot await an engine
     // future. This audit pins that shape at the source level — the denylist
     // runs on CLEANED code lines (comments and string literals cannot match),
     // so a doc mention or a log message can never false-positive (or mask a
@@ -1423,7 +1423,7 @@ fn kt_consumes_the_engine_only_through_the_blocking_facade() {
     });
     assert!(
         async_use.is_empty(),
-        "kt must never touch an engine async API or a runtime directly (it drives \
+        "the CLI must never touch an engine async API or a runtime directly (it drives \
          the blocking facade only): {}",
         async_use
             .iter()
@@ -1432,21 +1432,21 @@ fn kt_consumes_the_engine_only_through_the_blocking_facade() {
             .join("; ")
     );
 
-    // And POSITIVELY: kt really drives the facade (the sanctioned embedding
+    // And POSITIVELY: the CLI really drives the facade (the sanctioned embedding
     // surface) — `.blocking()` reachable on a CODE line (string-literal
     // contents are blanked before this matches).
     let facade_use = scan(&kt_src, &|line| line.contains(".blocking()"));
     assert!(
         !facade_use.is_empty(),
-        "kt's engine consumption must go through .blocking() — none found"
+        "the CLI's engine consumption must go through .blocking() — none found"
     );
 
-    // The "no tokio dependency" claim, pinned structurally: kt's manifest
+    // The "no tokio dependency" claim, pinned structurally: the CLI's manifest
     // declares no tokio edge (TOML `#` comments excluded), so the denylist
     // above has a build-level backstop inside this same audit.
     let manifest =
         std::fs::read_to_string(kt_src.parent().expect("kt crate root").join("Cargo.toml"))
-            .expect("read kt/Cargo.toml");
+            .expect("read the hemaka CLI Cargo.toml");
     let tokio_refs: Vec<&str> = manifest
         .lines()
         .filter(|l| {
@@ -1456,7 +1456,7 @@ fn kt_consumes_the_engine_only_through_the_blocking_facade() {
         .collect();
     assert!(
         tokio_refs.is_empty(),
-        "kt must not declare a tokio dependency (the facade is the only runtime \
+        "the CLI must not declare a tokio dependency (the facade is the only runtime \
          bridge): {tokio_refs:?}"
     );
 }
@@ -1464,9 +1464,9 @@ fn kt_consumes_the_engine_only_through_the_blocking_facade() {
 #[test]
 fn the_memory_attach_json_readback_error_arm_routes_to_attach_readback_failed() {
     let kt_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../kt/src")
+        .join("../hemaka/src")
         .canonicalize()
-        .expect("kt's src tree sits beside the engine crate in the workspace");
+        .expect("the hemaka CLI's src tree sits beside the engine crate in the workspace");
 
     // Retro #166 finding B10's operator contract, pinned at the SOURCE level
     // (the embed-clean audit's fragment-pin pattern: a UNIQUE fragment that

@@ -16,10 +16,19 @@
 //!
 //! 1. An explicit override passed to [`EnginePaths::new`] (tests pass a
 //!    `TempDir`; the registry facade threads it through).
-//! 2. Else the `KTESIO_STATE_DIR` environment variable, if set — this makes
-//!    `kt` integration tests (which spawn the real binary) hermetic, mirroring
-//!    the existing `KTESIO_NO_UPDATE_CHECK` / `XDG_CACHE_HOME` precedent.
-//! 3. Else the platform data dir via `ProjectDirs::from("", "", "ktesio")`.
+//! 2. Else the `HEMAKA_STATE_DIR` / `KTESIO_STATE_DIR` environment
+//!    variables, if set — `HEMAKA_STATE_DIR` is the forward-looking name
+//!    (v0.8.0 Hemaka rename); the legacy `KTESIO_STATE_DIR` keeps working
+//!    so existing installations and scripts are unaffected. Both set to
+//!    the SAME absolute path is accepted; both set to DIFFERENT paths is
+//!    a hard error (an ambiguous state root must never be silently
+//!    resolved). Either name makes CLI integration tests (which spawn the
+//!    real binary) hermetic, mirroring the existing
+//!    `KTESIO_NO_UPDATE_CHECK` / `XDG_CACHE_HOME` precedent.
+//! 3. Else the platform data dir via `ProjectDirs::from("", "", "ktesio")`
+//!    — the LEGACY directory name on purpose: the Hemaka rename (v0.8.0)
+//!    keeps every existing installation's data IN PLACE. Existing state
+//!    is never moved, merged, reset, or deleted by the rename.
 //!
 //! ## Layout (`[ASSUMPTION]`: exact names not spine-fixed)
 //!
@@ -186,7 +195,14 @@ pub(crate) fn write_atomic_via(temp: &Path, target: &Path, bytes: &[u8]) -> std:
 }
 
 /// Environment override for the state-dir base (integration-test hermeticity).
+/// The LEGACY name — preserved as-is so existing installations, scripts, and
+/// CI jobs keep working through the Hemaka rename.
 pub const STATE_DIR_ENV: &str = "KTESIO_STATE_DIR";
+
+/// The forward-looking alias for [`STATE_DIR_ENV`] (v0.8.0 Hemaka rename).
+/// Honored identically; see the module docs for the conflict rule when both
+/// names are set.
+pub const STATE_DIR_ENV_ALIAS: &str = "HEMAKA_STATE_DIR";
 
 /// File name of the SQLite state store inside the state base. `[ASSUMPTION]`
 pub const STATE_DB_FILE: &str = "state.db";
@@ -241,22 +257,75 @@ pub struct EnginePaths {
 /// Reasons the state-dir base could not be resolved.
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    /// No override, no `KTESIO_STATE_DIR`, and the platform data dir could not
-    /// be determined (e.g. no `HOME` on Unix).
+    /// No override, neither `HEMAKA_STATE_DIR` nor `KTESIO_STATE_DIR` set,
+    /// and the platform data dir could not be determined (e.g. no `HOME`
+    /// on Unix).
     #[error("could not determine a state directory; set {STATE_DIR_ENV} to an explicit path")]
     NoStateDir,
 
-    /// `KTESIO_STATE_DIR` was set to a relative path. A relative base would be
-    /// resolved against the current working directory — a non-portable,
-    /// surprising state location that would also get baked into the stored
-    /// absolute Agent Home paths — so we reject it with an explicit error.
+    /// A state-dir environment variable (`HEMAKA_STATE_DIR` or
+    /// `KTESIO_STATE_DIR`) was set to a relative path. A relative base
+    /// would be resolved against the current working directory — a
+    /// non-portable, surprising state location that would also get baked
+    /// into the stored absolute Agent Home paths — so we reject it with an
+    /// explicit error.
     #[error(
-        "{STATE_DIR_ENV} must be an absolute path, but was '{value}'; set it to an absolute path"
+        "the state-dir environment variable ({STATE_DIR_ENV_ALIAS} or {STATE_DIR_ENV}) must be an absolute path, but was '{value}'; set it to an absolute path"
     )]
     RelativeStateDir {
         /// The offending (relative) value.
         value: String,
     },
+
+    /// Both state-dir environment names are set, naming DIFFERENT
+    /// directories. The state root would be ambiguous, so resolution
+    /// refuses rather than silently picking a winner.
+    #[error(
+        "both {STATE_DIR_ENV_ALIAS} and {STATE_DIR_ENV} are set but name different state directories ('{alias}' vs '{legacy}'); set only one"
+    )]
+    ConflictingStateDir {
+        /// The value of `HEMAKA_STATE_DIR`.
+        alias: PathBuf,
+        /// The value of `KTESIO_STATE_DIR`.
+        legacy: PathBuf,
+    },
+}
+
+/// Read the state-dir base from the environment: `HEMAKA_STATE_DIR`
+/// (forward-looking) or `KTESIO_STATE_DIR` (legacy, unchanged through the
+/// Hemaka rename). `Ok(None)` when neither name is set to a non-empty
+/// value. Both names set to the SAME path is accepted (either spelling);
+/// both set to DIFFERENT paths is [`PathError::ConflictingStateDir`] — an
+/// ambiguous state root is never silently resolved. A relative value under
+/// either name is [`PathError::RelativeStateDir`].
+fn state_dir_env_base() -> Result<Option<PathBuf>, PathError> {
+    let alias = non_empty_env_path(STATE_DIR_ENV_ALIAS);
+    let legacy = non_empty_env_path(STATE_DIR_ENV);
+    let selected = match (alias, legacy) {
+        (Some(alias), Some(legacy)) => {
+            if alias != legacy {
+                return Err(PathError::ConflictingStateDir { alias, legacy });
+            }
+            Some(alias)
+        }
+        (alias, legacy) => alias.or(legacy),
+    };
+    // Reject a relative env-provided base: it would resolve CWD-relative
+    // and leak a non-portable path into the stored Agent Home paths. An
+    // explicit override (the Some arm of EnginePaths::new) is trusted;
+    // the environment is not.
+    match selected {
+        Some(base) if !base.is_absolute() => Err(PathError::RelativeStateDir {
+            value: base.to_string_lossy().into_owned(),
+        }),
+        selected => Ok(selected),
+    }
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 impl EnginePaths {
@@ -264,25 +333,14 @@ impl EnginePaths {
     ///
     /// `override_base`:
     /// * `Some(path)` — use it verbatim (tests / explicit embedding).
-    /// * `None` — consult `KTESIO_STATE_DIR`, then the platform data dir.
+    /// * `None` — consult `HEMAKA_STATE_DIR` / `KTESIO_STATE_DIR`
+    ///   ([`state_dir_env_base`]), then the platform data dir.
     pub fn new(override_base: Option<PathBuf>) -> Result<Self, PathError> {
         let state_base = match override_base {
             Some(base) => base,
-            None => match std::env::var_os(STATE_DIR_ENV) {
-                Some(env_base) if !env_base.is_empty() => {
-                    let base = PathBuf::from(env_base);
-                    // Reject a relative env-provided base: it would resolve
-                    // CWD-relative and leak a non-portable path into the stored
-                    // Agent Home paths. An explicit override (the Some arm) is
-                    // trusted; the environment is not.
-                    if !base.is_absolute() {
-                        return Err(PathError::RelativeStateDir {
-                            value: base.to_string_lossy().into_owned(),
-                        });
-                    }
-                    base
-                }
-                _ => ProjectDirs::from("", "", "ktesio")
+            None => match state_dir_env_base()? {
+                Some(base) => base,
+                None => ProjectDirs::from("", "", "ktesio")
                     .map(|dirs| dirs.data_dir().to_path_buf())
                     .ok_or(PathError::NoStateDir)?,
             },
@@ -429,6 +487,92 @@ mod tests {
         // (embedding/tests own it); only the env-provided base is rejected.
         let paths = EnginePaths::new(Some(PathBuf::from("relative/base"))).unwrap();
         assert_eq!(paths.state_base(), Path::new("relative/base"));
+    }
+
+    // ---- v0.8.0 Hemaka rename: the HEMAKA_STATE_DIR alias ----
+
+    /// Save/restore BOTH state-dir env names around an env-mutating test
+    /// (the shared process env is racy across parallel tests; mirror the
+    /// existing save/restore discipline in the sibling tests above).
+    fn with_state_dir_env<F>(alias: Option<&Path>, legacy: Option<&Path>, f: F)
+    where
+        F: FnOnce(),
+    {
+        let prev_alias = std::env::var_os(STATE_DIR_ENV_ALIAS);
+        let prev_legacy = std::env::var_os(STATE_DIR_ENV);
+        let set = |name: &str, value: Option<&Path>| match value {
+            Some(path) => std::env::set_var(name, path),
+            None => std::env::remove_var(name),
+        };
+        set(STATE_DIR_ENV_ALIAS, alias);
+        set(STATE_DIR_ENV, legacy);
+        f();
+        match prev_alias {
+            Some(v) => std::env::set_var(STATE_DIR_ENV_ALIAS, v),
+            None => std::env::remove_var(STATE_DIR_ENV_ALIAS),
+        }
+        match prev_legacy {
+            Some(v) => std::env::set_var(STATE_DIR_ENV, v),
+            None => std::env::remove_var(STATE_DIR_ENV),
+        }
+    }
+
+    #[test]
+    fn alias_env_override_is_honored_when_no_explicit_base() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        with_state_dir_env(Some(&base), None, || {
+            let paths = EnginePaths::new(None).unwrap();
+            assert_eq!(paths.state_base(), base);
+        });
+    }
+
+    #[test]
+    fn alias_and_legacy_env_naming_the_same_dir_are_accepted() {
+        // Both spellings of one path: NOT a conflict — scripts mid-migration
+        // export both, and the state root is unambiguous.
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        with_state_dir_env(Some(&base), Some(&base), || {
+            let paths = EnginePaths::new(None).unwrap();
+            assert_eq!(paths.state_base(), base);
+        });
+    }
+
+    #[test]
+    fn alias_and_legacy_env_naming_different_dirs_are_rejected() {
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        with_state_dir_env(Some(a.path()), Some(b.path()), || {
+            let err = EnginePaths::new(None).unwrap_err();
+            assert!(
+                matches!(&err, PathError::ConflictingStateDir { alias, legacy }
+                    if alias == a.path() && legacy == b.path()),
+                "got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_env_override_alone_still_works() {
+        // The legacy name keeps working unchanged (existing installs).
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        with_state_dir_env(None, Some(&base), || {
+            let paths = EnginePaths::new(None).unwrap();
+            assert_eq!(paths.state_base(), base);
+        });
+    }
+
+    #[test]
+    fn relative_alias_env_base_is_rejected() {
+        with_state_dir_env(Some(Path::new("relative/alias")), None, || {
+            let err = EnginePaths::new(None).unwrap_err();
+            assert!(
+                matches!(&err, PathError::RelativeStateDir { value } if value == "relative/alias"),
+                "got {err:?}"
+            );
+        });
     }
 
     // ---- Story 11-2 (AI-24/AI-28): the shared atomic write helper ----

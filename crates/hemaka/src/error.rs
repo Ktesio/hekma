@@ -3,70 +3,70 @@ use thiserror::Error;
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::self_update::failed))]
+#[diagnostic(code(hemaka::self_update::failed))]
 pub struct SelfUpdateFailed {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::duplicate_name))]
+#[diagnostic(code(hemaka::agent::duplicate_name))]
 pub struct AgentDuplicateName {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::invalid_name))]
+#[diagnostic(code(hemaka::agent::invalid_name))]
 pub struct AgentInvalidName {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::not_found))]
+#[diagnostic(code(hemaka::agent::not_found))]
 pub struct AgentNotFound {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::running_requires_force))]
+#[diagnostic(code(hemaka::agent::running_requires_force))]
 pub struct AgentRunningRequiresForce {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::io))]
+#[diagnostic(code(hemaka::agent::io))]
 pub struct AgentIo {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::store))]
+#[diagnostic(code(hemaka::agent::store))]
 pub struct AgentStore {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::unknown_kind))]
+#[diagnostic(code(hemaka::agent::unknown_kind))]
 pub struct AgentUnknownKind {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::manifest_not_found))]
+#[diagnostic(code(hemaka::agent::manifest_not_found))]
 pub struct AgentManifestNotFound {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::manifest_invalid))]
+#[diagnostic(code(hemaka::agent::manifest_invalid))]
 pub struct AgentManifestInvalid {
     pub message: String,
 }
@@ -77,49 +77,49 @@ pub struct AgentManifestInvalid {
 /// the frozen 4-3 exit-code table gained no new number).
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::contract_incompatible))]
+#[diagnostic(code(hemaka::agent::contract_incompatible))]
 pub struct AgentContractIncompatible {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::manifest_unreadable))]
+#[diagnostic(code(hemaka::agent::manifest_unreadable))]
 pub struct AgentManifestUnreadable {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::no_metering_source))]
+#[diagnostic(code(hemaka::agent::no_metering_source))]
 pub struct AgentNoMeteringSource {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::no_capabilities))]
+#[diagnostic(code(hemaka::agent::no_capabilities))]
 pub struct AgentNoCapabilities {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::invalid_transition))]
+#[diagnostic(code(hemaka::agent::invalid_transition))]
 pub struct AgentInvalidTransition {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::launch_failed))]
+#[diagnostic(code(hemaka::agent::launch_failed))]
 pub struct AgentLaunchFailed {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::capability_unsupported))]
+#[diagnostic(code(hemaka::agent::capability_unsupported))]
 pub struct AgentCapabilityUnsupported {
     pub message: String,
 }
@@ -134,54 +134,54 @@ pub struct AgentCapabilityUnsupported {
 /// [`AgentCapabilityUnsupported`], no new exit-code number (DC-4).
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::resume_unsupported))]
+#[diagnostic(code(hemaka::agent::resume_unsupported))]
 pub struct AgentResumeUnsupported {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::unknown_config_key))]
+#[diagnostic(code(hemaka::agent::unknown_config_key))]
 pub struct AgentUnknownConfigKey {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::config))]
+#[diagnostic(code(hemaka::agent::config))]
 pub struct AgentConfig {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::not_running))]
+#[diagnostic(code(hemaka::agent::not_running))]
 pub struct AgentNotRunning {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::interaction_unavailable))]
+#[diagnostic(code(hemaka::agent::interaction_unavailable))]
 pub struct AgentInteractionUnavailable {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::interaction_timed_out))]
+#[diagnostic(code(hemaka::agent::interaction_timed_out))]
 pub struct AgentInteractionTimedOut {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::stop_unconfirmed))]
+#[diagnostic(code(hemaka::agent::stop_unconfirmed))]
 pub struct AgentStopUnconfirmed {
     pub message: String,
 }
 
-/// Story 12-1: a detached start (`kt agent start --detach`) was requested for
+/// Story 12-1: a detached start (`hemaka agent start --detach`) was requested for
 /// an instance whose configuration cannot be detached — v1's single refusal is
 /// the `engine-observed` metering channel, whose loopback forward listener
 /// lives inside the starting command and would strand the agent's model traffic
@@ -192,21 +192,21 @@ pub struct AgentStopUnconfirmed {
 /// capability-unsupported command; no new exit-code number was minted (DC-4).
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::detach_refused))]
+#[diagnostic(code(hemaka::agent::detach_refused))]
 pub struct AgentDetachRefused {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::memory_hot_swap))]
+#[diagnostic(code(hemaka::agent::memory_hot_swap))]
 pub struct AgentMemoryHotSwap {
     pub message: String,
 }
 
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
-#[diagnostic(code(ktesio::agent::memory_kind_conflict))]
+#[diagnostic(code(hemaka::agent::memory_kind_conflict))]
 pub struct AgentMemoryKindConflict {
     pub message: String,
 }

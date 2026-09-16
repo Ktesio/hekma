@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/kt",
+    "crates/hemaka",
     "crates/hemaka-engine",
     "crates/hemaka-adapter-api",
     "crates/hemaka-adapters-hermes",
@@ -9,7 +9,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+# v0.8.0 (D3, ratified 2026-09-16): the Hemaka debut — continues the ktesio
+# CLI line (published ktesio 0.7.0 stays frozen on crates.io). Library
+# crates continue their own lines under the hemaka-* names.
+version = "0.8.0"
 edition = "2021"
 # Minimum supported Rust version. Floor is set by the bundled-SQLite build:
 # rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
@@ -25,9 +28,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 
 [workspace.dependencies]
 # Internal crates
-hemaka-engine = { path = "crates/hemaka-engine", version = "0.3.0" }
-hemaka-adapter-api = { path = "crates/hemaka-adapter-api", version = "0.1.0" }
-hemaka-adapters-hermes = { path = "crates/hemaka-adapters-hermes", version = "0.1.0" }
+hemaka-engine = { path = "crates/hemaka-engine", version = "0.4.0" }
+hemaka-adapter-api = { path = "crates/hemaka-adapter-api", version = "0.2.0" }
+hemaka-adapters-hermes = { path = "crates/hemaka-adapters-hermes", version = "0.2.0" }
 
 # External dependencies (single source of truth for versions)
 clap = { version = "4", features = ["derive"] }

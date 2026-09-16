@@ -1,10 +1,10 @@
-//! The `kt` numeric exit-code contract (story 4-3, FR-26 / PRD §7).
+//! The `hemaka` numeric exit-code contract (story 4-3, FR-26 / PRD §7).
 //!
-//! `kt` returns a documented, stable set of numeric exit codes so it is
+//! `hemaka` returns a documented, stable set of numeric exit codes so it is
 //! scriptable without the Embedding Interface. This is a **v1 compatibility
 //! surface** governed by PRD §7 (announce → one-minor notice → remove-at-major):
 //! the numbers below are FROZEN, and the compatibility tests
-//! (`crates/kt/tests/agent_cli.rs` + this module's own unit tests) pin them so an
+//! (`crates/hemaka/tests/agent_cli.rs` + this module's own unit tests) pin them so an
 //! unannounced change fails CI on all three OSes.
 //!
 //! **How each code is actually gated** (fix pass, 2026-07-21 — the chain has three
@@ -35,7 +35,7 @@
 //! ## Why a downcast classifier (not a `CliError` enum)
 //!
 //! The 22 diagnostics are independent `thiserror` + `miette` structs boxed as
-//! `Box<dyn std::error::Error>` (miette lives in `kt` only — conventions). Rather
+//! `Box<dyn std::error::Error>` (miette lives in `hemaka` only — conventions). Rather
 //! than wrap all of them in one enum (which would touch every `map_*` mapper and
 //! all 22 structs), `main` classifies the boxed error here by DOWNCAST — the
 //! low-churn approach the story recommends. A `CliError` enum is the cleaner
@@ -60,7 +60,7 @@ use crate::error::{
     AgentUnknownKind,
 };
 
-/// The documented, stable `kt` process exit codes (story 4-3). A FROZEN v1
+/// The documented, stable `hemaka` process exit codes (story 4-3). A FROZEN v1
 /// compatibility surface — see the module docs for the governing table.
 ///
 /// The discriminants ARE the wire contract; changing a number is a breaking
