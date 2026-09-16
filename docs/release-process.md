@@ -61,8 +61,8 @@ The workflow verifies that `Cargo.toml` version matches the tag without the lead
 ## Publishing the Engine Crates
 
 Story 7-4 prepared everything needed to publish the embedding crates
-(`ktesio-engine` + `ktesio-adapter-api`, plus the engine's builtin-adapter
-dependency `ktesio-adapters-hermes`) and executed none of it. **Every HOLD
+(`hemaka-engine` + `hemaka-adapter-api`, plus the engine's builtin-adapter
+dependency `hemaka-adapters-hermes`) and executed none of it. **Every HOLD
 gate below opens only on Islam's explicit go** (the standing non-negotiable:
 no deployments, no releases, no tags, nothing that costs money). Until that
 go, all four internal crate manifests still carry `publish = false` (pinned
@@ -86,8 +86,8 @@ re-confirmation.
 2. **Versions set and concrete.** The release version bump is a real commit:
    the root `[workspace.package]` `version` (inherited by the `ktesio` CLI
    crate) bumped to the release version, the crate-level versions confirmed
-   (`0.1.0` today for `ktesio-adapter-api`, `ktesio-adapters-hermes`,
-   `ktesio-engine`), and `CHANGELOG.md` / `docs/RELEASE_NOTES.md` current for
+   (`0.1.0` today for `hemaka-adapter-api`, `hemaka-adapters-hermes`,
+   `hemaka-engine`), and `CHANGELOG.md` / `docs/RELEASE_NOTES.md` current for
    everything shipping. The tag in step 6 goes ON that release commit.
 3. **Registry identity.** `cargo login` has been run locally with an account
    that will own the `ktesio-*` crate names (this is what the manual `cargo
@@ -96,8 +96,8 @@ re-confirmation.
    below returned 404 (available) for all three.
 4. **Dependency chain closed.** Every NORMAL dependency of the three
    publishable crates is either external (already on crates.io) or named in
-   this chain. Today that is exactly `ktesio-adapter-api` +
-   `ktesio-adapters-hermes` (both in the chain). If a new internal crate has
+   this chain. Today that is exactly `hemaka-adapter-api` +
+   `hemaka-adapters-hermes` (both in the chain). If a new internal crate has
    since become a normal dependency, add it to the chain AHEAD of its
    dependents — the recovery is always "publish the missing dependency
    first", never a `--allow` style bypass.
@@ -111,7 +111,7 @@ One-time name-availability check (expect `404` = available today; a `200`
 means the name is TAKEN — stop and reconcile before anything else):
 
 ```bash
-for crate in ktesio-adapter-api ktesio-adapters-hermes ktesio-engine; do
+for crate in hemaka-adapter-api hemaka-adapters-hermes hemaka-engine; do
   printf '%s: ' "$crate"
   curl -s -o /dev/null -w '%{http_code}\n' "https://crates.io/api/v1/crates/$crate"
 done
@@ -120,9 +120,9 @@ done
 ### Safe rehearsals (purely local, allowed any time)
 
 ```bash
-cargo package --list -p ktesio-adapter-api
-cargo package --list -p ktesio-adapters-hermes
-cargo package --list -p ktesio-engine
+cargo package --list -p hemaka-adapter-api
+cargo package --list -p hemaka-adapters-hermes
+cargo package --list -p hemaka-engine
 ```
 
 `cargo package --list` builds nothing remote and contacts no registry. Even
@@ -138,11 +138,11 @@ BEFORE the tag (which releases the `ktesio` CLI crate, the binaries, the
 GitHub Release, and the Homebrew tap update in one automated sweep).
 
 **Step 0 — flip the publish flags (part of the same go).** Remove
-`publish = false` from `crates/ktesio-adapter-api/Cargo.toml`,
-`crates/ktesio-adapters-hermes/Cargo.toml`, and
-`crates/ktesio-engine/Cargo.toml`, and update the three PUBLISH-HELD
+`publish = false` from `crates/hemaka-adapter-api/Cargo.toml`,
+`crates/hemaka-adapters-hermes/Cargo.toml`, and
+`crates/hemaka-engine/Cargo.toml`, and update the three PUBLISH-HELD
 comments, in the release commit from precondition 2.
-(`ktesio-conformance` KEEPS its flag — it is the dev/test kit, nothing
+(`hemaka-conformance` KEEPS its flag — it is the dev/test kit, nothing
 published depends on it, and publishing it is a separate, undecided step.)
 Note: this flip intentionally FAILS the `test_automation.py` hold-pin until
 it lands as this step — that is the pin working.
@@ -152,8 +152,8 @@ immutable: there is no true delete, only yank. Before EACH publish, build and
 review the exact tarball that would be uploaded:
 
 ```bash
-cargo package --no-verify -p ktesio-adapter-api
-tar -tzf target/package/ktesio-adapter-api-0.1.0.crate
+cargo package --no-verify -p hemaka-adapter-api
+tar -tzf target/package/hemaka-adapter-api-0.1.0.crate
 ```
 
 (Read the version off the manifest; extract the `.crate` — a plain
@@ -161,10 +161,10 @@ tar -tzf target/package/ktesio-adapter-api-0.1.0.crate
 stray files, version and description match.) Release-surface changes (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata) get the TWO-PASS review treatment — see "Two-pass review covers the release surface (AI-55)" in `AGENTS.md`. Then, one at a time, each
 **HOLD — requires Islam's explicit go**:
 
-1. `cargo +stable publish --locked -p ktesio-adapter-api`
-2. `cargo +stable publish --locked -p ktesio-adapters-hermes` (a normal
+1. `cargo +stable publish --locked -p hemaka-adapter-api`
+2. `cargo +stable publish --locked -p hemaka-adapters-hermes` (a normal
    dependency of the engine — step 3 fails without it)
-3. `cargo +stable publish --locked -p ktesio-engine`
+3. `cargo +stable publish --locked -p hemaka-engine`
 
 A transient registry error: re-running that exact step is safe (crates.io
 rejects duplicates).
@@ -176,20 +176,20 @@ with no git/path override:
 ```bash
 cargo new /tmp/ktesio-host-probe
 cd /tmp/ktesio-host-probe
-cargo add ktesio-engine@0.3.0
+cargo add hemaka-engine@0.3.0
 cargo build
 ```
 
-Only when this build pulls `ktesio-engine` from crates.io and compiles does
+Only when this build pulls `hemaka-engine` from crates.io and compiles does
 the chain proceed — the tag below fires release automation, and it must never
 fire ahead of a broken publish. Same go; recorded checkpoint.
 
 **Step 5 — POST-PUBLISH DOCS flip (the docs-currency gate).** On `main`,
 in the same release-commit series: switch [Embedding the
 engine](embedding.md)'s dependency form from the git pin to the published
-version line (`ktesio-engine = "0.3"`) and rewrite its Availability section
+version line (`hemaka-engine = "0.3"`) and rewrite its Availability section
 from held to published; update the ONE remaining PUBLISH-HELD comment
-(`ktesio-conformance`'s, whose flag stays); move the held-block banners in
+(`hemaka-conformance`'s, whose flag stays); move the held-block banners in
 `CHANGELOG.md` / `docs/RELEASE_NOTES.md` into their release sections per
 their placement notes. **HOLD — requires Islam's explicit go.**
 
@@ -242,13 +242,13 @@ widen a gate or an allowlist to make a baseline pass.
   loop armed on main after `4e12ef8` and correctly demanded a bump for
   `EngineError::ResumeUnsupported`; the source bump landed as `d087ed0` with
   the AI-55 two-pass record). Steps executed: package + tarball review
-  (two-pass), `cargo +stable publish --locked -p ktesio-engine`, the
+  (two-pass), `cargo +stable publish --locked -p hemaka-engine`, the
   from-crates.io host probe, and the step-5 docs flip. adapter-api and
   adapters-hermes stay at 0.1.0 (surfaces unchanged, semver-checked).
 - **Publish go (engine 0.3.0):** GRANTED 2026-09-16 — Islam's explicit go in
   the ktesio.dev working session ("Let's go with the publish"), same scoped
   shape as the 0.2.0 go: the ENGINE crate publish only (package + two-pass
-  tarball review, `cargo +stable publish --locked -p ktesio-engine`, the
+  tarball review, `cargo +stable publish --locked -p hemaka-engine`, the
   from-crates.io host probe, the docs flip); the tag (step 6) is NOT opened.
   Context: the gate forced the version (the crates.io loop's second firing —
   epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt

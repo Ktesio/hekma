@@ -20,7 +20,7 @@ Long-running AI agents are processes that cost money on every call. Ktesio treat
 - **Metering — real token usage.** Every registered agent declares a Metering Source, and the engine records real per-run and cumulative token totals into a durable Usage Ledger. Usage is either **self-reported** by the agent or **engine-observed** through a loopback proxy, so governance never depends on the agent's cooperation.
 - **Budgets & cost control — ceilings that actually stop spend.** Set per-run and cumulative **token** budgets, and (with a configured Rate) **dollar** cost caps. Each carries a Breach Action — `pause`, `stop`, or `warn` — enforced the instant a ceiling is reached, in the same commit path as the usage that crossed it. Every dollar figure is integer micro-dollars, labeled an estimate.
 - **One vocabulary, any agent.** Register a native builtin, or bring your own agent with a small `adapter.toml` manifest that declares how to launch it, its per-OS capabilities, and its metering source. Configure every agent through one layered-TOML config with per-value provenance and `secret:NAME` references that stay masked in Ktesio's surfaces.
-- **Embedding — a library, not just a CLI.** The engine is an embeddable Rust library (`ktesio-engine`) with a blocking facade and a subscribe surface, so a host application drives the whole fleet — lifecycle, configuration, budgets, and events — without the CLI. See [Embedding the engine](docs/embedding.md).
+- **Embedding — a library, not just a CLI.** The engine is an embeddable Rust library (`hemaka-engine`) with a blocking facade and a subscribe surface, so a host application drives the whole fleet — lifecycle, configuration, budgets, and events — without the CLI. See [Embedding the engine](docs/embedding.md).
 
 ## Install
 
@@ -179,15 +179,15 @@ If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a
 # pin deliberately.
 [dev-dependencies]
 # The kit is not published to a registry yet — depend on it by git until
-# then (a workspace-relative path like `../ktesio-conformance` only works
+# then (a workspace-relative path like `../hemaka-conformance` only works
 # inside this repository; a git dependency works for any third party):
-ktesio-conformance = { git = "https://github.com/Ktesio/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
+hemaka-conformance = { git = "https://github.com/Ktesio/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }
 ```
 
 ```rust
 #[test]
 fn my_adapter_conforms() {
-    let report = ktesio_conformance::run_mock_conformance(std::path::Path::new("adapter-dir"));
+    let report = hemaka_conformance::run_mock_conformance(std::path::Path::new("adapter-dir"));
     assert!(report.is_conformant(), "failures = {:?}", report.failures());
 }
 ```

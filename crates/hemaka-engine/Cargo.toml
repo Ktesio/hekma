@@ -1,0 +1,107 @@
+[package]
+name = "hemaka-engine"
+version = "0.3.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Ktesio agent-runner engine; its public API is the Embedding Interface"
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# PUBLISHED (0.1.0 2026-09-09; 0.2.0 2026-09-15 — the breaking
+# `EngineError::ResumeUnsupported` extension, PR #181; 0.3.0 2026-09-16 —
+# the epic-12 detached-start surface: DetachRefused, SpawnRecord.detach,
+# ProcessBackend::adopt; each on Islam's explicit go, each gated by the CI
+# semver job). Publication actions always require that explicit go — never
+# flip, tag, or publish autonomously (docs/release-process.md).
+
+[dependencies]
+hemaka-adapter-api = { workspace = true }
+# The builtin native-adapter table (AD-3) carries the launchable `hermes`
+# adapter (story 6-2). kt itself still depends only on engine + adapter-api
+# (the AD-2 boundary gate's allowlist covers this edge).
+hemaka-adapters-hermes = { workspace = true }
+# State store (AD-6): rusqlite with bundled SQLite (WAL, synchronous=NORMAL,
+# foreign_keys=ON). No system SQLite dependency; first build compiles it.
+rusqlite = { workspace = true }
+# Path authority (cfg-free): cross-platform data-dir resolution. All OS `cfg`
+# lives inside this crate, keeping the engine free of #[cfg(unix/windows)]
+# (OS-cfg CI gate).
+directories = { workspace = true }
+# thiserror in the engine lib (no miette here — conventions).
+thiserror = { workspace = true }
+# serde derives on domain types (LifecycleState wire form, etc.).
+serde = { workspace = true }
+# Persist the effective per-OS Capability Declaration snapshot as a JSON file in
+# the Agent Home (AD-6: structured artifacts are files in the home, DB stays
+# lean). JSON (not TOML) so the adapter SNAPSHOT does not depend on `toml`.
+serde_json = { workspace = true }
+# Parse + serialize the layered unified-config TOML (AD-9: "TOML at every
+# layer"), story 2-1. APPROVED additive runtime dep: the workspace already pins
+# `toml = "1"`; historically only `hemaka-adapter-api` consumed it (AD-3, which
+# governs the adapter-MANIFEST schema). Config keys are a DIFFERENT concern from
+# the manifest schema, so parsing config TOML here does not violate AD-3 — the
+# engine defines no manifest schema. It is a normal external edge (not an
+# internal ktesio-* crate), so the AD-2 boundary gate is unaffected.
+toml = { workspace = true }
+# Async supervision core (AD-13). The engine owns the tokio runtime; the
+# blocking() facade drives it for kt. Not a ktesio-* crate, so it is fine on the
+# AD-2 boundary gate (a normal edge, but not an internal one). Story 3-4 adds the
+# `net` + `io-util` features (the loopback forward listener's async TCP).
+tokio = { workspace = true }
+# Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
+# listener's HTTP substrate (see the workspace Cargo.toml for the NFR-8 dep
+# justification). Engine-INTERNAL (AD-2 — the listener lives in `src/metering/`,
+# never crosses to kt). Portable async networking — NO OS cfg (the listener is in
+# the engine CORE, not `backends/`; the OS-cfg gate stays green). Builds on MSRV
+# 1.96.1 (verified). Lean: server + client + http1. Story 12-3 adds the TLS leg:
+# `https://` upstreams dial VENDORED rustls+ring (no system TLS; ONE
+# rustls+ring pair unifies with kt→ureq — see the workspace deps comment).
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+# Unix ProcessBackend (AD-4): dedicated process groups (setpgid) + signal
+# delivery to the group (SIGTERM/SIGKILL via killpg). Target-gated so it is only
+# pulled on Unix; the cfg lives in Cargo.toml (the OS-cfg CI gate greps *.rs, not
+# manifests). Minimal features — nix is heavily feature-gated. MSRV 1.69.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+
+# Windows ProcessBackend (AD-4): one Job Object per Agent Instance
+# (CreateJobObjectW / AssignProcessToJobObject / SetInformationJobObject
+# kill-on-close / TerminateJobObject). Per-API feature gating — enable only the
+# Job-Object + threading + foundation surfaces. MSRV 1.71.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+# Hermetic temp base dir for engine unit + integration tests.
+tempfile = { workspace = true }
+# Story 12-3 (TLS test only): the self-signed root the https+SSE composition
+# test mints. DEV-ONLY — never a shipping artifact (the workspace dep comment
+# carries the full justification).
+rcgen = { workspace = true }
+# Test-only: the reusable conformance mock adapter + scripted fake agent. This
+# is a DEV dependency ONLY — a normal edge would be transitive into `kt` and
+# trip the AD-2 boundary gate (which excludes dev-deps). The shipping engine
+# resolves `--kind mock` via its own internal builtin, not this crate.
+hemaka-conformance = { path = "../hemaka-conformance" }
+# Story 7-5 perf harness ONLY (`examples/perf-budgets.rs`): samples the ENGINE
+# process's CPU% + RSS for the NFR-4 steady-state supervision-overhead budget.
+# DEV-ONLY and benchmark-gated — the example is compiled by `--all-targets` but
+# RUN only when invoked explicitly (`cargo run --example perf-budgets`), so it
+# never enters a shipping artifact and NFR-8's runtime-lean policy is
+# untouched: `cargo tree -p ktesio -e normal,build` is unchanged by this edge
+# (the spec record names sysinfo as the sanctioned measurement dev-dep).
+sysinfo = { workspace = true }
+
+[lints]
+workspace = true

@@ -18,7 +18,7 @@ name = "kt"
 path = "src/main.rs"
 
 [dependencies]
-ktesio-engine = { workspace = true }
+hemaka-engine = { workspace = true }
 clap = { workspace = true }
 console = { workspace = true }
 miette = { workspace = true }
@@ -44,7 +44,7 @@ rusqlite = { workspace = true }
 # `kt agent start` restarts a `failed` instance to `running`. Dev-only — excluded
 # from the boundary gate (`cargo tree -e normal,build`), so the shipping `kt`
 # graph still never depends on it (same rationale as the engine's dev-dep).
-ktesio-conformance = { path = "../ktesio-conformance" }
+hemaka-conformance = { path = "../hemaka-conformance" }
 
 [lints]
 workspace = true

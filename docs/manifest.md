@@ -181,4 +181,4 @@ Notes:
 - [Adapter Contract](adapter-contract.md) — the versioned contract this manifest speaks: negotiation, versioning/deprecation policy, and the ratified v1 decisions.
 - [Command reference](commands.md) — the `kt agent` commands and unified config keys.
 - [Architecture](architecture.md) — the Adapter Contract, the Usage Ledger, and budget enforcement.
-- [The Conformance Test Kit](testing.md#the-conformance-test-kit) — add `ktesio-conformance` as a dev-dependency and prove your `adapter.toml` honors the contract from your own `#[test]`.
+- [The Conformance Test Kit](testing.md#the-conformance-test-kit) — add `hemaka-conformance` as a dev-dependency and prove your `adapter.toml` honors the contract from your own `#[test]`.

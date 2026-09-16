@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use ktesio_engine::{
+use hemaka_engine::{
     render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
     ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
     FleetEntry, FleetListing, FleetTotals, GuaranteeLevel, LifecycleState, LogLine,
@@ -366,11 +366,11 @@ fn fleet_usage_json(totals: FleetTotals) -> Result<String, Box<dyn std::error::E
 /// (usage). `show --json` and `usage <name>`, however, resolve the instance with a
 /// linear `find` over `fleet()` and then SYNTHESIZE [`RegistryError::NotFound`],
 /// which reported the same malformed input as exit `3`. Validating here — through
-/// the engine's PUBLIC [`ktesio_engine::InstanceName`] newtype, the SAME rule the
+/// the engine's PUBLIC [`hemaka_engine::InstanceName`] newtype, the SAME rule the
 /// engine applies internally, so `kt` re-derives nothing (AD-2) — makes the code
 /// uniformly `2` for every command.
 fn validate_instance_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    ktesio_engine::InstanceName::new(name)
+    hemaka_engine::InstanceName::new(name)
         .map(|_| ())
         .map_err(|reason| {
             map_error(RegistryError::InvalidName {
@@ -463,7 +463,7 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// read `list` uses), or `None` if that read degraded — in which case the
 /// usage/metering/budget rows fall back to zero/unknown/absent so the table still
 /// renders (mirroring the runtime-field degradation).
-fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&FleetEntry>) {
+fn render_runtime_status(status: &hemaka_engine::InstanceStatus, entry: Option<&FleetEntry>) {
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
         ui::TableColumn::new("Field", 14, 20),
@@ -528,7 +528,7 @@ fn render_runtime_status(status: &ktesio_engine::InstanceStatus, entry: Option<&
     ui::print_table(&title, &columns, &rows);
     // For a failed instance, surface the last-known cause (the crash / crash-loop
     // detail) so the operator sees WHY it failed and the active policy (AC9).
-    if status.instance.state == ktesio_engine::LifecycleState::Failed {
+    if status.instance.state == hemaka_engine::LifecycleState::Failed {
         if let Some(cause) = &status.failed_cause {
             ui::info(format!("Failed cause: {cause}"));
         }
@@ -868,7 +868,7 @@ fn fleet_total_footer(totals: &FleetTotals) -> String {
 /// [`FleetListing`] document to STDOUT and nothing else there (AD-14: `kt --json`
 /// serializes the same struct the Host event stream will publish). Freshness
 /// (≤2s, AC6) is structural: each invocation opens the engine and reads live
-/// persisted state via [`ktesio_engine::Engine::fleet`] — there is no cache, so
+/// persisted state via [`hemaka_engine::Engine::fleet`] — there is no cache, so
 /// any committed transition is reflected on the next listing (a single DB read).
 pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = open_engine()?;
@@ -1296,7 +1296,7 @@ const LOGS_FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// process has finished the engine-line write (step two) — a real,
 /// cross-process race, distinct from (and independent of) the reader/tailer
 /// mechanics. Retrying briefly here closes it. Mirrors
-/// `crates/ktesio-engine/tests/logs.rs`'s
+/// `crates/hemaka-engine/tests/logs.rs`'s
 /// `follow_drains_and_exits_cleanly_on_stop`'s own accommodation for this
 /// exact race (there, a 3s bound); kept short here since the remaining gap
 /// between the two steps is normally sub-millisecond.
@@ -1329,7 +1329,7 @@ const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// SAME append order as the human form (never timestamp-sorted — story 4-2
 /// AC-G). NDJSON — not a single wrapping document — because `--follow` is an
 /// unbounded stream a wrapper could never close; each [`LogLine`] already carries
-/// its own `schema_version` ([`ktesio_engine::LOG_SCHEMA_VERSION`]), so per-line
+/// its own `schema_version` ([`hemaka_engine::LOG_SCHEMA_VERSION`]), so per-line
 /// versioning is intrinsic. The shape is identical for one-shot and `--follow`.
 /// Output discipline holds in BOTH modes (DC-3): stdout stays pure NDJSON while
 /// the rotation notice and the follow-exit note ride on stderr (AD-12).
@@ -1479,7 +1479,7 @@ fn classify_stdout_write(err: std::io::Error) -> Result<EmitOutcome, Box<dyn std
 /// Serialize one [`LogLine`] to a SINGLE compact JSON line (NDJSON — story 4-3):
 /// `serde_json::to_string` (never `to_string_pretty`, which would break the
 /// one-object-per-line invariant). Reuses the engine's already-versioned
-/// [`LogLine`] (its `schema_version` is [`ktesio_engine::LOG_SCHEMA_VERSION`]) — no
+/// [`LogLine`] (its `schema_version` is [`hemaka_engine::LOG_SCHEMA_VERSION`]) — no
 /// new schema constant. Pure and unit-testable; a serialize failure (unreachable
 /// for this plain serde struct) becomes an [`AgentIo`] diagnostic, never a panic.
 fn log_line_json(line: &LogLine) -> Result<String, Box<dyn std::error::Error>> {
@@ -1520,7 +1520,7 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
-fn note_if_best_effort(facade: &ktesio_engine::Blocking<'_>, name: &str, op: &str) {
+fn note_if_best_effort(facade: &hemaka_engine::Blocking<'_>, name: &str, op: &str) {
     let Ok(caps) = facade.effective_capabilities(name) else {
         return;
     };
@@ -1587,7 +1587,7 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// effective config as a Key/Value/Validated/**Source** table to stdout, or (with
 /// `--json`) a single versioned document to stdout and nothing else there. Each
 /// value NAMES its source layer (`engine-default` / `kind-default` / `instance` /
-/// `invocation-override`), read from the [`ktesio_engine::SourceLayer`] tag the
+/// `invocation-override`), read from the [`hemaka_engine::SourceLayer`] tag the
 /// engine records per leaf (AD-2: `kt` never re-derives it). Deep-resolved via the
 /// engine (engine defaults < kind defaults < instance < invocation overrides); a
 /// key set at the instance layer overrides the same key at a lower layer, every
@@ -1599,7 +1599,7 @@ pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std:
 /// so a residual deferral note would be false.
 ///
 /// SECRETS (story 2-4, AC-C/AC11): `secret:NAME` values are MASKED by default (the
-/// engine's [`ktesio_engine::ResolvedValue::display`] masks them — `kt` renders
+/// engine's [`hemaka_engine::ResolvedValue::display`] masks them — `kt` renders
 /// whatever the engine hands it, AD-2). `--reveal` (`reveal == true`) is the SOLE
 /// un-mask: it asks the engine to re-resolve the secret leaves LIVE and overlays
 /// their cleartext into BOTH the human table and `--json` (Assumption 11 —
@@ -1746,7 +1746,7 @@ fn leaf_display(
 /// story 2-4 masks a `secret:` value at this single choke point — AC8), OVERLAID
 /// with the engine-resolved cleartext for a secret leaf when `--reveal` is passed
 /// (AC-C — the sole un-mask of machine-readable output); `source` is the kebab-case
-/// [`ktesio_engine::SourceLayer`] wire label; `unvalidated` is the story-2-2
+/// [`hemaka_engine::SourceLayer`] wire label; `unvalidated` is the story-2-2
 /// pass-through marker (derived via the engine accessor, AD-2). When `only` is
 /// `Some(key)` the document carries just that one leaf (the single-key
 /// `config get <name> <key> --json` form).
@@ -1782,8 +1782,8 @@ struct ConfigDocument {
 /// unit-testable in-process; the CLI just prints the returned string to stdout.
 /// `only` selects a single leaf (the single-key form) or `None` for the whole
 /// config. Every value renders via the engine's ONE display path — the resolved
-/// leaf's [`ktesio_engine::ResolvedValue::display`] — and every source via the
-/// winning layer tag's `as_str` ([`ktesio_engine::SourceLayer::as_str`]) — `kt`
+/// leaf's [`hemaka_engine::ResolvedValue::display`] — and every source via the
+/// winning layer tag's `as_str` ([`hemaka_engine::SourceLayer::as_str`]) — `kt`
 /// never re-derives either (AD-2). A serialize failure (not reachable for these
 /// plain serde structs) becomes an [`AgentIo`] diagnostic, never a panic.
 fn config_json(
@@ -1832,7 +1832,7 @@ const VALIDATED_MARKER: &str = "validated";
 /// the story-2-2 "Validated" marker column, and the story-2-3 **"Source"** column
 /// naming each value's winning layer (FR-13). A leaf under `agent.*` is marked
 /// **unvalidated** (it bypassed known-key validation, AC-B/AC7); a known key is
-/// marked validated. The "Source" column shows the winning [`ktesio_engine::SourceLayer`]
+/// marked validated. The "Source" column shows the winning [`hemaka_engine::SourceLayer`]
 /// label (`engine-default` / `kind-default` / `instance` / `invocation-override`),
 /// read per leaf from the engine's `source` tag (AD-2: `kt` never re-derives it).
 /// An empty effective config prints a plain info line rather than an empty table.
@@ -2240,7 +2240,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
         // Story 6-6 (FR-30, the v1 freeze): the manifest is well-formed but its
         // contract MAJOR does not negotiate with this engine. `detail` already
         // names BOTH versions and quotes the compatibility rule (rendered once
-        // in ktesio-adapter-api), so this arm adds only the remediation.
+        // in hemaka-adapter-api), so this arm adds only the remediation.
         RegistryError::ContractIncompatible { path, detail } => AgentContractIncompatible {
             message: format!(
                 "The adapter manifest at '{path}' cannot load: {detail}. Ask the adapter author \
@@ -2566,7 +2566,7 @@ mod tests {
 
         let invalid = map_error(RegistryError::InvalidName {
             name: "Bad".into(),
-            reason: ktesio_engine::NameError::BadChar,
+            reason: hemaka_engine::NameError::BadChar,
         });
         assert!(invalid.to_string().contains("^[a-z0-9]"));
 
@@ -2601,7 +2601,7 @@ mod tests {
 
         // Store errors surface as a state-store diagnostic.
         let store = map_error(RegistryError::Store(
-            ktesio_engine::ports::StoreError::Backend("db gone".into()),
+            hemaka_engine::ports::StoreError::Backend("db gone".into()),
         ));
         assert!(store.to_string().contains("State store error"));
     }
@@ -2868,7 +2868,7 @@ mod tests {
                 "InvalidName",
                 EngineError::InvalidName {
                     name: "Bad Name".to_string(),
-                    reason: ktesio_engine::NameError::BadFirstChar,
+                    reason: hemaka_engine::NameError::BadFirstChar,
                 },
                 ExitCode::Usage,
             ),
@@ -2912,7 +2912,7 @@ mod tests {
                 "InvalidName",
                 RegistryError::InvalidName {
                     name: "Bad Name".to_string(),
-                    reason: ktesio_engine::NameError::BadFirstChar,
+                    reason: hemaka_engine::NameError::BadFirstChar,
                 },
                 ExitCode::Usage,
             ),
@@ -3104,16 +3104,16 @@ mod tests {
 
     fn sample_fleet_entry(name: &str) -> FleetEntry {
         FleetEntry {
-            name: ktesio_engine::InstanceName::new(name).unwrap(),
+            name: hemaka_engine::InstanceName::new(name).unwrap(),
             kind: "mock".to_string(),
-            state: ktesio_engine::LifecycleState::Registered,
+            state: hemaka_engine::LifecycleState::Registered,
             restart_count: 0,
-            restart_policy: ktesio_engine::RestartPolicy::OnFailure,
+            restart_policy: hemaka_engine::RestartPolicy::OnFailure,
             failed_cause: None,
             budget: None,
             usage: UsageView::new(
-                ktesio_engine::UsageTotals::zero(),
-                ktesio_engine::UsageTotals::zero(),
+                hemaka_engine::UsageTotals::zero(),
+                hemaka_engine::UsageTotals::zero(),
             ),
             metering_source: "self-reported".to_string(),
             agent_home: format!("/x/agents/{name}"),
@@ -3199,11 +3199,11 @@ mod tests {
     ) -> FleetEntry {
         let mut entry = sample_fleet_entry(name);
         let base = UsageView::new(
-            ktesio_engine::UsageTotals {
+            hemaka_engine::UsageTotals {
                 input_tokens: input,
                 output_tokens: output,
             },
-            ktesio_engine::UsageTotals::zero(),
+            hemaka_engine::UsageTotals::zero(),
         );
         entry.usage = match dollars {
             Some(cost) => base.with_dollars(cost, Micros::ZERO, EstimateLabel::Estimated),
@@ -3308,11 +3308,11 @@ mod tests {
         // — when a Run has usage; a non-running/zero-run instance shows only cumulative
         // (no fabricated `run: in 0 / out 0`).
         let running = UsageView::new(
-            ktesio_engine::UsageTotals {
+            hemaka_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
             },
-            ktesio_engine::UsageTotals {
+            hemaka_engine::UsageTotals {
                 input_tokens: 40,
                 output_tokens: 60,
             },
@@ -3326,11 +3326,11 @@ mod tests {
 
         // No current run → cumulative only.
         let idle = UsageView::new(
-            ktesio_engine::UsageTotals {
+            hemaka_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
             },
-            ktesio_engine::UsageTotals::zero(),
+            hemaka_engine::UsageTotals::zero(),
         );
         let shown = usage_cell_show(&idle);
         assert!(shown.contains("in 100 / out 250"), "{shown}");
@@ -3428,7 +3428,7 @@ mod tests {
     /// (a known key from the instance layer + an agent.* pass-through leaf from a
     /// weaker layer), reusing the engine's public resolver.
     fn sample_effective() -> EffectiveConfig {
-        use ktesio_engine::{resolve, SourceLayer};
+        use hemaka_engine::{resolve, SourceLayer};
         let layers = [
             ConfigLayer::parse(
                 SourceLayer::EngineDefault,
@@ -3483,7 +3483,7 @@ mod tests {
     fn config_json_value_matches_the_human_display_form() {
         // AC8: the --json value and the human value both render via the ONE display
         // path — a non-string scalar renders in the same inline form in both.
-        use ktesio_engine::{resolve, SourceLayer};
+        use hemaka_engine::{resolve, SourceLayer};
         let eff = resolve([
             ConfigLayer::empty(),
             ConfigLayer::empty(),
@@ -3514,7 +3514,7 @@ mod tests {
         // an elision count. A key that is neither a value nor a prefix yields None
         // (the plain unknown-key diagnostic). Built through the engine's public
         // resolver, like the config_json unit tests.
-        use ktesio_engine::{resolve, SourceLayer};
+        use hemaka_engine::{resolve, SourceLayer};
         let resolve_instance = |toml_text: &str| {
             resolve([
                 ConfigLayer::empty(),
@@ -3646,7 +3646,7 @@ mod tests {
 
             // reveal_secrets returns the resolved cleartext for the secret leaf only.
             let revealed = blocking
-                .reveal_secrets("sec", ktesio_engine::ConfigLayer::empty())
+                .reveal_secrets("sec", hemaka_engine::ConfigLayer::empty())
                 .unwrap();
             assert_eq!(revealed.get("model").map(String::as_str), Some(sentinel));
             assert!(!revealed.contains_key("agent.plain"), "only secret leaves");
@@ -3663,7 +3663,7 @@ mod tests {
         let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
         let eff = engine
             .blocking()
-            .effective_config("sec", ktesio_engine::ConfigLayer::empty())
+            .effective_config("sec", hemaka_engine::ConfigLayer::empty())
             .unwrap();
         let mut overlay = std::collections::BTreeMap::new();
         overlay.insert("model".to_string(), sentinel.to_string());
@@ -3671,7 +3671,7 @@ mod tests {
         // A non-overlaid secret leaf falls back to the masked display().
         assert_eq!(
             leaf_display(&eff, "model", &std::collections::BTreeMap::new()),
-            ktesio_engine::SECRET_MASK
+            hemaka_engine::SECRET_MASK
         );
 
         unsafe {
@@ -3682,7 +3682,7 @@ mod tests {
 
     #[test]
     fn render_capabilities_handles_empty_and_nonempty() {
-        use ktesio_engine::{Capability, OsId, SupportLevel};
+        use hemaka_engine::{Capability, OsId, SupportLevel};
         // Empty projection: prints the "none declared" info line without panic.
         let empty = EffectiveCapabilities {
             os: OsId::current(),
@@ -3712,7 +3712,7 @@ mod tests {
         per_run_dollars: Option<(Micros, Micros)>,
         cumulative_dollars: Option<(Micros, Micros)>,
         estimate_label: Option<EstimateLabel>,
-        breach_action: ktesio_engine::BreachAction,
+        breach_action: hemaka_engine::BreachAction,
     ) -> BudgetView {
         BudgetView {
             per_run_limit: per_run.map(|(limit, _)| limit),
@@ -3741,7 +3741,7 @@ mod tests {
             None,
             None,
             None,
-            ktesio_engine::BreachAction::Pause,
+            hemaka_engine::BreachAction::Pause,
         );
 
         assert_eq!(
@@ -3765,7 +3765,7 @@ mod tests {
             Some((Micros(500_000), Micros(200_000))),
             Some((Micros(2_000_000), Micros(1_250_000))),
             Some(EstimateLabel::Estimated),
-            ktesio_engine::BreachAction::Stop,
+            hemaka_engine::BreachAction::Stop,
         );
 
         assert_eq!(
@@ -3794,11 +3794,11 @@ mod tests {
         // qualifier ([`USAGE_LIST_HEADER`]) OR leaking the label into the InHeader
         // cell (where truncation could strip it) both fail.
         let usage = UsageView::new(
-            ktesio_engine::UsageTotals {
+            hemaka_engine::UsageTotals {
                 input_tokens: 120,
                 output_tokens: 340,
             },
-            ktesio_engine::UsageTotals::zero(),
+            hemaka_engine::UsageTotals::zero(),
         )
         .with_dollars(Micros(300_000), Micros::ZERO, EstimateLabel::Estimated);
 
@@ -3826,7 +3826,7 @@ mod tests {
             None,
             None,
             None,
-            ktesio_engine::BreachAction::Pause,
+            hemaka_engine::BreachAction::Pause,
         );
 
         let cell = budget_cell(Some(&budget), DollarLabel::Inline);
@@ -3847,7 +3847,7 @@ mod tests {
             None,
             None,
             None,
-            ktesio_engine::BreachAction::Warn,
+            hemaka_engine::BreachAction::Warn,
         );
 
         assert_eq!(
@@ -4067,7 +4067,7 @@ mod tests {
 
         let backend = map_engine_error(EngineError::Backend {
             name: "demo".to_string(),
-            source: ktesio_engine::ports::BackendError::Spawn {
+            source: hemaka_engine::ports::BackendError::Spawn {
                 exec: "/usr/bin/ghost".to_string(),
                 detail: "No such file or directory".to_string(),
             },
@@ -4076,7 +4076,7 @@ mod tests {
         assert!(backend.to_string().contains("/usr/bin/ghost"));
 
         let store = map_engine_error(EngineError::Store(
-            ktesio_engine::ports::StoreError::CorruptRow {
+            hemaka_engine::ports::StoreError::CorruptRow {
                 name: "demo".to_string(),
                 detail: "unrecognized lifecycle state 'quantum'".to_string(),
             },

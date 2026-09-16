@@ -506,6 +506,64 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hemaka-adapter-api"
+version = "0.1.0"
+dependencies = [
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "hemaka-adapters-hermes"
+version = "0.1.0"
+dependencies = [
+ "hemaka-adapter-api",
+]
+
+[[package]]
+name = "hemaka-conformance"
+version = "0.1.0"
+dependencies = [
+ "hemaka-adapter-api",
+ "hemaka-engine",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "hemaka-engine"
+version = "0.3.0"
+dependencies = [
+ "bytes",
+ "directories",
+ "hemaka-adapter-api",
+ "hemaka-adapters-hermes",
+ "hemaka-conformance",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "nix",
+ "rcgen",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "webpki-roots",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -763,8 +821,8 @@ dependencies = [
  "clap",
  "console",
  "flate2",
- "ktesio-conformance",
- "ktesio-engine",
+ "hemaka-conformance",
+ "hemaka-engine",
  "miette",
  "rusqlite",
  "semver",
@@ -776,64 +834,6 @@ dependencies = [
  "thiserror",
  "ureq",
  "zip",
-]
-
-[[package]]
-name = "ktesio-adapter-api"
-version = "0.1.0"
-dependencies = [
- "semver",
- "serde",
- "serde_json",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "ktesio-adapters-hermes"
-version = "0.1.0"
-dependencies = [
- "ktesio-adapter-api",
-]
-
-[[package]]
-name = "ktesio-conformance"
-version = "0.1.0"
-dependencies = [
- "ktesio-adapter-api",
- "ktesio-engine",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "ktesio-engine"
-version = "0.3.0"
-dependencies = [
- "bytes",
- "directories",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ktesio-adapter-api",
- "ktesio-adapters-hermes",
- "ktesio-conformance",
- "nix",
- "rcgen",
- "rusqlite",
- "rustls",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "webpki-roots",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

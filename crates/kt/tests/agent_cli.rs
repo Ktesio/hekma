@@ -10,9 +10,9 @@ mod helpers;
 use std::path::Path;
 
 use helpers::{run_kt_agent, run_kt_agent_with_env, KtRun, TestContext};
-use ktesio_conformance::test_support::{current_os_key, ManifestFixture};
-use ktesio_conformance::uj3;
-use ktesio_engine::{Engine, FleetEntry, LifecycleState, UsageView};
+use hemaka_conformance::test_support::{current_os_key, ManifestFixture};
+use hemaka_conformance::uj3;
+use hemaka_engine::{Engine, FleetEntry, LifecycleState, UsageView};
 
 /// Path to the SQLite state DB the engine creates under a state base.
 fn state_db(state_dir: &Path) -> std::path::PathBuf {
@@ -100,7 +100,7 @@ fn agent_cli_start_helper_subprocess() {
         return;
     };
     let state = std::path::PathBuf::from(std::env::var("KTESIO_STATE_DIR").unwrap());
-    let engine = ktesio_engine::Engine::open(Some(state)).expect("helper engine open");
+    let engine = hemaka_engine::Engine::open(Some(state)).expect("helper engine open");
     engine.blocking().start(&name).expect("helper start");
     // Exit WITHOUT dropping `engine` (crash semantics): the started process
     // survives and re-parents to init, ready for the next command to adopt.
@@ -393,7 +393,7 @@ source = "self-reported"
 /// Write an `adapter.toml` into a fresh subdirectory of `dir` and return it.
 ///
 /// Deliberately NOT consolidated onto the shared
-/// `ktesio_conformance::test_support::ManifestFixture` (story 10-1): this
+/// `hemaka_conformance::test_support::ManifestFixture` (story 10-1): this
 /// writer takes a RAW TOML body, which is the point — the register/show
 /// failure-path tests feed it INTENTIONALLY INVALID or bespoke manifests
 /// (a missing `[metering]`, a nonexistent `exec`, hand-picked per-OS pause
@@ -562,9 +562,9 @@ fn show_unknown_instance_exits_nonzero() {
 /// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent`,
 /// interaction `guaranteed` on all three OSes. The TOML body is the SHARED
 /// builder's `fake_agent` preset (story 10-1 —
-/// `ktesio_conformance::test_support` states the manifest shape ONCE); this
+/// `hemaka_conformance::test_support` states the manifest shape ONCE); this
 /// wrapper only keeps the fixture's `fake-agent-adapter` subdirectory name.
-/// The locator behind it is the SHARED `ktesio_conformance::fake_agent_bin`:
+/// The locator behind it is the SHARED `hemaka_conformance::fake_agent_bin`:
 /// the running kt integration-test binary resolves its own
 /// `target/<profile>/deps/` sibling — the same profile dir the old local
 /// `CARGO_BIN_EXE_kt`-anchored copy named — so that copy was duplication,
@@ -682,7 +682,7 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
 /// `adoption.rs` convention: branch on the runtime OS id and shell out; NO
 /// `#[cfg]` — this file is outside the engine-backends allowlist).
 fn pid_alive(pid: u32) -> bool {
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         let out = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output();
@@ -1076,7 +1076,7 @@ fn start_detach_of_an_engine_observed_instance_is_refused_with_exit_code_5() {
     // env mapping the engine's loopback injection targets.
     let m = ctx.project_dir.join("obs-detach-adapter");
     std::fs::create_dir_all(&m).unwrap();
-    let bin = ktesio_conformance::fake_agent_bin();
+    let bin = hemaka_conformance::fake_agent_bin();
     std::fs::write(
         m.join("adapter.toml"),
         format!(
@@ -1402,7 +1402,7 @@ fn pause_after_windows_engine_death_reconciles_and_fails_honestly_windows() {
     // diagnostic — never a fabricated `paused` on stdout. This is the
     // end-to-end proof that a Windows pause command can never silently
     // "pause" an instance whose process no longer exists.
-    if ktesio_engine::OsId::current() != ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() != hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();
@@ -1497,12 +1497,12 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
     // adoption reconciles the row to `failed` and pause can't run. Cross-lifetime
     // survival genuinely can't be simulated on Windows (consistent with the
     // engine's documented single-lifetime behavior); the pause/resume SEMANTICS
-    // are fully covered on Windows by `crates/ktesio-engine/tests/pause.rs`, and
+    // are fully covered on Windows by `crates/hemaka-engine/tests/pause.rs`, and
     // the Windows-correct CLI sibling in this family — the honest
     // reconciled-to-`failed` pause failure after an engine death — runs on the
     // Windows leg
     // (`pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`).
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     // AC2 + AC6 at the CLI: a best-effort pause prints the new state `paused` to
@@ -1558,7 +1558,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // reconciles the row to `failed` and pause fails with a reconciled-to-failed
     // error instead of the intended UNSUPPORTED diagnostic. Cross-lifetime
     // survival can't be simulated on Windows; the pause semantics (including the
-    // unsupported projection) are covered by `crates/ktesio-engine/tests/pause.rs`,
+    // unsupported projection) are covered by `crates/hemaka-engine/tests/pause.rs`,
     // and the family's Windows-correct CLI sibling runs on the Windows leg
     // (`pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`).
     // Per-OS honesty note (AI-29, story 11-5): there is deliberately NO Windows
@@ -1567,7 +1567,7 @@ fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // Windows CLI invocation can reach; the diagnostic→code mapping stays pinned
     // cross-OS by the `exit_code.rs` classifier unit tests (the file-level
     // convention note above).
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     // AC3 + AC6 at the CLI: a pause that is `unsupported` on this OS fails fast
@@ -1722,7 +1722,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     // delivered. AC-A's single-session happy path (exit 0 + delivered input)
     // is fully proven at the engine level by
     // `send_input_delivers_text_to_a_running_manifest_adapter_agent` in
-    // `crates/ktesio-engine/tests/interaction.rs`, which does not cross a
+    // `crates/hemaka-engine/tests/interaction.rs`, which does not cross a
     // process boundary.
     //
     // Runtime-skip on Windows: `start_via_surviving_engine`'s cross-lifetime
@@ -1730,7 +1730,7 @@ fn send_on_an_adopted_instance_exits_nonzero_with_interaction_unavailable_unix()
     // JOB_CLOSE` kills the child on Windows when the helper exits) — the SAME
     // reason the pause CLI tests skip Windows. NO `#[cfg]` (data-driven; this
     // file is outside the backends allowlist).
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();
@@ -1830,7 +1830,7 @@ fn send_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // unsupported-but-DB-hacked `force_state_running` would not survive
     // `adopt_orphans`' reconciliation (see that test's own comment on why the
     // heavier harness is required even for the fail-fast path).
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();
@@ -2250,7 +2250,7 @@ fn start_restarts_a_failed_instance() {
 
     // Register a manifest instance whose exec is the real fake_agent (lingers).
     let manifest_dir = TestContext::new();
-    let bin = ktesio_conformance::fake_agent_bin();
+    let bin = hemaka_conformance::fake_agent_bin();
     let body = format!(
         r#"
 contract_version = "1.0.0"
@@ -2721,7 +2721,7 @@ fn uj1_governance_journey_through_documented_cli_commands() {
 /// opens an engine over `KTESIO_STATE_DIR`, STARTS the named instance, waits —
 /// in THIS engine session, where the background reaper lives — for the
 /// committed `paused` state the breach produces (via the SHARED
-/// `ktesio_conformance::uj3` poller), reads the LIVE Fleet row and asserts the
+/// `hemaka_conformance::uj3` poller), reads the LIVE Fleet row and asserts the
 /// shared paused-entry shape (the same assertion the host test feeds from its
 /// own facade read — the paused-entry leg is proven on BOTH paths), and only
 /// then exits WITHOUT dropping the engine (crash semantics): the suspended
@@ -2828,11 +2828,11 @@ impl Drop for StopOrphanOnDrop<'_> {
 #[test]
 fn uj3_governance_journey_through_documented_cli_commands_unix() {
     // Story 7-1 (FR-31), the behavioral-identity half: the SAME UJ-3 flow the
-    // library host test (`crates/ktesio-engine/tests/uj3_library_host.rs`)
+    // library host test (`crates/hemaka-engine/tests/uj3_library_host.rs`)
     // drives through the engine's `Blocking` facade is driven here through
     // DOCUMENTED `kt` commands only — register --manifest, config set,
     // config get, show --json / usage --json, stop — and EVERY assertion comes
-    // from the SHARED `ktesio_conformance::uj3` module (the expectations are
+    // from the SHARED `hemaka_conformance::uj3` module (the expectations are
     // pinned once; neither suite re-states them). The two suites drive
     // DIFFERENT roots (this one: the `KTESIO_STATE_DIR`-pinned kt harness home;
     // the host: its own temp engine root); the shared module asserts on
@@ -3014,7 +3014,7 @@ fn show_entry(ctx: &TestContext, state_dir: &Path, name: &str) -> FleetEntry {
         .unwrap_or_else(|e| panic!("show --json not JSON: {e}\n{}", show.stdout));
     assert_eq!(
         doc["schema_version"],
-        serde_json::json!(ktesio_engine::FLEET_SCHEMA_VERSION),
+        serde_json::json!(hemaka_engine::FLEET_SCHEMA_VERSION),
         "the show document negotiates on the pinned Fleet schema version: {doc}"
     );
     serde_json::from_value(doc["instance"].clone())
@@ -3037,7 +3037,7 @@ fn usage_view(ctx: &TestContext, state_dir: &Path, name: &str) -> UsageView {
         .unwrap_or_else(|e| panic!("usage --json not JSON: {e}\n{}", usage.stdout));
     assert_eq!(
         doc["schema_version"],
-        serde_json::json!(ktesio_engine::FLEET_SCHEMA_VERSION),
+        serde_json::json!(hemaka_engine::FLEET_SCHEMA_VERSION),
         "the usage document carries the pinned Fleet schema version: {doc}"
     );
     serde_json::from_value(doc["usage"].clone())
@@ -5145,7 +5145,7 @@ fn logs_reads_retained_output_after_the_instance_stops_unix() {
     // and (unlike 4.1's `send`) expected to succeed even across a clean
     // process boundary, since a stopped instance's log file needs no live
     // handle at all.
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();
@@ -5212,7 +5212,7 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
     // admitted it doesn't prove — mirrors how the engine-level sibling test
     // is correctly named
     // `adopted_instance_can_be_followed_from_a_fresh_engine_session`
-    // (`ktesio-engine/tests/logs.rs`), not "...streams_new_output". Verified
+    // (`hemaka-engine/tests/logs.rs`), not "...streams_new_output". Verified
     // EMPIRICALLY (both here and at the engine level, unaffected by this
     // fix pass's crash-safety redesign — an adopted handle still gets no
     // capture pipeline of its own, by design, matching pre-fix behavior
@@ -5239,7 +5239,7 @@ fn logs_follow_on_an_adopted_instance_reads_history_and_exits_cleanly_on_stop_un
     // `start_via_surviving_engine`'s other CLI tests document
     // (`agent_cli.rs:906-918`) — inherited, not new. NO `#[cfg]`
     // (data-driven; this file is outside the backends allowlist).
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();
@@ -5413,7 +5413,7 @@ fn logs_on_an_unregistered_name_is_not_found() {
 //
 // WHY BESPOKE TESTS AND NOT `cargo-semver-checks` (recorded for reviewers):
 // the repo's semver-check job is (a) currently DORMANT and (b) Rust-API-only
-// by design — it compares the `ktesio-engine` *Rust* public API. It does NOT
+// by design — it compares the `hemaka-engine` *Rust* public API. It does NOT
 // see serialized JSON (a `#[serde(rename)]` that silently renames a wire
 // field PASSES semver-checks) and it does not see process exit codes at all.
 // It also never inspects the `kt` binary crate, where the CLI-local documents
@@ -6287,7 +6287,7 @@ fn attributed_output_log_path(state_dir: &Path, name: &str) -> std::path::PathBu
 /// THREE OSes: producing real captured output needs a live child that survives
 /// its starting engine session, which only the Unix-only
 /// `start_via_surviving_engine` harness can arrange.
-fn append_captured_log_lines(state_dir: &Path, name: &str, lines: &[ktesio_engine::LogLine]) {
+fn append_captured_log_lines(state_dir: &Path, name: &str, lines: &[hemaka_engine::LogLine]) {
     use std::io::Write;
     let path = attributed_output_log_path(state_dir, name);
     std::fs::create_dir_all(path.parent().unwrap()).expect("create the instance log dir");
@@ -6303,8 +6303,8 @@ fn append_captured_log_lines(state_dir: &Path, name: &str, lines: &[ktesio_engin
 }
 
 /// One captured line, for [`append_captured_log_lines`].
-fn captured(name: &str, stream: ktesio_engine::LogStream, text: &str) -> ktesio_engine::LogLine {
-    ktesio_engine::LogLine::new(name, stream, text, "2026-07-20T12:00:00Z")
+fn captured(name: &str, stream: hemaka_engine::LogStream, text: &str) -> hemaka_engine::LogLine {
+    hemaka_engine::LogLine::new(name, stream, text, "2026-07-20T12:00:00Z")
 }
 
 /// Assert every non-empty stdout line is ONE complete, compact `LogLine` JSON
@@ -6362,9 +6362,9 @@ fn logs_json_wire_shape_is_frozen_ndjson_on_every_os() {
         state_dir,
         "nat",
         &[
-            captured("nat", ktesio_engine::LogStream::AgentOut, "first out"),
-            captured("nat", ktesio_engine::LogStream::AgentErr, "second \"err\""),
-            captured("nat", ktesio_engine::LogStream::Engine, "third engine"),
+            captured("nat", hemaka_engine::LogStream::AgentOut, "first out"),
+            captured("nat", hemaka_engine::LogStream::AgentErr, "second \"err\""),
+            captured("nat", hemaka_engine::LogStream::Engine, "third engine"),
         ],
     );
 
@@ -6423,7 +6423,7 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
         "nat",
         &[captured(
             "nat",
-            ktesio_engine::LogStream::AgentOut,
+            hemaka_engine::LogStream::AgentOut,
             "backlog line",
         )],
     );
@@ -6465,7 +6465,7 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
         "nat",
         &[captured(
             "nat",
-            ktesio_engine::LogStream::Engine,
+            hemaka_engine::LogStream::Engine,
             "incremental line",
         )],
     );
@@ -6521,11 +6521,11 @@ fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
     // the child provably writes into a closed pipe.
     let (ctx, state) = registered_mock("nat");
     let state_dir = state.project_dir.as_path();
-    let lines: Vec<ktesio_engine::LogLine> = (0..5_000)
+    let lines: Vec<hemaka_engine::LogLine> = (0..5_000)
         .map(|i| {
             captured(
                 "nat",
-                ktesio_engine::LogStream::AgentOut,
+                hemaka_engine::LogStream::AgentOut,
                 &format!("line {i} — padding to push well past any pipe buffer"),
             )
         })
@@ -6581,7 +6581,7 @@ fn logs_json_emits_newline_delimited_self_versioned_loglines_in_append_order_uni
     // three OSes in `logs_json_wire_shape_is_frozen_ndjson_on_every_os`. What
     // remains here, and only here, is the end-to-end proof over output captured
     // by the real engine rather than seeded onto disk.
-    if ktesio_engine::OsId::current() == ktesio_engine::OsId::Windows {
+    if hemaka_engine::OsId::current() == hemaka_engine::OsId::Windows {
         return;
     }
     let ctx = TestContext::new();

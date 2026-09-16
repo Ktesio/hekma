@@ -150,11 +150,11 @@ class ReleaseDocsTests(unittest.TestCase):
         # process-spawning tests race on the lib's on-demand build fallback. Guard
         # both the `rm` and the explicit rebuild so neither is dropped.
         self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
-        self.assertIn("cargo +stable build -p ktesio-conformance --bin fake_agent", ci)
+        self.assertIn("cargo +stable build -p hemaka-conformance --bin fake_agent", ci)
         # hermes_shim (story 6-2) joins fake_agent in the stale-helper guard for
         # the identical reason — assert its rm + rebuild pair in BOTH jobs too.
         self.assertIn("rm -f target/debug/hermes_shim target/debug/hermes_shim.exe", ci)
-        self.assertIn("cargo +stable build -p ktesio-conformance --bin hermes_shim", ci)
+        self.assertIn("cargo +stable build -p hemaka-conformance --bin hermes_shim", ci)
         # The COVERAGE job needs the very same guard, for the same reason, and a
         # workspace-wide assertIn cannot tell the two jobs apart — so scope this
         # pair to the coverage step's own script. The stale-helper defect has now
@@ -169,7 +169,7 @@ class ReleaseDocsTests(unittest.TestCase):
             coverage_step,
         )
         self.assertIn(
-            "cargo +stable build -p ktesio-conformance --bin fake_agent",
+            "cargo +stable build -p hemaka-conformance --bin fake_agent",
             coverage_step,
         )
         # hermes_shim's pair is asserted in the coverage job's own script too.
@@ -178,7 +178,7 @@ class ReleaseDocsTests(unittest.TestCase):
             coverage_step,
         )
         self.assertIn(
-            "cargo +stable build -p ktesio-conformance --bin hermes_shim",
+            "cargo +stable build -p hemaka-conformance --bin hermes_shim",
             coverage_step,
         )
         self.assertIn(
@@ -209,11 +209,11 @@ class ReleaseDocsTests(unittest.TestCase):
             '"cov/$pkg"',
             ci,
         )
-        # The exact five workspace crates, lightest → heaviest with ktesio-engine
+        # The exact five workspace crates, lightest → heaviest with hemaka-engine
         # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers logged).
         self.assertIn(
-            "set -- ktesio-adapter-api ktesio-conformance ktesio-adapters-hermes "
-            "ktesio ktesio-engine",
+            "set -- hemaka-adapter-api hemaka-conformance hemaka-adapters-hermes "
+            "ktesio hemaka-engine",
             ci,
         )
         # Each per-crate run is grouped and dumps free/df first, so a per-crate OOM
@@ -377,14 +377,14 @@ class ReleaseDocsTests(unittest.TestCase):
         # integration binaries, with the existing retries + slow-timeout untouched.
         self.assertIn("[test-groups.engine-integration-serial]", nextest)
         self.assertIn("max-threads = 1", nextest)
-        self.assertIn('filter = "kind(test) & package(ktesio-engine)"', nextest)
+        self.assertIn('filter = "kind(test) & package(hemaka-engine)"', nextest)
         self.assertIn('test-group = "engine-integration-serial"', nextest)
         self.assertIn("retries = 2", nextest)
         self.assertIn("slow-timeout = ", nextest)
         # The temporary bisect scaffold and the watchdog/off-pipe machinery are GONE
         # (no per-OS special-casing, no per-binary steps, no in-step capture hacks).
         self.assertNotIn("ubuntu bisect:", ci)
-        self.assertNotIn("binary_id(=ktesio-engine::", ci)
+        self.assertNotIn("binary_id(=hemaka-engine::", ci)
         self.assertNotIn("RUNLOG", ci)
         self.assertNotIn("kill -USR1 $$", ci)
         self.assertNotIn("matrix.os == 'ubuntu-latest'", ci)
@@ -403,17 +403,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("ktesio-(engine|adapter-api|adapters-hermes)", ci)
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
-        self.assertIn("crates/ktesio-engine/src/backends/", ci)
+        self.assertIn("crates/hemaka-engine/src/backends/", ci)
         # OS-cfg allowlist covers honestly-unix-gated engine integration tests
         # (AI-35 disclosure convention) alongside the backends home. Assert the
         # FULL allowlist LINE shape (review blind-12): a bare substring would
         # also match a stale comment quoting the pattern, so a narrowed
         # allowlist (e.g. a dropped legacy-file entry) must fail here.
         self.assertIn(
-            r"allowlist='^crates/ktesio-engine/src/backends/"
+            r"allowlist='^crates/hemaka-engine/src/backends/"
             r"|^crates/kt/src/update_check\.rs:"
             r"|^crates/kt/src/cli/self_update\.rs:"
-            r"|^crates/ktesio-engine/tests/'",
+            r"|^crates/hemaka-engine/tests/'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
@@ -427,7 +427,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("Enforce single currency-formatting module", ci)
         self.assertIn(r"""pattern='\$ ?\{|\}\$|"\$|'\''\$'\''""", ci)
         self.assertIn(
-            r"allowlist='^crates/ktesio-engine/src/domain/cost\.rs:"
+            r"allowlist='^crates/hemaka-engine/src/domain/cost\.rs:"
             r"|contains\(.\$|\$PWD|\$KT_TEST'",
             ci,
         )
@@ -469,7 +469,7 @@ class ReleaseDocsTests(unittest.TestCase):
         # The old constant key must not resurface.
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
         # In-repo baseline guard (#160, epic-6 retro A1): the frozen
-        # ktesio-adapter-api v1 surface is diffed against the contract-v1
+        # hemaka-adapter-api v1 surface is diffed against the contract-v1
         # freeze commit on EVERY run — the crates.io gates below it stay
         # dormant (404 -> notice) until the HELD publish executes
         # (docs/release-process.md), so this run is the active guard against
@@ -478,11 +478,11 @@ class ReleaseDocsTests(unittest.TestCase):
         # cargo-semver-checks flag (verified locally: green vs 4119db3,
         # `function_missing` failure on a removed pub item).
         self.assertIn(
-            "cargo +stable semver-checks check-release -p ktesio-adapter-api "
+            "cargo +stable semver-checks check-release -p hemaka-adapter-api "
             "--baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e",
             ci,
         )
-        # Story 7-4 arms the SAME mechanism for ktesio-engine, against a
+        # Story 7-4 arms the SAME mechanism for hemaka-engine, against a
         # DIFFERENT honest freeze point (NOT the contract freeze 4119db3 —
         # the engine's unpublished surface legitimately grew after the
         # contract froze; a 4119db3 baseline fails major lints on that
@@ -497,7 +497,7 @@ class ReleaseDocsTests(unittest.TestCase):
         # infra error. Maintenance: bump all four pins (two here, two in
         # ci.yml) together at the next deliberate freeze.
         self.assertIn(
-            "cargo +stable semver-checks check-release -p ktesio-engine "
+            "cargo +stable semver-checks check-release -p hemaka-engine "
             "--baseline-rev 49da96b6f1c695edd6afd379526deba42cf6da60",
             ci,
         )
@@ -573,7 +573,7 @@ class ReleaseDocsTests(unittest.TestCase):
         example = (
             release_docs.ROOT
             / "crates"
-            / "ktesio-engine"
+            / "hemaka-engine"
             / "examples"
             / "embedding-quickstart.rs"
         )
@@ -587,7 +587,7 @@ class ReleaseDocsTests(unittest.TestCase):
         build_end = build_start + 1 + next_job.start() if next_job else len(ci)
         build_job = ci[build_start:build_end]
         self.assertIn(
-            "cargo +stable build --release --example embedding-quickstart -p ktesio-engine",
+            "cargo +stable build --release --example embedding-quickstart -p hemaka-engine",
             build_job,
         )
         # The RUN step is guarded: a step-level timeout independent of the
@@ -617,7 +617,7 @@ class ReleaseDocsTests(unittest.TestCase):
         example = (
             release_docs.ROOT
             / "crates"
-            / "ktesio-engine"
+            / "hemaka-engine"
             / "examples"
             / "perf-budgets.rs"
         )
@@ -631,7 +631,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("name: perf-budgets", perf_job)
         self.assertIn("runs-on: ubuntu-latest", perf_job)
         self.assertIn(
-            "cargo +stable build --release -p ktesio-engine --example perf-budgets",
+            "cargo +stable build --release -p hemaka-engine --example perf-budgets",
             perf_job,
         )
         # The stale-helper guard: rm + explicit rebuild for the fake_agent
@@ -640,7 +640,7 @@ class ReleaseDocsTests(unittest.TestCase):
             "rm -f target/release/fake_agent target/release/fake_agent.exe", perf_job
         )
         self.assertIn(
-            "cargo +stable build --release -p ktesio-conformance --bin fake_agent",
+            "cargo +stable build --release -p hemaka-conformance --bin fake_agent",
             perf_job,
         )
         # Blocking, pinned structurally beyond substrings: the RUN step's
@@ -675,21 +675,21 @@ class ReleaseDocsTests(unittest.TestCase):
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):
         the three library crates are PUBLISHED (no publish=false) and
-        ktesio-conformance KEEPS its flag (dev/test kit, separate decision).
+        hemaka-conformance KEEPS its flag (dev/test kit, separate decision).
         This pin now catches an accidental re-add of publish=false to the
         published crates, or a flip of conformance's flag."""
-        for crate in ("ktesio-adapter-api", "ktesio-adapters-hermes", "ktesio-engine"):
+        for crate in ("hemaka-adapter-api", "hemaka-adapters-hermes", "hemaka-engine"):
             manifest = (release_docs.ROOT / "crates" / crate / "Cargo.toml").read_text(
                 encoding="utf-8"
             )
             self.assertNotIn("publish = false", manifest, crate)
             self.assertNotIn("publish.workspace", manifest, crate)
-        conformance = (release_docs.ROOT / "crates" / "ktesio-conformance" / "Cargo.toml").read_text(
+        conformance = (release_docs.ROOT / "crates" / "hemaka-conformance" / "Cargo.toml").read_text(
             encoding="utf-8"
         )
         # The dev/test kit KEEPS its flag — publishing it is a separate,
         # undecided decision (docs/release-process.md decision log).
-        self.assertIn("publish = false", conformance, "ktesio-conformance")
+        self.assertIn("publish = false", conformance, "hemaka-conformance")
 
 
     def test_ci_enforces_msrv_floor(self) -> None:

@@ -18,7 +18,7 @@ The crates are published — depend on the released version:
 
 ```toml
 [dependencies]
-ktesio-engine = "0.3"
+hemaka-engine = "0.3"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -52,7 +52,7 @@ builds), and Ktesio is **source-available**, not open source — the
 noncommercial use free and requires the author's written approval for
 commercial use.
 
-Only `ktesio-engine` is needed. It is a normal Rust dependency — the engine
+Only `hemaka-engine` is needed. It is a normal Rust dependency — the engine
 never touches your TTY, never reads stdin, holds no global process state, and
 several engines can live in one process side by side, each rooted at its own
 state directory.
@@ -127,7 +127,7 @@ same truth the query APIs serve: transitions, breaches, ledger rows) and
 returns them as the exact event payloads the live bus delivers:
 
 ```rust
-use ktesio_engine::{Blocking, ResyncCursor};
+use hemaka_engine::{Blocking, ResyncCursor};
 
 // 1. Subscribe live FIRST — the gap-free order. Every commit from this
 //    moment reaches the stream, whatever the backfill does afterwards.
@@ -203,7 +203,7 @@ always have; nothing is written to stdout, ever. A host that owns its stderr
 (for a daemon, a GUI, a log pipeline) can route both into its own writer:
 
 ```rust
-use ktesio_engine::{DiagnosticSink, Engine};
+use hemaka_engine::{DiagnosticSink, Engine};
 use std::sync::{Arc, Mutex};
 
 // Any std::io::Write works — a file, a channel, an in-memory buffer.
@@ -247,11 +247,11 @@ The contract, in five rules:
 ## The quickstart example
 
 A complete, runnable host lives at
-[`crates/ktesio-engine/examples/embedding-quickstart.rs`](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/examples/embedding-quickstart.rs).
+[`crates/hemaka-engine/examples/embedding-quickstart.rs`](https://github.com/Ktesio/ktesio/blob/main/crates/hemaka-engine/examples/embedding-quickstart.rs).
 Run it from the repository root:
 
 ```bash
-cargo run -p ktesio-engine --example embedding-quickstart
+cargo run -p hemaka-engine --example embedding-quickstart
 ```
 
 It is deliberately dependency-free — no `kt`, no test fixtures, no helper
@@ -302,7 +302,7 @@ does. Four instruments keep that statement honest:
   register → configure → cap → start → breach → pause → stop journey through
   the facade alone and shares its assertions with the CLI suite, proving the
   library path and the CLI path behave identically
-  ([the host test](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
+  ([the host test](https://github.com/Ktesio/ktesio/blob/main/crates/hemaka-engine/tests/uj3_library_host.rs)).
 - **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
   bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family, and
   since story 12-3 the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),
@@ -324,12 +324,12 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-**Published**: `ktesio-engine` 0.3 (breaking: the 0.2.0
+**Published**: `hemaka-engine` 0.3 (breaking: the 0.2.0
 `EngineError::ResumeUnsupported` and the 0.3.0 detached-start surface — see
-the [changelog](../CHANGELOG.md) banners), `ktesio-adapter-api` 0.1, and
-`ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
+the [changelog](../CHANGELOG.md) banners), `hemaka-adapter-api` 0.1, and
+`hemaka-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
 release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15; engine 0.3.0,
-2026-09-16). Depend on `ktesio-engine = "0.3"` — no git dependency needed.
+2026-09-16). Depend on `hemaka-engine = "0.3"` — no git dependency needed.
 The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
