@@ -1,0 +1,57 @@
+name: Migration Matrix
+
+# Post-release EVIDENCE for the v0.8.0 Hemaka rename: proves, against the
+# REAL released artifacts, that an operator on any old kt release (D5
+# floor: ALL versions, v0.1.1–v0.7.0) migrates to the latest Hemaka via
+# the installer with their data intact (instance identity, absolute
+# paths, env-name parity, conflict refusal).
+#
+# Post-release by construction: it installs `releases/latest`, so it is
+# EXPECTED TO FAIL if dispatched before the first hemaka release exists —
+# that is the harness honestly saying "nothing to migrate to yet", not a
+# regression. Run it manually right after publishing v0.8.0 and let the
+# weekly schedule keep the evidence current during the migration period.
+#
+# The harness (scripts/migration_matrix.sh) downloads each old ktesio-v*
+# archive, seeds state through the old binary, migrates via this repo's
+# installer, and asserts on the result. Unix runners only (the Windows
+# leg is covered by the installer's own test seams + manual verification;
+# the matrix's checksum/extract logic is POSIX).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_triple:
+        description: "Release target triple to test (defaults to the runner's)"
+        required: false
+        default: ""
+      floor_versions:
+        description: "Space-separated old versions to hop from (default: all)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly (Wednesdays 05:41 UTC — off the CI nightly and the docs probe)
+    - cron: "41 5 * * 3"
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: kt ${{ github.event.inputs.target_triple || 'runner default' }} -> hemaka hops
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Run the migration matrix
+        env:
+          FLOOR_VERSIONS: ${{ github.event.inputs.floor_versions }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "${{ github.event.inputs.target_triple }}" ]; then
+            args+=("${{ github.event.inputs.target_triple }}")
+          fi
+          bash scripts/migration_matrix.sh "${args[@]}"
