@@ -245,6 +245,14 @@ widen a gate or an allowlist to make a baseline pass.
   (two-pass), `cargo +stable publish --locked -p ktesio-engine`, the
   from-crates.io host probe, and the step-5 docs flip. adapter-api and
   adapters-hermes stay at 0.1.0 (surfaces unchanged, semver-checked).
+- **Publish go (engine 0.3.0):** GRANTED 2026-09-16 — Islam's explicit go in
+  the ktesio.dev working session ("Let's go with the publish"), same scoped
+  shape as the 0.2.0 go: the ENGINE crate publish only (package + two-pass
+  tarball review, `cargo +stable publish --locked -p ktesio-engine`, the
+  from-crates.io host probe, the docs flip); the tag (step 6) is NOT opened.
+  Context: the gate forced the version (the crates.io loop's second firing —
+  epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
+  against the published 0.2.0; the source bump landed as `394e660`).
 - **Semver-baseline retire-or-keep — DECIDED: KEEP (2026-09-15, at the
   second published release as scheduled).** The in-repo freeze baselines
   (adapter-api @ 4119db3, engine @ bee7d48) stay as fast pre-publish guards:

@@ -18,7 +18,7 @@ The crates are published — depend on the released version:
 
 ```toml
 [dependencies]
-ktesio-engine = "0.2"
+ktesio-engine = "0.3"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -39,9 +39,11 @@ git rev-parse origin/main
 
 (paste the full 40-character output as your `rev`). The published and
 in-repo forms compile against the same facade — see the [changelog](
-../CHANGELOG.md) banner for what moved in 0.2.0
-(`EngineError::ResumeUnsupported`; exhaustive `match`es over `EngineError`
-need the new arm).
+../CHANGELOG.md) banners for what moved in 0.2.0 and 0.3.0
+(`EngineError::ResumeUnsupported`, then the 0.3.0 detached-start surface:
+`EngineError::DetachRefused`, `SpawnRecord.detach`, and the
+`ProcessBackend::adopt` signature — exhaustive `match`es over
+`EngineError` need each new arm).
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
@@ -322,11 +324,13 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-**Published**: `ktesio-engine` 0.2 (breaking: `EngineError::ResumeUnsupported`
-— see the [changelog](../CHANGELOG.md) banner), `ktesio-adapter-api` 0.1, and
+**Published**: `ktesio-engine` 0.3 (breaking: the 0.2.0
+`EngineError::ResumeUnsupported` and the 0.3.0 detached-start surface — see
+the [changelog](../CHANGELOG.md) banners), `ktesio-adapter-api` 0.1, and
 `ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
-release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15). Depend on
-`ktesio-engine = "0.2"` — no git dependency needed. The engine's IN-REPO version is now **0.3.0** (the epic-12 detached-start surface — see the changelog banner); its crates.io publish is held for the author's explicit go, so `"0.2"` remains the correct crates.io pin until that release lands. The crates are
+release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15; engine 0.3.0,
+2026-09-16). Depend on `ktesio-engine = "0.3"` — no git dependency needed.
+The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
 

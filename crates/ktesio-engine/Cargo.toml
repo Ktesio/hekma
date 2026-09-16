@@ -7,14 +7,12 @@ description = "Ktesio agent-runner engine; its public API is the Embedding Inter
 license-file.workspace = true
 homepage.workspace = true
 repository.workspace = true
-# PUBLISHED (first release 2026-09-09: ktesio-engine 0.1.0; 0.2.0 published
-# 2026-09-15 on Islam's explicit go — the breaking `EngineError::
-# ResumeUnsupported` extension, announced in PR #181 and gated by the CI
-# semver job). The 0.3.0 line above carries the epic-12 detached-start
-# surface (DetachRefused variant, SpawnRecord.detach, ProcessBackend::adopt
-# signature) — its crates.io publish is HELD pending Islam's explicit go.
-# Publication actions always require that explicit go — never flip, tag, or
-# publish autonomously (docs/release-process.md).
+# PUBLISHED (0.1.0 2026-09-09; 0.2.0 2026-09-15 — the breaking
+# `EngineError::ResumeUnsupported` extension, PR #181; 0.3.0 2026-09-16 —
+# the epic-12 detached-start surface: DetachRefused, SpawnRecord.detach,
+# ProcessBackend::adopt; each on Islam's explicit go, each gated by the CI
+# semver job). Publication actions always require that explicit go — never
+# flip, tag, or publish autonomously (docs/release-process.md).
 
 [dependencies]
 ktesio-adapter-api = { workspace = true }
