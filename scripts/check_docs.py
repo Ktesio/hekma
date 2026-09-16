@@ -68,6 +68,10 @@ STALE_PATTERNS = [
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 JSON_FENCE_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+# The CLI command allowlist is shared by every shipped binary name —
+# `kt` (retired at 0.8.0, still allowed in historical/compat examples),
+# `hemaka`, and `maka` run the same subcommand tree.
+CLI_COMMAND_NAMES = ("kt", "hemaka", "maka")
 KT_COMMANDS = {
     "self-update",
     "help",
@@ -166,7 +170,7 @@ def validate_command_examples(
         line = raw_line.strip()
         if not line or line.startswith("#") or line.endswith("\\"):
             continue
-        if "kt" not in line:
+        if not any(name in line for name in CLI_COMMAND_NAMES):
             continue
         try:
             tokens = shlex.split(line)
@@ -185,12 +189,15 @@ def validate_command_examples(
             continue
 
         binary = tokens[command_index]
-        if not (binary == "kt" or binary.endswith("/kt") or binary.endswith("\\kt")):
+        if not any(
+            binary == name or binary.endswith(f"/{name}")
+            for name in CLI_COMMAND_NAMES
+        ):
             continue
 
         if len(tokens) <= command_index + 1:
             errors.append(
-                f"{rel_path}: shell fence #{fence_index}, line {line_number}: `kt` example is missing a command"
+                f"{rel_path}: shell fence #{fence_index}, line {line_number}: CLI example is missing a command"
             )
             continue
 

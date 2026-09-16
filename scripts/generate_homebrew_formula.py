@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Homebrew formula for a tagged Ktesio release."""
+"""Generate the Homebrew formula for a tagged Hemaka release."""
 
 from __future__ import annotations
 
@@ -8,8 +8,11 @@ import re
 from pathlib import Path
 
 
+# The repository is still Ktesio/ktesio at the 0.8.0 release (the gated repo
+# rename follows AFTER the release is live, so release URLs never depend on
+# redirects); flip this with the canonical-URL change in 0.8.1.
 REPO = "Ktesio/ktesio"
-FORMULA_CLASS = "Ktesio"
+FORMULA_CLASS = "Hemaka"
 DESCRIPTION = (
     "Run AI agents like services: supervise their lifecycle, meter real "
     "token usage, and enforce dollar budgets."
@@ -21,8 +24,8 @@ LICENSE = ":any"
 # Emitted above the `license` clause in the formula so the tap states the
 # real terms even though `:any` cannot name them.
 LICENSE_COMMENT = (
-    "# Ktesio Noncommercial-Attribution License 1.0.0 — source-available; "
-    "commercial use requires the author's written approval."
+    "# Hemaka ships the Ktesio Noncommercial-Attribution License 1.0.0 — "
+    "source-available; commercial use requires the author's written approval."
 )
 HOMEBREW_TARGETS = [
     ("x86_64-apple-darwin", "tar.gz"),
@@ -123,11 +126,13 @@ def render_formula(tag: str, checksums: dict[str, str]) -> str:
   end
 
   def install
-    bin.install "kt"
+    bin.install "hemaka"
+    bin.install "maka"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/kt --version")
+    assert_match version.to_s, shell_output("#{{bin}}/hemaka --version")
+    assert_match version.to_s, shell_output("#{{bin}}/maka --version")
   end
 end
 '''
@@ -141,7 +146,7 @@ def version_from_tag(tag: str) -> str:
 
 
 def asset_name(tag: str, target: str, extension: str) -> str:
-    return f"ktesio-{tag}-{target}.{extension}"
+    return f"hemaka-{tag}-{target}.{extension}"
 
 
 def release_url(tag: str, asset: str) -> str:

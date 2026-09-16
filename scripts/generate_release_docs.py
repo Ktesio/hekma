@@ -58,7 +58,7 @@ def main() -> int:
     if args.update_files:
         upsert_release_section(
             ROOT / "CHANGELOG.md",
-            "# Changelog\n\nAll notable changes to Ktesio are generated from git history.\n",
+            "# Changelog\n\nAll notable changes to Hemaka (formerly Ktesio) are generated from git history.\n",
             args.tag,
             section,
         )
@@ -126,7 +126,7 @@ def render_release_body(tag: str, previous_tag: str | None, commits: list[Commit
         else "Initial release history"
     )
     lines = [
-        f"# Ktesio {tag}",
+        f"# Hemaka {tag}",
         "",
         "Install the archive for your platform, unpack it, and place `kt` on your PATH.",
         "",
@@ -165,12 +165,12 @@ def render_asset_table(tag: str) -> list[str]:
         "|----------|--------|---------|----------|",
     ]
     for platform, target, extension in TARGETS:
-        archive = f"ktesio-{tag}-{target}.{extension}"
+        archive = f"hemaka-{tag}-{target}.{extension}"
         url = f"https://github.com/{REPO}/releases/download/{tag}/{archive}"
         checksum = f"{url}.sha256"
         lines.append(f"| {platform} | `{target}` | [{archive}]({url}) | [sha256]({checksum}) |")
-    aggregate = f"https://github.com/{REPO}/releases/download/{tag}/ktesio-{tag}-checksums.txt"
-    lines.append(f"| All | checksums | [ktesio-{tag}-checksums.txt]({aggregate}) | - |")
+    aggregate = f"https://github.com/{REPO}/releases/download/{tag}/hemaka-{tag}-checksums.txt"
+    lines.append(f"| All | checksums | [hemaka-{tag}-checksums.txt]({aggregate}) | - |")
     return lines
 
 

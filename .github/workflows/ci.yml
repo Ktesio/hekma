@@ -389,18 +389,18 @@ jobs:
       - name: Check kt against its declared crate graph
         # Explicit +stable (see fmt job): boundary gate runs on latest stable; the
         # root rust-toolchain.toml pins only local bare cargo. MSRV floor: `msrv` job.
-        run: cargo +stable check -p ktesio
+        run: cargo +stable check -p hemaka
       - name: Enforce kt dependency law (AD-2)
         shell: bash
         run: |
           set -euo pipefail
-          tree="$(cargo +stable tree -p ktesio -e normal,build --all-features)"
+          tree="$(cargo +stable tree -p hemaka -e normal,build --all-features)"
           echo "$tree"
-          # Allowlist, not blocklist: any internal ktesio-* edge other than
+          # Allowlist, not blocklist: any internal hemaka-* edge other than
           # hemaka-engine / hemaka-adapter-api / hemaka-adapters-hermes fails,
           # so future internal crates are caught automatically.
           scan_status=0
-          edges="$(printf '%s\n' "$tree" | grep -oE 'ktesio-[a-z0-9_-]+' | sort -u)" || scan_status=$?
+          edges="$(printf '%s\n' "$tree" | grep -oE 'hemaka-[a-z0-9_-]+' | sort -u)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
             echo "::error::grep exited ${scan_status} while extracting internal crate edges."
             exit "$scan_status"
@@ -408,7 +408,7 @@ jobs:
           violations=''
           if [ -n "$edges" ]; then
             filter_status=0
-            violations="$(printf '%s\n' "$edges" | grep -Evx 'ktesio-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'hemaka-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
             if [ "$filter_status" -ge 2 ]; then
               echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
               exit "$filter_status"
@@ -472,13 +472,14 @@ jobs:
           # Allowlist: engine backends (the convention home, spine AD-4) plus
           # two pre-existing v0.5.0 legacy CLI files (self-update platform
           # detection) grandfathered until epic 8 relocates/deprecates them
-          # (AC-4 amendment, ratified 2026-07-02), plus engine integration
+          # (AC-4 amendment, ratified 2026-07-02; paths updated for the
+          # v0.8.0 crates/kt -> crates/hemaka move), plus engine integration
           # TESTS: the symlink-containment test (memory.rs:605, story 5-1) is
           # the one honestly unix-gated suite there under the AI-35 disclosure
           # convention ("the test does not exist on Windows" rather than
           # passing vacuously) — adoption/interaction suites deliberately use
           # NO cfg (data-driven OS ids); no production code may use cfg.
-          allowlist='^crates/hemaka-engine/src/backends/|^crates/kt/src/update_check\.rs:|^crates/kt/src/cli/self_update\.rs:|^crates/hemaka-engine/tests/'
+          allowlist='^crates/hemaka-engine/src/backends/|^crates/hemaka/src/update_check\.rs:|^crates/hemaka/src/cli/self_update\.rs:|^crates/hemaka-engine/tests/'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -572,7 +573,7 @@ jobs:
         id: semver_version
         run: |
           set -euo pipefail
-          user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          user_agent="hemaka-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
           # The cache key must name a CONTENT hash, never a constant (AI-3): it
           # carries the resolved cargo-semver-checks version so a toolchain
           # update gets a fresh key. Non-fatal on crates.io trouble — an
@@ -613,7 +614,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.semver_version.outputs.version }}"
-          user_agent="ktesio-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          user_agent="hemaka-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
           # Install the binary UP FRONT: the armed in-repo baseline guards below
           # run on EVERY push, so the old "lazy install inside the armed
           # branch" dormancy no longer applies — the adapter-api and engine
@@ -697,23 +698,30 @@ jobs:
           # been bumped to the epic-12 main-history merge commit 49da96b
           # (here AND in scripts/test_automation.py) — the same post-merge
           # step PR #181 did for its own extension.
-          git cat-file -e 4119db37b5288b990144d28f995ee14a69271b5e^{commit} || {
-            echo "::error::semver baseline rev 4119db37… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
-            exit 1
-          }
-          cargo +stable semver-checks check-release -p hemaka-adapter-api --baseline-rev 4119db37b5288b990144d28f995ee14a69271b5e
-          git cat-file -e 49da96b6f1c695edd6afd379526deba42cf6da60^{commit} || {
-            echo "::error::semver baseline rev 49da96b… is not resolvable in this checkout (history rewrite or shallow clone?) — the guard cannot run."
-            exit 1
-          }
-
-          # BASELINE-REV CONSTRAINT (learned 2026-09-09): this repo squash-merges,
-          # so branch commits never enter main history — a baseline rev MUST be a
-          # main-side commit (an earlier landing or a merge commit) or the cat-file
-          # check reds every post-merge run (8a8b328 was a branch-only commit and
-          # did exactly that). Bump baselines only to main-history revs at
-          # deliberate freeze points, together with scripts/test_automation.py.
-          cargo +stable semver-checks check-release -p hemaka-engine --baseline-rev 49da96b6f1c695edd6afd379526deba42cf6da60
+          # RENAME-AWARE BASELINE STRATEGY (v0.8.0 Hemaka migration): the two
+          # freeze baselines predate the crate rename, so same-name baseline
+          # diffing (`-p hemaka-engine --baseline-rev <old>`) cannot resolve a
+          # package that did not carry that name at the baseline rev — by
+          # construction, not by drift. Until fresh baselines are pinned to the
+          # migration's main-side merge commit (the SAME post-merge step PRs
+          # #181/#184 took for their freeze bumps — BASELINE-REV CONSTRAINT:
+          # this repo squash-merges, so the merge SHA exists only AFTER
+          # landing; update the SHAs here AND in scripts/test_automation.py
+          # together), the rename SURFACE CHECK holds the line: an external
+          # consumer fixture compiles against BOTH the baseline rev's
+          # old-named crate and HEAD's renamed crate. No compatibility claim
+          # ever comes from a skipped check — either build failing reds this
+          # job.
+          bash scripts/rename_surface_check.sh \
+            4119db37b5288b990144d28f995ee14a69271b5e \
+            crates/hemaka-adapter-api \
+            ktesio-adapter-api hemaka-adapter-api \
+            fixtures/external-consumers/adapter-api-consumer/src/main.rs
+          bash scripts/rename_surface_check.sh \
+            49da96b6f1c695edd6afd379526deba42cf6da60 \
+            crates/hemaka-engine \
+            ktesio-engine hemaka-engine \
+            fixtures/external-consumers/engine-consumer/src/main.rs
           for crate in hemaka-engine hemaka-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
@@ -735,6 +743,31 @@ jobs:
                 ;;
             esac
           done
+
+          # BOTH-GRAPH CONSUMER (arms at first hemaka-engine publish): the
+          # published ktesio-engine 0.3.0 and hemaka-engine must resolve in
+          # ONE external dependency graph (fixtures/external-consumers/
+          # both-graph) — dependency aliases prove nothing, a real
+          # two-dependency lockfile does.
+          both_status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/hemaka-engine")" || both_status=000
+          case "$both_status" in
+            200)
+              (cd fixtures/external-consumers/both-graph \
+                && cargo +stable build --quiet \
+                && cargo +stable run --quiet)
+              echo "both-graph consumer ok: ktesio-engine 0.3.0 + hemaka-engine resolve together."
+              ;;
+            404)
+              echo "::notice::hemaka-engine is not on crates.io yet; the both-graph consumer arms at first publish."
+              ;;
+            000|429|5[0-9][0-9])
+              echo "::notice::crates.io returned transient status ${both_status}; skipping the both-graph consumer this run."
+              ;;
+            *)
+              echo "::error::Unexpected crates.io API status ${both_status} for hemaka-engine (both-graph probe)."
+              exit 1
+              ;;
+          esac
       - name: Save cargo-semver-checks binary (only when an install ran)
         if: steps.semver_check.outputs.installed == 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -932,7 +965,7 @@ jobs:
         # CORRECTNESS (de-risked locally before this landed): tarpaulin reports
         # coverage for ALL workspace source each built test binary touches, NOT just
         # the `-p` crate's own source — so a hemaka-engine line covered only by a
-        # `kt` CLI test IS credited under `-p ktesio`. The UNION of the five
+        # `hemaka` CLI test IS credited under `-p hemaka`. The UNION of the five
         # per-crate tracefiles therefore reproduces the --workspace result exactly:
         # locally the merged aggregate is 95.22% (5718/6005), identical to
         # --workspace to the line (0 lines lost, 0 gained). No report-scope flag is
@@ -1008,7 +1041,7 @@ jobs:
           rm -rf cov && mkdir -p cov
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, hemaka-engine LAST (see the WHY comment above).
-          set -- hemaka-adapter-api hemaka-conformance hemaka-adapters-hermes ktesio hemaka-engine
+          set -- hemaka-adapter-api hemaka-conformance hemaka-adapters-hermes hemaka hemaka-engine
           for pkg in "$@"; do
             echo "::group::tarpaulin -p $pkg"
             echo "--- resources before $pkg ---"
