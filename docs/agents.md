@@ -1,11 +1,16 @@
 ---
 title: Supported Agents
-description: The agents Ktesio's adapters target, the exact versions each adapter was validated against, the PATH requirement, and the re-validation duty.
+description: The agents Hemaka's adapters target, the exact versions each adapter was validated against, the PATH requirement, and the re-validation duty.
 ---
 
 # Supported Agents
 
-Ktesio runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
+Hemaka runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
+
+> **Isolation honesty.** Agent Home organizes and isolates an agent's files.
+> It is not a security sandbox: supervised agents run as normal processes with
+> your user's permissions.
+
 
 | Agent | Adapter | Validation status | Validated against | Evidence |
 |-------|---------|-------------------|-------------------|----------|
@@ -14,11 +19,11 @@ Ktesio runs agents as adapter-backed processes: the built-in `hermes` native ada
 
 ## Hermes (`--kind hermes`)
 
-The `hermes` builtin is compiled into the engine and declares a FIXED launch — `hermes gateway run --external-supervisor` — so Ktesio supervises a foreground gateway process instead of the agent's own service manager. What the adapter declares:
+The `hermes` builtin is compiled into the engine and declares a FIXED launch — `hermes gateway run --external-supervisor` — so Hemaka supervises a foreground gateway process instead of the agent's own service manager. What the adapter declares:
 
-- **Config mapping**: only the reserved `memory.dir` key → env `HERMES_HOME` (attaching a `filesystem` Memory Backing gives the gateway its per-instance home; with no backing attached the gateway receives NO `HERMES_HOME` and falls back to its own default home — see [the command reference](commands.md#kt-agent-memory-attach-name---kind-kind)). The unified `model` key is a documented no-op for hermes.
+- **Config mapping**: only the reserved `memory.dir` key → env `HERMES_HOME` (attaching a `filesystem` Memory Backing gives the gateway its per-instance home; with no backing attached the gateway receives NO `HERMES_HOME` and falls back to its own default home — see [the command reference](commands.md#hemaka-agent-memory-attach-name---kind-kind)). The unified `model` key is a documented no-op for hermes.
 - **Capabilities**: pause `best-effort` and interaction `guaranteed` on every OS; metering `self-reported`.
-- **PATH requirement**: the launch's `exec` is the bare word `hermes`, resolved through the operator's `PATH` at start. Ktesio does not bundle, install, or pin the Hermes binary — you install it (per Hermes' own docs), keep it on the `PATH` of the environment `kt` runs in, and `kt agent start` resolves it like any other program. A start whose `hermes` cannot resolve fails with the engine's launch-failure diagnostic naming the executable.
+- **PATH requirement**: the launch's `exec` is the bare word `hermes`, resolved through the operator's `PATH` at start. Hemaka does not bundle, install, or pin the Hermes binary — you install it (per Hermes' own docs), keep it on the `PATH` of the environment `hemaka` runs in, and `hemaka agent start` resolves it like any other program. A start whose `hermes` cannot resolve fails with the engine's launch-failure diagnostic naming the executable.
 
 **Validation pin**: the adapter's behavior was verified against Hermes at `v0.20.5`, commit `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (verified 2026-08-25). CI never launches the real gateway: the conformance passes run under the recorded `hermes_shim` PATH-sim sandbox (an isolated stand-in that re-execs a test helper), so the suite is deterministic and network-free — the real-binary validation is the pinned manual pass recorded above it.
 

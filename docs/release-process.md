@@ -1,11 +1,11 @@
 ---
 title: Release Process
-description: How Ktesio release tags build binaries, publish crates, update Homebrew, and refresh release documentation.
+description: How Hemaka release tags build binaries, publish crates, update Homebrew, and refresh release documentation.
 ---
 
 # Release Process
 
-Ktesio releases are driven by git tags.
+Hemaka releases (v0.8.0+; the pre-rename Ktesio line ended at v0.7.0) are driven by git tags.
 
 ## Tag Format
 
@@ -31,7 +31,7 @@ When a `v*` tag is pushed, `.github/workflows/release.yml`:
 3. Generates per-asset `.sha256` files and one aggregate checksum file.
 4. Creates a draft GitHub Release for the tag.
 5. Uploads all release assets.
-6. Publishes the `ktesio` crate to crates.io.
+6. Publishes the `hemaka` crate to crates.io (the pre-rename `ktesio` crate is frozen at 0.7.0, preserved, never yanked).
 7. Publishes the GitHub Release with a clean asset table.
 8. Updates the Homebrew tap formula for macOS Intel, macOS Apple Silicon, and Linux x64.
 9. Opens a pull request updating `CHANGELOG.md` and `docs/RELEASE_NOTES.md`.
@@ -43,18 +43,19 @@ The docs PR happens after the tag because a tag points at an existing commit. Th
 Release tags publish the crate package to crates.io as:
 
 ```text
-ktesio
+hemaka
 ```
 
-The installed binary is `kt`, so users can install it with:
+The installed binaries are `hemaka` and `maka` (one package, two commands),
+so users can install them with:
 
 ```bash
-cargo install ktesio
+cargo install hemaka
 ```
 
 Configure this repository secret before publishing a tag:
 
-- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access to the `ktesio` crate.
+- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access to the `hemaka` crate.
 
 The workflow verifies that `Cargo.toml` version matches the tag without the leading `v`. If the crate version is already published, the workflow skips the publish step so release reruns stay safe.
 
@@ -84,13 +85,13 @@ re-confirmation.
 1. CI green on `main`: fmt, clippy, the 3-OS test matrix, boundary, semver,
    coverage, docs.
 2. **Versions set and concrete.** The release version bump is a real commit:
-   the root `[workspace.package]` `version` (inherited by the `ktesio` CLI
+   the root `[workspace.package]` `version` (inherited by the `hemaka` CLI
    crate) bumped to the release version, the crate-level versions confirmed
    (`0.1.0` today for `hemaka-adapter-api`, `hemaka-adapters-hermes`,
    `hemaka-engine`), and `CHANGELOG.md` / `docs/RELEASE_NOTES.md` current for
    everything shipping. The tag in step 6 goes ON that release commit.
 3. **Registry identity.** `cargo login` has been run locally with an account
-   that will own the `ktesio-*` crate names (this is what the manual `cargo
+   that will own the `hemaka-*` crate names (this is what the manual `cargo
    publish` steps authenticate with; `CARGO_REGISTRY_TOKEN` is the CI
    secret the tag workflow uses), and the one-time name-availability check
    below returned 404 (available) for all three.
@@ -134,7 +135,7 @@ it against the real registry without the go.
 Order matters (precondition 4): crates.io refuses a package whose normal
 dependencies are not already published, so the chain is adapter-api →
 adapters-hermes → engine, each reviewed, then a from-crates.io host probe
-BEFORE the tag (which releases the `ktesio` CLI crate, the binaries, the
+BEFORE the tag (which releases the `hemaka` CLI crate, the binaries, the
 GitHub Release, and the Homebrew tap update in one automated sweep).
 
 **Step 0 — flip the publish flags (part of the same go).** Remove
@@ -174,8 +175,8 @@ the uploaded crate resolves for a real host from a FRESH out-of-tree project
 with no git/path override:
 
 ```bash
-cargo new /tmp/ktesio-host-probe
-cd /tmp/ktesio-host-probe
+cargo new /tmp/hemaka-host-probe
+cd /tmp/hemaka-host-probe
 cargo add hemaka-engine@0.3.0
 cargo build
 ```
@@ -253,6 +254,19 @@ widen a gate or an allowlist to make a baseline pass.
   Context: the gate forced the version (the crates.io loop's second firing —
   epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
   against the published 0.2.0; the source bump landed as `394e660`).
+- **Hemaka rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
+  recorded in docs/proposals/hemaka-migration-spec-draft.md): product Hemaka;
+  binaries `hemaka` + `maka`; `kt` dropped (clean break, D7); crate `hemaka`
+  (ktesio frozen at 0.7.0); libraries continue their lines (engine 0.4.0,
+  adapter-api 0.2.0, adapters-hermes 0.2.0); docs canonical at
+  hemaka.ktesio.dev; NO compatibility window on release artifacts (D4) —
+  migration via the installer for ALL old versions (D5). Semver baselines:
+  the pre-rename freeze revs cannot serve same-name diffs, so the rename
+  SURFACE CHECK (external consumers, scripts/rename_surface_check.sh) holds
+  the line until fresh `--baseline-rev` pins land on this change's
+  main-side merge SHA (post-merge follow-up, mirrored in
+  scripts/test_automation.py). Two-pass review of the release surface
+  completes before the tag (AI-55).
 - **Semver-baseline retire-or-keep — DECIDED: KEEP (2026-09-15, at the
   second published release as scheduled).** The in-repo freeze baselines
   (adapter-api @ 4119db3, engine @ bee7d48) stay as fast pre-publish guards:
@@ -268,8 +282,13 @@ widen a gate or an allowlist to make a baseline pass.
 Homebrew publishing updates a tap formula from the release checksums. By default, the workflow writes:
 
 ```text
-Formula/ktesio.rb
+Formula/hemaka.rb
 ```
+
+plus the tap-root `formula_renames.json` (`{"ktesio": "hemaka"}`), so
+`brew install|upgrade ktesio` resolves to the renamed formula and legacy
+kegs migrate on upgrade. Both are written by the tag workflow (other
+`formula_renames.json` entries are preserved).
 
 to:
 
@@ -331,9 +350,14 @@ python3 scripts/generate_release_docs.py v0.1.0 --update-files
 ## Asset Names
 
 ```text
-ktesio-<tag>-x86_64-apple-darwin.tar.gz
-ktesio-<tag>-aarch64-apple-darwin.tar.gz
-ktesio-<tag>-x86_64-pc-windows-msvc.zip
-ktesio-<tag>-x86_64-unknown-linux-gnu.tar.gz
-ktesio-<tag>-checksums.txt
+hemaka-<tag>-x86_64-apple-darwin.tar.gz
+hemaka-<tag>-aarch64-apple-darwin.tar.gz
+hemaka-<tag>-x86_64-pc-windows-msvc.zip
+hemaka-<tag>-x86_64-unknown-linux-gnu.tar.gz
+hemaka-<tag>-checksums.txt
 ```
+
+Each archive carries BOTH binaries (`hemaka` + `maka`). There is NO legacy
+`ktesio-*` asset family (ratified no-compatibility-window decision,
+2026-09-16): old `kt` self-updaters cannot reach these releases and the
+curl installer is the documented migration path (docs/migration.md).

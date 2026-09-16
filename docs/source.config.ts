@@ -4,6 +4,7 @@ const files = [
   'README.md',
   'get-started.md',
   'installation.md',
+  'migration.md',
   'troubleshooting.md',
   'commands.md',
   'manifest.md',
