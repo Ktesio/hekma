@@ -94,17 +94,18 @@ for version in $FLOOR_VERSIONS; do
   [ -f "$KT_BIN" ] || KT_BIN="$hop_dir/bin/kt.exe"
 
   echo "seed state through the old binary"
-  KTESIO_STATE_DIR="$hop_dir/state" KTESIO_NO_UPDATE_CHECK=1 \
-    "$KT_BIN" agent register matrix-seed --kind mock >/dev/null 2>&1 \
-    || echo "note: ${version} register exit $? (pre-mock-adapter releases seed via state only)"
+  seeded=0
+  if KTESIO_STATE_DIR="$hop_dir/state" KTESIO_NO_UPDATE_CHECK=1 \
+      "$KT_BIN" agent register matrix-seed --kind mock >/dev/null 2>&1; then
+    seeded=1
+  else
+    echo "note: ${version} register exited nonzero (v0.1.x has no agent surface; the hop then proves install + state-dir compatibility only)"
+  fi
   # The instance row is what must survive; assert it exists when the old
   # release supported registration (v0.2.0+).
-  case "$version" in
-    v0.1.1) : ;; # pre-fleet-shape release: data-preservation is the dir itself
-    *)
-      [ -f "$hop_dir/state/state.db" ] || fail "old binary did not create state.db"
-      ;;
-  esac
+  if [ "$seeded" = "1" ] && [ ! -f "$hop_dir/state/state.db" ]; then
+    fail "old binary registered but created no state.db"
+  fi
 
   echo "migrate via the new installer (binary channel, dry-run=False)"
   HEKMA_INSTALL_METHOD=binary \
@@ -120,12 +121,21 @@ for version in $FLOOR_VERSIONS; do
   HEKMA="$hop_dir/bin/hekma"
   [ -f "$HEKMA" ] || HEKMA="$hop_dir/bin/hekma.exe"
 
-  echo "assert the seeded data survived and is visible under BOTH env names"
+  echo "assert the state survived and is visible IDENTICALLY under BOTH env names"
   legacy_json="$(KTESIO_STATE_DIR="$hop_dir/state" HEKMA_NO_UPDATE_CHECK=1 "$HEKMA" agent list --json 2>/dev/null || true)"
   alias_json="$(HEKMA_STATE_DIR="$hop_dir/state" HEKMA_NO_UPDATE_CHECK=1 "$HEKMA" agent list --json 2>/dev/null || true)"
-  if [ -n "$legacy_json" ]; then
-    printf '%s' "$legacy_json" | grep -q matrix-seed || fail "${version}: seeded instance missing under KTESIO_STATE_DIR"
-    [ "$legacy_json" = "$alias_json" ] || fail "${version}: alias and legacy state dirs disagree"
+  # ALWAYS asserted (every floor version): both env names yield the SAME
+  # document, and it carries the frozen schema_version. An EMPTY fleet is a
+  # valid result for pre-fleet releases (v0.1.x), where the hop proves
+  # install + state-dir compatibility.
+  [ -n "$legacy_json" ] || fail "${version}: agent list --json produced nothing under KTESIO_STATE_DIR"
+  [ "$legacy_json" = "$alias_json" ] || fail "${version}: alias and legacy state dirs disagree"
+  printf '%s' "$legacy_json" | grep -q '"schema_version"' \
+    || fail "${version}: list JSON lacks schema_version (not the frozen document)"
+  # matrix-seed must be present ONLY when the old binary actually registered.
+  if [ "$seeded" = "1" ]; then
+    printf '%s' "$legacy_json" | grep -q matrix-seed \
+      || fail "${version}: seeded instance missing under KTESIO_STATE_DIR"
   fi
 
   echo "assert conflicting state dirs are REFUSED"
