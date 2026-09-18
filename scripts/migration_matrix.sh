@@ -47,7 +47,7 @@ esac
 # `cargo install hekma --force`, covered by the guide + the cargo-channel
 # installer tests).
 FLOOR_VERSIONS="${FLOOR_VERSIONS:-v0.1.1 v0.2.0 v0.3.0 v0.3.1 v0.4.0 v0.5.0 v0.7.0}"
-REPO="Ktesio/ktesio"
+REPO="Ktesio/hekma"  # canonical post-rename (2026-09-18); the pre-rename path 301-redirects
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 BUILD_TMP="$(mktemp -d)"
