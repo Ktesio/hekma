@@ -40,10 +40,13 @@ case "$TARGET_TRIPLE" in
   *windows*) EXT=zip ;; *) EXT=tar.gz ;;
 esac
 
-# D5 floor: ALL released kt versions. v0.1.0 predates the archive naming
-# scheme and was superseded within a day by v0.1.1; the documented floor
-# starts there.
-FLOOR_VERSIONS="${FLOOR_VERSIONS:-v0.1.1 v0.2.0 v0.3.0 v0.3.1 v0.4.0 v0.5.0 v0.6.0 v0.7.0}"
+# D5 floor: ALL kt versions with GitHub release binaries. v0.1.0 predates
+# the archive naming scheme (superseded within a day by v0.1.1); v0.6.0
+# exists only on crates.io — there is NO v0.6.0 GitHub release, so it has
+# no binary-install hop (its cargo users migrate via
+# `cargo install hekma --force`, covered by the guide + the cargo-channel
+# installer tests).
+FLOOR_VERSIONS="${FLOOR_VERSIONS:-v0.1.1 v0.2.0 v0.3.0 v0.3.1 v0.4.0 v0.5.0 v0.7.0}"
 REPO="Ktesio/ktesio"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
