@@ -38,24 +38,24 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 failure-output = "immediate-final"
 status-level = "retry"
 
-# Serialize the HEAVY hemaka-engine integration tests (#106). The `adoption` binary
+# Serialize the HEAVY hekma-engine integration tests (#106). The `adoption` binary
 # (and its siblings) RE-EXEC the test binary as subprocesses that spawn real
 # `fake_agent` children with `--linger-ms 600000`, deliberately designed to SURVIVE
 # and re-parent to init (the NFR-1 engine-crash survival proof). Under nextest's
 # intra-binary parallelism on the genuine 2-core x86 ubuntu runner, many heavy
 # re-exec'd processes plus long-lived orphans ran at once and the runner wedged into
 # an UNINTERRUPTIBLE (D-state) hang that rode the job to its timeout-cancel. A
-# per-binary bisect on CI pinned the culprit to `hemaka-engine::adoption`; it passes
+# per-binary bisect on CI pinned the culprit to `hekma-engine::adoption`; it passes
 # on macOS, Windows, and arm64-2core — this is x86-ubuntu-runner-specific under
 # concurrent heavy process-spawning. Capping this test-group to ONE thread removes
 # the contention. It HIDES/SKIPS nothing — every test still runs and full coverage
 # is retained; it only limits PARALLELISM (harmless on fast runners, a small
 # wall-clock cost). The `filter` selects exactly the 10 engine integration binaries
-# (kind(test) & package(hemaka-engine)) — NOT the engine lib unit tests (kind=lib),
+# (kind(test) & package(hekma-engine)) — NOT the engine lib unit tests (kind=lib),
 # NOT other crates.
 [test-groups.engine-integration-serial]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "kind(test) & package(hemaka-engine)"
+filter = "kind(test) & package(hekma-engine)"
 test-group = "engine-integration-serial"

@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hemaka",
-    "crates/hemaka-engine",
-    "crates/hemaka-adapter-api",
-    "crates/hemaka-adapters-hermes",
-    "crates/hemaka-conformance",
+    "crates/hekma",
+    "crates/hekma-engine",
+    "crates/hekma-adapter-api",
+    "crates/hekma-adapters-hermes",
+    "crates/hekma-conformance",
 ]
 
 [workspace.package]
-# v0.8.0 (D3, ratified 2026-09-16): the Hemaka debut — continues the ktesio
+# v0.8.0 (D3, ratified 2026-09-16): the Hekma debut — continues the ktesio
 # CLI line (published ktesio 0.7.0 stays frozen on crates.io). Library
-# crates continue their own lines under the hemaka-* names.
+# crates continue their own lines under the hekma-* names.
 version = "0.8.0"
 edition = "2021"
 # Minimum supported Rust version. Floor is set by the bundled-SQLite build:
@@ -28,9 +28,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 
 [workspace.dependencies]
 # Internal crates
-hemaka-engine = { path = "crates/hemaka-engine", version = "0.4.0" }
-hemaka-adapter-api = { path = "crates/hemaka-adapter-api", version = "0.2.0" }
-hemaka-adapters-hermes = { path = "crates/hemaka-adapters-hermes", version = "0.2.0" }
+hekma-engine = { path = "crates/hekma-engine", version = "0.4.0" }
+hekma-adapter-api = { path = "crates/hekma-adapter-api", version = "0.2.0" }
+hekma-adapters-hermes = { path = "crates/hekma-adapters-hermes", version = "0.2.0" }
 
 # External dependencies (single source of truth for versions)
 clap = { version = "4", features = ["derive"] }
@@ -41,7 +41,7 @@ clap = { version = "4", features = ["derive"] }
 # io-util (story 3-4: the engine-observed loopback forward listener's async TCP +
 # stream copy — loopback HTTP is portable, NO OS cfg). We do NOT enable/require
 # tokio_unstable — process-group control uses nix/windows-sys in the engine
-# backends instead. Referenced by hemaka-engine only (kt uses the blocking
+# backends instead. Referenced by hekma-engine only (kt uses the blocking
 # facade; adapter-api is pure contract types). MSRV 1.71 << floor 1.96.1.
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync", "macros", "net", "io-util"] }
 # Engine-observed metering (AD-7 / FR-19), story 3-4: the loopback forward
@@ -55,8 +55,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "sync
 # system TLS library (no OpenSSL/native-tls/security-framework), matching the
 # dependency philosophy that already bundled SQLite and that `kt`→`ureq`
 # already paid into (one rustls+ring pair unifies across the whole workspace —
-# verify with `cargo tree -p hemaka-engine -e normal | grep -E "rustls|ring"`).
-# All build cleanly on MSRV 1.96.1. Referenced by hemaka-engine ONLY (the
+# verify with `cargo tree -p hekma-engine -e normal | grep -E "rustls|ring"`).
+# All build cleanly on MSRV 1.96.1. Referenced by hekma-engine ONLY (the
 # listener is engine-internal, AD-2; kt never sees it) — a normal external
 # edge, unaffected by the AD-2 boundary gate.
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -95,7 +95,7 @@ miette = { version = "7", features = ["fancy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # TOML deserializer for the manifest-adapter schema (adapter.toml). Owned by
-# hemaka-adapter-api ONLY (AD-3: it owns manifest parsing); the engine + kt
+# hekma-adapter-api ONLY (AD-3: it owns manifest parsing); the engine + kt
 # consume the parsed form. New dep this story (approved: `toml = "1"`).
 toml = "1"
 thiserror = "2"
@@ -108,7 +108,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 tempfile = "3"
 # Story 7-5 perf harness: the process-metrics crate behind the NFR-4
 # steady-state measurement (the ENGINE process's CPU% + RSS). DEV-DEPENDENCY
-# ONLY — consumed solely by hemaka-engine's `[dev-dependencies]` for the
+# ONLY — consumed solely by hekma-engine's `[dev-dependencies]` for the
 # benchmark-gated `perf-budgets` example (it never enters any shipping
 # artifact, so NFR-8's runtime-lean policy is untouched and the AD-2
 # `cargo tree -p ktesio -e normal,build` gate is unchanged). Renamed here so

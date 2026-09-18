@@ -1,0 +1,42 @@
+[package]
+name = "hekma-conformance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Ktesio adapter conformance test kit (TCK) and mock adapter"
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# UNPUBLISHED by decision (v0.7.0 release, 2026-09-09): this dev/test kit
+# KEEPS `publish = false` — it is the dev/test kit, nothing published
+# depends on it, and publishing it is a separate, undecided step
+# (docs/release-process.md decision log).
+publish = false
+
+[dependencies]
+hekma-adapter-api = { workspace = true }
+# Story 6-4: the TCK entry point is a PUBLIC lib API (a third-party adapter
+# crate dev-depends on hekma-conformance and calls the harness from its own
+# tests), so the engine must be a NORMAL dependency — dev-deps are invisible
+# to lib code. NO cycle: the engine's edge back to this crate is dev-only, and
+# kt's normal tree never includes conformance (the AD-2 gate inspects
+# `cargo tree -p ktesio -e normal,build`, which stays clean).
+hekma-engine = { workspace = true }
+# The TCK reads the COMMITTED Usage Ledger directly (the same committed-state
+# seam the engine's own metering tests use — never a poll of a side channel).
+rusqlite = { workspace = true }
+# Report types are `Serialize` (the machine-readable contract).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Story 6-4: the TCK creates hermetic per-run state roots via `tempfile`
+# (lib API — the caller may be a test, but the harness itself makes the dirs).
+tempfile = { workspace = true }
+
+# Story 6-2: the `hermes_shim` PATH-shim bin re-execs the fake_agent fixture.
+[[bin]]
+name = "hermes_shim"
+path = "src/bin/hermes_shim.rs"
+
+[lints]
+workspace = true

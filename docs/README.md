@@ -1,15 +1,15 @@
 ---
-title: Hemaka
+title: Hekma
 description: Run AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets, from a single Rust CLI.
 ---
 
-# Hemaka Documentation
+# Hekma Documentation
 
-![Hemaka banner: run AI agents like services — supervise, meter, and budget them](assets/hemaka-banner.png)
+![Hekma banner: run AI agents like services — supervise, meter, and budget them](assets/hekma-banner.png)
 
-Welcome to the Hemaka docs. Hemaka is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
+Welcome to the Hekma docs. Hekma is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
 
-By *agent* these pages mean a third-party program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Hemaka runs that program as a supervised, metered process; it is not a framework for writing agents.
+By *agent* these pages mean a third-party program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Hekma runs that program as a supervised, metered process; it is not a framework for writing agents.
 
 ## Start Here
 

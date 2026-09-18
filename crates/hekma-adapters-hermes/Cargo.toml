@@ -1,0 +1,20 @@
+[package]
+name = "hekma-adapters-hermes"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Native Hermes agent adapter for Ktesio"
+license-file.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# PUBLISH HELD (story 7-4): the boundary is proven and the publish machinery
+# is prepared, but every publication action is HELD — requires Islam's
+# explicit go (no deployments, no releases, nothing that costs money).
+# Removing this flag is step 0 of the runbook in docs/release-process.md
+# ("Publishing the Engine Crates — ON HOLD"); do not flip it before that go.
+
+[dependencies]
+hekma-adapter-api = { workspace = true }
+
+[lints]
+workspace = true

@@ -506,14 +506,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hemaka"
+name = "hekma"
 version = "0.8.0"
 dependencies = [
  "clap",
  "console",
  "flate2",
- "hemaka-conformance",
- "hemaka-engine",
+ "hekma-conformance",
+ "hekma-engine",
  "miette",
  "rusqlite",
  "semver",
@@ -528,7 +528,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hemaka-adapter-api"
+name = "hekma-adapter-api"
 version = "0.2.0"
 dependencies = [
  "semver",
@@ -539,18 +539,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "hemaka-adapters-hermes"
+name = "hekma-adapters-hermes"
 version = "0.2.0"
 dependencies = [
- "hemaka-adapter-api",
+ "hekma-adapter-api",
 ]
 
 [[package]]
-name = "hemaka-conformance"
+name = "hekma-conformance"
 version = "0.1.0"
 dependencies = [
- "hemaka-adapter-api",
- "hemaka-engine",
+ "hekma-adapter-api",
+ "hekma-engine",
  "rusqlite",
  "serde",
  "serde_json",
@@ -558,14 +558,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "hemaka-engine"
+name = "hekma-engine"
 version = "0.4.0"
 dependencies = [
  "bytes",
  "directories",
- "hemaka-adapter-api",
- "hemaka-adapters-hermes",
- "hemaka-conformance",
+ "hekma-adapter-api",
+ "hekma-adapters-hermes",
+ "hekma-conformance",
  "http-body-util",
  "hyper",
  "hyper-rustls",

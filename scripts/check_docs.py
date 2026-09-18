@@ -70,14 +70,14 @@ JSON_FENCE_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 # The CLI command allowlist is shared by every shipped binary name —
 # `kt` (retired at 0.8.0, still allowed in historical/compat examples),
-# `hemaka`, and `maka` run the same subcommand tree.
-CLI_COMMAND_NAMES = ("kt", "hemaka", "maka")
+# `hekma`, and `hkm` run the same subcommand tree.
+CLI_COMMAND_NAMES = ("kt", "hekma", "hkm")
 KT_COMMANDS = {
     "self-update",
     "help",
     "agent",
 }
-# `hemaka agent` owns its own subcommand tree (crates/hemaka/src/lib.rs `AgentCommands`).
+# `hekma agent` owns its own subcommand tree (crates/hekma/src/lib.rs `AgentCommands`).
 # Model it the same way as the top level — an allowlist per nesting level — so the
 # agent-runner surface validates without a blanket bypass.
 AGENT_COMMANDS = {
@@ -231,7 +231,7 @@ def validate_agent_subcommands(
     rest: list[str],
     errors: list[str],
 ) -> None:
-    """Validate the `kt agent` subcommand tree (crates/hemaka/src/lib.rs `AgentCommands`
+    """Validate the `kt agent` subcommand tree (crates/hekma/src/lib.rs `AgentCommands`
     / `ConfigCommands`), mirroring the top-level allowlist at each nesting level.
 
     `rest` is the tokens AFTER `kt agent`. A flag-only tail (e.g. `kt agent --help`)

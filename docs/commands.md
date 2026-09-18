@@ -1,21 +1,21 @@
 ---
 title: Command Reference
-description: Every hemaka agent command, its arguments and flags, and the unified config keys for budgets, rates, and metering.
+description: Every hekma agent command, its arguments and flags, and the unified config keys for budgets, rates, and metering.
 ---
 
 # Command Reference
 
-The agent runner lives under `hemaka agent`. Every command supports `--help`, and `hemaka --version` prints the package version.
+The agent runner lives under `hekma agent`. Every command supports `--help`, and `hekma --version` prints the package version.
 
 Output discipline: command results go to stdout, while notices and diagnostics go to stderr, so `--json` output on stdout is always machine-parseable.
 
-## `hemaka agent register <name> (--kind <kind> | --manifest <path>)`
+## `hekma agent register <name> (--kind <kind> | --manifest <path>)`
 
 Register a new Agent Instance under a Fleet-unique name.
 
 ```bash
-hemaka agent register demo --kind mock
-hemaka agent register my-agent --manifest ./my-agent
+hekma agent register demo --kind mock
+hekma agent register my-agent --manifest ./my-agent
 ```
 
 Arguments and options:
@@ -28,45 +28,45 @@ Exactly one of `--kind` or `--manifest` is required. Registration validates the 
 
 The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
 
-**Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home.** A fleet of multiple unbacked hermes instances therefore all resolve the **same** unmanaged default home (documented fallback, not an error); attach Memory Backing (`hemaka agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
+**Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home.** A fleet of multiple unbacked hermes instances therefore all resolve the **same** unmanaged default home (documented fallback, not an error); attach Memory Backing (`hekma agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
 
-## `hemaka agent list [--json]`
+## `hekma agent list [--json]`
 
 List every Agent Instance in the Fleet.
 
 ```bash
-hemaka agent list
-hemaka agent list --json
+hekma agent list
+hekma agent list --json
 ```
 
 The human table shows name, kind, state, restart count, the token budget (ceilings + remaining + Breach Action, or `—` when un-budgeted), the real usage totals (cumulative tokens plus — when a Rate is configured — the derived dollar cost), and the Agent Home, followed by a Fleet-wide totals footer.
 
 Both money-bearing columns are headed `Budget (tok, est. $)` and `Usage (tok, est. $)`: the `est. $` estimate qualifier lives in the HEADER because those cells are narrow and truncate — a truncated cell can never strip the label off a real dollar figure, so the cells render their dollar figures bare.
 
-The active Metering Source is deliberately **not** a human-`list` column — the compact table is the ratified 80-column design, and a Metering column there overflows the default width and truncates cells. Read the Metering Source from `hemaka agent show` (the detail row), `hemaka agent list --json` (the `metering_source` field), or `hemaka agent usage`.
+The active Metering Source is deliberately **not** a human-`list` column — the compact table is the ratified 80-column design, and a Metering column there overflows the default width and truncates cells. Read the Metering Source from `hekma agent show` (the detail row), `hekma agent list --json` (the `metering_source` field), or `hekma agent usage`.
 
-`--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `hemaka agent usage` below.
+`--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `hekma agent usage` below.
 
-## `hemaka agent show <name> [--json]`
+## `hekma agent show <name> [--json]`
 
 Show one instance's effective per-OS Capability Declaration plus its runtime status.
 
 ```bash
-hemaka agent show demo
-hemaka agent show demo --json
+hekma agent show demo
+hekma agent show demo --json
 ```
 
 The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
 
-## `hemaka agent usage [<name>] [--json]`
+## `hekma agent usage [<name>] [--json]`
 
 Read Usage Ledger totals for one instance, or for the whole Fleet.
 
 ```bash
-hemaka agent usage
-hemaka agent usage my-agent
-hemaka agent usage my-agent --json
-hemaka agent usage --json
+hekma agent usage
+hekma agent usage my-agent
+hekma agent usage my-agent --json
+hekma agent usage --json
 ```
 
 - `<name>` — optional; with a name, reports that instance's usage. Omitted, reports the Fleet-wide totals.
@@ -110,7 +110,7 @@ The Fleet-wide form (no name) is the same document family with `totals` in place
 }
 ```
 
-`totals` is byte-identical to the `totals` object `hemaka agent list --json` carries — one aggregate, two surfaces. `dollars_partial` is `true` when some metered instance has no Rate, making `total_dollars` a lower bound; `unpriced_count` then names how many instances were left out.
+`totals` is byte-identical to the `totals` object `hekma agent list --json` carries — one aggregate, two surfaces. `dollars_partial` is `true` when some metered instance has no Rate, making `total_dollars` a lower bound; `unpriced_count` then names how many instances were left out.
 
 Dollars are **integer micro-dollars** (1,000,000 = $1.00) plus an `estimate_label` of `estimated` or `reconciled` — never a preformatted `$` string, so a caller formats its own currency.
 
@@ -118,81 +118,81 @@ Dollar fields are **omitted entirely** when no Rate is configured (`cumulative_d
 
 With no instances registered, the Fleet form still emits a valid document (all-zero totals) and prints a short registration hint to stderr, so an empty Fleet is never mistaken for instances that consumed nothing.
 
-## `hemaka agent start <name> [--detach]`
+## `hekma agent start <name> [--detach]`
 
 Start a registered Agent Instance.
 
 ```bash
-hemaka agent start my-agent
-hemaka agent start my-agent --detach
+hekma agent start my-agent
+hekma agent start my-agent --detach
 ```
 
 On success the instance transitions to `running` and the new state prints to stdout. A launch failure lands the instance in `failed` with a diagnostic on stderr. Before the process spawns, the start seam can emit one-line engine diagnostics on stderr (or the host sink): a report of every launch environment variable the config mapping **overwrote** (the config value wins), and a warn-only report of config keys whose `secret:` cleartext was delivered into a **flag** target (visible on the process argv) — neither ever rejects the start.
 
 Without `--detach`, the started process is supervised only for that command's lifetime and stops when the command exits (a note is printed to stderr). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
 
-`--detach` keeps the agent running after the command exits: the process handle is disarmed at spawn, and the next `hemaka` command re-adopts the surviving process through the existing pid + start-time fingerprint path. The detached start prints a notice to stderr naming the honest **enforcement window**: between commands the agent is **not supervised** — no crash detection, no budget enforcement, and no usage/event delivery happen until the next command adopts it (supervision is command-scoped). Two further facts are pinned by design: a detached start refuses `engine-observed` instances (exit code 5) before anything changes — their loopback listener dies with the starting command, which would strand the agent's model traffic on a dead port — and a detached child is spawned with stdin closed regardless of its declared interaction level (`send` on it fails with the adopted-instance diagnostic after re-adoption, as for any adopted process).
+`--detach` keeps the agent running after the command exits: the process handle is disarmed at spawn, and the next `hekma` command re-adopts the surviving process through the existing pid + start-time fingerprint path. The detached start prints a notice to stderr naming the honest **enforcement window**: between commands the agent is **not supervised** — no crash detection, no budget enforcement, and no usage/event delivery happen until the next command adopts it (supervision is command-scoped). Two further facts are pinned by design: a detached start refuses `engine-observed` instances (exit code 5) before anything changes — their loopback listener dies with the starting command, which would strand the agent's model traffic on a dead port — and a detached child is spawned with stdin closed regardless of its declared interaction level (`send` on it fails with the adopted-instance diagnostic after re-adoption, as for any adopted process).
 
-## `hemaka agent stop <name> [--timeout <secs>]`
+## `hekma agent stop <name> [--timeout <secs>]`
 
 Stop a running Agent Instance: graceful shutdown, then a forced kill after the window.
 
 ```bash
-hemaka agent stop my-agent
-hemaka agent stop my-agent --timeout 10
+hekma agent stop my-agent
+hekma agent stop my-agent --timeout 10
 ```
 
 - `--timeout <secs>` — the graceful-shutdown window before a forced kill (default 30). No child process survives. `--timeout 0` skips the graceful window entirely: SIGTERM is sent and a forced kill escalates immediately.
 
-## `hemaka agent pause <name>` / `hemaka agent resume <name>`
+## `hekma agent pause <name>` / `hekma agent resume <name>`
 
 Pause a running instance, or resume a paused one, with honest per-OS semantics.
 
 ```bash
-hemaka agent pause my-agent
-hemaka agent resume my-agent
+hekma agent pause my-agent
+hekma agent resume my-agent
 ```
 
-A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration. `resume` shares the dispatch: a **guaranteed** resume wakes the suspended process (SIGCONT), a **best-effort** resume records its qualifier, and a resume of an instance that is `paused` while the CURRENT declaration reads `unsupported` (declaration/OS drift) fails fast with a dedicated diagnostic that names the paused state and the escape hatch — `stop` works without pause support, so `hemaka agent stop <name> && hemaka agent start <name>` recovers (exit code 5, the capability-unsupported class). A guaranteed pause OR RESUME of an instance this engine session holds no process handle for (e.g. started by a prior engine whose process is gone) still transitions, but the recorded cause is the honest best-effort qualifier naming the missing handle — nothing was signalled at all, so the cause never reads as a plain "paused"/"resumed" command that a real suspension would earn; a budget-driven override in that no-handle case is wrapped in the same qualifier rather than replacing it.
+A **guaranteed** pause suspends the process (SIGSTOP on Unix); a **best-effort** pause proceeds cooperatively and prints a visible qualifier note; an **unsupported** pause fails fast, quoting the Capability Declaration. The posture is per-OS, read from the adapter's declaration. `resume` shares the dispatch: a **guaranteed** resume wakes the suspended process (SIGCONT), a **best-effort** resume records its qualifier, and a resume of an instance that is `paused` while the CURRENT declaration reads `unsupported` (declaration/OS drift) fails fast with a dedicated diagnostic that names the paused state and the escape hatch — `stop` works without pause support, so `hekma agent stop <name> && hekma agent start <name>` recovers (exit code 5, the capability-unsupported class). A guaranteed pause OR RESUME of an instance this engine session holds no process handle for (e.g. started by a prior engine whose process is gone) still transitions, but the recorded cause is the honest best-effort qualifier naming the missing handle — nothing was signalled at all, so the cause never reads as a plain "paused"/"resumed" command that a real suspension would earn; a budget-driven override in that no-handle case is wrapped in the same qualifier rather than replacing it.
 
-One interaction with detach is worth knowing: pause a `--detach`ed agent and then let the command exit, and the agent stays SIGSTOP-frozen and unsupervised between commands — frozen (no work) but also unwatched (no crash detection, no enforcement, no event delivery) until some later command holds it again; a later `hemaka agent resume <name>` wakes it, and `hemaka agent stop <name>` is always available.
+One interaction with detach is worth knowing: pause a `--detach`ed agent and then let the command exit, and the agent stays SIGSTOP-frozen and unsupervised between commands — frozen (no work) but also unwatched (no crash detection, no enforcement, no event delivery) until some later command holds it again; a later `hekma agent resume <name>` wakes it, and `hekma agent stop <name>` is always available.
 
-## `hemaka agent send <name> <text>`
+## `hekma agent send <name> <text>`
 
 Send text input to a running Agent Instance's native input channel (v1: the spawned child's OS stdin pipe).
 
 ```bash
-hemaka agent send my-agent "hello there"
+hekma agent send my-agent "hello there"
 ```
 
 A trailing newline is appended to `<text>` if it does not already end with one. Unlike `pause`/`resume`, `send` is not a lifecycle transition: the instance's state is unchanged, and only a confirmation prints to stdout.
 
 The same three-way honesty as `pause`, with one difference: a **guaranteed** and a **best-effort** interaction level both deliver the input identically (there is no OS-conditional difference in writing to a pipe — best-effort is purely an adapter-author signal), while an **unsupported** interaction level fails fast, quoting the Capability Declaration.
 
-`send` requires the instance to be genuinely `running`, and it inherits the same single-lifetime caveat as `start` (above): a standalone `hemaka agent start` supervises a process only for that command's lifetime, so a process adopted after an engine restart has no recoverable input channel in the new session — `send` on such an instance fails honestly (naming the cause) rather than silently dropping the input.
+`send` requires the instance to be genuinely `running`, and it inherits the same single-lifetime caveat as `start` (above): a standalone `hekma agent start` supervises a process only for that command's lifetime, so a process adopted after an engine restart has no recoverable input channel in the new session — `send` on such an instance fails honestly (naming the cause) rather than silently dropping the input.
 
 Stdin is piped only for adapters that declare interaction support (`guaranteed` or `best-effort`); an adapter that doesn't declare interaction sees stdin exactly as before this command existed (`/dev/null`-equivalent), so it never blocks waiting on input that will never arrive.
 
 If an agent stops draining its input (a stuck/deadlocked process), `send`'s write is bounded — it fails with a distinct diagnostic naming the timeout rather than hanging, and the instance's interaction channel stays unavailable for the rest of that session until it is stopped and started again.
 
-## `hemaka agent logs <name> [--follow] [--json]`
+## `hekma agent logs <name> [--follow] [--json]`
 
 Read an Agent Instance's retained output, optionally following live output.
 
 ```bash
-hemaka agent logs my-agent
-hemaka agent logs my-agent --follow
-hemaka agent logs my-agent --json
-hemaka agent logs my-agent --follow --json
+hekma agent logs my-agent
+hekma agent logs my-agent --follow
+hekma agent logs my-agent --json
+hekma agent logs my-agent --follow --json
 ```
 
 Every currently-retained line is printed to stdout as `<at> [<stream>] <text>`, in the order it was captured (append order — never re-sorted by timestamp, since same-second lines are common). `<stream>` is one of `agent-out`, `agent-err`, or `engine`: the spawned process's stdout and stderr are captured separately (so you can tell them apart), and a best-effort `engine` line is added at each lifecycle transition (start, stop, pause, resume, crash, restart), mirroring the same facts the structured transition log already records.
 
 Log capture is **unconditional and capability-independent** — unlike `send`, it does not depend on the adapter's declared `interaction` support. Reading an instance's output always works, even for an adapter that declares `interaction: unsupported`; only writing to a process (`send`) is gated on that capability.
 
-The captured output is bounded: each generation caps at 10MB, with the current generation plus its 2 most recent rotated predecessors retained (10MB × 3 total, fixed and non-configurable). `hemaka agent logs` never errors due to rotation — a read that spans a rotation boundary returns whatever is currently retained, not a claim of the instance's entire lifetime history.
+The captured output is bounded: each generation caps at 10MB, with the current generation plus its 2 most recent rotated predecessors retained (10MB × 3 total, fixed and non-configurable). `hekma agent logs` never errors due to rotation — a read that spans a rotation boundary returns whatever is currently retained, not a claim of the instance's entire lifetime history.
 
-`--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops, pauses, crashes to `failed`, or otherwise leaves `running` (never hanging). This works identically whether or not the current `hemaka` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `hemaka agent logs --follow` also works against an instance recovered by crash adoption in a different `hemaka agent start` session.
+`--follow` (`-f`) prints the retained lines first, then keeps polling for new output and printing it as it arrives — exiting cleanly with a note once the instance stops, pauses, crashes to `failed`, or otherwise leaves `running` (never hanging). This works identically whether or not the current `hekma` process is the one that originally started the instance: reading only needs the instance's log file, not a live process handle, so `hekma agent logs --follow` also works against an instance recovered by crash adoption in a different `hekma agent start` session.
 
 `--json` emits **newline-delimited JSON (NDJSON)**: one complete, self-contained log-line object per stdout line, each carrying its own `schema_version`. This is deliberately not a single wrapping document — `--follow` is an unbounded stream that a wrapper could never close — so the shape is identical for the one-shot and `--follow` forms, and a reader can process each line as it arrives:
 
@@ -202,14 +202,14 @@ The captured output is bounded: each generation caps at 10MB, with the current g
 
 Lines are emitted in on-disk append order (never re-sorted by `at`, whose whole-second resolution makes ties common). An empty log emits nothing at all — zero lines, not `[]`. Under `--json`, stdout is pure NDJSON: the rotation notice and the follow-exit note go to stderr like every other diagnostic.
 
-## `hemaka agent remove <name> [--delete | --retain] [--force]`
+## `hekma agent remove <name> [--delete | --retain] [--force]`
 
 Remove an Agent Instance from the Fleet.
 
 ```bash
-hemaka agent remove demo
-hemaka agent remove demo --delete
-hemaka agent remove my-agent --force
+hekma agent remove demo
+hekma agent remove demo --delete
+hekma agent remove my-agent --force
 ```
 
 - `--retain` — keep the Agent Home directory on disk (the default).
@@ -218,17 +218,17 @@ hemaka agent remove my-agent --force
 
 `--delete` and `--retain` are mutually exclusive; when neither is given, the safe default is to retain.
 
-## `hemaka agent memory attach <name> --kind <kind>`
+## `hekma agent memory attach <name> --kind <kind>`
 
 Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
 
 - **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
-- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hemaka guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hekma guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
 
 ```bash
-hemaka agent memory attach demo --kind filesystem
-hemaka agent memory attach demo --kind native
-hemaka agent memory attach demo --kind filesystem --json
+hekma agent memory attach demo --kind filesystem
+hekma agent memory attach demo --kind native
+hekma agent memory attach demo --kind filesystem --json
 ```
 
 Arguments:
@@ -249,14 +249,14 @@ The human confirmation names the kind and prints one boundary sentence stating e
   "instance": "demo",
   "kind": "filesystem",
   "guarantee": "managed_dir_byte_durable",
-  "dir": "/home/you/.local/share/hemaka/agents/demo/memory",
+  "dir": "/home/you/.local/share/hekma/agents/demo/memory",
   "declared": true
 }
 ```
 
 A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
 
-For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Hemaka says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
+For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Hekma says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
 `memory.dir` is an engine-reserved delivery key, never operator configuration — do not set it yourself. Any hand-set value is stripped from the operator layers at resolve time: the engine removes it when resolving what applies at start, so it can be delivered only by the engine itself (when a `filesystem` backing is attached) and never lands in the persisted start snapshot as applied configuration.
 
@@ -270,15 +270,15 @@ Both backing kinds travel with the Agent Home — the attachment lives in the st
 2. **Copy the whole state dir**, preserving the relative layout (`state.db`, `secrets.toml` if present, and everything under `agents/`). Do not reorganize or rename anything inside it.
 3. **Open at the same relative location on the target machine** (or set `KTESIO_STATE_DIR` to the copied root).
 
-The `filesystem` memory tree arrives byte-identical and the instance runs with memory intact; the delegation recorded for a `native` backing travels too. One caveat: a state database written by a NEWER Hemaka version refuses to open on an older one with a clear schema-version error — upgrade before copying forward.
+The `filesystem` memory tree arrives byte-identical and the instance runs with memory intact; the delegation recorded for a `native` backing travels too. One caveat: a state database written by a NEWER Hekma version refuses to open on an older one with a clear schema-version error — upgrade before copying forward.
 
-## `hemaka agent memory detach <name>`
+## `hekma agent memory detach <name>`
 
 Detach an Agent Instance's Memory Backing.
 
 ```bash
-hemaka agent memory detach demo
-hemaka agent memory detach demo --json
+hekma agent memory detach demo
+hekma agent memory detach demo --json
 ```
 
 Arguments:
@@ -288,7 +288,7 @@ Arguments:
 
 Detach is metadata-only: the attachment is removed, but the managed directory **and its contents remain on disk** — your data is never silently deleted, and re-attaching later re-adopts the existing contents. The same terminal-state requirement applies as `attach`.
 
-With `--json`, stdout carries the versioned confirmation document and nothing else. It is intentionally minimal — the versioned proof that nothing is attached anymore; it carries no path (Hemaka never constructs the managed-directory name itself, and after a detach the engine reports no attachment to quote):
+With `--json`, stdout carries the versioned confirmation document and nothing else. It is intentionally minimal — the versioned proof that nothing is attached anymore; it carries no path (Hekma never constructs the managed-directory name itself, and after a detach the engine reports no attachment to quote):
 
 ```json
 {
@@ -299,19 +299,19 @@ With `--json`, stdout carries the versioned confirmation document and nothing el
 
 ## Memory guarantees at a glance
 
-| Kind | Hemaka guarantees | Delegated to the agent |
+| Kind | Hekma guarantees | Delegated to the agent |
 | --- | --- | --- |
 | `filesystem` | The managed directory exists, its contents survive restarts byte-identically, and it travels with the Agent Home | What the agent does with the delivered path |
 | `native` | Only that the Agent Home persists | All memory semantics (storage, retrieval, lifecycle) |
 
-## `hemaka agent config set <name> <key> <value>`
+## `hekma agent config set <name> <key> <value>`
 
 Set one config key on the Agent Instance layer. Validated at write time.
 
 ```bash
-hemaka agent config set demo model gpt-4
-hemaka agent config set demo budget.tokens.cumulative 500000
-hemaka agent config set demo agent.api_key secret:OPENAI_KEY
+hekma agent config set demo model gpt-4
+hekma agent config set demo budget.tokens.cumulative 500000
+hekma agent config set demo agent.api_key secret:OPENAI_KEY
 ```
 
 A known unified key or an `agent.*` pass-through key is accepted and persisted; an unknown key **outside** `agent.*` is rejected before anything is written, with the nearest valid key suggested. The value is stored verbatim — a `secret:NAME` reference is stored as-is and resolved + masked at start/read (never resolved or echoed by this write). Setting config on a **running** instance is allowed and never touches the live process: the change takes effect on the next start (budget/cost keys are an exception — they are re-read on each usage ingestion and apply immediately).
@@ -322,15 +322,15 @@ The `<value>` position accepts a leading-dash value (e.g. `-x`, `--model-x`) **l
 
 **Warning (warn-only).** Setting a `secret:NAME` value on a key the agent's adapter maps to a **flag** target succeeds, but prints a warning to stderr: the resolved cleartext would ride the agent's command line, where argv is readable by other local users (`ps`, `/proc/<pid>/cmdline`). Prefer an **env** or **file** target for secret-carrying keys (see Architecture — Secrets); at **start** the same fact is reported as a one-line engine diagnostic.
 
-## `hemaka agent config get <name> [<key>] [--json] [--reveal]`
+## `hekma agent config get <name> [<key>] [--json] [--reveal]`
 
 Read the effective (resolved) config with per-value provenance.
 
 ```bash
-hemaka agent config get demo
-hemaka agent config get demo model
-hemaka agent config get demo --json
-hemaka agent config get demo --reveal
+hekma agent config get demo
+hekma agent config get demo model
+hekma agent config get demo --json
+hekma agent config get demo --reveal
 ```
 
 - `<key>` — optional; omitted prints the whole effective config. With a key, prints just that value. A key with no effective value is rejected on stderr with a non-zero exit. When that key has no value of its own but **is a table prefix** of effective keys (e.g. `budget` while `budget.tokens.cumulative` is set), the diagnostic names the effective child leaves (the first eight, then an ellipsis) and suggests the `get` for one of them; a key that is neither a value nor a prefix gets the plain not-found diagnostic. The same diagnostic applies in `--json` mode (stderr carries it; stdout stays clean of a partial document).
@@ -341,7 +341,7 @@ Values resolve across four layers — engine defaults &lt; agent-kind defaults &
 
 ## Unified Config Keys
 
-Set these with `hemaka agent config set <name> <key> <value>`.
+Set these with `hekma agent config set <name> <key> <value>`.
 
 | Key | Value | Meaning |
 |-----|-------|---------|
@@ -358,7 +358,7 @@ Set these with `hemaka agent config set <name> <key> <value>`.
 
 Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
-Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hemaka displays it.
+Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
 
 ### Budget breaches and the pause action
 
@@ -368,7 +368,7 @@ When a token ceiling or dollar Cost Cap is crossed, the recorded breach names it
 
 ### Exit codes
 
-Every `hemaka` command returns one of these numeric exit codes, so failures can be branched on in a script without parsing stderr:
+Every `hekma` command returns one of these numeric exit codes, so failures can be branched on in a script without parsing stderr:
 
 | Code | Meaning | Typical causes |
 |------|---------|----------------|
@@ -377,31 +377,31 @@ Every `hemaka` command returns one of these numeric exit codes, so failures can 
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
-| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `hemaka agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `hemaka agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `hemaka agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
+| `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `hekma agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `hekma agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `hekma agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 
 A script branches on the code directly — no stderr parsing:
 
 ```bash
-hemaka agent show my-agent --json > status.json
+hekma agent show my-agent --json > status.json
 code=$?
 if [ $code -eq 3 ]; then
-  hemaka agent register my-agent --kind mock
+  hekma agent register my-agent --kind mock
 elif [ $code -eq 4 ]; then
-  hemaka agent start my-agent
+  hekma agent start my-agent
 elif [ $code -ne 0 ]; then
   echo "unexpected failure (exit $code)" >&2
   exit 1
 fi
 ```
 
-Every command that writes machine-readable output to stdout keeps that output pure, so `hemaka agent logs my-agent --json | head -5` is safe: a consumer that stops reading ends the command cleanly with `0` rather than an I/O failure.
+Every command that writes machine-readable output to stdout keeps that output pure, so `hekma agent logs my-agent --json | head -5` is safe: a consumer that stops reading ends the command cleanly with `0` rather than an I/O failure.
 
 These codes are a **v1 compatibility surface**, governed by the same deprecation policy as the `--json` schemas: a breaking change is announced in the release notes, carries at least a one-minor notice window, and is removed only at a major version. Compatibility tests assert each documented condition returns its documented code, so an unannounced change fails CI.
 
 ### Environment variables
 
-Two environment variables control `hemaka`'s own behavior (they are never injected into the agent's environment):
+Two environment variables control `hekma`'s own behavior (they are never injected into the agent's environment):
 
 | Variable | Meaning |
 |----------|---------|
@@ -410,12 +410,12 @@ Two environment variables control `hemaka`'s own behavior (they are never inject
 
 ### Update checks
 
-When a `hemaka` subcommand runs, Hemaka checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `hemaka self-update`. Machine-readable JSON on stdout is unaffected. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
+When a `hekma` subcommand runs, Hekma checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `hekma self-update`. Machine-readable JSON on stdout is unaffected. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
 
-### `hemaka self-update`
+### `hekma self-update`
 
-Update the `hemaka` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary). Running instances already hold their own process image: they keep executing the binary they were started with until their next start, so a self-update does not interrupt them — restart agents to pick up the new version.
+Update the `hekma` binary itself, preserving the current install channel (Homebrew, Cargo, or a manual release binary). Running instances already hold their own process image: they keep executing the binary they were started with until their next start, so a self-update does not interrupt them — restart agents to pick up the new version.
 
 ```bash
-hemaka self-update
+hekma self-update
 ```

@@ -11,7 +11,7 @@ This page is the hands-on development guide. For project rules and the Contribut
 
 ```bash
 git clone https://github.com/Ktesio/ktesio.git
-cd hemaka
+cd hekma
 cargo build
 cargo test --workspace --all-targets
 ```
@@ -31,15 +31,15 @@ The commands above run under the same MSRV pin (1.96.1 via `rust-toolchain.toml`
 
 ## Adding CLI Behavior
 
-- Update `crates/hemaka/src/main.rs` command parsing.
-- Add or update a module under `crates/hemaka/src/cli/`.
+- Update `crates/hekma/src/main.rs` command parsing.
+- Add or update a module under `crates/hekma/src/cli/`.
 - Add unit tests for command logic with explicit project roots.
-- Add integration tests under `crates/hemaka/tests/` for user-facing workflows.
+- Add integration tests under `crates/hekma/tests/` for user-facing workflows.
 - Update [commands.md](commands.md) and [get-started.md](get-started.md) when behavior changes.
 
 ## Test Fixtures
 
-Integration tests use local temporary git repositories through `crates/hemaka/tests/helpers/mod.rs`. Avoid network-only tests in the default suite.
+Integration tests use local temporary git repositories through `crates/hekma/tests/helpers/mod.rs`. Avoid network-only tests in the default suite.
 
 ## Pull Requests
 

@@ -1,17 +1,17 @@
 ---
-title: Migration to Hemaka
-description: Migrating from Ktesio kt releases (v0.1.1–v0.7.0) to Hemaka 0.8.0 — commands, install channels, the data guarantee, and the environment settings map.
+title: Migration to Hekma
+description: Migrating from Ktesio kt releases (v0.1.1–v0.7.0) to Hekma 0.8.0 — commands, install channels, the data guarantee, and the environment settings map.
 ---
 
-# Migration to Hemaka
+# Migration to Hekma
 
-Hemaka 0.8.0 is the rename of the product formerly released as **Ktesio**
+Hekma 0.8.0 is the rename of the product formerly released as **Ktesio**
 (the `ktesio` crate, the `kt` binary). Ktesio remains the publisher and
-umbrella brand — Hemaka is a [ktesio.dev](https://ktesio.dev) project —
-but the product you install and run is now **Hemaka**: the `hemaka` command,
-the short alias `maka`, and the `hemaka-*` crates.
+umbrella brand — Hekma is a [ktesio.dev](https://ktesio.dev) project —
+but the product you install and run is now **Hekma**: the `hekma` command,
+the short alias `hkm`, and the `hekma-*` crates.
 
-**The one thing that does not change: your data.** Hemaka reads the exact
+**The one thing that does not change: your data.** Hekma reads the exact
 same state directory `kt` used. Nothing is moved, merged, reset, or
 deleted — instances, usage ledgers, budgets, memory backings, secrets, and
 permissions all survive as-is.
@@ -22,31 +22,31 @@ Re-run the installer; it detects the existing install and follows its
 original channel:
 
 ```bash
-curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | sh
+curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh
 ```
 
 ```powershell
-irm https://cli.ktesio.dev/hemaka/install.ps1 | iex
+irm https://cli.ktesio.dev/hekma/install.ps1 | iex
 ```
 
-You get `hemaka` and `maka` (both standalone, both the same CLI). Your old
+You get `hekma` and `hkm` (both standalone, both the same CLI). Your old
 `kt` binary **keeps working but can no longer update** — see
 [Why kt self-update no longer reaches 0.8.0](#why-kt-self-update-no-longer-reaches-080),
 then remove it at your leisure.
 
 ## What changed, precisely
 
-| Before (≤ 0.7.0) | Hemaka 0.8.0 |
+| Before (≤ 0.7.0) | Hekma 0.8.0 |
 |---|---|
-| Command `kt` | `hemaka` (primary) + `maka` (alias) — `kt` is retired |
-| Crate `ktesio` | `hemaka` (the `ktesio` crate is frozen at 0.7.0, preserved on crates.io) |
-| Library `ktesio-engine` 0.3.0 | `hemaka-engine` 0.4.0 (same line, continued) |
-| Release archives `ktesio-v*-*` | `hemaka-v*-*` |
-| Homebrew `ktesio/tap/ktesio` | `ktesio/tap/hemaka` (same org tap; the formula renamed) |
-| State env `KTESIO_STATE_DIR` | still works — **and** `HEMAKA_STATE_DIR` is accepted |
-| `KTESIO_NO_UPDATE_CHECK` | still works — **and** `HEMAKA_NO_UPDATE_CHECK` |
-| `KTESIO_INSTALL_METHOD/_DIR/_DRY_RUN` | still work — **and** the `HEMAKA_*` equivalents |
-| Docs `docs.ktesio.dev` | `hemaka.ktesio.dev` (the old host redirects) |
+| Command `kt` | `hekma` (primary) + `hkm` (alias) — `kt` is retired |
+| Crate `ktesio` | `hekma` (the `ktesio` crate is frozen at 0.7.0, preserved on crates.io) |
+| Library `ktesio-engine` 0.3.0 | `hekma-engine` 0.4.0 (same line, continued) |
+| Release archives `ktesio-v*-*` | `hekma-v*-*` |
+| Homebrew `ktesio/tap/ktesio` | `ktesio/tap/hekma` (same org tap; the formula renamed) |
+| State env `KTESIO_STATE_DIR` | still works — **and** `HEKMA_STATE_DIR` is accepted |
+| `KTESIO_NO_UPDATE_CHECK` | still works — **and** `HEKMA_NO_UPDATE_CHECK` |
+| `KTESIO_INSTALL_METHOD/_DIR/_DRY_RUN` | still work — **and** the `HEKMA_*` equivalents |
+| Docs `docs.ktesio.dev` | `hekma.ktesio.dev` (the old host redirects) |
 
 Unchanged: JSON output shapes and schema versions, exit codes 0–6, the
 `KTESIO_USAGE` self-report sentinel agents emit, the `KTESIO_MEMORY_DIR`
@@ -62,28 +62,28 @@ carries a `formula_renames.json` mapping, so a plain upgrade follows the
 rename:
 
 ```bash
-brew upgrade ktesio/tap/hemaka
+brew upgrade ktesio/tap/hekma
 ```
 
 Fresh installs (and the documented reinstall path):
 
 ```bash
-brew install ktesio/tap/hemaka
+brew install ktesio/tap/hekma
 ```
 
 Uninstall:
 
 ```bash
-brew uninstall ktesio/tap/hemaka
+brew uninstall ktesio/tap/hekma
 ```
 
 ### Cargo
 
 ```bash
-cargo install hemaka --force
+cargo install hekma --force
 ```
 
-This installs `hemaka` and `maka` into `$CARGO_HOME/bin`. The old
+This installs `hekma` and `hkm` into `$CARGO_HOME/bin`. The old
 cargo-installed `kt` stays behind as an orphan of the frozen `ktesio`
 crate; remove it with:
 
@@ -93,13 +93,13 @@ cargo uninstall ktesio
 
 ### Manual binary (curl archive or direct download)
 
-Download the `hemaka-v<version>-<target>` archive from
+Download the `hekma-v<version>-<target>` archive from
 [GitHub Releases](https://github.com/Ktesio/ktesio/releases), unpack, and
-place **both** `hemaka` and `maka` on your `PATH` (beside your old `kt` is
+place **both** `hekma` and `hkm` on your `PATH` (beside your old `kt` is
 fine). The installer does this for you; if you migrate by hand, both
 binaries must come from the same release so they stay version-matched.
-`hemaka self-update` (manual channel) replaces both binaries on every
-update — running it as `maka` still refreshes `hemaka`, and vice versa.
+`hekma self-update` (manual channel) replaces both binaries on every
+update — running it as `hkm` still refreshes `hekma`, and vice versa.
 
 Remove the retired `kt` whenever you like:
 
@@ -110,7 +110,7 @@ rm "$(command -v kt)"
 ## Why kt self-update no longer reaches 0.8.0
 
 A deliberate decision (no compatibility window on release artifacts): from
-0.8.0 on, GitHub releases carry only `hemaka-*` archives. Old `kt`
+0.8.0 on, GitHub releases carry only `hekma-*` archives. Old `kt`
 binaries' self-update constructs `ktesio-v<tag>-<target>` download URLs,
 which no longer exist — the update fails with a download/checksum error
 rather than partially upgrading. Re-running the installer (or cargo/brew)
@@ -119,16 +119,16 @@ version, v0.1.1 through v0.7.0.
 
 ## Environment settings map
 
-`KTESIO_*` settings keep working; the `HEMAKA_*` names are preferred going
+`KTESIO_*` settings keep working; the `HEKMA_*` names are preferred going
 forward. When both state-dir variables are set they must name the **same**
 absolute path — different paths is a hard error (an ambiguous state root is
 never silently resolved).
 
 | Setting | Status |
 |---|---|
-| `KTESIO_STATE_DIR` | honored; alias `HEMAKA_STATE_DIR` |
-| `KTESIO_NO_UPDATE_CHECK` | honored; alias `HEMAKA_NO_UPDATE_CHECK` (either truthy disables; `CI` too) |
-| `KTESIO_INSTALL_METHOD` / `_DIR` / `_DRY_RUN` | honored; `HEMAKA_INSTALL_*` aliases preferred |
+| `KTESIO_STATE_DIR` | honored; alias `HEKMA_STATE_DIR` |
+| `KTESIO_NO_UPDATE_CHECK` | honored; alias `HEKMA_NO_UPDATE_CHECK` (either truthy disables; `CI` too) |
+| `KTESIO_INSTALL_METHOD` / `_DIR` / `_DRY_RUN` | honored; `HEKMA_INSTALL_*` aliases preferred |
 | `KTESIO_USAGE` (agent-side sentinel) | **unchanged** — agents keep emitting this line |
 | `KTESIO_MEMORY_DIR` (mock adapter memory) | **unchanged** |
 | `HERMES_HOME` (Hermes' own variable) | **unchanged** |
@@ -138,22 +138,22 @@ A note on piping the installer: an assignment like
 not on the shell reading the script. Put it on the `sh` segment instead:
 
 ```bash
-curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | KTESIO_INSTALL_METHOD=binary sh
+curl -fsSL https://cli.ktesio.dev/hekma/install.sh | KTESIO_INSTALL_METHOD=binary sh
 ```
 
 ## Windows notes
 
-- New default install dir: `%LOCALAPPDATA%\hemaka\bin`. The installer
+- New default install dir: `%LOCALAPPDATA%\hekma\bin`. The installer
   reuses the legacy `%LOCALAPPDATA%\ktesio\bin` (or `~/.ktesio\bin`) when
-  your existing install lives there, so Hemaka lands beside the old
+  your existing install lives there, so Hekma lands beside the old
   binary instead of shadowing it on `PATH`.
-- Replacing a running binary: stop any running `kt`/`hemaka` processes
+- Replacing a running binary: stop any running `kt`/`hekma` processes
   before migrating, then re-run the installer.
 
 ## FAQ
 
-**Is `maka` a different program?** No — `hemaka` and `maka` are two names
-for the same CLI (`maka --version` reports the shared `hemaka` identity).
+**Is `hkm` a different program?** No — `hekma` and `hkm` are two names
+for the same CLI (`hkm --version` reports the shared `hekma` identity).
 Ship both in scripts where brevity matters; both are standalone.
 
 **Do I need to re-register agents?** No. Open the same state directory as

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Hemaka (Ktesio through v0.7.0) are generated from git history when a version tag is published.
+All notable changes to Hekma (Ktesio through v0.7.0) are generated from git history when a version tag is published.
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
@@ -57,9 +57,9 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > - Hosts on the crates.io pin move `ktesio-engine = "0.1"` → `"0.2"`; the git-pin alternative is unchanged (see [Embedding the engine](docs/embedding.md)).
 > - `ktesio-adapter-api` and `ktesio-adapters-hermes` are unchanged at 0.1.0 — no republish.
 
-> **Hemaka — the v0.8.0 rename (Ktesio → Hemaka), shipping in this release.**
-> The product formerly released as Ktesio ships as **Hemaka**: the commands are `hemaka` (primary) and `maka` (short alias — same CLI, both standalone); the crate is `hemaka` (the `ktesio` crate is frozen at 0.7.0 on crates.io, preserved, never yanked); the engine family continues its line as `hemaka-engine` 0.4.0, `hemaka-adapter-api` 0.2.0, `hemaka-adapters-hermes` 0.2.0; the Homebrew formula renames in the same tap to `ktesio/tap/hemaka`; docs live at `hemaka.ktesio.dev`. **Ktesio remains the publisher** — Hemaka is a ktesio.dev project; the license (Ktesio Noncommercial-Attribution License 1.0.0) is unchanged.
-> **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hemaka-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hemaka/install.sh | sh`), or `cargo install hemaka --force`, or `brew upgrade ktesio/tap/hemaka`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEMAKA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](docs/migration.md).
+> **Hekma — the v0.8.0 rename (Ktesio → Hekma), shipping in this release.**
+> The product formerly released as Ktesio ships as **Hekma**: the commands are `hekma` (primary) and `hkm` (short alias — same CLI, both standalone); the crate is `hekma` (the `ktesio` crate is frozen at 0.7.0 on crates.io, preserved, never yanked); the engine family continues its line as `hekma-engine` 0.4.0, `hekma-adapter-api` 0.2.0, `hekma-adapters-hermes` 0.2.0; the Homebrew formula renames in the same tap to `ktesio/tap/hekma`; docs live at `hekma.ktesio.dev`. **Ktesio remains the publisher** — Hekma is a ktesio.dev project; the license (Ktesio Noncommercial-Attribution License 1.0.0) is unchanged.
+> **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hekma-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh`), or `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEKMA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](docs/migration.md).
 
 
 ## v0.6.0

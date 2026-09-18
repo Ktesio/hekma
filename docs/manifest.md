@@ -8,7 +8,7 @@ description: The adapter.toml shape that registers an agent — how to launch it
 A **manifest adapter** registers any agent from a single `adapter.toml`. It declares how the engine launches the agent process, the agent's per-OS capabilities, its metering source, and (optionally) how unified config keys map into the agent's native mechanism. Register one with:
 
 ```bash
-hemaka agent register <name> --manifest <dir-or-adapter.toml>
+hekma agent register <name> --manifest <dir-or-adapter.toml>
 ```
 
 The manifest is parsed and validated **before** any state is written. Unknown keys are rejected (typo protection), and the first missing or invalid mandatory section is named in the error.
@@ -145,7 +145,7 @@ Interaction channel wiring. Optional: omitting this section entirely still means
 |-------|------|---------|
 | `channel` | closed enum | The interaction channel: `"stdio"` (the spawned child's OS stdin pipe) or `"http"` (an HTTP-native interaction surface, e.g. an agent's loopback server). An unrecognized value is rejected at parse time. |
 
-`"http"` is documentary vocabulary (contract v1, CP-6.5-a option (i)): it names where the adapter's agent really takes interaction, so an HTTP-native agent declares `interaction` supported honestly. v1 ships no engine-side HTTP delivery — the engine does not branch on the declared channel, and `hemaka agent send` still writes the child's stdin; an adapter whose agent cannot read stdin should declare `interaction` unsupported on OSes where that is true (an adapter whose ONLY capability key is declared unsupported everywhere is rejected as non-viable). A real HTTP send implementation is a post-v1 change under the [versioning policy](adapter-contract.md#versioning).
+`"http"` is documentary vocabulary (contract v1, CP-6.5-a option (i)): it names where the adapter's agent really takes interaction, so an HTTP-native agent declares `interaction` supported honestly. v1 ships no engine-side HTTP delivery — the engine does not branch on the declared channel, and `hekma agent send` still writes the child's stdin; an adapter whose agent cannot read stdin should declare `interaction` unsupported on OSes where that is true (an adapter whose ONLY capability key is declared unsupported everywhere is rejected as non-viable). A real HTTP send implementation is a post-v1 change under the [versioning policy](adapter-contract.md#versioning).
 
 ### `[config]` — unified → native config mapping
 
@@ -170,7 +170,7 @@ Notes:
 - A `file` target's `path` is **relative to the Agent Home**; an absolute path or one escaping the home is rejected at load time (the engine is the sole writer).
 - A documented key the adapter maps nowhere is a silent no-op — not every adapter supports every unified key.
 - `agent.*` pass-through keys are delivered verbatim (by convention, as an env var named by the key tail) without a mapping entry.
-- For a `secret:NAME` value, the resolved cleartext is delivered into the native target while every Hemaka display of the same key stays masked. Prefer `env`/`file` targets over `flag` for secret-carrying keys — an argv flag is visible to other local users on the process list.
+- For a `secret:NAME` value, the resolved cleartext is delivered into the native target while every Hekma display of the same key stays masked. Prefer `env`/`file` targets over `flag` for secret-carrying keys — an argv flag is visible to other local users on the process list.
 - **Agents with JSON-native config**: v1's documented pattern is env-content delivery — map a unified key to the agent's config-content environment variable (e.g. `OPENCODE_CONFIG_CONTENT`) and the start seam delivers the value with no file format or placement question. A format-qualified `file` target (JSON alongside TOML) is reserved post-v1; the current `file` target renders a TOML document only.
 - **`{env:VAR}` substitution honesty** (contract v1 rider): some agents substitute `{env:VAR}` placeholders in their own config and render an **unset variable as an empty string, silently**. An adapter to such an agent MUST map every substituted key through a delivery that guarantees the variable is set — or fail the render with a named reason — before the child launches. A silently-empty rendered config is a contract violation, not a quirk to tolerate.
 - **Self-updating agents** (contract v1): an adapter for an agent that downloads its own updates MUST map that agent's update-disable mechanism (env or config) so the pinned, supervised binary stays pinned. The adapter docs must additionally state whether the agent's config chain contains a higher-authority (managed/MDM) layer that can override supervisor-delivered values, so an operator on a managed machine can verify the pin survived.
@@ -179,6 +179,6 @@ Notes:
 ## See Also
 
 - [Adapter Contract](adapter-contract.md) — the versioned contract this manifest speaks: negotiation, versioning/deprecation policy, and the ratified v1 decisions.
-- [Command reference](commands.md) — the `hemaka agent` commands and unified config keys.
+- [Command reference](commands.md) — the `hekma agent` commands and unified config keys.
 - [Architecture](architecture.md) — the Adapter Contract, the Usage Ledger, and budget enforcement.
-- [The Conformance Test Kit](testing.md#the-conformance-test-kit) — add `hemaka-conformance` as a dev-dependency and prove your `adapter.toml` honors the contract from your own `#[test]`.
+- [The Conformance Test Kit](testing.md#the-conformance-test-kit) — add `hekma-conformance` as a dev-dependency and prove your `adapter.toml` honors the contract from your own `#[test]`.

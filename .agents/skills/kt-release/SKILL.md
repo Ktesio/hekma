@@ -1,17 +1,17 @@
 ---
 name: kt-release
-description: Start the Hemaka release flow (the kt-release name predates the v0.8.0 Hemaka rename) from the repository root. Use when Codex is asked to prepare, cut, tag, or publish a Hemaka release by inferring the next semver bump from unreleased git history, updating Cargo.toml and Cargo.lock, running required Rust checks, committing the version bump with sign-off, pushing the release preparation commit, and pushing the matching v* tag. Patch and minor releases run automatically; major releases require clear user confirmation before any release mutation proceeds.
+description: Start the Hekma release flow (the kt-release name predates the v0.8.0 Hekma rename) from the repository root. Use when Codex is asked to prepare, cut, tag, or publish a Hekma release by inferring the next semver bump from unreleased git history, updating Cargo.toml and Cargo.lock, running required Rust checks, committing the version bump with sign-off, pushing the release preparation commit, and pushing the matching v* tag. Patch and minor releases run automatically; major releases require clear user confirmation before any release mutation proceeds.
 ---
 
 # Kt Release
 
 ## Overview
 
-Automate the Hemaka release trigger flow while preserving the repository's tag-driven release process. The helper script infers patch/minor/major from commit history since the latest semver tag, bumps Cargo metadata, validates, commits, pushes `main`, then pushes the lightweight release tag.
+Automate the Hekma release trigger flow while preserving the repository's tag-driven release process. The helper script infers patch/minor/major from commit history since the latest semver tag, bumps Cargo metadata, validates, commits, pushes `main`, then pushes the lightweight release tag.
 
 ## Workflow
 
-1. Start at the Hemaka repository root (github.com/Ktesio/ktesio until the gated repo rename).
+1. Start at the Hekma repository root (github.com/Ktesio/ktesio until the gated repo rename).
 2. Run a dry run first:
 
 ```bash
@@ -54,7 +54,7 @@ Use `scripts/prepare_kt_release.py` as the source of truth for the release seque
 - Validate repository identity and clean release state.
 - Fetch `origin main` and tags.
 - Infer the release kind and target version.
-- Update the root `Cargo.toml` (`[workspace.package]` version, inherited by the `hemaka` package in `crates/hemaka/`) and `Cargo.lock`.
+- Update the root `Cargo.toml` (`[workspace.package]` version, inherited by the `hekma` package in `crates/hekma/`) and `Cargo.lock`.
 - Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets`.
 - Commit `Cargo.toml` and `Cargo.lock` with `chore(release): bump version to X.Y.Z` and `--signoff`.
 - Push `HEAD:main`.

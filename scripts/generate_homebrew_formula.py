@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Homebrew formula for a tagged Hemaka release."""
+"""Generate the Homebrew formula for a tagged Hekma release."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 # rename follows AFTER the release is live, so release URLs never depend on
 # redirects); flip this with the canonical-URL change in 0.8.1.
 REPO = "Ktesio/ktesio"
-FORMULA_CLASS = "Hemaka"
+FORMULA_CLASS = "Hekma"
 DESCRIPTION = (
     "Run AI agents like services: supervise their lifecycle, meter real "
     "token usage, and enforce dollar budgets."
@@ -24,7 +24,7 @@ LICENSE = ":any"
 # Emitted above the `license` clause in the formula so the tap states the
 # real terms even though `:any` cannot name them.
 LICENSE_COMMENT = (
-    "# Hemaka ships the Ktesio Noncommercial-Attribution License 1.0.0 — "
+    "# Hekma ships the Ktesio Noncommercial-Attribution License 1.0.0 — "
     "source-available; commercial use requires the author's written approval."
 )
 HOMEBREW_TARGETS = [
@@ -126,13 +126,13 @@ def render_formula(tag: str, checksums: dict[str, str]) -> str:
   end
 
   def install
-    bin.install "hemaka"
-    bin.install "maka"
+    bin.install "hekma"
+    bin.install "hkm"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/hemaka --version")
-    assert_match version.to_s, shell_output("#{{bin}}/maka --version")
+    assert_match version.to_s, shell_output("#{{bin}}/hekma --version")
+    assert_match version.to_s, shell_output("#{{bin}}/hkm --version")
   end
 end
 '''
@@ -146,7 +146,7 @@ def version_from_tag(tag: str) -> str:
 
 
 def asset_name(tag: str, target: str, extension: str) -> str:
-    return f"hemaka-{tag}-{target}.{extension}"
+    return f"hekma-{tag}-{target}.{extension}"
 
 
 def release_url(tag: str, asset: str) -> str:

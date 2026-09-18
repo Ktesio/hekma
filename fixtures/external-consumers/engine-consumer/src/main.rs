@@ -1,13 +1,13 @@
 //! The embedding quickstart — a complete Ktesio host in one file (story 7-4).
 //!
 //! This is the copy-paste starting point for embedding the Ktesio engine as a
-//! Rust library. It depends on NOTHING but `hemaka-engine` itself — no `kt`,
+//! Rust library. It depends on NOTHING but `hekma-engine` itself — no `kt`,
 //! no CLI, no test fixtures, no helper crates — and drives one mini
 //! lifecycle: open → register → configure → subscribe → start → observe →
 //! stop. The full flow proof (breach, pause, shared assertions) lives in the
 //! test suite; this file is the embedder's hello-world.
 //!
-//! Run it from the repo root with `cargo run -p hemaka-engine --example
+//! Run it from the repo root with `cargo run -p hekma-engine --example
 //! embedding-quickstart`. The walkthrough lives at docs/embedding.md.
 //!
 //! ## How it stays hermetic and dependency-free
@@ -36,7 +36,7 @@ const INSTANCE: &str = "hello-agent";
 
 /// The sentinel argument that turns a re-execution of this binary into the
 /// agent process the engine supervises.
-const AGENT_ARG: &str = "--hemaka-rename-fixture-agent";
+const AGENT_ARG: &str = "--hekma-rename-fixture-agent";
 
 /// How long the agent side idles if the engine never stops it. This BOUNDS
 /// any orphan to two minutes (it does not prevent one); the ordinary end is
@@ -59,7 +59,7 @@ fn main() {
     //    (the pid keeps concurrent runs apart), cleaned up best-effort at the
     //    end. A real host passes its own state directory — or `None` for the
     //    OS default.
-    let root = std::env::temp_dir().join(format!("hemaka-rename-fixture-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("hekma-rename-fixture-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root); // a stale run that reused this pid
     std::fs::create_dir_all(&root).expect("create the scratch root");
 

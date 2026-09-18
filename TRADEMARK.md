@@ -204,13 +204,13 @@ The maintainers may update this policy over time.
 
 Existing approved uses may be reviewed if they become confusing, misleading, harmful to the project, or inconsistent with the purpose of this policy.
 
-## Hemaka (product marks, added at the v0.8.0 rename)
+## Hekma (product marks, added at the v0.8.0 rename)
 
 Effective with the v0.8.0 release, the product formerly shipped as Ktesio
-ships as **Hemaka** (the `hemaka` / `maka` commands, the `hemaka` and
-`hemaka-*` crates, and `ktesio/tap/hemaka`). The Hemaka name, logo, release
+ships as **Hekma** (the `hekma` / `hkm` commands, the `hekma` and
+`hekma-*` crates, and `ktesio/tap/hekma`). The Hekma name, logo, release
 names, and package names are product marks controlled by the official
 Ktesio project maintainers under this same policy: every protection and
 allowed use stated for the Ktesio Marks above applies verbatim to the
-Hemaka Marks. Ktesio remains the publisher and umbrella brand; "Hemaka, a
+Hekma Marks. Ktesio remains the publisher and umbrella brand; "Hekma, a
 Ktesio project" is the canonical attribution form.

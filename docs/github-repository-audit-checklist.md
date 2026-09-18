@@ -1,6 +1,6 @@
 ---
 title: GitHub Repository Audit Checklist
-description: Repository hardening checks and evidence for the public Hemaka GitHub project.
+description: Repository hardening checks and evidence for the public Hekma GitHub project.
 ---
 
 # GitHub Repository Audit Checklist
