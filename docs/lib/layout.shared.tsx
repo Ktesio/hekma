@@ -19,6 +19,12 @@ export function baseOptions(): BaseLayoutProps {
         text: 'Crates.io',
         url: 'https://crates.io/crates/hekma',
       },
+      {
+        // Hekma is a Ktesio project — the publisher lives on every page.
+        active: 'none',
+        text: 'A Ktesio project ↗',
+        url: 'https://ktesio.dev',
+      },
     ],
     nav: {
       title: 'Hekma',
