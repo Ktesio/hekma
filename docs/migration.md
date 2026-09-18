@@ -65,6 +65,12 @@ rename:
 brew upgrade ktesio/tap/hekma
 ```
 
+> On newer Homebrew versions with tap trust gates, an upgrade may first
+> refuse with "Refusing to load formula … from untrusted tap ktesio/tap."
+> — trust your own tap once with `brew trust ktesio/tap`, then re-run the
+> upgrade. (Verified live: this exact path migrates a real 0.3.1 keg to
+> `ktesio/tap/hekma` 0.8.0 in one command, removing the old keg.)
+
 Fresh installs (and the documented reinstall path):
 
 ```bash
