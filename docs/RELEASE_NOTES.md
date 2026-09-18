@@ -76,6 +76,75 @@ The tag workflow updates the GitHub Release immediately and then opens a pull re
 > **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hekma-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh`), or `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEKMA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](migration.md).
 
 
+## v0.8.0
+
+Comparison: [v0.7.0...v0.8.0](https://github.com/Ktesio/ktesio/compare/v0.7.0...v0.8.0)
+
+| Platform | Target | Archive | Checksum |
+|----------|--------|---------|----------|
+| macOS Intel | `x86_64-apple-darwin` | [hekma-v0.8.0-x86_64-apple-darwin.tar.gz](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-apple-darwin.tar.gz.sha256) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | [hekma-v0.8.0-aarch64-apple-darwin.tar.gz](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-aarch64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-aarch64-apple-darwin.tar.gz.sha256) |
+| Windows x64 | `x86_64-pc-windows-msvc` | [hekma-v0.8.0-x86_64-pc-windows-msvc.zip](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-pc-windows-msvc.zip) | [sha256](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-pc-windows-msvc.zip.sha256) |
+| Linux x64 | `x86_64-unknown-linux-gnu` | [hekma-v0.8.0-x86_64-unknown-linux-gnu.tar.gz](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-unknown-linux-gnu.tar.gz) | [sha256](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-x86_64-unknown-linux-gnu.tar.gz.sha256) |
+| All | checksums | [hekma-v0.8.0-checksums.txt](https://github.com/Ktesio/ktesio/releases/download/v0.8.0/hekma-v0.8.0-checksums.txt) | - |
+
+### Features
+
+- Hemaka — the v0.8.0 rename (Ktesio → Hemaka) (#187) ([ad0feaf](https://github.com/Ktesio/ktesio/commit/ad0feaf))
+- durable detach + the production-usable observed channel (#184) ([49da96b](https://github.com/Ktesio/ktesio/commit/49da96b))
+- bump ktesio-engine to 0.2.0 — the announced breaking release ([d087ed0](https://github.com/Ktesio/ktesio/commit/d087ed0))
+- epic 11 — Technical Debt & Process Cleanup (all 7 stories) (#181) ([bee7d48](https://github.com/Ktesio/ktesio/commit/bee7d48))
+- epic 10 — consolidate & harden the embedding surface (#180) ([b590dc8](https://github.com/Ktesio/ktesio/commit/b590dc8))
+
+### Fixes
+
+- correct the product name — Hemaka → Hekma, maka → hkm (#188) ([54dc79c](https://github.com/Ktesio/ktesio/commit/54dc79c))
+- adopted Windows stop could never confirm death — add SYNCHRONIZE + exit-code probe ([c6ecadb](https://github.com/Ktesio/ktesio/commit/c6ecadb))
+
+### Documentation
+
+- v0.8.0 cutover — publishes recorded, embedding flip, fresh semver baselines @54dc79c ([ba7406d](https://github.com/Ktesio/ktesio/commit/ba7406d))
+- 0.3.0 published — docs flip + decision log (Islam's go) ([4299bde](https://github.com/Ktesio/ktesio/commit/4299bde))
+- step-5 flip — ktesio-engine 0.2.0 is LIVE; pins move to "0.2" ([fa76eaa](https://github.com/Ktesio/ktesio/commit/fa76eaa))
+- announce engine 0.2.0 (the first breaking library release); record the go + the semver-baseline KEEP decision ([5152977](https://github.com/Ktesio/ktesio/commit/5152977))
+- record the v0.7.0 manual tap push in the decision log ([5747d50](https://github.com/Ktesio/ktesio/commit/5747d50))
+
+### Tests
+
+- bounded reader grace (no join) in the detach harness — the hang is a PRODUCT finding ([56ee766](https://github.com/Ktesio/ktesio/commit/56ee766))
+- in-harness progress markers (entry / post-spawn / 10s ticks) for the Windows detach hang ([66654e1](https://github.com/Ktesio/ktesio/commit/66654e1))
+- incremental pipe readers + non-blocking timeout dump in the detach harness ([e5092ce](https://github.com/Ktesio/ktesio/commit/e5092ce))
+- kill-before-join in the bounded harness — the join deadlocked the dump ([d773932](https://github.com/Ktesio/ktesio/commit/d773932))
+- the detach-test forensic dump goes to stdout (nextest TMT shows stdout only) ([2e5546d](https://github.com/Ktesio/ktesio/commit/2e5546d))
+- bounded legs + forensic dump in the 12-1 detach CLI test ([139f7c2](https://github.com/Ktesio/ktesio/commit/139f7c2))
+- detach-leg markers on stdout (nextest TMT shows stdout only) ([40be515](https://github.com/Ktesio/ktesio/commit/40be515))
+- leg markers in the 12-1 detach CLI test (Windows hang triage) ([08ae1d5](https://github.com/Ktesio/ktesio/commit/08ae1d5))
+
+### Maintenance
+
+- lockfiles for the one-shot ktesio-* deprecation shims (v0.8.0 release series) ([f8d6fb1](https://github.com/Ktesio/ktesio/commit/f8d6fb1))
+- record the 12-1 Windows findings — SYNCHRONIZE stop fix landed; the stdio pipe-hold gap routed ([a7fcc1b](https://github.com/Ktesio/ktesio/commit/a7fcc1b))
+- bump ktesio-engine to 0.3.0 — the epic-12 breaking release ([394e660](https://github.com/Ktesio/ktesio/commit/394e660))
+- point github-sync-map project number at the Ktesio org copy (project 3) ([d32570d](https://github.com/Ktesio/ktesio/commit/d32570d))
+- point project links at the Ktesio org copy (project 3) ([3ec8f86](https://github.com/Ktesio/ktesio/commit/3ec8f86))
+- update repository references for Ktesio org migration ([e05bc93](https://github.com/Ktesio/ktesio/commit/e05bc93))
+- post-merge epic-12 followups — semver baseline to 49da96b, tracker done ([8842b8b](https://github.com/Ktesio/ktesio/commit/8842b8b))
+- untrack the local .video_agent artifact + ignore it ([9ee4df7](https://github.com/Ktesio/ktesio/commit/9ee4df7))
+- RATIFIED — AI-20/AI-47 applied verbatim as epic-12 (Islam: recommended across the board) ([27ecf07](https://github.com/Ktesio/ktesio/commit/27ecf07))
+- AI-58 draft — the AI-20 + AI-47 product-call proposals (awaiting ratification) ([de78001](https://github.com/Ktesio/ktesio/commit/de78001))
+- epic-11 retrospective — accepted-with-open-items, 7 action items ([5d84e7f](https://github.com/Ktesio/ktesio/commit/5d84e7f))
+- epic-11 complete — flip 11-1..11-7 + epic to done (merged as bee7d48) ([1ef8439](https://github.com/Ktesio/ktesio/commit/1ef8439))
+- bump the ktesio-engine semver baseline to the epic-11 merge commit (bee7d48) ([4e12ef8](https://github.com/Ktesio/ktesio/commit/4e12ef8))
+- epic 11 opened — Technical Debt & Process Cleanup ([f99e670](https://github.com/Ktesio/ktesio/commit/f99e670))
+- epic 11 opened — Technical Debt & Process Cleanup (sprint change proposal approved) ([2f2b763](https://github.com/Ktesio/ktesio/commit/2f2b763))
+- epic-5 + epic-7 retrospectives complete ([29bff1d](https://github.com/Ktesio/ktesio/commit/29bff1d))
+- epic 10 -> done (PR #180 merged as b590dc8); 10-1..10-3 -> done ([ba524c5](https://github.com/Ktesio/ktesio/commit/ba524c5))
+- epic 10 opened — consolidate & harden the embedding surface (sprint change proposal approved) ([999164c](https://github.com/Ktesio/ktesio/commit/999164c))
+
+### Other Changes
+
+- is_multiple_of — the newer stable-clippy lint the CI gate runs ([35a7525](https://github.com/Ktesio/ktesio/commit/35a7525))
+
 ## v0.6.0
 
 Ktesio is repositioned as an agent runner: `kt` runs AI agents like services — supervising their lifecycle, metering real token usage, and enforcing dollar budgets.
