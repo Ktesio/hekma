@@ -722,6 +722,16 @@ jobs:
             crates/hekma-engine \
             ktesio-engine hekma-engine \
             fixtures/external-consumers/engine-consumer/src/main.rs
+
+          # FRESH POST-RENAME BASELINES (pinned 2026-09-16, after the
+          # hekma-* publishes, to 54dc79c — the PR #188 correction merge,
+          # the first main-side rev carrying the hekma-* package names).
+          # Same-name baseline diffing works again from here; the rename
+          # surface checks above stay as the old-vs-new compat guard.
+          # BASELINE-REV CONSTRAINT: main-history revs only; bump here AND
+          # in scripts/test_automation.py together at the next freeze.
+          cargo +stable semver-checks check-release -p hekma-adapter-api --baseline-rev 54dc79c46f2c538762a4743898c3014e34ffcfe8
+          cargo +stable semver-checks check-release -p hekma-engine --baseline-rev 54dc79c46f2c538762a4743898c3014e34ffcfe8
           for crate in hekma-engine hekma-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in

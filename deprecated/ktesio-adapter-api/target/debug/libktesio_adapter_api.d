@@ -1,0 +1,1 @@
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/libktesio_adapter_api.rlib: /Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/package/ktesio-adapter-api-0.1.1/src/lib.rs

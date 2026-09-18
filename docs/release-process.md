@@ -267,13 +267,28 @@ widen a gate or an allowlist to make a baseline pass.
   Context: the gate forced the version (the crates.io loop's second firing —
   epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
   against the published 0.2.0; the source bump landed as `394e660`).
-- **hekma-* first publishes — PENDING (not yet executed).** The renamed
-  crates (`hekma-adapter-api` 0.2.0, `hekma-adapters-hermes` 0.2.0,
-  `hekma-engine` 0.4.0) have ZERO published versions as of this writing;
-  their publishes are steps of the v0.8.0 cutover (spec §5), each on its
-  own go, BEFORE the tag. The historical entries above document the
-  KTESIO-named publishes.
-- **Hekma rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
+
+- **Publish go (v0.8.0 Hekma rename, full cutover):** GRANTED 2026-09-16 —
+  Islam's explicit go in the ktesio.dev working session ("187 merged, let's
+  go", then "Merged" for the name-correction PR #188 after #187 was found
+  to have merged the mistyped "Hemaka" tree; the correction landed as
+  54dc79c). Executed same day by the orchestrator:
+  - `hekma-adapter-api` 0.2.0, `hekma-adapters-hermes` 0.2.0,
+    `hekma-engine` 0.4.0 published (each: tarball review, `cargo +stable
+    publish --locked`, registry verify) + the from-crates.io host probe
+    (fresh /tmp project, `cargo add hekma-engine@0.4.0`, build — green).
+  - One-shot deprecation shims published: `ktesio-engine` 0.3.1,
+    `ktesio-adapter-api` 0.1.1, `ktesio-adapters-hermes` 0.1.1 (final-ever
+    versions under the old names; re-export their hekma-* successors;
+    lockfiles committed with this release series). The `ktesio` CLI crate
+    is NOT shimmed by design.
+  - Fresh in-repo semver baselines pinned to 54dc79c (the hekma correction
+    merge) in ci.yml + test_automation.py together; the rename surface
+    checks (old freeze revs 4119db3/49da96b) stay armed as the old-vs-new
+    compat guard.
+  - Step-5 docs flip: embedding.md Availability switched to the published
+    hekma-* version line.
+- - **Hekma rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
   recorded in docs/proposals/hekma-migration-spec-draft.md): product Hekma;
   binaries `hekma` + `hkm`; `kt` dropped (clean break, D7); crate `hekma`
   (ktesio frozen at 0.7.0); libraries continue their lines (engine 0.4.0,

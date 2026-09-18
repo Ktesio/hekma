@@ -1,0 +1,1 @@
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapters-hermes/target/debug/libktesio_adapters_hermes.rlib: /Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapters-hermes/target/package/ktesio-adapters-hermes-0.1.1/src/lib.rs

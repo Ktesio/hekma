@@ -14,19 +14,20 @@ in [Architecture](architecture.md).
 
 ## Adding the dependency
 
-Until the v0.8.0 library publishes execute (see Availability below), pin
-the repository to a full-length commit SHA:
-
-```toml
-[dependencies]
-hekma-engine = { git = "https://github.com/Ktesio/ktesio", rev = "<full commit SHA>" }
-```
-
-Once published, the version line replaces the pin:
+Depend on the released version:
 
 ```toml
 [dependencies]
 hekma-engine = "0.4"
+```
+
+Prefer to track `main` between releases? Pin the repository to a
+**full-length commit SHA**, never a branch: a pinned `rev` makes your build
+reproducible and upgrades deliberate.
+
+```toml
+[dependencies]
+hekma-engine = { git = "https://github.com/Ktesio/ktesio", rev = "<full commit SHA>" }
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -332,15 +333,15 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-**v0.8.0 rename state (honest):** the engine family was published on
-[crates.io](https://crates.io) under the pre-rename names — `ktesio-engine`
-0.1.0–0.3.0, `ktesio-adapter-api` 0.1.0, `ktesio-adapters-hermes` 0.1.0
-(first release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15; engine 0.3.0,
-2026-09-16 — frozen, preserved, never yanked). The renamed `hekma-*`
-crates debut at **0.4.0 / 0.2.0 / 0.2.0** with the v0.8.0 release runbook;
-until those publishes execute, depend on the git pin below (the runbook's
-step-5 docs flip switches this section to the published version line the
-moment they are live). The crates are
+**Published (2026-09-16):** `hekma-engine` 0.4.0, `hekma-adapter-api`
+0.2.0, and `hekma-adapters-hermes` 0.2.0 are live on
+[crates.io](https://crates.io) — the renamed line continuing the
+pre-rename `ktesio-*` history (ktesio-engine 0.1.0–0.3.0, ktesio-adapter-
+api 0.1.0, ktesio-adapters-hermes 0.1.0; first release v0.7.0,
+2026-09-09). The old names each carry ONE final deprecation-shim version
+(ktesio-engine 0.3.1, ktesio-adapter-api 0.1.1, ktesio-adapters-hermes
+0.1.1) that re-exports their hekma-* successors and will never publish
+again. The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
 

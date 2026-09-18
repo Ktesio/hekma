@@ -1,0 +1,14 @@
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/deps/serde-5897fb8a31cbdc0b.d: /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/build/serde-2c05ee523120dbcc/out/private.rs
+
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/deps/libserde-5897fb8a31cbdc0b.rlib: /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/build/serde-2c05ee523120dbcc/out/private.rs
+
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/deps/libserde-5897fb8a31cbdc0b.rmeta: /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/build/serde-2c05ee523120dbcc/out/private.rs
+
+/Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/Users/imagdy/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/build/serde-2c05ee523120dbcc/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/imagdy/dev/ktesio.dev/deprecated/ktesio-adapter-api/target/debug/build/serde-2c05ee523120dbcc/out
