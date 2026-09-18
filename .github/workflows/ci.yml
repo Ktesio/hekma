@@ -767,6 +767,11 @@ jobs:
                 && cargo +stable run --quiet)
               echo "both-graph consumer ok: ktesio-engine 0.3.0 + hekma-engine resolve together."
               ;;
+            *)
+              echo "::error::Unexpected crates.io API status ${both_status} for hekma-engine (both-graph probe)."
+              exit 1
+              ;;
+          esac
 
           # DEPRECATION SHIM compile check (arms when the hekma-* libraries
           # are live): the three one-shot ktesio-* shims under deprecated/
@@ -790,17 +795,6 @@ jobs:
               ;;
             *)
               echo "::error::Unexpected crates.io API status ${shim_status} for hekma-engine (shim probe)."
-              exit 1
-              ;;
-          esac
-            404)
-              echo "::notice::hekma-engine is not on crates.io yet; the both-graph consumer arms at first publish."
-              ;;
-            000|429|5[0-9][0-9])
-              echo "::notice::crates.io returned transient status ${both_status}; skipping the both-graph consumer this run."
-              ;;
-            *)
-              echo "::error::Unexpected crates.io API status ${both_status} for hekma-engine (both-graph probe)."
               exit 1
               ;;
           esac

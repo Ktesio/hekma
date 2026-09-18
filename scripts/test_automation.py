@@ -946,5 +946,71 @@ class InstallerScriptTests(unittest.TestCase):
         self.assertIn("Refusing to overwrite non-Ktesio command", result.stderr)
 
 
+class WorkflowScriptSyntaxTests(unittest.TestCase):
+    """Every `run: |` shell block embedded in the workflows must parse.
+
+    A malformed embedded script passed all content pins and only exploded
+    in CI (the v0.9.0-era semver job: an insertion landed inside a case
+    statement, `syntax error near unexpected token '||'`). This gate runs
+    `bash -n` on every sh/bash block so syntax breaks fail locally."""
+
+    WORKFLOWS = (
+        "ci.yml",
+        "release.yml",
+        "docs-probe.yml",
+        "migration-matrix.yml",
+    )
+
+    def test_every_embedded_shell_run_block_parses(self) -> None:
+        checked = 0
+        for workflow in self.WORKFLOWS:
+            path = release_docs.ROOT / ".github" / "workflows" / workflow
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            for idx, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped != "run: |":
+                    continue
+                indent = len(line) - len(line.lstrip())
+                shell = "sh"
+                for back in range(idx - 1, max(idx - 6, -1), -1):
+                    back_line = lines[back].strip()
+                    if back_line.startswith("shell:"):
+                        shell = back_line.split(":", 1)[1].strip()
+                        break
+                    if back_line.startswith("- name:") or back_line.startswith("- uses:"):
+                        break
+                if "pwsh" in shell or "powershell" in shell:
+                    continue
+                block: list[str] = []
+                for later in lines[idx + 1 :]:
+                    later_indent = len(later) - len(later.lstrip())
+                    if later.strip() and later_indent <= indent:
+                        break
+                    block.append(later[indent + 2 :] if later.startswith(" " * (indent + 2)) else later.lstrip())
+                script = "\n".join(block)
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
+                    handle.write(script)
+                    temp_name = handle.name
+                try:
+                    result = subprocess.run(
+                        ["bash", "-n", temp_name],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                    )
+                finally:
+                    os.unlink(temp_name)
+                self.assertEqual(
+                    0,
+                    result.returncode,
+                    f"{workflow} run block near '{lines[idx + 1].strip()[:60]}' "
+                    f"does not parse: {result.stderr}",
+                )
+                checked += 1
+        self.assertGreaterEqual(checked, 8, "expected to check at least the known shell blocks")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
