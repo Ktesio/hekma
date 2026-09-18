@@ -10,4 +10,4 @@ publish = false
 
 [dependencies]
 ktesio-engine = "0.3.0"
-hemaka-engine = "0.4"
+hekma-engine = "0.4"

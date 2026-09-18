@@ -1,7 +1,7 @@
 //! External-consumer fixture: the Adapter Contract surface (manifest
 //! parsing + validation + projections) must compile and behave
 //! identically against the baseline crate (ktesio-adapter-api at the
-//! contract-v1 freeze) and the renamed crate (hemaka-adapter-api).
+//! contract-v1 freeze) and the renamed crate (hekma-adapter-api).
 //!
 //! Consumed by scripts/rename_surface_check.sh, which builds this file
 //! against BOTH sources with the dependency renamed to the neutral

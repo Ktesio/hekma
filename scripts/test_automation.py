@@ -25,9 +25,9 @@ class ReleaseDocsTests(unittest.TestCase):
         table = "\n".join(release_docs.render_asset_table("v1.2.3"))
 
         for _platform, target, extension in release_docs.TARGETS:
-            self.assertIn(f"hemaka-v1.2.3-{target}.{extension}", table)
-            self.assertIn(f"hemaka-v1.2.3-{target}.{extension}.sha256", table)
-        self.assertIn("hemaka-v1.2.3-checksums.txt", table)
+            self.assertIn(f"hekma-v1.2.3-{target}.{extension}", table)
+            self.assertIn(f"hekma-v1.2.3-{target}.{extension}.sha256", table)
+        self.assertIn("hekma-v1.2.3-checksums.txt", table)
 
     def test_changelog_groups_conventional_commits(self) -> None:
         grouped = release_docs.group_commits(
@@ -65,22 +65,22 @@ class ReleaseDocsTests(unittest.TestCase):
         # Release publish is explicit about its toolchain: the root
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), but shipped
         # artifacts and the crates.io publish run on latest stable (AI-17).
-        self.assertIn("cargo +stable publish --locked -p hemaka", workflow)
+        self.assertIn("cargo +stable publish --locked -p hekma", workflow)
         # v0.8.0 rename: the release writes the renamed formula AND the
         # tap-root formula_renames.json (preserving other entries), so
-        # `brew install|upgrade ktesio` resolves to hemaka.
-        self.assertIn('renames["ktesio"] = "hemaka"', workflow)
-        self.assertIn("git -C homebrew-tap add Formula/hemaka.rb formula_renames.json", workflow)
+        # `brew install|upgrade ktesio` resolves to hekma.
+        self.assertIn('renames["ktesio"] = "hekma"', workflow)
+        self.assertIn("git -C homebrew-tap add Formula/hekma.rb formula_renames.json", workflow)
         # The rename ENGAGES only when the old formula file is gone (brew
         # consults formula_renames.json solely then) — the workflow must
         # delete Formula/ktesio.rb in the same tap commit.
         self.assertIn(
             "git -C homebrew-tap rm --ignore-unmatch Formula/ktesio.rb", workflow
         )
-        # M4 ordering guard: the CLI publish waits for the hemaka-* library
+        # M4 ordering guard: the CLI publish waits for the hekma-* library
         # chain to be live on crates.io.
-        self.assertIn("for lib in hemaka-adapter-api hemaka-adapters-hermes hemaka-engine; do", workflow)
-        self.assertIn('--output homebrew-tap/Formula/hemaka.rb', workflow)
+        self.assertIn("for lib in hekma-adapter-api hekma-adapters-hermes hekma-engine; do", workflow)
+        self.assertIn('--output homebrew-tap/Formula/hekma.rb', workflow)
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("oras-project/setup-oras", workflow)
         self.assertNotIn("oras push", workflow)
@@ -91,15 +91,15 @@ class ReleaseDocsTests(unittest.TestCase):
 
     def test_homebrew_formula_uses_release_assets_and_checksums(self) -> None:
         checksums = {
-            "hemaka-v1.2.3-x86_64-apple-darwin.tar.gz": "a" * 64,
-            "hemaka-v1.2.3-aarch64-apple-darwin.tar.gz": "b" * 64,
-            "hemaka-v1.2.3-x86_64-unknown-linux-gnu.tar.gz": "c" * 64,
-            "hemaka-v1.2.3-x86_64-pc-windows-msvc.zip": "d" * 64,
+            "hekma-v1.2.3-x86_64-apple-darwin.tar.gz": "a" * 64,
+            "hekma-v1.2.3-aarch64-apple-darwin.tar.gz": "b" * 64,
+            "hekma-v1.2.3-x86_64-unknown-linux-gnu.tar.gz": "c" * 64,
+            "hekma-v1.2.3-x86_64-pc-windows-msvc.zip": "d" * 64,
         }
 
         formula = homebrew_formula.render_formula("v1.2.3", checksums)
 
-        self.assertIn('class Hemaka < Formula', formula)
+        self.assertIn('class Hekma < Formula', formula)
         self.assertIn('version "1.2.3"', formula)
         self.assertIn("on_macos do", formula)
         self.assertIn("on_arm do", formula)
@@ -110,9 +110,9 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("x86_64-unknown-linux-gnu", formula)
         self.assertNotIn("x86_64-pc-windows-msvc", formula)
         # BOTH shipped binaries install from the one formula.
-        self.assertIn('bin.install "hemaka"', formula)
-        self.assertIn('bin.install "maka"', formula)
-        self.assertIn('shell_output("#{bin}/maka --version")', formula)
+        self.assertIn('bin.install "hekma"', formula)
+        self.assertIn('bin.install "hkm"', formula)
+        self.assertIn('shell_output("#{bin}/hkm --version")', formula)
         # The custom license has no SPDX id: Homebrew gets the unquoted `:any`
         # symbol ("license unspecified"), never a quoted string, and the
         # formula comments the real terms above the clause.
@@ -131,14 +131,14 @@ class ReleaseDocsTests(unittest.TestCase):
         checksums = homebrew_formula.parse_checksums(
             "\n".join(
                 [
-                    f"{'A' * 64}  hemaka-v1.2.3-x86_64-apple-darwin.tar.gz",
-                    f"{'b' * 64} *hemaka-v1.2.3-aarch64-apple-darwin.tar.gz",
+                    f"{'A' * 64}  hekma-v1.2.3-x86_64-apple-darwin.tar.gz",
+                    f"{'b' * 64} *hekma-v1.2.3-aarch64-apple-darwin.tar.gz",
                 ]
             )
         )
 
-        self.assertEqual("a" * 64, checksums["hemaka-v1.2.3-x86_64-apple-darwin.tar.gz"])
-        self.assertEqual("b" * 64, checksums["hemaka-v1.2.3-aarch64-apple-darwin.tar.gz"])
+        self.assertEqual("a" * 64, checksums["hekma-v1.2.3-x86_64-apple-darwin.tar.gz"])
+        self.assertEqual("b" * 64, checksums["hekma-v1.2.3-aarch64-apple-darwin.tar.gz"])
 
     def test_ci_runs_coverage_after_primary_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -170,11 +170,11 @@ class ReleaseDocsTests(unittest.TestCase):
         # process-spawning tests race on the lib's on-demand build fallback. Guard
         # both the `rm` and the explicit rebuild so neither is dropped.
         self.assertIn("rm -f target/debug/fake_agent target/debug/fake_agent.exe", ci)
-        self.assertIn("cargo +stable build -p hemaka-conformance --bin fake_agent", ci)
+        self.assertIn("cargo +stable build -p hekma-conformance --bin fake_agent", ci)
         # hermes_shim (story 6-2) joins fake_agent in the stale-helper guard for
         # the identical reason — assert its rm + rebuild pair in BOTH jobs too.
         self.assertIn("rm -f target/debug/hermes_shim target/debug/hermes_shim.exe", ci)
-        self.assertIn("cargo +stable build -p hemaka-conformance --bin hermes_shim", ci)
+        self.assertIn("cargo +stable build -p hekma-conformance --bin hermes_shim", ci)
         # The COVERAGE job needs the very same guard, for the same reason, and a
         # workspace-wide assertIn cannot tell the two jobs apart — so scope this
         # pair to the coverage step's own script. The stale-helper defect has now
@@ -189,7 +189,7 @@ class ReleaseDocsTests(unittest.TestCase):
             coverage_step,
         )
         self.assertIn(
-            "cargo +stable build -p hemaka-conformance --bin fake_agent",
+            "cargo +stable build -p hekma-conformance --bin fake_agent",
             coverage_step,
         )
         # hermes_shim's pair is asserted in the coverage job's own script too.
@@ -198,7 +198,7 @@ class ReleaseDocsTests(unittest.TestCase):
             coverage_step,
         )
         self.assertIn(
-            "cargo +stable build -p hemaka-conformance --bin hermes_shim",
+            "cargo +stable build -p hekma-conformance --bin hermes_shim",
             coverage_step,
         )
         self.assertIn(
@@ -229,11 +229,11 @@ class ReleaseDocsTests(unittest.TestCase):
             '"cov/$pkg"',
             ci,
         )
-        # The exact five workspace crates, lightest → heaviest with hemaka-engine
+        # The exact five workspace crates, lightest → heaviest with hekma-engine
         # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers logged).
         self.assertIn(
-            "set -- hemaka-adapter-api hemaka-conformance hemaka-adapters-hermes "
-            "hemaka hemaka-engine",
+            "set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes "
+            "hekma hekma-engine",
             ci,
         )
         # Each per-crate run is grouped and dumps free/df first, so a per-crate OOM
@@ -341,9 +341,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # v0.8.0: the probe checks the CANONICAL host (200) and the LEGACY
         # host (must 3xx-redirect to canonical) SEPARATELY — a 200 from
         # docs.ktesio.dev after cutover is a split-brain failure, not a pass.
-        self.assertIn('base="https://hemaka.ktesio.dev"', probe)
+        self.assertIn('base="https://hekma.ktesio.dev"', probe)
         self.assertIn('legacy="https://docs.ktesio.dev"', probe)
-        self.assertIn("hemaka.ktesio.dev page is DOWN", probe)
+        self.assertIn("hekma.ktesio.dev page is DOWN", probe)
         self.assertIn("expected 200", probe)
         self.assertIn("legacy docs.ktesio.dev pages do not redirect", probe)
         # The two special-case URL mappings mirror docs/lib/source.ts's
@@ -401,14 +401,14 @@ class ReleaseDocsTests(unittest.TestCase):
         # integration binaries, with the existing retries + slow-timeout untouched.
         self.assertIn("[test-groups.engine-integration-serial]", nextest)
         self.assertIn("max-threads = 1", nextest)
-        self.assertIn('filter = "kind(test) & package(hemaka-engine)"', nextest)
+        self.assertIn('filter = "kind(test) & package(hekma-engine)"', nextest)
         self.assertIn('test-group = "engine-integration-serial"', nextest)
         self.assertIn("retries = 2", nextest)
         self.assertIn("slow-timeout = ", nextest)
         # The temporary bisect scaffold and the watchdog/off-pipe machinery are GONE
         # (no per-OS special-casing, no per-binary steps, no in-step capture hacks).
         self.assertNotIn("ubuntu bisect:", ci)
-        self.assertNotIn("binary_id(=hemaka-engine::", ci)
+        self.assertNotIn("binary_id(=hekma-engine::", ci)
         self.assertNotIn("RUNLOG", ci)
         self.assertNotIn("kill -USR1 $$", ci)
         self.assertNotIn("matrix.os == 'ubuntu-latest'", ci)
@@ -421,23 +421,23 @@ class ReleaseDocsTests(unittest.TestCase):
 
         # Stable jobs select +stable so the root rust-toolchain.toml pin (MSRV
         # 1.96.1) does not silently redirect them off latest stable (AI-17).
-        self.assertIn("cargo +stable check -p hemaka", ci)
-        self.assertIn("cargo +stable tree -p hemaka -e normal,build --all-features", ci)
+        self.assertIn("cargo +stable check -p hekma", ci)
+        self.assertIn("cargo +stable tree -p hekma -e normal,build --all-features", ci)
         # Boundary gate is an allowlist: only these internal edges may exist.
-        self.assertIn("hemaka-(engine|adapter-api|adapters-hermes)", ci)
+        self.assertIn("hekma-(engine|adapter-api|adapters-hermes)", ci)
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
-        self.assertIn("crates/hemaka-engine/src/backends/", ci)
+        self.assertIn("crates/hekma-engine/src/backends/", ci)
         # OS-cfg allowlist covers honestly-unix-gated engine integration tests
         # (AI-35 disclosure convention) alongside the backends home. Assert the
         # FULL allowlist LINE shape (review blind-12): a bare substring would
         # also match a stale comment quoting the pattern, so a narrowed
         # allowlist (e.g. a dropped legacy-file entry) must fail here.
         self.assertIn(
-            r"allowlist='^crates/hemaka-engine/src/backends/"
-            r"|^crates/hemaka/src/update_check\.rs:"
-            r"|^crates/hemaka/src/cli/self_update\.rs:"
-            r"|^crates/hemaka-engine/tests/'",
+            r"allowlist='^crates/hekma-engine/src/backends/"
+            r"|^crates/hekma/src/update_check\.rs:"
+            r"|^crates/hekma/src/cli/self_update\.rs:"
+            r"|^crates/hekma-engine/tests/'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
@@ -451,7 +451,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("Enforce single currency-formatting module", ci)
         self.assertIn(r"""pattern='\$ ?\{|\}\$|"\$|'\''\$'\''""", ci)
         self.assertIn(
-            r"allowlist='^crates/hemaka-engine/src/domain/cost\.rs:"
+            r"allowlist='^crates/hekma-engine/src/domain/cost\.rs:"
             r"|contains\(.\$|\$PWD|\$KT_TEST'",
             ci,
         )
@@ -492,7 +492,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn('if [ "$cached" != "$version" ]; then', ci)
         # The old constant key must not resurface.
         self.assertNotIn("key: ${{ runner.os }}-cargo-semver-checks-bin\n", ci)
-        # RENAME-AWARE BASELINE STRATEGY (v0.8.0 Hemaka migration): the
+        # RENAME-AWARE BASELINE STRATEGY (v0.8.0 Hekma migration): the
         # pre-rename freeze baselines cannot serve same-name baseline diffs,
         # so until fresh baselines are pinned to the migration's main-side
         # merge commit (post-merge; update ci.yml + this file together),
@@ -505,14 +505,14 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self.assertIn(
             "4119db37b5288b990144d28f995ee14a69271b5e \\\n"
-            "            crates/hemaka-adapter-api \\\n"
-            "            ktesio-adapter-api hemaka-adapter-api",
+            "            crates/hekma-adapter-api \\\n"
+            "            ktesio-adapter-api hekma-adapter-api",
             ci,
         )
         self.assertIn(
             "49da96b6f1c695edd6afd379526deba42cf6da60 \\\n"
-            "            crates/hemaka-engine \\\n"
-            "            ktesio-engine hemaka-engine",
+            "            crates/hekma-engine \\\n"
+            "            ktesio-engine hekma-engine",
             ci,
         )
         self.assertIn(
@@ -521,12 +521,16 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "fixtures/external-consumers/engine-consumer/src/main.rs", ci
         )
-        # The BOTH-GRAPH consumer (ktesio-engine 0.3.0 + hemaka-engine in one
-        # registry-resolved graph) arms at first hemaka-engine publish.
+        # The BOTH-GRAPH consumer (ktesio-engine 0.3.0 + hekma-engine in one
+        # registry-resolved graph) arms at first hekma-engine publish.
         self.assertIn(
             "(cd fixtures/external-consumers/both-graph", ci
         )
-        # Story 7-4 arms the SAME mechanism for hemaka-engine, against a
+        # The DEPRECATION SHIMS (one-shot ktesio-* final versions under
+        # deprecated/) compile-check against the published hekma-* crates,
+        # armed at first publish like the both-graph consumer.
+        self.assertIn("for shim in deprecated/ktesio-engine deprecated/ktesio-adapter-api deprecated/ktesio-adapters-hermes; do", ci)
+        # Story 7-4 arms the SAME mechanism for hekma-engine, against a
         # DIFFERENT honest freeze point (NOT the contract freeze 4119db3 —
         # the engine's unpublished surface legitimately grew after the
         # contract froze; a 4119db3 baseline fails major lints on that
@@ -612,7 +616,7 @@ class ReleaseDocsTests(unittest.TestCase):
         example = (
             release_docs.ROOT
             / "crates"
-            / "hemaka-engine"
+            / "hekma-engine"
             / "examples"
             / "embedding-quickstart.rs"
         )
@@ -626,7 +630,7 @@ class ReleaseDocsTests(unittest.TestCase):
         build_end = build_start + 1 + next_job.start() if next_job else len(ci)
         build_job = ci[build_start:build_end]
         self.assertIn(
-            "cargo +stable build --release --example embedding-quickstart -p hemaka-engine",
+            "cargo +stable build --release --example embedding-quickstart -p hekma-engine",
             build_job,
         )
         # The RUN step is guarded: a step-level timeout independent of the
@@ -656,7 +660,7 @@ class ReleaseDocsTests(unittest.TestCase):
         example = (
             release_docs.ROOT
             / "crates"
-            / "hemaka-engine"
+            / "hekma-engine"
             / "examples"
             / "perf-budgets.rs"
         )
@@ -670,7 +674,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("name: perf-budgets", perf_job)
         self.assertIn("runs-on: ubuntu-latest", perf_job)
         self.assertIn(
-            "cargo +stable build --release -p hemaka-engine --example perf-budgets",
+            "cargo +stable build --release -p hekma-engine --example perf-budgets",
             perf_job,
         )
         # The stale-helper guard: rm + explicit rebuild for the fake_agent
@@ -679,7 +683,7 @@ class ReleaseDocsTests(unittest.TestCase):
             "rm -f target/release/fake_agent target/release/fake_agent.exe", perf_job
         )
         self.assertIn(
-            "cargo +stable build --release -p hemaka-conformance --bin fake_agent",
+            "cargo +stable build --release -p hekma-conformance --bin fake_agent",
             perf_job,
         )
         # Blocking, pinned structurally beyond substrings: the RUN step's
@@ -714,21 +718,21 @@ class ReleaseDocsTests(unittest.TestCase):
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):
         the three library crates are PUBLISHED (no publish=false) and
-        hemaka-conformance KEEPS its flag (dev/test kit, separate decision).
+        hekma-conformance KEEPS its flag (dev/test kit, separate decision).
         This pin now catches an accidental re-add of publish=false to the
         published crates, or a flip of conformance's flag."""
-        for crate in ("hemaka-adapter-api", "hemaka-adapters-hermes", "hemaka-engine"):
+        for crate in ("hekma-adapter-api", "hekma-adapters-hermes", "hekma-engine"):
             manifest = (release_docs.ROOT / "crates" / crate / "Cargo.toml").read_text(
                 encoding="utf-8"
             )
             self.assertNotIn("publish = false", manifest, crate)
             self.assertNotIn("publish.workspace", manifest, crate)
-        conformance = (release_docs.ROOT / "crates" / "hemaka-conformance" / "Cargo.toml").read_text(
+        conformance = (release_docs.ROOT / "crates" / "hekma-conformance" / "Cargo.toml").read_text(
             encoding="utf-8"
         )
         # The dev/test kit KEEPS its flag — publishing it is a separate,
         # undecided decision (docs/release-process.md decision log).
-        self.assertIn("publish = false", conformance, "hemaka-conformance")
+        self.assertIn("publish = false", conformance, "hekma-conformance")
 
 
     def test_ci_enforces_msrv_floor(self) -> None:
@@ -809,15 +813,15 @@ class InstallerScriptTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def fake_hemaka(self, directory: Path, output: str = "hemaka 0.8.0") -> Path:
-        path = directory / "hemaka"
+    def fake_hekma(self, directory: Path, output: str = "hekma 0.8.0") -> Path:
+        path = directory / "hekma"
         path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n", encoding="utf-8")
         path.chmod(0o755)
         return path
 
     def test_install_sh_migrates_a_legacy_kt_in_place_with_a_note(self) -> None:
         # D7 clean break: a legacy `kt` is recognized as OURS, the manual
-        # channel installs hemaka+maka BESIDE it, and (outside dry-run) a
+        # channel installs hekma+hkm BESIDE it, and (outside dry-run) a
         # visible retirement note names the old binary. In dry-run the
         # planned install names both binaries and the existing directory.
         with tempfile.TemporaryDirectory() as tmp:
@@ -831,17 +835,17 @@ class InstallerScriptTests(unittest.TestCase):
                 }
             )
 
-        self.assertIn("(hemaka + maka)", result.stdout)
+        self.assertIn("(hekma + hkm)", result.stdout)
         self.assertIn(f"to {bin_dir}", result.stdout)
 
-    def test_install_sh_updates_an_existing_hemaka_manual_install(self) -> None:
+    def test_install_sh_updates_an_existing_hekma_manual_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = Path(tmp) / "bin"
             bin_dir.mkdir()
-            hemaka_path = self.fake_hemaka(bin_dir)
+            hekma_path = self.fake_hekma(bin_dir)
             result = self.run_install_sh(
                 {
-                    "KTESIO_INSTALL_TEST_KT_PATH": str(hemaka_path),
+                    "KTESIO_INSTALL_TEST_KT_PATH": str(hekma_path),
                     "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 }
             )
@@ -851,19 +855,19 @@ class InstallerScriptTests(unittest.TestCase):
     def test_install_sh_prefers_homebrew_for_new_installs(self) -> None:
         result = self.run_install_sh({"KTESIO_INSTALL_TEST_HAS_BREW": "1"})
 
-        self.assertIn("DRY RUN: brew install ktesio/tap/hemaka", result.stdout)
+        self.assertIn("DRY RUN: brew install ktesio/tap/hekma", result.stdout)
 
     def test_install_sh_uses_cargo_when_homebrew_is_unavailable(self) -> None:
         result = self.run_install_sh({"KTESIO_INSTALL_TEST_HAS_CARGO": "1"})
 
-        self.assertIn("DRY RUN: cargo install hemaka --force", result.stdout)
+        self.assertIn("DRY RUN: cargo install hekma --force", result.stdout)
 
     def test_install_sh_uses_prebuilt_binary_without_package_managers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = self.run_install_sh({"HOME": tmp})
 
         self.assertIn(
-            "DRY RUN: install prebuilt x86_64-unknown-linux-gnu (hemaka + maka)",
+            "DRY RUN: install prebuilt x86_64-unknown-linux-gnu (hekma + hkm)",
             result.stdout,
         )
 
@@ -878,7 +882,7 @@ class InstallerScriptTests(unittest.TestCase):
                 }
             )
 
-        self.assertIn("DRY RUN: brew upgrade ktesio/tap/hemaka", result.stdout)
+        self.assertIn("DRY RUN: brew upgrade ktesio/tap/hekma", result.stdout)
 
     def test_install_sh_updates_existing_cargo_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -894,7 +898,7 @@ class InstallerScriptTests(unittest.TestCase):
                 }
             )
 
-        self.assertIn("DRY RUN: cargo install hemaka --force", result.stdout)
+        self.assertIn("DRY RUN: cargo install hekma --force", result.stdout)
 
     def test_install_sh_replaces_existing_manual_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -928,7 +932,7 @@ class InstallerScriptTests(unittest.TestCase):
 
         output = result.stdout + result.stderr
         self.assertIn("is not writable", output)
-        self.assertIn("HEMAKA_INSTALL_DIR", output)
+        self.assertIn("HEKMA_INSTALL_DIR", output)
         self.assertIn("KTESIO_INSTALL_DIR", output)
 
     def test_install_sh_rejects_unsupported_binary_target_without_cargo(self) -> None:
@@ -938,7 +942,7 @@ class InstallerScriptTests(unittest.TestCase):
                 expect_success=False,
             )
 
-        self.assertIn("No prebuilt Hemaka binary is available", result.stderr)
+        self.assertIn("No prebuilt Hekma binary is available", result.stderr)
 
     def test_install_sh_refuses_non_ktesio_kt_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

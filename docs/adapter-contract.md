@@ -1,11 +1,11 @@
 ---
 title: Adapter Contract
-description: The versioned contract between the Hemaka engine and every agent adapter — trait surface, capability declarations, version negotiation, and the versioning and deprecation policy.
+description: The versioned contract between the Hekma engine and every agent adapter — trait surface, capability declarations, version negotiation, and the versioning and deprecation policy.
 ---
 
 # Adapter Contract (v1)
 
-The **Adapter Contract** is the agreement between the Hemaka engine and every agent adapter — native builtins and manifest adapters alike. An *agent* here is the third-party program an adapter makes runnable — a personal agent such as Hermes Agent or a coding agent such as opencode — never something Hemaka authors. It lives in the `hemaka-adapter-api` crate (the schema's single home), is versioned independently of the engine under its own semver, and is **frozen at v1 (`1.0.0`)** as of 2026-09-04 after validation against a second agent (opencode) and the story 6-4/6-5 conformance passes. This page is the contract's normative home: what an adapter implements, what the engine enforces, and the rules for changing any of it.
+The **Adapter Contract** is the agreement between the Hekma engine and every agent adapter — native builtins and manifest adapters alike. An *agent* here is the third-party program an adapter makes runnable — a personal agent such as Hermes Agent or a coding agent such as opencode — never something Hekma authors. It lives in the `hekma-adapter-api` crate (the schema's single home), is versioned independently of the engine under its own semver, and is **frozen at v1 (`1.0.0`)** as of 2026-09-04 after validation against a second agent (opencode) and the story 6-4/6-5 conformance passes. This page is the contract's normative home: what an adapter implements, what the engine enforces, and the rules for changing any of it.
 
 Everything here applies uniformly to both adapter kinds ("two kinds, one trait"): a native builtin declares the same shapes in code that a manifest adapter declares in `adapter.toml`. **One deliberate exception: version negotiation.** `contract_version` and the negotiation gate below are **manifest-only** — only a manifest adapter carries a `contract_version` and can fail negotiation; native builtins declare no contract version in code and are always compatible with the engine that ships them (a builtin and its engine release from the same build). The concrete manifest syntax is documented in [the manifest reference](manifest.md); the Conformance Test Kit ([testing](testing.md#the-conformance-test-kit)) proves an adapter honors the sections it can exercise.
 
@@ -60,7 +60,7 @@ Per-OS honesty is the adapter author's job: the contract lets an author declare 
 
 ## Memory
 
-Memory Backing vocabulary is part of the frozen v1 surface, carried on `hemaka agent memory attach|detach --json` (story 6-6's wire freeze; before it, the surface was human-output-only):
+Memory Backing vocabulary is part of the frozen v1 surface, carried on `hekma agent memory attach|detach --json` (story 6-6's wire freeze; before it, the surface was human-output-only):
 
 - **Kinds** (snake_case wire strings, verbatim): `filesystem` (an engine-managed directory inside the Agent Home, byte-durable across restarts) and `native` (an explicit delegation marker).
 - **Guarantee levels** (snake_case wire strings, verbatim): `managed_dir_byte_durable` and `home_persistence_only`.
@@ -100,7 +100,7 @@ The contract carries a semantic version; **the engine states which contract vers
 - **Strict `X.Y.Z` parsing** (AI-6, resolved at the freeze): the manifest's `contract_version` must be a strict semver triple — no `v` prefix, no partial versions (`1`, `1.0`). Prerelease and build-metadata suffixes (`1.0.0-rc.1+build.5`) parse as semver; **negotiation compares majors only**, so a same-major prerelease manifest is compatible. Prerelease spellings are development-time conveniences, not a published compatibility promise — release tooling always publishes clean triples.
 - **Pre-v1 (`0.x`) manifests are not grandfathered**: the contract was never published under 0.x, so the seed values (0.1.0–0.4.0) carry no back-compat obligation. They fail registration exactly like any other major mismatch.
 - **Within a major**, changes are additive (a new optional manifest section, a new enum variant, a new optional JSON field). Anything that removes or renumbers is breaking and requires the next major.
-- The Rust API of `hemaka-adapter-api` is guarded by the CI `semver` job (`cargo-semver-checks`) on two baselines: an **armed in-repo baseline** that diffs the frozen surface against the contract-v1 freeze commit (`4119db3`) on every run, and the crates.io-published baseline once story 7-4 publishes the crates. The serialized wire shapes and exit codes are guarded by the workspace compatibility tests (`crates/hemaka/tests/agent_cli.rs`), which fail CI on an unannounced change on all three OSes.
+- The Rust API of `hekma-adapter-api` is guarded by the CI `semver` job (`cargo-semver-checks`) on two baselines: an **armed in-repo baseline** that diffs the frozen surface against the contract-v1 freeze commit (`4119db3`) on every run, and the crates.io-published baseline once story 7-4 publishes the crates. The serialized wire shapes and exit codes are guarded by the workspace compatibility tests (`crates/hekma/tests/agent_cli.rs`), which fail CI on an unannounced change on all three OSes.
 
 ## Deprecation policy
 
@@ -110,7 +110,7 @@ The contract carries a semantic version; **the engine states which contract vers
 
 The CI `semver` job runs `cargo-semver-checks` on **two baselines**:
 
-1. **In-repo baseline (armed, #160):** every run diffs `hemaka-adapter-api`'s public Rust surface against the contract-v1 freeze commit (`4119db3`) via `--baseline-rev`. Any breaking public-surface change vs the baseline — removal, rename, or signature — **fails CI red**, announced or not (announcement itself is review discipline; the gate cannot read intent). This closed the freeze's guard gap (retro finding A1), where no verification failed on a public-surface break during the pre-publish window.
+1. **In-repo baseline (armed, #160):** every run diffs `hekma-adapter-api`'s public Rust surface against the contract-v1 freeze commit (`4119db3`) via `--baseline-rev`. Any breaking public-surface change vs the baseline — removal, rename, or signature — **fails CI red**, announced or not (announcement itself is review discipline; the gate cannot read intent). This closed the freeze's guard gap (retro finding A1), where no verification failed on a public-surface break during the pre-publish window.
 2. **crates.io baseline (dormant until 7-4):** the published-baseline comparison cannot fire until the crates publish to crates.io (story 7-4); today that leg checks crates.io, sees the 404, and emits a notice saying exactly that. It arms itself automatically at first publish, and its cache plumbing is already version-keyed and armed-ready.
 
 What additionally protects the contract are the workspace compatibility tests and the review discipline.
@@ -145,6 +145,6 @@ For adapter authors upgrading from a pre-freeze seed manifest:
 ## See Also
 
 - [Adapter manifest (`adapter.toml`)](manifest.md) — the concrete manifest syntax.
-- [Command reference](commands.md) — the `hemaka agent` commands, including the memory `--json` documents.
+- [Command reference](commands.md) — the `hekma agent` commands, including the memory `--json` documents.
 - [Architecture](architecture.md) — how the engine, the contract crate, and the conformance kit fit together.
 - [The Conformance Test Kit](testing.md#the-conformance-test-kit) — prove your adapter conforms.

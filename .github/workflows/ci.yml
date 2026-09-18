@@ -89,7 +89,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
-    # doctest pass. 25 gives headroom now that the heavy hemaka-engine integration
+    # doctest pass. 25 gives headroom now that the heavy hekma-engine integration
     # tests are SERIALIZED (the `engine-integration-serial` max-threads=1 test-group
     # in .config/nextest.toml) — the source fix for the x86-ubuntu `adoption` hang
     # (#106), where concurrent heavy process-spawning wedged the 2-core runner into
@@ -160,7 +160,7 @@ jobs:
         # hardlinks the bin to target/debug/fake_agent), `cargo nextest run
         # --all-targets` only compiles it for its own unit tests and does NOT place
         # that top-level hardlink. The process-spawning tests resolve the helper at
-        # target/debug/fake_agent (`hemaka_conformance::fake_agent_bin`), so without
+        # target/debug/fake_agent (`hekma_conformance::fake_agent_bin`), so without
         # this build the first such tests race on the lib's on-demand `cargo build`
         # fallback (concurrent cargo invocations contend on the build-dir lock —
         # observed as a flake). The explicit build makes the path deterministic.
@@ -170,20 +170,20 @@ jobs:
         run: |
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
           rm -f target/debug/hermes_shim target/debug/hermes_shim.exe
-          cargo +stable build -p hemaka-conformance --bin fake_agent
+          cargo +stable build -p hekma-conformance --bin fake_agent
           # hermes_shim gets the SAME freshness guard (review-of-6-2, vg-o1):
           # the hermes e2e test resolves it at target/debug/hermes_shim via the
-          # same exists()-only locator (install_shim, hemaka-engine/tests/
+          # same exists()-only locator (install_shim, hekma-engine/tests/
           # hermes.rs), so a cached stale copy would silently shadow the
           # committed launcher's current arg surface (--crash-* family).
-          cargo +stable build -p hemaka-conformance --bin hermes_shim
+          cargo +stable build -p hekma-conformance --bin hermes_shim
           cargo +stable nextest run --workspace --all-targets --no-run
       - name: Run tests (nextest)
         # Single unified run for all three OSes (#106). The x86-ubuntu `adoption`
         # hang — concurrent heavy re-exec'd process-spawning wedging the genuine
         # 2-core runner into an uninterruptible D-state — is fixed AT THE SOURCE by
         # the `engine-integration-serial` test-group in .config/nextest.toml
-        # (max-threads=1 over `kind(test) & package(hemaka-engine)`), which caps the
+        # (max-threads=1 over `kind(test) & package(hekma-engine)`), which caps the
         # heavy engine integration binaries to one at a time WITHOUT skipping any
         # test (full Linux coverage retained). So no per-OS special-casing, watchdog,
         # or bisect is needed — a per-binary CI bisect had pinned the hang to the
@@ -222,14 +222,14 @@ jobs:
         run: cargo +stable build --release
       - name: Build the embedding quickstart example (story 7-4)
         # The publish capstone's compile-level proof: the quickstart is HOST
-        # code — it links only hemaka-engine's public facade (no kt, no
-        # hemaka-conformance) — so building it in CI proves the embedding
+        # code — it links only hekma-engine's public facade (no kt, no
+        # hekma-conformance) — so building it in CI proves the embedding
         # surface compiles from outside the engine crate, exactly what a
         # crates.io host will do once the HELD publish runs
         # (docs/release-process.md). Keeping the build in this job means a
         # facade regression reds the ordinary build gate before any host ever
         # sees it. Explicit +stable (see fmt job).
-        run: cargo +stable build --release --example embedding-quickstart -p hemaka-engine
+        run: cargo +stable build --release --example embedding-quickstart -p hekma-engine
       - name: Run the embedding quickstart (hermetic)
         # Ubuntu-scoped BY JOB DESIGN: this whole `build` job runs on
         # ubuntu-latest only (the build matrix is the `test` job's), so the
@@ -298,7 +298,7 @@ jobs:
         # Release profile: the measurement must not pay dev-profile build
         # noise. Explicit +stable (see fmt job): the root rust-toolchain.toml
         # pins only local bare cargo; MSRV floor: the `msrv` job.
-        run: cargo +stable build --release -p hemaka-engine --example perf-budgets
+        run: cargo +stable build --release -p hekma-engine --example perf-budgets
       - name: Rebuild the fake_agent helper (stale-helper guard)
         # The SAME stale-helper guard the test + coverage jobs carry (and
         # scripts/test_automation.py enforces for any job that spawns
@@ -313,7 +313,7 @@ jobs:
         shell: bash
         run: |
           rm -f target/release/fake_agent target/release/fake_agent.exe
-          cargo +stable build --release -p hemaka-conformance --bin fake_agent
+          cargo +stable build --release -p hekma-conformance --bin fake_agent
       - name: Run the perf harness (NFR-4 budgets; regressions fail this job)
         # Blocking by design: a budget regression (reads p99 over 1s, RSS
         # over 50 MiB/instance or its 2x spike guard, CPU over its applicable
@@ -386,21 +386,21 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Check hemaka against its declared crate graph
+      - name: Check hekma against its declared crate graph
         # Explicit +stable (see fmt job): boundary gate runs on latest stable; the
         # root rust-toolchain.toml pins only local bare cargo. MSRV floor: `msrv` job.
-        run: cargo +stable check -p hemaka
+        run: cargo +stable check -p hekma
       - name: Enforce kt dependency law (AD-2)
         shell: bash
         run: |
           set -euo pipefail
-          tree="$(cargo +stable tree -p hemaka -e normal,build --all-features)"
+          tree="$(cargo +stable tree -p hekma -e normal,build --all-features)"
           echo "$tree"
-          # Allowlist, not blocklist: any internal hemaka-* edge other than
-          # hemaka-engine / hemaka-adapter-api / hemaka-adapters-hermes fails,
+          # Allowlist, not blocklist: any internal hekma-* edge other than
+          # hekma-engine / hekma-adapter-api / hekma-adapters-hermes fails,
           # so future internal crates are caught automatically.
           scan_status=0
-          edges="$(printf '%s\n' "$tree" | grep -oE 'hemaka-[a-z0-9_-]+' | sort -u)" || scan_status=$?
+          edges="$(printf '%s\n' "$tree" | grep -oE 'hekma-[a-z0-9_-]+' | sort -u)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
             echo "::error::grep exited ${scan_status} while extracting internal crate edges."
             exit "$scan_status"
@@ -408,7 +408,7 @@ jobs:
           violations=''
           if [ -n "$edges" ]; then
             filter_status=0
-            violations="$(printf '%s\n' "$edges" | grep -Evx 'hemaka-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'hekma-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
             if [ "$filter_status" -ge 2 ]; then
               echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
               exit "$filter_status"
@@ -416,7 +416,7 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::kt may depend only on hemaka-engine (plus hemaka-adapter-api types and the hemaka-adapters-hermes builtin); forbidden internal crate edge found."
+            echo "::error::kt may depend only on hekma-engine (plus hekma-adapter-api types and the hekma-adapters-hermes builtin); forbidden internal crate edge found."
             # WHY the adapters-hermes edge is allowed (review blind-22): it is
             # the builtin native-adapter table the engine's `native()` matcher
             # consults to resolve `--kind hermes` — code, not a plugin, so the
@@ -424,7 +424,7 @@ jobs:
             # out of kt's graph (mock/dev fixtures ride dev-dependencies only).
             exit 1
           fi
-          echo "Boundary gate green: internal edges are exactly the allowlisted hemaka-engine / hemaka-adapter-api / hemaka-adapters-hermes."
+          echo "Boundary gate green: internal edges are exactly the allowlisted hekma-engine / hekma-adapter-api / hekma-adapters-hermes."
       - name: Enforce the one-rustls/ring TLS invariant (story 12-3, NFR-8)
         shell: bash
         run: |
@@ -433,7 +433,7 @@ jobs:
           # workspace (no system TLS, no openssl/native-tls, no second copy of
           # rustls or ring drifting in via a transitive dep, no aws-lc-sys
           # provider). This is the CI TEETH for that invariant: the WORKSPACE
-          # graph (kt + hemaka-engine + the adapter crates — review round 2
+          # graph (kt + hekma-engine + the adapter crates — review round 2
           # widened the scan from engine-only, so a TLS crate smuggled in via
           # kt or an adapter cannot slip past an engine-scoped gate) must
           # carry EXACTLY ONE `rustls` package and EXACTLY ONE `ring`
@@ -473,13 +473,13 @@ jobs:
           # two pre-existing v0.5.0 legacy CLI files (self-update platform
           # detection) grandfathered until epic 8 relocates/deprecates them
           # (AC-4 amendment, ratified 2026-07-02; paths updated for the
-          # v0.8.0 crates/kt -> crates/hemaka move), plus engine integration
+          # v0.8.0 crates/kt -> crates/hekma move), plus engine integration
           # TESTS: the symlink-containment test (memory.rs:605, story 5-1) is
           # the one honestly unix-gated suite there under the AI-35 disclosure
           # convention ("the test does not exist on Windows" rather than
           # passing vacuously) — adoption/interaction suites deliberately use
           # NO cfg (data-driven OS ids); no production code may use cfg.
-          allowlist='^crates/hemaka-engine/src/backends/|^crates/hemaka/src/update_check\.rs:|^crates/hemaka/src/cli/self_update\.rs:|^crates/hemaka-engine/tests/'
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -497,7 +497,7 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hemaka-engine/src/backends/ and crates/hemaka-engine/tests/ (legacy kt self-update files are grandfathered until epic 8)."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/ and crates/hekma-engine/tests/ (legacy kt self-update files are grandfathered until epic 8)."
             exit 1
           fi
           echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
@@ -506,7 +506,7 @@ jobs:
         run: |
           set -euo pipefail
           # AD-8: exactly ONE module formats currency. Money becomes a `$X.XX` human
-          # string ONLY in crates/hemaka-engine/src/domain/cost.rs (render_dollars /
+          # string ONLY in crates/hekma-engine/src/domain/cost.rs (render_dollars /
           # render_dollars_bare). Every other module passes Micros + EstimateLabel as
           # DATA; --json emits integer micros, never a `$` string. This gate FAILS if a
           # `$`-string-building form appears anywhere else.
@@ -527,7 +527,7 @@ jobs:
           #   \$PWD / \$KT_TEST — shell-variable interpolation in a spawned command
           #                    string (a process backend test), not a dollar figure.
           # No NEW currency formatting may appear anywhere else in the workspace.
-          allowlist='^crates/hemaka-engine/src/domain/cost\.rs:|contains\(.\$|\$PWD|\$KT_TEST'
+          allowlist='^crates/hekma-engine/src/domain/cost\.rs:|contains\(.\$|\$PWD|\$KT_TEST'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -545,7 +545,7 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::Currency formatting (a \`\$\`-string form: \`\${...}\`, \`\$ {}\`, \`{}\$\`, a \"\$\"-prefixed string, or a '\$' char) is allowed ONLY in crates/hemaka-engine/src/domain/cost.rs (AD-8: one currency module). Pass Micros + EstimateLabel as data and render through render_dollars / render_dollars_bare."
+            echo "::error::Currency formatting (a \`\$\`-string form: \`\${...}\`, \`\$ {}\`, \`{}\$\`, a \"\$\"-prefixed string, or a '\$' char) is allowed ONLY in crates/hekma-engine/src/domain/cost.rs (AD-8: one currency module). Pass Micros + EstimateLabel as data and render through render_dollars / render_dollars_bare."
             exit 1
           fi
           echo "Currency gate green: dollar formatting lives only in the one currency module."
@@ -560,8 +560,8 @@ jobs:
         with:
           # The armed in-repo baseline guard (#160, epic-6 retro A1; engine arm
           # in story 7-4) diffs TWO frozen surfaces against their freeze
-          # commits: hemaka-adapter-api against the contract-v1 freeze commit
-          # 4119db3, and hemaka-engine against the epic-12 surface-extension
+          # commits: hekma-adapter-api against the contract-v1 freeze commit
+          # 4119db3, and hekma-engine against the epic-12 surface-extension
           # freeze commit 49da96b (see the baseline comment below for why the
           # two SHAs differ, and for the freeze history). The default shallow
           # clone cannot resolve a historical rev, so this job fetches full
@@ -573,7 +573,7 @@ jobs:
         id: semver_version
         run: |
           set -euo pipefail
-          user_agent="hemaka-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          user_agent="hekma-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
           # The cache key must name a CONTENT hash, never a constant (AI-3): it
           # carries the resolved cargo-semver-checks version so a toolchain
           # update gets a fresh key. Non-fatal on crates.io trouble — an
@@ -608,13 +608,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-semver-checks-bin-
           path: |
             ~/.cargo/bin
-      - name: Check public API semver (hemaka-engine, hemaka-adapter-api)
+      - name: Check public API semver (hekma-engine, hekma-adapter-api)
         id: semver_check
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.semver_version.outputs.version }}"
-          user_agent="hemaka-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
+          user_agent="hekma-ci-semver-gate (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}; CI semver gate)"
           # Install the binary UP FRONT: the armed in-repo baseline guards below
           # run on EVERY push, so the old "lazy install inside the armed
           # branch" dormancy no longer applies — the adapter-api and engine
@@ -653,7 +653,7 @@ jobs:
               echo "installed=true" >> "$GITHUB_OUTPUT"
             fi
           fi
-          # ARMED in-repo baseline guards (#160, epic-6 retro A1; hemaka-engine
+          # ARMED in-repo baseline guards (#160, epic-6 retro A1; hekma-engine
           # armed in story 7-4): diff the FROZEN public surfaces against their
           # freeze commits. The guard fires on ANY breaking surface change vs
           # the baseline (removal, rename, signature) — whether or not it was
@@ -662,9 +662,9 @@ jobs:
           # (the dormant per-crate crates.io loop below arms at first publish).
           #
           # TWO baselines, two honest freeze points:
-          # * hemaka-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
+          # * hekma-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
           #   contract surface has been frozen since story 6-6.
-          # * hemaka-engine @ 49da96b — the epic-12 merge (2026-09-15, PR
+          # * hekma-engine @ 49da96b — the epic-12 merge (2026-09-15, PR
           #   #184): the latest deliberate post-freeze surface extension
           #   (`EngineError::DetachRefused` + `SpawnSpec.detach` — announced
           #   in the PR) defines the new freeze point. The prior extension
@@ -694,13 +694,13 @@ jobs:
           # EPIC-12 NOTE (resolved at merge): the epic-12 PR's announced
           # surface extension (`EngineError::DetachRefused` + the
           # `SpawnSpec.detach` field, story 12-1) red this gate against
-          # bee7d48 exactly as predicted; the hemaka-engine baseline has
+          # bee7d48 exactly as predicted; the hekma-engine baseline has
           # been bumped to the epic-12 main-history merge commit 49da96b
           # (here AND in scripts/test_automation.py) — the same post-merge
           # step PR #181 did for its own extension.
-          # RENAME-AWARE BASELINE STRATEGY (v0.8.0 Hemaka migration): the two
+          # RENAME-AWARE BASELINE STRATEGY (v0.8.0 Hekma migration): the two
           # freeze baselines predate the crate rename, so same-name baseline
-          # diffing (`-p hemaka-engine --baseline-rev <old>`) cannot resolve a
+          # diffing (`-p hekma-engine --baseline-rev <old>`) cannot resolve a
           # package that did not carry that name at the baseline rev — by
           # construction, not by drift. Until fresh baselines are pinned to the
           # migration's main-side merge commit (the SAME post-merge step PRs
@@ -714,15 +714,15 @@ jobs:
           # job.
           bash scripts/rename_surface_check.sh \
             4119db37b5288b990144d28f995ee14a69271b5e \
-            crates/hemaka-adapter-api \
-            ktesio-adapter-api hemaka-adapter-api \
+            crates/hekma-adapter-api \
+            ktesio-adapter-api hekma-adapter-api \
             fixtures/external-consumers/adapter-api-consumer/src/main.rs
           bash scripts/rename_surface_check.sh \
             49da96b6f1c695edd6afd379526deba42cf6da60 \
-            crates/hemaka-engine \
-            ktesio-engine hemaka-engine \
+            crates/hekma-engine \
+            ktesio-engine hekma-engine \
             fixtures/external-consumers/engine-consumer/src/main.rs
-          for crate in hemaka-engine hemaka-adapter-api; do
+          for crate in hekma-engine hekma-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
               200)
@@ -744,27 +744,53 @@ jobs:
             esac
           done
 
-          # BOTH-GRAPH CONSUMER (arms at first hemaka-engine publish): the
-          # published ktesio-engine 0.3.0 and hemaka-engine must resolve in
+          # BOTH-GRAPH CONSUMER (arms at first hekma-engine publish): the
+          # published ktesio-engine 0.3.0 and hekma-engine must resolve in
           # ONE external dependency graph (fixtures/external-consumers/
           # both-graph) — dependency aliases prove nothing, a real
           # two-dependency lockfile does.
-          both_status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/hemaka-engine")" || both_status=000
+          both_status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/hekma-engine")" || both_status=000
           case "$both_status" in
             200)
               (cd fixtures/external-consumers/both-graph \
                 && cargo +stable build --quiet \
                 && cargo +stable run --quiet)
-              echo "both-graph consumer ok: ktesio-engine 0.3.0 + hemaka-engine resolve together."
+              echo "both-graph consumer ok: ktesio-engine 0.3.0 + hekma-engine resolve together."
+              ;;
+
+          # DEPRECATION SHIM compile check (arms when the hekma-* libraries
+          # are live): the three one-shot ktesio-* shims under deprecated/
+          # must compile against the PUBLISHED hekma-* crates — their
+          # re-exports are what keep old `use ktesio_*::…` paths working
+          # after `cargo update`. Before those publishes their registry
+          # dependencies cannot resolve (404 -> notice, armed at publish).
+          shim_status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/hekma-engine")" || shim_status=000
+          case "$shim_status" in
+            200)
+              for shim in deprecated/ktesio-engine deprecated/ktesio-adapter-api deprecated/ktesio-adapters-hermes; do
+                cargo +stable check --quiet --manifest-path "${shim}/Cargo.toml"
+              done
+              echo "deprecation shims green against the published hekma-* crates."
               ;;
             404)
-              echo "::notice::hemaka-engine is not on crates.io yet; the both-graph consumer arms at first publish."
+              echo "::notice::hekma-engine is not on crates.io yet; the deprecation-shim compile check arms at first publish."
+              ;;
+            000|429|5[0-9][0-9])
+              echo "::notice::crates.io returned transient status ${shim_status}; skipping the deprecation-shim check this run."
+              ;;
+            *)
+              echo "::error::Unexpected crates.io API status ${shim_status} for hekma-engine (shim probe)."
+              exit 1
+              ;;
+          esac
+            404)
+              echo "::notice::hekma-engine is not on crates.io yet; the both-graph consumer arms at first publish."
               ;;
             000|429|5[0-9][0-9])
               echo "::notice::crates.io returned transient status ${both_status}; skipping the both-graph consumer this run."
               ;;
             *)
-              echo "::error::Unexpected crates.io API status ${both_status} for hemaka-engine (both-graph probe)."
+              echo "::error::Unexpected crates.io API status ${both_status} for hekma-engine (both-graph probe)."
               exit 1
               ;;
           esac
@@ -964,8 +990,8 @@ jobs:
         #
         # CORRECTNESS (de-risked locally before this landed): tarpaulin reports
         # coverage for ALL workspace source each built test binary touches, NOT just
-        # the `-p` crate's own source — so a hemaka-engine line covered only by a
-        # `hemaka` CLI test IS credited under `-p hemaka`. The UNION of the five
+        # the `-p` crate's own source — so a hekma-engine line covered only by a
+        # `hekma` CLI test IS credited under `-p hekma`. The UNION of the five
         # per-crate tracefiles therefore reproduces the --workspace result exactly:
         # locally the merged aggregate is 95.22% (5718/6005), identical to
         # --workspace to the line (0 lines lost, 0 gained). No report-scope flag is
@@ -973,7 +999,7 @@ jobs:
         # lcov 2.x rejects the benign FN-start-line drift tarpaulin emits across
         # runs (function metadata only — it does not touch DA/LF/LH line data).
         #
-        # ORDER: lightest → heaviest, hemaka-engine LAST. If the heavy crate still
+        # ORDER: lightest → heaviest, hekma-engine LAST. If the heavy crate still
         # OOMs the runner, the lighter crates' tracefiles + per-crate numbers are
         # already printed, so a per-crate OOM is diagnosable (which crate, at what
         # `free`/`df`) instead of one opaque --workspace failure.
@@ -1008,7 +1034,7 @@ jobs:
           # agent.log" / "echoed stdin line never appeared") that LOOK like slow
           # IO but are a missing feature. Compounding it: tarpaulin compiles the
           # helper only as a `--test` artifact and never uplifts it to
-          # target/debug/fake_agent, while `hemaka_conformance::fake_agent_bin()`
+          # target/debug/fake_agent, while `hekma_conformance::fake_agent_bin()`
           # accepts that path when the file merely EXISTS (no freshness check) --
           # so the frozen copy is exactly what every spawning test runs.
           #
@@ -1027,11 +1053,11 @@ jobs:
           # only as a spawned subprocess and is excluded from coverage).
           rm -f target/debug/fake_agent target/debug/fake_agent.exe
           rm -f target/debug/hermes_shim target/debug/hermes_shim.exe
-          cargo +stable build -p hemaka-conformance --bin fake_agent
+          cargo +stable build -p hekma-conformance --bin fake_agent
           # hermes_shim: same freshness + lock-contention rationale as
           # fake_agent above (review-of-6-2, vg-o1) — its locator also accepts
           # a merely-EXISTING target/debug/hermes_shim.
-          cargo +stable build -p hemaka-conformance --bin hermes_shim
+          cargo +stable build -p hekma-conformance --bin hermes_shim
           # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
           # on a since-disproven "runner contention" theory) could never converge:
           # the failure above is DETERMINISTIC, so every attempt re-hit it. It
@@ -1040,8 +1066,8 @@ jobs:
           # and stay untouched.)
           rm -rf cov && mkdir -p cov
           # Crate list as positional params (portable, no word-split reliance):
-          # lightest → heaviest, hemaka-engine LAST (see the WHY comment above).
-          set -- hemaka-adapter-api hemaka-conformance hemaka-adapters-hermes hemaka hemaka-engine
+          # lightest → heaviest, hekma-engine LAST (see the WHY comment above).
+          set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma hekma-engine
           for pkg in "$@"; do
             echo "::group::tarpaulin -p $pkg"
             echo "--- resources before $pkg ---"
@@ -1060,12 +1086,12 @@ jobs:
           #
           # PR #117 fix pass: this used to skip ANY crate with no lcov.info, not
           # just hermes. That silently swallowed a real failure mode -- when a
-          # crate's OWN tarpaulin run fails (e.g. hemaka-engine hitting one of this
+          # crate's OWN tarpaulin run fails (e.g. hekma-engine hitting one of this
           # job's real-IO tests), it produces no lcov.info too, and the old
           # code merged the aggregate from whatever crates DID succeed anyway. The
           # resulting gate failure ("merged coverage NN% is below 95%") read like a
           # genuine coverage shortfall across the whole workspace, when the real
-          # story was "hemaka-engine's measurement is entirely missing, so the
+          # story was "hekma-engine's measurement is entirely missing, so the
           # smaller remaining slice can't possibly clear a 95% bar sized for the
           # full workspace" -- confusing, and it silently accepted a
           # SUBSET-OF-THE-WORKSPACE gate as if it were the real one. Any crate
@@ -1076,7 +1102,7 @@ jobs:
           for pkg in "$@"; do
             if [ -s "cov/$pkg/lcov.info" ]; then
               add_args="$add_args -a cov/$pkg/lcov.info"
-            elif [ "$pkg" = "hemaka-adapters-hermes" ]; then
+            elif [ "$pkg" = "hekma-adapters-hermes" ]; then
               echo "::notice::no coverable lines for $pkg (expected for the mapping-only hermes lib); skipping in merge."
             else
               echo "::error::$pkg produced no lcov.info -- its tarpaulin run above almost certainly failed (a crashed/failed test suite, not a legitimately-empty crate). Failing the coverage gate rather than silently merging a partial, misleading aggregate."

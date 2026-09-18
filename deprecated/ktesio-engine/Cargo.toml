@@ -1,0 +1,23 @@
+[package]
+# ONE-SHOT DEPRECATION SHIM (ratified 2026-09-16): `ktesio-engine` was renamed
+# to `hekma-engine` (v0.8.0 Hekma rename). This FINAL version exists only to
+# re-export the new crate and point crates.io visitors at it. PUBLISH ONCE,
+# on Islam's explicit go, AFTER `hekma-engine` 0.4 is live on
+# crates.io (publishing requires the dependency on the registry); never
+# publish another version under this name.
+name = "ktesio-engine"
+version = "0.3.1"
+edition = "2021"
+rust-version = "1.96.1"
+license-file = "../../LICENSE"
+description = "DEPRECATED: renamed to hekma-engine — depend on hekma-engine instead; this final version only re-exports it"
+homepage = "https://github.com/Ktesio/ktesio"
+repository = "https://github.com/Ktesio/ktesio"
+readme = "README.md"
+
+# Standalone on purpose: NOT a workspace member (a one-shot shim, outside
+# the boundary gate and the root lockfile).
+[workspace]
+
+[dependencies]
+hekma-engine = "0.4"

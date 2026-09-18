@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rename-aware semver surface check (v0.8.0 Hemaka migration).
+# Rename-aware semver surface check (v0.8.0 Hekma migration).
 #
 # WHY THIS EXISTS: the CI semver gate's in-repo freeze baselines
 # (ktesio-adapter-api @ 4119db3, ktesio-engine @ 49da96b) contain the
@@ -18,12 +18,12 @@
 #
 # Usage: rename_surface_check.sh <baseline-rev> <crate-dir> <old-name> <new-name> <fixture-src>
 #   <baseline-rev>  main-history rev carrying the OLD crate (freeze point)
-#   <crate-dir>     crate directory relative to the repo root, e.g. crates/hemaka-engine
+#   <crate-dir>     crate directory relative to the repo root, e.g. crates/hekma-engine
 #                   (the OLD name's directory at the baseline rev is derived: the
 #                   baseline worktree still has the old dir; we resolve it by package
 #                   name via cargo metadata)
 #   <old-name>      package name at the baseline rev (e.g. ktesio-engine)
-#   <new-name>      package name in the current tree (e.g. hemaka-engine)
+#   <new-name>      package name in the current tree (e.g. hekma-engine)
 #   <fixture-src>   path to the consumer fixture's main.rs
 set -euo pipefail
 

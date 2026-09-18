@@ -1,11 +1,11 @@
 ---
 title: Release Process
-description: How Hemaka release tags build binaries, publish crates, update Homebrew, and refresh release documentation.
+description: How Hekma release tags build binaries, publish crates, update Homebrew, and refresh release documentation.
 ---
 
 # Release Process
 
-Hemaka releases (v0.8.0+; the pre-rename Ktesio line ended at v0.7.0) are driven by git tags.
+Hekma releases (v0.8.0+; the pre-rename Ktesio line ended at v0.7.0) are driven by git tags.
 
 ## Tag Format
 
@@ -31,7 +31,7 @@ When a `v*` tag is pushed, `.github/workflows/release.yml`:
 3. Generates per-asset `.sha256` files and one aggregate checksum file.
 4. Creates a draft GitHub Release for the tag.
 5. Uploads all release assets.
-6. Publishes the `hemaka` crate to crates.io (the pre-rename `ktesio` crate is frozen at 0.7.0, preserved, never yanked).
+6. Publishes the `hekma` crate to crates.io (the pre-rename `ktesio` crate is frozen at 0.7.0, preserved, never yanked).
 7. Publishes the GitHub Release with a clean asset table.
 8. Updates the Homebrew tap formula for macOS Intel, macOS Apple Silicon, and Linux x64.
 9. Opens a pull request updating `CHANGELOG.md` and `docs/RELEASE_NOTES.md`.
@@ -43,27 +43,27 @@ The docs PR happens after the tag because a tag points at an existing commit. Th
 Release tags publish the crate package to crates.io as:
 
 ```text
-hemaka
+hekma
 ```
 
-The installed binaries are `hemaka` and `maka` (one package, two commands),
+The installed binaries are `hekma` and `hkm` (one package, two commands),
 so users can install them with:
 
 ```bash
-cargo install hemaka
+cargo install hekma
 ```
 
 Configure this repository secret before publishing a tag:
 
-- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access to the `hemaka` crate.
+- `CARGO_REGISTRY_TOKEN`: crates.io API token with publish access to the `hekma` crate.
 
 The workflow verifies that `Cargo.toml` version matches the tag without the leading `v`. If the crate version is already published, the workflow skips the publish step so release reruns stay safe.
 
 ## Publishing the Engine Crates
 
 Story 7-4 prepared everything needed to publish the embedding crates
-(`hemaka-engine` + `hemaka-adapter-api`, plus the engine's builtin-adapter
-dependency `hemaka-adapters-hermes`) and executed none of it. **Every HOLD
+(`hekma-engine` + `hekma-adapter-api`, plus the engine's builtin-adapter
+dependency `hekma-adapters-hermes`) and executed none of it. **Every HOLD
 gate below opens only on Islam's explicit go** (the standing non-negotiable:
 no deployments, no releases, no tags, nothing that costs money). Until that
 go, all four internal crate manifests still carry `publish = false` (pinned
@@ -85,20 +85,20 @@ re-confirmation.
 1. CI green on `main`: fmt, clippy, the 3-OS test matrix, boundary, semver,
    coverage, docs.
 2. **Versions set and concrete.** The release version bump is a real commit:
-   the root `[workspace.package]` `version` (inherited by the `hemaka` CLI
+   the root `[workspace.package]` `version` (inherited by the `hekma` CLI
    crate) bumped to the release version, the crate-level versions confirmed
-   (`0.1.0` today for `hemaka-adapter-api`, `hemaka-adapters-hermes`,
-   `hemaka-engine`), and `CHANGELOG.md` / `docs/RELEASE_NOTES.md` current for
+   (`0.1.0` today for `hekma-adapter-api`, `hekma-adapters-hermes`,
+   `hekma-engine`), and `CHANGELOG.md` / `docs/RELEASE_NOTES.md` current for
    everything shipping. The tag in step 6 goes ON that release commit.
 3. **Registry identity.** `cargo login` has been run locally with an account
-   that will own the `hemaka-*` crate names (this is what the manual `cargo
+   that will own the `hekma-*` crate names (this is what the manual `cargo
    publish` steps authenticate with; `CARGO_REGISTRY_TOKEN` is the CI
    secret the tag workflow uses), and the one-time name-availability check
    below returned 404 (available) for all three.
 4. **Dependency chain closed.** Every NORMAL dependency of the three
    publishable crates is either external (already on crates.io) or named in
-   this chain. Today that is exactly `hemaka-adapter-api` +
-   `hemaka-adapters-hermes` (both in the chain). If a new internal crate has
+   this chain. Today that is exactly `hekma-adapter-api` +
+   `hekma-adapters-hermes` (both in the chain). If a new internal crate has
    since become a normal dependency, add it to the chain AHEAD of its
    dependents — the recovery is always "publish the missing dependency
    first", never a `--allow` style bypass.
@@ -112,7 +112,7 @@ One-time name-availability check (expect `404` = available today; a `200`
 means the name is TAKEN — stop and reconcile before anything else):
 
 ```bash
-for crate in hemaka-adapter-api hemaka-adapters-hermes hemaka-engine; do
+for crate in hekma-adapter-api hekma-adapters-hermes hekma-engine; do
   printf '%s: ' "$crate"
   curl -s -o /dev/null -w '%{http_code}\n' "https://crates.io/api/v1/crates/$crate"
 done
@@ -121,9 +121,9 @@ done
 ### Safe rehearsals (purely local, allowed any time)
 
 ```bash
-cargo package --list -p hemaka-adapter-api
-cargo package --list -p hemaka-adapters-hermes
-cargo package --list -p hemaka-engine
+cargo package --list -p hekma-adapter-api
+cargo package --list -p hekma-adapters-hermes
+cargo package --list -p hekma-engine
 ```
 
 `cargo package --list` builds nothing remote and contacts no registry. Even
@@ -135,15 +135,15 @@ it against the real registry without the go.
 Order matters (precondition 4): crates.io refuses a package whose normal
 dependencies are not already published, so the chain is adapter-api →
 adapters-hermes → engine, each reviewed, then a from-crates.io host probe
-BEFORE the tag (which releases the `hemaka` CLI crate, the binaries, the
+BEFORE the tag (which releases the `hekma` CLI crate, the binaries, the
 GitHub Release, and the Homebrew tap update in one automated sweep).
 
 **Step 0 — flip the publish flags (part of the same go).** Remove
-`publish = false` from `crates/hemaka-adapter-api/Cargo.toml`,
-`crates/hemaka-adapters-hermes/Cargo.toml`, and
-`crates/hemaka-engine/Cargo.toml`, and update the three PUBLISH-HELD
+`publish = false` from `crates/hekma-adapter-api/Cargo.toml`,
+`crates/hekma-adapters-hermes/Cargo.toml`, and
+`crates/hekma-engine/Cargo.toml`, and update the three PUBLISH-HELD
 comments, in the release commit from precondition 2.
-(`hemaka-conformance` KEEPS its flag — it is the dev/test kit, nothing
+(`hekma-conformance` KEEPS its flag — it is the dev/test kit, nothing
 published depends on it, and publishing it is a separate, undecided step.)
 Note: this flip intentionally FAILS the `test_automation.py` hold-pin until
 it lands as this step — that is the pin working.
@@ -153,8 +153,8 @@ immutable: there is no true delete, only yank. Before EACH publish, build and
 review the exact tarball that would be uploaded:
 
 ```bash
-cargo package --no-verify -p hemaka-adapter-api
-tar -tzf target/package/hemaka-adapter-api-0.2.0.crate
+cargo package --no-verify -p hekma-adapter-api
+tar -tzf target/package/hekma-adapter-api-0.2.0.crate
 ```
 
 (Read the version off the manifest; extract the `.crate` — a plain
@@ -162,35 +162,48 @@ tar -tzf target/package/hemaka-adapter-api-0.2.0.crate
 stray files, version and description match.) Release-surface changes (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata) get the TWO-PASS review treatment — see "Two-pass review covers the release surface (AI-55)" in `AGENTS.md`. Then, one at a time, each
 **HOLD — requires Islam's explicit go**:
 
-1. `cargo +stable publish --locked -p hemaka-adapter-api`
-2. `cargo +stable publish --locked -p hemaka-adapters-hermes` (a normal
+1. `cargo +stable publish --locked -p hekma-adapter-api`
+2. `cargo +stable publish --locked -p hekma-adapters-hermes` (a normal
    dependency of the engine — step 3 fails without it)
-3. `cargo +stable publish --locked -p hemaka-engine`
+3. `cargo +stable publish --locked -p hekma-engine`
 
 A transient registry error: re-running that exact step is safe (crates.io
 rejects duplicates).
+
+**Steps 3a–3c — the one-shot deprecation shims (v0.8.0 cutover, ratified
+2026-09-16).** With the `hekma-*` libraries now live (steps 1–3), publish
+the FINAL versions of the pre-rename names — each a one-time deprecation
+shim under `deprecated/` that re-exports its renamed crate so existing
+`use ktesio_*::…` paths keep compiling after `cargo update`:
+`ktesio-engine` 0.3.1 → `ktesio-adapter-api` 0.1.1 →
+`ktesio-adapters-hermes` 0.1.1. Review each tarball first
+(`cargo package --no-verify`, as steps 1–3). NEVER publish another
+version under these names, and do NOT shim the `ktesio` CLI crate (a
+bin-less final version would break old `kt` binaries' harmless
+`cargo install ktesio --force` reinstall). **HOLD — each publish
+requires Islam's explicit go.**
 
 **Step 4 — POST-PUBLISH VERIFY, before the tag (cheap and decisive).** Prove
 the uploaded crate resolves for a real host from a FRESH out-of-tree project
 with no git/path override:
 
 ```bash
-cargo new /tmp/hemaka-host-probe
-cd /tmp/hemaka-host-probe
-cargo add hemaka-engine@0.4.0
+cargo new /tmp/hekma-host-probe
+cd /tmp/hekma-host-probe
+cargo add hekma-engine@0.4.0
 cargo build
 ```
 
-Only when this build pulls `hemaka-engine` from crates.io and compiles does
+Only when this build pulls `hekma-engine` from crates.io and compiles does
 the chain proceed — the tag below fires release automation, and it must never
 fire ahead of a broken publish. Same go; recorded checkpoint.
 
 **Step 5 — POST-PUBLISH DOCS flip (the docs-currency gate).** On `main`,
 in the same release-commit series: switch [Embedding the
 engine](embedding.md)'s dependency form from the git pin to the published
-version line (`hemaka-engine = "0.3"`) and rewrite its Availability section
+version line (`hekma-engine = "0.3"`) and rewrite its Availability section
 from held to published; update the ONE remaining PUBLISH-HELD comment
-(`hemaka-conformance`'s, whose flag stays); move the held-block banners in
+(`hekma-conformance`'s, whose flag stays); move the held-block banners in
 `CHANGELOG.md` / `docs/RELEASE_NOTES.md` into their release sections per
 their placement notes. **HOLD — requires Islam's explicit go.**
 
@@ -254,18 +267,18 @@ widen a gate or an allowlist to make a baseline pass.
   Context: the gate forced the version (the crates.io loop's second firing —
   epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
   against the published 0.2.0; the source bump landed as `394e660`).
-- **hemaka-* first publishes — PENDING (not yet executed).** The renamed
-  crates (`hemaka-adapter-api` 0.2.0, `hemaka-adapters-hermes` 0.2.0,
-  `hemaka-engine` 0.4.0) have ZERO published versions as of this writing;
+- **hekma-* first publishes — PENDING (not yet executed).** The renamed
+  crates (`hekma-adapter-api` 0.2.0, `hekma-adapters-hermes` 0.2.0,
+  `hekma-engine` 0.4.0) have ZERO published versions as of this writing;
   their publishes are steps of the v0.8.0 cutover (spec §5), each on its
   own go, BEFORE the tag. The historical entries above document the
   KTESIO-named publishes.
-- **Hemaka rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
-  recorded in docs/proposals/hemaka-migration-spec-draft.md): product Hemaka;
-  binaries `hemaka` + `maka`; `kt` dropped (clean break, D7); crate `hemaka`
+- **Hekma rename (v0.8.0) — RATIFIED 2026-09-16** (owner decisions D1–D8,
+  recorded in docs/proposals/hekma-migration-spec-draft.md): product Hekma;
+  binaries `hekma` + `hkm`; `kt` dropped (clean break, D7); crate `hekma`
   (ktesio frozen at 0.7.0); libraries continue their lines (engine 0.4.0,
   adapter-api 0.2.0, adapters-hermes 0.2.0); docs canonical at
-  hemaka.ktesio.dev; NO compatibility window on release artifacts (D4) —
+  hekma.ktesio.dev; NO compatibility window on release artifacts (D4) —
   migration via the installer for ALL old versions (D5). Semver baselines:
   the pre-rename freeze revs cannot serve same-name diffs, so the rename
   SURFACE CHECK (external consumers, scripts/rename_surface_check.sh) holds
@@ -288,10 +301,10 @@ widen a gate or an allowlist to make a baseline pass.
 Homebrew publishing updates a tap formula from the release checksums. By default, the workflow writes:
 
 ```text
-Formula/hemaka.rb
+Formula/hekma.rb
 ```
 
-plus the tap-root `formula_renames.json` (`{"ktesio": "hemaka"}`), so
+plus the tap-root `formula_renames.json` (`{"ktesio": "hekma"}`), so
 `brew install|upgrade ktesio` resolves to the renamed formula and legacy
 kegs migrate on upgrade. Both are written by the tag workflow (other
 `formula_renames.json` entries are preserved).
@@ -335,9 +348,9 @@ repository. The installer endpoint should be configured through the Pages
 custom-domain flow before relying on DNS records alone.
 
 The installer binary fallback resolves the latest GitHub Release, downloads the
-matching archive and `.sha256` file, verifies the checksum, and installs `hemaka` + `maka`.
-The canonical v0.8.0+ installer URLs add the `/hemaka/` prefix
-(`cli.ktesio.dev/hemaka/install.sh|.ps1`); `scripts/public/_redirects` makes
+matching archive and `.sha256` file, verifies the checksum, and installs `hekma` + `hkm`.
+The canonical v0.8.0+ installer URLs add the `/hekma/` prefix
+(`cli.ktesio.dev/hekma/install.sh|.ps1`); `scripts/public/_redirects` makes
 those routes rewrites of the root files (single source, no duplication), and
 the legacy root URLs keep serving.
 Keep the asset names below stable or update `scripts/public/install.sh`,
@@ -360,14 +373,14 @@ python3 scripts/generate_release_docs.py v0.1.0 --update-files
 ## Asset Names
 
 ```text
-hemaka-<tag>-x86_64-apple-darwin.tar.gz
-hemaka-<tag>-aarch64-apple-darwin.tar.gz
-hemaka-<tag>-x86_64-pc-windows-msvc.zip
-hemaka-<tag>-x86_64-unknown-linux-gnu.tar.gz
-hemaka-<tag>-checksums.txt
+hekma-<tag>-x86_64-apple-darwin.tar.gz
+hekma-<tag>-aarch64-apple-darwin.tar.gz
+hekma-<tag>-x86_64-pc-windows-msvc.zip
+hekma-<tag>-x86_64-unknown-linux-gnu.tar.gz
+hekma-<tag>-checksums.txt
 ```
 
-Each archive carries BOTH binaries (`hemaka` + `maka`). There is NO legacy
+Each archive carries BOTH binaries (`hekma` + `hkm`). There is NO legacy
 `ktesio-*` asset family (ratified no-compatibility-window decision,
 2026-09-16): old `kt` self-updaters cannot reach these releases and the
 curl installer is the documented migration path (docs/migration.md).

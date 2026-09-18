@@ -6,20 +6,20 @@ import { Provider } from './provider';
 
 export const metadata: Metadata = {
   description:
-    'Developer documentation for Hemaka, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
-  metadataBase: new URL('https://hemaka.ktesio.dev'),
+    'Developer documentation for Hekma, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
+  metadataBase: new URL('https://hekma.ktesio.dev'),
   openGraph: {
     description:
-      'Developer documentation for Hemaka, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
-    images: ['/assets/hemaka-banner.png'],
-    siteName: 'Hemaka Docs',
-    title: 'Hemaka Docs',
+      'Developer documentation for Hekma, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
+    images: ['/assets/hekma-banner.png'],
+    siteName: 'Hekma Docs',
+    title: 'Hekma Docs',
     type: 'website',
     url: '/',
   },
   title: {
-    default: 'Hemaka Docs',
-    template: '%s | Hemaka Docs',
+    default: 'Hekma Docs',
+    template: '%s | Hekma Docs',
   },
 };
 
