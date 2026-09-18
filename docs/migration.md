@@ -46,7 +46,7 @@ then remove it at your leisure.
 | State env `KTESIO_STATE_DIR` | still works — **and** `HEKMA_STATE_DIR` is accepted |
 | `KTESIO_NO_UPDATE_CHECK` | still works — **and** `HEKMA_NO_UPDATE_CHECK` |
 | `KTESIO_INSTALL_METHOD/_DIR/_DRY_RUN` | still work — **and** the `HEKMA_*` equivalents |
-| Docs `docs.ktesio.dev` | `hekma.ktesio.dev` (the old host redirects) |
+| Docs `docs.ktesio.dev` | `hekma.ktesio.dev` — update bookmarks; the old host is retired |
 
 Unchanged: JSON output shapes and schema versions, exit codes 0–6, the
 `KTESIO_USAGE` self-report sentinel agents emit, the `KTESIO_MEMORY_DIR`
@@ -100,7 +100,7 @@ cargo uninstall ktesio
 ### Manual binary (curl archive or direct download)
 
 Download the `hekma-v<version>-<target>` archive from
-[GitHub Releases](https://github.com/Ktesio/ktesio/releases), unpack, and
+[GitHub Releases](https://github.com/Ktesio/hekma/releases), unpack, and
 place **both** `hekma` and `hkm` on your `PATH` (beside your old `kt` is
 fine). The installer does this for you; if you migrate by hand, both
 binaries must come from the same release so they stay version-matched.

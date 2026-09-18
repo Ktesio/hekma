@@ -7,16 +7,12 @@ name: Docs Probe
 # watcher: a scheduled probe that curls every registered docs page and
 # fails, naming the dead page, when any of them stops serving.
 #
-# v0.8.0 Hekma rename: the probe now checks TWO surfaces separately —
-#   1. CANONICAL content at hekma.ktesio.dev (every registered page must
-#      answer HTTP 200);
-#   2. LEGACY redirects: every docs.ktesio.dev page must answer 3xx with
-#      a Location pointing at the canonical host (a 200 from the legacy
-#      host means the redirect is MISSING; a 404 means it broke).
-# Cutover note: the canonical host serves only after the (gated, outside-
-# repo-CI) Cloudflare deploy; between landing this workflow and that
-# deploy the probe is EXPECTED red on the canonical leg — run the hosting
-# cutover in the same session as the release (migration spec §6.6).
+# v0.8.0 Hekma rename (amended 2026-09-18): the probe checks the
+# CANONICAL host hekma.ktesio.dev (every registered page must answer
+# HTTP 200) plus the installer URLs at cli.ktesio.dev. The legacy
+# retired legacy host is repurposed by the owner for
+# something else, so there is no redirect and nothing to probe here;
+# old docs links must point at the canonical host.
 #
 # Deliberately a SEPARATE workflow with no `needs:` coupling and no
 # dependency on the CI job graph: the probe must run (and fail) even when
@@ -40,7 +36,7 @@ permissions:
 
 jobs:
   probe:
-    name: probe hekma.ktesio.dev + legacy redirects
+    name: probe hekma.ktesio.dev
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -93,40 +89,6 @@ jobs:
             exit 1
           fi
           echo "Canonical probe green: every registered page serves HTTP 200."
-
-      - name: Probe every legacy docs.ktesio.dev page for a redirect (3xx to canonical)
-        # A 200 from the LEGACY host is a FAILURE here: it means the redirect
-        # to the canonical host is missing and two live copies can drift
-        # apart (the exact split-brain the Aug 2026 incident made possible).
-        # The Location header must name the canonical host.
-        shell: bash
-        run: |
-          set -euo pipefail
-          legacy="https://docs.ktesio.dev"
-          canonical="https://hekma.ktesio.dev"
-          bad=0
-          pages="$(jq -r '.pages[] | select(startswith("---") | not)' docs/meta.json)"
-          while IFS= read -r page; do
-            case "$page" in
-              README) url="$legacy/" ;;
-              RELEASE_NOTES) url="$legacy/release-notes" ;;
-              *) url="$legacy/$page" ;;
-            esac
-            headers="$(curl --silent --show-error --max-time 30 -o /dev/null -D - "$url")" || headers=""
-            code="$(printf '%s\n' "$headers" | head -1 | grep -oE '[0-9]{3}' || printf '000')"
-            location="$(printf '%s\n' "$headers" | tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -1)"
-            if [ "${code:0:1}" = "3" ] && printf '%s' "$location" | grep -q "$canonical"; then
-              echo "ok   $url -> $location"
-            else
-              echo "::error::legacy page $url answered HTTP $code (Location: ${location:-<none>}) — expected a 3xx redirect to $canonical. A 200 here means the redirect is MISSING (split-brain risk); a 404/5xx means it broke."
-              bad=$((bad + 1))
-            fi
-          done <<< "$pages"
-          if [ "$bad" -gt 0 ]; then
-            echo "::error::$bad legacy docs.ktesio.dev pages do not redirect to the canonical host."
-            exit 1
-          fi
-          echo "Legacy redirect probe green: every legacy page 3xx-redirects to $canonical."
 
       - name: Probe the canonical installer URLs (cli.ktesio.dev)
         # The v0.8.0 install commands point at cli.ktesio.dev/hekma/install.sh|.ps1

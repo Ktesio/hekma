@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = "Ktesio/ktesio"
+REPO = "Ktesio/hekma"
 TARGETS = [
     ("macOS Intel", "x86_64-apple-darwin", "tar.gz"),
     ("macOS Apple Silicon", "aarch64-apple-darwin", "tar.gz"),

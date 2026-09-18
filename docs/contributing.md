@@ -10,7 +10,7 @@ This page is the hands-on development guide. For project rules and the Contribut
 ## Setup
 
 ```bash
-git clone https://github.com/Ktesio/ktesio.git
+git clone https://github.com/Ktesio/hekma.git
 cd hekma
 cargo build
 cargo test --workspace --all-targets

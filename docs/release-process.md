@@ -235,7 +235,7 @@ widen a gate or an allowlist to make a baseline pass.
 ### Decision log
 
 - **Publish go:** GRANTED 2026-09-09 — Islam's explicit go recorded on the release-tracking issue
-  [#176](https://github.com/Ktesio/ktesio/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
+  [#176](https://github.com/Ktesio/hekma/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
   kt/tag v0.7.0, #168 dispositions ratified in the same decision round). Steps 0–7 executed by the
   orchestrator same day. The one-time name check returned 200 for all three names — reconciled as
   Islam's OWN v0.0.1 placeholder reservations (created 2026-07-03, owners verified = iMagdy), so
@@ -352,7 +352,7 @@ automation-focused `scripts/` directory.
 Pages configuration:
 
 - Project: `ktesio-cli`
-- Repository: `Ktesio/ktesio`
+- Repository: `Ktesio/hekma`
 - Production branch: `main`
 - Build command: `exit 0`
 - Output directory: `scripts/public`

@@ -7,7 +7,7 @@ description: Repository hardening checks and evidence for the public Hekma GitHu
 
 Status date: 2026-07-01.
 
-This checklist tracks repository-level hardening for the public `Ktesio/ktesio`
+This checklist tracks repository-level hardening for the public `Ktesio/hekma`
 repository. Treat the GitHub API, workflow results, and repository files as the
 source of truth.
 
@@ -28,8 +28,8 @@ source of truth.
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio`
-- `gh api repos/Ktesio/ktesio/license`
+- `gh api repos/Ktesio/hekma`
+- `gh api repos/Ktesio/hekma/license`
 - Observed: `license.spdx_id` is `null` and GitHub displays the custom license as "Other"; the fetched `LICENSE` is titled "Ktesio Noncommercial-Attribution License 1.0.0" (PolyForm Noncommercial 1.0.0 terms plus the Attribution condition).
 
 ## Branch And Tag Rulesets
@@ -54,9 +54,9 @@ Evidence:
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio/rulesets`
-- `gh api repos/Ktesio/ktesio/rulesets/17082021`
-- `gh api repos/Ktesio/ktesio/rulesets/17082811`
+- `gh api repos/Ktesio/hekma/rulesets`
+- `gh api repos/Ktesio/hekma/rulesets/17082021`
+- `gh api repos/Ktesio/hekma/rulesets/17082811`
 
 Note: last push approval is useful when another maintainer can approve a
 maintainer-pushed fix. With only one direct maintainer, it turns normal reviewed
@@ -77,9 +77,9 @@ contribution flow into routine admin bypass.
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio/actions/permissions`
-- `gh api repos/Ktesio/ktesio/actions/permissions/selected-actions`
-- `gh api repos/Ktesio/ktesio/actions/permissions/workflow`
+- `gh api repos/Ktesio/hekma/actions/permissions`
+- `gh api repos/Ktesio/hekma/actions/permissions/selected-actions`
+- `gh api repos/Ktesio/hekma/actions/permissions/workflow`
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
 
@@ -98,13 +98,13 @@ Evidence:
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio/private-vulnerability-reporting`
-- `gh api -i repos/Ktesio/ktesio/vulnerability-alerts`
-- `gh api repos/Ktesio/ktesio/automated-security-fixes`
-- `gh api repos/Ktesio/ktesio/code-scanning/default-setup`
-- `gh api repos/Ktesio/ktesio/code-scanning/alerts`
-- `gh api repos/Ktesio/ktesio/secret-scanning/alerts`
-- `gh api repos/Ktesio/ktesio/dependabot/alerts`
+- `gh api repos/Ktesio/hekma/private-vulnerability-reporting`
+- `gh api -i repos/Ktesio/hekma/vulnerability-alerts`
+- `gh api repos/Ktesio/hekma/automated-security-fixes`
+- `gh api repos/Ktesio/hekma/code-scanning/default-setup`
+- `gh api repos/Ktesio/hekma/code-scanning/alerts`
+- `gh api repos/Ktesio/hekma/secret-scanning/alerts`
+- `gh api repos/Ktesio/hekma/dependabot/alerts`
 
 ## Community Health Files
 
@@ -125,8 +125,8 @@ Evidence:
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio/community/profile`
-- `gh api repos/Ktesio/ktesio/contents/.github/ISSUE_TEMPLATE`
+- `gh api repos/Ktesio/hekma/community/profile`
+- `gh api repos/Ktesio/hekma/contents/.github/ISSUE_TEMPLATE`
 - Local files in the repository root and `.github/`
 
 ## Dependency And Maintenance Automation
@@ -142,8 +142,8 @@ Evidence:
 Evidence:
 
 - `.github/dependabot.yml`
-- `gh pr list --repo Ktesio/ktesio --state open`
-- `gh api repos/Ktesio/ktesio/labels`
+- `gh pr list --repo Ktesio/hekma --state open`
+- `gh api repos/Ktesio/hekma/labels`
 
 ## Release Readiness
 
@@ -155,9 +155,9 @@ Evidence:
 
 Evidence:
 
-- `gh api repos/Ktesio/ktesio/environments`
-- `gh api repos/Ktesio/ktesio/environments/release/secrets`
-- `gh api repos/Ktesio/ktesio/actions/variables`
+- `gh api repos/Ktesio/hekma/environments`
+- `gh api repos/Ktesio/hekma/environments/release/secrets`
+- `gh api repos/Ktesio/hekma/actions/variables`
 
 The unchecked release secrets are intentionally not filled with placeholder
 values. They require real credentials with publish access to crates.io and the
@@ -174,4 +174,4 @@ Homebrew tap repository.
 Evidence:
 
 - Local command output from the hardening work.
-- `gh api repos/Ktesio/ktesio/commits/main/check-runs`
+- `gh api repos/Ktesio/hekma/commits/main/check-runs`

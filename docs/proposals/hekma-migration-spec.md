@@ -33,6 +33,19 @@ supplied 2026-09-16** (2160×728 PNG, `hekma.png`) and is installed at
 banner was replaced by the corrected one in the same branch). PR #186's
 older Nomarch iteration is moot.
 
+### D2 amendment + 0.8.1 URL flip (2026-09-18, owner)
+
+docs.ktesio.dev will be REPURPOSED for something else — NO redirect to
+the canonical host (amends D2's "docs.ktesio.dev 308 -> canonical").
+The docs-probe legacy-redirect leg was removed accordingly (the legacy
+host is no longer ours to check); old docs links must point at
+hekma.ktesio.dev. The 0.8.1 release flips
+all canonical repo URLs to github.com/Ktesio/hekma (manifests,
+README/badges, installers, self-update + update-check endpoints,
+generators, docs). Historical records (CHANGELOG/RELEASE_NOTES history,
+decision log, LICENSE/CLA, published deprecated-shim manifests) keep
+the old path — GitHub's 301 redirect covers it permanently.
+
 ## 2. Implementation state (branch `feat/hekma-migration`)
 
 | Commit | Scope |

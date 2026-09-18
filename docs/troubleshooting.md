@@ -116,7 +116,7 @@ from GitHub Releases. A checksum mismatch usually means the download was
 interrupted, cached incorrectly, or replaced by a network proxy.
 
 Retry the installer. If the error repeats, download the archive and checksum
-from [GitHub Releases](https://github.com/Ktesio/ktesio/releases) directly and
+from [GitHub Releases](https://github.com/Ktesio/hekma/releases) directly and
 compare them locally before installing.
 
 ## Installer Refuses to Overwrite `hekma`
@@ -159,7 +159,7 @@ cargo install hekma --force
 For manual installs, Hekma downloads the latest release archive and its
 `.sha256` file from GitHub Releases. Retry the command if the download was
 interrupted. If checksum verification keeps failing, download the archive and
-checksum from [GitHub Releases](https://github.com/Ktesio/ktesio/releases) and
+checksum from [GitHub Releases](https://github.com/Ktesio/hekma/releases) and
 compare them locally before replacing the binary.
 
 If your platform does not have a prebuilt release archive, install with Cargo:

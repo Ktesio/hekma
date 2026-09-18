@@ -753,7 +753,7 @@ mod tests {
     fn test_cli_help_includes_license_and_repository() {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("License: Ktesio Noncommercial-Attribution License 1.0.0"));
-        assert!(help.contains("Repository: https://github.com/Ktesio/ktesio"));
+        assert!(help.contains("Repository: https://github.com/Ktesio/hekma"));
     }
 
     #[test]

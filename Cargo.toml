@@ -9,10 +9,10 @@ members = [
 ]
 
 [workspace.package]
-# v0.8.0 (D3, ratified 2026-09-16): the Hekma debut — continues the ktesio
-# CLI line (published ktesio 0.7.0 stays frozen on crates.io). Library
-# crates continue their own lines under the hekma-* names.
-version = "0.8.0"
+# v0.8.1: the canonical-URL flip to github.com/Ktesio/hekma (the repo
+# rename happened after v0.8.0 shipped; release URLs never depended on
+# the redirect). Continues the hekma line begun at 0.8.0.
+version = "0.8.1"
 edition = "2021"
 # Minimum supported Rust version. Floor is set by the bundled-SQLite build:
 # rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
@@ -20,8 +20,8 @@ edition = "2021"
 # `rust-version.workspace = true`.
 rust-version = "1.96.1"
 license-file = "LICENSE"
-homepage = "https://github.com/Ktesio/ktesio"
-repository = "https://github.com/Ktesio/ktesio"
+homepage = "https://github.com/Ktesio/hekma"
+repository = "https://github.com/Ktesio/hekma"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }

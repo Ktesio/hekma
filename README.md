@@ -4,7 +4,7 @@
 
 # Hekma
 
-[![CI](https://github.com/Ktesio/ktesio/actions/workflows/ci.yml/badge.svg)](https://github.com/Ktesio/ktesio/actions/workflows/ci.yml)
+[![CI](https://github.com/Ktesio/hekma/actions/workflows/ci.yml/badge.svg)](https://github.com/Ktesio/hekma/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hekma.svg)](https://crates.io/crates/hekma)
 [![License](https://img.shields.io/badge/license-Ktesio%20NC--Attribution%201.0.0-blue.svg)](LICENSE)
 
@@ -69,10 +69,10 @@ brew install ktesio/tap/hekma
 >
 > Upgrading from the even older `imagdy/tap` location? Run `brew untap imagdy/tap && brew install ktesio/tap/hekma` once — the tap lives in the Ktesio org.
 
-You can also download a release archive from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), unpack it, and place `hekma` on your `PATH`, or build from source:
+You can also download a release archive from [GitHub Releases](https://github.com/Ktesio/hekma/releases), unpack it, and place `hekma` on your `PATH`, or build from source:
 
 ```bash
-git clone https://github.com/Ktesio/ktesio.git
+git clone https://github.com/Ktesio/hekma.git
 cd ktesio
 cargo install --path .
 ```
@@ -194,7 +194,7 @@ If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a
 # The kit is not published to a registry yet — depend on it by git until
 # then (a workspace-relative path like `../hekma-conformance` only works
 # inside this repository; a git dependency works for any third party):
-hekma-conformance = { git = "https://github.com/Ktesio/ktesio", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }  # pin a current rev
+hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }  # pin a current rev
 ```
 
 ```rust

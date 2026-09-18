@@ -35,7 +35,7 @@ function docsHref(href?: string) {
   }
 
   if (href === '../CONTRIBUTING.md') {
-    return 'https://github.com/Ktesio/ktesio/blob/main/CONTRIBUTING.md';
+    return 'https://github.com/Ktesio/hekma/blob/main/CONTRIBUTING.md';
   }
 
   const [path, fragment] = href.split('#', 2);
