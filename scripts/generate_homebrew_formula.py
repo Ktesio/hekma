@@ -17,16 +17,10 @@ DESCRIPTION = (
     "Run AI agents like services: supervise their lifecycle, meter real "
     "token usage, and enforce dollar budgets."
 )
-# Ktesio ships a custom license (no SPDX id exists), so Homebrew gets the
-# `:any` symbol — to Homebrew this means the license is unspecified, not
-# "any version". It must render unquoted: `license :any`.
-LICENSE = ":any"
-# Emitted above the `license` clause in the formula so the tap states the
-# real terms even though `:any` cannot name them.
-LICENSE_COMMENT = (
-    "# Hekma ships the Ktesio Noncommercial-Attribution License 1.0.0 — "
-    "source-available; commercial use requires the author's written approval."
-)
+# Standard SPDX license (v0.9.0+: fully OSS under Apache-2.0; pre-0.9.0
+# releases shipped a custom source-available license). SPDX ids are
+# strings and render quoted in the formula.
+LICENSE = "Apache-2.0"
 HOMEBREW_TARGETS = [
     ("x86_64-apple-darwin", "tar.gz"),
     ("aarch64-apple-darwin", "tar.gz"),
@@ -105,7 +99,6 @@ def render_formula(tag: str, checksums: dict[str, str]) -> str:
   desc "{DESCRIPTION}"
   homepage "https://github.com/{REPO}"
   version "{version}"
-  {LICENSE_COMMENT}
   license {license_clause()}
 
   on_macos do

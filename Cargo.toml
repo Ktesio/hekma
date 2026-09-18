@@ -9,17 +9,17 @@ members = [
 ]
 
 [workspace.package]
-# v0.8.1: the canonical-URL flip to github.com/Ktesio/hekma (the repo
-# rename happened after v0.8.0 shipped; release URLs never depended on
-# the redirect). Continues the hekma line begun at 0.8.0.
-version = "0.8.1"
+# v0.9.0: fully OSS — the Apache-2.0 license change (owner, 2026-09-18).
+# A license relicense to a PERMISSIVE terms set ships as a minor: every
+# recipient's rights only widen; pre-0.9.0 tags keep their shipped terms.
+version = "0.9.0"
 edition = "2021"
 # Minimum supported Rust version. Floor is set by the bundled-SQLite build:
 # rusqlite 0.40.1 → libsqlite3-sys 0.38.1 uses cfg_select!, stabilized in
 # 1.96.1 (builds cleanly there; 1.94.1 fails with E0658). Members inherit via
 # `rust-version.workspace = true`.
 rust-version = "1.96.1"
-license-file = "LICENSE"
+license = "Apache-2.0"
 homepage = "https://github.com/Ktesio/hekma"
 repository = "https://github.com/Ktesio/hekma"
 

@@ -29,7 +29,7 @@ Examples of larger changes:
 
 ## Contributor License Agreement
 
-Ktesio is source-available software. To keep the project's licensing clear and to let the project owner offer commercial licenses, all contributions are made under the project's Contributor License Agreement (CLA).
+Hekma is open source under the Apache License 2.0. To keep the project's licensing clear and under unified ownership, all contributions are made under the project's Contributor License Agreement (CLA).
 
 By submitting a contribution — for example, opening a pull request — you agree to the terms in [`CLA.md`](CLA.md). Under the CLA you assign your copyright in the contribution to the project owner, Islam Magdy, and receive a broad license back to keep using your own contribution for your own purposes. Contributors do not retain ownership of contributed code.
 

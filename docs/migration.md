@@ -50,8 +50,11 @@ then remove it at your leisure.
 
 Unchanged: JSON output shapes and schema versions, exit codes 0–6, the
 `KTESIO_USAGE` self-report sentinel agents emit, the `KTESIO_MEMORY_DIR`
-mock-adapter mapping, `HERMES_HOME`, the adapter contract
-(`contract_version = "1.0.0"`), and the license.
+mock-adapter mapping, `HERMES_HOME`, and the adapter contract
+(`contract_version = "1.0.0"`). **Changed with 0.9.0:** the license —
+Hekma is now fully open source under [Apache-2.0](https://github.com/Ktesio/hekma/blob/main/LICENSE);
+releases up to v0.8.1 remain under the source-available license they
+shipped with.
 
 ## Migrating each install channel
 

@@ -2,6 +2,11 @@
 
 Thank you for your interest in contributing to Ktesio ("the Project").
 
+*Scope note (2026-09-18): this Agreement covers contributions to all
+Ktesio projects, including Hekma (github.com/Ktesio/hekma). Copyright
+assignment is what allows the project to relicense — in either
+direction — under unified ownership.*
+
 This Contributor License Agreement ("Agreement") sets out the terms under which contributions are made to the Project. Its purpose is to keep the Project under clear, unified ownership so that the project owner can maintain the Project, set its license, and offer commercial licenses.
 
 By submitting a Contribution to the Project — for example, by opening a pull request, sending a patch, or otherwise providing a Contribution — You agree to the terms of this Agreement.

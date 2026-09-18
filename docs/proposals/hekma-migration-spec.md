@@ -33,7 +33,23 @@ supplied 2026-09-16** (2160×728 PNG, `hekma.png`) and is installed at
 banner was replaced by the corrected one in the same branch). PR #186's
 older Nomarch iteration is moot.
 
-### D2 amendment + 0.8.1 URL flip (2026-09-18, owner)
+### License change: Apache-2.0, CLA retained (2026-09-18, owner)
+
+The owner took the project fully OSS: LICENSE is now the canonical
+Apache License 2.0 text (copyright Islam Magdy), a NOTICE file carries
+the Ktesio attribution, and Cargo manifests use the `Apache-2.0` SPDX id
+(the deprecated/ shim manifests stay as published — immutable). The
+Homebrew formula declares `license "Apache-2.0"`. The `--help` footer
+and its drift guard match the canonical text (whitespace-normalized).
+Category-3 status resolved: the OLD category-3 references
+(LICENSE/CLA/badges/banners) were owner-authorized amendments, applied
+in v0.9.0. Releases ≤ v0.8.1 remain under the license each shipped; the
+copyright-assignment CLA is retained (scope note added) so a future
+move to BSL/PolyForm — or back — stays clean. Historical
+RELEASE_NOTES/CHANGELOG banners describing the OLD license change stay
+verbatim (they documented that moment).
+
+## 2. Implementation state
 
 docs.ktesio.dev will be REPURPOSED for something else — NO redirect to
 the canonical host (amends D2's "docs.ktesio.dev 308 -> canonical").

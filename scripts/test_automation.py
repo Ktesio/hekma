@@ -113,19 +113,11 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn('bin.install "hekma"', formula)
         self.assertIn('bin.install "hkm"', formula)
         self.assertIn('shell_output("#{bin}/hkm --version")', formula)
-        # The custom license has no SPDX id: Homebrew gets the unquoted `:any`
-        # symbol ("license unspecified"), never a quoted string, and the
-        # formula comments the real terms above the clause.
-        self.assertIn("license :any", formula)
-        self.assertNotIn('license "', formula)
-        # The LICENSE TITLE is unchanged (binding text; category-3
-        # preservation) even though the formula class renamed.
-        self.assertIn(
-            "Ktesio Noncommercial-Attribution License 1.0.0", formula
-        )
-        self.assertIn(
-            "commercial use requires the author's written approval", formula
-        )
+        # v0.9.0+: the standard SPDX id, quoted (a string, not a Ruby
+        # symbol); the old custom license is gone from the formula.
+        self.assertIn('license "Apache-2.0"', formula)
+        self.assertNotIn("license :any", formula)
+        self.assertNotIn("Noncommercial-Attribution", formula)
 
     def test_homebrew_checksum_parser_accepts_sha256sum_lines(self) -> None:
         checksums = homebrew_formula.parse_checksums(
