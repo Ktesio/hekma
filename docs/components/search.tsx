@@ -24,7 +24,7 @@ function initDB() {
   });
 }
 
-export default function KtesioSearchDialog(props: SharedProps) {
+export default function HekmaSearchDialog(props: SharedProps) {
   const { locale } = useI18n();
   const { query, search, setSearch } = useDocsSearch({
     initDB,
