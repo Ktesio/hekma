@@ -12,7 +12,7 @@ set -eu
 #     migrations install hekma+hkm beside it and print a retirement
 #     note; cargo/brew channels follow their package manager.
 #   * The legacy data directory is untouched (the engine keeps reading it).
-REPO="Ktesio/ktesio"
+REPO="Ktesio/hekma"
 TAP="ktesio/tap/hekma"
 CRATE="hekma"
 BIN="hekma"

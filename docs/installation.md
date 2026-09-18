@@ -53,7 +53,7 @@ a directory that is not on `PATH`, it prints the directory to add.
 ## Install from source
 
 ```bash
-git clone https://github.com/Ktesio/ktesio.git
+git clone https://github.com/Ktesio/hekma.git
 cd ktesio
 cargo install --path .
 ```
@@ -75,7 +75,7 @@ The crates.io package is named `hekma`; it installs the `hekma` and `hkm` binari
 
 ## Install from a release
 
-Download the archive for your platform from [GitHub Releases](https://github.com/Ktesio/ktesio/releases), then unpack it and place the `hekma` and `hkm` binaries on your `PATH`.
+Download the archive for your platform from [GitHub Releases](https://github.com/Ktesio/hekma/releases), then unpack it and place the `hekma` and `hkm` binaries on your `PATH`.
 
 Release archives use this naming pattern:
 

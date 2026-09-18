@@ -338,14 +338,13 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         # The page list is read from the site's own registry at probe time.
         self.assertIn("jq -r '.pages[] | select(startswith(\"---\") | not)' docs/meta.json", probe)
-        # v0.8.0: the probe checks the CANONICAL host (200) and the LEGACY
-        # host (must 3xx-redirect to canonical) SEPARATELY — a 200 from
-        # docs.ktesio.dev after cutover is a split-brain failure, not a pass.
+        # v0.8.0, amended 2026-09-18: the probe checks the CANONICAL host
+        # only — docs.ktesio.dev was retired (owner repurposes it), so
+        # there is no legacy-redirect leg anymore.
         self.assertIn('base="https://hekma.ktesio.dev"', probe)
-        self.assertIn('legacy="https://docs.ktesio.dev"', probe)
         self.assertIn("hekma.ktesio.dev page is DOWN", probe)
         self.assertIn("expected 200", probe)
-        self.assertIn("legacy docs.ktesio.dev pages do not redirect", probe)
+        self.assertNotIn("docs.ktesio.dev", probe)
         # The two special-case URL mappings mirror docs/lib/source.ts's
         # slugs(): README is the site root, RELEASE_NOTES serves at
         # /release-notes.

@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 # binaries; detects an existing Hekma OR legacy `kt` install and migrates
 # it along its original install channel. A retired `kt` is never deleted
 # silently — a visible note names it.
-$Repo = "Ktesio/ktesio"
+$Repo = "Ktesio/hekma"
 $Crate = "hekma"
 $Bin = "hekma.exe"
 $Hkm = "hkm.exe"

@@ -14,8 +14,8 @@ use crate::ui;
 
 const TAP: &str = "ktesio/tap/hekma";
 const CRATE: &str = "hekma";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/ktesio/releases/latest";
-const RELEASE_BASE_URL: &str = "https://github.com/Ktesio/ktesio/releases/download";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Ktesio/hekma/releases/latest";
+const RELEASE_BASE_URL: &str = "https://github.com/Ktesio/hekma/releases/download";
 
 #[cfg(not(tarpaulin_include))]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

@@ -8,10 +8,10 @@ import re
 from pathlib import Path
 
 
-# The repository is still Ktesio/ktesio at the 0.8.0 release (the gated repo
+# The repository is still Ktesio/hekma at the 0.8.0 release (the gated repo
 # rename follows AFTER the release is live, so release URLs never depend on
 # redirects); flip this with the canonical-URL change in 0.8.1.
-REPO = "Ktesio/ktesio"
+REPO = "Ktesio/hekma"
 FORMULA_CLASS = "Hekma"
 DESCRIPTION = (
     "Run AI agents like services: supervise their lifecycle, meter real "

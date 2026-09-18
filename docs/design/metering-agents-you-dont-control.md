@@ -73,7 +73,7 @@ Money gets the same suspicion. Rates are dollars per million tokens, stored as i
 }
 ```
 
-Those token totals are the ledger sums exactly, the same numbers `hekma agent list` and `hekma agent show` print. With no rate configured the dollar fields are absent rather than `0`. The code is [source-available](https://github.com/Ktesio/ktesio), so every sentence in this section can be checked against it.
+Those token totals are the ledger sums exactly, the same numbers `hekma agent list` and `hekma agent show` print. With no rate configured the dollar fields are absent rather than `0`. The code is [source-available](https://github.com/Ktesio/hekma), so every sentence in this section can be checked against it.
 
 ## What the meter can't see
 
