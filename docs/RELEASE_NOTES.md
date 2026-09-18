@@ -76,6 +76,32 @@ The tag workflow updates the GitHub Release immediately and then opens a pull re
 > **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hekma-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh`), or `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEKMA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](migration.md).
 
 
+## v0.8.1
+
+Comparison: [v0.8.0...v0.8.1](https://github.com/Ktesio/hekma/compare/v0.8.0...v0.8.1)
+
+| Platform | Target | Archive | Checksum |
+|----------|--------|---------|----------|
+| macOS Intel | `x86_64-apple-darwin` | [hekma-v0.8.1-x86_64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-apple-darwin.tar.gz.sha256) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | [hekma-v0.8.1-aarch64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-aarch64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-aarch64-apple-darwin.tar.gz.sha256) |
+| Windows x64 | `x86_64-pc-windows-msvc` | [hekma-v0.8.1-x86_64-pc-windows-msvc.zip](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-pc-windows-msvc.zip) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-pc-windows-msvc.zip.sha256) |
+| Linux x64 | `x86_64-unknown-linux-gnu` | [hekma-v0.8.1-x86_64-unknown-linux-gnu.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-unknown-linux-gnu.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-x86_64-unknown-linux-gnu.tar.gz.sha256) |
+| All | checksums | [hekma-v0.8.1-checksums.txt](https://github.com/Ktesio/hekma/releases/download/v0.8.1/hekma-v0.8.1-checksums.txt) | - |
+
+### Fixes
+
+- matrix REPO -> Ktesio/hekma (canonical post-rename) ([3377a2d](https://github.com/Ktesio/hekma/commit/3377a2d))
+- drop v0.6.0 from the matrix floor — no GitHub release exists ([f2b7794](https://github.com/Ktesio/hekma/commit/f2b7794))
+- matrix harness — assert empty-fleet JSON correctly on pre-fleet hops ([24900ec](https://github.com/Ktesio/hekma/commit/24900ec))
+
+### Documentation
+
+- brew trust-gate note (verified live during the v0.8.0 cutover) ([6b2f4ed](https://github.com/Ktesio/hekma/commit/6b2f4ed))
+
+### Maintenance
+
+- v0.8.1 — canonical URLs to Ktesio/hekma; docs probe drops the retired legacy host ([74fdcae](https://github.com/Ktesio/hekma/commit/74fdcae))
+
 ## v0.8.0
 
 Comparison: [v0.7.0...v0.8.0](https://github.com/Ktesio/ktesio/compare/v0.7.0...v0.8.0)
