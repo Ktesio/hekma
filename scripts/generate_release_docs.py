@@ -58,7 +58,7 @@ def main() -> int:
     if args.update_files:
         upsert_release_section(
             ROOT / "CHANGELOG.md",
-            "# Changelog\n\nAll notable changes to Ktesio are generated from git history.\n",
+            "# Changelog\n\nAll notable changes to Hemaka (formerly Ktesio) are generated from git history.\n",
             args.tag,
             section,
         )
@@ -126,13 +126,24 @@ def render_release_body(tag: str, previous_tag: str | None, commits: list[Commit
         else "Initial release history"
     )
     lines = [
-        f"# Ktesio {tag}",
+        f"# Hemaka {tag}",
         "",
-        "Install the archive for your platform, unpack it, and place `kt` on your PATH.",
-        "",
-        "## Downloads",
+        "Install the archive for your platform, unpack it, and place `hemaka` and `maka` on your PATH.",
         "",
     ]
+    # v0.8.0+ (the Hemaka rename): every release body points kt users at
+    # the migration guide — the old self-updater cannot reach these
+    # releases by design (no compatibility window, ratified 2026-09-16).
+    if semver_key(tag) is not None and semver_key(tag) >= (0, 8, 0):
+        lines += [
+            "> **Coming from `kt` (Ktesio ≤ 0.7.0)?** Your data directory is "
+            "untouched and `kt self-update` cannot reach this release by "
+            "design — re-run the installer (or `cargo install hemaka "
+            "--force` / `brew upgrade ktesio/tap/hemaka`). See the "
+            "[migration guide](https://hemaka.ktesio.dev/migration).",
+            "",
+        ]
+    lines += ["## Downloads", ""]
     lines.extend(render_asset_table(tag))
     lines += ["", "## Changes", "", f"Comparison: {compare}", ""]
     lines.extend(render_commit_sections(commits))
@@ -165,12 +176,12 @@ def render_asset_table(tag: str) -> list[str]:
         "|----------|--------|---------|----------|",
     ]
     for platform, target, extension in TARGETS:
-        archive = f"ktesio-{tag}-{target}.{extension}"
+        archive = f"hemaka-{tag}-{target}.{extension}"
         url = f"https://github.com/{REPO}/releases/download/{tag}/{archive}"
         checksum = f"{url}.sha256"
         lines.append(f"| {platform} | `{target}` | [{archive}]({url}) | [sha256]({checksum}) |")
-    aggregate = f"https://github.com/{REPO}/releases/download/{tag}/ktesio-{tag}-checksums.txt"
-    lines.append(f"| All | checksums | [ktesio-{tag}-checksums.txt]({aggregate}) | - |")
+    aggregate = f"https://github.com/{REPO}/releases/download/{tag}/hemaka-{tag}-checksums.txt"
+    lines.append(f"| All | checksums | [hemaka-{tag}-checksums.txt]({aggregate}) | - |")
     return lines
 
 

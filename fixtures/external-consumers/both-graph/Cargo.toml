@@ -1,0 +1,13 @@
+[package]
+name = "both-graph-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone on purpose: an EXTERNAL consumer's graph, not a workspace
+# member (the root workspace must not own it).
+[workspace]
+
+[dependencies]
+ktesio-engine = "0.3.0"
+hemaka-engine = "0.4"

@@ -56,7 +56,7 @@ the authoritative wording lives in
   that only lives in a comment is a lie waiting to happen. Current exemplars (paths current as of 2026-09; if they move, follow the symbol names):
   the best-effort pause/resume qualifier note `pause`/`resume` emit to stderr
   (`note_if_best_effort` in `crates/kt/src/cli/agent.rs`); orphan-adoption
-  honesty in the engine (`ktesio-engine` supervisor + ports record the
+  honesty in the engine (`hemaka-engine` supervisor + ports record the
   exit-code-unavailable fact instead of pretending a clean read); and the
   Fleet cells' honest `—` absence token (`FleetEntry::METERING_SEED_CELL`)
   where a fabricated `0`/`$0.00` would lie.

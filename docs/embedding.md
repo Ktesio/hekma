@@ -1,11 +1,11 @@
 ---
 title: Embedding the Engine
-description: Drive the Ktesio engine as a Rust library — the facade surface, the event bus, and the hermetic quickstart example.
+description: Drive the Hemaka engine as a Rust library — the facade surface, the event bus, and the hermetic quickstart example.
 ---
 
 # Embedding the Engine
 
-Ktesio is a library first and a CLI second: the `kt` binary is itself just an
+Hemaka is a library first and a CLI second: the `hemaka` binary is itself just an
 embedder that drives the engine's public Rust facade. A hosting platform can do
 the same — register agents, configure them, enforce token and dollar budgets,
 subscribe to lifecycle events, and supervise processes, with no CLI, no TTY, and
@@ -14,11 +14,19 @@ in [Architecture](architecture.md).
 
 ## Adding the dependency
 
-The crates are published — depend on the released version:
+Until the v0.8.0 library publishes execute (see Availability below), pin
+the repository to a full-length commit SHA:
 
 ```toml
 [dependencies]
-ktesio-engine = "0.3"
+hemaka-engine = { git = "https://github.com/Ktesio/ktesio", rev = "<full commit SHA>" }
+```
+
+Once published, the version line replaces the pin:
+
+```toml
+[dependencies]
+hemaka-engine = "0.4"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -47,12 +55,12 @@ in-repo forms compile against the same facade — see the [changelog](
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
-builds), and Ktesio is **source-available**, not open source — the
+builds), and Hemaka is **source-available**, not open source — the
 [Ktesio Noncommercial-Attribution License 1.0.0](../LICENSE) keeps
 noncommercial use free and requires the author's written approval for
 commercial use.
 
-Only `ktesio-engine` is needed. It is a normal Rust dependency — the engine
+Only `hemaka-engine` is needed. It is a normal Rust dependency — the engine
 never touches your TTY, never reads stdin, holds no global process state, and
 several engines can live in one process side by side, each rooted at its own
 state directory.
@@ -61,7 +69,7 @@ state directory.
 
 Open an engine with `Engine::open(base)` and either call its `async` methods on
 your own runtime or take `engine.blocking()` for a synchronous view — the same
-surface `kt` uses. The capabilities you will reach for first:
+surface `hemaka` uses. The capabilities you will reach for first:
 
 | Facade | Purpose |
 |--------|---------|
@@ -73,7 +81,7 @@ surface `kt` uses. The capabilities you will reach for first:
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
 | `resync_events` / `Blocking::resync_events` | Backfill the committed events a subscriber missed (below). |
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
-| `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `kt agent list` renders. |
+| `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hemaka agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. |
 
@@ -106,7 +114,7 @@ Four rules cover the whole contract:
    readable through the query APIs.
 2. **Payloads are versioned structs.** Every event carries a `schema_version`
    and is one of: a lifecycle transition, a budget breach, or a committed
-   usage measurement — the exact wire shapes `kt --json` documents.
+   usage measurement — the exact wire shapes `hemaka --json` documents.
 3. **A slow subscriber never stalls supervision.** The bus is bounded; if you
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the
@@ -127,7 +135,7 @@ same truth the query APIs serve: transitions, breaches, ledger rows) and
 returns them as the exact event payloads the live bus delivers:
 
 ```rust
-use ktesio_engine::{Blocking, ResyncCursor};
+use hemaka_engine::{Blocking, ResyncCursor};
 
 // 1. Subscribe live FIRST — the gap-free order. Every commit from this
 //    moment reaches the stream, whatever the backfill does afterwards.
@@ -203,7 +211,7 @@ always have; nothing is written to stdout, ever. A host that owns its stderr
 (for a daemon, a GUI, a log pipeline) can route both into its own writer:
 
 ```rust
-use ktesio_engine::{DiagnosticSink, Engine};
+use hemaka_engine::{DiagnosticSink, Engine};
 use std::sync::{Arc, Mutex};
 
 // Any std::io::Write works — a file, a channel, an in-memory buffer.
@@ -220,7 +228,7 @@ engine.blocking().with_diagnostics(sink);
 The contract, in five rules:
 
 1. **Exact texts.** Each diagnostic arrives as one full line — the same
-   `[ktesio] `-prefixed text stderr would have received, `\n`-terminated. A
+   `[hemaka] `-prefixed text stderr would have received, `\n`-terminated. A
    sink that mirrors its input reproduces the default output byte-for-byte.
 2. **Opt-in, additive — and one-way.** Installing nothing changes nothing;
    the default path is pinned by CI as byte-identical to the historical
@@ -247,14 +255,14 @@ The contract, in five rules:
 ## The quickstart example
 
 A complete, runnable host lives at
-[`crates/ktesio-engine/examples/embedding-quickstart.rs`](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/examples/embedding-quickstart.rs).
+[`crates/hemaka-engine/examples/embedding-quickstart.rs`](https://github.com/Ktesio/ktesio/blob/main/crates/hemaka-engine/examples/embedding-quickstart.rs).
 Run it from the repository root:
 
 ```bash
-cargo run -p ktesio-engine --example embedding-quickstart
+cargo run -p hemaka-engine --example embedding-quickstart
 ```
 
-It is deliberately dependency-free — no `kt`, no test fixtures, no helper
+It is deliberately dependency-free — no `hemaka`, no test fixtures, no helper
 crates, not even `tempfile` — so it shows exactly what a host depends on. The
 seven legs, matching the numbered steps in the file:
 
@@ -286,15 +294,15 @@ ubuntu on every push — the quickstart cannot silently rot.
 
 What a host can reach is enforced by the compiler, not by convention: the
 engine's private modules are Rust-private, so **if you cannot name it, you
-cannot call it** — a host compiles against exactly the same public API `kt`
+cannot call it** — a host compiles against exactly the same public API `hemaka`
 does. Four instruments keep that statement honest:
 
 - **The dependency-shape gate** — CI's `boundary` job allowlists the internal
-  edges of the shipped CLI's graph (`cargo tree`), so `kt` cannot quietly grow
+  edges of the shipped CLI's graph (`cargo tree`), so `hemaka` cannot quietly grow
   a dependency on anything but the engine, the adapter-contract types, and the
   built-in hermes adapter; a future internal crate fails the gate
   automatically ([the workflow](https://github.com/Ktesio/ktesio/blob/main/.github/workflows/ci.yml)).
-- **The facade audits** — the embed-clean suites prove `kt` consumes only the
+- **The facade audits** — the embed-clean suites prove `hemaka` consumes only the
   blocking facade (no async APIs, no runtime of its own) and that every async
   method has a blocking counterpart, with no TTY, prompt, or global-state
   escapes.
@@ -302,7 +310,7 @@ does. Four instruments keep that statement honest:
   register → configure → cap → start → breach → pause → stop journey through
   the facade alone and shares its assertions with the CLI suite, proving the
   library path and the CLI path behave identically
-  ([the host test](https://github.com/Ktesio/ktesio/blob/main/crates/ktesio-engine/tests/uj3_library_host.rs)).
+  ([the host test](https://github.com/Ktesio/ktesio/blob/main/crates/hemaka-engine/tests/uj3_library_host.rs)).
 - **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
   bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family, and
   since story 12-3 the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),
@@ -324,13 +332,15 @@ does. Four instruments keep that statement honest:
 
 ## Availability
 
-**Published**: `ktesio-engine` 0.3 (breaking: the 0.2.0
-`EngineError::ResumeUnsupported` and the 0.3.0 detached-start surface — see
-the [changelog](../CHANGELOG.md) banners), `ktesio-adapter-api` 0.1, and
-`ktesio-adapters-hermes` 0.1 are on [crates.io](https://crates.io) (first
-release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15; engine 0.3.0,
-2026-09-16). Depend on `ktesio-engine = "0.3"` — no git dependency needed.
-The crates are
+**v0.8.0 rename state (honest):** the engine family was published on
+[crates.io](https://crates.io) under the pre-rename names — `ktesio-engine`
+0.1.0–0.3.0, `ktesio-adapter-api` 0.1.0, `ktesio-adapters-hermes` 0.1.0
+(first release v0.7.0, 2026-09-09; engine 0.2.0, 2026-09-15; engine 0.3.0,
+2026-09-16 — frozen, preserved, never yanked). The renamed `hemaka-*`
+crates debut at **0.4.0 / 0.2.0 / 0.2.0** with the v0.8.0 release runbook;
+until those publishes execute, depend on the git pin below (the runbook's
+step-5 docs flip switches this section to the published version line the
+moment they are live). The crates are
 source-available (noncommercial free; commercial use requires the author's
 written approval — see the license).
 
