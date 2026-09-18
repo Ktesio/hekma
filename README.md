@@ -8,7 +8,7 @@
 [![Crates.io](https://img.shields.io/crates/v/hekma.svg)](https://crates.io/crates/hekma)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Hekma is a [Ktesio](https://ktesio.com) project (the OSS branch lives on [ktesio.dev](https://ktesio.dev)).
+Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesio.dev](https://ktesio.dev).
 
 > **License.** Hekma is a Ktesio project, fully open source under the [Apache License 2.0](LICENSE). Contributions are made under a [CLA](CLA.md) that keeps the project under unified ownership.
 
