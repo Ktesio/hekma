@@ -11,6 +11,8 @@ Welcome to the Hekma docs. Hekma is a Rust CLI and engine that **runs AI agents 
 
 By *agent* these pages mean a third-party program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Hekma runs that program as a supervised, metered process; it is not a framework for writing agents.
 
+Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesio.dev](https://ktesio.dev) and released under the [Apache License 2.0](https://github.com/Ktesio/hekma/blob/main/LICENSE).
+
 ## Start Here
 
 - [Getting started](get-started.md)
