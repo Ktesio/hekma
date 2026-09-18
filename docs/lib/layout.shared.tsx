@@ -17,11 +17,11 @@ export function baseOptions(): BaseLayoutProps {
       {
         active: 'none',
         text: 'Crates.io',
-        url: 'https://crates.io/crates/ktesio',
+        url: 'https://crates.io/crates/hekma',
       },
     ],
     nav: {
-      title: 'Ktesio',
+      title: 'Hekma',
     },
   };
 }

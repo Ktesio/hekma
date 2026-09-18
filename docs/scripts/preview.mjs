@@ -80,5 +80,5 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Ktesio docs preview: http://${host}:${port}`);
+  console.log(`Hekma docs preview: http://${host}:${port}`);
 });
