@@ -577,10 +577,10 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self.assertEqual(
             check_release_sites,
-            1,
-            "post-rename the ONE armed check-release site is the crates.io "
-            "release-to-release loop (the pre-rename baseline diffs are "
-            "replaced by the rename surface checks); "
+            3,
+            "three armed check-release sites: the fresh post-rename "
+            "baselines pinned to 54dc79c (hekma-adapter-api + hekma-engine) "
+            "plus the crates.io release-to-release loop; "
             f"found {check_release_sites}",
         )
         # (2) The lazy install is GUARDED and ORDERED: the `command -v` probe
