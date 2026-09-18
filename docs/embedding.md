@@ -56,10 +56,9 @@ in-repo forms compile against the same facade — see the [changelog](
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
-builds), and Hekma is **source-available**, not open source — the
-[Ktesio Noncommercial-Attribution License 1.0.0](../LICENSE) keeps
-noncommercial use free and requires the author's written approval for
-commercial use.
+builds), and Hekma is fully open source under the
+[Apache License 2.0](../LICENSE) — free for commercial use, with an
+explicit patent grant.
 
 Only `hekma-engine` is needed. It is a normal Rust dependency — the engine
 never touches your TTY, never reads stdin, holds no global process state, and
@@ -342,8 +341,8 @@ api 0.1.0, ktesio-adapters-hermes 0.1.0; first release v0.7.0,
 (ktesio-engine 0.3.1, ktesio-adapter-api 0.1.1, ktesio-adapters-hermes
 0.1.1) that re-exports their hekma-* successors and will never publish
 again. The crates are
-source-available (noncommercial free; commercial use requires the author's
-written approval — see the license).
+open source under the Apache License 2.0 (free for commercial use; the
+explicit patent grant is part of the license).
 
 The publish runbook's historical HELD state is retained in
 [the release process](release-process.md) decision log.

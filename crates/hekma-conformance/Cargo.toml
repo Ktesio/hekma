@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Ktesio adapter conformance test kit (TCK) and mock adapter"
-license-file.workspace = true
+license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 # UNPUBLISHED by decision (v0.7.0 release, 2026-09-09): this dev/test kit

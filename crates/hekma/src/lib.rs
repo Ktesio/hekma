@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 // Cargo exposes no `CARGO_PKG_LICENSE` value for it (that env is empty under
 // `license-file`); the title is stated literally instead.
 const HELP_FOOTER: &str = concat!(
-    "License: Ktesio Noncommercial-Attribution License 1.0.0",
+    "License: Apache License Version 2.0 (Apache-2.0)",
     "\nRepository: ",
     env!("CARGO_PKG_REPOSITORY")
 );
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn test_cli_help_includes_license_and_repository() {
         let help = Cli::command().render_help().to_string();
-        assert!(help.contains("License: Ktesio Noncommercial-Attribution License 1.0.0"));
+        assert!(help.contains("License: Apache License Version 2.0"));
         assert!(help.contains("Repository: https://github.com/Ktesio/hekma"));
     }
 
@@ -765,17 +765,26 @@ mod tests {
         // ships. The title must appear in the binding text below the
         // separator, not just the non-binding preface.
         let license = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../LICENSE"));
-        let title = HELP_FOOTER
+        // The license title the footer claims (first line, after the
+        // prefix) — asserted against the SHIPPED LICENSE below, so a
+        // LICENSE retitle fails CI instead of the footer advertising
+        // terms the file no longer carries. (The footer's parenthetical
+        // SPDX suffix is cosmetic and not part of the match.)
+        let footer_title = HELP_FOOTER
             .strip_prefix("License: ")
             .and_then(|rest| rest.split('\n').next())
+            .and_then(|rest| rest.split(" (").next())
             .expect("HELP_FOOTER must start with the license title");
-        let binding = license
-            .split_once("\n----")
-            .map(|(_, rest)| rest)
-            .unwrap_or(license);
+        let title = footer_title;
+        // Whitespace-normalized matching: the canonical Apache-2.0 text
+        // wraps its title across lines ("Apache License\n Version 2.0"),
+        // so the title only matches after normalization. (The footer's
+        // parenthetical SPDX suffix is cosmetic and not part of the match.)
+        let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let binding = license;
         assert!(
-            binding.contains(title),
-            "LICENSE's binding terms must contain the printed license title {title:?}"
+            normalize(binding).contains(&normalize(title)),
+            "LICENSE's terms must contain the printed license title {title:?}"
         );
     }
 

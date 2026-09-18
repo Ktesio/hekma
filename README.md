@@ -6,11 +6,11 @@
 
 [![CI](https://github.com/Ktesio/hekma/actions/workflows/ci.yml/badge.svg)](https://github.com/Ktesio/hekma/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hekma.svg)](https://crates.io/crates/hekma)
-[![License](https://img.shields.io/badge/license-Ktesio%20NC--Attribution%201.0.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Hekma is a [Ktesio](https://ktesio.com) project (the OSS branch lives on [ktesio.dev](https://ktesio.dev)).
 
-> **License posture.** Hekma is a Ktesio project. It is source-available under the Ktesio Noncommercial-Attribution License 1.0.0 — not OSI open source; commercial use requires written permission from the copyright holder.
+> **License.** Hekma is a Ktesio project, fully open source under the [Apache License 2.0](LICENSE). Contributions are made under a [CLA](CLA.md) that keeps the project under unified ownership.
 
 Hekma is a Rust CLI and engine that **runs AI agents like services** — supervise their lifecycle, meter real token usage, and enforce dollar budgets. Register any agent, start and stop it under supervision, watch what it actually consumes, and set token and cost ceilings that stop runaway spend the moment they are crossed.
 
@@ -229,15 +229,15 @@ Hekma is early and moving fast. The lifecycle, layered configuration, secrets, t
 
 ## License
 
-Hekma is **source-available**, licensed under the [Ktesio Noncommercial-Attribution License 1.0.0](LICENSE).
+Hekma is **open source**, licensed under the [Apache License 2.0](LICENSE) (`Apache-2.0`).
 
-- **Noncommercial use is free.** You may use, copy, modify, and share Hekma for any noncommercial purpose under the terms of the license.
-- **Visible credit is required.** Whenever you distribute Hekma, distribute a modified version of it, use it in your own product or distribution, or operate it to provide functionality to third parties, you must prominently credit the Hekma project and its author ("Islam Magdy", the copyright holder) in at least one place a reasonable user would readily see — your product's documentation, an "About" or credits screen, or a public README all qualify. Private, internal use that reaches no third party owes no credit. See the Attribution section of the LICENSE file.
-- **Commercial use requires a separate license.** Any commercial use needs the prior written permission of the copyright holder, Islam Magdy. To request a commercial license, open an issue or contact the maintainer through the project's official channels.
+- **Free for everyone, including commercial use.** You may use, copy, modify, and distribute Hekma under the Apache-2.0 terms — no permission needed.
+- **Trademark, not license.** The Apache license grants no rights to the Ktesio/Hekma names or marks; see [TRADEMARK.md](TRADEMARK.md) for the brand policy.
+- **Patent grant included.** Apache-2.0 carries an explicit patent license from every contributor.
+- **Historical note:** releases up to and including v0.8.1 shipped under a custom source-available license (Ktesio Noncommercial-Attribution 1.0.0). Those tags stay under the license each of them shipped with; v0.9.0+ are Apache-2.0.
 
-Based on the PolyForm Noncommercial License 1.0.0 (polyformproject.org), modified: an Attribution condition has been added. This is a custom license, not a PolyForm license.
+Contributions are welcome under the project's [Contributor License Agreement](CLA.md): anyone can contribute, but you assign copyright in your contribution to the project owner so Hekma stays under unified ownership (which also keeps future licensing decisions, in either direction, clean). See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md) for details.
 
-This is source-available software, not an OSI-approved open source license.
 
 ## Contributing
 

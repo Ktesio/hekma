@@ -4,7 +4,7 @@ version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Ktesio Adapter Contract: the types and traits agent adapters implement"
-license-file.workspace = true
+license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 # PUBLISH HELD (story 7-4): the boundary is proven and the publish machinery
