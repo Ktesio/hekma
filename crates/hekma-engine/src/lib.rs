@@ -82,6 +82,11 @@
 //! [`StateStore`]: crate::ports::StateStore
 
 pub mod adapter;
+// The ACP transport core (spine AD-19, story 14-1): engine-INTERNAL — the
+// client-side codec/handshake/connection for the builtin `acp` kind. `kt`
+// never sees it; the public surface change for 14-1 is the kind's
+// registration availability only.
+mod acp;
 mod backends;
 pub mod domain;
 mod engine;

@@ -98,6 +98,14 @@ impl Supervisor {
         // effort per instance, exactly like the self-reported drain.
         self.drain_observed_all(registry);
 
+        // Then DRAIN each running acp instance's surfaced notices (story 14-1,
+        // spine AD-19): malformed lines, permission denials, usage updates,
+        // unhandled messages, and stream-end facts the reader thread queued
+        // WITHOUT ever taking the supervisor lock. Emitted here through
+        // `emit_diagnostic` (the choke point — we hold the lock), bounded by
+        // the queue cap per instance.
+        self.drain_acp_notices_all();
+
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
@@ -327,6 +335,9 @@ impl Supervisor {
                         .running
                         .get(&name)
                         .and_then(|s| self.backend.log_capture(&s.handle));
+                    // Story 14-1: surface any queued acp notices BEFORE the
+                    // connection drops with the handle.
+                    self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
                     self.running.remove(&name);
                     if registry.clear_spawn_record(&name).is_ok() {
@@ -346,6 +357,9 @@ impl Supervisor {
                     }
                     continue;
                 }
+                // Story 14-1: surface any queued acp notices before the
+                // requested-stop handle drop (the reader's EOF notice).
+                self.drain_acp_notices_for(&name);
                 self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
                 continue;
@@ -372,6 +386,10 @@ impl Supervisor {
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
             let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            // Story 14-1: surface any queued acp notices before the crashed
+            // instance's connection drops with the handle (the reader's EOF /
+            // malformed-line / permission facts must not die silently with it).
+            self.drain_acp_notices_for(&name);
             self.clear_poll_error_streak(&name);
             self.running.remove(&name);
             let base_detail = match crash {
@@ -663,9 +681,31 @@ impl Supervisor {
                             // genuinely unreadable code falls to the
                             // unavailable-code cause there.
                             adopted: true,
+                            // Story 14-1 (spine AD-19): an ADOPTED acp instance
+                            // is re-held as a bare process — its ACP pipe
+                            // halves died with the engine that spawned it, so
+                            // NO connection is re-established here (the honest
+                            // note below says so; `session/load` resume is
+                            // story 14-2).
+                            acp: None,
                         },
                     );
                     adopted += 1;
+                    // Story 14-1: surface the acp adoption honesty — the
+                    // instance is alive but this engine holds no ACP session
+                    // for it, so `send` refuses (the ordinary
+                    // adopted-instance interaction error) until a stop→start
+                    // re-establishes the transport. Surfaced-not-silent
+                    // (AI-18); the diagnostic is emitted under the supervisor
+                    // lock via the choke point.
+                    let kind = registry
+                        .lookup(&name)
+                        .map(|instance| instance.kind)
+                        .unwrap_or_default();
+                    if crate::acp::is_acp_kind(&kind) {
+                        let note = crate::acp::adopted_acp_note(name.as_str());
+                        self.emit_diagnostic(&note);
+                    }
                     // AI-46 (story 11-3): an adopted ENGINE-OBSERVED instance is
                     // stranded — the paragraph on `observed_listener: None`
                     // above documents it, but until now the engine said it

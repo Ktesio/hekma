@@ -148,6 +148,20 @@ pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
 /// snapshot (3-4's honest-provenance split, extended by 5-1's CORRECTION).
 pub const MEMORY_DIR_KEY: &str = "memory.dir";
 
+/// The engine-namespace config key for the builtin `acp` kind's launch
+/// executable (story 14-1, spine AD-19). REQUIRED at start: an `acp`
+/// instance whose `acp.command` is unset refuses honestly, naming both this
+/// key and [`ACP_ARGS_KEY`]. A validated KNOWN key (not `agent.*`
+/// pass-through); does NOT touch the Adapter Contract surface (builtin
+/// kinds do not negotiate — epic-6 B3 precedent).
+pub const ACP_COMMAND_KEY: &str = "acp.command";
+
+/// The engine-namespace config key for the builtin `acp` kind's launch
+/// arguments (story 14-1, spine AD-19). OPTIONAL: a TOML array of strings
+/// (element-wise) or a plain string (whitespace-split). A validated KNOWN
+/// key; see [`ACP_COMMAND_KEY`] for the contract.
+pub const ACP_ARGS_KEY: &str = "acp.args";
+
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
 /// delivered verbatim (the mapping into an agent's native mechanism is 2-2,
@@ -606,6 +620,14 @@ const KNOWN_KEYS: &[&str] = &[
     // CONTRACT_VERSION bump). The operator never sets it — it is a delivery
     // mechanism, not operator configuration, and is never persisted into the snapshot.
     MEMORY_DIR_KEY,
+    // Story 14-1 (spine AD-19, the builtin `acp` kind): the operator-set
+    // ACP launch keys. `acp.command` (REQUIRED at start — the executable)
+    // and `acp.args` (optional). Engine-namespace keys (NOT `agent.*`
+    // pass-through); they do NOT touch the Adapter Contract surface (the
+    // builtin kind does not negotiate — epic-6 B3 precedent). The start
+    // refuses honestly naming both keys when `acp.command` is unset.
+    ACP_COMMAND_KEY,
+    ACP_ARGS_KEY,
 ];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
@@ -1683,7 +1705,9 @@ mod tests {
         // `model` + the three story-3-2 Token-Budget keys + the four story-3-3 dollar
         // keys (Rate ×2 + Cost Cap ×2) + the two story-3-4 engine-observed metering
         // keys (the operator-set upstream URL + the engine-injected loopback base_url)
-        // + the story 5-1 engine-injected managed-memory key are the known set.
+        // + the story 5-1 engine-injected managed-memory key + the two story 14-1
+        // acp launch keys (`acp.command` required + `acp.args` optional, spine
+        // AD-19) are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1698,6 +1722,8 @@ mod tests {
                 "metering.upstream_base_url",
                 "metering.base_url",
                 "memory.dir",
+                "acp.command",
+                "acp.args",
             ]
         );
         // Story 3-4: both metering keys are known (a mapping can target them) and

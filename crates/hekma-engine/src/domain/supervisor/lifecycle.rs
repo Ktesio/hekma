@@ -213,6 +213,14 @@ impl Supervisor {
                 .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
 
+        // Story 14-1 (spine AD-19): for an `acp` instance with a turn in
+        // flight, write `session/cancel` FIRST (the bounded write; the agent
+        // aborts its turn), then proceed through the EXISTING stop ladder
+        // unchanged. Best-effort + surfaced: a cancellation that could not be
+        // delivered emits one diagnostic, and the ladder runs regardless.
+        // Pause/resume are untouched (process semantics for every kind).
+        self.cancel_in_flight_acp_turn(&name);
+
         // Drain any final self-reported usage the agent emitted before the stop, so
         // the last batch of a Run is not lost to the race between "agent printed it"
         // and "we killed the process" (story 3-1). TERMINAL drain: the process is
@@ -227,6 +235,10 @@ impl Supervisor {
         // loss — there is no next pass — and any parked buffer dies with the
         // instance.
         self.drain_observed_for(registry, &name, DrainMode::Terminal);
+        // Story 14-1: surface any queued acp notices before the transport
+        // tears down with the handle (malformed lines, permission denials,
+        // usage updates — surfaced, never lost silently to the stop).
+        self.drain_acp_notices_for(&name);
 
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
@@ -306,6 +318,11 @@ impl Supervisor {
         // reaper's proven drain-AFTER-observed-exit (see `poll_once`). Best-effort,
         // like the pre-kill drain — a drain hiccup never blocks the stop.
         self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // Story 14-1: one FINAL acp notice drain after the process is
+        // provably dead — the reader's EOF/stream-end notice is queued only
+        // once the kill closes the pipe, so this is the last chance to
+        // surface it before the connection drops with the handle below.
+        self.drain_acp_notices_for(&name);
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.clear_poll_error_streak(&name);

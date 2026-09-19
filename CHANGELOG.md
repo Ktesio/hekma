@@ -4,6 +4,14 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — epic 14 in review: ACP backend support (the builtin `acp` kind).**
+> Announced ahead of the release that ships it:
+>
+> - **New builtin `acp` kind** — any Agent Client Protocol (ACP) v1 agent runs under full supervision via `kt agent register <name> --kind acp` + the `acp.command`/`acp.args` config keys. `send` = one `session/prompt` turn (returns immediately; chunks + stop reason stream to the log/events); `stop` sends `session/cancel` first; a concurrent second prompt is refused (typed, surfaced); permissions are denied with a surfaced diagnostic; detached acp starts are refused (the transport needs the pipes). Client capabilities advertised = the protocol default (no fs/terminal/elicitation in v1).
+> - **`EngineError::AcpTurnInFlight`** — new variant on the exhaustive `EngineError` enum (hosts matching exhaustively need the arm or `_`). Maps to exit-code row 4; no new exit code.
+> - **`SpawnSpec.pipe_stdout` (new public field) + `ProcessBackend::take_stdin`/`take_stdout` (defaulted trait methods)** — the ACP transport owns the child's stdio halves; every raw line still lands in the instance log. Defaulted methods keep existing backends compiling; exhaustive `SpawnSpec` constructors outside the crate need the new field. `hekma-engine` → **0.5.0**.
+> - **ACP metering**: `usage_update` is context-grain and surfaced only (never billed); billing-grade tokens (input/output/**cached**) come from the epic's tiered paths (observed base-URL / stderr sentinel); no source → the honest not-available marker. Cached tokens become first-class across parse/ledger/rate/budgets/surfaces for every kind.
+
 > **Compatibility notice — announced ahead of the next release (Adapter Contract v1 freeze).**
 > Per the deprecation policy ratified by Islam on 2026-09-04 (*within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI*):
 >

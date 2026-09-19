@@ -52,15 +52,19 @@ pub const HERMES_ARGS: [&str; 3] = hekma_adapters_hermes::HERMES_ARGS;
 
 /// Resolve a native `kind` to a boxed builtin adapter, or `None` if unknown.
 ///
-/// The table carries two kinds: the inert `mock` (the conformance stand-in) and
-/// the launchable `hermes` builtin (story 6-2, the first launchable native
-/// adapter).
+/// The table carries three kinds: the inert `mock` (the conformance
+/// stand-in), the launchable `hermes` builtin (story 6-2, the first
+/// launchable native adapter), and the launchable `acp` builtin (story 14-1,
+/// spine AD-19 — the transport core; its START launch comes from the
+/// instance's `acp.command`/`acp.args` config keys at start time, so unlike
+/// hermes it declares no code-declared launch here).
 pub fn native(kind: &str) -> Option<Box<dyn AgentAdapter>> {
     match kind {
         "mock" => Some(Box::new(BuiltinMock::new())),
         hekma_adapters_hermes::HERMES_KIND => {
             Some(Box::new(hekma_adapters_hermes::HermesAdapter::new()))
         }
+        crate::acp::ACP_KIND => Some(Box::new(BuiltinAcp::new())),
         _ => None,
     }
 }
@@ -161,6 +165,78 @@ impl AgentAdapter for BuiltinMock {
     // Lifecycle ops use the trait's inert default bodies (execution is 1-4).
 }
 
+/// The engine's builtin `acp` adapter (story 14-1, spine AD-19): the
+/// registration half of the ACP transport core.
+///
+/// * **Metering Source = `SelfReported`** (the contract requires a viable
+///   source; the sentinel channel yields honest nothing for agents that do
+///   not emit — the designed last-resort honesty, AI-18/AD-8). The tiered
+///   acquisition (observed base-URL / sentinel mode / the honest `—` gap
+///   notice) is stories 14-3/14-5; `usage_update` surfacing is 14-3. This
+///   story implements the transport core only.
+/// * **Capabilities:** `interaction` GUARANTEED on every OS (the ACP
+///   transport IS the stdin/stdout pipe pair — without a piped stdin there
+///   is no transport) and `pause` guaranteed on Linux/macOS, best-effort on
+///   Windows — pause/resume keep PROCESS semantics for an `acp` instance
+///   (SIGSTOP/SIGCONT parity; the transport is untouched by a frozen
+///   process).
+/// * **No code-declared launch:** the launch comes from the instance's
+///   `acp.command`/`acp.args` unified config keys at start ([`crate::acp`]'s
+///   resolver; the start refuses honestly naming both keys when unset), so
+///   `native_launch("acp")` stays `None` and the start's acp branch resolves
+///   the launch from the effective config instead of the builtin table.
+/// * **No `contract_version` negotiation:** a builtin does not negotiate
+///   (epic-6 B3 precedent) — the acp kind never engages the adapter contract
+///   v1 (D5).
+/// * **Config mapping:** empty (no unified key maps into a native target;
+///   `agent.*` pass-through still applies through the generic start seam).
+#[derive(Clone, Debug)]
+struct BuiltinAcp {
+    capabilities: CapabilityDeclaration,
+}
+
+impl BuiltinAcp {
+    fn new() -> Self {
+        let capabilities = CapabilityDeclaration::new()
+            .with(Capability::Pause, OsId::Linux, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Macos, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Windows, SupportLevel::BestEffort)
+            .with(
+                Capability::Interaction,
+                OsId::Linux,
+                SupportLevel::Guaranteed,
+            )
+            .with(
+                Capability::Interaction,
+                OsId::Macos,
+                SupportLevel::Guaranteed,
+            )
+            .with(
+                Capability::Interaction,
+                OsId::Windows,
+                SupportLevel::Guaranteed,
+            );
+        Self { capabilities }
+    }
+}
+
+impl AgentAdapter for BuiltinAcp {
+    fn kind(&self) -> &str {
+        crate::acp::ACP_KIND
+    }
+
+    fn capabilities(&self) -> &CapabilityDeclaration {
+        &self.capabilities
+    }
+
+    fn metering_source(&self) -> MeteringSource {
+        MeteringSource::SelfReported
+    }
+
+    // Config mapping: the trait's EMPTY default (the acp kind maps no
+    // unified keys; `agent.*` pass-through delivery is unchanged).
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +253,46 @@ mod tests {
     fn unknown_kind_returns_none() {
         assert!(native("nope").is_none());
         assert!(native("").is_none());
+    }
+
+    #[test]
+    fn acp_kind_resolves_with_the_transport_shape() {
+        // Story 14-1: the launchable acp builtin resolves through the same
+        // table as mock/hermes. Metering source = self-reported (the honest
+        // last resort; the tiered billing acquisition is 14-3/14-5).
+        let adapter = native(crate::acp::ACP_KIND).expect("acp must resolve");
+        assert_eq!(adapter.kind(), crate::acp::ACP_KIND);
+        assert_eq!(adapter.metering_source(), MeteringSource::SelfReported);
+        let decl = adapter.capabilities();
+        for os in [OsId::Linux, OsId::Macos, OsId::Windows] {
+            // The transport IS the stdio pipe pair: interaction guaranteed
+            // everywhere; pause keeps process semantics (guaranteed on
+            // Linux/macOS, best-effort on Windows — the AD-4 exemplar shape).
+            assert_eq!(
+                decl.support(Capability::Interaction, os),
+                SupportLevel::Guaranteed,
+                "os={os}"
+            );
+            assert_eq!(
+                decl.support(Capability::Pause, os),
+                if os == OsId::Windows {
+                    SupportLevel::BestEffort
+                } else {
+                    SupportLevel::Guaranteed
+                },
+                "os={os}"
+            );
+        }
+        // No code-declared launch: the launch resolves from the instance's
+        // acp.command/acp.args config keys at start (the start's acp branch),
+        // so the builtin table's launch stays None — a registration snapshot
+        // with no launch, exactly like mock.
+        assert!(native_launch(crate::acp::ACP_KIND).is_none());
+        // No unified-key mapping (empty mapping; pass-through unchanged).
+        assert_eq!(
+            native_config_mapping(crate::acp::ACP_KIND).unwrap().len(),
+            0
+        );
     }
 
     #[test]

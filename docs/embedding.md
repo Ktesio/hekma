@@ -18,7 +18,7 @@ Depend on the released version:
 
 ```toml
 [dependencies]
-hekma-engine = "0.4"
+hekma-engine = "0.5"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a

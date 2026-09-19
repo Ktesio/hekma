@@ -24,9 +24,9 @@ use hekma_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible, AgentDetachRefused,
-    AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
-    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentAcpTurnInFlight, AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible,
+    AgentDetachRefused, AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable,
+    AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
     AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
@@ -2497,6 +2497,18 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 14-1 (spine AD-19): a second prompt targeted an `acp`
+        // instance while a turn was in flight — the surfaced typed refusal
+        // (ACP serializes turns per session; the first turn is unaffected).
+        EngineError::AcpTurnInFlight { name } => AgentAcpTurnInFlight {
+            message: format!(
+                "Agent Instance '{name}' already has an ACP turn in flight; the acp kind \
+                 serializes turns per session. Wait for the current turn to complete (its \
+                 stopReason lands in: hekma agent logs {name}), or stop the instance with: \
+                 hekma agent stop {name}"
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -2861,6 +2873,15 @@ mod tests {
                 EngineError::StopUnconfirmed {
                     name: "svc".to_string(),
                     timeout_secs: 5,
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                // Story 14-1: the acp in-flight refusal — an invalid-state
+                // refusal (4), never a demotion to General.
+                "AcpTurnInFlight",
+                EngineError::AcpTurnInFlight {
+                    name: "acp-svc".to_string(),
                 },
                 ExitCode::InvalidState,
             ),

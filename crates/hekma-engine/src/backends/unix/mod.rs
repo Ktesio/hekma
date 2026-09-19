@@ -34,7 +34,7 @@
 
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -133,6 +133,16 @@ pub struct UnixProcess {
     /// needed for it to outlive us; stop/pause/resume still work in-process
     /// via `killpg` for as long as this handle is held.
     detached: bool,
+    /// Story 14-1 (spine AD-19): the child's stdout read half when
+    /// [`SpawnSpec::pipe_stdout`] was set — the `acp` transport's protocol
+    /// stream. Held until the supervisor takes it via
+    /// [`ProcessBackend::take_stdout`] to feed the connection's reader
+    /// thread; `None` for every other spawn (file redirect) and for every
+    /// adopted handle. Taking it is the ONLY access — an un-taken pipe would
+    /// fill and block the child, so a spawned-but-unclaimed stdout pipe is
+    /// structurally impossible in the acp flow (the supervisor always takes
+    /// it right before building the connection or fails the launch).
+    stdout: Option<ChildStdout>,
 }
 
 /// The Unix process backend (AD-4).
@@ -222,12 +232,20 @@ impl ProcessBackend for UnixBackend {
             None => (None, None),
         };
         // DIRECT, crash-immune redirects (never `Stdio::piped()` — the whole
-        // point of this fix pass): the agent's `write()` to either stream
-        // succeeds or fails based ONLY on this regular file, never on
-        // whether the engine process is even still alive to read anything.
-        command.stdout(match stdout_target {
-            Some(file) => Stdio::from(file),
-            None => Stdio::null(),
+        // point of this fix pass) — UNLESS the caller asked for the stdout
+        // pipe (story 14-1, `SpawnSpec::pipe_stdout`): an `acp` spawn's
+        // stdout IS the protocol stream the connection's reader consumes
+        // (and re-records into the raw log), so the pipe is the point. The
+        // `Stdio::from(file)` guard for the piped arm drops the opened
+        // stdout file handle (the fail-fast open above still validated the
+        // path is writable; the reader reopens it append-mode by path).
+        command.stdout(if spec.pipe_stdout {
+            Stdio::piped()
+        } else {
+            match stdout_target {
+                Some(file) => Stdio::from(file),
+                None => Stdio::null(),
+            }
         });
         command.stderr(match stderr_target {
             Some(file) => Stdio::from(file),
@@ -349,6 +367,11 @@ impl ProcessBackend for UnixBackend {
             Some(s) => StdinState::Live(s),
             None => StdinState::NoPipe,
         };
+        // Story 14-1: capture the piped stdout when the caller asked for it
+        // (`spec.pipe_stdout` — the acp transport's protocol stream). Stdio
+        // plumbing populates `child.stdout` exactly when `Stdio::piped()` was
+        // used, so branching on std's own answer stays robust.
+        let stdout = child.stdout.take();
         // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
         // handle gets the output-capture pipeline whenever `capture` is
         // `Some`. `spawn_output_capture` takes only the raw files' PATHS
@@ -373,6 +396,7 @@ impl ProcessBackend for UnixBackend {
             stdin,
             log_capture,
             detached: spec.detach,
+            stdout,
         })
     }
 
@@ -530,6 +554,10 @@ impl ProcessBackend for UnixBackend {
             start_time: live_start,
             stdin: StdinState::NoPipe,
             log_capture: None,
+            // Story 14-1: no recoverable stdout pipe either — an adopted acp
+            // instance gets NO ACP connection (the surfaced adoption note is
+            // the supervisor's; story 14-2 adds the session resume).
+            stdout: None,
             // Story 12-1 AMENDMENT (review loop 1): detached-ness RIDES THE
             // RECORD — an adopted handle for a detached spawn is re-held
             // DISARMED (Drop skips the group kill), exactly like its spawning
@@ -566,6 +594,24 @@ impl ProcessBackend for UnixBackend {
 
     fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
         handle.log_capture.clone()
+    }
+
+    fn take_stdin(&self, handle: &mut Self::Handle) -> Option<StdinState> {
+        // Story 14-1: the acp transport takes exclusive ownership of the
+        // child's stdin (the connection's ONE bounded-writer mutex replaces
+        // the handle-map path). The state becomes `NoPipe`, so the handle's
+        // own `has_stdin` honestly reads `false` afterwards.
+        match std::mem::replace(&mut handle.stdin, StdinState::NoPipe) {
+            state @ StdinState::Live(_) => Some(state),
+            other => {
+                handle.stdin = other;
+                None
+            }
+        }
+    }
+
+    fn take_stdout(&self, handle: &mut Self::Handle) -> Option<ChildStdout> {
+        handle.stdout.take()
     }
 }
 
@@ -963,6 +1009,7 @@ mod tests {
             // helper spawns with a live stdin pipe, matching what they
             // already assumed.
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         }
     }
@@ -1329,6 +1376,7 @@ mod tests {
             stdin: StdinState::NoPipe,
             log_capture: None,
             detached: false,
+            stdout: None,
         };
         assert_eq!(
             backend.poll(&mut recycled).unwrap(),
@@ -1363,6 +1411,7 @@ mod tests {
             stdin: StdinState::NoPipe,
             log_capture: None,
             detached: false,
+            stdout: None,
         };
         assert_eq!(
             backend.poll(&mut degraded).unwrap(),
@@ -1538,6 +1587,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         s.env.clear();
@@ -1702,6 +1752,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: dir.path().to_path_buf(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
@@ -1808,6 +1859,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
@@ -1857,6 +1909,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         s.env.clear();
@@ -1977,6 +2030,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         let mut proc = backend
@@ -2036,6 +2090,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
@@ -2113,6 +2168,7 @@ mod tests {
             stderr_log_file: Some(stderr_raw.clone()),
             instance_name: "dual".to_string(),
             pipe_stdin: false,
+            pipe_stdout: false,
             detach: false,
         };
         let backend = UnixBackend::new();
@@ -2200,6 +2256,7 @@ mod tests {
             stderr_log_file: Some(dir.path().join("stderr.raw")),
             instance_name: "svc".to_string(),
             pipe_stdin: false,
+            pipe_stdout: false,
             detach: false,
         };
         let mut original = backend.spawn(&s).expect("spawn sleep with capture");

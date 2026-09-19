@@ -603,6 +603,17 @@ struct Supervised {
     /// freshly spawned process (whose `code: None` genuinely means "terminated by
     /// a signal" — `try_wait` had the authoritative `ExitStatus`).
     adopted: bool,
+    /// The instance's ACP connection (story 14-1, spine AD-19) — `Some` only
+    /// for a freshly started `acp` instance whose handshake + `session/new`
+    /// completed this engine lifetime. Holds the reader thread's shared
+    /// state, the bounded writer, the session id, the in-flight-turn flag,
+    /// and the surfaced-notice queue (drained by the reaper cadence through
+    /// `emit_diagnostic`). `None` for every other kind and for an ADOPTED
+    /// `acp` instance (its pipe halves died with the spawning engine; the
+    /// honest adoption note says so; `session/load` resume is story 14-2).
+    /// Dropping the `Supervised` drops the connection, which closes the
+    /// child's stdin — the connection teardown on stop/drop/terminal-settle.
+    acp: Option<crate::acp::AcpConnection>,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -917,6 +928,71 @@ impl Supervisor {
             None => {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
+        }
+    }
+
+    // ---- ACP transport support (story 14-1, spine AD-19) ----
+
+    /// Drain ONE instance's ACP connection's surfaced notices through
+    /// `emit_diagnostic` (the choke point). The reader thread queues
+    /// malformed-line, permission-denial, usage-update, unhandled-message,
+    /// and stream-end facts WITHOUT ever taking the supervisor lock; the
+    /// supervisor's OWN cadence (the crash-reaper tick — this method's
+    /// callers) drains them HERE, under the supervisor lock the choke point
+    /// requires. Best-effort: an instance with no connection (or a dropped
+    /// one) is a no-op.
+    pub(super) fn drain_acp_notices_for(&mut self, name: &InstanceName) {
+        let Some(notices) = self
+            .running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+            .map(|connection| connection.drain_notices())
+        else {
+            return;
+        };
+        // The reader queues are bounded (overflow is announced INSIDE the
+        // drain), so this loop is bounded — the AD-17/AD-18 rule holds.
+        for notice in notices {
+            let line = format!("{}: {notice}", name.as_str());
+            self.emit_diagnostic(&line);
+        }
+    }
+
+    /// Drain EVERY running instance's ACP notices (the reaper-tick shape,
+    /// mirroring `drain_usage_all`/`drain_observed_all`). Called at the top
+    /// of [`Supervisor::poll_once`].
+    pub(super) fn drain_acp_notices_all(&mut self) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_acp_notices_for(&name);
+        }
+    }
+
+    /// Write `session/cancel` for an instance's in-flight ACP turn (the
+    /// stop path calls this BEFORE the termination ladder — spine AD-19:
+    /// cancel, then the normal stop proceeds). Best-effort + surfaced: a
+    /// cancellation that could not be WRITTEN (the bounded write timed out
+    /// or the pipe broke) emits ONE diagnostic naming why, and the stop
+    /// ladder still runs unchanged. When no turn is in flight, this is a
+    /// silent no-op (there is nothing to cancel — no diagnostic, no write).
+    pub(super) fn cancel_in_flight_acp_turn(&mut self, name: &InstanceName) {
+        let Some(connection) = self
+            .running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+        else {
+            return;
+        };
+        if !connection.turn_in_flight() {
+            return;
+        }
+        if let Err(detail) = connection.cancel_turn() {
+            let note = format!(
+                "{}: the session/cancel for the in-flight ACP turn could not be delivered \
+                 ({detail}); the stop ladder proceeds regardless",
+                name.as_str(),
+            );
+            self.emit_diagnostic(&note);
         }
     }
 }
