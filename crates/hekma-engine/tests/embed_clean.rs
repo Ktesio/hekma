@@ -46,7 +46,7 @@
 //!      disjoint-run-id assertion proves this per-process property.
 //!
 //!    The audit's TWO historical print-site allowlist entries — the best-effort
-//!    stderr diagnostics in `domain/supervisor.rs` (the DC-10 memory-delivery
+//!    stderr diagnostics in the `domain/supervisor/` module (the DC-10 memory-delivery
 //!    notice and the enforcement breadcrumb, both citing spine AD-12) — were
 //!    CLOSED by story 10-2, not allowlisted forever: the pinned diagnostics now
 //!    route through the host-provided diagnostic sink (`Supervisor::
@@ -502,6 +502,12 @@ fn fleet_entry(facade: &hekma_engine::Blocking<'_>) -> hekma_engine::FleetEntry 
 /// FILE or DIRECTORY PANICS with its path — a read failure must never
 /// silently mean "unscanned": a directory whose `read_dir` fails would
 /// otherwise vacuously pass the audit as an unvisited subtree.
+///
+/// `tests.rs` files and `tests/` subtrees under `src/` are SKIPPED: they are
+/// `#[cfg(test)]` regions by construction under the Rust 2018 module layout
+/// (`supervisor.rs` + `supervisor/tests.rs`), the same reason `clean_source`
+/// region-skips inline `#[cfg(test)] mod tests { … }` blocks. Production
+/// sources — everything else — are always scanned.
 fn visit_rs(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!(
@@ -512,8 +518,14 @@ fn visit_rs(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "tests") {
+                continue;
+            }
             visit_rs(&path, f);
         } else if path.extension().is_some_and(|e| e == "rs") {
+            if path.file_name().is_some_and(|n| n == "tests.rs") {
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!("could not read {} for the audit scan: {e}", path.display())
             });
@@ -856,7 +868,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         prompts.is_empty(),
         "a raw print site appeared in production sources — the engine's ONLY \
          diagnostic emission is the story-10-2 diagnostic sink \
-         (`Supervisor::emit_diagnostic` in domain/supervisor.rs; stderr is its \
+         (`Supervisor::emit_diagnostic` in domain/supervisor/mod.rs; stderr is its \
          no-sink default). A print is a control surface: route it through the \
          sink or re-review the sink contract: {}",
         prompts
@@ -874,14 +886,14 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // The ONE diagnostic emission choke point (every pinned diagnostic routes
         // through it; the `[hekma] ` prefix + terminating newline live here).
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/mod.rs",
             "fn emit_diagnostic(&self",
             "the diagnostic-sink choke point",
         ),
         // The DC-10 memory-delivery notice's route into the sink (story
         // 5-1/2-2 Decision 6 — the operator attach action is owed the truth).
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/spawn.rs",
             "self.emit_diagnostic(&notice)",
             "the DC-10 memory-delivery notice's route into the sink",
         ),
@@ -891,7 +903,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // whole single-line call, so it stays distinct from the AI-41 site
         // below (a multi-line `format!` whose call line carries no args).
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/usage.rs",
             "self.emit_diagnostic(&format!(",
             "the enforcement breadcrumb's route into the sink",
         ),
@@ -902,7 +914,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // by its own route line (distinct from the enforcement breadcrumb's
         // single-line `format!` call above).
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/usage.rs",
             "self.emit_diagnostic(&failure);",
             "the AI-41 usage-commit-failure report's route into the sink",
         ),
@@ -911,7 +923,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // ledger and the live process may diverge; the divergence is
         // announced, never silent.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/lifecycle.rs",
             "self.emit_diagnostic(&signal_failure);",
             "the AI-9 signal-failure divergence breadcrumb's route into the sink",
         ),
@@ -920,7 +932,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // backend/environment-wide condition; the no-mass-crash guard's
         // decision is announced, never silent.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/reaper.rs",
             "self.emit_diagnostic(&environmental);",
             "the AI-12 environmental poll-failure notice's route into the sink",
         ),
@@ -928,7 +940,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // still-failing INSERT on the final drain cannot be retried (the
         // handle is being removed), so the loss is announced, never silent.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/usage.rs",
             "self.emit_diagnostic(&loss);",
             "the AI-41 terminal-drain loss notice's route into the sink",
         ),
@@ -937,7 +949,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // points at the PREVIOUS engine's dead listener; the condition and the
         // stop→start remediation are announced at adoption, never silent.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/reaper.rs",
             "self.emit_diagnostic(&strand);",
             "the AI-46 stranded-listener adoption notice's route into the sink",
         ),
@@ -946,7 +958,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // var; the config value wins (precedence untouched) and the shadow is
         // announced at start, never silent.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/spawn.rs",
             "self.emit_diagnostic(&shadow_notice);",
             "the AI-27 env-shadow notice's route into the sink",
         ),
@@ -955,7 +967,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // the accepted-but-stricter boundary); the fact is announced warn-only
         // on every start that delivers one, never silent, never the value.
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/spawn.rs",
             "self.emit_diagnostic(&flag_notice);",
             "the AI-39 secret-into-flag notice's route into the sink",
         ),
@@ -963,7 +975,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // to stderr byte-identically to the pre-sink engine (pinned
         // end-to-end by the `diagnostic_sink.rs` subprocess suite).
         (
-            "domain/supervisor.rs",
+            "domain/supervisor/mod.rs",
             "std::io::stderr().write_all(",
             "the sink's stderr default arm",
         ),
@@ -1009,7 +1021,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         stdio_reaches.len(),
         1,
         "the engine must reach stdio in EXACTLY ONE place (the diagnostic \
-         sink's stderr default arm in domain/supervisor.rs) — counted across \
+         sink's stderr default arm in domain/supervisor/mod.rs) — counted across \
          fully-qualified calls, bare imported-path calls, stdio imports, and \
          hand-written _print internals: {}",
         stdio_reaches
@@ -1019,7 +1031,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
             .join("; ")
     );
     assert_eq!(
-        stdio_reaches[0].file, "domain/supervisor.rs",
+        stdio_reaches[0].file, "domain/supervisor/mod.rs",
         "the one stdio reach must be the sink's stderr default arm"
     );
     assert!(

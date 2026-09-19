@@ -171,6 +171,7 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
 
+### Epic 13: Engine Correctness & the Supervisor Module Boundary *(opened 2026-09-19)*
 ### Epic 12: Durable Detach & the Production-Usable Observed Channel
 An Operator can detach a start from the CLI's lifetime (the agent survives via the adoption path), and the engine-observed metering channel works against real providers: streamed completions are metered (the `include_usage` terminal frame), HTTPS upstreams dial directly (vendored rustls), and a store outage degrades the observed drain loudly with a bounded-skip instead of wedging or silently losing. Opened 2026-09-15 by Islam's ratification (recommended across the board) of ai-20-ai-47-product-calls-2026-09-15.md.
 **FRs covered:** FR-19 amendment (observed-channel production usability; no new FR numbers — this epic lands ratified follow-ups)
@@ -946,3 +947,53 @@ start-time `https://` refusal error is replaced by a working forward; supply-cha
 The observed drain gets the AI-41 treatment the self-reported channel has: park + bounded
 retry + the loud SKIPPED diagnostic instead of silent best-effort loss under store failure
 (closes the deferred-work entry routed "→ 11-6", stranded by 11-6's partial landing).
+
+## Epic 13: Engine Correctness & the Supervisor Module Boundary
+
+> **(2026-09-19 — opened to close the two HIGH retro defects and the twice-carried
+> split study.** Story 13.1 closes epic-5 retro A1 (the `memory.dir` strip gap on the
+> invocation-override path — the one real correctness finding of the epic-5 retro);
+> story 13.2 closes epic-6 retro B1 (the legacy start fallback re-reads `adapter.toml`
+> without renegotiating, bypassing the 6-6 load gate); story 13.3 is the supervisor
+> module-boundary study carried since epic-11 (F-agg2) and named in AD-18's carried
+> debt — its spec-stage deliverable is a bounded-options boundary proposal;
+> implementation of the chosen boundary is ratification-gated per AI-58. All paths
+> post-rename (`crates/hekma-engine`).)
+
+### Story 13.1: Close the memory.dir strip gap on the invocation-override path (epic-5 retro A1)
+The operator-spoofed `memory.dir` strip (`start_inner`'s 2b-memory-spoof block) covers the
+local effective-config path only; when invocation overrides exist (engine-observed
+instance), the re-fold can resurrect a hand-set `memory.dir` into `apply_config_mapping`,
+delivering through a declared mapping (hermes → `HERMES_HOME`) with no DC-10 notice.
+Fix: make delivery refusal uniform across both config paths (strip or refuse identically),
+surface the degradation honestly, pin the strip with tests at BOTH layers (none exists
+today), and correct the stale docs claim.
+**Resolution (2026-09-19):** the DELIVERY defect was already closed by story 11-3
+(`bee7d48`) — the override-branch strip exists (`supervisor.rs:1191-1205`, comment
+"(2b-memory-spoof, the override branch — story 11-3, A1)") and its engine-observed pin
+(`tests/observed_metering.rs:826`) mutation-verifies; the retro's "no test pins any
+layer" was half-stale. 13-1's remaining truth: the LOCAL-path strip (5-1's E4) shipped
+with no pin — landed here (`tests/memory.rs::a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces`,
+mutation-verified, positive-controlled). Tracker + retro item reconciled closed.
+
+### Story 13.2: Renegotiate the contract on the legacy start fallback (epic-6 retro B1)
+The launch-less/legacy snapshot fallback re-parses `adapter.toml` at start time without
+calling `negotiate_contract_version`, so a manifest edited to an incompatible
+`contract_version` after registration starts via the fallback, bypassing the 6-6 load
+gate. Fix: negotiate on the fallback re-parse (mapping to the existing
+fallback-incompatible error surface) + a bypass test (registered compatible, edited
+incompatible, start via fallback → refused).
+**Resolution (2026-09-19):** already closed by `7b1a70c2` (PR #172, 2026-09-07, retro
+item #2) — the fallback re-parse negotiates (`adapter/mod.rs:338-352`), surfaced as
+`LaunchResolveError::ContractIncompatible`, with the bypass tests
+(`resolve_start_launch_renegotiates_a_drifted_contract_major` / `..._still_accepts_same_major`)
+and the docs correction all landed there; verified at HEAD, no code change in epic-13.
+Tracker + retro item reconciled closed.
+
+### Story 13.3: Supervisor module boundary — the split study (epic-11 F-agg2, AD-18 carried debt)
+`crates/hekma-engine/src/domain/supervisor.rs` is ~9.1k lines (4.8k production) after
+growing +36% in epic-11 and +~1k in epic-12. The spec-stage deliverable is a COMPLETE
+bounded-options proposal for a deliberate module boundary (AI-58: draft-then-ratify) —
+options concretely stated with trade-offs, a recommendation, and a migration shape that
+keeps every step compile-gated and independently revertible. Implementation follows only
+after Islam ratifies a boundary.

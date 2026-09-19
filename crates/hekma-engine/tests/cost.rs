@@ -677,7 +677,7 @@ fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
     // AD-7 companion invariant for DOLLARS (mirroring budget.rs's token audit): NO
     // code path other than the supervisor's ONE ingestion→commit choke point may
     // EVALUATE a Cost Cap. A source scan proves every CALL to
-    // `CostEvaluator::evaluate(` lives ONLY in `domain/supervisor.rs` (+ its own home
+    // `CostEvaluator::evaluate(` lives ONLY in `domain/supervisor/usage.rs` (+ its own home
     // `domain/cost.rs` unit tests). If a future change scatters a second enforcement
     // site, this fails. Pure source scan (no OS cfg); runs on every OS.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -701,17 +701,18 @@ fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
             }
         }
     });
-    let allowed: std::collections::BTreeSet<String> = ["domain/supervisor.rs", "domain/cost.rs"]
-        .into_iter()
-        .map(String::from)
-        .collect();
+    let allowed: std::collections::BTreeSet<String> =
+        ["domain/supervisor/usage.rs", "domain/cost.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
     let violations: Vec<&String> = eval_files.difference(&allowed).collect();
     assert!(
         violations.is_empty(),
         "CostEvaluator::evaluate is called outside the ingestion choke point: {violations:?}"
     );
     assert!(
-        eval_files.contains("domain/supervisor.rs"),
+        eval_files.contains("domain/supervisor/usage.rs"),
         "the enforcement choke point must call CostEvaluator::evaluate; callers: {eval_files:?}"
     );
 }

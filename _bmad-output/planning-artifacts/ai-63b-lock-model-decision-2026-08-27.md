@@ -2,7 +2,7 @@
 type: architecture-decision-proposal
 date: 2026-08-27
 author: Winston (System Architect) via BMAD correct-course follow-up, for Islam
-status: awaiting-ratification  # per AI-58's draft-then-ratify pattern: proposal touches ZERO real planning artifacts; AD-18 is applied to ARCHITECTURE-SPINE.md only after Islam ratifies
+status: resolved-coarse-ratified  # RESOLVED 2026-09-19: Islam ratified the COARSE two-mutex model (Option A) — AD-18 applied to ARCHITECTURE-SPINE.md records the ratification, its evidence, and the four reopen triggers. This document is archived as the standing per-instance replacement plan (designed, not disproven); its Steps 0-4 remain executable on their own merits; Step 0/Step 7 model-free items are carried as debt in the spine's AD-18.
 decides: "AI-63(b) — the replacement concurrency model for the engine's coarse global locks"
 gate: "AD-17 requires (b) decided BEFORE Epic 7's daemon/embedding work begins. Epic 6 is in progress (6-1 done, 6-2 merged); Epic 7 is next."
 method: "4 independent architect proposals from distinct starting biases -> 3-lens judge panel (correctness/race-safety, Epic-7+NFR-4 fitness, migration cost/testability) -> synthesis. 9 agents, 0 failures."
