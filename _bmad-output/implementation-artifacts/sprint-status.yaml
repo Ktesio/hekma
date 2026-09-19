@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "09-19-2026 01:41"
+last_updated: "09-19-2026 02:47"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -121,6 +121,7 @@ development_status:
   12-3-rustls-tls-upstream-for-observed-metering: done  # AI-47(a) — metering.upstream_base_url accepts https:// via vendored rustls+ring; supply-chain/boundary teeth updated. Loop 1 patch bundle: the one-rustls/ring invariant has CI TEETH (boundary-job cargo tree grep-assert: exactly one rustls, one ring, no aws-lc/openssl) and the cargo-audit cache key is date-stamped so the scanner binary actually refreshes 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
   12-4-observed-drain-durability-cursor-retry-skip: done  # retro F3 fold — the observed drain gets the AI-41 treatment: park + bounded retry + loud SKIPPED instead of silent loss under store failure. Loop 1: the park buffer is CAPPED (OBSERVED_PARK_MAX_EVENTS, oldest dropped LOUDLY on overflow) and the shared ingest-failure diagnostic is MODE-aware (a terminal drain never claims "parked for retry"; the terminal test asserts the absence) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
   epic-8-retrospective: optional
+  epic-12-retrospective: done  # 2026-09-19 (epic-12-retro-2026-09-19.md) — verdict accepted-with-open-items; 5 action items appended
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
   # 2026-07-14: CLEAN REMOVAL at v0.6.0; remove top-level `kt list`/`kt show`; PRD FR-37/38
@@ -1466,3 +1467,55 @@ action_items:
     owner: "next engine epic"
     status: open
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+  - id: "epic-12-retro-item-95-stabilize-the-macos-ci-flake-family-epic"
+    epic: 12
+    action: "Stabilize the macOS CI flake family (epic-12 retro P2): same-SHA green-red
+      flips on main — uj3_governance_journey_through_documented_cli_commands_unix
+      (crates/kt/tests/agent_cli.rs:2977), interleaved_instances_keep_per_instance_fifo
+      (crates/hekma-conformance/src/uj3.rs:418), log_file_captures_child_stdout spawn
+      start-time race (crates/hekma-engine/src/backends/unix/mod.rs:1042), two_engines
+      embed_clean concurrency (crates/hekma-engine/tests/embed_clean.rs:323). Reproduce
+      under load; fix the race or add principled tolerance (no blind retry). [epic-12
+      retro action 1, MED]"
+    owner: "next CI-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-96-tracker-status-consistency-pin-in-script"
+    epic: 12
+    action: "Tracker-status consistency pin in scripts/test_automation.py: fail when
+      any development_status row comment says MERGED to main while its status is not
+      done — would have caught 8842b8b dropping the 12-1..12-4 flip on day zero. [epic-12
+      retro action 2, LOW]"
+    owner: "next automation-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-97-canonize-verify-the-diff-not-the-message"
+    epic: 12
+    action: "Canonize verify-the-diff-not-the-message as an AGENTS.md engineering
+      pattern (AI-57 sibling): a commit claiming a bookkeeping/state change is verified
+      against its diff before handoff (8842b8b precedent). Fold with epic-11 item
+      3 AGENTS.md edit. [epic-12 retro action 3, LOW]"
+    owner: "next docs/process-touching change"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-98-put-the-two-windows-lifetime-caveats-on"
+    epic: 12
+    action: "Put the two Windows lifetime caveats on operator surfaces (epic-12 retro
+      R1/R2, AI-18): (a) troubleshooting.md entry for the start --detach stdio pipe-hold
+      hang (scripted captures block until agent exit, Windows); (b) one sentence stating
+      the adopted-Windows stop boundary (descendants not terminated; unix killpg parity
+      only in the spawning lifetime); (c) log the second review round in spec-epic-12
+      change log or correct its loop-2 wording (R4). Owner: next docs-touching change,
+      coordinated with the routed Windows story. [epic-12 retro action 4, MED]"
+    owner: "next docs-touching change"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-99-c6ecadb-seam-test-or-documented-accept-e"
+    epic: 12
+    action: "c6ecadb seam test or documented accept (epic-12 retro R5): pin the adopted-open
+      failure arm (SYNCHRONIZE-denied process -> honest Ok(None), no live-to-failed
+      reconciliation) or record the accept, next time the Windows backend is touched.
+      [epic-12 retro action 5, LOW]"
+    owner: "next Windows-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
