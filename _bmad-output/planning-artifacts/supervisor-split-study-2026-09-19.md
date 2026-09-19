@@ -2,7 +2,7 @@
 type: architecture-decision-proposal
 date: 2026-09-19
 author: drafted per story 13-3's spec stage (epic-11 retro F-agg2; AD-18 carried debt), for Islam
-status: awaiting-ratification  # per AI-58 draft-then-ratify: this proposal touches ZERO production code; the chosen boundary is applied only after Islam ratifies
+status: ratified-and-implemented  # Islam ratified A+B on 2026-09-19; implemented as story 13-3 in two compile-gated commits (tests move, then the production directory split). The Option-C extraction reopens only per the conditions in its 'why not now' section.
 decides: "the deliberate module boundary for crates/hekma-engine/src/domain/supervisor.rs (9101 lines at HEAD 1388e79)"
 scope_note: >
   MODULE boundary only — file organization inside the engine crate. The LOCK model is
