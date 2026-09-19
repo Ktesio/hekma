@@ -417,7 +417,7 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
     // Ledger. A grep-style source guard over the engine `src/` proves that every
     // CALL to `record_usage_event(` (excluding its trait declaration, the SQLite
     // impl `fn record_usage_event`, and the Registry pass-through that funnels to
-    // the store) lives ONLY in `domain/supervisor.rs`. If a future change scatters a
+    // the store) lives ONLY in `domain/supervisor/usage.rs`. If a future change scatters a
     // second writer, this fails — the exact invariant story 3-2's enforcement relies
     // on. Pure source scan (no OS cfg); runs on every OS.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -449,7 +449,7 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
     // independent writer — it just forwards to the store in one place). The store
     // impl + the port trait are excluded above (they DEFINE the method).
     let allowed: std::collections::BTreeSet<String> = [
-        "domain/supervisor.rs",
+        "domain/supervisor/usage.rs",
         "domain/registry.rs",
         "store/sqlite.rs",
     ]
@@ -463,7 +463,7 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
     );
     // And it MUST be present in the supervisor (the choke point exists).
     assert!(
-        writer_files.contains("domain/supervisor.rs"),
+        writer_files.contains("domain/supervisor/usage.rs"),
         "the commit choke point must call record_usage_event; callers found: {writer_files:?}"
     );
 }

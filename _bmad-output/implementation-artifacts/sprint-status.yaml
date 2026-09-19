@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "09-15-2026 13:10"
+last_updated: "09-19-2026 05:28"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -116,11 +116,22 @@ development_status:
   11-6-supervision-and-ops-decisions: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). LANDED 2026-09-11, PARTIAL BY RATIFICATION: the two non-decision items closed (AI-46 via 11-3's stranded-listener diagnostic; AI-48's dependency-audit checkpoint documented in docs/embedding.md) and AI-36 was already resolved (superseded by AI-53, PR #108). AI-20 (daemon/detach) and AI-47 (HTTPS upstream + streaming parse) REMAIN OPEN awaiting Islam's product calls per the change proposal's own §6 gate — dated notes on each entry name the decision needed; surfaced in the epic-11 PR description. AI-20/46/47/48 — daemon/detach, HTTPS upstream, Dependabot, tracing (needs Islam product calls)
   11-7-orchestration-and-review-process: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). landed 2026-09-11 (this branch, story commit follows): AI-17 residual hardening — the three semver pins scoped OUT of the file-wide test into the semver-job slice (exact count==3 comment-stripped check-release sites, probe-precedes-install ordering assertion, line-exact plain-install pin, transient-skip regex verified single-use in ci.yml so scoping loses nothing); AI-19 verify-only (adopted by 11-4, flipped done); AI-55/57/58 codified as AGENTS.md Engineering patterns (+ release-process.md AI-55 anchor); AI-56 satisfied-by-events (stale key removed ff1f669, epic-8 superseded, epics.md authoritative); epic-6-retro-item-9 closed — the four #168 verdicts mirrored into AI-63/65/66/69 (AI-63's stale part-(b) framing superseded). Reviewed by the three lenses; 10 patch-class findings applied. AI-17/19/55/56/57/58 + epic-6-retro-item-9 — automation pins, sprint-status sync, playbook patterns
   epic-12: done  # opened 2026-09-15 by Islam's ratification (recommended across the board) of ai-20-ai-47-product-calls-2026-09-15.md — durable detach + the production-usable observed channel (AI-20 + AI-47 + retro F3 fold). Review loop 1 (2026-09-15, step-04 three-layer review): three DESIGN-level findings (post-adoption survival never designed; path-blind stream_options injection; Windows detached descendant leak) reverted the first derivation; re-derived on the AMENDED spec (review_loop_iteration: 1) with the 12-1a/12-1b/12-2/12-4 amendments + the patch bundle. MERGE CHECKLIST (do at merge time, per the #181 precedent): after the epic-12 squash lands on main, move the semver baseline SHA in BOTH pinned sites — .github/workflows/ci.yml (the semver job's `--baseline-rev` + its `git cat-file -e` probe) AND scripts/test_automation.py (the in-repo guard that pins the SAME sha and asserts the ci.yml line) — to the new merge commit; also put the same checklist + the one-PR squash note in the PR body. Spec's Tasks checkboxes ticked on the re-derivation; keep this tracker row's wording in sync at merge 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
-  12-1-detached-start-survives-cli-exit-via-adoption: review  # AI-20 ratified option (b) — kt agent start --detach via the AD-5 adoption path; refuses engine-observed instances (exit 5); honest enforcement-window docs. Loop 1: detached-ness RIDES the spawn record (SpawnRecord.detach, schema v6) so every later adopt() re-holds the handle DISARMED — a benign intervening command (kt agent list) must not kill the agent; Windows detached spawn keeps a Job Object WITHOUT kill-on-close so stop's TerminateJobObject still reaches descendants (unix killpg parity) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE. POST-MERGE FIX 2026-09-15 (c6ecadb): adopted Windows stop could never confirm death — OpenProcess rights lacked SYNCHRONIZE so reap_if_exited's adopted branch was permanently blind (found by this story's own windows-latest test; StopUnconfirmed for every adopted stop; probe fallback added). REMAINING GAP (deferred-work, routed next Windows story): the detached child inherits kt's stdio pipe write-ends on Windows — capturing `start --detach` in a script hangs until the agent exits (interactive unaffected); proven by the CLI test's forensic harness (56ee766).
-  12-2-streaming-usage-parse-include-usage-terminal-frame: review  # AI-47(b) — listener requests stream_options.include_usage, parses the terminal SSE usage frame into ParsedUsage; SSE stub cases in observed_metering. Loop 1: the injection is additionally PATH-gated to /chat/completions — any other streaming endpoint is forwarded UNMODIFIED (a provider 400 on injected stream_options would break the call being metered) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
-  12-3-rustls-tls-upstream-for-observed-metering: review  # AI-47(a) — metering.upstream_base_url accepts https:// via vendored rustls+ring; supply-chain/boundary teeth updated. Loop 1 patch bundle: the one-rustls/ring invariant has CI TEETH (boundary-job cargo tree grep-assert: exactly one rustls, one ring, no aws-lc/openssl) and the cargo-audit cache key is date-stamped so the scanner binary actually refreshes 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
-  12-4-observed-drain-durability-cursor-retry-skip: review  # retro F3 fold — the observed drain gets the AI-41 treatment: park + bounded retry + loud SKIPPED instead of silent loss under store failure. Loop 1: the park buffer is CAPPED (OBSERVED_PARK_MAX_EVENTS, oldest dropped LOUDLY on overflow) and the shared ingest-failure diagnostic is MODE-aware (a terminal drain never claims "parked for retry"; the terminal test asserts the absence) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
+  12-1-detached-start-survives-cli-exit-via-adoption: done  # AI-20 ratified option (b) — kt agent start --detach via the AD-5 adoption path; refuses engine-observed instances (exit 5); honest enforcement-window docs. Loop 1: detached-ness RIDES the spawn record (SpawnRecord.detach, schema v6) so every later adopt() re-holds the handle DISARMED — a benign intervening command (kt agent list) must not kill the agent; Windows detached spawn keeps a Job Object WITHOUT kill-on-close so stop's TerminateJobObject still reaches descendants (unix killpg parity) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE. POST-MERGE FIX 2026-09-15 (c6ecadb): adopted Windows stop could never confirm death — OpenProcess rights lacked SYNCHRONIZE so reap_if_exited's adopted branch was permanently blind (found by this story's own windows-latest test; StopUnconfirmed for every adopted stop; probe fallback added). REMAINING GAP (deferred-work, routed next Windows story): the detached child inherits kt's stdio pipe write-ends on Windows — capturing `start --detach` in a script hangs until the agent exits (interactive unaffected); proven by the CLI test's forensic harness (56ee766).
+  12-2-streaming-usage-parse-include-usage-terminal-frame: done  # AI-47(b) — listener requests stream_options.include_usage, parses the terminal SSE usage frame into ParsedUsage; SSE stub cases in observed_metering. Loop 1: the injection is additionally PATH-gated to /chat/completions — any other streaming endpoint is forwarded UNMODIFIED (a provider 400 on injected stream_options would break the call being metered) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
+  12-3-rustls-tls-upstream-for-observed-metering: done  # AI-47(a) — metering.upstream_base_url accepts https:// via vendored rustls+ring; supply-chain/boundary teeth updated. Loop 1 patch bundle: the one-rustls/ring invariant has CI TEETH (boundary-job cargo tree grep-assert: exactly one rustls, one ring, no aws-lc/openssl) and the cargo-audit cache key is date-stamped so the scanner binary actually refreshes 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
+  12-4-observed-drain-durability-cursor-retry-skip: done  # retro F3 fold — the observed drain gets the AI-41 treatment: park + bounded retry + loud SKIPPED instead of silent loss under store failure. Loop 1: the park buffer is CAPPED (OBSERVED_PARK_MAX_EVENTS, oldest dropped LOUDLY on overflow) and the shared ingest-failure diagnostic is MODE-aware (a terminal drain never claims "parked for retry"; the terminal test asserts the absence) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
   epic-8-retrospective: optional
+  epic-12-retrospective: done  # 2026-09-19 (epic-12-retro-2026-09-19.md) — verdict accepted-with-open-items; 5 action items appended
+  # Epic 13 (engine correctness & the supervisor boundary) — opened 2026-09-19 carrying the two
+  # HIGH retro defects (epic-5 A1 memory.dir strip gap on the invocation-override path; epic-6 B1
+  # legacy-start-fallback negotiation bypass) + the twice-carried supervisor split study
+  # (13-3's spec stage proposes the module boundary; implementation is ratification-gated per
+  # AI-58). Post-rename paths (crates/hekma-engine). Stories run as a batch (no per-story files),
+  # epic-12 shape.
+  epic-13: done  # 🎉 all three stories complete 2026-09-19 (13-1/13-2 reconciled pre-closed + the missing local-path strip pin; 13-3 split study ratified A+B and implemented). Full gates green at each commit.
+  13-1-close-the-memory-dir-strip-gap-on-the-invocation-override-path: done  # RESOLVED 2026-09-19: the delivery defect was ALREADY closed by 11-3 (bee7d48 — override-branch strip supervisor.rs:1191-1205 + engine-observed pin observed_metering.rs:826, mutation-verified); 13-1's net change is the genuinely-missing LOCAL-path pin (tests/memory.rs a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces, +102, mutation-verified with a positive control). Retro item epic-5-retro-item-1 reconciled closed.
+  13-2-renegotiate-the-contract-on-the-legacy-start-fallback: done  # RESOLVED-PRE-EXISTING 2026-09-19: closed by 7b1a70c2 (PR #172, 2026-09-07, retro item #2) — fallback re-parse negotiates (adapter/mod.rs:338-352 → LaunchResolveError::ContractIncompatible), bypass tests at mod.rs:1348/:1390, docs corrected in the same PR; verified at HEAD, zero code change in epic-13. Retro item epic-6-retro-item-2 reconciled closed.
+  13-3-supervisor-module-boundary-split-study: done  # spec stage (supervisor-split-study-2026-09-19.md, options A/B/C) ratified A+B by Islam 2026-09-19; implemented in two compile-gated commits: commit 1 = tests -> supervisor/tests.rs (9101 -> 4775-line supervisor.rs) + embed_clean walker recognizes tests.rs/tests/ test regions; commit 2 = production directory split mod.rs(core+transitions)/spawn/lifecycle/reaper/usage/interaction (pure impl-block moves, 11 cross-family fns widened pub(super), audit path pins updated to the family files). Lock model untouched per AD-18.
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
   # 2026-07-14: CLEAN REMOVAL at v0.6.0; remove top-level `kt list`/`kt show`; PRD FR-37/38
@@ -1273,7 +1284,7 @@ action_items:
       post-registration manifest edit to 2.x bypasses the 6-6 load gate) + bypass
       test. [epic-6 retro B1, high]"
     owner: "first engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-3-frozen-doc-corrections"
     epic: 6
@@ -1352,7 +1363,7 @@ action_items:
       the re-folded layers restore it UNSTRIPPED, delivering through a declared mapping
       with no DC-10 notice; no test pins any layer. [epic-5 retro A1, high]"
     owner: "next engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-2-untested-refusals"
     epic: 5
@@ -1384,7 +1395,7 @@ action_items:
       7-5 perf evidence (0.7%/instance vs 2% budget) supports ratifying the coarse
       two-mutex model; ratify or commission the split. [epic-5 retro B5]"
     owner: "Islam"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-7-retro-item-1-homebrew-token-renewal"
     epic: 7
@@ -1464,68 +1475,57 @@ action_items:
       epic-11; the next engine epic spec stage should propose a deliberate module
       boundary instead of accreting. [epic-11 retro F-agg2, LOW]"
     owner: "next engine epic"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-1-fix-unix-spawn-diagnostic-inversion"
-    epic: 11
-    action: "Fix the unix spawn fail-closed diagnostic inversion (L1): the killpg/wait
-      reaps the child BEFORE the try_wait distinction, so exited-instantly always
-      fires and the platform-failure arm is dead (backends/unix/mod.rs:301-327; Windows
-      mirror is correct). Capture the retry-loop outcome before the kill; seam-test
-      both arms at the spawn site. [epic-11 retro L1, MED]"
-    owner: "next engine-touching story"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-2-verify-loop2-invariants-cap-skip-pins"
-    epic: 11
-    action: "Verify the loop-2 invariants (L2+L3): test the AI-12 40-tick environmental
-      cap (escalation once, crash credit resumes), test the AI-41 bounded-park SKIP
-      path (SKIPPED diagnostic + cursor advance), and add embed-clean count==1 pins
-      for the &skip/&escalation/&unclear diagnostic routes. [epic-11 retro L2/L3,
-      MED]"
-    owner: "next engine-touching story"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-3-agents-coverage-gate-sentence"
-    epic: 11
-    action: "Correct AGENTS.md:34-35 coverage-gate wording (names cargo tarpaulin
-      --workspace --fail-under 95; the real gate is the 11-5 per-crate split + lcov
-      merge + exact-fraction comparison - link docs/testing.md). [epic-11 retro L5,
-      LOW]"
-    owner: "next docs-touching change"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-4-recovery-session-verification-bar-pattern"
-    epic: 11
-    action: "Canonize the recovery-session verification bar as an AGENTS.md Engineering
-      pattern (AI-57 sibling): a session resuming a dead session review loop applies
-      its patches at the SAME evidence bar (test + pin), and the commissioning loop
-      re-runs over the recovery work. Root cause of L1-L3. [epic-11 retro process
-      lesson]"
-    owner: "next process-touching story"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-5-windows-parity-adoption-tests"
-    epic: 11
-    action: "Windows-positive twins for the AI-44 x3 + AI-46 adoption tests (they
-      runtime-skip Windows; the harness is Windows-capable; the survival-test twins
-      are the template). [epic-11 retro L4, LOW]"
-    owner: "next Windows-touching story"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-6-semver-job-collect-both-layers"
-    epic: 11
-    action: "Optional: semver CI job collects BOTH layer findings (in-repo baseline
-      + crates.io loop) before exiting - the sequential fail-fast masked the crates.io
-      version-bump finding for the PR whole life. [epic-11 retro F2, LOW]"
+  - id: "epic-12-retro-item-95-stabilize-the-macos-ci-flake-family-epic"
+    epic: 12
+    action: "Stabilize the macOS CI flake family (epic-12 retro P2): same-SHA green-red
+      flips on main — uj3_governance_journey_through_documented_cli_commands_unix
+      (crates/kt/tests/agent_cli.rs:2977), interleaved_instances_keep_per_instance_fifo
+      (crates/hekma-conformance/src/uj3.rs:418), log_file_captures_child_stdout spawn
+      start-time race (crates/hekma-engine/src/backends/unix/mod.rs:1042), two_engines
+      embed_clean concurrency (crates/hekma-engine/tests/embed_clean.rs:323). Reproduce
+      under load; fix the race or add principled tolerance (no blind retry). [epic-12
+      retro action 1, MED]"
     owner: "next CI-touching story"
     status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
-  - id: "epic-11-retro-item-7-supervisor-split-study"
-    epic: 11
-    action: "supervisor.rs split study: production 4437 + tests 3671 lines, +36 percent
-      in epic-11; the next engine epic spec stage should propose a deliberate module
-      boundary instead of accreting. [epic-11 retro F-agg2, LOW]"
-    owner: "next engine epic"
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-96-tracker-status-consistency-pin-in-script"
+    epic: 12
+    action: "Tracker-status consistency pin in scripts/test_automation.py: fail when
+      any development_status row comment says MERGED to main while its status is not
+      done — would have caught 8842b8b dropping the 12-1..12-4 flip on day zero. [epic-12
+      retro action 2, LOW]"
+    owner: "next automation-touching story"
     status: open
-    ref: "_bmad-output/implementation-artifacts/epic-11-retro-2026-09-15.md"
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-97-canonize-verify-the-diff-not-the-message"
+    epic: 12
+    action: "Canonize verify-the-diff-not-the-message as an AGENTS.md engineering
+      pattern (AI-57 sibling): a commit claiming a bookkeeping/state change is verified
+      against its diff before handoff (8842b8b precedent). Fold with epic-11 item
+      3 AGENTS.md edit. [epic-12 retro action 3, LOW]"
+    owner: "next docs/process-touching change"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-98-put-the-two-windows-lifetime-caveats-on"
+    epic: 12
+    action: "Put the two Windows lifetime caveats on operator surfaces (epic-12 retro
+      R1/R2, AI-18): (a) troubleshooting.md entry for the start --detach stdio pipe-hold
+      hang (scripted captures block until agent exit, Windows); (b) one sentence stating
+      the adopted-Windows stop boundary (descendants not terminated; unix killpg parity
+      only in the spawning lifetime); (c) log the second review round in spec-epic-12
+      change log or correct its loop-2 wording (R4). Owner: next docs-touching change,
+      coordinated with the routed Windows story. [epic-12 retro action 4, MED]"
+    owner: "next docs-touching change"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-12-retro-item-99-c6ecadb-seam-test-or-documented-accept-e"
+    epic: 12
+    action: "c6ecadb seam test or documented accept (epic-12 retro R5): pin the adopted-open
+      failure arm (SYNCHRONIZE-denied process -> honest Ok(None), no live-to-failed
+      reconciliation) or record the accept, next time the Windows backend is touched.
+      [epic-12 retro action 5, LOW]"
+    owner: "next Windows-touching story"
+    status: open
+    ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"

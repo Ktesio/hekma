@@ -735,6 +735,108 @@ fn a_native_backing_never_injects_the_reserved_key_or_creates_the_directory_at_s
     facade.stop("nat", Some(Duration::from_secs(5))).unwrap();
 }
 
+#[test]
+fn a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces() {
+    // The LOCAL half of the reserved-key strip (epic-5 retro A1; the
+    // engine-observed half is pinned in tests/observed_metering.rs). On a plain
+    // start — self-reported metering, no invocation overrides — `start_inner`
+    // strips a hand-set `memory.dir` from the operator layers BEFORE the config
+    // mapping applies (5-1's CORRECTION: the key is a delivery mechanism, never
+    // operator configuration; 5-1's E4 review patch shipped this strip with NO
+    // test — this is that missing pin). With no backing attached the engine
+    // injects nothing at this key, so the only way the decoy could reach the
+    // agent is by leaking through the operator layer into the declared mapping
+    // — it must appear in NEITHER the delivered env (the child's dump) NOR the
+    // persisted effective-config snapshot.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+
+    // The dump target lives OUTSIDE the Agent Home so the home stays pristine
+    // for the snapshot assertion below.
+    let dump = state.path().join("memory-strip-local.dump");
+    let dump_arg = format!("{}", dump.display());
+    // The manifest DECLARES a mapping for the reserved key (env
+    // `AGENT_MEMORY_DIR`), so an unstripped value WOULD be delivered. The
+    // `write_fake_manifest` body is `self-reported` metering: a PLAIN start —
+    // no engine-observed listener, hence NO invocation-override re-fold, the
+    // exact path the base strip guards.
+    write_fake_manifest(
+        manifest.path(),
+        "localmem",
+        &["--linger-ms", "600000", "--dump", &dump_arg],
+        Some(MEMORY_MAPPED_CONFIG),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    let registered = facade
+        .register_with_adapter(
+            "localmem",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    // THE DECOY: a hand-set value at the reserved key in the operator
+    // (instance) layer — the observed_metering.rs decoy pattern.
+    let decoy = "/tmp/ktesio-decoy-memory-dir-local";
+    facade.set_config("localmem", "memory.dir", decoy).unwrap();
+    // POSITIVE CONTROL: an `agent.*` pass-through key set through the SAME
+    // operator layer and delivered by the SAME start — its delivery proves the
+    // operator layer and the mapping path are live end-to-end, so the decoy's
+    // absence below is attributable to the STRIP, not to a dead mapping or an
+    // operator layer that never reaches the child.
+    facade
+        .set_config("localmem", "agent.PROBE_CONTROL_KEY", "control-value-local")
+        .unwrap();
+
+    facade.start("localmem").unwrap();
+    // Poll the committed dump (the bounded committed-artifact pattern), then
+    // assert the decoy reached NOTHING: a stripped key is a mapping no-op, so
+    // there is no AGENT_MEMORY_DIR env line at all.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let dump_text = loop {
+        match std::fs::read_to_string(&dump) {
+            Ok(text) if text.contains("arg=") => break text,
+            _ => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the agent never wrote its dump at {}",
+                    dump.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    assert!(
+        !dump_text.contains("env=AGENT_MEMORY_DIR="),
+        "a hand-set reserved key must not be delivered as engine memory:\n{dump_text}"
+    );
+    assert!(
+        !dump_text.contains(decoy),
+        "the decoy must not reach the child's environment anywhere:\n{dump_text}"
+    );
+    assert!(
+        dump_text.contains("env=PROBE_CONTROL_KEY=control-value-local"),
+        "the positive control must be delivered by the same start (proves the \
+         operator layer and mapping path are live and the strip is what blocked \
+         the reserved key):\n{dump_text}"
+    );
+
+    // ... and neither the key nor the value lands in the effective-config
+    // snapshot (the 3-4/5-1 honest-provenance split).
+    let snapshot =
+        std::fs::read_to_string(Path::new(&registered.agent_home).join("effective-config.json"))
+            .expect("snapshot written at start");
+    assert!(
+        !snapshot.contains("memory.dir") && !snapshot.contains(decoy),
+        "the reserved key must stay out of effective-config.json:\n{snapshot}"
+    );
+
+    facade
+        .stop("localmem", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
 // ---- Story 5-2, AC2: portability — a copied Agent Home serves memory intact ----
 
 #[test]
