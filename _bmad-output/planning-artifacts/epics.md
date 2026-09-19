@@ -1028,13 +1028,35 @@ on re-adoption, resume via `session/load` when the agent advertises `loadSession
 `session/new` with an honest stderr note. Detach (epic-12) composes: the process survives
 the CLI exit; the session resumes on the next command's reattach.
 
-### Story 14.3: Honest fleet surfaces for ACP agents (D2)
-ACP agents are UNMETERED in v1 — the protocol carries no usage data and third-party agents
-cannot be assumed to emit the KTESIO_USAGE sentinel: Fleet/config metering surfaces show
-the honest `—` (the METERING_SEED_CELL pattern), docs state it plainly, and no usage or
-cost is ever fabricated (AD-8). Config mapping (env/args) and Memory Backing delivery work
-unchanged through existing machinery; `--help`/notice honesty per the house pattern
-(AI-18 surfaced-not-silent throughout).
+### Story 14.3: ACP usage acquisition — tiered, honest (D2, AMENDED: metering is critical)
+The `acp` kind acquires REAL token usage tiered — `—` is the surfaced LAST RESORT, never the stance:
+(T1) parse the de-facto usage channels on the ACP stream — usage-bearing `session/update` chunks
+(Claude-adapter shapes carry Anthropic usage fields) and usage-update notifications (Gemini/ADK
+`usageMetadata` shapes), tolerant of absence and `_meta` extension shapes, tracking the draft
+"End-Turn Token Usage" RFD for standardization; (T2) the engine-observed loopback channel (3-4)
+where the agent honors a provider base-URL override; (T3) the optional stderr KTESIO_USAGE
+sentinel (cooperative agents — 14.5's mode). When NO tier yields usage, the Fleet/config surfaces
+show the honest `—` (METERING_SEED_CELL pattern) with a surfaced notice naming the gap and the
+tiers attempted — never fabricated counts, never silent absence (AD-8, AI-18). Config mapping
+(env/args) and Memory Backing delivery unchanged; `--help`/notice honesty throughout.
+
+### Story 14.6: Cached tokens across the metering pipeline (D8, ACP-independent — FOUNDATION)
+The gap predates ACP and bites every kind: `metering/parse.rs` explicitly ignores
+`prompt_tokens_details` (OpenAI's `cached_tokens` home) and `total_tokens`; the `Rate` cost
+model carries only input/output prices; the ledger has no cached column. This story:
+ParsedUsage parses the three provider cached shapes (OpenAI `prompt_tokens_details.cached_tokens`;
+Anthropic `cache_read_input_tokens` + `cache_creation_input_tokens`; Gemini
+`cachedContentTokenCount`) — absence of a known field parses as known-zero, unknown fields stay
+uninterpreted (honest lower bound); the ledger gains an additive nullable `cached_tokens` column
+(next migration after v6, additive-nullable precedent); `Rate` gains an OPTIONAL cached rate —
+unset prices cached tokens AT THE INPUT RATE (documented conservative default: overstates cost,
+never understates), set prices at the cached rate; token budgets count cached tokens; fleet and
+config surfaces distinguish the cached contribution. Runs FIRST after 14.1 — the ACP acquisition
+story (14.3) lands on this foundation.
+
+**Execution order (amended 2026-09-19 — metering is critical):** 14-1 (transport core) →
+**14-6 (cached-token pipeline foundation)** → 14-3 (ACP usage acquisition) → 14-2 (sessions
+across lifetimes) → 14-5 (hermes deprecation path) → 14-4 (verification & docs).
 
 ### Story 14.5: Hermes-kind deprecation path (D7 — Islam's amendment, Hermes speaks ACP)
 The bespoke `hermes` builtin (epic-6) is a special case of `acp`: Hermes Agent ships a first-class
