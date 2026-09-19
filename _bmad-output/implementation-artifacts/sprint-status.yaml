@@ -129,6 +129,17 @@ development_status:
   # AI-58). Post-rename paths (crates/hekma-engine). Stories run as a batch (no per-story files),
   # epic-12 shape.
   epic-13: done  # 🎉 all three stories complete 2026-09-19 (13-1/13-2 reconciled pre-closed + the missing local-path strip pin; 13-3 split study ratified A+B and implemented). Full gates green at each commit.
+  # Epic 14 (ACP backend support) — opened 2026-09-19 via correct-course (Sprint Change Proposal
+  # sprint-change-proposal-2026-09-19-acp.md, APPROVED by Islam with decisions D1–D6): any ACP-v1-capable
+  # agent becomes a backend via the builtin `acp` kind; frozen contract v1 NOT engaged (B3 precedent);
+  # honest unmetered v1 (D2); minimal capability advertisement (D3); session persistence + load (D4).
+  # PRD gains FR-40 + SM-1 note; architecture gains AD-19 at 14-1's spec stage.
+  epic-14: backlog  # opened 2026-09-19 via correct-course — ACP backend support (FR-40); next epic after 13
+  14-1-acp-transport-core-builtin-acp-kind: backlog  # D1/D3/D6 — initialize handshake, minimal capabilities, session/prompt turns, update capture, cancel+stop ladder
+  14-2-acp-sessions-across-lifetimes: backlog  # D4 — persist session id; session/load on adoption when advertised, else session/new + honest note; composes with detach
+  14-3-acp-honest-fleet-surfaces: backlog  # D2 — honest unmetered `—` cells; config/memory machinery unchanged; surfaced-not-silent refusals
+  14-4-acp-verification-and-docs: backlog  # fake ACP agent in conformance + real-agent smoke (gemini --acp, skip otherwise) + docs sweep + AI-55 announcement
+  14-5-hermes-kind-deprecation-path: backlog  # D7 amendment (Islam, 2026-09-19) — Hermes speaks ACP (hermes-acp): acp-kind metering parity (optional stderr sentinel) + HERMES_HOME proof, deprecation announcement, real-hermes-over-acp smoke; actual hermes removal at a later major
   13-1-close-the-memory-dir-strip-gap-on-the-invocation-override-path: done  # RESOLVED 2026-09-19: the delivery defect was ALREADY closed by 11-3 (bee7d48 — override-branch strip supervisor.rs:1191-1205 + engine-observed pin observed_metering.rs:826, mutation-verified); 13-1's net change is the genuinely-missing LOCAL-path pin (tests/memory.rs a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces, +102, mutation-verified with a positive control). Retro item epic-5-retro-item-1 reconciled closed.
   13-2-renegotiate-the-contract-on-the-legacy-start-fallback: done  # RESOLVED-PRE-EXISTING 2026-09-19: closed by 7b1a70c2 (PR #172, 2026-09-07, retro item #2) — fallback re-parse negotiates (adapter/mod.rs:338-352 → LaunchResolveError::ContractIncompatible), bypass tests at mod.rs:1348/:1390, docs corrected in the same PR; verified at HEAD, zero code change in epic-13. Retro item epic-6-retro-item-2 reconciled closed.
   13-3-supervisor-module-boundary-split-study: done  # spec stage (supervisor-split-study-2026-09-19.md, options A/B/C) ratified A+B by Islam 2026-09-19; implemented in two compile-gated commits: commit 1 = tests -> supervisor/tests.rs (9101 -> 4775-line supervisor.rs) + embed_clean walker recognizes tests.rs/tests/ test regions; commit 2 = production directory split mod.rs(core+transitions)/spawn/lifecycle/reaper/usage/interaction (pure impl-block moves, 11 cross-family fns widened pub(super), audit path pins updated to the family files). Lock model untouched per AD-18.

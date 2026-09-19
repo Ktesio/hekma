@@ -171,6 +171,7 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
 
+### Epic 14: ACP Backend Support *(opened 2026-09-19 via correct-course)*
 ### Epic 13: Engine Correctness & the Supervisor Module Boundary *(opened 2026-09-19)*
 ### Epic 12: Durable Detach & the Production-Usable Observed Channel
 An Operator can detach a start from the CLI's lifetime (the agent survives via the adoption path), and the engine-observed metering channel works against real providers: streamed completions are metered (the `include_usage` terminal frame), HTTPS upstreams dial directly (vendored rustls), and a store outage degrades the observed drain loudly with a bounded-skip instead of wedging or silently losing. Opened 2026-09-15 by Islam's ratification (recommended across the board) of ai-20-ai-47-product-calls-2026-09-15.md.
@@ -997,3 +998,58 @@ bounded-options proposal for a deliberate module boundary (AI-58: draft-then-rat
 options concretely stated with trade-offs, a recommendation, and a migration shape that
 keeps every step compile-gated and independently revertible. Implementation follows only
 after Islam ratifies a boundary.
+
+## Epic 14: ACP Backend Support
+
+> **(2026-09-19 — opened via correct-course from Islam's directive; Sprint Change Proposal:
+> `sprint-change-proposal-2026-09-19-acp.md`, APPROVED with decisions D1–D6.)** Any agent
+> speaking the Agent Client Protocol (ACP, Zed's JSON-RPC-over-stdio standard, v1) becomes a
+> Hekma backend through a new builtin `acp` kind — minimal integration friction, no per-agent
+> adapter authoring. Serves SM-1 (cross-agent operability) and SM-5 (adapter effort ~zero for
+> ACP-capable agents); adds FR-40 to the PRD. The frozen adapter contract v1 is NOT engaged
+> (builtin kinds don't negotiate — epic-6 retro B3 precedent). All paths post-rename
+> (`crates/hekma-*`). Batch-epic shape (10–13 precedent).
+
+### Story 14.1: ACP transport core — the builtin `acp` kind (D1, D3, D6)
+Spawn the agent under existing supervision; run the ACP `initialize` handshake (pin the ACP version RANGE at the spec stage (docs claim v1; Hermes tracks 0.8.1–<1.0);
+negotiate the version at `initialize`, refusing unsupported ones with a surfaced, traffic-free error — the
+6-6 shape transposed); advertise MINIMAL client capabilities (baseline only per D3 — no
+`fs.*`, no `terminal`, no `elicitation`; un-advertised capability requests get typed,
+surfaced refusals); `session/new` at start; `send` = a `session/prompt` turn; the
+`session/update` stream routes into the existing per-instance output log + events; stop =
+`session/cancel` then the engine's normal termination ladder; pause/resume via the existing
+process semantics (SIGSTOP parity unchanged). JSON-RPC framing is OS-uniform stdio (AD-4:
+no per-OS cfg outside `backends/`); the JSON-RPC dependency question settles under NFR-8's
+lean policy at the spec stage.
+
+### Story 14.2: Sessions across lifetimes (D4)
+Persist the last ACP session id alongside the spawn record (additive schema extension);
+on re-adoption, resume via `session/load` when the agent advertises `loadSession`, else
+`session/new` with an honest stderr note. Detach (epic-12) composes: the process survives
+the CLI exit; the session resumes on the next command's reattach.
+
+### Story 14.3: Honest fleet surfaces for ACP agents (D2)
+ACP agents are UNMETERED in v1 — the protocol carries no usage data and third-party agents
+cannot be assumed to emit the KTESIO_USAGE sentinel: Fleet/config metering surfaces show
+the honest `—` (the METERING_SEED_CELL pattern), docs state it plainly, and no usage or
+cost is ever fabricated (AD-8). Config mapping (env/args) and Memory Backing delivery work
+unchanged through existing machinery; `--help`/notice honesty per the house pattern
+(AI-18 surfaced-not-silent throughout).
+
+### Story 14.5: Hermes-kind deprecation path (D7 — Islam's amendment, Hermes speaks ACP)
+The bespoke `hermes` builtin (epic-6) is a special case of `acp`: Hermes Agent ships a first-class
+`hermes-acp` stdio entry point (listed on agentclientprotocol.com). Land the retirement path, not a hard removal:
+(a) the `acp` kind gains an OPTIONAL self-reported metering mode reading the KTESIO_USAGE sentinel from the shared
+stderr agent.log (hermes cooperates; D2's default stays unmetered), and the HERMES_HOME memory-delivery proof is
+re-established under the `acp` kind; (b) docs announce the deprecation — new registrations steer to `--kind acp`,
+the `hermes` kind keeps working, actual removal at a later MAJOR per the CLI-surface policy (no stranded instances,
+no silent metering loss); (c) real-hermes-over-acp verification joins 14.4's smoke matrix.
+
+### Story 14.4: Verification & docs
+A fake ACP agent binary in `hekma-conformance` (scriptable JSON-RPC over stdio) drives the
+test matrix: handshake, prompt turn on the wire, update capture, cancel/stop, load/no-load
+adoption (14.2), un-advertised-capability refusal (D3), protocol-major refusal (D6).
+Real-agent smoke against `gemini --acp` when present (skip otherwise, surfaced). Docs:
+commands.md (the `acp` kind), supported-agents page, architecture AD-19 (spine; seed text
+in the proposal), adapter-contract scope sentence (builtins don't negotiate — B3), metering
+honesty note. Release-surface announcement per AI-55 (new kind, additive schema, no break).
