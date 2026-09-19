@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "09-19-2026 04:16"
+last_updated: "09-19-2026 04:35"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -122,6 +122,16 @@ development_status:
   12-4-observed-drain-durability-cursor-retry-skip: done  # retro F3 fold — the observed drain gets the AI-41 treatment: park + bounded retry + loud SKIPPED instead of silent loss under store failure. Loop 1: the park buffer is CAPPED (OBSERVED_PARK_MAX_EVENTS, oldest dropped LOUDLY on overflow) and the shared ingest-failure diagnostic is MODE-aware (a terminal drain never claims "parked for retry"; the terminal test asserts the absence) 🎉 MERGED to main 2026-09-15 as 49da96b (PR #184, epic-12 one-PR squash); semver baseline moved to 49da96b in ci.yml + scripts/test_automation.py (#181 precedent). MERGE CHECKLIST from the in-progress note: DONE.
   epic-8-retrospective: optional
   epic-12-retrospective: done  # 2026-09-19 (epic-12-retro-2026-09-19.md) — verdict accepted-with-open-items; 5 action items appended
+  # Epic 13 (engine correctness & the supervisor boundary) — opened 2026-09-19 carrying the two
+  # HIGH retro defects (epic-5 A1 memory.dir strip gap on the invocation-override path; epic-6 B1
+  # legacy-start-fallback negotiation bypass) + the twice-carried supervisor split study
+  # (13-3's spec stage proposes the module boundary; implementation is ratification-gated per
+  # AI-58). Post-rename paths (crates/hekma-engine). Stories run as a batch (no per-story files),
+  # epic-12 shape.
+  epic-13: in-progress  # opened 2026-09-19 by Islam's directive — close the two HIGH deferred defects + the supervisor split study
+  13-1-close-the-memory-dir-strip-gap-on-the-invocation-override-path: done  # RESOLVED 2026-09-19: the delivery defect was ALREADY closed by 11-3 (bee7d48 — override-branch strip supervisor.rs:1191-1205 + engine-observed pin observed_metering.rs:826, mutation-verified); 13-1's net change is the genuinely-missing LOCAL-path pin (tests/memory.rs a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces, +102, mutation-verified with a positive control). Retro item epic-5-retro-item-1 reconciled closed.
+  13-2-renegotiate-the-contract-on-the-legacy-start-fallback: done  # RESOLVED-PRE-EXISTING 2026-09-19: closed by 7b1a70c2 (PR #172, 2026-09-07, retro item #2) — fallback re-parse negotiates (adapter/mod.rs:338-352 → LaunchResolveError::ContractIncompatible), bypass tests at mod.rs:1348/:1390, docs corrected in the same PR; verified at HEAD, zero code change in epic-13. Retro item epic-6-retro-item-2 reconciled closed.
+  13-3-supervisor-module-boundary-split-study: in-progress  # epic-11 F-agg2 carried; spec stage = bounded-options boundary proposal, implementation ratification-gated
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
   # 2026-07-14: CLEAN REMOVAL at v0.6.0; remove top-level `kt list`/`kt show`; PRD FR-37/38
@@ -1274,7 +1284,7 @@ action_items:
       post-registration manifest edit to 2.x bypasses the 6-6 load gate) + bypass
       test. [epic-6 retro B1, high]"
     owner: "first engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-3-frozen-doc-corrections"
     epic: 6
@@ -1353,7 +1363,7 @@ action_items:
       the re-folded layers restore it UNSTRIPPED, delivering through a declared mapping
       with no DC-10 notice; no test pins any layer. [epic-5 retro A1, high]"
     owner: "next engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-2-untested-refusals"
     epic: 5
