@@ -502,6 +502,12 @@ fn fleet_entry(facade: &hekma_engine::Blocking<'_>) -> hekma_engine::FleetEntry 
 /// FILE or DIRECTORY PANICS with its path — a read failure must never
 /// silently mean "unscanned": a directory whose `read_dir` fails would
 /// otherwise vacuously pass the audit as an unvisited subtree.
+///
+/// `tests.rs` files and `tests/` subtrees under `src/` are SKIPPED: they are
+/// `#[cfg(test)]` regions by construction under the Rust 2018 module layout
+/// (`supervisor.rs` + `supervisor/tests.rs`), the same reason `clean_source`
+/// region-skips inline `#[cfg(test)] mod tests { … }` blocks. Production
+/// sources — everything else — are always scanned.
 fn visit_rs(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
         panic!(
@@ -512,8 +518,14 @@ fn visit_rs(dir: &Path, f: &mut impl FnMut(&Path, &str)) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "tests") {
+                continue;
+            }
             visit_rs(&path, f);
         } else if path.extension().is_some_and(|e| e == "rs") {
+            if path.file_name().is_some_and(|n| n == "tests.rs") {
+                continue;
+            }
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!("could not read {} for the audit scan: {e}", path.display())
             });
