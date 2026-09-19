@@ -134,8 +134,8 @@ development_status:
   # agent becomes a backend via the builtin `acp` kind; frozen contract v1 NOT engaged (B3 precedent);
   # honest unmetered v1 (D2); minimal capability advertisement (D3); session persistence + load (D4).
   # PRD gains FR-40 + SM-1 note; architecture gains AD-19 at 14-1's spec stage.
-  epic-14: backlog  # opened 2026-09-19 via correct-course — ACP backend support (FR-40); next epic after 13
-  14-1-acp-transport-core-builtin-acp-kind: backlog  # D1/D3/D6 — initialize handshake, minimal capabilities, session/prompt turns, update capture, cancel+stop ladder
+  epic-14: in-progress  # spec stage COMPLETE 2026-09-19 (spec-epic-14-acp-backend-support.md @ 702571e; AD-19 landed in the spine; protocol pinned: ndJSON framing, default caps, usage_update=standard-but-CONTEXT-grain, StopReason set, codec=hand-rolled serde_json). Dev next: 14-1 → 14-6 → 14-3 → 14-2 → 14-5 → 14-4.
+  14-1-acp-transport-core-builtin-acp-kind: in-progress  # D1/D3/D6 — spec'd: src/acp/{codec,client,updates,connection}.rs, send=session/prompt (constant-time), in-flight refusal, permission auto-deny+diagnostic, version counter posture {1}, updates→log/events
   14-2-acp-sessions-across-lifetimes: backlog  # D4 — persist session id; session/load on adoption when advertised, else session/new + honest note; composes with detach
   14-3-acp-usage-acquisition-tiered: backlog  # D2 AMENDED (Islam: metering critical) — tiered REAL-usage acquisition: T1 de-facto ACP usage channels (Claude/Gemini shapes, RFD tracked), T2 observed base-URL, T3 stderr sentinel; `—` only as surfaced last resort naming gap+tiers; never fabricated
   14-6-cached-tokens-across-the-metering-pipeline: backlog  # D8 (Islam, 2026-09-19) — ACP-independent FOUNDATION: parse 3 provider cached shapes (parse.rs today IGNORES prompt_tokens_details), additive nullable cached_tokens column (post-v6), optional Rate cached rate w/ conservative input-rate default, budgets count cached, surfaces distinguish; runs first after 14-1
