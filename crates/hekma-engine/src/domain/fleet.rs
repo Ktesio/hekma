@@ -238,13 +238,24 @@ pub struct UsageView {
     /// when a Rate is configured; v1 always `estimated`. NEVER a `$` string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_label: Option<EstimateLabel>,
+    /// The CUMULATIVE cached-token subset (story 14-6, D8) — the cached SUBSET
+    /// of [`Self::cumulative_input_tokens`] under the INPUT-INCLUSIVE invariant.
+    /// `None`/absent = the scope contains a row with an UNKNOWN cached count
+    /// (a pre-v7 ledger row) — the honest absence, never a fabricated zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_cached_tokens: Option<u64>,
+    /// The CURRENT-RUN cached-token subset (story 14-6) — same semantics as
+    /// [`Self::cumulative_cached_tokens`], scoped to the active Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_cached_tokens: Option<u64>,
 }
 
 impl UsageView {
     /// Build a TOKENS-ONLY [`UsageView`] from the cumulative + current-run
     /// [`UsageTotals`] the Fleet read summed from the ledger (the dollar fields
     /// absent — the no-Rate case, AC-B). Story 3-3's [`Self::with_dollars`] adds the
-    /// derived cost when a Rate is present.
+    /// derived cost when a Rate is present. The 14-6 cached rollups ride through
+    /// verbatim (`None` = unknown in scope).
     pub fn new(cumulative: UsageTotals, current_run: UsageTotals) -> Self {
         Self {
             cumulative_input_tokens: cumulative.input_tokens,
@@ -254,6 +265,8 @@ impl UsageView {
             cumulative_dollars: None,
             current_run_dollars: None,
             estimate_label: None,
+            cumulative_cached_tokens: cumulative.cached_tokens,
+            current_run_cached_tokens: current_run.cached_tokens,
         }
     }
 
@@ -423,6 +436,13 @@ pub struct FleetTotals {
     /// `None` when `total_dollars` is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate_label: Option<EstimateLabel>,
+    /// The summed cached-token subset across the Fleet (story 14-6, D8) — the
+    /// cached SUBSET of [`Self::total_input_tokens`] under the INPUT-INCLUSIVE
+    /// invariant. `None`/absent = at least one metered row in the Fleet has an
+    /// UNKNOWN cached count (a pre-v7 ledger row) — the honest absence, never a
+    /// fabricated zero; `Some(0)` = the Fleet's known-zero (nothing cached).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cached_tokens: Option<u64>,
 }
 
 impl FleetTotals {
@@ -441,6 +461,11 @@ impl FleetTotals {
     pub fn from_entries(entries: &[FleetEntry]) -> Self {
         let mut total_input_tokens: u64 = 0;
         let mut total_output_tokens: u64 = 0;
+        // The running cached-subset sum (14-6): `Some(0)` start (an empty Fleet
+        // knows its zero); ANY entry with an UNKNOWN cached rollup poisons the
+        // whole total to `None` — a partial cached sum masquerading as complete
+        // would be a fabricated figure.
+        let mut total_cached_tokens: Option<u64> = Some(0);
         // The running dollar sum + whether ANY instance contributed a dollar figure
         // (had a Rate) + how many METERED instances lacked one (each → partial, and the
         // count is what the human footer names).
@@ -455,6 +480,12 @@ impl FleetTotals {
             total_input_tokens = total_input_tokens.saturating_add(usage.cumulative_input_tokens);
             total_output_tokens =
                 total_output_tokens.saturating_add(usage.cumulative_output_tokens);
+            // The cached subset (14-6): summed when known; one unknown row makes
+            // the Fleet total honestly unknown.
+            match (usage.cumulative_cached_tokens, total_cached_tokens) {
+                (Some(c), Some(sum)) => total_cached_tokens = Some(sum.saturating_add(c)),
+                _ => total_cached_tokens = None,
+            }
             // Dollars: sum ONLY where a derived cost exists (a Rate is configured).
             match usage.cumulative_dollars {
                 Some(cost) => {
@@ -497,6 +528,7 @@ impl FleetTotals {
             dollars_partial,
             unpriced_count,
             estimate_label,
+            total_cached_tokens,
         }
     }
 
@@ -600,10 +632,12 @@ mod tests {
             UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
+                cached_tokens: Some(60),
             },
             UsageTotals {
                 input_tokens: 40,
                 output_tokens: 60,
+                cached_tokens: Some(0),
             },
         );
         let value: serde_json::Value = serde_json::to_value(&entry).unwrap();
@@ -623,6 +657,85 @@ mod tests {
         // Still tokens only — no dollars leaked into the view.
         assert!(value["usage"].get("cost").is_none());
         assert!(value["usage"].get("dollars").is_none());
+    }
+
+    #[test]
+    fn usage_view_carries_the_cached_subset_additively_on_the_wire() {
+        // Story 14-6 (D8): the cached rollups ride the usage view — a KNOWN
+        // subset serializes as an integer (a subset of the input, never added to
+        // the total); an UNKNOWN one (a pre-v7 row in scope) is ABSENT from the
+        // wire (the honest `—` on human surfaces), never a fabricated zero.
+        let known = UsageView::new(
+            UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+                cached_tokens: Some(60),
+            },
+            UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+                cached_tokens: Some(10),
+            },
+        );
+        let value: serde_json::Value = serde_json::to_value(known).unwrap();
+        assert_eq!(value["cumulative_cached_tokens"], serde_json::json!(60));
+        assert_eq!(value["current_run_cached_tokens"], serde_json::json!(10));
+        // Backward-additive: an old consumer ignoring the field still parses.
+        let unknown = UsageView::new(
+            UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+                cached_tokens: None,
+            },
+            UsageTotals::zero(),
+        );
+        let value: serde_json::Value = serde_json::to_value(unknown).unwrap();
+        assert!(
+            value.get("cumulative_cached_tokens").is_none(),
+            "an UNKNOWN cached subset is absent, never null-zero: {value}"
+        );
+    }
+
+    #[test]
+    fn fleet_totals_sum_the_cached_subset_or_go_honestly_unknown() {
+        // Story 14-6 on the aggregate: Some subsets sum saturating; ONE entry
+        // with an unknown cached rollup makes the Fleet total None (never a
+        // partial sum masquerading as complete).
+        let mut a = sample_entry("a");
+        a.usage = UsageView::new(
+            UsageTotals {
+                input_tokens: 100,
+                output_tokens: 0,
+                cached_tokens: Some(60),
+            },
+            UsageTotals::zero(),
+        );
+        let mut b = sample_entry("b");
+        b.usage = UsageView::new(
+            UsageTotals {
+                input_tokens: 40,
+                output_tokens: 0,
+                cached_tokens: Some(0),
+            },
+            UsageTotals::zero(),
+        );
+        let totals = FleetTotals::from_entries(&[a.clone(), b.clone()]);
+        assert_eq!(totals.total_cached_tokens, Some(60));
+        // An unknown-cached entry poisons the total to None.
+        let mut c = sample_entry("c");
+        c.usage = UsageView::new(
+            UsageTotals {
+                input_tokens: 10,
+                output_tokens: 0,
+                cached_tokens: None,
+            },
+            UsageTotals::zero(),
+        );
+        let totals = FleetTotals::from_entries(&[a, c]);
+        assert_eq!(
+            totals.total_cached_tokens, None,
+            "one unknown row = unknown total"
+        );
     }
 
     // ---- Story 3-2: BudgetView (AC9) ----
@@ -813,6 +926,7 @@ mod tests {
             UsageTotals {
                 input_tokens: input,
                 output_tokens: output,
+                cached_tokens: Some(0),
             },
             UsageTotals::zero(),
         );
@@ -826,7 +940,9 @@ mod tests {
     #[test]
     fn totals_of_an_empty_fleet_are_zero_and_dollars_absent() {
         // Empty Fleet → all-zero tokens, no dollar total (nothing to estimate), no
-        // label, not partial.
+        // label, not partial. The cached rollup (14-6) is the truthful KNOWN zero
+        // (`Some(0)` — nothing unknown about an empty Fleet), deliberately NOT
+        // `FleetTotals::default()`'s unknown-None.
         let totals = FleetTotals::from_entries(&[]);
         assert_eq!(totals.total_input_tokens, 0);
         assert_eq!(totals.total_output_tokens, 0);
@@ -834,7 +950,7 @@ mod tests {
         assert_eq!(totals.total_dollars, None);
         assert_eq!(totals.estimate_label, None);
         assert!(!totals.dollars_partial);
-        assert_eq!(totals, FleetTotals::default());
+        assert_eq!(totals.total_cached_tokens, Some(0));
     }
 
     #[test]
@@ -1107,6 +1223,7 @@ mod tests {
             UsageTotals {
                 input_tokens: 1_000_000,
                 output_tokens: 1_000_000,
+                cached_tokens: Some(0),
             },
             UsageTotals::zero(),
         )

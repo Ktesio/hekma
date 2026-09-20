@@ -566,6 +566,127 @@ fn a_per_run_budget_breaches_within_the_run() {
 }
 
 #[test]
+fn cached_tokens_enforce_inside_the_inclusive_input_never_added_again() {
+    // Story 14-6 (D8) + THE INPUT-INCLUSIVE INVARIANT, enforced end-to-end:
+    // cached tokens are REAL billed tokens that ride INSIDE `input_tokens`, so a
+    // cached-bearing event breaches a token budget sized on input+output — and
+    // the cached subset is NEVER added a second time (the same event would
+    // breach a doubled budget if it were). One event: input 20 (10 of them
+    // cached) + output 10 = 30 total tokens. A cumulative ceiling of 25
+    // breaches on this single event (30 >= 25); a ceiling of 35 (which only a
+    // double-count of the cached subset would reach: 30 + 10 cached = 40) does
+    // NOT breach.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "cached",
+        &[
+            "--emit-usage",
+            "1",
+            "--usage-input-tokens",
+            "20",
+            "--usage-output-tokens",
+            "10",
+            "--usage-cached-tokens",
+            "10",
+            "--linger-ms",
+            "600000",
+        ],
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "cached",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    // 30 total tokens vs a 25 ceiling: breaches, proving the cached subset
+    // (inside input) counts.
+    facade
+        .set_config("cached", "budget.tokens.cumulative", "25")
+        .unwrap();
+    facade.start("cached").unwrap();
+    wait_for_state(
+        state.path(),
+        "cached",
+        LifecycleState::Paused,
+        Duration::from_secs(30),
+    );
+    let breaches = facade.budget_breach_events("cached").unwrap();
+    assert_eq!(breaches.len(), 1, "one breach for the single crossing");
+    assert_eq!(
+        breaches[0].observed, 30,
+        "observed = input(20, cached subset included) + output(10), NOT + cached again"
+    );
+
+    // The ledger stored the cached subset as a KNOWN value (Some(10)) — and the
+    // Fleet total stays input+output (the subset rides inside input).
+    let entry = facade
+        .fleet()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name.as_str() == "cached")
+        .unwrap();
+    assert_eq!(entry.usage.cumulative_input_tokens, 20);
+    assert_eq!(entry.usage.cumulative_output_tokens, 10);
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(10),
+        "the cached subset persists as a known count"
+    );
+    assert_eq!(
+        entry.usage.cumulative_total_tokens(),
+        30,
+        "never double-counted"
+    );
+
+    let _ = facade.stop("cached", Some(Duration::from_secs(5)));
+
+    // THE NEVER-ADDED-AGAIN PIN: the identical event under a 35 ceiling (which a
+    // double-count 30+10=40 would breach) stays WITHIN budget.
+    let state2 = TempDir::new().unwrap();
+    let manifest2 = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest2.path(),
+        "cached2",
+        &[
+            "--emit-usage",
+            "1",
+            "--usage-input-tokens",
+            "20",
+            "--usage-output-tokens",
+            "10",
+            "--usage-cached-tokens",
+            "10",
+            "--linger-ms",
+            "600000",
+        ],
+    );
+    let engine2 = open(&state2);
+    let facade2 = engine2.blocking();
+    facade2
+        .register_with_adapter(
+            "cached2",
+            &AdapterRef::Manifest(manifest2.path().to_path_buf()),
+        )
+        .unwrap();
+    facade2
+        .set_config("cached2", "budget.tokens.cumulative", "35")
+        .unwrap();
+    facade2.start("cached2").unwrap();
+    wait_for_usage_rows(state2.path(), "cached2", 1, Duration::from_secs(30));
+    assert_eq!(
+        facade2.budget_breach_events("cached2").unwrap().len(),
+        0,
+        "cached rides INSIDE input: total 30 < 35 — no double-count breach"
+    );
+    let _ = facade2.stop("cached2", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_budget_changed_while_running_applies_immediately() {
     // AC-B: budgets are changeable while `running`, applying immediately. Start
     // under a HIGH budget (no breach), confirm the instance is running past some

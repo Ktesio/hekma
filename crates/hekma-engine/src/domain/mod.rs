@@ -42,8 +42,8 @@ pub use config::{
     SECRET_PREFIX,
 };
 pub use cost::{
-    cost_micros, render_dollars, render_dollars_bare, CostCap, CostEvaluator, EstimateLabel,
-    Micros, Rate, MICROS_PER_DOLLAR,
+    cost_micros, cost_micros_with_cached, render_dollars, render_dollars_bare, CostCap,
+    CostEvaluator, EstimateLabel, Micros, Rate, MICROS_PER_DOLLAR,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{

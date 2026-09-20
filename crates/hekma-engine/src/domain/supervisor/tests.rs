@@ -3611,8 +3611,8 @@ fn an_observed_drain_parks_and_retries_the_same_minted_events() {
     let db = state.path().join("state.db");
 
     // Two observed completions; then the store dies.
-    queue.lock().unwrap().push_back((10, 20));
-    queue.lock().unwrap().push_back((11, 22));
+    queue.lock().unwrap().push_back((10, 20, 0));
+    queue.lock().unwrap().push_back((11, 22, 0));
     let schema = usage_events_schema(&db);
     assert!(
         schema
@@ -3683,8 +3683,8 @@ fn an_observed_partial_failure_parks_only_the_uncommitted_tail() {
     let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obspart");
     let db = state.path().join("state.db");
 
-    queue.lock().unwrap().push_back((10, 20));
-    queue.lock().unwrap().push_back((11, 22));
+    queue.lock().unwrap().push_back((10, 20, 0));
+    queue.lock().unwrap().push_back((11, 22, 0));
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
         "CREATE TRIGGER obs_fail_second BEFORE INSERT ON usage_events \
@@ -3742,9 +3742,9 @@ fn an_observed_poisoned_event_is_skipped_loudly_after_the_bound() {
     let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obsskip");
     let db = state.path().join("state.db");
 
-    queue.lock().unwrap().push_back((42, 1)); // the poisoned event
-    queue.lock().unwrap().push_back((7, 2));
-    queue.lock().unwrap().push_back((8, 3));
+    queue.lock().unwrap().push_back((42, 1, 0)); // the poisoned event
+    queue.lock().unwrap().push_back((7, 2, 0));
+    queue.lock().unwrap().push_back((8, 3, 0));
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
         "CREATE TRIGGER obs_poison BEFORE INSERT ON usage_events \
@@ -3836,7 +3836,7 @@ fn an_oversized_observed_park_drops_the_oldest_events_loudly() {
     // is dead: the buffer can hold only OBSERVED_PARK_MAX_EVENTS of them.
     let total = OBSERVED_PARK_MAX_EVENTS + 2;
     for i in 0..total {
-        queue.lock().unwrap().push_back((1, i as u64));
+        queue.lock().unwrap().push_back((1, i as u64, 0));
     }
     let schema = usage_events_schema(&db);
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -3914,12 +3914,12 @@ fn a_terminal_observed_drain_failure_announces_the_loss_without_a_retry_claim() 
     let db = state.path().join("state.db");
 
     // (1) Store UP: event A commits immediately.
-    queue.lock().unwrap().push_back((30, 40));
+    queue.lock().unwrap().push_back((30, 40, 0));
     sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
     assert_eq!(ledger_totals(state.path(), "obslost"), (1, 30));
 
     // (2) Store DIES: event B parks on the MidRun pass.
-    queue.lock().unwrap().push_back((3, 4));
+    queue.lock().unwrap().push_back((3, 4, 0));
     let schema = usage_events_schema(&db);
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute("DROP TABLE usage_events", []).unwrap();

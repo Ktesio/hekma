@@ -351,6 +351,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
+| `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |
 | `budget.dollars.per_run` | dollar string | Per-run dollar Cost Cap (needs a Rate to enforce) |
 | `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
 | `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
@@ -358,7 +359,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 
 Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
-Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
+Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). The cached price is OPTIONAL: when set, an event's cached tokens (the subset the provider served from its prompt cache) price at the cached rate and the remaining input at the input rate; when unset, cached tokens price AT the input rate — a deliberate conservative default that can only overstate the cost, never understate it. Cached tokens ride inside `input_tokens` (the input is inclusive), so token budgets count them once, through the ordinary totals, and surfaces show a `/ cached N` suffix only when a known non-zero subset exists. Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
 
 ### Budget breaches and the pause action
 

@@ -44,6 +44,15 @@ use tempfile::TempDir;
 /// object — so ledger totals are exact-match assertions (K calls × these).
 const STUB_PROMPT_TOKENS: u64 = 30;
 const STUB_COMPLETION_TOKENS: u64 = 70;
+/// The FIXED cached SUBSET the stub reports in
+/// `usage.prompt_tokens_details.cached_tokens` (story 14-6) — a subset of
+/// [`STUB_PROMPT_TOKENS`] under the INPUT-INCLUSIVE invariant (the OpenAI
+/// convention: prompt_tokens includes the cached portion). Adding the details
+/// object changes NO pre-existing assertion: input/output totals are unchanged,
+/// and a row with no cached RATE configured prices its whole input at the input
+/// rate (the conservative default) — so the older tests double as the
+/// backward-compatibility proof.
+const STUB_CACHED_TOKENS: u64 = 20;
 
 /// A sentinel API key value the `fake_agent` forwards in the `Authorization`
 /// header; the no-leak sweep asserts it appears in NONE of ktesio's surfaces.
@@ -185,7 +194,7 @@ fn serve_one(
         // include_usage asks for), and the `[DONE]` sentinel.
         let sse = format!(
             "data: {{\"id\":\"chatcmpl-stub\",\"choices\":[{{\"delta\":{{\"content\":\"he\"}}}}],\"usage\":null}}\n\n\
-             data: {{\"id\":\"chatcmpl-stub\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{STUB_PROMPT_TOKENS},\"completion_tokens\":{STUB_COMPLETION_TOKENS},\"total_tokens\":{total}}}}}\n\n\
+             data: {{\"id\":\"chatcmpl-stub\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{STUB_PROMPT_TOKENS},\"completion_tokens\":{STUB_COMPLETION_TOKENS},\"total_tokens\":{total},\"prompt_tokens_details\":{{\"cached_tokens\":{STUB_CACHED_TOKENS}}}}}}}\n\n\
              data: [DONE]\n\n",
             total = STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS,
         );
@@ -198,7 +207,7 @@ fn serve_one(
         let body = format!(
             r#"{{"id":"chatcmpl-stub","object":"chat.completion","model":"gpt-observed",
 "choices":[{{"index":0,"message":{{"role":"assistant","content":"ok"}},"finish_reason":"stop"}}],
-"usage":{{"prompt_tokens":{STUB_PROMPT_TOKENS},"completion_tokens":{STUB_COMPLETION_TOKENS},"total_tokens":{total}}}}}"#,
+"usage":{{"prompt_tokens":{STUB_PROMPT_TOKENS},"completion_tokens":{STUB_COMPLETION_TOKENS},"total_tokens":{total},"prompt_tokens_details":{{"cached_tokens":{STUB_CACHED_TOKENS}}}}}}}"#,
             total = STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS,
         );
         format!(
@@ -446,8 +455,93 @@ fn a_streamed_completion_is_metered_end_to_end_through_the_terminal_sse_frame() 
         2 * STUB_COMPLETION_TOKENS,
         "the terminal SSE frame's output tokens landed exactly"
     );
+    // Story 14-6: the terminal frame's cached subset landed too (the SSE seam
+    // parses `prompt_tokens_details.cached_tokens`).
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(2 * STUB_CACHED_TOKENS),
+        "the terminal SSE frame's cached subset landed exactly"
+    );
 
     let _ = facade.stop("obsstream", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn observed_cached_tokens_land_and_price_at_the_configured_cached_rate() {
+    // Story 14-6 (D8), the OBSERVED-path end-to-end: the upstream's
+    // `prompt_tokens_details.cached_tokens` lands in the ledger as a KNOWN
+    // subset (the INPUT-INCLUSIVE invariant — input totals unchanged), and —
+    // with `cost.rate.cached` configured — the derived cost prices the
+    // non-cached remainder at the input rate and the cached subset at the
+    // cached rate, per row, no-retro-repricing.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let stub = start_upstream_stub();
+
+    write_observed_manifest(
+        manifest.path(),
+        "obscached",
+        &["--observed-calls", "2", "--linger-ms", "600000"],
+        None,
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "obscached",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_config("obscached", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+    // The Rate: input $3/1M, output $15/1M, cached $0.30/1M.
+    facade
+        .set_config("obscached", "cost.rate.input", "3.00")
+        .unwrap();
+    facade
+        .set_config("obscached", "cost.rate.output", "15.00")
+        .unwrap();
+    facade
+        .set_config("obscached", "cost.rate.cached", "0.30")
+        .unwrap();
+
+    facade.start("obscached").unwrap();
+    let count = wait_for_observed_rows(state.path(), "obscached", 2, Duration::from_secs(30));
+    assert_eq!(count, 2, "both observed calls committed");
+
+    let entry = facade
+        .fleet()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name.as_str() == "obscached")
+        .unwrap();
+    // The cached subset persisted as KNOWN — a subset of the input, which is
+    // UNCHANGED (the inclusive invariant: never added to the total).
+    assert_eq!(entry.usage.cumulative_input_tokens, 2 * STUB_PROMPT_TOKENS);
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(2 * STUB_CACHED_TOKENS),
+        "the cached subset persisted (known, per call)"
+    );
+    assert_eq!(
+        entry.usage.cumulative_total_tokens(),
+        2 * (STUB_PROMPT_TOKENS + STUB_COMPLETION_TOKENS),
+        "the total is input+output only — the cached subset rides inside input"
+    );
+    // THE COST PIN (per row): (30-20) tokens x $3/1M = 30 micros + 20 x
+    // $0.30/1M = 6 micros + 70 x $15/1M = 1050 micros = 1086 micros/event;
+    // 2 events = 2172 micros. Without the cached rate the same rows would
+    // price 30x3 + 70x15 = 1140 micros/event (conservative) — the cached rate
+    // is what produced the re-split.
+    assert_eq!(
+        entry.usage.cumulative_dollars,
+        Some(hekma_engine::Micros(2 * 1086)),
+        "non-cached at the input rate + cached at the cached rate, per row"
+    );
+
+    let _ = facade.stop("obscached", Some(Duration::from_secs(5)));
 }
 
 #[test]

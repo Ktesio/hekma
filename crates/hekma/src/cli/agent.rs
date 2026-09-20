@@ -594,8 +594,8 @@ pub fn remove(
 const METERING_NOTE: &str =
     "usage + budget are real TOKEN counts from the Usage Ledger (budget '—' means \
      no budget configured); dollar figures appear only when a Rate is configured \
-     (cost.rate.input/output) and are labeled estimates — with no Rate, dollar \
-     features are inert.";
+     (cost.rate.input/output, optional cost.rate.cached) and are labeled estimates \
+     — with no Rate, dollar features are inert.";
 
 /// The guidance printed when the Fleet is EMPTY — shared by `list` and the
 /// Fleet-wide `usage` (fix pass, L3) so both surfaces say the same thing rather
@@ -651,8 +651,10 @@ const USAGE_LIST_HEADER: &str = "Usage (tok, est. $)";
 /// (estimated)`; InHeader → `in 120 / out 340 · $0.30`.
 fn usage_cell(usage: &UsageView, dollar_label: DollarLabel) -> String {
     let tokens = format!(
-        "in {} / out {}",
-        usage.cumulative_input_tokens, usage.cumulative_output_tokens
+        "in {} / out {}{}",
+        usage.cumulative_input_tokens,
+        usage.cumulative_output_tokens,
+        cached_suffix(usage.cumulative_cached_tokens)
     );
     match (usage.cumulative_dollars, usage.estimate_label) {
         (Some(dollars), label) => {
@@ -690,11 +692,26 @@ fn usage_cell_show(usage: &UsageView) -> String {
         .saturating_add(usage.current_run_output_tokens);
     if run_total > 0 {
         format!(
-            "cumulative {cumulative}; this run: in {} / out {}",
-            usage.current_run_input_tokens, usage.current_run_output_tokens
+            "cumulative {cumulative}; this run: in {} / out {}{}",
+            usage.current_run_input_tokens,
+            usage.current_run_output_tokens,
+            cached_suffix(usage.current_run_cached_tokens)
         )
     } else {
         cumulative
+    }
+}
+
+/// The optional ` / cached N` suffix for a token cell (story 14-6, D8) — the
+/// cached-token SUBSET of the cell's input figure under the INPUT-INCLUSIVE
+/// invariant. Rendered ONLY when the subset is KNOWN and non-zero: a known-zero
+/// stays off the cell (compact), and an UNKNOWN subset — a pre-v7 ledger row —
+/// stays off too, the honest absence (`—` on the wide `show` cell would overstate
+/// the row; omitting says less, never a fabricated `cached 0`).
+fn cached_suffix(cached: Option<u64>) -> String {
+    match cached {
+        Some(n) if n > 0 => format!(" / cached {n}"),
+        _ => String::new(),
     }
 }
 
@@ -826,8 +843,10 @@ fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
 /// in-process; `list` prints the returned line to stdout as command output (AD-12).
 fn fleet_total_footer(totals: &FleetTotals) -> String {
     let tokens = format!(
-        "in {} / out {}",
-        totals.total_input_tokens, totals.total_output_tokens
+        "in {} / out {}{}",
+        totals.total_input_tokens,
+        totals.total_output_tokens,
+        cached_suffix(totals.total_cached_tokens)
     );
     // The count of metered-but-unpriced rows that make the dollar total a lower bound
     // is carried on `totals.unpriced_count` (the engine `domain` computed it alongside
@@ -1071,8 +1090,10 @@ fn render_usage_instance(entry: &FleetEntry) {
         vec![
             ui::TableCell::plain("Cumulative tokens"),
             ui::TableCell::plain(format!(
-                "in {} / out {}",
-                usage.cumulative_input_tokens, usage.cumulative_output_tokens
+                "in {} / out {}{}",
+                usage.cumulative_input_tokens,
+                usage.cumulative_output_tokens,
+                cached_suffix(usage.cumulative_cached_tokens)
             )),
         ],
         vec![
@@ -1084,8 +1105,10 @@ fn render_usage_instance(entry: &FleetEntry) {
         vec![
             ui::TableCell::plain("Current-run tokens"),
             ui::TableCell::plain(format!(
-                "in {} / out {}",
-                usage.current_run_input_tokens, usage.current_run_output_tokens
+                "in {} / out {}{}",
+                usage.current_run_input_tokens,
+                usage.current_run_output_tokens,
+                cached_suffix(usage.current_run_cached_tokens)
             )),
         ],
         vec![
@@ -3223,6 +3246,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: input,
                 output_tokens: output,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         );
@@ -3332,10 +3356,12 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals {
                 input_tokens: 40,
                 output_tokens: 60,
+                cached_tokens: Some(0),
             },
         );
         let shown = usage_cell_show(&running);
@@ -3350,6 +3376,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         );
@@ -3358,6 +3385,111 @@ mod tests {
         assert!(
             !shown.contains("this run"),
             "no fabricated run scope: {shown}"
+        );
+    }
+
+    #[test]
+    fn cached_tokens_render_only_when_known_and_non_zero() {
+        // Story 14-6 (D8) on the human cells: the cached subset renders as
+        // ` / cached N` ONLY when it is KNOWN and non-zero. A known-zero (a
+        // cache miss) stays off the cell (compact), and an UNKNOWN subset (a
+        // pre-v7 ledger row) stays off too — the honest absence, never a
+        // fabricated `cached 0`.
+        let cached = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cached_tokens: Some(800),
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&cached, DollarLabel::Inline),
+            "in 1200 / out 300 / cached 800",
+            "the known non-zero subset renders"
+        );
+        let zero = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 340,
+                cached_tokens: Some(0),
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&zero, DollarLabel::Inline),
+            "in 120 / out 340",
+            "a known-zero subset stays off the cell"
+        );
+        let unknown = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 340,
+                cached_tokens: None,
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&unknown, DollarLabel::InHeader),
+            "in 120 / out 340",
+            "an UNKNOWN subset is an honest absence, never cached 0"
+        );
+    }
+
+    #[test]
+    fn show_cell_carries_the_current_run_cached_subset() {
+        // The wide `show` cell's CURRENT-RUN scope carries its own cached subset
+        // the same way — known-nonzero renders, known-zero/unknown stays off.
+        let running = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+                cached_tokens: Some(0),
+            },
+            hekma_engine::UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+                cached_tokens: Some(25),
+            },
+        );
+        let shown = usage_cell_show(&running);
+        assert!(
+            shown.contains("this run: in 40 / out 60 / cached 25"),
+            "run-scope cached renders: {shown}"
+        );
+        assert!(
+            !shown.contains("cached 0"),
+            "the known-zero cumulative subset stays off: {shown}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_carries_the_fleet_cached_subset_when_known_nonzero() {
+        // The Fleet footer's cached sum: rendered only when known and non-zero;
+        // one unknown-cached row keeps the honest absence (no partial cached
+        // sum masquerading as complete).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 1000, 200, Some(Micros(3_000_000))),
+            metered_fleet_entry("b", 500, 0, None),
+        ]);
+        // The metered_fleet_entry helper stamps known-zero subsets: no suffix.
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            !footer.contains("cached"),
+            "known-zero sum stays off: {footer}"
+        );
+        // A real cached subset renders.
+        let mut entry = metered_fleet_entry("c", 1000, 0, None);
+        entry.usage.cumulative_cached_tokens = Some(800);
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[entry]));
+        assert!(footer.contains("in 1000 / out 0 / cached 800"), "{footer}");
+        // One UNKNOWN row poisons the Fleet cached sum to the honest absence.
+        let mut unknown = metered_fleet_entry("d", 10, 0, None);
+        unknown.usage.cumulative_cached_tokens = None;
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[unknown]));
+        assert!(
+            !footer.contains("cached"),
+            "unknown sum stays off: {footer}"
         );
     }
 
@@ -3818,6 +3950,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 120,
                 output_tokens: 340,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         )

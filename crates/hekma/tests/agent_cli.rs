@@ -2337,6 +2337,8 @@ fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
     assert!(doc["totals"].is_object(), "totals present: {doc}");
     assert_eq!(doc["totals"]["total_input_tokens"], serde_json::json!(0));
     assert_eq!(doc["totals"]["total_output_tokens"], serde_json::json!(0));
+    // Story 14-6: the Fleet cached sum is the truthful known-zero here.
+    assert_eq!(doc["totals"]["total_cached_tokens"], serde_json::json!(0));
     assert!(
         doc["totals"].get("total_dollars").is_none(),
         "no Rate anywhere ⇒ no dollar total: {doc}"
@@ -2361,6 +2363,19 @@ fn list_json_emits_a_parseable_document_with_budget_seed_and_real_usage() {
     );
     assert_eq!(
         entry["usage"]["cumulative_output_tokens"],
+        serde_json::json!(0)
+    );
+    // Story 14-6: the cached rollups ride the wire. A never-metered instance's
+    // cached totals are the TRUTHFUL known-zero (0 — no rows at all, nothing
+    // unknown), serialized as a plain integer; an UNKNOWN cached subset (a
+    // pre-v7 row) would serialize as an ABSENT field instead, never a
+    // fabricated zero.
+    assert_eq!(
+        entry["usage"]["cumulative_cached_tokens"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        entry["usage"]["current_run_cached_tokens"],
         serde_json::json!(0)
     );
     // The active Metering Source is surfaced (AC-C).
@@ -2510,6 +2525,12 @@ fn show_json_surfaces_the_same_entry_shape_with_budget_seed_and_real_usage() {
     );
     assert_eq!(
         entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0)
+    );
+    // Story 14-6: the cached rollups ride show --json too (known-zero for a
+    // never-metered instance).
+    assert_eq!(
+        entry["usage"]["cumulative_cached_tokens"],
         serde_json::json!(0)
     );
     assert_eq!(entry["metering_source"], serde_json::json!("self-reported"));
@@ -5444,13 +5465,18 @@ const FLEET_ENTRY_KEYS: &[&str] = &[
 ];
 
 /// The FROZEN `UsageView` key-set for an instance with NO Rate configured —
-/// the four always-present token counters. The three dollar fields
+/// the four always-present token counters PLUS the two story-14-6 cached
+/// rollups (announced additive edit: the cached SUBSET of the input, present
+/// when KNOWN — `Some(0)` serializes — and absent when UNKNOWN, a pre-v7
+/// ledger row, never a fabricated zero). The three dollar fields
 /// (`cumulative_dollars`, `current_run_dollars`, `estimate_label`) are
 /// `skip_serializing_if` and appear ONLY when a Rate exists (AC-B: no Rate ⇒
 /// no dollar figure, never a fabricated `$0.00`).
 const USAGE_VIEW_TOKEN_KEYS: &[&str] = &[
+    "cumulative_cached_tokens",
     "cumulative_input_tokens",
     "cumulative_output_tokens",
+    "current_run_cached_tokens",
     "current_run_input_tokens",
     "current_run_output_tokens",
 ];
@@ -5460,6 +5486,7 @@ const USAGE_VIEW_TOKEN_KEYS: &[&str] = &[
 /// until at least one instance is priced.
 const FLEET_TOTALS_KEYS: &[&str] = &[
     "dollars_partial",
+    "total_cached_tokens",
     "total_input_tokens",
     "total_output_tokens",
     "unpriced_count",
@@ -5486,9 +5513,11 @@ const FLEET_TOTALS_KEYS: &[&str] = &[
 /// PLUS the three dollar fields (integer micros + the `estimated`/`reconciled`
 /// label — never a `$` string, AD-8/AD-14).
 const USAGE_VIEW_PRICED_KEYS: &[&str] = &[
+    "cumulative_cached_tokens",
     "cumulative_dollars",
     "cumulative_input_tokens",
     "cumulative_output_tokens",
+    "current_run_cached_tokens",
     "current_run_dollars",
     "current_run_input_tokens",
     "current_run_output_tokens",
@@ -5500,6 +5529,7 @@ const USAGE_VIEW_PRICED_KEYS: &[&str] = &[
 const FLEET_TOTALS_PRICED_KEYS: &[&str] = &[
     "dollars_partial",
     "estimate_label",
+    "total_cached_tokens",
     "total_dollars",
     "total_input_tokens",
     "total_output_tokens",
@@ -5527,6 +5557,16 @@ const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
 // ---------------------------------------------------------------------------
 // The MEMORY documents — story 6-6, THE ONE ANNOUNCED KEY-SET EDIT
 // ---------------------------------------------------------------------------
+//
+// STORY 14-6 ANNOUNCED ADDITIVE EDIT (2026-09-19): the `UsageView` and
+// `FleetTotals` frozen key-sets above gain the cached-token rollups
+// (`cumulative_cached_tokens`, `current_run_cached_tokens`,
+// `total_cached_tokens`) — backward-additive fields carrying the cached SUBSET
+// of the input under the ledger's INPUT-INCLUSIVE invariant; present when
+// KNOWN (a plain integer, `0` included) and ABSENT when UNKNOWN (a pre-v7
+// ledger row), never a fabricated zero. The Fleet document schema version does
+// NOT bump (the Epic-3 additive-field precedent).
+
 //
 // Epic 5 shipped `hekma agent memory attach|detach` human-output-only, deferring
 // the wire surface to Epic 6 with Story 5-1's DC-6 "ONE intentional announced

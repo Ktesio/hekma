@@ -211,11 +211,12 @@ impl Supervisor {
     /// parsed out of the agent's model traffic) into the SAME [`Self::ingest_usage`]
     /// choke point (story 3-4), minting the per-Run `sequence` for each.
     ///
-    /// The listener task PUSHES each parsed `(input, output)` pair; this reaper pass
+    /// The listener task PUSHES each parsed `(input, output, cached)` triple; this reaper pass
     /// DRAINS the queue (event-driven, NOT the log-tail path — observed usage does
     /// NOT ride the agent-output log, AD-12 contrast), the [`ObservedUsageSource`]
     /// mints the engine-side `sequence` (the agent supplies none), and each becomes
-    /// a `ParsedUsage` fed to `ingest_usage` under the instance's CURRENT Run id +
+    /// a `ParsedUsage` (input/output/cached — the cached subset since story 14-6)
+    /// fed to `ingest_usage` under the instance's CURRENT Run id +
     /// `engine-observed` source. NO new ledger writer, NO new enforcement path — the
     /// SAME choke point stamps + records + enforces (so 3-2 budgets + 3-3 caps apply
     /// unchanged). A `self-reported` instance (no `observed_source`/`observed_listener`)
@@ -263,12 +264,12 @@ impl Supervisor {
                 // A poisoned queue lock is a best-effort skip of the DRAIN — any
                 // parked events still retry below, and the queued pairs stay queued
                 // for the next pass (never silently lost).
-                let drained: Vec<(u64, u64)> = match listener.queue().lock() {
+                let drained: Vec<(u64, u64, u64)> = match listener.queue().lock() {
                     Ok(mut q) => q.drain(..).collect(),
                     Err(_) => Vec::new(),
                 };
-                for (input, output) in drained {
-                    events.push(source.mint(input, output));
+                for (input, output, cached) in drained {
+                    events.push(source.mint(input, output, cached));
                 }
                 if events.is_empty() {
                     return;

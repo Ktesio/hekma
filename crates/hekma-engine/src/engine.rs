@@ -683,12 +683,19 @@ impl Engine {
         // are scoped to the supervisor's live Run id (zero when not running / no run
         // id). A read-back failure degrades to zero totals (like the runtime fields),
         // never failing the whole Fleet. The totals equal the ledger exactly (FR-22).
+        // Story 14-6 honesty split: a DEGRADED ledger read defaults to
+        // `UsageTotals::default()` whose cached rollup is the UNKNOWN absence
+        // (`None` — never a fabricated zero), while NO current Run at all is the
+        // truthful `zero()` (known-zero cached — there is nothing to be unknown
+        // about a Run that does not exist).
         let cumulative = registry.usage_totals(&instance.name).unwrap_or_default();
         let current_run_id = supervisor.current_run_id(&instance.name);
-        let current_run = current_run_id
-            .as_ref()
-            .and_then(|run_id| registry.run_usage_totals(&instance.name, run_id).ok())
-            .unwrap_or_default();
+        let current_run = match current_run_id.as_ref() {
+            Some(run_id) => registry
+                .run_usage_totals(&instance.name, run_id)
+                .unwrap_or_default(),
+            None => crate::domain::UsageTotals::zero(),
+        };
         // Story 3-3 dollar surface: resolve the CURRENT Rate/cap + action ONCE
         // through the SAME live config resolve enforcement uses (so the Fleet view
         // matches what enforcement sees). A degraded read → no Rate / no budget

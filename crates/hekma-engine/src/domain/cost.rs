@@ -108,7 +108,8 @@ impl Micros {
 }
 
 /// A per-instance Rate (spine FR-20, `[ASSUMPTION: split rates]`) — separate input
-/// and output prices, each in micro-dollars per 1M tokens.
+/// and output prices, each in micro-dollars per 1M tokens, plus the OPTIONAL
+/// cached price (story 14-6, D8).
 ///
 /// PER-DIRECTION because the 3-1 ledger already splits `input_tokens`/`output_tokens`
 /// and real models price output several× input; a single blended rate would misprice
@@ -119,25 +120,49 @@ impl Micros {
 /// no-Rate-yet (inert, AC-B), avoiding a silently-half-priced ledger. `Serialize`/
 /// `Deserialize` (snake_case) so it can be persisted per-event (the no-retro-repricing
 /// column) without a float ever touching the wire.
+///
+/// **The cached price (14-6):** `cached_micros_per_1m` is `None` when UNSET —
+/// and an unset cached rate prices the event's cached tokens AT THE INPUT RATE
+/// (the documented conservative default: the cheaper cache pricing would LOWER
+/// the derived cost, so omitting it can only OVERSTATE, never understate —
+/// AD-8). Under the ledger's INPUT-INCLUSIVE invariant the cached subset rides
+/// inside `input_tokens`, so this default is exactly [`cost_micros`]'s math.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rate {
-    /// The input (prompt) price in micro-dollars per 1M tokens.
+    /// The input (prompt) price in micro-dollars per 1M tokens. INCLUSIVE of the
+    /// cached subset under the 14-6 ledger invariant.
     pub input_micros_per_1m: u64,
     /// The output (completion) price in micro-dollars per 1M tokens.
     pub output_micros_per_1m: u64,
+    /// The OPTIONAL cached-subset price in micro-dollars per 1M tokens (14-6).
+    /// `None` = unset → cached tokens price at [`Rate::input_micros_per_1m`]
+    /// (the conservative default). Absent from the wire when `None`
+    /// (backward-additive: older payloads deserialize unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_micros_per_1m: Option<u64>,
 }
 
 impl Rate {
-    /// Build a Rate from the two per-direction micro-dollar-per-1M-token prices.
+    /// Build a Rate from the two per-direction micro-dollar-per-1M-token prices
+    /// (the cached price UNSET — the conservative default).
     pub const fn new(input_micros_per_1m: u64, output_micros_per_1m: u64) -> Self {
         Self {
             input_micros_per_1m,
             output_micros_per_1m,
+            cached_micros_per_1m: None,
         }
     }
 
+    /// Attach the OPTIONAL cached-subset price (story 14-6) to this Rate.
+    pub const fn with_cached(mut self, cached_micros_per_1m: u64) -> Self {
+        self.cached_micros_per_1m = Some(cached_micros_per_1m);
+        self
+    }
+
     /// The dollar cost of `(input_tokens, output_tokens)` at this Rate (a method
-    /// form of [`cost_micros`], for the ledger read path).
+    /// form of [`cost_micros`], for the ledger read path). The cached subset (when
+    /// the caller knows it) prices through [`cost_micros_with_cached`] instead —
+    /// this method prices ALL input at the input rate (the conservative default).
     pub fn cost_of(&self, input_tokens: u64, output_tokens: u64) -> Micros {
         cost_micros(input_tokens, output_tokens, self)
     }
@@ -159,24 +184,83 @@ impl Rate {
 ///   rounds to the nearest micro, a tie (exactly half) going UP. Deterministic and
 ///   testable (the money-correctness crux).
 ///
-/// NO I/O, NO ledger, NO lifecycle — pure, so the boundary/precision/overflow tests
-/// are cheap and cross-OS by construction.
+/// This is ALSO the conservative default for the cached subset (story 14-6): the
+/// WHOLE input (cached portion included) prices at the input rate. Use
+/// [`cost_micros_with_cached`] when the event's cached subset is known AND a
+/// cached rate is configured. NO I/O, NO ledger, NO lifecycle — pure, so the
+/// boundary/precision/overflow tests are cheap and cross-OS by construction.
 pub fn cost_micros(input_tokens: u64, output_tokens: u64, rate: &Rate) -> Micros {
-    let per_direction = |tokens: u64, price_per_1m: u64| -> i64 {
-        // u128 intermediate: a u64 token count × a u64 price cannot overflow u128.
-        let product = (tokens as u128).saturating_mul(price_per_1m as u128);
-        // Round-half-up on the divide by 1e6 (the per-1M denominator): add half the
-        // divisor before the integer division. Saturating so the +bias cannot wrap.
-        let rounded = product
-            .saturating_add(ROUND_HALF_UP_BIAS)
-            .saturating_div(MICROS_PER_DOLLAR as u128);
-        // Saturate the u128 micro-dollars into i64 (the Micros domain): a runaway
-        // value pins at i64::MAX rather than wrapping negative (the un-breach guard).
-        i64::try_from(rounded).unwrap_or(i64::MAX)
-    };
-    let input_cost = per_direction(input_tokens, rate.input_micros_per_1m);
-    let output_cost = per_direction(output_tokens, rate.output_micros_per_1m);
+    let input_cost = per_direction_cost(input_tokens, rate.input_micros_per_1m);
+    let output_cost = per_direction_cost(output_tokens, rate.output_micros_per_1m);
     Micros(input_cost.saturating_add(output_cost))
+}
+
+/// The cached-aware PURE cost derivation (story 14-6, D8) — re-splits the INPUT
+/// direction under the ledger's INPUT-INCLUSIVE invariant: the NON-cached
+/// remainder (`input − cached`) prices at the input rate and the cached subset
+/// prices at the cached rate (output prices at the output rate as before). The
+/// total billed token count is unchanged — cached rides inside `input`.
+///
+/// The CONSERVATIVE DEFAULTS (AD-8 — overstate, never understate):
+/// * `cached_tokens` is `None` (unknown — a pre-v7 row) → the whole input
+///   prices at the input rate ([`cost_micros`]).
+/// * the Rate's `cached_micros_per_1m` is `None` (unset) → the whole input
+///   prices at the input rate — mathematically identical to re-splitting, so
+///   [`cost_micros`] is used verbatim.
+/// * `cached_tokens` is `Some(0)` (a known cache miss) → identical to
+///   [`cost_micros`] (the re-split degenerates honestly).
+///
+/// Same u128-saturating + round-half-up disciplines as [`cost_micros`]; the two
+/// input-side terms are rounded INDEPENDENTLY (per-direction quantum, the same
+/// per-row discipline the ledger read documents — the sum can only round UP).
+pub fn cost_micros_with_cached(
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: Option<u64>,
+    rate: &Rate,
+) -> Micros {
+    let Some(cached) = cached_tokens else {
+        // Unknown cached subset → the conservative whole-input-at-input-rate cost.
+        return cost_micros(input_tokens, output_tokens, rate);
+    };
+    let Some(cached_price) = rate.cached_micros_per_1m else {
+        // Unset cached rate → the conservative default (cached at the input
+        // rate), which is exactly the plain derivation's math.
+        return cost_micros(input_tokens, output_tokens, rate);
+    };
+    if cached == 0 {
+        // A known cache miss degenerates to the plain derivation.
+        return cost_micros(input_tokens, output_tokens, rate);
+    }
+    // The inclusive invariant (`cached <= input`) is the ledger's parse/store
+    // contract; a defensive saturating_sub floors the non-cached remainder at 0
+    // (never a wrapped negative that would DISCOUNT the cost).
+    let uncached = input_tokens.saturating_sub(cached);
+    let uncached_cost = per_direction_cost(uncached, rate.input_micros_per_1m);
+    let cached_cost = per_direction_cost(cached, cached_price);
+    let output_cost = per_direction_cost(output_tokens, rate.output_micros_per_1m);
+    Micros(
+        uncached_cost
+            .saturating_add(cached_cost)
+            .saturating_add(output_cost),
+    )
+}
+
+/// Price ONE direction: `tokens × price_per_1m / 1e6`, with the u128 saturating
+/// intermediate + round-half-up divide (the billing-correctness crux, shared by
+/// [`cost_micros`] and [`cost_micros_with_cached`] so the two derivations can
+/// never drift).
+fn per_direction_cost(tokens: u64, price_per_1m: u64) -> i64 {
+    // u128 intermediate: a u64 token count × a u64 price cannot overflow u128.
+    let product = (tokens as u128).saturating_mul(price_per_1m as u128);
+    // Round-half-up on the divide by 1e6 (the per-1M denominator): add half the
+    // divisor before the integer division. Saturating so the +bias cannot wrap.
+    let rounded = product
+        .saturating_add(ROUND_HALF_UP_BIAS)
+        .saturating_div(MICROS_PER_DOLLAR as u128);
+    // Saturate the u128 micro-dollars into i64 (the Micros domain): a runaway
+    // value pins at i64::MAX rather than wrapping negative (the un-breach guard).
+    i64::try_from(rounded).unwrap_or(i64::MAX)
 }
 
 /// A per-instance dollar Cost Cap (spine FR-21) — per-run and cumulative dollar
@@ -516,8 +600,137 @@ mod tests {
         let value: serde_json::Value = serde_json::to_value(rate).unwrap();
         assert_eq!(value["input_micros_per_1m"], serde_json::json!(3_000_000));
         assert_eq!(value["output_micros_per_1m"], serde_json::json!(15_000_000));
+        // 14-6: the unset cached price is ABSENT from the wire (backward-additive).
+        assert!(
+            value.get("cached_micros_per_1m").is_none(),
+            "unset cached price must be absent, not null/0: {value}"
+        );
         let back: Rate = serde_json::from_value(value).unwrap();
         assert_eq!(back, rate);
+        // A set cached price rides as an integer and round-trips.
+        let cached = rate.with_cached(300_000);
+        let value: serde_json::Value = serde_json::to_value(cached).unwrap();
+        assert_eq!(value["cached_micros_per_1m"], serde_json::json!(300_000));
+        let back: Rate = serde_json::from_value(value).unwrap();
+        assert_eq!(back, cached);
+        // An OLD payload (pre-14-6, no cached field) deserializes to None.
+        let old = serde_json::json!({
+            "input_micros_per_1m": 3_000_000,
+            "output_micros_per_1m": 15_000_000
+        });
+        let back: Rate = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            back.cached_micros_per_1m, None,
+            "old payload -> unset cached"
+        );
+    }
+
+    // ---- Story 14-6 (D8): the cached-aware derivation ----
+
+    #[test]
+    fn cached_rate_resplits_the_input_direction() {
+        // THE MATH PIN: 1M input (800k cached), 1M output; input $3/1M, cached
+        // $0.30/1M, output $15/1M → 200k×$3 + 800k×$0.30 + 1M×$15 = $0.60 +
+        // $0.24 + $15.00 = $15.84 = 15_840_000 micros.
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 1_000_000, Some(800_000), &rate),
+            Micros(15_840_000)
+        );
+        // The total billed token count is UNCHANGED vs the plain derivation —
+        // cached is a RE-SPLIT of the input direction, not an addition (the
+        // INPUT-INCLUSIVE invariant): the same 1M input prices $3.00 fully
+        // uncached vs $0.30 fully cached — both are 1M tokens, never 2M.
+        let plain = Rate::new(3_000_000, 15_000_000);
+        assert_eq!(cost_micros(1_000_000, 0, &plain), Micros(3_000_000));
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 0, Some(1_000_000), &rate),
+            Micros(300_000)
+        );
+    }
+
+    #[test]
+    fn unset_cached_rate_prices_cached_at_the_input_rate_conservatively() {
+        // THE CONSERVATIVE DEFAULT PIN (AD-8): with the cached price UNSET, the
+        // cached-aware derivation DEGENERATES to the plain derivation — the whole
+        // input (cached subset included) prices at the input rate. The cheaper
+        // cache pricing would LOWER the cost, so omitting it can only OVERSTATE,
+        // never understate.
+        let rate = Rate::new(3_000_000, 15_000_000);
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 2_000_000, Some(800_000), &rate),
+            cost_micros(1_000_000, 2_000_000, &rate),
+            "unset cached rate = plain math (cached at input rate)"
+        );
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 2_000_000, Some(800_000), &rate),
+            Micros(33_000_000)
+        );
+    }
+
+    #[test]
+    fn unknown_cached_subset_prices_whole_input_at_the_input_rate() {
+        // `None` cached (a pre-v7 row's unknown subset) → the conservative
+        // whole-input-at-input-rate cost, EVEN when a cached rate is configured
+        // (we never invent a cached count to discount with).
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 0, None, &rate),
+            cost_micros(1_000_000, 0, &rate),
+        );
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 0, None, &rate),
+            Micros(3_000_000)
+        );
+    }
+
+    #[test]
+    fn a_known_cache_miss_degenerates_to_the_plain_derivation() {
+        // Some(0) — a known cache miss — prices identically to the plain math
+        // (the re-split degenerates honestly; no rounding anomaly is possible).
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 1_000_000, Some(0), &rate),
+            cost_micros(1_000_000, 1_000_000, &rate),
+        );
+        // cached == input: the whole input prices at the cached rate.
+        assert_eq!(
+            cost_micros_with_cached(1_000_000, 0, Some(1_000_000), &rate),
+            Micros(300_000)
+        );
+    }
+
+    #[test]
+    fn cached_derivation_saturates_and_never_wraps() {
+        // The runaway guard carries over: u64::MAX everywhere saturates at
+        // i64::MAX rather than wrapping (which would silently un-breach).
+        let rate = Rate::new(u64::MAX, u64::MAX).with_cached(u64::MAX);
+        assert_eq!(
+            cost_micros_with_cached(u64::MAX, u64::MAX, Some(u64::MAX), &rate),
+            Micros(i64::MAX)
+        );
+        // A defensive cached > input (never produced by the ledger) floors the
+        // non-cached remainder at 0 — the cost is the cached-rate cost of the
+        // cached count, never a negative discount: 500 tokens x $0.30/1M =
+        // 150 micros (the remainder contributes 0).
+        let small = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        assert_eq!(
+            cost_micros_with_cached(100, 0, Some(500), &small),
+            Micros(150),
+            "remainder floored at 0; cached count prices at the cached rate"
+        );
+    }
+
+    #[test]
+    fn cached_derivation_rounds_half_up_per_direction() {
+        // The shared per-direction rounding: the re-split's two input terms each
+        // round half-up independently (the documented per-row quantum).
+        // 1.5M uncached at $1/1M = 1.5 → 2; 1.5M cached at $1/1M = 1.5 → 2.
+        let rate = Rate::new(1, 0).with_cached(1);
+        assert_eq!(
+            cost_micros_with_cached(3_000_000, 0, Some(1_500_000), &rate),
+            Micros(4)
+        );
     }
 
     // ---- CostCap shape ----
