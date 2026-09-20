@@ -29,6 +29,18 @@ The `hermes` builtin is compiled into the engine and declares a FIXED launch —
 
 **Validation pin**: the adapter's behavior was verified against Hermes at `v0.20.5`, commit `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (verified 2026-08-25). CI never launches the real gateway: the conformance passes run under the recorded `hermes_shim` PATH-sim sandbox (an isolated stand-in that re-execs a test helper), so the suite is deterministic and network-free — the real-binary validation is the pinned manual pass recorded above it.
 
+## ACP agents (`--kind acp`)
+
+The `acp` builtin (epic 14) is agent-agnostic: any executable speaking Agent Client Protocol v1 over stdio is a Hekma backend with no per-agent adapter work. The agents this epic targets:
+
+- **Hermes Agent** — natively, via its dedicated `hermes-acp` entry point (point `acp.command` at `hermes-acp`). This is the migration path from the deprecated `hermes` kind (notice above); the parity proofs — metering via the stderr sentinel and `HERMES_HOME` delivery under a `filesystem` Memory Backing — are shipped and tested.
+- **Gemini CLI** — speaks ACP when started with its ACP-mode flag: `acp.command` = `gemini`, `acp.args` = `--experimental-acp` (the long-documented IDE-integration spelling; newer builds accept the shortened `--acp`).
+- **Claude Code** — has no native ACP mode; it integrates through an ACP adapter binary that wraps the Claude Code SDK and speaks the protocol on its behalf (point `acp.command` at that adapter, with whatever args it documents). Hekma ships no such adapter — treat any third-party one as its own supply-chain decision.
+
+**Metering honesty, per the tiered design.** An ACP agent's `usage_update` notifications carry its session **context** window — surfaced under the additive `acp_context_usage` field, never billed. Billing-grade tokens come only from the metering tiers: the **self-reported sentinel** (under `acp` the cooperative agent writes `KTESIO_USAGE {json}` lines to its **stderr**, its stdout being the protocol stream) or the **engine-observed** loopback channel when the agent honors a base-URL override (`metering.upstream_base_url`). With neither, the token/cost cells show the honest `—` and a notice naming the tiers attempted — never a fabricated figure. All three counts (input/output/cached) meter identically under `acp` as under any other kind since the cached-token pipeline.
+
+**Validation status: contract-validated, not agent-pinned.** The transport is validated against a scripted contract-twin agent (`fake_acp_agent` in `hekma-conformance`), which drives every protocol behavior the epic pins — handshake, chunked updates, `usage_update`, tool-call permission denial, session resume, version counter, malformed lines. The real agents are exercised by skip-unless-present smoke tests (`hermes-acp`, `gemini` — run them on a machine where the binary exists; they are honest no-ops in CI's network-free sandbox), so no upstream version pin is claimed here yet: re-validate against your installed agent version before relying on agent-specific behavior, per the duty below.
+
 ## opencode (paper-validated)
 
 opencode has no builtin adapter: it integrates as a manifest adapter whose `[lifecycle.start]` points at its `serve` command, declaring `interaction: http` (the additive documentary channel) with `XDG_DATA_HOME` + `XDG_CONFIG_HOME` as its isolation levers. Its contract behavior was **validated on paper only** — a primary-source characterization of the `v1.18.27` sources plus a conformance mapping that shaped the Adapter Contract v1 freeze. Nothing in this repository has launched opencode; treat its adapter shape as a starting point and re-validate before relying on it.

@@ -895,6 +895,73 @@ fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
     assert_eq!(stopped.state, LifecycleState::Stopped);
 }
 
+/// Story 14-4, the REAL-AGENT smoke for Gemini CLI (the spec's
+/// `gemini --acp` row): the Gemini CLI speaks ACP v1 over stdio when started
+/// with an ACP-mode flag — registered under the `acp` kind as
+/// `acp.command = gemini` + the flag argument. SKIPPED HONESTLY when no
+/// `gemini` binary is on this machine's PATH (the repo's isolation strategy:
+/// no network, no vendored agent binaries — the same skip-unless-present
+/// posture the hermes smoke above pins; story 14-4 runs the matrix on
+/// machines where the agents exist).
+///
+/// The flag spelling is NOT hardcoded to one era of the CLI: the long-
+/// documented Zed/IDE integration form is `--experimental-acp`, and newer
+/// builds accept the shortened `--acp`. The smoke tries both known spellings
+/// in order and pins whichever the installed CLI accepts — a launch refusal
+/// under BOTH shapes is a REAL failure (a gemini that accepts neither flag
+/// cannot be the ACP agent this smoke exists to prove).
+#[test]
+fn real_gemini_acp_smoke_register_start_send_stop_when_present() {
+    if !probe_binary_present("gemini") {
+        return; // the honest skip: no real agent on this machine.
+    }
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "gemini-acp-smoke";
+    register_acp(&engine, base.path(), name);
+    engine
+        .blocking()
+        .set_config(name, "acp.command", "gemini")
+        .expect("set the real agent's launch command");
+
+    // Try the two known ACP flag spellings; the first that reaches `running`
+    // is the installed CLI's ACP mode. A BOTH-flags failure surfaces here as
+    // a test failure (the smoke's honest verdict), never a silent skip.
+    let mut started = None;
+    let mut last_err = None;
+    for flag in ["--experimental-acp", "--acp"] {
+        engine
+            .blocking()
+            .set_config(name, "acp.args", flag)
+            .expect("set the ACP flag argument");
+        match engine.blocking().start(name) {
+            Ok(started_run) => {
+                started = Some(started_run);
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                // A refused start lands the instance `failed` (the launch
+                // ladder); the retry needs it restartable — `failed` is.
+            }
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!("real gemini start failed under every known ACP flag spelling: {last_err:?}")
+    });
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // One prompt accepted (the send is constant-time; a real agent's turn
+    // latency is unbounded and is not waited out). The stop then cancels any
+    // in-flight turn and terminates through the normal ladder.
+    engine
+        .blocking()
+        .send_input(name, "smoke prompt")
+        .expect("send to the real agent");
+    let stopped = engine.blocking().stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
+
 // ---------------------------------------------------------------------------
 // Story 14-2 — sessions across lifetimes (D4). The RULING (draft-then-ratify,
 // 2026-09-19): an adopted acp process is NOT re-piped — the ACP transport is

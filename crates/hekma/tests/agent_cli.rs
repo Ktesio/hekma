@@ -7315,3 +7315,442 @@ fn a_start_with_an_attached_but_unmapped_memory_backing_says_so_and_still_succee
         "the notice is a diagnostic (stderr), never stdout",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Epic 14, story 14-4 — the kt-level ACP e2e (the binary against the fake
+// ACP agent). The engine-level matrix lives in
+// `crates/hekma-engine/tests/acp_lifecycle.rs`; these tests drive the REAL
+// `hekma` binary (the file's established `run_hekma_agent` pattern) and pin
+// what is REACHABLE across single-lifetime engine commands:
+//
+// * registration + the missing-`acp.command` refusal (exit 1 — the launch
+//   family; the frozen exit-code table gained NO new number this epic: the
+//   in-flight refusal's `4` is classifier-pinned in `exit_code.rs` +
+//   `cli::agent`'s mapper tests, and is unreachable through separate binary
+//   invocations because a live ACP turn exists only inside ONE engine
+//   lifetime — the documented single-lifetime boundary, AD-18/AI-20).
+// * the FULL handshake (initialize → agent caps → session/new → `running`)
+//   completing inside one `start` invocation against the REAL
+//   `fake_acp_agent` subprocess.
+// * the ADDITIVE Fleet surfaces: `usage_gap` (the honest `—` + the tiers
+//   notice), the honest `acp_context_usage` absence, and — after a
+//   sentinel-mode turn driven by the file's surviving-engine helper pattern —
+//   the billing ledger (input/output/cached) with the gap GONE.
+// * the 14-2 resume-at-next-start note shape on an ADOPTED acp instance.
+//
+// Honesty note (AI-18 for tests): the `acp_context_usage` FIGURE itself is
+// live-supervision state (the connection's in-memory record), so no
+// cross-invocation binary test can observe it — the turn + figure proof is
+// the engine-level `usage_update_is_surfaced_as_context_and_never_billed`
+// (in one in-process lifetime) plus the CLI cell renderers' unit tests.
+// ---------------------------------------------------------------------------
+
+/// Set the acp launch config keys through the REAL binary (`config set`).
+fn acp_configure_via_cli(ctx: &TestContext, state_dir: &Path, name: &str, args: &str) {
+    let bin = hekma_conformance::fake_acp_agent_bin();
+    let set_command = run_hekma_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            name,
+            "acp.command",
+            bin.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        set_command.code,
+        Some(0),
+        "config set acp.command should exit 0; stderr={}",
+        set_command.stderr
+    );
+    let set_args = run_hekma_agent(
+        &["agent", "config", "set", name, "acp.args", args],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        set_args.code,
+        Some(0),
+        "config set acp.args should exit 0; stderr={}",
+        set_args.stderr
+    );
+}
+
+#[test]
+fn acp_e2e_register_start_refusal_handshake_and_honest_gap_surfaces() {
+    // The whole registration → refusal → handshake → honest-gap journey
+    // through the real binary, every step its own engine lifetime (the
+    // single-lifetime boundary is WHY the assertions are shaped per command).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let name = "acp-e2e";
+
+    // (1) `--kind acp` registers like any builtin (the builtin table resolves
+    // it; no manifest, no contract negotiation — D5).
+    let register = run_hekma_agent(
+        &["agent", "register", name, "--kind", "acp"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        register.code,
+        Some(0),
+        "register --kind acp should exit 0; stderr={}",
+        register.stderr
+    );
+
+    // (2) A start without `acp.command` refuses honestly, naming BOTH config
+    // keys, and exits `1` — the launch-failure row of the frozen exit-code
+    // table (the epic added no new number; the instance stays `registered`).
+    let early = run_hekma_agent(&["agent", "start", name], &ctx.project_dir, state_dir);
+    assert_eq!(
+        early.code,
+        Some(1),
+        "the missing-command refusal is the launch family (1), never a new code; stderr={}",
+        early.stderr
+    );
+    assert!(
+        early.stderr.contains("acp.command") && early.stderr.contains("acp.args"),
+        "the refusal names both launch keys; stderr={}",
+        early.stderr
+    );
+
+    // (3) Configure the launch through the documented config keys.
+    acp_configure_via_cli(&ctx, state_dir, name, "--mode chunky");
+
+    // (4) `start` drives the FULL ACP handshake inside this one invocation —
+    // the real fake_acp_agent subprocess answers initialize + session/new and
+    // the command exits 0 with the `running` state on stdout.
+    let start = run_hekma_agent(&["agent", "start", name], &ctx.project_dir, state_dir);
+    assert_eq!(
+        start.code,
+        Some(0),
+        "the handshake must complete through the binary; stderr={}",
+        start.stderr
+    );
+    assert!(
+        start.stdout.contains("running"),
+        "the post-handshake state prints on stdout; stdout={}",
+        start.stdout
+    );
+
+    // (5) The next command reconciles the killed-at-drop child honestly
+    // (`failed`) — and the ADDITIVE Fleet surfaces are all there: the honest
+    // gap (no billing-grade usage anywhere), the honest context-usage
+    // absence, truthful zero ledger totals, and the acp metering default.
+    let show = run_hekma_agent(
+        &["agent", "show", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(show.code, Some(0), "stderr={}", show.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("show --json stdout not JSON: {e}\n{}", show.stdout));
+    let entry = &doc["instance"];
+    assert_eq!(entry["kind"], serde_json::json!("acp"), "{entry}");
+    assert_eq!(entry["state"], serde_json::json!("failed"), "{entry}");
+    assert_eq!(
+        entry["metering_source"],
+        serde_json::json!("self-reported"),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(0),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_cached_tokens"],
+        serde_json::json!(0),
+        "{entry}"
+    );
+    // The context figure is honestly ABSENT (no live connection reported one).
+    assert!(
+        entry.get("acp_context_usage").is_none(),
+        "acp_context_usage must be an additive absence when nothing reported: {entry}"
+    );
+    // The gap notice names every tier and the context state — nothing fabricated.
+    let gap = entry
+        .get("usage_gap")
+        .expect("a bare acp instance carries the honest gap notice");
+    assert_eq!(
+        gap["observed"],
+        serde_json::json!("not-configured"),
+        "{gap}"
+    );
+    assert_eq!(gap["sentinel"], serde_json::json!("no-lines-seen"), "{gap}");
+    assert_eq!(
+        gap["context_usage_reported"],
+        serde_json::json!(false),
+        "{gap}"
+    );
+    let notice = gap["notice"].as_str().expect("the notice rides as text");
+    assert!(
+        notice.contains("no billing-grade usage in the ledger")
+            && notice.contains("observed: not-configured")
+            && notice.contains("sentinel: no-lines-seen")
+            && notice.contains("no context usage reported"),
+        "the notice names the tiers + the context state: {notice}"
+    );
+
+    // (6) The human surfaces: the wide `show` carries the `—` usage row with
+    // the full tier notice INLINE plus the honest "ACP context usage" row; the
+    // narrow `list` shows the bare `—` cell and rides the tier notice on
+    // STDERR (AD-12 — the note channel), one note per gapped instance.
+    let human_show = run_hekma_agent(&["agent", "show", name], &ctx.project_dir, state_dir);
+    assert_eq!(human_show.code, Some(0), "stderr={}", human_show.stderr);
+    assert!(
+        human_show
+            .stdout
+            .contains("no billing-grade usage in the ledger"),
+        "the wide show usage row carries the gap notice inline; stdout={}",
+        human_show.stdout
+    );
+    assert!(
+        human_show
+            .stdout
+            .contains("no usage_update reported this session"),
+        "the ACP context usage row shows the honest absence; stdout={}",
+        human_show.stdout
+    );
+    let list = run_hekma_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert_eq!(list.code, Some(0), "stderr={}", list.stderr);
+    assert!(
+        list.stdout.contains('—'),
+        "the gapped acp usage cell renders the honest em dash; stdout={}",
+        list.stdout
+    );
+    assert!(
+        list.stderr
+            .contains(&format!("{name}: no billing-grade usage in the ledger")),
+        "the tier notice rides stderr as an instance-prefixed note; stderr={}",
+        list.stderr
+    );
+}
+
+/// The re-exec entry for the ACP TURN helper (the
+/// `agent_cli_start_helper_subprocess` pattern, extended one step): opens an
+/// engine, starts the named acp instance from its config keys, sends ONE
+/// prompt (a full ACP turn through the engine library), then polls the
+/// COMMITTED ledger until the fake agent's sentinel line landed (input=40 —
+/// the fake agent's fixed per-turn counts) before exiting. The engine's clean
+/// drop then tears the child down; the LEDGER rows survive for the parent's
+/// binary assertions.
+#[test]
+fn agent_cli_acp_turn_helper_subprocess() {
+    let Ok(name) = std::env::var("KTESIO_ACP_TURN_HELPER") else {
+        return;
+    };
+    let state = std::path::PathBuf::from(std::env::var("KTESIO_STATE_DIR").unwrap());
+    let engine = hekma_engine::Engine::open(Some(state)).expect("helper engine open");
+    let blocking = engine.blocking();
+    blocking.start(&name).expect("helper start");
+    blocking
+        .send_input(&name, "e2e sentinel turn")
+        .expect("helper send");
+
+    // Bounded committed-state poll (the house determinism posture): the
+    // stderr sentinel drain lands the turn's billing row within the budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let landed = blocking
+            .fleet_entry(&name)
+            .ok()
+            .map(|entry| entry.usage.cumulative_input_tokens == 40)
+            .unwrap_or(false);
+        if landed || std::time::Instant::now() >= deadline {
+            assert!(
+                landed,
+                "the sentinel turn's ledger row never landed within the budget"
+            );
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Fall off the end: the engine drops (the child is killed; the ledger and
+    // the write-ahead record persist for the parent's commands).
+}
+
+#[test]
+fn acp_e2e_sentinel_turn_lands_the_ledger_and_clears_the_gap_through_the_binary() {
+    // A billing-grade turn THROUGH the binary surface: the turn helper (the
+    // file's re-exec pattern) drives start + send against the fake agent's
+    // `sentinel-stderr` mode — the acp kind's self-reported sentinel channel
+    // (its stdout is the protocol stream, so the sentinel rides STDERR,
+    // carrying the input-inclusive cached subset). The parent then reads the
+    // DURABLE surfaces through `show --json`: input/output land, the cached
+    // subset rides the ledger's cached column (the 14-6 vocabulary), and —
+    // because billing-grade usage EXISTS — the honest gap notice is GONE (the
+    // `—` was only ever the surfaced last resort). Cross-OS: no cross-lifetime
+    // child survival is needed (the ledger is SQLite, not a process).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let name = "acp-e2e-sentinel";
+
+    let register = run_hekma_agent(
+        &["agent", "register", name, "--kind", "acp"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(register.code, Some(0), "stderr={}", register.stderr);
+    acp_configure_via_cli(&ctx, state_dir, name, "--mode sentinel-stderr");
+
+    // The helper: one full turn (start + send) in its own engine lifetime.
+    let exe = std::env::current_exe().expect("test exe");
+    let status = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "agent_cli_acp_turn_helper_subprocess",
+            "--nocapture",
+        ])
+        .env("KTESIO_ACP_TURN_HELPER", name)
+        .env("KTESIO_STATE_DIR", state_dir)
+        .status()
+        .expect("run acp turn helper subprocess");
+    assert!(
+        status.success(),
+        "acp turn helper subprocess failed: {status}"
+    );
+
+    // The durable read, through the real binary: the billing ledger holds the
+    // turn exactly once, the cached subset landed with it, and the gap is gone.
+    let show = run_hekma_agent(
+        &["agent", "show", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(show.code, Some(0), "stderr={}", show.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("show --json stdout not JSON: {e}\n{}", show.stdout));
+    let entry = &doc["instance"];
+    assert_eq!(entry["kind"], serde_json::json!("acp"), "{entry}");
+    assert_eq!(
+        entry["usage"]["cumulative_input_tokens"],
+        serde_json::json!(40),
+        "the stderr sentinel's input count (the turn ran end to end): {entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_output_tokens"],
+        serde_json::json!(20),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["usage"]["cumulative_cached_tokens"],
+        serde_json::json!(25),
+        "the input-inclusive cached subset rides the same sentinel line: {entry}"
+    );
+    assert_eq!(
+        entry["metering_source"],
+        serde_json::json!("self-reported"),
+        "{entry}"
+    );
+    assert!(
+        entry.get("usage_gap").is_none(),
+        "billing-grade usage exists — the honest gap notice is gone: {entry}"
+    );
+    assert!(
+        entry.get("acp_context_usage").is_none(),
+        "no usage_update was sent (the sentinel is the billing grain): {entry}"
+    );
+}
+
+#[test]
+fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
+    // The 14-2 resume-at-next-start note shape, at the binary level: a
+    // surviving-engine helper starts an `--advertise-load --linger-on-eof`
+    // acp instance (the handshake persists `fake-session-1`) and exits
+    // crash-style; the real binary's next command ADOPTS the lingering agent
+    // and surfaces the adopted-acp note — the dead-pipe fact PLUS the
+    // session-on-record promise ("will be offered via session/load at the
+    // next start") — while `show --json` carries the honest gap (the adopted
+    // instance holds no live connection, so no context figure either).
+    //
+    // `_unix` (the file's naming convention): cross-lifetime survival cannot
+    // be simulated on Windows (Job-Object kill-on-close takes the child with
+    // the helper). Every OS-INDEPENDENT wire shape this test guards — the
+    // adopted note text, the gap JSON, the resume-promise sentence — is
+    // additionally covered cross-OS by the note's own unit tests
+    // (`kind_dispatch_and_the_adoption_note_are_stable`) and the
+    // cross-OS e2e above.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return; // the documented Windows limitation; the `_unix` suffix says so.
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let name = "acp-e2e-adopt";
+
+    let register = run_hekma_agent(
+        &["agent", "register", name, "--kind", "acp"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(register.code, Some(0), "stderr={}", register.stderr);
+    acp_configure_via_cli(
+        &ctx,
+        state_dir,
+        name,
+        "--mode chunky --advertise-load --linger-on-eof",
+    );
+
+    // The surviving-engine helper: start (the handshake persists the session
+    // id) and exit WITHOUT dropping the engine — the lingering agent survives.
+    start_via_surviving_engine(state_dir, name);
+
+    // The real binary adopts the survivor: exit 0, the adopted-acp note on
+    // stderr (surfaced-not-silent), and the honest gap on the JSON surface.
+    let show = run_hekma_agent(
+        &["agent", "show", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(show.code, Some(0), "stderr={}", show.stderr);
+    assert!(
+        show.stderr.contains("adopted an acp instance"),
+        "the adoption note must surface; stderr={}",
+        show.stderr
+    );
+    assert!(
+        show.stderr.contains(
+            "a previous session (fake-session-1) is on record and will be \
+                       offered via session/load at the next start"
+        ),
+        "the resume-at-next-start promise names the persisted session; stderr={}",
+        show.stderr
+    );
+    let doc: serde_json::Value = serde_json::from_str(&show.stdout)
+        .unwrap_or_else(|e| panic!("show --json stdout not JSON: {e}\n{}", show.stdout));
+    let entry = &doc["instance"];
+    assert_eq!(entry["state"], serde_json::json!("running"), "{entry}");
+    assert!(
+        entry.get("usage_gap").is_some(),
+        "the adopted acp instance's ledger is empty — the gap stays honest: {entry}"
+    );
+    assert!(
+        entry.get("acp_context_usage").is_none(),
+        "an adopted instance holds no live connection — no context figure: {entry}"
+    );
+
+    // This command's exit killed the adopted (non-detached) lingering agent;
+    // the trailing command reconciles the row honestly so no phantom `running`
+    // row or orphan survives the test.
+    let settle = run_hekma_agent(
+        &["agent", "show", name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(settle.code, Some(0), "stderr={}", settle.stderr);
+    let settle_doc: serde_json::Value = serde_json::from_str(&settle.stdout)
+        .unwrap_or_else(|e| panic!("settle stdout not JSON: {e}\n{}", settle.stdout));
+    assert_eq!(
+        settle_doc["instance"]["state"],
+        serde_json::json!("failed"),
+        "the killed survivor reconciles honestly: {}",
+        settle.stdout
+    );
+}

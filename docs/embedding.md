@@ -52,7 +52,14 @@ in-repo forms compile against the same facade — see the [changelog](
 (`EngineError::ResumeUnsupported`, then the 0.3.0 detached-start surface:
 `EngineError::DetachRefused`, `SpawnRecord.detach`, and the
 `ProcessBackend::adopt` signature — exhaustive `match`es over
-`EngineError` need each new arm).
+`EngineError` need each new arm). Epic 14 (the ACP backend, shipping as
+0.5.0) grows the surface additively the same way: `EngineError::AcpTurnInFlight`
+is a new exhaustive-match arm (exit-code row 4 — a second prompt while an
+`acp` turn is in flight), `SpawnSpec` gains the `pipe_stdout` field (the ACP
+transport owns the child's stdout; exhaustive struct literals need it), and
+`ProcessBackend::take_stdin`/`take_stdout` are NEW DEFAULTED trait methods
+(existing backends compile unchanged). The new builtin `acp` kind registers
+like any native kind and needs no contract negotiation.
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
@@ -74,7 +81,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | Facade | Purpose |
 |--------|---------|
 | `Engine::open(base)` | Open (or create) an engine rooted at a state directory; `None` uses the OS default. |
-| `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. |
+| `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and, since epic 14, `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
 | `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle (story 12-1); refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
@@ -83,7 +90,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hekma agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
-| `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. |
+| `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
 with a reason and a remediation instead of panicking.
