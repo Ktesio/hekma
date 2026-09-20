@@ -50,6 +50,21 @@ pub const MOCK_MEMORY_ENV_VAR: &str = "KTESIO_MEMORY_DIR";
 pub const HERMES_EXEC: &str = hekma_adapters_hermes::HERMES_EXEC;
 pub const HERMES_ARGS: [&str; 3] = hekma_adapters_hermes::HERMES_ARGS;
 
+/// The builtin `acp`'s code-declared env target for the reserved
+/// [`METERING_BASE_URL_KEY`] leaf (story 14-3, T2): when the operator opts an
+/// `acp` instance into the engine-observed channel (set
+/// `metering.upstream_base_url`), the engine starts its loopback forward
+/// listener and injects `http://127.0.0.1:<port>` at that key — this mapping
+/// delivers it into the child's environment under the DE-FACTO base-URL
+/// override convention most OpenAI-compatible agents honor. When the instance
+/// is NOT in observed mode the key is never injected, so the mapping is a
+/// no-op (the mapping application iterates only keys PRESENT in the effective
+/// config). One env var, deliberately: the observed pipeline's parse
+/// vocabulary (OpenAI/Anthropic/Gemini shapes) is broader than any one
+/// launch-env convention, and an agent that reads a different variable is
+/// still free to consume the listener URL however its operator configures it.
+pub const ACP_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
+
 /// Resolve a native `kind` to a boxed builtin adapter, or `None` if unknown.
 ///
 /// The table carries three kinds: the inert `mock` (the conformance
@@ -233,8 +248,18 @@ impl AgentAdapter for BuiltinAcp {
         MeteringSource::SelfReported
     }
 
-    // Config mapping: the trait's EMPTY default (the acp kind maps no
-    // unified keys; `agent.*` pass-through delivery is unchanged).
+    /// Story 14-3 (T2): the reserved `metering.base_url` leaf maps into the
+    /// child's `OPENAI_BASE_URL` env — the delivery mechanism for the
+    /// engine-observed loopback listener's address when the operator opts in
+    /// via `metering.upstream_base_url`. A no-op otherwise (the key is only
+    /// ever engine-injected, never operator-set — the reserved-key contract
+    /// the manifest adapters' `[config."metering.base_url"]` mappings follow).
+    fn config_mapping(&self) -> ConfigMapping {
+        ConfigMapping::new().with(
+            crate::domain::METERING_BASE_URL_KEY,
+            ConfigTarget::env(ACP_BASE_URL_ENV_VAR),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -288,10 +313,18 @@ mod tests {
         // so the builtin table's launch stays None — a registration snapshot
         // with no launch, exactly like mock.
         assert!(native_launch(crate::acp::ACP_KIND).is_none());
-        // No unified-key mapping (empty mapping; pass-through unchanged).
+        // Exactly ONE unified-key mapping (story 14-3, T2): the reserved
+        // `metering.base_url` leaf → the child's `OPENAI_BASE_URL` env — the
+        // engine-observed opt-in's delivery mechanism, a no-op unless the
+        // engine injects the key (the operator never sets it).
+        let mapping = native_config_mapping(crate::acp::ACP_KIND).unwrap();
+        assert_eq!(mapping.len(), 1);
         assert_eq!(
-            native_config_mapping(crate::acp::ACP_KIND).unwrap().len(),
-            0
+            mapping
+                .target(crate::domain::METERING_BASE_URL_KEY)
+                .unwrap()
+                .env_var(),
+            Some(ACP_BASE_URL_ENV_VAR)
         );
     }
 

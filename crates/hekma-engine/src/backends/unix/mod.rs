@@ -410,8 +410,16 @@ impl ProcessBackend for UnixBackend {
             return Ok(StopOutcome { forced: false });
         }
 
-        // (1) Graceful: SIGTERM to the whole group.
-        signal_group(handle.pgid, Signal::SIGTERM)?;
+        // (1) Graceful: SIGTERM to the whole group. BEST-EFFORT: a signal
+        // that cannot be delivered must not abort the STOP — the stop's
+        // contract is that the child ends up dead, and the escalation below
+        // still runs. The exotic delivery failures are real (story 14-1's
+        // stop test): a cooperative agent exits on `session/cancel` and the
+        // not-yet-reaped zombie answers macOS killpg with EPERM (Linux:
+        // ESRCH), and under heavy parallel load the same EPERM appears even
+        // while `try_wait` still reports the child alive. The wait loop's
+        // reap check + the death confirmation below carry the truth.
+        let _ = signal_group(handle.pgid, Signal::SIGTERM);
 
         // (2) Wait up to the window for the group leader (our child) to exit.
         let deadline = Instant::now() + graceful_window;
@@ -459,7 +467,12 @@ impl ProcessBackend for UnixBackend {
         // return `Ok` even when still alive after its own 5s poll). Group
         // members are killed by the SIGKILL below and reaped by init (or,
         // for a still-stuck leader, will be once the OS condition clears).
-        signal_group(handle.pgid, Signal::SIGKILL)?;
+        // (2) Escalate best-effort as well (the same delivery failures as
+        // the SIGTERM above), then CONFIRM death: an already-gone child
+        // reaps cleanly here; a genuinely unkillable one surfaces the
+        // honest timeout error. The confirmation — not the signal — is the
+        // contract.
+        let _ = signal_group(handle.pgid, Signal::SIGKILL);
         confirm_death(handle, KILL_CONFIRM_TIMEOUT)?;
         Ok(StopOutcome { forced: true })
     }
@@ -1045,6 +1058,29 @@ mod tests {
             }
             other => panic!("expected Spawn, got {other}"),
         }
+    }
+
+    #[test]
+    fn stop_on_an_unreaped_zombie_child_is_graceful_not_eperm() {
+        // Story 14-1's stop test found this on macOS: a COOPERATIVE agent
+        // exits on `session/cancel` right as the stop ladder runs, and the
+        // not-yet-reaped zombie still counts as a killpg target — macOS
+        // answers with EPERM (Linux: ESRCH), which used to fail the stop.
+        // A gone child is the stop's end state. Reproduced here WITHOUT the
+        // race: kill the child out-of-band (it stays a zombie — the backend
+        // has not reaped it) and then stop; the reap-first checks must land
+        // the stop in the graceful arm instead of surfacing the signal
+        // error.
+        let backend = UnixBackend::new();
+        let mut proc = backend.spawn(&spec("sleep", &["30"])).expect("spawn sleep");
+        let pid = proc.pid; // same module — the handle's pid is accessible
+        kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("out-of-band SIGKILL");
+        // The child is now a zombie (we hold it unreaped).
+        sleep(Duration::from_millis(50));
+        let outcome = backend
+            .stop(&mut proc, Duration::from_secs(1))
+            .expect("stop");
+        assert!(!outcome.forced);
     }
 
     #[test]

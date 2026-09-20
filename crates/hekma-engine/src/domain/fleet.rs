@@ -292,6 +292,128 @@ impl UsageView {
     }
 }
 
+/// The LATEST ACP `usage_update` context figure, as the Fleet surfaces render
+/// it (story 14-3, T1 — spine AD-19). CONTEXT-grain BY NAME: the field is
+/// `acp_context_usage` on [`FleetEntry`], it names the agent's session
+/// CONTEXT WINDOW (`used` of `size` tokens), and it must never be displayed
+/// inside — or derived into — the billing token/cost cells (`usage` /
+/// `cost`). `used`/`size` are `None` when the agent reported the update
+/// without that field (surfaced as an honest "unknown", never a fabricated
+/// zero). Present ONLY while a live `acp` connection has reported a figure
+/// this Run (an in-memory metric; a stopped or adopted instance honestly
+/// carries none).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpContextUsageView {
+    /// Context-window tokens used (agent-reported); `null` when unreported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used: Option<u64>,
+    /// The context-window size in tokens (agent-reported); `null` when
+    /// unreported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// The optional agent-reported cost block — the agent's OWN claim, kept
+    /// as its raw `(amount, currency)` display pair. Surfaced LABELED as
+    /// agent-reported; this engine never derives a billed figure from it
+    /// (AD-8: no cost derivation from context-grain alone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<AcpContextCostView>,
+}
+
+/// The agent-reported cost block of an ACP context-usage figure (story 14-3,
+/// T1) — a raw display pair, NOT a [`Micros`] figure: this is the agent's own
+/// claim about its context spend, never an engine-derived or engine-priced
+/// dollar (AD-8). Rendered verbatim with the agent-reported label.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpContextCostView {
+    /// The amount exactly as the agent reported it (a raw display string —
+    /// never parsed into a dollar by this engine).
+    pub amount: String,
+    /// The ISO-style currency code the agent reported (e.g. `USD`).
+    pub currency: String,
+}
+
+/// The honest USAGE-GAP notice for an `acp` instance with NO billing-grade
+/// usage (story 14-3 — spine AD-19's surfaced last resort, AI-18). Present on
+/// [`FleetEntry::usage_gap`] exactly when the instance is the `acp` kind AND
+/// its Usage Ledger holds no billing-grade tokens at all; `None` (absent)
+/// for every other kind and for an acp instance that has real ledger usage.
+///
+/// The structured fields name the TIERS ATTEMPTED — the observed base-URL
+/// channel (configured or not) and the stderr sentinel (lines seen or not) —
+/// plus whether any context-usage figure has been reported, so an operator
+/// can tell "context usage reported; billing-grade unavailable" apart from
+/// "no usage signal" (the spec's honesty split). `notice` is the one-line
+/// human form (the same text the CLI renders); the structured fields are the
+/// wire contract. NEVER fabricated: every field is derived from configuration
+/// or observed behavior, nothing is inferred into a count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageGapNotice {
+    /// The observed (T2) tier state: `not-configured` (no
+    /// `metering.upstream_base_url` — the loopback channel was never opted
+    /// into) or `configured` (the listener ran for this instance).
+    pub observed: String,
+    /// The sentinel (T3) tier state: `no-lines-seen` (no well-formed
+    /// `KTESIO_USAGE` line has arrived on any self-reported channel) or
+    /// `lines-seen` (at least one arrived — its events then went to the
+    /// ledger, so a gap WITH `lines-seen` names a store-side problem the
+    /// drain diagnostics already announce loudly).
+    pub sentinel: String,
+    /// Whether a context-usage figure (`usage_update`) has been reported this
+    /// Run — the "context usage reported; billing-grade unavailable" half of
+    /// the honesty split. `false` = no usage signal of ANY grain.
+    pub context_usage_reported: bool,
+    /// The one-line human notice (the CLI renders this verbatim on the wide
+    /// `show` cell; the narrow `list` cell shows the `—` token and this full
+    /// line rides the stderr note).
+    pub notice: String,
+}
+
+impl UsageGapNotice {
+    /// The observed-tier wire value for a configured / not-configured channel.
+    pub const OBSERVED_CONFIGURED: &'static str = "configured";
+    /// The observed-tier wire value when the channel was never opted into.
+    pub const OBSERVED_NOT_CONFIGURED: &'static str = "not-configured";
+    /// The sentinel-tier wire value when no sentinel line has been seen.
+    pub const SENTINEL_NO_LINES_SEEN: &'static str = "no-lines-seen";
+    /// The sentinel-tier wire value once a sentinel line has been seen.
+    pub const SENTINEL_LINES_SEEN: &'static str = "lines-seen";
+
+    /// Compose the gap notice from the tier facts (pure — the engine
+    /// computes, the CLI renders). `notice` names the grain split (billing vs
+    /// context) and both tiers' states, never a fabricated figure.
+    pub fn acp(
+        observed_configured: bool,
+        sentinel_seen: bool,
+        context_usage_reported: bool,
+    ) -> Self {
+        let observed = if observed_configured {
+            Self::OBSERVED_CONFIGURED
+        } else {
+            Self::OBSERVED_NOT_CONFIGURED
+        };
+        let sentinel = if sentinel_seen {
+            Self::SENTINEL_LINES_SEEN
+        } else {
+            Self::SENTINEL_NO_LINES_SEEN
+        };
+        let context = if context_usage_reported {
+            "context usage reported"
+        } else {
+            "no context usage reported"
+        };
+        let notice = format!(
+            "no billing-grade usage in the ledger — tiers attempted: observed: {observed}; \
+             sentinel: {sentinel}; {context} (ACP usage_update is context-grain, never billed)"
+        );
+        Self {
+            observed: observed.to_string(),
+            sentinel: sentinel.to_string(),
+            context_usage_reported,
+            notice,
+        }
+    }
+}
+
 /// One Agent Instance as the Fleet listing / `--json` document sees it (story
 /// 1-7, FR-4).
 ///
@@ -341,6 +463,20 @@ pub struct FleetEntry {
     /// The active Metering Source wire string (`self-reported` / `engine-observed`),
     /// visible in Fleet detail (AC-C). Read from the persisted adapter snapshot.
     pub metering_source: String,
+    /// The LATEST ACP context-usage figure (story 14-3, T1) — CONTEXT-grain,
+    /// agent-reported, present only while a live `acp` connection has
+    /// reported one this Run. ADDITIVE + ABSENT-when-none
+    /// (`skip_serializing_if`): never a billing cell, never a fabricated
+    /// zero, and every non-acp instance omits the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_context_usage: Option<AcpContextUsageView>,
+    /// The honest usage-gap notice (story 14-3) — present ONLY for an `acp`
+    /// instance whose Usage Ledger holds no billing-grade usage; names the
+    /// tiers attempted (observed / sentinel) + the context-usage state. An
+    /// ADDITIVE absence (`skip_serializing_if`): a real-usage acp instance
+    /// and every other kind omit the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_gap: Option<UsageGapNotice>,
     /// Absolute Agent Home path (engine-computed; the path authority).
     pub agent_home: String,
 }
@@ -593,6 +729,8 @@ mod tests {
             budget: None,
             usage: UsageView::new(UsageTotals::zero(), UsageTotals::zero()),
             metering_source: "self-reported".to_string(),
+            acp_context_usage: None,
+            usage_gap: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }
@@ -1211,6 +1349,112 @@ mod tests {
     fn metering_seed_cell_is_the_em_dash_token() {
         // The human cell token is `—` (consistent between list + show).
         assert_eq!(FleetEntry::METERING_SEED_CELL, "—");
+    }
+
+    // ---- Story 14-3: the ACP context-usage view + the usage-gap notice ----
+
+    #[test]
+    fn acp_context_usage_view_serializes_context_grain_and_omits_absences() {
+        // T1 on the wire: the context figure rides as its own additive object
+        // naming used/size (+ the optional agent-reported cost), with absent
+        // fields omitted — never fabricated zeros, never a billing cell.
+        let view = AcpContextUsageView {
+            used: Some(1200),
+            size: Some(200_000),
+            cost: Some(AcpContextCostView {
+                amount: "0.0034".to_string(),
+                currency: "USD".to_string(),
+            }),
+        };
+        let value: serde_json::Value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["used"], serde_json::json!(1200));
+        assert_eq!(value["size"], serde_json::json!(200_000));
+        assert_eq!(value["cost"]["amount"], serde_json::json!("0.0034"));
+        assert_eq!(value["cost"]["currency"], serde_json::json!("USD"));
+        // Round-trips.
+        let back: AcpContextUsageView = serde_json::from_value(value).unwrap();
+        assert_eq!(back, view);
+        // An update without those fields omits them (the honest "unknown").
+        let bare = AcpContextUsageView {
+            used: None,
+            size: None,
+            cost: None,
+        };
+        let value: serde_json::Value = serde_json::to_value(&bare).unwrap();
+        assert!(value.get("used").is_none(), "{value}");
+        assert!(value.get("size").is_none(), "{value}");
+        assert!(value.get("cost").is_none(), "{value}");
+    }
+
+    #[test]
+    fn usage_gap_notice_names_both_tiers_and_the_context_state() {
+        // The gap notice's honest vocabulary: tiers attempted + context state,
+        // with a one-line notice that names the context-vs-billing grain split.
+        let bare = UsageGapNotice::acp(false, false, false);
+        assert_eq!(bare.observed, "not-configured");
+        assert_eq!(bare.sentinel, "no-lines-seen");
+        assert!(!bare.context_usage_reported);
+        assert!(
+            bare.notice.contains("observed: not-configured"),
+            "{}",
+            bare.notice
+        );
+        assert!(
+            bare.notice.contains("sentinel: no-lines-seen"),
+            "{}",
+            bare.notice
+        );
+        assert!(
+            bare.notice.contains("no context usage reported"),
+            "{}",
+            bare.notice
+        );
+        assert!(bare.notice.contains("never billed"), "{}", bare.notice);
+
+        let context_only = UsageGapNotice::acp(true, false, true);
+        assert_eq!(context_only.observed, "configured");
+        assert_eq!(context_only.sentinel, "no-lines-seen");
+        assert!(context_only.context_usage_reported);
+        assert!(
+            context_only.notice.contains("context usage reported"),
+            "{}",
+            context_only.notice
+        );
+
+        // Serializes as data (a --json consumer can branch on the tiers).
+        let value: serde_json::Value = serde_json::to_value(&context_only).unwrap();
+        assert_eq!(value["observed"], serde_json::json!("configured"));
+        assert_eq!(value["sentinel"], serde_json::json!("no-lines-seen"));
+        assert_eq!(value["context_usage_reported"], serde_json::json!(true));
+        assert!(value["notice"].is_string());
+        let back: UsageGapNotice = serde_json::from_value(value).unwrap();
+        assert_eq!(back, context_only);
+    }
+
+    #[test]
+    fn fleet_entry_omits_the_acp_fields_when_absent_and_carries_them_when_set() {
+        // Backward-additive: a non-acp entry omits both fields entirely; an
+        // acp entry carries them; both re-parse.
+        let plain = sample_entry("plain");
+        let value: serde_json::Value = serde_json::to_value(&plain).unwrap();
+        assert!(value.get("acp_context_usage").is_none(), "{value}");
+        assert!(value.get("usage_gap").is_none(), "{value}");
+        let back: FleetEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(back, plain);
+
+        let mut acp = sample_entry("acp-1");
+        acp.kind = "acp".to_string();
+        acp.acp_context_usage = Some(AcpContextUsageView {
+            used: Some(10),
+            size: Some(100),
+            cost: None,
+        });
+        acp.usage_gap = Some(UsageGapNotice::acp(false, false, true));
+        let value: serde_json::Value = serde_json::to_value(&acp).unwrap();
+        assert!(value["acp_context_usage"].is_object(), "{value}");
+        assert!(value["usage_gap"].is_object(), "{value}");
+        let back: FleetEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(back, acp);
     }
 
     // ---- Story 3-3: dollar fields on the views (AC-B/AC10) ----

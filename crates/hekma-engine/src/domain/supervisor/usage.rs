@@ -4,6 +4,86 @@
 
 use super::*;
 
+/// WHICH captured-output channel a self-reported usage drain reads (story
+/// 14-3, T3). The two channels are byte-identical in SEMANTICS (the same
+/// [`USAGE_SENTINEL_PREFIX`] convention, the same cursor + AI-41 park
+/// discipline, the same commit choke point) and differ only in FILE and
+/// ownership:
+///
+/// * [`UsageChannel::Stdout`] — every kind's `agent.log` (the stdout capture;
+///   for an `acp` instance this is fed by the ACP connection's reader, whose
+///   lines are protocol, never sentinels — stdout purity, spine AD-19).
+/// * [`UsageChannel::Stderr`] — the `agent-stderr.log` capture; the acp
+///   kind's sentinel channel, because its stdout is the protocol stream and
+///   "no reading of agent stdout as anything but ACP" is a Never rule. A
+///   cooperative ACP agent therefore emits `KTESIO_USAGE {json}` on STDERR,
+///   which the backend's crash-immune direct redirect lands in this file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsageChannel {
+    /// The captured stdout log (`agent.log`) — every kind's sentinel channel.
+    Stdout,
+    /// The captured stderr log (`agent-stderr.log`) — the acp kind's sentinel
+    /// channel (story 14-3, T3).
+    Stderr,
+}
+
+impl UsageChannel {
+    /// The captured log FILE this channel drains.
+    fn log_path(&self, registry: &Registry, name: &InstanceName) -> std::path::PathBuf {
+        match self {
+            UsageChannel::Stdout => registry.agent_output_log_path(name),
+            UsageChannel::Stderr => registry.agent_stderr_log_path(name),
+        }
+    }
+
+    /// The channel's byte cursor on `supervised`.
+    fn cursor(&self, supervised: &Supervised) -> u64 {
+        match self {
+            UsageChannel::Stdout => supervised.usage_cursor,
+            UsageChannel::Stderr => supervised.stderr_usage_cursor,
+        }
+    }
+
+    /// Set the channel's byte cursor on `supervised`.
+    fn set_cursor(&self, supervised: &mut Supervised, cursor: u64) {
+        match self {
+            UsageChannel::Stdout => supervised.usage_cursor = cursor,
+            UsageChannel::Stderr => supervised.stderr_usage_cursor = cursor,
+        }
+    }
+
+    /// The channel's AI-41 park state on `supervised`.
+    fn park(&self, supervised: &Supervised) -> Option<(u64, u32)> {
+        match self {
+            UsageChannel::Stdout => supervised.usage_park_attempts,
+            UsageChannel::Stderr => supervised.stderr_usage_park_attempts,
+        }
+    }
+
+    /// Set the channel's AI-41 park state on `supervised`.
+    fn set_park(&self, supervised: &mut Supervised, park: Option<(u64, u32)>) {
+        match self {
+            UsageChannel::Stdout => supervised.usage_park_attempts = park,
+            UsageChannel::Stderr => supervised.stderr_usage_park_attempts = park,
+        }
+    }
+
+    /// The metering-source string stamped on this channel's ingested events.
+    /// Stdout keeps the instance's DECLARED source (byte-identical to the
+    /// pre-14-3 behavior). Stderr stamps `self-reported` EXPLICITLY: a
+    /// sentinel line is by definition a SELF-REPORT, so an acp instance that
+    /// opted into the observed channel (declared `engine-observed`) still
+    /// stamps its stderr sentinel rows with the channel that actually
+    /// produced them — the ledger names the honest provenance, never the
+    /// instance's declaration alone.
+    fn metering_source(&self, supervised: &Supervised) -> String {
+        match self {
+            UsageChannel::Stdout => supervised.metering_source.clone(),
+            UsageChannel::Stderr => "self-reported".to_string(),
+        }
+    }
+}
+
 impl Supervisor {
     /// Drain self-reported usage from EVERY currently-running instance (the reaper
     /// cadence). Best-effort per instance — one instance's drain failure never
@@ -11,16 +91,43 @@ impl Supervisor {
     ///
     /// This is the MID-RUN cadence: the process is (believed) still alive, so a
     /// half-written final line is left for the next pass ([`DrainMode::MidRun`]).
+    ///
+    /// Story 14-3 (T3): an `acp` instance drains BOTH its self-reported
+    /// channels — the captured stdout log (protocol lines; no sentinels can
+    /// live there) AND the captured stderr log (its sentinel channel). The
+    /// per-channel drains are independent cursors over independent files, so
+    /// a line can never be ingested twice.
     pub(super) fn drain_usage_all(&mut self, registry: &Registry) {
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         for name in names {
-            self.drain_usage_for(registry, &name, DrainMode::MidRun);
+            self.drain_self_reported_for(registry, &name, DrainMode::MidRun);
         }
     }
 
-    /// Drain the NEWLY-captured tail of one instance's agent-output log, ingesting
-    /// each well-formed usage sentinel line through the commit choke point
-    /// ([`Supervisor::ingest_usage`]), and advance the read cursor.
+    /// Drain BOTH self-reported sentinel channels for `name` under `mode`:
+    /// the captured stdout log (every kind, the story-3-1 channel) plus — for
+    /// an `acp` instance only — the captured stderr log (story 14-3, T3).
+    /// The stop/crash-reap TERMINAL callers route through here too, so a
+    /// final stderr sentinel line flushed without a newline is not stranded
+    /// (the H1 rule, per channel).
+    pub(super) fn drain_self_reported_for(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        mode: DrainMode,
+    ) {
+        self.drain_usage_for(registry, name, mode);
+        if self.running.get(name).is_some_and(|s| s.is_acp) {
+            self.drain_stderr_usage_for(registry, name, mode);
+        }
+    }
+
+    /// Drain the NEWLY-captured tail of one instance's captured stdout log
+    /// (the story-3-1 channel), ingesting each well-formed usage sentinel line
+    /// through the commit choke point ([`Supervisor::ingest_usage`]), and
+    /// advance the read cursor. The acp kind's STDERR twin is
+    /// [`Supervisor::drain_stderr_usage_for`] (story 14-3); both share the
+    /// channel-generic [`Supervisor::drain_channel_usage_for`].
     ///
     /// Reads from the per-instance cursor to the file's end (only the bytes written
     /// since the last drain), parses usage lines via the self-reported
@@ -59,12 +166,48 @@ impl Supervisor {
         name: &InstanceName,
         mode: DrainMode,
     ) {
+        self.drain_channel_usage_for(registry, name, mode, UsageChannel::Stdout);
+    }
+
+    /// The acp kind's STDERR sentinel drain (story 14-3, T3, spine AD-19): the
+    /// byte-identical twin of [`Supervisor::drain_usage_for`] over the captured
+    /// stderr log. An `acp` instance's stdout is the ACP protocol stream (stdout
+    /// purity is a Never rule), so a cooperative agent's `KTESIO_USAGE {json}`
+    /// lines arrive on STDERR — captured by the backend's crash-immune direct
+    /// redirect into `agent-stderr.log`, where this drain tail-reads them under
+    /// the SAME cursor + AI-41 park discipline. Events stamp `self-reported`
+    /// (the channel's own truth — see [`UsageChannel::metering_source`]).
+    pub(super) fn drain_stderr_usage_for(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        mode: DrainMode,
+    ) {
+        self.drain_channel_usage_for(registry, name, mode, UsageChannel::Stderr);
+    }
+
+    /// The channel-generic implementation both self-reported drains share. Every
+    /// behavior below (the AI-63 tail read, the H1/M2 `plan_drain` rules, the
+    /// AI-41 ingest-before-advance + park/bound discipline) is byte-identical
+    /// per channel; only the file, the cursor/park state, and the stamped
+    /// metering source differ (see [`UsageChannel`]).
+    fn drain_channel_usage_for(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        mode: DrainMode,
+        channel: UsageChannel,
+    ) {
         // Only running/adopted instances have a cursor + metering context.
         let (cursor, run_id, metering_source) = match self.running.get(name) {
-            Some(s) => (s.usage_cursor, s.run_id.clone(), s.metering_source.clone()),
+            Some(s) => (
+                channel.cursor(s),
+                s.run_id.clone(),
+                channel.metering_source(s),
+            ),
             None => return,
         };
-        let path = registry.agent_output_log_path(name);
+        let path = channel.log_path(registry, name);
         // AI-63 (billing-critical stall fix): read ONLY the tail written since the
         // last drain (`[cursor, len)`) — NEVER the whole never-rotated `agent.log`.
         // `read_usage_tail` returns the SAME bytes the old whole-file read's
@@ -82,7 +225,7 @@ impl Supervisor {
             // double-count → no inflated bill).
             UsageTail::Shrunk { new_cursor } => {
                 if let Some(s) = self.running.get_mut(name) {
-                    s.usage_cursor = new_cursor;
+                    channel.set_cursor(s, new_cursor);
                 }
                 return;
             }
@@ -102,6 +245,16 @@ impl Supervisor {
             } => {
                 let block = String::from_utf8_lossy(&tail[range]);
                 let parsed = self.usage_source.drain(&block);
+                // Story 14-3 (T3): a parsed sentinel line on EITHER channel is
+                // the instance's "sentinel: lines seen" state — the honest gap
+                // notice reports it instead of "no lines seen" once any line
+                // has arrived this Run. Recorded at PARSE time (not commit):
+                // "seen" is about the agent's behavior, not the store's.
+                if !parsed.is_empty() {
+                    if let Some(s) = self.running.get_mut(name) {
+                        s.sentinel_lines_seen = true;
+                    }
+                }
                 // AI-41 (billing honesty): ingest FIRST; advance the cursor past
                 // the consumed block ONLY when every parsed event committed (or
                 // was a recognized duplicate replay). The pre-fix code advanced
@@ -131,8 +284,8 @@ impl Supervisor {
                 // reached only when every event behind the advance is durable.
                 if committed_count == parsed.len() {
                     if let Some(s) = self.running.get_mut(name) {
-                        s.usage_cursor = cursor + consumed;
-                        s.usage_park_attempts = None;
+                        channel.set_cursor(s, cursor + consumed);
+                        channel.set_park(s, None);
                     }
                 } else if mode == DrainMode::Terminal {
                     // AI-41 (loop 1): on the TERMINAL drain there IS no next
@@ -158,16 +311,15 @@ impl Supervisor {
                     // offset, skip the block with a loud diagnostic: billing
                     // honesty cuts both ways — announce the loss, don't strand
                     // the ledger.
-                    let attempts = match self.running.get(name).and_then(|s| s.usage_park_attempts)
-                    {
+                    let attempts = match self.running.get(name).and_then(|s| channel.park(s)) {
                         Some((parked_cursor, n)) if parked_cursor == cursor => n + 1,
                         _ => 1,
                     };
                     if attempts >= USAGE_PARK_MAX_ATTEMPTS {
                         let lost = parsed.len() - committed_count;
                         if let Some(s) = self.running.get_mut(name) {
-                            s.usage_cursor = cursor + consumed;
-                            s.usage_park_attempts = None;
+                            channel.set_cursor(s, cursor + consumed);
+                            channel.set_park(s, None);
                         }
                         let skip = format!(
                             "{}: {lost} usage event(s) at byte offset {cursor} failed to \
@@ -178,7 +330,7 @@ impl Supervisor {
                         );
                         self.emit_diagnostic(&skip);
                     } else if let Some(s) = self.running.get_mut(name) {
-                        s.usage_park_attempts = Some((cursor, attempts));
+                        channel.set_park(s, Some((cursor, attempts)));
                     }
                 }
             }

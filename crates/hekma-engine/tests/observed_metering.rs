@@ -1022,6 +1022,75 @@ fn a_hand_set_memory_dir_never_reaches_an_engine_observed_start_surfaces() {
     facade.stop("obsmem", Some(Duration::from_secs(5))).unwrap();
 }
 
+/// Story 14-3 (T2), the ACP end-to-end: an `acp`-kind instance whose operator
+/// opts into the observed channel (`metering.upstream_base_url` — the same
+/// key an observed MANIFEST agent honors) starts the loopback listener and
+/// receives its address via the builtin acp mapping (`metering.base_url` →
+/// `OPENAI_BASE_URL`); the fake ACP agent's model traffic through the
+/// listener lands billing-grade input/output/CACHED tokens in the ledger
+/// tagged `engine-observed`, the Fleet entry surfaces that active source, and
+/// the usage-gap notice is ABSENT (billing-grade usage exists).
+#[test]
+fn an_acp_instance_with_a_base_url_override_meters_engine_observed() {
+    let state = TempDir::new().unwrap();
+    let stub = start_upstream_stub();
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("acpobs", "acp").unwrap();
+    // The acp launch keys + the observed opt-in (the operator gesture).
+    let bin = hekma_conformance::fake_acp_agent_bin();
+    facade
+        .set_config("acpobs", "acp.command", &bin.to_string_lossy())
+        .unwrap();
+    facade
+        .set_config("acpobs", "acp.args", "--mode observed-call")
+        .unwrap();
+    facade
+        .set_config("acpobs", "metering.upstream_base_url", &stub.base_url)
+        .unwrap();
+
+    let started = facade.start("acpobs").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // One prompt turn → one observed model call → one ledger event.
+    facade
+        .send_input("acpobs", "make one observed call")
+        .unwrap();
+    let count = wait_for_observed_rows(state.path(), "acpobs", 1, Duration::from_secs(30));
+    assert_eq!(
+        count, 1,
+        "the ACP agent's observed call landed exactly once"
+    );
+
+    // The totals are the stub's fixed usage, cached subset included (the
+    // kind-agnostic observed pipeline — parse → ledger — unchanged).
+    let entry = facade
+        .fleet()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name.as_str() == "acpobs")
+        .unwrap();
+    assert_eq!(entry.kind, "acp");
+    assert_eq!(entry.usage.cumulative_input_tokens, STUB_PROMPT_TOKENS);
+    assert_eq!(entry.usage.cumulative_output_tokens, STUB_COMPLETION_TOKENS);
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(STUB_CACHED_TOKENS),
+        "the cached subset landed through the kind-agnostic pipeline"
+    );
+    // The ACTIVE source (resolved from the opt-in config, not the always-
+    // self-reported registration snapshot) is surfaced.
+    assert_eq!(entry.metering_source, "engine-observed");
+    // Billing-grade usage exists → the honest gap notice is absent.
+    assert!(
+        entry.usage_gap.is_none(),
+        "a metered instance has no usage gap: {entry:?}"
+    );
+
+    let _ = facade.stop("acpobs", Some(Duration::from_secs(5)));
+}
+
 #[test]
 fn adding_engine_observed_did_not_add_a_no_metering_escape_hatch() {
     // AC-C (regression guard, 3-4's obligation): the FR-19 hard line still holds —

@@ -501,3 +501,178 @@ fn permission_request_is_denied_and_the_turn_completes() {
 
     let _ = blocking.stop(name, None).expect("stop");
 }
+
+// ---------------------------------------------------------------------------
+// Story 14-3 — the metering tiers (T1 context surfacing, T3 stderr sentinel,
+// and the honest `—` gap notice)
+// ---------------------------------------------------------------------------
+
+/// T1: the agent's `usage_update` is surfaced as CONTEXT usage — the
+/// `acp_context_usage` field (used/size + the agent-reported cost) appears on
+/// the Fleet entry, the CONTEXT-grain diagnostic is announced through the
+/// sink — and NOTHING is minted into the billing ledger (`usage` stays all
+/// zero, and the gap notice says exactly that with
+/// `context_usage_reported: true`).
+#[test]
+fn usage_update_is_surfaced_as_context_and_never_billed() {
+    let base = TempDir::new().unwrap();
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open(&base, Some(&shared));
+    let name = "acp-context";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "usage-update", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    blocking.send_input(name, "measure me").expect("send");
+
+    // The context figure lands on the Fleet entry (the reader recorded the
+    // latest usage_update; the fleet read lifts it).
+    poll_until("the acp_context_usage figure on the fleet entry", || {
+        blocking
+            .fleet_entry(name)
+            .ok()
+            .and_then(|e| e.acp_context_usage)
+            .is_some()
+    });
+    let entry = blocking.fleet_entry(name).expect("fleet entry");
+    let context = entry.acp_context_usage.as_ref().unwrap();
+    assert_eq!(context.used, Some(1200), "the used figure, verbatim");
+    assert_eq!(context.size, Some(200_000), "the size figure, verbatim");
+    let cost = context
+        .cost
+        .as_ref()
+        .expect("the agent-reported cost block");
+    assert_eq!(
+        (cost.amount.as_str(), cost.currency.as_str()),
+        ("0.0034", "USD")
+    );
+
+    // CONTEXT-grain, never billed: the ledger view is untouched (zero
+    // billing tokens — the cached rollup rides the ledger's own honesty).
+    assert_eq!(entry.usage.cumulative_input_tokens, 0);
+    assert_eq!(entry.usage.cumulative_output_tokens, 0);
+    assert_eq!(entry.usage.cumulative_total_tokens(), 0);
+
+    // The gap notice is PRESENT (no billing-grade usage anywhere) and names
+    // the honest context state: reported.
+    let gap = entry.usage_gap.as_ref().expect("the usage gap notice");
+    assert!(!gap.notice.is_empty());
+    assert!(gap.context_usage_reported, "{gap:?}");
+    assert_eq!(gap.observed, "not-configured");
+    assert_eq!(gap.sentinel, "no-lines-seen");
+    // The active source is the acp default (no observed opt-in here).
+    assert_eq!(entry.metering_source, "self-reported");
+
+    // The diagnostic surfaced with the CONTEXT-grain label (surfaced-not-
+    // silent, and never mistakable for a billing figure).
+    poll_until("the CONTEXT-grain usage diagnostic surfaced", || {
+        sink_text(&shared).contains("usage_update (CONTEXT-grain)")
+    });
+
+    let _ = blocking.stop(name, None).expect("stop");
+}
+
+/// The honest `—` gap notice on a BARE acp instance: no observed opt-in, no
+/// sentinel lines, no context figure — the fleet entry carries the structured
+/// gap (tiers attempted + context state), the usage view stays the ledger's
+/// truthful zero, and nothing is fabricated.
+#[test]
+fn bare_acp_instance_surfaces_the_honest_gap_notice() {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "acp-gap";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "chunky", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    // A turn with NO usage signal of any grain (chunky emits chunks only).
+    blocking.send_input(name, "no usage here").expect("send");
+    poll_until("the turn completes", || {
+        std::fs::read_to_string(agent_log_path(base.path(), name))
+            .unwrap_or_default()
+            .contains("\"stopReason\":\"end_turn\"")
+    });
+
+    let entry = blocking.fleet_entry(name).expect("fleet entry");
+    let gap = entry.usage_gap.as_ref().expect("the usage gap notice");
+    assert_eq!(gap.observed, "not-configured", "no upstream key was set");
+    assert_eq!(
+        gap.sentinel, "no-lines-seen",
+        "no sentinel line was emitted"
+    );
+    assert!(!gap.context_usage_reported, "no usage_update was sent");
+    assert!(
+        gap.notice.contains("observed: not-configured")
+            && gap.notice.contains("sentinel: no-lines-seen")
+            && gap.notice.contains("no context usage reported"),
+        "the notice names every tier: {}",
+        gap.notice
+    );
+    // The context field is honestly absent, the usage view the ledger's zero.
+    assert!(entry.acp_context_usage.is_none());
+    assert_eq!(entry.usage.cumulative_input_tokens, 0);
+    assert_eq!(entry.usage.cumulative_output_tokens, 0);
+
+    let _ = blocking.stop(name, None).expect("stop");
+}
+
+/// T3: a cooperative agent emits `KTESIO_USAGE {json}` on STDERR (an acp
+/// instance's stdout is the protocol stream) — the stderr sentinel drain
+/// lands each line in the billing ledger, the metering_source stamps
+/// `self-reported`, and once billing-grade usage EXISTS the gap notice is
+/// gone (the `—` was only ever the surfaced last resort).
+#[test]
+fn sentinel_lines_on_stderr_reach_the_ledger() {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "acp-sentinel";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "sentinel-stderr", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    blocking.send_input(name, "turn one").expect("send");
+    // The sentinel line (40 in / 20 out) lands in the ledger through the
+    // stderr drain (the reaper cadence), stamped self-reported.
+    poll_until("the stderr sentinel usage landed in the ledger", || {
+        blocking
+            .fleet_entry(name)
+            .map(|e| e.usage.cumulative_input_tokens == 40)
+            .unwrap_or(false)
+    });
+    let entry = blocking.fleet_entry(name).expect("fleet entry");
+    assert_eq!(entry.usage.cumulative_output_tokens, 20);
+    assert_eq!(entry.metering_source, "self-reported");
+    // Billing-grade usage exists → NO gap notice, and no honest-`—` state.
+    assert!(
+        entry.usage_gap.is_none(),
+        "a metered instance has no usage gap: {entry:?}"
+    );
+
+    // A second turn increments the sentinel sequence (per-Run monotonic) and
+    // the totals accumulate exactly (dedup keyed on the agent's sequence).
+    poll_until("the in-flight flag cleared on the stopReason", || {
+        std::fs::read_to_string(agent_log_path(base.path(), name))
+            .unwrap_or_default()
+            .contains("\"stopReason\":\"end_turn\"")
+    });
+    blocking.send_input(name, "turn two").expect("send");
+    poll_until("both sentinel lines landed", || {
+        blocking
+            .fleet_entry(name)
+            .map(|e| {
+                e.usage.cumulative_input_tokens == 80 && e.usage.cumulative_output_tokens == 40
+            })
+            .unwrap_or(false)
+    });
+
+    let _ = blocking.stop(name, None).expect("stop");
+}

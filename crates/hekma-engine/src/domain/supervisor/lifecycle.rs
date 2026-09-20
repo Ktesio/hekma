@@ -226,8 +226,9 @@ impl Supervisor {
         // and "we killed the process" (story 3-1). TERMINAL drain: the process is
         // about to be gone, so a final newline-less usage line is consumed to
         // end-of-log rather than stranded (H1). Best-effort — a drain hiccup never
-        // blocks the stop.
-        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // blocks the stop. Story 14-3 (T3): an acp instance's stderr sentinel
+        // channel drains here too, under the same terminal rule (its own cursor).
+        self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
         // Drain any final ENGINE-OBSERVED usage still queued before the listener is
         // torn down (story 3-4): a completion the proxy parsed just before the stop
         // must land, not be lost when the `Supervised` (and its listener) is dropped
@@ -316,8 +317,11 @@ impl Supervisor {
         // still be in `self.running` for its cursor/run_id/metering_source to be
         // read — hence strictly BEFORE `self.running.remove`. This mirrors the crash
         // reaper's proven drain-AFTER-observed-exit (see `poll_once`). Best-effort,
-        // like the pre-kill drain — a drain hiccup never blocks the stop.
-        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // like the pre-kill drain — a drain hiccup never blocks the stop. The acp
+        // stderr sentinel channel (story 14-3, T3) rides the same rescue: its
+        // stderr cursor advanced in the pre-kill drain, so this pass ingests
+        // only the stderr bytes that arrived after it.
+        self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
         // Story 14-1: one FINAL acp notice drain after the process is
         // provably dead — the reader's EOF/stream-end notice is queued only
         // once the kill closes the pipe, so this is the last chance to

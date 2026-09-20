@@ -128,9 +128,21 @@ impl Supervisor {
         // snapshot — stamped on every UsageEvent ingested during this Run. Read here
         // (a pure snapshot read) before any side effect; a corrupt snapshot surfaces
         // the same way the launch-facts read above would.
-        let metering_source = registry
-            .metering_source(&name)
-            .map_err(registry_to_engine)?;
+        //
+        // Story 14-3 (T2, spine AD-19): the acp kind's ACTIVE source is resolved
+        // from its effective config instead of the (always self-reported) snapshot
+        // — the operator's `metering.upstream_base_url` key opts the instance into
+        // the engine-observed loopback channel, exactly the key an observed
+        // MANIFEST agent honors. The snapshot stays untouched (a registration
+        // record); the Fleet read resolves the same way, so the surfaced source
+        // matches what this start does.
+        let metering_source = if is_acp {
+            crate::acp::resolve_acp_metering_source(&effective).to_string()
+        } else {
+            registry
+                .metering_source(&name)
+                .map_err(registry_to_engine)?
+        };
 
         // Story 12-1 — the DETACHED REFUSAL for engine-observed instances,
         // BEFORE ANY SIDE EFFECT (no `starting` transition, no loopback
@@ -439,7 +451,12 @@ impl Supervisor {
         // readiness would skip them — the ingestion bug this prevents. For an `acp`
         // spawn (story 14-1) the READER appends the raw lines to this same file (the
         // stdout is a pipe, not a redirect), so the cursor semantics are unchanged.
+        // Story 14-3 (T3): the acp kind's STDERR sentinel channel anchors the same
+        // way, at the captured stderr log's pre-spawn length — a prior Run's
+        // captured stderr lines stay behind the cursor, never re-ingested under
+        // this fresh Run id.
         let usage_cursor = self.agent_log_len(registry, &name);
+        let stderr_usage_cursor = self.agent_stderr_log_len(registry, &name);
 
         // (3) registered/stopped/failed → starting.
         self.transition(
@@ -676,6 +693,16 @@ impl Supervisor {
                 metering_source,
                 usage_cursor,
                 usage_park_attempts: None,
+                // Story 14-3 (T3): the stderr sentinel channel's fresh
+                // cursor + park (acp-only in practice; zero for the rest).
+                stderr_usage_cursor,
+                stderr_usage_park_attempts: None,
+                // A fresh Run has seen no sentinel lines yet (the gap
+                // notice's honest "no lines seen" until one arrives).
+                sentinel_lines_seen: false,
+                // Story 14-3 (T2): carried beside the handle so the drain
+                // cadence gates the stderr channel without a re-read.
+                is_acp,
                 // Story 12-4: a fresh Run starts with no parked observed events.
                 observed_park: None,
                 // A fresh Run starts with an EMPTY breach latch (story 3-2): the

@@ -41,6 +41,27 @@
 //!   `end_turn`. The engine must answer DENIED and surface one diagnostic;
 //!   the turn proceeds to completion so the test can observe both facts.
 //!
+//! ## Story 14-3 modes (the metering tiers)
+//!
+//! * `usage-update` — for each `session/prompt`, first emit ONE
+//!   `session/update` carrying a `usage_update` (CONTEXT-grain:
+//!   `used`/`size` + the optional `cost` block) before the chunks. The
+//!   engine must surface it as CONTEXT usage (diagnostic + the
+//!   `acp_context_usage` show/fleet field) and mint NOTHING into the
+//!   billing ledger.
+//! * `sentinel-stderr` — for each `session/prompt`, write ONE
+//!   `KTESIO_USAGE {json}` line to STDERR (sequence 0,1,… per turn) before
+//!   the chunks. An acp instance's stdout is the protocol stream, so its
+//!   self-reported sentinel channel is stderr — the engine's stderr
+//!   sentinel drain must land each line in the billing ledger
+//!   (input/output tokens).
+//! * `observed-call` — for each `session/prompt`, make ONE real
+//!   OpenAI-compatible POST to `$OPENAI_BASE_URL/chat/completions` (the
+//!   env the engine injects when the instance opts into the observed
+//!   channel) and consume the response, then the chunks. The loopback
+//!   forward listener must parse the fixed `usage` into the billing
+//!   ledger, tagged `engine-observed`.
+//!
 //! Coverage note: like `fake_agent`, this binary only ever runs as a
 //! SPAWNED SUBPROCESS (a tarpaulin-instrumented parent can never record its
 //! lines), so it is excluded from coverage — its behavior is proven by the
@@ -107,6 +128,83 @@ fn emit_chunks() {
     }
 }
 
+/// The `usage_update` notification for one turn (story 14-3, T1): the
+/// CONTEXT-grain figure — a fixed `used`/`size` plus the optional
+/// agent-reported cost block, so the engine's surfacing (diagnostic + the
+/// `acp_context_usage` field) is observable with and without the cost.
+#[cfg(not(tarpaulin_include))]
+fn usage_update() -> serde_json::Value {
+    notification(
+        "session/update",
+        serde_json::json!({
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 1200,
+                "size": 200000,
+                "cost": { "amount": 0.0034, "currency": "USD" },
+            },
+        }),
+    )
+}
+
+/// One `KTESIO_USAGE {json}` line to STDERR (story 14-3, T3): the acp kind's
+/// self-reported sentinel channel. Pure `std`, `sequence` stamped by the
+/// caller (per-turn monotonic), token counts FIXED so the ledger total is an
+/// exact-match assertion (K turns × 40 in / 20 out).
+#[cfg(not(tarpaulin_include))]
+fn emit_stderr_sentinel(sequence: u64) {
+    eprintln!("KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":40,\"output_tokens\":20}}");
+}
+
+/// ONE OpenAI-compatible POST to the injected base URL (story 14-3, T2): the
+/// observed-call mode's model traffic for the loopback forward listener to
+/// intercept. Pure `std` (a blocking `TcpStream`), bounded reads, no
+/// dependency; a failed call is noted on stderr and the turn continues (the
+/// engine's ledger simply stays empty — the honest gap).
+#[cfg(not(tarpaulin_include))]
+fn post_one_observed_call(base_url: &str) {
+    // Parse `http://127.0.0.1:<port>` into host:port (loopback only in tests).
+    let Some(authority) = base_url.strip_prefix("http://") else {
+        eprintln!("fake_acp_agent: unsupported base URL shape: {base_url}");
+        return;
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port),
+        None => (authority, "80"),
+    };
+    let body = r#"{"model":"fake-acp","messages":[{"role":"user","content":"hi"}]}"#;
+    let request = format!(
+        "POST /chat/completions HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: \
+         application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+        len = body.len(),
+    );
+    let Ok(port) = port.parse::<u16>() else {
+        eprintln!("fake_acp_agent: unsupported base URL port: {base_url}");
+        return;
+    };
+    let outcome = std::net::TcpStream::connect((host, port)).and_then(|mut stream| {
+        use std::io::Read;
+        stream.write_all(request.as_bytes())?;
+        let mut response = String::new();
+        // Bounded read: the stub answers a fixed body and closes.
+        let _ = stream.take(64 * 1024).read_to_string(&mut response);
+        Ok(response)
+    });
+    match outcome {
+        Ok(response) if response.contains("chat.completion") || response.contains("chatcmpl") => {}
+        Ok(response) => {
+            eprintln!(
+                "fake_acp_agent: observed call answered unexpectedly ({} bytes)",
+                response.len()
+            );
+        }
+        Err(err) => {
+            eprintln!("fake_acp_agent: observed call failed: {err}");
+        }
+    }
+}
+
 #[cfg(not(tarpaulin_include))]
 fn main() {
     use std::sync::mpsc;
@@ -144,6 +242,7 @@ fn main() {
     enum Inbound {
         Request { id: u64, method: String },
         Response { id: u64 },
+        Cancelled,
         Eof,
     }
     let (tx, rx) = mpsc::channel::<Inbound>();
@@ -165,16 +264,21 @@ fn main() {
                     };
                     if value.get("method").and_then(|m| m.as_str()) == Some("session/cancel") {
                         // An ACP agent aborts its in-flight turn on cancel.
-                        // Handled HERE (the reader thread wakes the instant
-                        // the line arrives) so the receipt is observable
-                        // before the client's termination ladder escalates;
-                        // stderr (NOT stdout — the protocol stream stays
-                        // pure) notes it for the stop test. The process does
-                        // NOT self-exit: the client's stop ladder owns the
-                        // termination (a self-exit here would race its
-                        // SIGTERM with a not-yet-reaped zombie — EPERM on
-                        // macOS).
+                        // The reader thread wakes the instant the line
+                        // arrives and hands the cancellation to the main
+                        // loop, which ends the turn (`stopReason: cancelled`)
+                        // and exits cooperatively — the graceful stage of the
+                        // client's stop ladder then reaps an already-exited
+                        // child on every OS. (The engine's unix stop maps a
+                        // vanished group to success — ESRCH is pinned — and
+                        // its reap-first ordering makes the old fear of a
+                        // SIGTERM/zombie race unfounded; an earlier draft of
+                        // this branch only LOGGED the cancel and never
+                        // exited, which left the WINDOWS stop ladder polling
+                        // its whole graceful window for an exit that never
+                        // came: the stop test's 30s timeout.)
                         eprintln!("fake_acp_agent: session/cancel received");
+                        let _ = tx.send(Inbound::Cancelled);
                         continue;
                     }
                     let id = value.get("id").and_then(|v| v.as_u64());
@@ -199,6 +303,9 @@ fn main() {
     });
 
     let mut next_agent_request_id: u64 = 1000;
+    // The per-turn counter the sentinel-stderr mode stamps (a per-Run
+    // monotonic sequence, the sentinel convention's dedup ordinal).
+    let mut next_turn_sequence: u64 = 0;
 
     while let Ok(message) = rx.recv() {
         let Inbound::Request { id, method } = message else {
@@ -290,11 +397,54 @@ fn main() {
                 }
                 if mode == "in-flight" {
                     // Keep the turn in flight for the delay so a test can
-                    // attempt a second prompt or a stop against it. A
-                    // `session/cancel` that arrives mid-delay is handled by
-                    // the reader thread above (abort + exit) — exactly the
-                    // cooperative-abort shape a real ACP agent has.
-                    std::thread::sleep(delay);
+                    // attempt a second prompt or a stop against it. The wait
+                    // is CANCELLABLE: a `session/cancel` arriving mid-delay
+                    // (relayed by the reader thread) ends the turn the way a
+                    // real ACP agent ends it — the prompt response carries
+                    // `stopReason: "cancelled"` — and the process exits
+                    // cooperatively, so the client's stop ladder reaps an
+                    // already-exited child promptly on every OS.
+                    let deadline = std::time::Instant::now() + delay;
+                    let mut cancelled = false;
+                    while std::time::Instant::now() < deadline {
+                        match rx.recv_timeout(Duration::from_millis(50)) {
+                            Ok(Inbound::Cancelled) => {
+                                cancelled = true;
+                                break;
+                            }
+                            Ok(Inbound::Eof) => return,
+                            Ok(_) => continue,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    }
+                    if cancelled {
+                        emit(&response(
+                            id,
+                            serde_json::json!({ "stopReason": "cancelled" }),
+                        ));
+                        let _ = std::io::stdout().flush();
+                        return;
+                    }
+                }
+                // Story 14-3 tier modes, in turn order before the chunks.
+                if mode == "usage-update" {
+                    emit(&usage_update());
+                }
+                if mode == "observed-call" {
+                    // The model traffic for the loopback listener to observe;
+                    // the base URL arrives via the env the engine injected.
+                    if let Ok(base_url) = std::env::var("OPENAI_BASE_URL") {
+                        post_one_observed_call(&base_url);
+                    } else {
+                        eprintln!(
+                            "fake_acp_agent: observed-call mode but OPENAI_BASE_URL is unset"
+                        );
+                    }
+                }
+                if mode == "sentinel-stderr" {
+                    emit_stderr_sentinel(next_turn_sequence);
+                    next_turn_sequence += 1;
                 }
                 emit_chunks();
                 emit(&response(

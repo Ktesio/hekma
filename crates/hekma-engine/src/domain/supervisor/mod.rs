@@ -535,6 +535,30 @@ struct Supervised {
     /// with a loud diagnostic, so a permanently poisoned row cannot wedge the
     /// cursor (and silently strand every later usage event for the Run) forever.
     usage_park_attempts: Option<(u64, u32)>,
+    /// The STDERR sentinel channel's byte cursor (story 14-3, T3) — the
+    /// acp-kind twin of [`Supervised::usage_cursor`], anchored the same way
+    /// (at the captured stderr log's pre-spawn length) and advanced by the
+    /// SAME AI-41 discipline. An acp instance's stdout is the ACP protocol
+    /// stream, so its self-reported sentinel lines arrive on STDERR, which
+    /// the backend captures into `agent-stderr.log`; this cursor keeps the
+    /// two channels' drains disjoint. Zero for a non-acp instance (never
+    /// drained).
+    stderr_usage_cursor: u64,
+    /// The stderr sentinel channel's AI-41 park (the exact twin of
+    /// [`Supervised::usage_park_attempts`], per channel — a store error on
+    /// one channel must not wedge the other's retry identity).
+    stderr_usage_park_attempts: Option<(u64, u32)>,
+    /// Story 14-3 (T3): whether ANY well-formed `KTESIO_USAGE` sentinel line
+    /// has been parsed from either self-reported channel this Run. The honest
+    /// gap notice reports "lines seen" vs "no lines seen" from THIS flag (a
+    /// parse-time fact about the agent's behavior), never inferred from the
+    /// ledger. Resets with the Run (a fresh `Supervised` starts false).
+    sentinel_lines_seen: bool,
+    /// Story 14-3 (T2): whether this Run's instance is the builtin `acp`
+    /// kind. Gates the stderr sentinel drain (acp-only: every other kind's
+    /// sentinel channel is stdout) — a plain fact carried beside the handle
+    /// so the drain cadence never re-reads the registry per tick.
+    is_acp: bool,
     /// Story 12-4: the OBSERVED channel's park — `Some((pending, attempts))`
     /// while a store error keeps minted-but-uncommitted observed events parked
     /// (the analog of `usage_park_attempts`, which is the SELF-REPORTED
@@ -966,6 +990,34 @@ impl Supervisor {
         for name in names {
             self.drain_acp_notices_for(&name);
         }
+    }
+
+    /// The LATEST context-usage figure an instance's live ACP connection has
+    /// reported (story 14-3, T1), or `None` when the instance is not running,
+    /// is not the `acp` kind, or its agent has not sent a `usage_update` yet
+    /// this Run. The Fleet read (`fleet_entry_for`) surfaces it as the
+    /// `acp_context_usage` view — CONTEXT-grain by name, never a billing
+    /// figure. A short bounded read under the supervisor lock (the caller
+    /// already holds it), mirroring `current_run_id`'s shape.
+    pub(crate) fn acp_context_usage(
+        &self,
+        name: &InstanceName,
+    ) -> Option<crate::acp::AcpContextUsage> {
+        self.running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+            .and_then(|connection| connection.context_usage())
+    }
+
+    /// Whether ANY sentinel line has been seen for the instance this Run
+    /// (story 14-3, T3 — the gap notice's sentinel tier state). `false` when
+    /// the instance has no live supervision state (never started this
+    /// lifetime, or already torn down): the Fleet read then falls back to the
+    /// ledger-derived truth (no committed usage ⇒ none seen).
+    pub(crate) fn sentinel_lines_seen(&self, name: &InstanceName) -> bool {
+        self.running
+            .get(name)
+            .is_some_and(|supervised| supervised.sentinel_lines_seen)
     }
 
     /// Write `session/cancel` for an instance's in-flight ACP turn (the

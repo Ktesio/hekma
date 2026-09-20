@@ -284,8 +284,9 @@ impl Supervisor {
             // dropped (which kills the group), so this is the last chance to
             // capture the flushed tail; a truncated mid-write line fails the
             // sentinel parse and is skipped, and the DB dedup key backstops the
-            // rest.
-            self.drain_usage_for(registry, &name, DrainMode::Terminal);
+            // rest. Story 14-3 (T3): an acp instance's stderr sentinel channel
+            // drains here too, under the same terminal rule (its own cursor).
+            self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
             // Drain any final ENGINE-OBSERVED usage still queued before the crashed
             // instance's listener is torn down (story 3-4): a completion parsed just
             // before the crash must land, not be lost when the `Supervised` is
@@ -614,24 +615,60 @@ impl Supervisor {
                     // includes the run id, so even an overlapping sequence is safe.
                     let run_id = RunId::mint();
                     let usage_cursor = self.agent_log_len(registry, &name);
-                    let metering_source = registry.metering_source(&name).unwrap_or_else(|err| {
-                        // AI-46 (review loop 1): a registry read hiccup must
-                        // not SILENCE the stranded-listener diagnostic —
-                        // defaulting to `self-reported` here would skip the
-                        // one announcement an actually-observed orphan
-                        // needs. Announce the ambiguity loudly, then use
-                        // the neutral fallback for bookkeeping.
-                        let unclear = format!(
-                            "{}: the adopted instance's metering source could not be \
-                                 read ({err}); if it is engine-observed, its injected \
-                                 'metering.base_url' points at the PREVIOUS engine's dead \
-                                 loopback listener — stop the instance and start it again \
-                                 to re-anchor the listener",
-                            name.as_str(),
-                        );
-                        self.emit_diagnostic(&unclear);
-                        "self-reported".to_string()
-                    });
+                    // Story 14-3 (T3): the acp kind's stderr sentinel channel
+                    // anchors the same way (at the CURRENT end of the captured
+                    // stderr log, skipping pre-crash lines — the documented
+                    // adoption posture above, per channel).
+                    let stderr_usage_cursor = self.agent_stderr_log_len(registry, &name);
+                    // Story 14-3 (T2): the acp kind's ACTIVE source resolves
+                    // from its effective config (the same resolution the start
+                    // seam and the Fleet read use), so an adopted instance that
+                    // opted into the observed channel keeps surfacing that
+                    // source. A degraded config read falls back to the snapshot
+                    // value already resolved above (the AI-46 note stays the
+                    // loud path for a snapshot failure).
+                    let adopted_is_acp = registry
+                        .lookup(&name)
+                        .map(|instance| crate::acp::is_acp_kind(&instance.kind))
+                        .unwrap_or(false);
+                    let metering_source = if adopted_is_acp {
+                        registry
+                            .effective_config(&name, ConfigLayer::empty())
+                            .map(|effective| {
+                                crate::acp::resolve_acp_metering_source(&effective).to_string()
+                            })
+                            .unwrap_or_else(|err| {
+                                let unclear = format!(
+                                    "{}: the adopted acp instance's effective config could \
+                                     not be read ({err}); its metering source stays the \
+                                     snapshot value until the next start",
+                                    name.as_str(),
+                                );
+                                self.emit_diagnostic(&unclear);
+                                registry
+                                    .metering_source(&name)
+                                    .unwrap_or_else(|_| "self-reported".to_string())
+                            })
+                    } else {
+                        registry.metering_source(&name).unwrap_or_else(|err| {
+                            // AI-46 (review loop 1): a registry read hiccup must
+                            // not SILENCE the stranded-listener diagnostic —
+                            // defaulting to `self-reported` here would skip the
+                            // one announcement an actually-observed orphan
+                            // needs. Announce the ambiguity loudly, then use
+                            // the neutral fallback for bookkeeping.
+                            let unclear = format!(
+                                "{}: the adopted instance's metering source could not be \
+                                     read ({err}); if it is engine-observed, its injected \
+                                     'metering.base_url' points at the PREVIOUS engine's dead \
+                                     loopback listener — stop the instance and start it again \
+                                     to re-anchor the listener",
+                                name.as_str(),
+                            );
+                            self.emit_diagnostic(&unclear);
+                            "self-reported".to_string()
+                        })
+                    };
                     // Clone the Run context into `Supervised` — the AI-44
                     // enforcement call below borrows the same values afterwards.
                     self.clear_poll_error_streak(&name);
@@ -643,6 +680,15 @@ impl Supervisor {
                             metering_source: metering_source.clone(),
                             usage_cursor,
                             usage_park_attempts: None,
+                            // Story 14-3 (T3): the adopted instance's stderr
+                            // sentinel channel anchors fresh (no parked state
+                            // survives the prior engine).
+                            stderr_usage_cursor,
+                            stderr_usage_park_attempts: None,
+                            // A fresh (adopted) Run has seen no sentinel lines.
+                            sentinel_lines_seen: false,
+                            // Story 14-3 (T2): gates the stderr sentinel drain.
+                            is_acp: adopted_is_acp,
                             // Story 12-4: an adopted instance starts with no parked
                             // observed events (its prior engine's park died with it).
                             observed_park: None,

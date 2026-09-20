@@ -34,6 +34,78 @@ use crate::error::{
 };
 use crate::ui;
 
+/// The Usage CELL for one Fleet entry (story 14-3): an `acp` instance whose
+/// ledger holds NO billing-grade usage renders the honest `—` gap marker
+/// ([`FleetEntry::METERING_SEED_CELL`]) — per the epic-14 spec, its token/cost
+/// cells show not-AVAILABLE (the tiers are known: none produced a billing
+/// event), distinctly from a consumed zero. Every other entry renders the
+/// cumulative token cell exactly as before. `dollar_label` follows the same
+/// narrow-list/wide-show split as [`usage_cell`].
+fn usage_entry_cell(entry: &FleetEntry, dollar_label: DollarLabel) -> String {
+    match &entry.usage_gap {
+        Some(_) => FleetEntry::METERING_SEED_CELL.to_string(),
+        None => usage_cell(&entry.usage, dollar_label),
+    }
+}
+
+/// The WIDE `show` Usage cell for one Fleet entry (story 14-3): a gapped acp
+/// entry carries the FULL gap notice INLINE (`— (no billing-grade usage —
+/// tiers attempted: …)`) — the wide Value column never truncates, the same
+/// treatment as [`cost_row_value`]'s inert-dollar note — so the tiers
+/// attempted are legible where the operator reads detail. Everyone else gets
+/// [`usage_cell_show`].
+fn usage_entry_cell_show(entry: &FleetEntry) -> String {
+    match &entry.usage_gap {
+        Some(gap) => format!("{} ({})", FleetEntry::METERING_SEED_CELL, gap.notice),
+        None => usage_cell_show(&entry.usage),
+    }
+}
+
+/// The stderr gap NOTE for one gapped entry (story 14-3, AI-18 — the narrow
+/// `list` cell truncates to the bare `—`, so the full tier breakdown rides
+/// the stderr note channel, AD-12). Composed from the engine's structured
+/// notice; the CLI adds only the instance-name prefix.
+fn usage_gap_note(entry: &FleetEntry) -> String {
+    match &entry.usage_gap {
+        Some(gap) => format!("{}: {}", entry.name.as_str(), gap.notice),
+        None => String::new(),
+    }
+}
+
+/// The `show` "ACP context usage" row value (story 14-3, T1): the
+/// agent-reported CONTEXT figure in its OWN row — never inside the billing
+/// Usage/Cost rows — labeled context-grain and agent-reported, with the
+/// optional agent-reported cost verbatim (NOT routed through the currency
+/// module: it is the agent's own claim, not an engine-derived estimate, so
+/// no `$` figure of ours is involved). The honest absence when nothing has
+/// been reported this session.
+fn acp_context_cell(entry: &FleetEntry) -> String {
+    match &entry.acp_context_usage {
+        Some(usage) => {
+            let used = usage
+                .used
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let size = usage
+                .size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let cost = match &usage.cost {
+                Some(cost) => format!(
+                    " · agent-reported cost {} {} (context-grain, NOT billed)",
+                    cost.amount, cost.currency
+                ),
+                None => String::new(),
+            };
+            format!("used {used} of {size} context tokens (agent-reported){cost}")
+        }
+        None => format!(
+            "{} (no usage_update reported this session)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    }
+}
+
 /// Retain/delete choice as parsed from the CLI flags.
 ///
 /// `[ASSUMPTION]` when neither `--delete` nor `--retain` is given we default to
@@ -471,8 +543,11 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     ];
     // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
     // falls back to zero usage / "unknown" source so `show` never fails on it.
+    // Story 14-3: the Usage cell routes through the gap-aware helper — a gapped
+    // acp instance shows the honest `—` + the full tier notice INLINE (the wide
+    // Value column never truncates).
     let usage_value = entry
-        .map(|e| usage_cell_show(&e.usage))
+        .map(usage_entry_cell_show)
         .unwrap_or_else(|| "in 0 / out 0".to_string());
     let metering_value = entry
         .map(|e| e.metering_source.clone())
@@ -488,7 +563,7 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     // inert note when no Rate is configured (AC-B: dollar features inert and SAY SO).
     let cost_value =
         cost_row_value(entry.and_then(|e| e.usage.cumulative_dollars.zip(e.usage.estimate_label)));
-    let rows = vec![
+    let mut rows = vec![
         vec![
             ui::TableCell::plain("State"),
             ui::TableCell::status(status.instance.state.as_str()),
@@ -525,6 +600,21 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
             ui::TableCell::plain(metering_value),
         ],
     ];
+    // Story 14-3 (T1): the ACP context-usage row — rendered for an `acp`
+    // instance only (the Fleet read carries the kind), holding the
+    // agent-reported CONTEXT figure in its own block, never inside the
+    // billing Usage/Cost rows above. A degraded Fleet read renders nothing
+    // (the row is entry-derived, like the budget/usage rows it extends).
+    let rows = match entry {
+        Some(acp_entry) if acp_entry.kind == "acp" => {
+            rows.push(vec![
+                ui::TableCell::plain("ACP context usage"),
+                ui::TableCell::plain(acp_context_cell(acp_entry)),
+            ]);
+            rows
+        }
+        _ => rows,
+    };
     ui::print_table(&title, &columns, &rows);
     // For a failed instance, surface the last-known cause (the crash / crash-loop
     // detail) so the operator sees WHY it failed and the active policy (AC9).
@@ -973,8 +1063,15 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 // plus, with a Rate, the derived dollar rendered BARE (AI-45): the
                 // estimate qualifier lives in the Usage column HEADER
                 // ([`USAGE_LIST_HEADER`]), whose min_width keeps it for every
-                // width that can still render the header at all.
-                ui::TableCell::plain(usage_cell(&entry.usage, DollarLabel::InHeader)),
+                // width that can still render the header at all. Story 14-3: a
+                // gapped acp instance renders the honest `—` (muted, like the
+                // absent budget); the full tier notice rides the stderr note
+                // below, since this narrow cell truncates.
+                if entry.usage_gap.is_some() {
+                    ui::TableCell::muted(usage_entry_cell(entry, DollarLabel::InHeader))
+                } else {
+                    ui::TableCell::plain(usage_entry_cell(entry, DollarLabel::InHeader))
+                },
                 ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
@@ -985,6 +1082,13 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // note when partial, and a `—` (never $0.00) when no instance is Rate'd. It is
     // command output (a summary of the table above it), so it rides STDOUT (AD-12).
     println!("{}", fleet_total_footer(&listing.totals));
+    // Story 14-3 (AI-18): the gapped acp instances' usage-gap notes ride STDERR —
+    // the narrow Usage cell can only show the `—` token, so the tier breakdown
+    // (observed / sentinel / context state) is surfaced here, one note per gap,
+    // through the established note channel (AD-12).
+    for entry in entries.iter().filter(|e| e.usage_gap.is_some()) {
+        ui::note(usage_gap_note(entry));
+    }
     // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
     ui::note(METERING_NOTE);
     Ok(())
@@ -3160,8 +3264,71 @@ mod tests {
                 hekma_engine::UsageTotals::zero(),
             ),
             metering_source: "self-reported".to_string(),
+            acp_context_usage: None,
+            usage_gap: None,
             agent_home: format!("/x/agents/{name}"),
         }
+    }
+
+    #[test]
+    fn usage_entry_cells_render_the_acp_gap_and_context_figures() {
+        // Story 14-3: a gapped acp entry renders the honest `—` in both cell
+        // widths; the wide show cell carries the FULL tier notice inline; a
+        // context figure renders in its own labeled cell (never inside the
+        // billing cells); a metered/non-acp entry renders as before.
+        let mut entry = sample_fleet_entry("acp-1");
+        entry.kind = "acp".to_string();
+        entry.usage_gap = Some(hekma_engine::UsageGapNotice::acp(false, false, true));
+
+        // The narrow list cell: the bare honest-— token (the notice rides the
+        // stderr note).
+        assert_eq!(
+            usage_entry_cell(&entry, DollarLabel::InHeader),
+            FleetEntry::METERING_SEED_CELL
+        );
+        // The wide show cell: `—` + the full notice, tiers named.
+        let show = usage_entry_cell_show(&entry);
+        assert!(show.starts_with(FleetEntry::METERING_SEED_CELL), "{show}");
+        assert!(show.contains("observed: not-configured"), "{show}");
+        assert!(show.contains("sentinel: no-lines-seen"), "{show}");
+        assert!(show.contains("context usage reported"), "{show}");
+        // The gap note names the instance for the stderr channel.
+        let note = usage_gap_note(&entry);
+        assert!(note.starts_with("acp-1: "), "{note}");
+        assert!(note.contains("never billed"), "{note}");
+
+        // The context figure cell: labeled agent-reported + context-grain,
+        // with the agent's own cost VERBATIM (no `$` formatting of ours).
+        entry.acp_context_usage = Some(hekma_engine::AcpContextUsageView {
+            used: Some(1200),
+            size: Some(200_000),
+            cost: Some(hekma_engine::AcpContextCostView {
+                amount: "0.0034".to_string(),
+                currency: "USD".to_string(),
+            }),
+        });
+        let context = acp_context_cell(&entry);
+        assert!(
+            context.contains("used 1200 of 200000 context tokens"),
+            "{context}"
+        );
+        assert!(context.contains("(agent-reported)"), "{context}");
+        assert!(
+            context.contains("agent-reported cost 0.0034 USD"),
+            "{context}"
+        );
+        assert!(
+            !context.contains('$'),
+            "no engine-formatted dollar: {context}"
+        );
+
+        // A non-acp entry (no gap, no context figure) renders the token cell.
+        let plain = sample_fleet_entry("mock-1");
+        assert_eq!(
+            usage_entry_cell(&plain, DollarLabel::InHeader),
+            usage_cell(&plain.usage, DollarLabel::InHeader)
+        );
+        assert!(acp_context_cell(&plain).contains("no usage_update reported"));
     }
 
     #[test]

@@ -382,4 +382,14 @@ impl Supervisor {
             .map(|m| m.len())
             .unwrap_or(0)
     }
+
+    /// The current byte length of an instance's captured STDERR log, or 0 if
+    /// it does not exist yet (story 14-3, T3) — the anchor for the acp kind's
+    /// stderr sentinel cursor, mirroring [`Self::agent_log_len`] exactly (the
+    /// same pre-spawn anchoring rule, its own crash-immune file).
+    pub(super) fn agent_stderr_log_len(&self, registry: &Registry, name: &InstanceName) -> u64 {
+        std::fs::metadata(registry.agent_stderr_log_path(name))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
 }

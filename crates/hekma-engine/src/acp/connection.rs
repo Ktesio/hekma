@@ -103,8 +103,9 @@ pub(crate) enum AcpNotice {
         outcome: String,
     },
     /// A `usage_update` — CONTEXT-grain usage. Surfaced here and NOWHERE
-    /// near the billing ledger (the two grains must never mix, spine AD-19;
-    /// stories 14-3/14-6 own the tiered billing acquisition).
+    /// near the billing ledger (the two grains must never mix, spine AD-19);
+    /// story 14-3 also records the latest figure on the connection so the
+    /// show/fleet surfaces can display it as the context metric.
     UsageUpdate {
         /// Context-window tokens used (agent-reported).
         used: Option<u64>,
@@ -183,6 +184,25 @@ impl AcpNotice {
             }
         }
     }
+}
+
+/// The LATEST `usage_update` context figure for one connection (story 14-3,
+/// spine AD-19 — T1). Recorded per instance so `kt agent show` / `list` /
+/// `show --json` / fleet can DISPLAY it as the context metric it is. This is
+/// CONTEXT-grain, never billing: it names the agent's session context window
+/// (`used` of `size` tokens, optional agent-reported `cost`) and is stored
+/// HERE ONLY — it never enters `usage_events` (the two usage grains must
+/// never mix; the billing tiers are the observed/sentinel channels).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AcpContextUsage {
+    /// Context-window tokens used (agent-reported).
+    pub used: Option<u64>,
+    /// The context-window size in tokens (agent-reported).
+    pub size: Option<u64>,
+    /// The optional agent-reported cost block, `(amount string, currency)` —
+    /// the agent's OWN claim, surfaced labeled as such; never derived into a
+    /// billed figure by this engine (AD-8: never fabricate, never mix grains).
+    pub cost: Option<(String, String)>,
 }
 
 /// Why a prompt could not be dispatched (surfaced as the typed refusal).
@@ -277,6 +297,11 @@ struct Inner {
     /// The surfaced-notice queue (bounded; drained by the reaper cadence
     /// under the supervisor lock).
     notices: Mutex<Notices>,
+    /// The LATEST `usage_update` context figure (story 14-3, T1) — recorded
+    /// by the reader thread (a short bounded swap, the AD-17/AD-18 shape),
+    /// read by the supervisor's Fleet/status read helpers. CONTEXT-grain
+    /// only; never the billing ledger.
+    context_usage: Mutex<Option<AcpContextUsage>>,
 }
 
 /// The bounded notice queue + its silent-loss counter (AI-18: a drop is
@@ -362,6 +387,7 @@ impl AcpConnection {
             prompt_id: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             notices: Mutex::new(Notices::default()),
+            context_usage: Mutex::new(None),
         });
         let connection = Self {
             inner: Arc::clone(&inner),
@@ -502,6 +528,36 @@ impl AcpConnection {
         self.inner
             .load_session
             .store(load_session, Ordering::Relaxed);
+    }
+
+    /// Record the LATEST `usage_update` context figure (story 14-3, T1) —
+    /// called by the reader thread on every `usage_update`, REPLACING any
+    /// earlier figure (the metric is the agent's current context state, not a
+    /// cumulative count — replacing is the honest semantics; the diagnostic
+    /// log keeps every report's history). A short bounded swap, never an
+    /// engine mutex.
+    pub(crate) fn record_context_usage(
+        &self,
+        used: Option<u64>,
+        size: Option<u64>,
+        cost: Option<(String, String)>,
+    ) {
+        *self
+            .inner
+            .context_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(AcpContextUsage { used, size, cost });
+    }
+
+    /// The latest recorded context-usage figure, or `None` while the agent
+    /// has not reported one this Run (`show`/fleet render the honest absence).
+    pub(crate) fn context_usage(&self) -> Option<AcpContextUsage> {
+        self.inner
+            .context_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Whether a turn is currently in flight (the in-flight refusal's check).
@@ -742,8 +798,13 @@ fn route_inbound(
                     }
                     SessionUpdate::UsageUpdate { used, size, cost } => {
                         // CONTEXT-grain surfacing ONLY — never the ledger
-                        // (spine AD-19; stories 14-3/14-6 own the billing
-                        // tiers).
+                        // (spine AD-19; the billing tiers are the observed /
+                        // sentinel channels). Story 14-3: the figure is ALSO
+                        // recorded on the connection (a short bounded swap)
+                        // so `show`/fleet can display the context metric —
+                        // labeled context-grain by its field name, never
+                        // inside the billing token/cost cells.
+                        connection.record_context_usage(used, size, cost.clone());
                         connection
                             .inner
                             .push_notice(AcpNotice::UsageUpdate { used, size, cost });

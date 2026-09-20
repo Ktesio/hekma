@@ -106,16 +106,16 @@ mod time;
 // collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
-    broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AgentInstance,
-    BreachAction, BreachDimension, BreachScope, BudgetBreachEvent, BudgetView, ConfigError,
-    ConfigLayer, CostCap, DiagnosticSink, EffectiveConfig, EngineError, EngineEvent, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError,
-    LifecycleState, LogLine, LogStream, Micros, NameError, Rate, Registry, RegistryError,
-    RemoveDisposition, ResolvedValue, RestartPolicy, ResyncBatch, ResyncCursor, RunId, SourceLayer,
-    TokenBudget, TransitionCause, TransitionEvent, UsageEvent, UsageTotals, UsageUpdateEvent,
-    UsageView, BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION,
-    FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK,
-    USAGE_SCHEMA_VERSION,
+    broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
+    AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
+    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink,
+    EffectiveConfig, EngineError, EngineEvent, EstimateLabel, FleetEntry, FleetListing,
+    FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState, LogLine,
+    LogStream, Micros, NameError, Rate, Registry, RegistryError, RemoveDisposition, ResolvedValue,
+    RestartPolicy, ResyncBatch, ResyncCursor, RunId, SourceLayer, TokenBudget, TransitionCause,
+    TransitionEvent, UsageEvent, UsageGapNotice, UsageTotals, UsageUpdateEvent, UsageView,
+    BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
+    LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EventSubscription, InstanceStatus};
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary

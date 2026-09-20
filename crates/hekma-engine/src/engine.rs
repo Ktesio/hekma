@@ -699,16 +699,37 @@ impl Engine {
         // Story 3-3 dollar surface: resolve the CURRENT Rate/cap + action ONCE
         // through the SAME live config resolve enforcement uses (so the Fleet view
         // matches what enforcement sees). A degraded read → no Rate / no budget
-        // (honest absence), never failing the Fleet.
-        let (rate, cost_cap, action) = registry
+        // (honest absence), never failing the Fleet. Story 14-3 (T2): the SAME
+        // resolved effective config decides the acp kind's ACTIVE metering source
+        // (the `metering.upstream_base_url` opt-in), so the surfaced source matches
+        // what the start seam did — the snapshot alone would always read
+        // self-reported for the acp builtin.
+        let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
-            .ok()
+            .ok();
+        let (rate, cost_cap, action) = effective_opt
+            .as_ref()
             .map(|effective| {
-                let (_token_budget, action) = crate::domain::resolve_token_budget(&effective);
-                let (rate, cost_cap, _cost_action) = crate::domain::resolve_cost(&effective);
+                let (_token_budget, action) = crate::domain::resolve_token_budget(effective);
+                let (rate, cost_cap, _cost_action) = crate::domain::resolve_cost(effective);
                 (rate, cost_cap, action)
             })
             .unwrap_or_else(|| (None, crate::domain::CostCap::none(), Default::default()));
+        let is_acp = crate::acp::is_acp_kind(&instance.kind);
+        let metering_source = if is_acp {
+            // The active source for the acp kind resolves from the effective
+            // config (start + Fleet read agree); a degraded read stays the
+            // honest "unknown" fallback (the same posture as the snapshot
+            // read below).
+            effective_opt
+                .as_ref()
+                .map(|effective| crate::acp::resolve_acp_metering_source(effective).to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            registry
+                .metering_source(&instance.name)
+                .unwrap_or_else(|_| "unknown".to_string())
+        };
         // The DERIVED dollar cost, present ONLY when a Rate is configured (AC-B: no
         // Rate ⇒ NO dollar figure, never a fabricated `$0.00`). Each row is priced at
         // its own persisted Rate (no retro-repricing), so these equal the ledger
@@ -734,33 +755,63 @@ impl Engine {
         };
         // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10): the
         // CURRENT resolved Token Budget + Cost Cap + Breach Action + remaining per
-        // scope. TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are present
-        // ONLY when a Rate exists (a cap with no Rate is inert — AC-B). An instance
-        // with NEITHER a budget nor an enforceable cap surfaces an honest absent
-        // budget (never a fabricated ceiling).
-        let budget = registry
-            .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
-            .ok()
-            .and_then(|effective| {
-                let (token_budget, _action) = crate::domain::resolve_token_budget(&effective);
-                crate::domain::BudgetView::from_budget_and_cost(
-                    &token_budget,
-                    &cost_cap,
-                    action,
-                    current_run.total_tokens(),
-                    cumulative.total_tokens(),
-                    rate.is_some(),
-                    current_run_cost,
-                    cumulative_cost,
-                    label,
-                )
-            });
-        // The active Metering Source is visible in Fleet detail (AC-C), read from the
-        // persisted adapter snapshot. A degraded read falls back to the honest
+        // scope, from the SAME effective config the Rate/action above resolved
+        // (one read — the AI-63 "double effective_config fold" debt shrinks by
+        // one here). TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are
+        // present ONLY when a Rate exists (a cap with no Rate is inert — AC-B).
+        // An instance with NEITHER a budget nor an enforceable cap surfaces an
+        // honest absent budget (never a fabricated ceiling).
+        let budget = effective_opt.as_ref().and_then(|effective| {
+            let (token_budget, _action) = crate::domain::resolve_token_budget(effective);
+            crate::domain::BudgetView::from_budget_and_cost(
+                &token_budget,
+                &cost_cap,
+                action,
+                current_run.total_tokens(),
+                cumulative.total_tokens(),
+                rate.is_some(),
+                current_run_cost,
+                cumulative_cost,
+                label,
+            )
+        });
+        // The active Metering Source is visible in Fleet detail (AC-C), resolved
+        // per kind above (the acp kind's active source; every other kind's
+        // persisted snapshot). A degraded read falls back to the honest
         // "unknown" marker rather than fabricating a source.
-        let metering_source = registry
-            .metering_source(&instance.name)
-            .unwrap_or_else(|_| "unknown".to_string());
+        // Story 14-3 (T1): the LATEST context-usage figure a live acp
+        // connection has reported — CONTEXT-grain, surfaced under its own
+        // `acp_context_usage` field, never inside the billing `usage` view.
+        let acp_context_usage = supervisor.acp_context_usage(&instance.name).map(|usage| {
+            crate::domain::AcpContextUsageView {
+                used: usage.used,
+                size: usage.size,
+                cost: usage
+                    .cost
+                    .map(|(amount, currency)| crate::domain::AcpContextCostView {
+                        amount,
+                        currency,
+                    }),
+            }
+        });
+        // Story 14-3: the honest usage-gap notice — present ONLY for an acp
+        // instance whose ledger holds NO billing-grade usage at all (the
+        // cumulative total is the every-Run truth; a gap is about billing
+        // availability, not just the current Run). The notice names the tiers
+        // attempted (observed configured-ness from the ACTIVE source; the
+        // sentinel lines-seen fact from live supervision — a non-running
+        // instance with a zero ledger has honestly seen none) plus the
+        // context-usage state. NEVER fabricated; every other kind (and a
+        // usage-carrying acp instance) omits the field.
+        let usage_gap = if is_acp && cumulative.total_tokens() == 0 {
+            Some(crate::domain::UsageGapNotice::acp(
+                metering_source == "engine-observed",
+                supervisor.sentinel_lines_seen(&instance.name),
+                acp_context_usage.is_some(),
+            ))
+        } else {
+            None
+        };
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -780,6 +831,8 @@ impl Engine {
             // aggregation rule is engine-domain; `hekma` triggers it over these rows).
             usage,
             metering_source,
+            acp_context_usage,
+            usage_gap,
             agent_home: instance.agent_home,
         }
     }

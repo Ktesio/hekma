@@ -42,7 +42,7 @@ use crate::domain::{EffectiveConfig, EngineError, InstanceName};
 use crate::domain::{ACP_ARGS_KEY, ACP_COMMAND_KEY};
 
 pub(crate) use client::handshake;
-pub(crate) use connection::{AcpConnection, PromptError};
+pub(crate) use connection::{AcpConnection, AcpContextUsage, PromptError};
 
 /// The builtin `acp` kind (spine AD-19) — the native-adapter table key the
 /// `--kind acp` registration resolves through. The same `^[a-z0-9][a-z0-9_-]*$`
@@ -156,6 +156,30 @@ pub(crate) fn adopted_acp_note(name: &str) -> String {
     )
 }
 
+/// The `acp` kind's ACTIVE Metering Source (story 14-3, T2 — spine AD-19's
+/// tiered acquisition): `self-reported` by default, or — when the operator
+/// configures `metering.upstream_base_url` — the `engine-observed` loopback
+/// channel (the same key an `engine-observed` MANIFEST agent honors; the
+/// engine-observed pipeline behind it — listener, parse incl. cached tokens,
+/// ledger, budgets — is kind-agnostic, so this is wiring, not new metering).
+///
+/// WHY the config key is the opt-in: the builtin acp adapter registers a
+/// fixed `SelfReported` snapshot (a builtin declares no `[metering]` section;
+/// the sentinel tier must be the honest default), so the SNAPSHOT alone would
+/// lock every acp instance out of the observed channel. The operator's
+/// upstream key is the deliberate, existing opt-in gesture — setting it says
+/// "this agent's model traffic honors a base-URL override", which is exactly
+/// the observed channel's precondition. Pure (a config read); called by the
+/// start seam (to pick the source + start the listener) and the Fleet read
+/// (so the surfaced source matches what the start did).
+pub(crate) fn resolve_acp_metering_source(effective: &EffectiveConfig) -> &'static str {
+    if crate::domain::resolve_upstream_base_url(effective).is_some() {
+        "engine-observed"
+    } else {
+        "self-reported"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +270,28 @@ mod tests {
         // Silence an unused-import lint in the test module (Value is used
         // only through the toml literals above on some compilers).
         let _ = Value::from(1);
+    }
+
+    #[test]
+    fn metering_source_resolves_self_reported_by_default_and_observed_on_the_upstream_key() {
+        // Story 14-3 (T2): the acp kind meters self-reported UNTIL the
+        // operator opts into the observed channel via the SAME upstream key
+        // an engine-observed manifest agent honors.
+        let bare = effective_from_instance("acp.command = 'agent'\n");
+        assert_eq!(resolve_acp_metering_source(&bare), "self-reported");
+        let opted_in = effective_from_instance(
+            "acp.command = 'agent'\n[metering]\nupstream_base_url = \"http://127.0.0.1:9\"\n",
+        );
+        assert_eq!(
+            resolve_acp_metering_source(&opted_in),
+            "engine-observed",
+            "metering.upstream_base_url is the observed opt-in for acp too"
+        );
+        // A secret-classified / empty upstream is NOT a URL (the same rule
+        // `resolve_upstream_base_url` applies to manifest agents) → no opt-in.
+        let empty = effective_from_instance(
+            "acp.command = 'agent'\n[metering]\nupstream_base_url = \"   \"\n",
+        );
+        assert_eq!(resolve_acp_metering_source(&empty), "self-reported");
     }
 }
