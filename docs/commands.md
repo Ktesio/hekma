@@ -21,7 +21,7 @@ hekma agent register my-agent --manifest ./my-agent
 Arguments and options:
 
 - `<name>` — Fleet-unique instance name matching `^[a-z0-9][a-z0-9_-]*$`.
-- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`). Mutually exclusive with `--manifest`.
+- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`, `acp`). Mutually exclusive with `--manifest`.
 - `--manifest <path>` — a manifest adapter loaded from a directory (or an `adapter.toml` file). Mutually exclusive with `--kind`.
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
@@ -29,6 +29,10 @@ Exactly one of `--kind` or `--manifest` is required. Registration validates the 
 The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
 
 **Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home.** A fleet of multiple unbacked hermes instances therefore all resolve the **same** unmanaged default home (documented fallback, not an error); attach Memory Backing (`hekma agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
+
+The `acp` kind runs any agent that speaks the Agent Client Protocol (ACP) v1 — Hermes Agent among them, natively, via its `hermes-acp` entry point. The launch is per-instance configuration: set `acp.command` (required, the executable) and `acp.args` (optional) with `hekma agent config set`, then `start`/`send`/`stop` like any other instance; a `start` without `acp.command` is refused naming both keys.
+
+> **Deprecation notice — the `hermes` kind.** The `hermes` builtin kind is **deprecated in favor of `--kind acp`**: Hermes Agent speaks the Agent Client Protocol natively (its `hermes-acp` entry point), and the generic `acp` kind runs it under the same supervision without a bespoke adapter. **New registrations should use `--kind acp`** (point `acp.command` at the `hermes-acp` executable). The `hermes` kind keeps working unchanged — this is an announcement, not a removal — and it will not be removed before a future **major** release, per the CLI-surface deprecation policy (announced ahead via these docs and the release notes; removal only at the stated major). Both migration parity items are shipped and tested with the `acp` kind: **metering** continues through the self-reported usage sentinel (under `acp` the sentinel channel is the agent's stderr, because its stdout is the ACP protocol stream), and **memory delivery** continues through `HERMES_HOME` — a `filesystem` Memory Backing attached to an `acp` instance is delivered into the agent's process environment exactly as under `hermes`.
 
 ## `hekma agent list [--json]`
 
@@ -223,7 +227,7 @@ hekma agent remove my-agent --force
 Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
 
 - **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
-- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hekma guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hekma guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` or `acp` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
 
 ```bash
 hekma agent memory attach demo --kind filesystem
@@ -241,7 +245,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 
 ### `memory attach --json`
 
-`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the injected path will actually reach the agent. `declared` reads `true` when the attached backing is `filesystem` AND the adapter's declared config mapping targets the reserved `memory.dir` key (the builtin `hermes` does — its mapping delivers `memory.dir` as `HERMES_HOME` — so a hermes instance with a filesystem backing reads `"declared": true`). It reads `false` when the mapping targets nothing, and also when the attached backing is `native` — for a `native` backing the `false` means "no delivery is offered", not "the adapter declined": nothing is delivered at start, so there is no delivery to declare.
+`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the injected path will actually reach the agent. `declared` reads `true` when the attached backing is `filesystem` AND the adapter's declared config mapping targets the reserved `memory.dir` key (the builtin `hermes` does — its mapping delivers `memory.dir` as `HERMES_HOME` — and so does the `acp` builtin since epic 14, so a hermes or acp instance with a filesystem backing reads `"declared": true`). It reads `false` when the mapping targets nothing, and also when the attached backing is `native` — for a `native` backing the `false` means "no delivery is offered", not "the adapter declined": nothing is delivered at start, so there is no delivery to declare.
 
 ```json
 {
@@ -254,7 +258,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 }
 ```
 
-A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
+A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` or `acp` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
 
 For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Hekma says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 

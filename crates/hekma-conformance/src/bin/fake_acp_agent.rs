@@ -54,7 +54,12 @@
 //!   the chunks. An acp instance's stdout is the protocol stream, so its
 //!   self-reported sentinel channel is stderr — the engine's stderr
 //!   sentinel drain must land each line in the billing ledger
-//!   (input/output tokens).
+//!   (input/output tokens). The line carries the OPTIONAL `cached_tokens`
+//!   field too (story 14-6's shape; a subset of the input count under the
+//!   INPUT-INCLUSIVE invariant) — the HERMES-SHAPED sentinel a cooperative
+//!   `hermes-acp` would emit, so story 14-5's parity proof covers the full
+//!   billing vocabulary the `hermes` kind's stdout sentinel has carried
+//!   since 14-6.
 //! * `observed-call` — for each `session/prompt`, make ONE real
 //!   OpenAI-compatible POST to `$OPENAI_BASE_URL/chat/completions` (the
 //!   env the engine injects when the instance opts into the observed
@@ -168,10 +173,15 @@ fn usage_update() -> serde_json::Value {
 /// One `KTESIO_USAGE {json}` line to STDERR (story 14-3, T3): the acp kind's
 /// self-reported sentinel channel. Pure `std`, `sequence` stamped by the
 /// caller (per-turn monotonic), token counts FIXED so the ledger total is an
-/// exact-match assertion (K turns × 40 in / 20 out).
+/// exact-match assertion (K turns × 40 in / 20 out). Story 14-5 (parity):
+/// the line carries the optional `cached_tokens` subset (25 of the 40 input
+/// — the INPUT-INCLUSIVE invariant) so the stderr sentinel proof covers the
+/// FULL billing vocabulary (in/out/cached) the `hermes` kind's stdout
+/// sentinel has carried since story 14-6; an acp cooperative agent's line
+/// must meter identically.
 #[cfg(not(tarpaulin_include))]
 fn emit_stderr_sentinel(sequence: u64) {
-    eprintln!("KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":40,\"output_tokens\":20}}");
+    eprintln!("KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":40,\"output_tokens\":20,\"cached_tokens\":25}}");
 }
 
 /// ONE OpenAI-compatible POST to the injected base URL (story 14-3, T2): the
@@ -256,6 +266,16 @@ fn main() {
         }
     }
     eprintln!("fake_acp_agent: mode={mode} pid={}", std::process::id());
+    // Story 14-5 (HERMES_HOME-under-acp delivery proof): echo the memory-home
+    // env the engine injected, so the spawning test can prove the managed
+    // Memory Backing dir reached THIS process. A separate line (the `pid=`
+    // startup line above must stay pid-terminated — the tests parse it), and
+    // printed ONLY when set: an unbacked acp instance receives no
+    // HERMES_HOME at all (the documented fallback), so its stderr stays
+    // free of the fact.
+    if let Ok(home) = std::env::var("HERMES_HOME") {
+        eprintln!("fake_acp_agent: HERMES_HOME={home}");
+    }
 
     // A READER THREAD feeds parsed inbound messages to the main loop, so a
     // `session/cancel` is observed WHILE a turn's delay is running (a

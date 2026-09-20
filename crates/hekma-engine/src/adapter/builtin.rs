@@ -51,6 +51,20 @@ pub const HERMES_EXEC: &str = hekma_adapters_hermes::HERMES_EXEC;
 pub const HERMES_ARGS: [&str; 3] = hekma_adapters_hermes::HERMES_ARGS;
 
 /// The builtin `acp`'s code-declared env target for the reserved
+/// [`MEMORY_DIR_KEY`] leaf (story 14-5, the hermes-kind retirement path):
+/// when a `filesystem` Memory Backing is attached to an `acp` instance, the
+/// engine injects the managed memory dir at that key as an invocation
+/// override, and this mapping delivers it into the child's environment as
+/// `HERMES_HOME` — the SAME var the `hermes` builtin maps (the retirement
+/// parity item: a `hermes-acp` agent under the `acp` kind must receive its
+/// memory home exactly as it did under the legacy kind). When NO backing is
+/// attached the key is never injected, so the mapping is a no-op (the
+/// mapping application iterates only keys PRESENT in the effective config;
+/// the agent then falls back to its own default home chain — the documented
+/// fallback, identical to the hermes kind's).
+pub const ACP_MEMORY_HOME_ENV_VAR: &str = hekma_adapters_hermes::HERMES_HOME;
+
+/// The builtin `acp`'s code-declared env target for the reserved
 /// [`METERING_BASE_URL_KEY`] leaf (story 14-3, T2): when the operator opts an
 /// `acp` instance into the engine-observed channel (set
 /// `metering.upstream_base_url`), the engine starts its loopback forward
@@ -203,8 +217,13 @@ impl AgentAdapter for BuiltinMock {
 /// * **No `contract_version` negotiation:** a builtin does not negotiate
 ///   (epic-6 B3 precedent) — the acp kind never engages the adapter contract
 ///   v1 (D5).
-/// * **Config mapping:** empty (no unified key maps into a native target;
-///   `agent.*` pass-through still applies through the generic start seam).
+/// * **Config mapping:** exactly TWO reserved leaves (both engine-injected
+///   only, never operator-set, so each is a no-op unless its machinery ran):
+///   `metering.base_url` → `OPENAI_BASE_URL` (story 14-3's observed opt-in)
+///   and `memory.dir` → `HERMES_HOME` (story 14-5's retirement parity — a
+///   filesystem Memory Backing delivers the managed dir to a `hermes-acp`
+///   agent under this kind exactly as the `hermes` kind does).
+///   `agent.*` pass-through still applies through the generic start seam.
 #[derive(Clone, Debug)]
 struct BuiltinAcp {
     capabilities: CapabilityDeclaration,
@@ -248,17 +267,24 @@ impl AgentAdapter for BuiltinAcp {
         MeteringSource::SelfReported
     }
 
-    /// Story 14-3 (T2): the reserved `metering.base_url` leaf maps into the
-    /// child's `OPENAI_BASE_URL` env — the delivery mechanism for the
-    /// engine-observed loopback listener's address when the operator opts in
-    /// via `metering.upstream_base_url`. A no-op otherwise (the key is only
-    /// ever engine-injected, never operator-set — the reserved-key contract
-    /// the manifest adapters' `[config."metering.base_url"]` mappings follow).
+    /// Story 14-3 (T2) + story 14-5 (the hermes retirement parity): the TWO
+    /// reserved leaves — `metering.base_url` → the child's `OPENAI_BASE_URL`
+    /// env (the engine-observed opt-in's delivery mechanism; a no-op unless
+    /// the engine injects it) and `memory.dir` → the child's `HERMES_HOME`
+    /// env (the filesystem Memory Backing's delivery, the SAME var the
+    /// `hermes` builtin maps, so a `hermes-acp` agent under this kind gets
+    /// its memory home exactly as under the legacy kind; a no-op unless a
+    /// backing is attached).
     fn config_mapping(&self) -> ConfigMapping {
-        ConfigMapping::new().with(
-            crate::domain::METERING_BASE_URL_KEY,
-            ConfigTarget::env(ACP_BASE_URL_ENV_VAR),
-        )
+        ConfigMapping::new()
+            .with(
+                crate::domain::METERING_BASE_URL_KEY,
+                ConfigTarget::env(ACP_BASE_URL_ENV_VAR),
+            )
+            .with(
+                crate::domain::MEMORY_DIR_KEY,
+                ConfigTarget::env(ACP_MEMORY_HOME_ENV_VAR),
+            )
     }
 }
 
@@ -313,18 +339,34 @@ mod tests {
         // so the builtin table's launch stays None — a registration snapshot
         // with no launch, exactly like mock.
         assert!(native_launch(crate::acp::ACP_KIND).is_none());
-        // Exactly ONE unified-key mapping (story 14-3, T2): the reserved
-        // `metering.base_url` leaf → the child's `OPENAI_BASE_URL` env — the
+        // Exactly TWO unified-key mappings: the reserved `metering.base_url`
+        // leaf → the child's `OPENAI_BASE_URL` env (story 14-3, T2 — the
         // engine-observed opt-in's delivery mechanism, a no-op unless the
-        // engine injects the key (the operator never sets it).
+        // engine injects it), and — story 14-5, the hermes retirement parity —
+        // the reserved `memory.dir` leaf → `HERMES_HOME`, the SAME var the
+        // `hermes` builtin maps, so a filesystem Memory Backing delivers to a
+        // `hermes-acp` agent under this kind exactly as under the legacy kind
+        // (a no-op unless a backing is attached).
         let mapping = native_config_mapping(crate::acp::ACP_KIND).unwrap();
-        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping.len(), 2);
         assert_eq!(
             mapping
                 .target(crate::domain::METERING_BASE_URL_KEY)
                 .unwrap()
                 .env_var(),
             Some(ACP_BASE_URL_ENV_VAR)
+        );
+        assert_eq!(
+            mapping
+                .target(crate::domain::MEMORY_DIR_KEY)
+                .unwrap()
+                .env_var(),
+            Some(ACP_MEMORY_HOME_ENV_VAR)
+        );
+        assert_eq!(
+            ACP_MEMORY_HOME_ENV_VAR,
+            hekma_adapters_hermes::HERMES_HOME,
+            "the acp kind's memory home var must BE the hermes kind's (retirement parity)"
         );
     }
 

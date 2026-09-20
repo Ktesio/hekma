@@ -35,12 +35,16 @@
 //! reads, the returned instance state, or the diagnostic sink's captured
 //! bytes — inside a bounded budget; never a wall-clock sleep-then-assert.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hekma_engine::{DiagnosticSink, Engine, EngineError, LifecycleState};
+use hekma_engine::{
+    ConfigLayer, DiagnosticSink, Engine, EngineError, LifecycleState, MemoryBackingKind,
+    SourceLayer,
+};
 use tempfile::TempDir;
 
 /// The bounded budget for every committed-state / sink-content poll in this
@@ -623,11 +627,15 @@ fn bare_acp_instance_surfaces_the_honest_gap_notice() {
     let _ = blocking.stop(name, None).expect("stop");
 }
 
-/// T3: a cooperative agent emits `KTESIO_USAGE {json}` on STDERR (an acp
-/// instance's stdout is the protocol stream) — the stderr sentinel drain
-/// lands each line in the billing ledger, the metering_source stamps
-/// `self-reported`, and once billing-grade usage EXISTS the gap notice is
-/// gone (the `—` was only ever the surfaced last resort).
+/// T3 (story 14-3) + the 14-5 HERMES-SHAPED METERING PARITY proof: a
+/// cooperative `hermes-acp`-shaped agent under the `acp` kind emits
+/// `KTESIO_USAGE {json}` lines on STDERR (an acp instance's stdout is the
+/// protocol stream) carrying the FULL billing vocabulary the `hermes` kind's
+/// stdout sentinel carries since 14-6 — input/output AND the optional
+/// `cached_tokens` subset. The stderr sentinel drain lands each line in the
+/// billing ledger (all three counts, exactly once), the metering_source
+/// stamps `self-reported`, and once billing-grade usage EXISTS the gap
+/// notice is gone (the `—` was only ever the surfaced last resort).
 #[test]
 fn sentinel_lines_on_stderr_reach_the_ledger() {
     let base = TempDir::new().unwrap();
@@ -641,8 +649,8 @@ fn sentinel_lines_on_stderr_reach_the_ledger() {
 
     let blocking = engine.blocking();
     blocking.send_input(name, "turn one").expect("send");
-    // The sentinel line (40 in / 20 out) lands in the ledger through the
-    // stderr drain (the reaper cadence), stamped self-reported.
+    // The sentinel line (40 in incl. 25 cached / 20 out) lands in the ledger
+    // through the stderr drain (the reaper cadence), stamped self-reported.
     poll_until("the stderr sentinel usage landed in the ledger", || {
         blocking
             .fleet_entry(name)
@@ -651,6 +659,14 @@ fn sentinel_lines_on_stderr_reach_the_ledger() {
     });
     let entry = blocking.fleet_entry(name).expect("fleet entry");
     assert_eq!(entry.usage.cumulative_output_tokens, 20);
+    // 14-5 parity: the cached SUBSET rides the same stderr line into the
+    // ledger's cached column (the hermes-shaped billing vocabulary) — the
+    // INPUT-INCLUSIVE invariant (25 <= 40) held at parse.
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(25),
+        "the cached subset must land with the stderr sentinel line"
+    );
     assert_eq!(entry.metering_source, "self-reported");
     // Billing-grade usage exists → NO gap notice, and no honest-`—` state.
     assert!(
@@ -674,8 +690,209 @@ fn sentinel_lines_on_stderr_reach_the_ledger() {
             })
             .unwrap_or(false)
     });
+    let entry = blocking.fleet_entry(name).expect("fleet entry");
+    assert_eq!(
+        entry.usage.cumulative_cached_tokens,
+        Some(50),
+        "the cached subset accumulates exactly once per line"
+    );
 
     let _ = blocking.stop(name, None).expect("stop");
+}
+
+// ---------------------------------------------------------------------------
+// Story 14-5 — the `hermes` retirement path: HERMES_HOME delivery under the
+// acp kind, and the real-agent smoke. The `hermes` kind itself is NOT touched
+// (the deprecation is an announcement, not a removal): these tests prove the
+// acp kind carries the two parity items an operator migrating a `hermes`
+// instance to `--kind acp` depends on — the memory-home delivery (this
+// section) and the metering sentinel (the test above).
+// ---------------------------------------------------------------------------
+
+/// Story 14-5 (HERMES_HOME under acp, the composition half — the exact mirror
+/// of `tests/hermes.rs`'s
+/// `hermes_memory_composition_maps_the_managed_dir_onto_hermes_home_exactly_as_start_would`):
+/// attach a filesystem Memory Backing to an `acp` instance, fold the
+/// invocation override into the effective config, resolve the acp builtin's
+/// declared mapping, and apply it onto the launch the acp branch resolves
+/// from the config keys — `HERMES_HOME` must carry the managed dir (the SAME
+/// var the `hermes` kind maps), the DC-10 `declared` fact must read true for
+/// the acp kind, and nothing else may be injected (no observed key without
+/// the opt-in).
+#[test]
+fn acp_memory_backing_delivers_hermes_home_exactly_as_start_would() {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "acp-memory";
+    register_acp(&engine, base.path(), name);
+
+    let blocking = engine.blocking();
+    let dir = blocking
+        .attach_memory(name, MemoryBackingKind::Filesystem)
+        .expect("attach filesystem backing");
+    let status = blocking.memory_status(name).unwrap().expect("attached");
+    assert!(
+        status.declared,
+        "the acp builtin declares memory.dir delivery (HERMES_HOME) since 14-5"
+    );
+
+    // The engine's start seam injects the managed dir at the reserved
+    // `memory.dir` key as an INVOCATION override (the strongest layer) —
+    // fold it exactly as the start would.
+    let overrides = ConfigLayer::parse(
+        SourceLayer::InvocationOverride,
+        "<memory-dir invocation override>",
+        &format!("[memory]\ndir = '{}'\n", dir.display()),
+    )
+    .expect("override layer parses (memory.dir is a KNOWN key)");
+    let effective = blocking.effective_config(name, overrides).unwrap();
+    let mapping = hekma_engine::adapter::resolve_config_mapping("acp", None).unwrap();
+    assert_eq!(
+        mapping
+            .target(hekma_engine::domain::MEMORY_DIR_KEY)
+            .and_then(|t| t.env_var()),
+        Some("HERMES_HOME"),
+        "the acp mapping must carry memory.dir to HERMES_HOME (retirement parity)"
+    );
+
+    // Compose the launch the acp branch resolves (from the config keys — the
+    // launch shape `resolve_acp_launch` yields) and apply the mapping onto it
+    // exactly as the start seam does.
+    let mut launch = hekma_engine::adapter::StartLaunch {
+        exec: "/usr/bin/some-acp-agent".to_string(),
+        args: vec!["--mode".to_string(), "chunky".to_string()],
+        env: BTreeMap::new(),
+    };
+    hekma_engine::adapter::apply_config_mapping(
+        &mut launch,
+        &mapping,
+        &effective,
+        &BTreeMap::new(),
+        Path::new(&blocking.instance_status(name).unwrap().instance.agent_home),
+    )
+    .unwrap_or_else(|e| panic!("apply failed: {e}"));
+    assert_eq!(
+        launch.env.get("HERMES_HOME"),
+        Some(&dir.to_string_lossy().into_owned()),
+        "HERMES_HOME must receive the managed Memory Backing dir under the acp kind"
+    );
+    assert_eq!(
+        launch.env.len(),
+        1,
+        "nothing else is injected (metering.base_url is absent without the observed opt-in)"
+    );
+}
+
+/// Story 14-5 (HERMES_HOME under acp, the END-TO-END half): attach a
+/// filesystem backing, configure the launch, START — the spawned agent's
+/// PROCESS environment carries the managed dir as `HERMES_HOME`, proven by
+/// the fake agent's stderr echo (the acp-kind twin of the hermes shim's
+/// `env=HERMES_HOME=…` dump line). An UNBACKED acp instance receives NO
+/// `HERMES_HOME` at all (the documented default-chain fallback, byte-identical
+/// to the hermes kind's rule).
+#[test]
+fn backed_acp_instance_delivers_hermes_home_to_the_agent_process() {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "acp-home";
+    register_acp(&engine, base.path(), name);
+
+    let blocking = engine.blocking();
+    let dir = blocking
+        .attach_memory(name, MemoryBackingKind::Filesystem)
+        .expect("attach filesystem backing");
+    configure_and_start(&engine, name, "chunky", &[]);
+    let started = blocking.start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let needle = format!("fake_acp_agent: HERMES_HOME={}", dir.display());
+    poll_until("the agent echoed its injected HERMES_HOME", || {
+        std::fs::read_to_string(agent_stderr_path(base.path(), name))
+            .unwrap_or_default()
+            .contains(&needle)
+    });
+
+    let _ = blocking.stop(name, None).expect("stop");
+}
+
+// ---------------------------------------------------------------------------
+// The real-agent smoke (skipped honestly when no binary is present)
+// ---------------------------------------------------------------------------
+
+/// Whether a command is PRESENT on this machine: spawn it with `--version`
+/// (stdin/stdout/stderr null) and classify the outcome. A successful spawn
+/// (any exit code, or still running past the bound) means the binary exists;
+/// a spawn failure (the OS's command-not-found) means it does not. The probe
+/// is bounded — a hung `--version` is killed and still counts as present.
+fn probe_binary_present(bin: &str) -> bool {
+    let Ok(mut child) = Command::new(bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            // Ran and exited (any code): the binary exists.
+            Ok(Some(_)) => return true,
+            // Still running past the bound: it exists (a slow --version).
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return true;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Story 14-5, the REAL-AGENT smoke: a real `hermes-acp` binary (Hermes
+/// Agent's native ACP entry point) driven under the `acp` kind — register
+/// with a launch command → start (the ACP handshake) → send (one prompt
+/// turn accepted) → stop (clean termination). SKIPPED HONESTLY when no
+/// `hermes-acp` is on this machine's PATH (this repo's isolation strategy:
+/// no network, no vendored agent binaries) — the standard skip-unless-present
+/// posture the epic-14 spec pins for the real-agent smoke; story 14-4 runs
+/// the matrix on machines where the agents exist. Only the acp KIND is
+/// exercised: the legacy `hermes` kind's behavior is untouched by this
+/// story (the deprecation is an announcement, not a removal).
+#[test]
+fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
+    // `hermes-acp` is Hermes' ACP entry point; plain `hermes` is the gateway
+    // CLI and does NOT speak ACP on stdio by default, so it is not a valid
+    // acp-kind launch and is deliberately not probed as a fallback.
+    if !probe_binary_present("hermes-acp") {
+        return; // the honest skip: no real agent on this machine.
+    }
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "hermes-acp-smoke";
+    register_acp(&engine, base.path(), name);
+    engine
+        .blocking()
+        .set_config(name, "acp.command", "hermes-acp")
+        .expect("set the real agent's launch command");
+
+    let started = engine
+        .blocking()
+        .start(name)
+        .expect("real hermes-acp start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // One prompt accepted (the send is constant-time; the turn streams
+    // asynchronously and is not waited out — a real agent's latency is
+    // unbounded). The stop then cancels any in-flight turn and terminates.
+    engine
+        .blocking()
+        .send_input(name, "smoke prompt")
+        .expect("send to the real agent");
+    let stopped = engine.blocking().stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
 }
 
 // ---------------------------------------------------------------------------

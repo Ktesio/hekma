@@ -5,7 +5,7 @@ description: The agents Hekma's adapters target, the exact versions each adapter
 
 # Supported Agents
 
-Hekma runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
+Hekma runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, the built-in `acp` kind (epic 14, in review) runs any Agent Client Protocol v1 agent — Hermes among them, via its native `hermes-acp` entry point — and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
 
 > **Isolation honesty.** Agent Home organizes and isolates an agent's files.
 > It is not a security sandbox: supervised agents run as normal processes with
@@ -18,6 +18,8 @@ Hekma runs agents as adapter-backed processes: the built-in `hermes` native adap
 | opencode (anomalyco) | manifest adapter shape (no builtin) | **Paper-validated** — primary-source characterization + conformance mapping; never launched by this repo | `v1.18.27` @ `4b7e19e315cca414121ba1d61523fef74bb3ae8b` (2026-09-02 release) | the story 6-5 characterization + conformance-mapping notes that fed the contract-v1 freeze |
 
 ## Hermes (`--kind hermes`)
+
+> **Deprecation notice.** The `hermes` kind is **deprecated in favor of `--kind acp`** — Hermes Agent speaks the Agent Client Protocol natively via its `hermes-acp` entry point, and new registrations should use `--kind acp` (set the `acp.command`/`acp.args` config keys to that executable). The `hermes` kind keeps working unchanged; removal can happen only at a future **major** release, per the CLI-surface deprecation policy (see [the command reference](commands.md#hekma-agent-register-name---kind-kind---manifest-path)). The migration parity is shipped and tested: metering continues via the self-reported usage sentinel (under `acp` it rides the agent's stderr, since its stdout is the ACP protocol stream), and a `filesystem` Memory Backing still delivers the managed dir as `HERMES_HOME` under the `acp` kind.
 
 The `hermes` builtin is compiled into the engine and declares a FIXED launch — `hermes gateway run --external-supervisor` — so Hekma supervises a foreground gateway process instead of the agent's own service manager. What the adapter declares:
 

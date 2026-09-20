@@ -2037,7 +2037,9 @@ fn render_effective_config(
 /// THIS mode performs the extra `memory_status` read-back that fills
 /// `declared` (the DC-10 delivery fact: whether the injected path will actually
 /// reach the agent — `true` only for a `filesystem` backing whose adapter maps
-/// `memory.dir` (the `hermes` builtin does, via `HERMES_HOME`); `false` for a
+/// `memory.dir` (the `hermes` builtin does, via `HERMES_HOME`, and so does the
+/// `acp` builtin since epic 14's story 14-5 — the hermes-kind retirement
+/// parity); `false` for a
 /// mapping-less adapter and also for a `native` backing, where it means "no
 /// delivery is offered", not "the adapter declined")
 /// and `guarantee`; the human path stays byte-identical to its pre-freeze
