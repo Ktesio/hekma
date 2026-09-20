@@ -240,6 +240,18 @@ pub fn session_new_params(cwd: &std::path::Path) -> Value {
     })
 }
 
+/// Build the `session/load` request params (story 14-2, D4): the persisted
+/// session id plus the same cwd/mcpServers shape `session/new` carries (the
+/// ACP v1 load shape). Sent by the handshake ONLY when the agent advertised
+/// `loadSession` and a session id is persisted from a previous Run.
+pub fn session_load_params(session_id: &str, cwd: &std::path::Path) -> Value {
+    json!({
+        "sessionId": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": [],
+    })
+}
+
 /// Build the `session/prompt` request params: the session id + ONE text
 /// ContentBlock (spine AD-19: `send` = one `session/prompt`). `text` rides
 /// INSIDE the params — never in any diagnostic (no-leak discipline).

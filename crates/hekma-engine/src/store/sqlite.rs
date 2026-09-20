@@ -32,7 +32,9 @@
 //! (AC-A). A DB ahead of this build is refused (forward-compat guard). Story
 //! 14-6 adds v7: the Usage Ledger's additive `cached_tokens` +
 //! `cached_micros_per_1m` columns (both NULLABLE — a pre-v7 row's cached count
-//! is UNKNOWN, never a fabricated zero).
+//! is UNKNOWN, never a fabricated zero). Story 14-2 adds v8: the spawn
+//! record's NULLABLE `acp_session_id` (the last established ACP session id —
+//! NULL = never established, or a pre-v8 record).
 
 use std::path::Path;
 
@@ -65,8 +67,14 @@ use crate::ports::{
 /// `cached_micros_per_1m` (the cached-token Rate in force at commit, the v4
 /// no-retro-repricing pattern extended to the new price; NULL = unset → cached
 /// tokens price at that row's stored input rate). The dedup UNIQUE key
-/// `(instance_id, run_id, sequence)` is UNCHANGED.
-const SCHEMA_VERSION: i64 = 7;
+/// `(instance_id, run_id, sequence)` is UNCHANGED. v8 (story 14-2, D4): the
+/// spawn record's NULLABLE `acp_session_id` — the last ACP session id the
+/// engine established for the instance, persisted so the NEXT start can offer
+/// it back via `session/load` (the resumed session; the ACP transport itself
+/// is a pipe pair that dies with the engine that held it, so the resume rides
+/// the next handshake, not the adopted process). NULL = a pre-v8 record, or no
+/// session established yet. Not part of any key; no column renamed/removed.
+const SCHEMA_VERSION: i64 = 8;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -217,6 +225,28 @@ ALTER TABLE agent_runtime ADD COLUMN detached INTEGER NOT NULL DEFAULT 0;
 const SCHEMA_V7: &str = "\
 ALTER TABLE usage_events ADD COLUMN cached_tokens INTEGER;
 ALTER TABLE usage_events ADD COLUMN cached_micros_per_1m INTEGER;
+";
+
+/// Schema v8 DDL (story 14-2, D4): the spawn record's ACP session id.
+///
+/// ADDITIVE over the frozen `agent_runtime` columns, following the v6
+/// (single-column ALTER on the same table) and v7 (NULLABLE honesty) patterns
+/// exactly: ONE NULLABLE TEXT column.
+///
+/// * `acp_session_id TEXT` (NULLABLE) — the last ACP session id this engine
+///   established for the instance, written by the start path at the point the
+///   handshake establishes it (post-`session/new` / post-`session/load`).
+///   NULL = a pre-v8 record, or no session was established. The id is the
+///   durable input for the NEXT start's `session/load` resume offer (spine
+///   AD-19: the ACP transport is a pipe pair that dies with the engine that
+///   held it, so the session resume rides the next handshake — the adopted
+///   PROCESS itself is not re-piped). NOT part of any UNIQUE key; the
+///   `settle_spawn_record` retention re-seed (story 14-2) carries it onto the
+///   pid-0 seed row across a stop/crash settle so a later start can still
+///   offer it. No column is renamed/removed, so v1..v7 → v8 preserves every
+///   row (old rows read as NULL = no session on record).
+const SCHEMA_V8: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN acp_session_id TEXT;
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -431,6 +461,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 7 {
         migrate_step(conn, 7, SCHEMA_V7)?;
+    }
+    if version < 8 {
+        migrate_step(conn, 8, SCHEMA_V8)?;
     }
 
     Ok(())
@@ -931,18 +964,23 @@ impl StateStore for SqliteStore {
             })?;
         // Insert-or-replace on the UNIQUE instance_id, in one statement (AD-6:
         // one transaction per event — a single INSERT ... ON CONFLICT is atomic).
+        // `acp_session_id` rides the record (story 14-2): the start path commits
+        // the record BEFORE the handshake with None (clearing any retained id —
+        // this Run's session is being (re)established) and then UPDATEs the
+        // established id post-handshake via `set_acp_session_id`.
         self.conn
             .execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
-                  detached) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                  detached, acp_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
                  restart_count = excluded.restart_count, \
                  last_known_cause = excluded.last_known_cause, \
-                 detached = excluded.detached",
+                 detached = excluded.detached, \
+                 acp_session_id = excluded.acp_session_id",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -951,10 +989,87 @@ impl StateStore for SqliteStore {
                     record.restart_count as i64,
                     record.last_known_cause,
                     record.detach as i64,
+                    record.acp_session_id,
                 ],
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn set_acp_session_id(
+        &self,
+        name: &InstanceName,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // The record must exist (the start path calls this right after the
+        // handshake, with the write-ahead record committed at spawn time; the
+        // settle-retention seed row is also a live row). A missing record is
+        // NotFound — the caller surfaces it (surfaced-not-silent); a silent
+        // no-op here would drop the resume id without a trace (AI-18).
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE agent_runtime SET acp_session_id = ?1 WHERE instance_id = ?2",
+                rusqlite::params![session_id, id],
+            )
+            .map_err(backend)?;
+        if rows == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, StoreError> {
+        // The story-14-2 settle: clear the live record (a clean stop, a crash
+        // reconcile, a terminal settle — the supervision facts die with the
+        // process) while RETAINING an established acp session id for the next
+        // start's resume offer. Returns whether an id was retained.
+        //
+        // For a record with NO acp session id (every non-acp kind, and an acp
+        // instance that never completed a handshake) this is byte-identical to
+        // `clear_spawn_record`: the row is deleted, nothing re-seeded. For a
+        // record WITH an id, a policy-only seed row (pid 0 — the exact shape
+        // `set_restart_policy` seeds and `adopt_orphans` already skips) is
+        // re-persisted carrying {policy, count, acp_session_id}, so the next
+        // start reads the id and offers it via `session/load`. Read + delete +
+        // (at most) one single-row INSERT — bounded metadata work (AD-17).
+        let Some(record) = self.get_spawn_record(name)? else {
+            return Ok(false);
+        };
+        // The record exists, so the instance row does too (the FK guarantees it).
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        self.conn
+            .execute("DELETE FROM agent_runtime WHERE instance_id = ?1", [id])
+            .map_err(backend)?;
+        if let Some(session_id) = record.acp_session_id.as_deref() {
+            self.conn
+                .execute(
+                    "INSERT INTO agent_runtime \
+                     (instance_id, pid, start_time, restart_policy, restart_count, \
+                      last_known_cause, acp_session_id) \
+                     VALUES (?1, 0, 0, ?2, ?3, NULL, ?4)",
+                    rusqlite::params![
+                        id,
+                        record.restart_policy.as_str(),
+                        record.restart_count as i64,
+                        session_id,
+                    ],
+                )
+                .map_err(backend)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), StoreError> {
@@ -976,7 +1091,7 @@ impl StateStore for SqliteStore {
         self.conn
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
-                 detached \
+                 detached, acp_session_id \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -992,7 +1107,7 @@ impl StateStore for SqliteStore {
             .conn
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
-                 r.last_known_cause, r.detached \
+                 r.last_known_cause, r.detached, r.acp_session_id \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1121,8 +1236,9 @@ impl StateStore for SqliteStore {
 }
 
 /// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
-/// restart_policy, restart_count, last_known_cause, detached` columns), decoding
-/// the policy wire form and clamping the integer columns into domain types.
+/// restart_policy, restart_count, last_known_cause, detached, acp_session_id`
+/// columns), decoding the policy wire form and clamping the integer columns
+/// into domain types.
 fn row_to_spawn_record(
     name: InstanceName,
     row: &rusqlite::Row<'_>,
@@ -1133,6 +1249,7 @@ fn row_to_spawn_record(
     let restart_count: i64 = row.get("restart_count").map_err(backend)?;
     let last_known_cause: Option<String> = row.get("last_known_cause").map_err(backend)?;
     let detached: i64 = row.get("detached").map_err(backend)?;
+    let acp_session_id: Option<String> = row.get("acp_session_id").map_err(backend)?;
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1145,6 +1262,7 @@ fn row_to_spawn_record(
         restart_count: restart_count.max(0) as u32,
         last_known_cause,
         detach: detached != 0,
+        acp_session_id,
     })
 }
 
@@ -1495,6 +1613,7 @@ mod tests {
             restart_count: count,
             last_known_cause: None,
             detach: false,
+            acp_session_id: None,
         }
     }
 
@@ -1538,6 +1657,153 @@ mod tests {
         let listed = store.list_spawn_records().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].detach, "the list path keeps the detached flag");
+    }
+
+    // ---- Story 14-2 (D4): the spawn record's acp_session_id (schema v8) ----
+
+    #[test]
+    fn acp_session_id_round_trips_and_clears_with_the_record() {
+        // The v8 column rides the record both ways: Some on write, Some on
+        // read (get AND list — the reconcile input), None when absent, and a
+        // plain clear removes it with the row.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("acp-1", "acp", "/x/agents/acp-1"))
+            .unwrap();
+        let mut rec = record("acp-1", 21, 220, 0);
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("acp-1")).unwrap().unwrap();
+        assert_eq!(
+            back.acp_session_id.as_deref(),
+            Some("fake-session-1"),
+            "the session id must ride the record"
+        );
+        let listed = store.list_spawn_records().unwrap();
+        assert_eq!(listed[0].acp_session_id.as_deref(), Some("fake-session-1"));
+
+        // set_acp_session_id is the single UPDATE writer: set, clear, and
+        // None-reads honestly.
+        store
+            .set_acp_session_id(&name("acp-1"), Some("fake-session-2"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-2")
+        );
+        store.set_acp_session_id(&name("acp-1"), None).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
+            None
+        );
+        // And the fresh-start upsert (acp_session_id: None) overwrites any
+        // retained id — the Run's handshake re-establishes it.
+        rec.acp_session_id = Some("stale".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        let mut fresh = record("acp-1", 22, 230, 0);
+        fresh.acp_session_id = None;
+        store.upsert_spawn_record(&fresh).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
+            None,
+            "the fresh-spawn upsert clears a stale id"
+        );
+
+        // A record with NO id clears exactly as before (byte-identical to the
+        // pre-v8 clear: no seed row left behind).
+        store.clear_spawn_record(&name("acp-1")).unwrap();
+        assert!(store.get_spawn_record(&name("acp-1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_acp_session_id_for_a_missing_record_is_not_found() {
+        // The start path calls set_acp_session_id right after the handshake
+        // with the record committed; a missing row is an error the caller
+        // SURFACES (a silently dropped resume id would be a lie — AI-18).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("ghost", "acp", "/x/agents/ghost"))
+            .unwrap();
+        let err = store
+            .set_acp_session_id(&name("ghost"), Some("s-1"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn settle_spawn_record_retains_the_session_id_on_a_pid0_seed() {
+        // THE 14-2 settle: a record WITH a session id settles to a pid-0 seed
+        // row carrying {policy, count, acp_session_id} — the shape adoption
+        // skips (pid 0) and the next start reads the id from. A record
+        // WITHOUT an id settles byte-identically to a plain clear.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("acp-1", "acp", "/x/agents/acp-1"))
+            .unwrap();
+        let mut rec = record("acp-1", 31, 330, 2);
+        rec.last_known_cause = Some("crashed with code 1".to_string());
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+
+        let retained = store.settle_spawn_record(&name("acp-1")).unwrap();
+        assert!(retained, "an id-bearing record reports retention");
+        let back = store
+            .get_spawn_record(&name("acp-1"))
+            .unwrap()
+            .expect("the retention seed row exists");
+        assert_eq!(
+            back.fingerprint.pid, 0,
+            "the seed row is pid-0 (adoption skips it)"
+        );
+        assert_eq!(
+            back.acp_session_id.as_deref(),
+            Some("fake-session-1"),
+            "the id survives the settle"
+        );
+        assert_eq!(back.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(back.restart_count, 2, "the honest count rides the seed");
+        // set_acp_session_id still targets the seed row (the next start's
+        // post-handshake write lands on it after the fresh upsert replaces it).
+        store
+            .set_acp_session_id(&name("acp-1"), Some("next-run"))
+            .unwrap();
+        // Settling again is fine (idempotent in effect) and still retains.
+        assert!(store.settle_spawn_record(&name("acp-1")).unwrap());
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("next-run")
+        );
+
+        // The id-less settle: nothing retained, no row left.
+        store
+            .create_instance(&sample("acp-2", "acp", "/x/agents/acp-2"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("acp-2", 32, 340, 0))
+            .unwrap();
+        let retained = store.settle_spawn_record(&name("acp-2")).unwrap();
+        assert!(!retained);
+        assert!(store.get_spawn_record(&name("acp-2")).unwrap().is_none());
+        // Settling an absent record is a success no-op.
+        assert!(!store.settle_spawn_record(&name("acp-2")).unwrap());
     }
 
     #[test]
@@ -2561,19 +2827,19 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: migrator steps 4 → 5 → 6 → 7 (each additive); user_version ==
-        // 7 and every prior row survives.
+        // Reopen: migrator steps 4 → 5 → 6 → 7 → 8 (each additive); user_version ==
+        // 8 and every prior row survives.
         let store = SqliteStore::open(&db).unwrap();
         // PINNED LITERAL (AI-66 #5): assert the actual version, never the
         // constant the migrator stamps from — comparing to SCHEMA_VERSION would
-        // pass even if the stamp and the constant drifted together. (The v7
-        // step, story 14-6, is the current last step; bump this literal when
+        // pass even if the stamp and the constant drifted together. (The v8
+        // step, story 14-2, is the current last step; bump this literal when
         // the next additive step lands.)
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -2708,15 +2974,16 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: the migrator steps 6 → 7, ADDING the two NULLABLE columns; the
+        // Reopen: the migrator steps 6 → 7 → 8, ADDING the NULLABLE columns; the
         // legacy row's cached columns default to NULL.
         let store = SqliteStore::open(&db).unwrap();
-        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 7.
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8 (the
+        // v8 step, story 14-2, is the current last step).
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -2739,6 +3006,89 @@ mod tests {
             store.cost_totals(&name("legacy")).unwrap(),
             Micros(1050),
             "a pre-v7 row's cost is unchanged by the v7 columns"
+        );
+    }
+
+    #[test]
+    fn migration_v7_db_upgrades_to_v8_and_pre_v8_records_read_null_session_honestly() {
+        // Story 14-2 (D4): the v7 → v8 additive step — ONE NULLABLE
+        // `agent_runtime` column (the v6 single-column-ALTER pattern on the
+        // same table). A DB written at schema v7 upgrades on open; the legacy
+        // spawn record survives and its session id reads as the honest
+        // absence (NULL → None: never established, never a fabricated id),
+        // and a post-migration record round-trips the id. Mirrors the v6→v7
+        // test.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.execute_batch(SCHEMA_V6).unwrap();
+            conn.execute_batch(SCHEMA_V7).unwrap();
+            conn.execute_batch("PRAGMA user_version = 7").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'acp', 'running', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, detached) \
+                 VALUES (?1, 42, 77, 'on-failure', 0, 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: the migrator steps 7 → 8, ADDING the nullable column; the
+        // legacy record survives with an honestly-unknown session state.
+        let store = SqliteStore::open(&db).unwrap();
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8.
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        let record = store
+            .get_spawn_record(&name("legacy"))
+            .unwrap()
+            .expect("the legacy spawn record survives the v8 migration");
+        assert_eq!(record.fingerprint, ProcessFingerprint::new(42, 77));
+        assert!(
+            record.acp_session_id.is_none(),
+            "a pre-v8 record has NO session id on record (NULL), never a fabricated one"
+        );
+        // And a post-migration record carries the id both ways (get + list).
+        let mut rec = record.clone();
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("legacy"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-1")
+        );
+        assert_eq!(
+            store.list_spawn_records().unwrap()[0]
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-1")
         );
     }
 

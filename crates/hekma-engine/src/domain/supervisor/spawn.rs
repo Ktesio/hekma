@@ -95,6 +95,31 @@ impl Supervisor {
         // directions (the transport IS the pipe pair), and its stdout is the
         // protocol stream the connection's reader consumes.
         let is_acp = crate::acp::is_acp_kind(&kind);
+        // Story 14-2 (D4, spine AD-19): the session id PERSISTED by a previous
+        // Run — the resume offer for this start's handshake. Read BEFORE any
+        // side effect (a pure record read; the write-ahead commit at (6)
+        // clears it, and the established id is re-persisted post-handshake).
+        // A read failure is surfaced honestly and start proceeds without a
+        // resume offer (a fresh session) — surfaced-not-silent (AI-18).
+        let resume_session: Option<String> = if is_acp {
+            match registry.spawn_record(&name) {
+                Ok(record) => record.and_then(|r| r.acp_session_id),
+                Err(err) => {
+                    // A distinct local name (not `notice`): the embed-clean
+                    // audit pins the `emit_diagnostic(&notice)` shape to the
+                    // ONE memory-delivery route (DC-10).
+                    let resume_read_notice = format!(
+                        "{}: the previous ACP session id could not be read from the spawn \
+                         record ({err}); a fresh session will open",
+                        name.as_str(),
+                    );
+                    self.emit_diagnostic(&resume_read_notice);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // The Agent Home + effective config are resolved EARLIER than the
         // (2b) block below because the acp launch needs the resolved config.
         // Both are pure reads (no state change), so an early failure still
@@ -546,6 +571,13 @@ impl Supervisor {
             // is the durable-detach promise across N commands, not just the
             // first.
             detach,
+            // Story 14-2: the fresh record commits WITHOUT a session id — the
+            // resume offer was read above (pre-commit), and the id THIS Run
+            // establishes lands right after the handshake via
+            // `set_acp_session_id`. Committing `None` here is what clears any
+            // settle-retained id: a Run whose handshake has not completed has,
+            // honestly, no session yet.
+            acp_session_id: None,
         };
         if let Err(e) = registry.write_spawn_record(&record) {
             // Persisting the record failed: kill the just-spawned process and
@@ -583,11 +615,14 @@ impl Supervisor {
         // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
         // take ownership of the child's pipe halves, start the connection
         // (the reader thread owns the stdout stream and re-records every raw
-        // line into `agent.log`), and drive the BOUNDED `initialize` →
-        // `session/new` handshake (protocol version 1, DEFAULT client
-        // capabilities — advertise-nothing, D3; the Agent Home as cwd;
-        // `mcpServers: []`). The agent's `agentCapabilities.loadSession` is
-        // recorded in memory (14-2 persists it — NO schema change here).
+        // line into `agent.log`), and drive the BOUNDED handshake (protocol
+        // version 1, DEFAULT client capabilities — advertise-nothing, D3; the
+        // Agent Home as cwd; `mcpServers: []`). Story 14-2 (D4): the
+        // handshake is RESUME-AWARE — the session id persisted by a previous
+        // Run (`resume_session`, read pre-commit above) is offered via
+        // `session/load` when the fresh agent advertises `loadSession`, with
+        // a `session/new` fallback + surfaced note otherwise; the id THIS Run
+        // establishes is persisted to the record post-handshake.
         //
         // Order: AFTER the write-ahead record commit (AD-5 — the spawn is a
         // recorded, adoptable process from this point on; a handshake failure
@@ -614,27 +649,57 @@ impl Supervisor {
                 agent_log_path.clone(),
                 capture,
             ) {
-                Ok(connection) => match crate::acp::handshake(&connection, &home) {
-                    Ok(_outcome) => {
-                        // The session id + loadSession flag live on the
-                        // connection (in memory this story; 14-2 persists).
-                        Some(connection)
+                Ok(connection) => {
+                    match crate::acp::handshake(&connection, &home, resume_session.as_deref()) {
+                        Ok(outcome) => {
+                            // Story 14-2 (D4): persist the established session id
+                            // at the point the connection establishes it — the
+                            // durable input for the NEXT start's `session/load`
+                            // resume offer. A persist failure is surfaced (the
+                            // resume would be silently lost otherwise, AI-18) and
+                            // never fatal: the instance is running with a live
+                            // session regardless.
+                            if let Err(err) =
+                                registry.set_acp_session_id(&name, Some(&outcome.session_id))
+                            {
+                                // A distinct local name (not `notice`): the
+                                // embed-clean audit pins the
+                                // `emit_diagnostic(&notice)` shape to the ONE
+                                // memory-delivery route (DC-10).
+                                let persist_notice = format!(
+                                    "{}: the established ACP session id could not be persisted to \
+                                 the spawn record ({err}); the next start will open a fresh \
+                                 session instead of resuming",
+                                    name.as_str(),
+                                );
+                                self.emit_diagnostic(&persist_notice);
+                            }
+                            // The ONE resume-outcome note (AI-18): surfaced when
+                            // the session was resumed or a persisted id could not
+                            // be; silent on a first start's fresh session.
+                            if let Some(note) =
+                                crate::acp::resume_outcome_note(name.as_str(), &outcome)
+                            {
+                                self.emit_diagnostic(&note);
+                            }
+                            Some(connection)
+                        }
+                        Err(handshake_err) => {
+                            // Close + refuse: tear the transport down (closing
+                            // stdin), kill the just-spawned process through the
+                            // backend's bounded stop, and land the instance
+                            // `failed` with the traffic-free refusal detail.
+                            drop(connection);
+                            let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                            drop(handle);
+                            return Err(self.fail_launch_detail(
+                                registry,
+                                &name,
+                                format!("ACP handshake failed: {handshake_err}"),
+                            ));
+                        }
                     }
-                    Err(handshake_err) => {
-                        // Close + refuse: tear the transport down (closing
-                        // stdin), kill the just-spawned process through the
-                        // backend's bounded stop, and land the instance
-                        // `failed` with the traffic-free refusal detail.
-                        drop(connection);
-                        let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
-                        drop(handle);
-                        return Err(self.fail_launch_detail(
-                            registry,
-                            &name,
-                            format!("ACP handshake failed: {handshake_err}"),
-                        ));
-                    }
-                },
+                }
                 Err(connection_err) => {
                     // No transport (e.g. a detached acp spawn has no stdin
                     // pipe): the same close + refuse shape.

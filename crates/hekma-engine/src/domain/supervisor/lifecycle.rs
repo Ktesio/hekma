@@ -177,8 +177,10 @@ impl Supervisor {
                 // as the ordinary path below would have on confirmed death.
                 self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
+                // Story 14-2: the settle retains an acp session id (see the
+                // ordinary stop path); identical to a clear otherwise.
                 registry
-                    .clear_spawn_record(&name)
+                    .settle_spawn_record(&name)
                     .map_err(registry_to_engine)?;
                 self.transition_with_log_capture(
                     registry,
@@ -332,11 +334,15 @@ impl Supervisor {
         self.clear_poll_error_streak(&name);
         self.running.remove(&name);
 
-        // Clear the write-ahead spawn record (AD-5): a cleanly-stopped instance
-        // must NOT be later adopted or reconciled-to-failed as an orphan. Cleared
+        // Settle the write-ahead spawn record (AD-5): a cleanly-stopped instance
+        // must NOT be later adopted or reconciled-to-failed as an orphan. Settled
         // BEFORE the terminal transition so the durable record leads the state.
+        // Story 14-2: the settle RETAINS an established acp session id on a
+        // pid-0 seed row (so the next start can offer it via `session/load`);
+        // for every record without one this is byte-identical to the plain
+        // clear.
         registry
-            .clear_spawn_record(&name)
+            .settle_spawn_record(&name)
             .map_err(registry_to_engine)?;
 
         // stopping → stopped, recording whether escalation happened (AC3).

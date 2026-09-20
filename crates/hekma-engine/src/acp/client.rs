@@ -106,24 +106,51 @@ impl std::fmt::Display for HandshakeError {
     }
 }
 
-/// What the handshake established (recorded in memory for the Run; 14-2
-/// persists the session id — NO schema migration in this story).
+/// What the handshake established (recorded in memory for the Run; the session
+/// id is ALSO persisted to the spawn record by the caller — story 14-2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Handshake {
-    /// The ACP session id the agent minted for `session/new`.
+    /// The ACP session id the agent minted for `session/new`, or the resumed
+    /// id accepted by `session/load`.
     pub session_id: String,
-    /// Whether the agent advertised the `loadSession` capability (14-2
-    /// resumes via `session/load` when true).
+    /// Whether the agent advertised the `loadSession` capability.
     pub load_session: bool,
+    /// Story 14-2 (D4): `true` when the session was RESUMED — a persisted id
+    /// was offered via `session/load` and the agent accepted it.
+    pub resumed: bool,
+    /// Story 14-2: WHY a persisted session id was NOT resumed, when one was
+    /// offered — `"the agent does not support resuming"` (no `loadSession`
+    /// capability) or `"session/load failed (...)"` (the agent refused / the
+    /// round trip failed). `None` when there was no persisted id (a first
+    /// start — nothing was expected, so no note) or when the load succeeded.
+    /// The caller surfaces this as the one honest stderr note (AI-18).
+    pub resume_declined: Option<String>,
 }
 
 /// Drive the full handshake over `conn` (synchronous, bounded by
-/// [`HANDSHAKE_TIMEOUT`] ACROSS both round trips). Order per spine AD-19:
+/// [`HANDSHAKE_TIMEOUT`] ACROSS all round trips). Order per spine AD-19:
 /// `initialize` (version 1, DEFAULT client capabilities, clientInfo) →
 /// validate the agent's counter against the tolerated set → record
-/// `agentCapabilities.loadSession` → `session/new` (cwd = the Agent Home,
-/// `mcpServers: []`).
-pub fn handshake(conn: &AcpConnection, cwd: &Path) -> Result<Handshake, HandshakeError> {
+/// `agentCapabilities.loadSession` → **the 14-2 resume decision** →
+/// `session/new` (cwd = the Agent Home, `mcpServers: []`) unless the session
+/// was resumed.
+///
+/// `resume` (story 14-2, D4) is the session id PERSISTED by a previous Run
+/// (`None` on a first start — no resume is attempted, and no note is owed).
+/// The decision order:
+/// 1. persisted id + `loadSession` advertised → `session/load`; on success the
+///    session IS the persisted id (`resumed: true`);
+/// 2. persisted id, not advertised → `session/new` +
+///    `resume_declined = "the agent does not support resuming"`;
+/// 3. persisted id, load fails (error response, write failure, or no answer
+///    in time) → `session/new` + a `resume_declined` naming the failure — a
+///    load failure is NEVER fatal to the start (the fresh session still
+///    supervises, spine AD-19).
+pub fn handshake(
+    conn: &AcpConnection,
+    cwd: &Path,
+    resume: Option<&str>,
+) -> Result<Handshake, HandshakeError> {
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let remaining = || deadline.saturating_duration_since(Instant::now());
 
@@ -171,37 +198,94 @@ pub fn handshake(conn: &AcpConnection, cwd: &Path) -> Result<Handshake, Handshak
         .unwrap_or(false);
     conn.set_load_session(load_session);
 
+    // (3b) The 14-2 RESUME DECISION (D4) — the order documented on this
+    // function. The load round trip shares the handshake's single deadline
+    // (the total stays bounded), and ANY load failure only sets
+    // `resume_declined` — the fallback below still opens a fresh session, so
+    // the start proceeds (surfaced-not-silent, never fatal).
+    let mut resumed = false;
+    let mut resume_declined: Option<String> = None;
+    if let Some(session_id) = resume {
+        if load_session {
+            let load_id = conn.next_request_id();
+            let load_rx = conn.register_waiter(load_id);
+            let line = codec::encode_request(
+                load_id,
+                "session/load",
+                codec::session_load_params(session_id, cwd),
+            );
+            let outcome = conn
+                .write_line(&line)
+                .map_err(|err| format!("could not send it: {err}"))
+                .and_then(|()| {
+                    conn.await_response(load_rx, remaining())
+                        .ok_or_else(|| "the agent did not answer it in time".to_string())?
+                });
+            match outcome {
+                Ok(_) => {
+                    // The agent accepted the persisted id: the session IS
+                    // that id (an ACP v1 load result carries no replacement
+                    // id; the agent replays history as session/update
+                    // notifications, which land in the ordinary record).
+                    conn.set_session_id(session_id.to_string());
+                    resumed = true;
+                }
+                Err(detail) => {
+                    // Traffic-free detail (the response router maps error
+                    // responses to "error response (code N)"; payloads never
+                    // ride a diagnostic).
+                    resume_declined = Some(format!(
+                        "session/load failed ({detail}); a new session opens"
+                    ));
+                }
+            }
+        } else {
+            resume_declined =
+                Some("the agent does not support resuming (no loadSession capability)".to_string());
+        }
+    }
+
     // (4) session/new (cwd = the Agent Home, no MCP servers) — same
-    // register-before-write ordering.
-    let new_id = conn.next_request_id();
-    let new_rx = conn.register_waiter(new_id);
-    let line = codec::encode_request(new_id, "session/new", codec::session_new_params(cwd));
-    conn.write_line(&line)
-        .map_err(|err| HandshakeError::WriteFailed {
-            method: "session/new",
-            detail: err.to_string(),
-        })?;
-    let result = conn
-        .await_response(new_rx, remaining())
-        .ok_or(HandshakeError::Timeout {
-            method: "session/new",
-        })?
-        .map_err(|message| HandshakeError::MalformedResponse {
-            method: "session/new",
-            detail: format!("the agent did not answer usably: {message}"),
-        })?;
-    let session_id = result
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let Some(session_id) = session_id else {
-        return Err(HandshakeError::MissingSessionId);
+    // register-before-write ordering; SKIPPED when the session was resumed.
+    let session_id = if resumed {
+        // The accepted id was already recorded on the connection.
+        resume
+            .expect("resumed implies a persisted id was offered")
+            .to_string()
+    } else {
+        let new_id = conn.next_request_id();
+        let new_rx = conn.register_waiter(new_id);
+        let line = codec::encode_request(new_id, "session/new", codec::session_new_params(cwd));
+        conn.write_line(&line)
+            .map_err(|err| HandshakeError::WriteFailed {
+                method: "session/new",
+                detail: err.to_string(),
+            })?;
+        let result = conn
+            .await_response(new_rx, remaining())
+            .ok_or(HandshakeError::Timeout {
+                method: "session/new",
+            })?
+            .map_err(|message| HandshakeError::MalformedResponse {
+                method: "session/new",
+                detail: format!("the agent did not answer usably: {message}"),
+            })?;
+        let session_id = result
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(session_id) = session_id else {
+            return Err(HandshakeError::MissingSessionId);
+        };
+        conn.set_session_id(session_id.clone());
+        session_id
     };
-    conn.set_session_id(session_id.clone());
 
     Ok(Handshake {
         session_id,
         load_session,
+        resumed,
+        resume_declined,
     })
 }
 

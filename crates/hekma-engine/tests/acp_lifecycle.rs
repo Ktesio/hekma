@@ -36,6 +36,7 @@
 //! bytes — inside a bounded budget; never a wall-clock sleep-then-assert.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -675,4 +676,443 @@ fn sentinel_lines_on_stderr_reach_the_ledger() {
     });
 
     let _ = blocking.stop(name, None).expect("stop");
+}
+
+// ---------------------------------------------------------------------------
+// Story 14-2 — sessions across lifetimes (D4). The RULING (draft-then-ratify,
+// 2026-09-19): an adopted acp process is NOT re-piped — the ACP transport is
+// a pipe pair that dies with the engine that held it, and there is no
+// OS-portable way to recover a stdio pipe from a bare {pid, start-time}
+// fingerprint (the backend's adopt documents this). The session resume
+// therefore rides the NEXT START's handshake: the session id is persisted to
+// the v8 spawn-record column post-handshake, RETAINED across stop/crash
+// settles on a pid-0 seed row, and offered via `session/load` at the next
+// start when the fresh agent advertises `loadSession` — with `session/new` +
+// a surfaced note on every other path. Adoption surfaces the recorded
+// session state honestly.
+// ---------------------------------------------------------------------------
+
+/// The instance's `acp_session_id` straight from the state DB (the v8 column),
+/// plus the record's pid — `(pid, session_id)`. `None` when no record row
+/// exists. The tests read the DB directly (the adoption.rs shape): the
+/// session id is engine-internal durable state, not a facade field.
+fn db_record_row(base: &Path, name: &str) -> Option<(i64, Option<String>)> {
+    let db = base.join("state.db");
+    let conn = rusqlite::Connection::open(&db).ok()?;
+    conn.query_row(
+        "SELECT r.pid, r.acp_session_id FROM agent_runtime r \
+         JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = ?1",
+        [name],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Wait for the fake agent's own startup line in the instance's STDERR log
+/// (`fake_acp_agent: mode=<m> pid=<n>`) and return the pid — the acp agent
+/// announces itself on stderr (its stdout is the protocol stream).
+fn wait_for_acp_agent_pid(base: &Path, name: &str) -> u32 {
+    let stderr = agent_stderr_path(base, name);
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&stderr) {
+            for line in contents.lines() {
+                if let Some(idx) = line.find("pid=") {
+                    if let Ok(pid) = line[idx + 4..].trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "acp agent pid never announced");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// THE D4 resume path: start → the session id lands in the v8 column → the
+/// engine DIES (in-process drop: the child is killed + reaped — the same
+/// reconcile input a crash leaves) → the next engine open reconciles the
+/// instance `failed` while RETAINING the id on the pid-0 seed → the next
+/// START offers it via `session/load`, the fresh fake agent logs the load of
+/// the SAME id on stderr, the surfaced note names the resumed session, and
+/// the newly-established id is re-persisted.
+#[test]
+fn persisted_session_resumes_via_session_load_at_the_next_start() {
+    let base = TempDir::new().unwrap();
+    let name = "acp-resume";
+    let shared1 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        // Engine 1: start the instance (handshake → session/new), then DIE
+        // without a clean stop (the drop shape a crash leaves behind).
+        let engine1 = open(&base, Some(&shared1));
+        register_acp(&engine1, base.path(), name);
+        configure_and_start(&engine1, name, "chunky", &["--advertise-load"]);
+        let started = engine1.blocking().start(name).expect("start");
+        assert_eq!(started.state, LifecycleState::Running);
+        // The handshake established the session and the id was PERSISTED at
+        // the point the connection established it (the 14-2 write path).
+        poll_until("the session id persisted to the v8 column", || {
+            db_record_row(base.path(), name)
+                .map(|(_, id)| id.as_deref() == Some("fake-session-1"))
+                .unwrap_or(false)
+        });
+        // Engine death: drop kills the child (killpg + wait — no zombie) and
+        // leaves the write-ahead record (with the id) in place.
+        drop(engine1);
+    }
+
+    // Engine 2: adoption reconciles the gone process to `failed`, and the
+    // settle RETAINS the session id on the pid-0 seed row.
+    let shared2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine2 = open(&base, Some(&shared2));
+    assert_eq!(
+        engine2
+            .blocking()
+            .instance_status(name)
+            .unwrap()
+            .instance
+            .state,
+        LifecycleState::Failed,
+        "the gone-process record reconciles to failed (AI-8)"
+    );
+    let (pid, retained) = db_record_row(base.path(), name).expect("the retention record exists");
+    assert_eq!(pid, 0, "the retention row is the pid-0 seed adoption skips");
+    assert_eq!(
+        retained.as_deref(),
+        Some("fake-session-1"),
+        "the session id survives the failed reconcile"
+    );
+
+    // The next START offers the retained id: the fresh agent advertises
+    // loadSession, accepts the load, and logs the SAME id on stderr.
+    let started = engine2.blocking().start(name).expect("the resume start");
+    assert_eq!(started.state, LifecycleState::Running);
+    poll_until(
+        "the fake agent logged the session/load of the SAME id",
+        || {
+            std::fs::read_to_string(agent_stderr_path(base.path(), name))
+                .unwrap_or_default()
+                .contains("session/load received: fake-session-1")
+        },
+    );
+    poll_until("the resumed-session note surfaced", || {
+        sink_text(&shared2).contains("resumed the previous ACP session (fake-session-1)")
+    });
+    // The established id was re-persisted post-handshake (the fresh record).
+    poll_until("the new Run's id persisted", || {
+        db_record_row(base.path(), name)
+            .map(|(pid, id)| pid != 0 && id.as_deref() == Some("fake-session-1"))
+            .unwrap_or(false)
+    });
+
+    let _ = engine2.blocking().stop(name, None).expect("stop");
+}
+
+/// The capability gate: a persisted id is offered ONLY when the agent
+/// advertises `loadSession`. Without it the start still succeeds via
+/// `session/new` — with the honest "does not support resuming" note (AI-18),
+/// and NO session/load on the wire.
+#[test]
+fn new_session_with_an_honest_note_when_the_agent_cannot_resume() {
+    let base = TempDir::new().unwrap();
+    let name = "acp-noload";
+    let shared1 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        // NO --advertise-load: the agent answers initialize without the
+        // capability. The id is still persisted (it WAS established).
+        let engine1 = open(&base, Some(&shared1));
+        register_acp(&engine1, base.path(), name);
+        configure_and_start(&engine1, name, "chunky", &[]);
+        engine1.blocking().start(name).expect("start");
+        poll_until("the session id persisted", || {
+            db_record_row(base.path(), name)
+                .map(|(_, id)| id.as_deref() == Some("fake-session-1"))
+                .unwrap_or(false)
+        });
+        drop(engine1);
+    }
+
+    let shared2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine2 = open(&base, Some(&shared2));
+    engine2
+        .blocking()
+        .start(name)
+        .expect("the fresh-session start");
+    assert_eq!(
+        engine2
+            .blocking()
+            .instance_status(name)
+            .unwrap()
+            .instance
+            .state,
+        LifecycleState::Running
+    );
+    // No session/load reached the agent; the honest note did surface.
+    poll_until("the does-not-support note surfaced", || {
+        sink_text(&shared2).contains("does not support resuming")
+    });
+    poll_until("the new session opened (turn machinery live)", || {
+        db_record_row(base.path(), name)
+            .map(|(pid, _)| pid != 0)
+            .unwrap_or(false)
+    });
+    let stderr = std::fs::read_to_string(agent_stderr_path(base.path(), name)).unwrap_or_default();
+    assert!(
+        !stderr.contains("session/load received"),
+        "session/load must never be sent without the advertised capability: {stderr}"
+    );
+    assert!(
+        sink_text(&shared2).contains("new ACP session"),
+        "the note names the fresh session: {}",
+        sink_text(&shared2)
+    );
+
+    let _ = engine2.blocking().stop(name, None).expect("stop");
+}
+
+/// The failure fallback: `loadSession` advertised but the agent REJECTS the
+/// load (`--fail-load` → a JSON-RPC error response). The start is NEVER
+/// fatal — it falls back to `session/new` and surfaces the failure (AI-18).
+#[test]
+fn load_failure_falls_back_to_a_new_session_with_a_surfaced_note() {
+    let base = TempDir::new().unwrap();
+    let name = "acp-failload";
+    let shared1 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    {
+        let engine1 = open(&base, Some(&shared1));
+        register_acp(&engine1, base.path(), name);
+        configure_and_start(
+            &engine1,
+            name,
+            "chunky",
+            &["--advertise-load", "--fail-load"],
+        );
+        engine1.blocking().start(name).expect("start");
+        poll_until("the session id persisted", || {
+            db_record_row(base.path(), name)
+                .map(|(_, id)| id.as_deref() == Some("fake-session-1"))
+                .unwrap_or(false)
+        });
+        drop(engine1);
+    }
+
+    let shared2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine2 = open(&base, Some(&shared2));
+    // The start SUCCEEDS despite the load failure (never fatal).
+    let started = engine2.blocking().start(name).expect("the fallback start");
+    assert_eq!(started.state, LifecycleState::Running);
+    // The load WAS attempted (the agent logged the receipt) and rejected...
+    poll_until("the load attempt reached the agent", || {
+        std::fs::read_to_string(agent_stderr_path(base.path(), name))
+            .unwrap_or_default()
+            .contains("session/load received: fake-session-1")
+    });
+    // ...and the surfaced note names both the failure and the fallback.
+    poll_until("the fallback note surfaced", || {
+        let captured = sink_text(&shared2);
+        captured.contains("session/load failed") && captured.contains("new ACP session")
+    });
+
+    let _ = engine2.blocking().stop(name, None).expect("stop");
+}
+
+/// The pre-v8 record: a spawn record with NO session id (NULL — never
+/// established, or written before the column existed) starts with a plain
+/// `session/new`, no resume attempt, and no owed note (nothing was expected).
+#[test]
+fn record_without_a_session_id_opens_a_new_session_silently() {
+    let base = TempDir::new().unwrap();
+    let name = "acp-prev8";
+    let engine = open(&base, None);
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "chunky", &["--advertise-load"]);
+    engine.blocking().start(name).expect("start");
+    poll_until("the session id persisted", || {
+        db_record_row(base.path(), name)
+            .map(|(_, id)| id.as_deref() == Some("fake-session-1"))
+            .unwrap_or(false)
+    });
+    // Fabricate the pre-v8 record: NULL the column (exactly what a v7-era row
+    // reads as after the additive migration).
+    {
+        let conn = rusqlite::Connection::open(base.path().join("state.db")).unwrap();
+        conn.execute("UPDATE agent_runtime SET acp_session_id = NULL", [])
+            .unwrap();
+    }
+    // Stop (a NULL-id record settles to a plain clear — no retention row) and
+    // start again: a fresh session, no load, no note.
+    engine.blocking().stop(name, None).expect("stop");
+    assert!(
+        db_record_row(base.path(), name).is_none(),
+        "a NULL-id record settles to NO row (byte-identical to the plain clear)"
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    // A fresh engine with the sink installed FROM OPEN (nothing may slip).
+    drop(engine);
+    let engine2 = open(&base, Some(&shared));
+    engine2.blocking().start(name).expect("restart");
+    poll_until("the restart reached running", || {
+        db_record_row(base.path(), name)
+            .map(|(pid, _)| pid != 0)
+            .unwrap_or(false)
+    });
+    let stderr = std::fs::read_to_string(agent_stderr_path(base.path(), name)).unwrap_or_default();
+    assert!(
+        !stderr.contains("session/load received"),
+        "no resume was offered without a persisted id: {stderr}"
+    );
+    let captured = sink_text(&shared);
+    assert!(
+        !captured.contains("resumed the previous ACP session"),
+        "no resume note is owed: {captured}"
+    );
+    assert!(
+        !captured.contains("new ACP session"),
+        "a first-class fresh start owes no note: {captured}"
+    );
+
+    let _ = engine2.blocking().stop(name, None).expect("stop");
+}
+
+// ---- The SURVIVOR composition (re-exec harness, the adoption.rs shape) ----
+
+/// Whether a pid is alive (the adoption.rs probe shape — shell-out, no OS-cfg;
+/// the /proc zombie discount no-ops off Linux).
+fn acp_pid_alive(pid: u32) -> bool {
+    match hekma_engine::OsId::current() {
+        hekma_engine::OsId::Windows => Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false),
+        _ => Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+    }
+}
+
+fn wait_until_acp_pid_gone(pid: u32, what: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    while acp_pid_alive(pid) {
+        assert!(Instant::now() < deadline, "{what} (pid {pid} still alive)");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// The re-exec entry for the 14-2 survivor setup (the adoption.rs crash
+/// shape): start an acp instance whose agent `--linger-on-eof` (it survives
+/// its client's death), then `std::process::exit` WITHOUT dropping the
+/// engine — no kill-on-drop runs, so the agent survives re-parented to init.
+/// When `KTESIO_ACP_HELPER` is unset this is a trivial pass.
+#[test]
+fn acp_helper_subprocess() {
+    let Ok(state) = std::env::var("KTESIO_ACP_STATE") else {
+        return; // normal in-process invocation: nothing to do.
+    };
+    let state = PathBuf::from(state);
+    let engine = Engine::open(Some(state.clone())).expect("helper engine open");
+    let facade = engine.blocking();
+    let name = "acp-survivor";
+    facade.register(name, "acp").unwrap();
+    let bin = hekma_conformance::fake_acp_agent_bin();
+    facade
+        .set_config(name, "acp.command", &bin.to_string_lossy())
+        .unwrap();
+    facade
+        .set_config(name, "acp.args", "--advertise-load --linger-on-eof")
+        .unwrap();
+    facade.start(name).unwrap();
+    // Crash semantics: exit without dropping (no kill-on-drop, no record
+    // settle). The lingering agent survives with its session state intact.
+    std::process::exit(0);
+}
+
+/// The D4 composition, end to end: start ATTACHED → the engine process dies
+/// (the re-exec crash shape) → the agent SURVIVES (linger-on-eof) → the next
+/// command RE-ADOPTS it and surfaces the recorded session → the stop→start
+/// remediation RESUMES via `session/load` (the agent logs the SAME id).
+///
+/// Windows skips (AI-29, the adoption.rs rationale): KILL_ON_JOB_CLOSE kills
+/// the child when the helper exits — no survivor is possible there. The
+/// Linux-CI skip mirrors adoption.rs's #109 mitigation.
+#[test]
+fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux
+        && std::env::var_os("CI").is_some()
+    {
+        return;
+    }
+    let base = TempDir::new().unwrap();
+    let name = "acp-survivor";
+
+    // Engine 1 in the helper subprocess: start + crash.
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "acp_helper_subprocess", "--nocapture"])
+        .env("KTESIO_ACP_STATE", base.path())
+        .status()
+        .expect("run the acp helper subprocess");
+    assert!(
+        status.success(),
+        "the acp helper subprocess failed: {status}"
+    );
+
+    // The agent SURVIVED its engine's death (the linger-on-eof deviation).
+    let pid = wait_for_acp_agent_pid(base.path(), name);
+    assert!(acp_pid_alive(pid), "the lingering acp agent must survive");
+
+    // Engine 2: ADOPTS the live process and surfaces the recorded session —
+    // the upgraded adoption note names the id and the resume promise.
+    let shared2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine2 = open(&base, Some(&shared2));
+    assert_eq!(
+        engine2
+            .blocking()
+            .instance_status(name)
+            .unwrap()
+            .instance
+            .state,
+        LifecycleState::Running,
+        "a live orphan is adopted as running"
+    );
+    poll_until(
+        "the adoption note surfaced naming the recorded session",
+        || {
+            let captured = sink_text(&shared2);
+            captured.contains("adopted an acp instance")
+                && captured.contains("fake-session-1")
+                && captured.contains("session/load at the next start")
+        },
+    );
+
+    // The remediation the note names: stop (the settle RETAINS the id on the
+    // pid-0 seed), then start — the fresh agent resumes the SAME session.
+    engine2.blocking().stop(name, None).expect("stop");
+    wait_until_acp_pid_gone(pid, "the stop must terminate the adopted agent");
+    let (seed_pid, retained) = db_record_row(base.path(), name).expect("the seed row exists");
+    assert_eq!(
+        seed_pid, 0,
+        "the stop settle retains the id on the pid-0 seed"
+    );
+    assert_eq!(retained.as_deref(), Some("fake-session-1"));
+
+    let started = engine2.blocking().start(name).expect("the resume start");
+    assert_eq!(started.state, LifecycleState::Running);
+    poll_until("the fresh agent logged the load of the SAME id", || {
+        std::fs::read_to_string(agent_stderr_path(base.path(), name))
+            .unwrap_or_default()
+            .contains("session/load received: fake-session-1")
+    });
+    poll_until("the resumed-session note surfaced", || {
+        sink_text(&shared2).contains("resumed the previous ACP session (fake-session-1)")
+    });
+
+    let _ = engine2.blocking().stop(name, None).expect("stop");
 }

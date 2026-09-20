@@ -23,10 +23,12 @@
 //!   permission auto-denial, the surfaced-notice queue, and the teardown
 //!   (close stdin → reader EOF) on stop/drop/terminal-settle.
 //!
-//! Stories 14-6/14-3/14-2/14-5/14-4 are OTHER stories: cached tokens, the
-//! tiered billing acquisition, session-id persistence + `session/load`
-//! adoption, the sentinel mode, and the verification/docs sweep — none of
-//! them live here.
+//! Stories 14-6 and 14-5 are OTHER stories: cached tokens and the sentinel
+//! mode. Story 14-2 (session resume) rides HERE for its transport half — the
+//! handshake's `session/load` resume decision (`client`), the persisted-id
+//! read/write helpers, and the adoption/resume notes; the schema v8 column
+//! and the settle retention live in the store. 14-4 is the verification/docs
+//! sweep.
 //!
 //! This module is crate-INTERNAL (the transport is engine machinery; the
 //! public surface change for 14-1 is the `acp` builtin kind's registration
@@ -141,19 +143,49 @@ pub(crate) fn spawn_pipe_stdout(is_acp: bool, detach: bool) -> bool {
     is_acp && !detach
 }
 
-/// The honest adoption note (story 14-1): an ADOPTED `acp` instance is
-/// re-held as a bare process — its ACP pipe halves died with the engine
-/// that spawned it, so this engine holds NO connection for it (the
-/// session/load resume is story 14-2; until then `send` fails with the
-/// ordinary adopted-instance interaction error). The diagnostic names the
-/// condition + the remediation, surfaced-not-silent (AI-18).
-pub(crate) fn adopted_acp_note(name: &str) -> String {
+/// The honest adoption note (story 14-1, extended by 14-2): an ADOPTED `acp`
+/// instance is re-held as a bare process — its ACP pipe halves died with the
+/// engine that spawned it, so this engine holds NO live connection for it
+/// (the adopted process is not re-piped; there is no OS-portable way to
+/// recover a stdio pipe from a bare fingerprint). The RESUME therefore rides
+/// the NEXT START's handshake: when a session id is persisted (story 14-2's
+/// v8 record column) the note says so — it will be offered via
+/// `session/load`; when none is on record, the note says THAT instead. The
+/// diagnostic names the condition + the remediation, surfaced-not-silent
+/// (AI-18). `session` is the persisted id from the adopted spawn record.
+pub(crate) fn adopted_acp_note(name: &str, session: Option<&str>) -> String {
+    let session_note = match session {
+        Some(id) => format!(
+            "a previous session ({id}) is on record and will be offered via session/load at \
+             the next start (if the agent supports resuming)"
+        ),
+        None => "no previous session is on record — the next start opens a new session".to_string(),
+    };
     format!(
         "{name}: adopted an acp instance; the ACP connection is a pair of pipes that died \
          with the previous engine process, so THIS engine holds no ACP session for it — \
-         send will refuse until the instance is stopped and started again (session resume \
-         across engine lifetimes lands in story 14-2)"
+         send will refuse until the instance is stopped and started again; {session_note}"
     )
+}
+
+/// The start path's ONE resume-outcome note (story 14-2, AI-18 — surfaced vs
+/// silent): `Some(note)` when the handshake's resume decision produced
+/// something an operator must hear — the session was RESUMED, or a persisted
+/// id could NOT be resumed (capability missing / load failed). `None` when a
+/// first start opened a fresh session (nothing was expected; a note on every
+/// start would be noise, and the honest absence is already visible in the
+/// record).
+pub(crate) fn resume_outcome_note(name: &str, outcome: &client::Handshake) -> Option<String> {
+    if outcome.resumed {
+        return Some(format!(
+            "{name}: resumed the previous ACP session ({}) via session/load",
+            outcome.session_id,
+        ));
+    }
+    outcome
+        .resume_declined
+        .as_ref()
+        .map(|reason| format!("{name}: opening a new ACP session — {reason}"))
 }
 
 /// The `acp` kind's ACTIVE Metering Source (story 14-3, T2 — spine AD-19's
@@ -258,11 +290,15 @@ mod tests {
         assert!(is_acp_kind("acp"));
         assert!(!is_acp_kind("mock"));
         assert!(!is_acp_kind("hermes"));
-        // The adoption note names the instance, the dead-pipe fact, and the
-        // 14-2 remediation horizon (surfaced-not-silent).
-        let note = adopted_acp_note("acp-1");
+        // The adoption note names the instance, the dead-pipe fact, and — for
+        // a recorded session (14-2) — the resume promise (surfaced-not-
+        // silent); the id-less variant names the honest absence instead.
+        let note = adopted_acp_note("acp-1", Some("fake-session-1"));
         assert!(note.contains("acp-1"), "{note}");
-        assert!(note.contains("14-2"), "{note}");
+        assert!(note.contains("fake-session-1"), "{note}");
+        assert!(note.contains("session/load"), "{note}");
+        let bare = adopted_acp_note("acp-1", None);
+        assert!(bare.contains("no previous session"), "{bare}");
         // The transport pipes stdout exactly for a non-detached acp spawn.
         assert!(spawn_pipe_stdout(true, false));
         assert!(!spawn_pipe_stdout(true, true));
@@ -270,6 +306,45 @@ mod tests {
         // Silence an unused-import lint in the test module (Value is used
         // only through the toml literals above on some compilers).
         let _ = Value::from(1);
+    }
+
+    #[test]
+    fn resume_outcome_note_covers_resumed_declined_and_silent_fresh() {
+        use crate::acp::client::Handshake;
+        // A resumed session is surfaced, naming the id.
+        let resumed = Handshake {
+            session_id: "fake-session-1".to_string(),
+            load_session: true,
+            resumed: true,
+            resume_declined: None,
+        };
+        let note = resume_outcome_note("acp-1", &resumed).expect("resumed is surfaced");
+        assert!(
+            note.contains("acp-1") && note.contains("fake-session-1"),
+            "{note}"
+        );
+        // A declined resume is surfaced with the reason (capability missing).
+        let declined = Handshake {
+            session_id: "s-2".to_string(),
+            load_session: false,
+            resumed: false,
+            resume_declined: Some(
+                "the agent does not support resuming (no loadSession \
+                                   capability)"
+                    .to_string(),
+            ),
+        };
+        let note = resume_outcome_note("acp-2", &declined).expect("declined is surfaced");
+        assert!(note.contains("new ACP session"), "{note}");
+        assert!(note.contains("does not support resuming"), "{note}");
+        // A first start (no persisted id) owes NO note.
+        let fresh = Handshake {
+            session_id: "s-3".to_string(),
+            load_session: false,
+            resumed: false,
+            resume_declined: None,
+        };
+        assert!(resume_outcome_note("acp-3", &fresh).is_none());
     }
 
     #[test]

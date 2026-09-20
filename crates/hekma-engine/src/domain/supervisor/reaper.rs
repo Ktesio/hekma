@@ -341,7 +341,9 @@ impl Supervisor {
                     self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
                     self.running.remove(&name);
-                    if registry.clear_spawn_record(&name).is_ok() {
+                    // Story 14-2: the settle retains an acp session id (see
+                    // the ordinary stop path); identical to a clear otherwise.
+                    if registry.settle_spawn_record(&name).is_ok() {
                         let _ = self.transition_with_log_capture(
                             registry,
                             &name,
@@ -547,17 +549,20 @@ impl Supervisor {
     /// does NOT adopt-attempt the dead/reused PID — the reconcile skips a pid-0
     /// record, exactly like a policy-only config seed), while RE-SEEDING the
     /// per-instance policy so `kt agent show` still reports the active Restart
-    /// Policy for the failed instance (AC9). Concretely: clear the record, then
-    /// re-persist the policy as a pid-0 seed. The failed CAUSE is not kept in the
-    /// record — it rides in the event log, which `instance_status` falls back to.
-    /// Best-effort (a store hiccup here is never a panic).
+    /// Policy for the failed instance (AC9). Concretely: settle the record
+    /// (clearing it, and — story 14-2 — retaining an established acp session
+    /// id on the pid-0 seed row so a later start can offer it via
+    /// `session/load`), then re-persist the policy as a pid-0 seed. The failed
+    /// CAUSE is not kept in the record — it rides in the event log, which
+    /// `instance_status` falls back to. Best-effort (a store hiccup here is
+    /// never a panic).
     fn settle_terminal_record(
         &self,
         registry: &Registry,
         name: &InstanceName,
         policy: RestartPolicy,
     ) {
-        let _ = registry.clear_spawn_record(name);
+        let _ = registry.settle_spawn_record(name);
         let _ = registry.set_restart_policy(name, policy);
     }
 
@@ -737,19 +742,25 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
-                    // Story 14-1: surface the acp adoption honesty — the
-                    // instance is alive but this engine holds no ACP session
-                    // for it, so `send` refuses (the ordinary
-                    // adopted-instance interaction error) until a stop→start
-                    // re-establishes the transport. Surfaced-not-silent
-                    // (AI-18); the diagnostic is emitted under the supervisor
-                    // lock via the choke point.
+                    // Story 14-1 + 14-2: surface the acp adoption honesty —
+                    // the instance is alive but this engine holds no live ACP
+                    // connection for it (the pipe pair died with the previous
+                    // engine; the adopted process is not re-piped), so `send`
+                    // refuses until a stop→start re-establishes the transport.
+                    // The note ALSO names the persisted session state: the
+                    // recorded id (if any) will be offered via `session/load`
+                    // at the next start. Surfaced-not-silent (AI-18); the
+                    // diagnostic is emitted under the supervisor lock via the
+                    // choke point.
                     let kind = registry
                         .lookup(&name)
                         .map(|instance| instance.kind)
                         .unwrap_or_default();
                     if crate::acp::is_acp_kind(&kind) {
-                        let note = crate::acp::adopted_acp_note(name.as_str());
+                        let note = crate::acp::adopted_acp_note(
+                            name.as_str(),
+                            record.acp_session_id.as_deref(),
+                        );
                         self.emit_diagnostic(&note);
                     }
                     // AI-46 (story 11-3): an adopted ENGINE-OBSERVED instance is
@@ -850,8 +861,12 @@ impl Supervisor {
                 TransitionCause::crashed(detail),
             );
         }
-        // Clear the stale record either way (its process is gone).
-        let _ = registry.clear_spawn_record(name);
+        // Settle the stale record either way (its process is gone). Story
+        // 14-2: the settle retains an established acp session id on a pid-0
+        // seed row — the crash the reconcile names is exactly when the NEXT
+        // start's `session/load` resume matters — and is byte-identical to a
+        // plain clear for records without one.
+        let _ = registry.settle_spawn_record(name);
     }
 
     // ---- internals ----

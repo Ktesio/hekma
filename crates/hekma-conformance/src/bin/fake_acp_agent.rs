@@ -67,6 +67,23 @@
 //! lines), so it is excluded from coverage — its behavior is proven by the
 //! spawning tests.
 
+//! ## Story 14-2 modes (sessions across lifetimes, D4)
+//!
+//! * `--advertise-load` — the `initialize` response advertises
+//!   `agentCapabilities.loadSession: true` (the gate the engine must honor
+//!   before ever sending `session/load`).
+//! * `session/load` handler (all modes) — answers the engine's
+//!   `session/load` with the resumed session id (`fake-session-1`), logging
+//!   receipt to STDERR (`fake_acp_agent: session/load received: <id>` — the
+//!   observation channel the tests poll via `agent-stderr.log`). With
+//!   `--fail-load`, the handler instead answers with a JSON-RPC ERROR (code
+//!   -32000, "session not found"), pinning the engine's fallback-to-
+//!   `session/new` + surfaced-note path.
+//! * `--linger-on-eof` — on stdin EOF the agent does NOT exit (the default:
+//!   an ACP agent whose client is gone exits, which is exactly why a REAL
+//!   acp child rarely survives its engine); it parks, so the process
+//!   SURVIVES the spawning engine's death for the adoption test to re-hold.
+
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
@@ -209,10 +226,13 @@ fn post_one_observed_call(base_url: &str) {
 fn main() {
     use std::sync::mpsc;
 
-    // Parse the script: `--mode <mode>` and `--delay-ms <ms>`.
+    // Parse the script: `--mode <mode>`, `--delay-ms <ms>`, `--advertise-load`,
+    // `--fail-load`, `--linger-on-eof`.
     let mut mode = "chunky".to_string();
     let mut delay = Duration::from_secs(5);
     let mut advertise_load = false;
+    let mut fail_load = false;
+    let mut linger_on_eof = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -227,6 +247,8 @@ fn main() {
                 }
             }
             "--advertise-load" => advertise_load = true,
+            "--fail-load" => fail_load = true,
+            "--linger-on-eof" => linger_on_eof = true,
             other => {
                 // Unknown args are ignored (a manifest may pass extra tokens).
                 let _ = other;
@@ -240,8 +262,16 @@ fn main() {
     // single-threaded read loop would never see the cancel until the turn
     // finished — the exact hang the stop test would exercise).
     enum Inbound {
-        Request { id: u64, method: String },
-        Response { id: u64 },
+        Request {
+            id: u64,
+            method: String,
+            /// The `params.sessionId`, when the request carried one (the
+            /// `session/load` receipt log names the REQUESTED id, story 14-2).
+            session_id: Option<String>,
+        },
+        Response {
+            id: u64,
+        },
         Cancelled,
         Eof,
     }
@@ -254,6 +284,18 @@ fn main() {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => {
+                    // Story 14-2: `--linger-on-eof` models the cooperative
+                    // survivor — the process outlives its client's death
+                    // (parking instead of exiting) so the adoption test can
+                    // re-hold it and read the persisted session state. The
+                    // DEFAULT (exit on EOF) is the real-agent behavior this
+                    // deviation is deliberately against.
+                    if linger_on_eof {
+                        eprintln!("fake_acp_agent: stdin EOF; lingering (survivor mode)");
+                        loop {
+                            std::thread::sleep(Duration::from_secs(3600));
+                        }
+                    }
                     let _ = tx.send(Inbound::Eof);
                     break;
                 }
@@ -288,7 +330,16 @@ fn main() {
                         .map(str::to_string);
                     match (method, id) {
                         (Some(method), Some(id)) => {
-                            let _ = tx.send(Inbound::Request { id, method });
+                            let session_id = value
+                                .get("params")
+                                .and_then(|p| p.get("sessionId"))
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string);
+                            let _ = tx.send(Inbound::Request {
+                                id,
+                                method,
+                                session_id,
+                            });
                         }
                         (None, Some(id)) => {
                             // A response to one of OUR requests (the
@@ -308,7 +359,12 @@ fn main() {
     let mut next_turn_sequence: u64 = 0;
 
     while let Ok(message) = rx.recv() {
-        let Inbound::Request { id, method } = message else {
+        let Inbound::Request {
+            id,
+            method,
+            session_id,
+        } = message
+        else {
             // Eof (or anything unaddressed): the client is gone — exit.
             break;
         };
@@ -349,6 +405,31 @@ fn main() {
                     id,
                     serde_json::json!({ "sessionId": SESSION_ID, "mcpServers": [] }),
                 ));
+            }
+            ("session/load", _) => {
+                // Story 14-2: the resume request. Receipt is logged to STDERR
+                // (stdout stays pure ACP) naming the REQUESTED session id, so
+                // the tests can pin that the engine resumed THE SAME id it
+                // persisted. The answer is the resumed session id — or, under
+                // `--fail-load`, a JSON-RPC error (the engine must fall back
+                // to `session/new` with a surfaced note, never fatal).
+                eprintln!(
+                    "fake_acp_agent: session/load received: {}",
+                    session_id.as_deref().unwrap_or("<none>")
+                );
+                if fail_load {
+                    let mut stdout = std::io::stdout();
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32000,"message":"session not found"}}}}"#
+                    );
+                    let _ = stdout.flush();
+                } else {
+                    emit(&response(
+                        id,
+                        serde_json::json!({ "sessionId": SESSION_ID }),
+                    ));
+                }
             }
             ("session/prompt", _) => {
                 if mode == "permission-request" {
