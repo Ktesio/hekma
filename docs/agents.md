@@ -5,7 +5,7 @@ description: The agents Hekma's adapters target, the exact versions each adapter
 
 # Supported Agents
 
-Hekma runs agents as adapter-backed processes: the built-in `hermes` native adapter targets the Hermes gateway, the built-in `acp` kind (epic 14, in review) runs any Agent Client Protocol v1 agent — Hermes among them, via its native `hermes-acp` entry point — and any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
+Hekma runs agents as adapter-backed processes: the built-in `acp` kind runs any Agent Client Protocol v1 agent — Hermes among them, via its native `hermes-acp` entry point — and is the recommended path for every ACP-capable agent; the built-in `hermes` native adapter also targets the Hermes gateway but is **deprecated** (see [below](#hermes---kind-hermes)); any other agent integrates through a manifest `adapter.toml` ([the manifest reference](manifest.md)). This page records **which agent versions the shipped adapters were validated against** — an adapter's honesty is only as good as its last validation, because agent upstreams move fast.
 
 > **Isolation honesty.** Agent Home organizes and isolates an agent's files.
 > It is not a security sandbox: supervised agents run as normal processes with
@@ -14,8 +14,8 @@ Hekma runs agents as adapter-backed processes: the built-in `hermes` native adap
 
 | Agent | Adapter | Validation status | Validated against | Evidence |
 |-------|---------|-------------------|-------------------|----------|
-| Hermes (NousResearch) | native builtin (`--kind hermes`) | **Run-verified** — launched, supervised, and driven end-to-end (lifecycle, metering, budget, memory) under the recorded isolation sandbox | `v0.20.5` @ `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (2026-08-25) | the story 6-1 primary-source verification note plus the story 6-2/6-3 conformance passes |
-| opencode (anomalyco) | manifest adapter shape (no builtin) | **Paper-validated** — primary-source characterization + conformance mapping; never launched by this repo | `v1.18.27` @ `4b7e19e315cca414121ba1d61523fef74bb3ae8b` (2026-09-02 release) | the story 6-5 characterization + conformance-mapping notes that fed the contract-v1 freeze |
+| Hermes (NousResearch) | native builtin (`--kind hermes`) — **deprecated; use `--kind acp`** | **Run-verified** — launched, supervised, and driven end-to-end (lifecycle, metering, budget, memory) under the recorded isolation sandbox | `v0.20.5` @ `41447a6d7063b2772b0c2f26a5b22d9bd444fb43` (2026-08-25) | primary-source verification plus end-to-end conformance passes (recorded in-repo) |
+| opencode (anomalyco) | manifest adapter shape (no builtin) | **Paper-validated** — primary-source characterization + conformance mapping; never launched by this repo | `v1.18.27` @ `4b7e19e315cca414121ba1d61523fef74bb3ae8b` (2026-09-02 release) | primary-source characterization + conformance-mapping notes that fed the contract-v1 freeze |
 
 ## Hermes (`--kind hermes`)
 
@@ -31,7 +31,7 @@ The `hermes` builtin is compiled into the engine and declares a FIXED launch —
 
 ## ACP agents (`--kind acp`)
 
-The `acp` builtin (epic 14) is agent-agnostic: any executable speaking Agent Client Protocol v1 over stdio is a Hekma backend with no per-agent adapter work. The agents this epic targets:
+The `acp` builtin is agent-agnostic: any executable speaking Agent Client Protocol v1 over stdio is a Hekma backend with no per-agent adapter work. Agents known to work or expected to:
 
 - **Hermes Agent** — natively, via its dedicated `hermes-acp` entry point (point `acp.command` at `hermes-acp`). This is the migration path from the deprecated `hermes` kind (notice above); the parity proofs — metering via the stderr sentinel and `HERMES_HOME` delivery under a `filesystem` Memory Backing — are shipped and tested.
 - **Gemini CLI** — speaks ACP when started with its ACP-mode flag: `acp.command` = `gemini`, `acp.args` = `--experimental-acp` (the long-documented IDE-integration spelling; newer builds accept the shortened `--acp`).
