@@ -1,6 +1,7 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
+import type { ComponentPropsWithoutRef } from 'react';
 import type { MDXComponents } from 'mdx/types';
-import { isValidElement, type ComponentPropsWithoutRef, type ReactNode } from 'react';
+
 import { Mermaid } from './mermaid';
 
 const routeByMarkdownFile = new Map([
@@ -56,45 +57,10 @@ function DocsLink(props: ComponentPropsWithoutRef<'a'>) {
   return <Anchor {...props} href={docsHref(props.href)} />;
 }
 
-// Fumadocs highlights fenced code through nested token spans, so the code
-// block's TEXT is recovered by walking the element tree — a plain
-// `children.toString()` would return "[object Object]" for any highlighted
-// block (and every fenced block is highlighted).
-function codeText(node: ReactNode): string {
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(codeText).join('');
-  if (isValidElement<{ children?: ReactNode }>(node)) {
-    return codeText(node.props.children);
-  }
-  return '';
-}
-
-function codeLanguage(node: ReactNode): string {
-  if (isValidElement<{ className?: string; children?: ReactNode }>(node)) {
-    const match = /language-([\w-]+)/.exec(node.props.className ?? '');
-    if (match) return match[1];
-    return codeLanguage(node.props.children);
-  }
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      const found = codeLanguage(child);
-      if (found) return found;
-    }
-  }
-  return '';
-}
-
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
-    pre: (props: ComponentPropsWithoutRef<'pre'>) => {
-      const language = codeLanguage(props.children);
-      if (language === 'mermaid') {
-        return <Mermaid chart={codeText(props.children)} />;
-      }
-      const Pre = defaultMdxComponents.pre ?? 'pre';
-      return <Pre {...props} />;
-    },
+    Mermaid,
     a: DocsLink,
     ...components,
   } satisfies MDXComponents;
