@@ -7717,7 +7717,7 @@ fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
     );
     assert!(
         show.stderr.contains(
-            "a previous session (fake-session-1) is on record and will be \
+            "a previous session is on record and will be \
                        offered via session/load at the next start"
         ),
         "the resume-at-next-start promise names the persisted session; stderr={}",

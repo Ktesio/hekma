@@ -1080,7 +1080,7 @@ fn persisted_session_resumes_via_session_load_at_the_next_start() {
         },
     );
     poll_until("the resumed-session note surfaced", || {
-        sink_text(&shared2).contains("resumed the previous ACP session (fake-session-1)")
+        sink_text(&shared2).contains("resumed the previous ACP session via session/load")
     });
     // The established id was re-persisted post-handshake (the fresh record).
     poll_until("the new Run's id persisted", || {
@@ -1367,11 +1367,11 @@ fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
         "a live orphan is adopted as running"
     );
     poll_until(
-        "the adoption note surfaced naming the recorded session",
+        "the adoption note surfaced with the resume-at-next-start promise",
         || {
             let captured = sink_text(&shared2);
             captured.contains("adopted an acp instance")
-                && captured.contains("fake-session-1")
+                && captured.contains("a previous session is on record")
                 && captured.contains("session/load at the next start")
         },
     );
@@ -1395,7 +1395,7 @@ fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
             .contains("session/load received: fake-session-1")
     });
     poll_until("the resumed-session note surfaced", || {
-        sink_text(&shared2).contains("resumed the previous ACP session (fake-session-1)")
+        sink_text(&shared2).contains("resumed the previous ACP session via session/load")
     });
 
     let _ = engine2.blocking().stop(name, None).expect("stop");

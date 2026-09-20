@@ -155,10 +155,12 @@ pub(crate) fn spawn_pipe_stdout(is_acp: bool, detach: bool) -> bool {
 /// (AI-18). `session` is the persisted id from the adopted spawn record.
 pub(crate) fn adopted_acp_note(name: &str, session: Option<&str>) -> String {
     let session_note = match session {
-        Some(id) => format!(
-            "a previous session ({id}) is on record and will be offered via session/load at \
+        // The id itself stays in the state DB (functional); the note
+        // surfaces only the fact + the promise (no opaque tokens in logs —
+        // CodeQL cleartext-logging).
+        Some(_) => "a previous session is on record and will be offered via session/load at \
              the next start (if the agent supports resuming)"
-        ),
+            .to_string(),
         None => "no previous session is on record — the next start opens a new session".to_string(),
     };
     format!(
@@ -177,9 +179,12 @@ pub(crate) fn adopted_acp_note(name: &str, session: Option<&str>) -> String {
 /// record).
 pub(crate) fn resume_outcome_note(name: &str, outcome: &client::Handshake) -> Option<String> {
     if outcome.resumed {
+        // The OUTCOME is what an operator acts on; the raw session id is
+        // deliberately NOT surfaced here (CodeQL cleartext-logging: opaque
+        // tokens stay out of log files — the full id lives in the state
+        // DB, where it is functional).
         return Some(format!(
-            "{name}: resumed the previous ACP session ({}) via session/load",
-            outcome.session_id,
+            "{name}: resumed the previous ACP session via session/load"
         ));
     }
     outcome
@@ -295,7 +300,10 @@ mod tests {
         // silent); the id-less variant names the honest absence instead.
         let note = adopted_acp_note("acp-1", Some("fake-session-1"));
         assert!(note.contains("acp-1"), "{note}");
-        assert!(note.contains("fake-session-1"), "{note}");
+        // The raw id is deliberately NOT in the surfaced note (cleartext-
+        // logging discipline) — the promise is, and the id lives in the DB.
+        assert!(!note.contains("fake-session-1"), "{note}");
+        assert!(note.contains("a previous session is on record"), "{note}");
         assert!(note.contains("session/load"), "{note}");
         let bare = adopted_acp_note("acp-1", None);
         assert!(bare.contains("no previous session"), "{bare}");
@@ -320,9 +328,12 @@ mod tests {
         };
         let note = resume_outcome_note("acp-1", &resumed).expect("resumed is surfaced");
         assert!(
-            note.contains("acp-1") && note.contains("fake-session-1"),
+            note.contains("acp-1") && note.contains("session/load"),
             "{note}"
         );
+        // The raw id is deliberately NOT in the surfaced note (cleartext-
+        // logging discipline) — it lives in the state DB.
+        assert!(!note.contains("fake-session-1"), "{note}");
         // A declined resume is surfaced with the reason (capability missing).
         let declined = Handshake {
             session_id: "s-2".to_string(),
