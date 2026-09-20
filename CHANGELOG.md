@@ -62,6 +62,36 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hekma-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh`), or `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEKMA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](docs/migration.md).
 
 
+## v0.9.0
+
+Comparison: [v0.8.1...v0.9.0](https://github.com/Ktesio/hekma/compare/v0.8.1...v0.9.0)
+
+| Platform | Target | Archive | Checksum |
+|----------|--------|---------|----------|
+| macOS Intel | `x86_64-apple-darwin` | [hekma-v0.9.0-x86_64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-apple-darwin.tar.gz.sha256) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | [hekma-v0.9.0-aarch64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-aarch64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-aarch64-apple-darwin.tar.gz.sha256) |
+| Windows x64 | `x86_64-pc-windows-msvc` | [hekma-v0.9.0-x86_64-pc-windows-msvc.zip](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-pc-windows-msvc.zip) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-pc-windows-msvc.zip.sha256) |
+| Linux x64 | `x86_64-unknown-linux-gnu` | [hekma-v0.9.0-x86_64-unknown-linux-gnu.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-unknown-linux-gnu.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-x86_64-unknown-linux-gnu.tar.gz.sha256) |
+| All | checksums | [hekma-v0.9.0-checksums.txt](https://github.com/Ktesio/hekma/releases/download/v0.9.0/hekma-v0.9.0-checksums.txt) | - |
+
+### Features
+
+- fully OSS — Apache-2.0, NOTICE added, CLA retained (v0.9.0) ([14fbf77](https://github.com/Ktesio/hekma/commit/14fbf77))
+
+### Fixes
+
+- sidebar brand + crates link still said Ktesio — the layout config escaped the rename ([249e300](https://github.com/Ktesio/hekma/commit/249e300))
+
+### Documentation
+
+- 'A Ktesio project ↗' -> ktesio.dev in the docs sidebar ([ee007b7](https://github.com/Ktesio/hekma/commit/ee007b7))
+- update release notes for v0.8.1 (#190) ([1b9b048](https://github.com/Ktesio/hekma/commit/1b9b048))
+- update release notes for v0.8.0 (#189) ([de0071e](https://github.com/Ktesio/hekma/commit/de0071e))
+
+### Maintenance
+
+- retrigger pages deploy (sidebar attribution) ([c49eaf3](https://github.com/Ktesio/hekma/commit/c49eaf3))
+
 ## v0.8.1
 
 Comparison: [v0.8.0...v0.8.1](https://github.com/Ktesio/hekma/compare/v0.8.0...v0.8.1)
