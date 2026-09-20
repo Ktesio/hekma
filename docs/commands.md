@@ -43,6 +43,64 @@ The `acp` kind's lifecycle semantics, where they differ from a plain process:
 
 > **Deprecation notice — the `hermes` kind.** The `hermes` builtin kind is **deprecated in favor of `--kind acp`**: Hermes Agent speaks the Agent Client Protocol natively (its `hermes-acp` entry point), and the generic `acp` kind runs it under the same supervision without a bespoke adapter. **New registrations should use `--kind acp`** (point `acp.command` at the `hermes-acp` executable). The `hermes` kind keeps working unchanged — this is an announcement, not a removal — and it will not be removed before a future **major** release, per the CLI-surface deprecation policy (announced ahead via these docs and the release notes; removal only at the stated major). Both migration parity items are shipped and tested with the `acp` kind: **metering** continues through the self-reported usage sentinel (under `acp` the sentinel channel is the agent's stderr, because its stdout is the ACP protocol stream), and **memory delivery** continues through `HERMES_HOME` — a `filesystem` Memory Backing attached to an `acp` instance is delivered into the agent's process environment exactly as under `hermes`.
 
+The whole journey, from registration to a clean stop (the engine runs for
+the duration of each command; `send` returns immediately and the turn
+streams in the background):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant E as Engine (per command)
+    participant A as ACP agent
+
+    Op->>E: agent config set <name> acp.command "…"
+    Op->>E: agent register <name> --kind acp
+    Op->>E: agent start <name>
+    E->>A: spawn → initialize → session/new
+    Note over E,A: state = running (session id persisted — schema v8)
+    Op->>E: agent send <name> "prompt"
+    E->>A: session/prompt (one text turn)
+    loop the turn (send already returned)
+        A-->>E: session/update → agent.log + events
+    end
+    A-->>E: prompt response (stopReason)
+    Op->>E: agent usage <name> / agent show <name>
+    Note over E: billing cells from the ledger ·<br/>context usage under acp_context_usage
+    Op->>E: agent stop <name>
+    E->>A: session/cancel (if a turn is in flight) → termination ladder
+    E-->>Op: state = stopped
+```
+
+And what a session survives — the engine does not: the agent (and its
+persisted session id) outlive any single command, and the resume happens
+at the next `start`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant E1 as Engine (start #1)
+    participant A as ACP agent (survives)
+    participant E2 as Engine (a later command)
+
+    Op->>E1: agent start <name>
+    E1->>A: initialize → session/new
+    Note over E1,A: session id PERSISTED on the spawn record (schema v8)
+    Note over E1: the engine exits (crash — or the command simply ends)
+    Note over A: the agent keeps running; the record survives
+    E2->>A: re-adopt (fingerprint match) — stderr names the recorded session id
+    Note over E2: the transport is not re-pipable: a send here fails honestly
+    Op->>E2: agent stop <name>
+    Op->>E2: agent start <name>
+    E2->>A: initialize (fresh pipes)
+    alt the agent advertised loadSession
+        E2->>A: session/load (the persisted id) — the conversation RESUMES
+    else resuming is not supported (or the load fails)
+        E2->>A: session/new + an honest note on stderr
+    end
+```
+
 ## `hekma agent list [--json]`
 
 List every Agent Instance in the Fleet.

@@ -64,6 +64,52 @@ A **Run** is the span from a `starting` transition to the next terminal state (`
 
 The builtin `acp` kind (AD-19) makes any Agent Client Protocol v1 agent a Hekma backend: the engine speaks JSON-RPC 2.0 over ndJSON on the child's stdio in the **client** role — `initialize` (protocol version 1, the protocol-default client capabilities: no filesystem, no terminal, no elicitation) → the agent's capabilities → `session/new` — before `start` reports `running`; `send` becomes one bounded `session/prompt` (constant-time; the turn's chunks and final stopReason stream asynchronously into the existing output-log/event machinery); `stop` writes `session/cancel` for an in-flight turn and then runs the ordinary termination ladder; a concurrent second prompt is the typed `AcpTurnInFlight` refusal (exit-code row 4 — the frozen table gained no new number); an incoming `session/request_permission` is answered denied with one surfaced diagnostic. The codec is **hand-rolled over `serde_json`** (already a dependency — no new crates; the official ACP SDK was evaluated and rejected for v1 on churn-vs-protocol-integer grounds, NFR-8), parsing tolerantly: unknown `session/update` variants are counted and surfaced as honest `Unhandled` diagnostics, and a malformed stdout line is skipped + counted, never fatal to the stream. The transport lives in `src/acp/` (`codec`/`client`/`updates`/`connection`) with no OS-conditional code (AD-4 — ndJSON framing is OS-uniform); the reader rides dedicated tasks off the engine mutexes (the AD-17/AD-18 lock discipline), and the child's stdout is piped to the engine only for a non-detached acp spawn (`SpawnSpec.pipe_stdout` — a detached start refuses: the pipe halves would die with the starting command). As a builtin it engages **no adapter-contract negotiation** (the epic-6 B3 precedent — no `contract_version` exchange for the `acp` kind), so its landing touched `hekma-adapter-api`'s public surface not at all. The launch is per-instance operator config (`acp.command`/`acp.args`) resolved at start; sessions persist as an additive nullable spawn-record column (schema v8) and resume at the NEXT START's handshake — `session/load` when the fresh agent advertises `loadSession`, else `session/new` with a surfaced note — because an adopted acp process is not re-piped (there is no OS-portable way to recover a stdio pipe from a bare fingerprint).
 
+The transport, end to end for one engine lifetime:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant E as Engine (hekma)
+    participant A as ACP agent (child process)
+
+    Op->>E: agent register <name> --kind acp
+    Op->>E: agent config set acp.command …
+    Op->>E: agent start <name>
+    E->>A: spawn (pipe stdin + stdout)
+    E->>A: initialize (protocol v1, default client capabilities)
+    A-->>E: negotiated version + agentCapabilities (loadSession?)
+    E->>A: session/new (cwd = the Agent Home)
+    E-->>Op: state = running (session id persisted, schema v8)
+    Op->>E: agent send <name> "prompt"
+    E->>A: session/prompt (text ContentBlock)
+    loop the turn streams asynchronously
+        A-->>E: session/update (chunks, tool calls, plan, usage_update)
+        E-->>E: append to agent.log + events (usage_update = context grain only)
+    end
+    A-->>E: prompt response (stopReason: end_turn)
+    Op->>E: agent stop <name>
+    E->>A: session/cancel (when a turn is in flight)
+    E->>A: termination ladder (bounded graceful window → escalate → confirm)
+    E-->>Op: state = stopped
+```
+
+And the metering tiers — which grain feeds which surface, and what happens
+when none does:
+
+```mermaid
+flowchart TD
+    A[acp instance] --> T1["T1 · usage_update on the ACP stream<br/>(CONTEXT grain: used / size / agent-reported cost)"]
+    T1 --> CS["surfaced on show / list / --json<br/>as acp_context_usage — NEVER the ledger"]
+    A --> T2["T2 · engine-observed loopback<br/>(metering.upstream_base_url)"]
+    T2 --> LED["[(Usage Ledger · input / output / cached)]"]
+    A --> T3["T3 · KTESIO_USAGE lines on stderr<br/>(self-reported sentinel)"]
+    T3 --> LED
+    LED --> BUD[budgets enforce · fleet cells<br/>+ the cached contribution]
+    NO[no billing tier produced usage] --> GAP["honest — cells + usage_gap notice<br/>(tiers attempted + the context state)"]
+    GAP -.->|never fabricated| BUD
+```
+
 **Usage is acquired tiered, and the two grains never mix.** The agent's `usage_update` notifications (T1) are **context-grain** — the agent's session context window, optionally with a self-reported cost — and are surfaced only: the latest figure rides the Fleet entry's additive `acp_context_usage` view (its own `show` row, the `--json` field) and is **never minted into the billing ledger** (minting a context figure would fabricate a billing record — AD-8). Billing-grade input/output/cached tokens come only from T2/T3: the **engine-observed loopback channel** (above — the acp kind honors the same `metering.upstream_base_url` opt-in and resolves its active source from it), or the **self-reported sentinel on the agent's stderr** (an acp child's stdout is the protocol stream, so its cooperative `KTESIO_USAGE` lines ride stderr; the same AI-41-parked drain feeds the ledger, cached subset included). When no tier yields billing-grade usage, the Fleet read composes the honest **usage-gap notice**: the token/cost cells render `—` (never a fabricated zero), and the notice names the tiers attempted (`observed: configured|not-configured`, `sentinel: lines-seen|no-lines-seen`) plus the context-usage state — "context usage reported; billing-grade unavailable" is a different fact from "no usage signal", and the surfaces say which.
 
 Ingestion is idempotent by construction: each event carries the agent-supplied `sequence` ordinal, recorded under a `UNIQUE(instance_id, run_id, sequence)` index, so a **delayed or replayed batch is recognized and skipped, not double-counted** — "no double-count" is a database invariant, not fragile application bookkeeping. All usage writes funnel through **one** engine choke point (the sole `usage_events` writer — no other code path may mutate the ledger), so token-budget enforcement (Epic 3.2) slots into that same commit path with no re-plumbing. The committed event also rides the versioned event schema as a `usage update` struct, published onto the bounded event bus at its ledger commit (story 7.2), so `hekma --json` and the Host stream stay one schema (AD-14).
