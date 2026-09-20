@@ -4,7 +4,7 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
-> **Unreleased — epic 14 in review: ACP backend support (the builtin `acp` kind).**
+> **Unreleased — ACP backend support (the builtin `acp` kind).**
 > Announced ahead of the release that ships it:
 >
 > - **New builtin `acp` kind** — any Agent Client Protocol (ACP) v1 agent runs under full supervision via `kt agent register <name> --kind acp` + the `acp.command`/`acp.args` config keys. `send` = one `session/prompt` turn (returns immediately; chunks + stop reason stream to the log/events); `stop` sends `session/cancel` first; a concurrent second prompt is refused (typed, surfaced); permissions are denied with a surfaced diagnostic; detached acp starts are refused (the transport needs the pipes). Client capabilities advertised = the protocol default (no fs/terminal/elicitation in v1).
