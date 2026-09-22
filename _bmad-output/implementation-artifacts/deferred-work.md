@@ -14,8 +14,17 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 ## From AI-17 (pin workspace toolchain to 1.96.1) — review, 2026-07-06
 
 - **Contributor docs still tell contributors to run bare `cargo` (fmt/clippy/test).** With the new `rust-toolchain.toml`, bare `cargo` resolves to the MSRV (1.96.1) locally for contributors without a `RUSTUP_TOOLCHAIN` override, while CI's fmt/clippy/test jobs now gate on latest `stable` (explicit `+stable`). This local-vs-CI toolchain skew is intentional but is not documented in the other contributor-facing files. Consider a one-line note (or a `+stable` reproduction hint) in: `CONTRIBUTING.md` (~L89-91), `docs/contributing.md` (~L15-24), `AGENTS.md` (~L14-16), `.github/pull_request_template.md` (~L7-9), `docs/github-repository-audit-checklist.md` (~L167-169), `.agents/skills/kt-release/SKILL.md` (~L58), and `scripts/prepare_kt_release.py` (~L244-246). `docs/testing.md` already documents the split; the rest do not. Low severity (surfaces as an occasional new-stable clippy/rustfmt CI nit, not a shipped bug).
+  resolved: 2026-09-22 hardening batch (after docs/contributing.md + the PR template
+  landed the note earlier) — CONTRIBUTING.md, the repository-audit checklist, and
+  .agents/skills/kt-release/SKILL.md now carry the MSRV-vs-+stable note; the
+  named scripts/prepare_kt_release.py path no longer exists (the script lives in
+  the skill, whose reference was fixed to the full path).
 
 - **Coverage CI job rebuilds `cargo-tarpaulin` on every fresh runner (no binary cache).** Pre-existing (predates AI-17): the `coverage` job in `.github/workflows/ci.yml` runs an unguarded `cargo install cargo-tarpaulin` with no `~/.cargo/bin` cache, so it recompiles tarpaulin (~several minutes) every run. The `semver` job already added a `${{ runner.os }}-cargo-semver-checks-bin` cache + `command -v` guard (AI-1); the coverage job could adopt the same pattern for symmetry and CI speed.
+  resolved: the AI-23 coverage-cache work — the coverage job now has a dedicated
+  `cargo-tarpaulin-bin` cache step (restore-keys seeded) plus the `command -v`
+  guarded `cargo +stable install` (marker appended by the 2026-09-22 hardening
+  batch; the fix shipped before the convention caught up).
 
 ## From Story 5-1 (managed filesystem Memory Backing) — three-layer review, 2026-08-23
 
@@ -26,6 +35,11 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: SQLite migration steps are not crash-atomic — each SCHEMA_Vn batch runs before its `PRAGMA user_version` stamp, so a crash between them re-runs the batch on reopen and dies on "table already exists".
   evidence: Pre-existing pattern for V1→V4 (this story only followed it for V5); never observed in the wild because the batch+stamp window is milliseconds and desktop state DBs are small. Proper fix = wrap each step in BEGIN IMMEDIATE…COMMIT across ALL versions, one focused migration-hardening change.
+  resolved: story 11-3 (B3, PR #181 / bee7d48) 2026-09-11 — `migrate_step` runs each
+  version's DDL and its user_version stamp inside ONE BEGIN IMMEDIATE transaction,
+  with the legacy-freeze fail-loud contract pinned (`migration_legacy_freeze_in_the_alter_window_fails_loud`)
+  (marker appended by the 2026-09-22 hardening batch; the fix shipped before the
+  convention caught up).
 
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Semantic split between store and registry — `StateStore::upsert_memory_backing` documents REPLACE-on-re-attach (kind + timestamp overwritten) while `Registry::attach_memory` promises idempotent re-attach keeps the original timestamp and never changes kind; any future caller bypassing the registry guard can violate the A-6 invariant through sanctioned store behavior.
@@ -34,6 +48,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Integration test helpers (fake-manifest writer, dump polling, tree snapshotting in tests/memory.rs) duplicate shapes already living in sibling integration files rather than a shared test-support utility.
   evidence: Same pattern grew per-file across registration/lifecycle/pause/interaction/logs/metering; each story copied the smallest shape it needed. Cost compounds across Epics 6–7 when manifest fixtures evolve (e.g. contract_version bumps touch N copies). Candidate: a `tests/support/` module (or `ktesio-conformance` test-fixture exports) once Epic 6's conformance kit forces the shape anyway. **Census update (Epic-7 review, 2026-09-09):** the duplication has grown — alongside `uj3::write_flow_manifest` there are now FIVE more near-identical manifest TOML writers (three in `crates/ktesio-engine/tests/events_subscription.rs` — `write_fake_manifest`/`write_lingering_manifest`/`write_crash_once_manifest` — the perf-budgets harness's `write_heartbeat_manifest`, and the embedding quickstart's `write_manifest`, the last deliberately standalone host code a consolidation must NOT absorb), plus two lag-accumulating `try_recv` drain implementations. A consolidation pass should fold the test-side writers into one shared fixture export and note which copies are load-bearing.
+  resolved: 2026-09-22 hardening batch — the seven identical write_fake_manifest copies
+  (budget, crash, fleet_totals, metering, lifecycle, cost, adoption) now delegate to
+  `hekma_conformance::test_support::ManifestFixture` (the perf harness already used
+  `heartbeat` since 10-3). The four remaining local writers (interaction, pause,
+  observed_metering, memory) are genuinely parametrized per-suite shapes
+  (runtime capability levels / injected config sections), not duplication — the
+  consolidation is complete under the census's own load-bearing-copies rule.
 
 ## Deferred from: code review of 5-2-delegate-to-native-memory-with-an-explicit-boundary (2026-08-24)
 
@@ -137,9 +158,18 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: A detached child that exits long after its handle dropped is reaped only once at drop — a long-lived embedding host can accumulate zombie entries until the host exits (kt CLI processes exit immediately, so CLI usage is unaffected).
   evidence: epic-12 step-04 edge-case-hunter (round 1, 2026-09-15) — a lazy-reaper arm in the backend (poll detached children this process spawned) is a small design task for an embedding-focused story.
+  resolved: 2026-09-22 hardening batch — the detached arm of `UnixProcess::drop`
+  hands a still-alive child to `spawn_detached_reaper` (a blocking wait thread,
+  AD-12 thread precedent; zero shared state), pinned by
+  `a_detached_handle_dropped_while_the_child_is_alive_reaps_the_later_exit`
+  (ECHILD observable).
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: In-memory park loss at engine death (observed pending buffer + self-reported parked tail die with the process) is acknowledged only in a code comment — the AI-18 comment-only-caveat shape; the crash window skips un-drained usage silently at adoption (cursor re-drifts to log end).
   evidence: epic-12 step-04 blind-hunter (round 1, 2026-09-15) — pre-existing crash-window family from Epic 3; an adoption-time diagnostic naming the possible un-flushed usage window would make it surfaced-not-silent.
+  resolved: 2026-09-22 hardening batch — the successful-adoption path emits the
+  park-loss note through the DiagnosticSink choke point
+  (`domain/supervisor/reaper.rs` adopt_orphans), pinned by
+  `adopt_orphans_surfaces_the_park_loss_window_on_a_successful_adoption`.
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md` (story 12-1, triaged 2026-09-15 from the windows-latest CI hang)
   summary: On Windows, a DETACHED agent ends up holding its spawning `kt` command's stdio pipe write-ends — any script that CAPTURES `kt agent start --detach` output (pipes) blocks until the agent exits; interactive terminals are unaffected (no pipes).
   evidence: the CLI detach test's forensic harness (agent_cli.rs `run_kt_agent_bounded`, 56ee766) proved kt EXITS (~1s, try_wait Ok(Some)) while its stdout/stderr pipes never EOF; std's spawn is documented to restrict inheritance to the child's own three stdio handles (attribute list), so the leak mechanism is unexpected — investigate (suspects: the Stdio::from(file) inheritable-dup path interacting with the job assignment, or a std behavior change) before fixing (candidates: explicit handle pinning at the Windows detached spawn, or DETACHED_PROCESS when the capture files already carry the output).

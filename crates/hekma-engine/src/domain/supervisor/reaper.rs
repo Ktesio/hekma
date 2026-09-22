@@ -618,6 +618,22 @@ impl Supervisor {
                     // the post-adoption span without re-attributing (or double-
                     // counting) the old Run's already-captured usage; the DB dedup key
                     // includes the run id, so even an overlapping sequence is safe.
+                    //
+                    // AI-18 (surfaced-not-silent, 2026-09-22 hardening): the cursor
+                    // re-derivation skips everything the previous engine had NOT
+                    // yet flushed — its in-memory park (the observed pending buffer
+                    // and the self-reported parked tail die with the process). An
+                    // adoption previously noted only the detach/session facts; the
+                    // un-flushed window went unmentioned (the AI-18 comment-only-
+                    // caveat shape). This diagnostic names it, once per successful
+                    // adoption, through the choke point.
+                    self.emit_diagnostic(&format!(
+                        "{}: adopted from a previous engine; metering resumes at the \
+                         current end of the instance logs — any usage the previous \
+                         engine still held in memory (its park) at its death is not \
+                         recoverable and goes unaccounted",
+                        name.as_str(),
+                    ));
                     let run_id = RunId::mint();
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
