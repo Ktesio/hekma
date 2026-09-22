@@ -145,7 +145,7 @@ Interaction channel wiring. Optional: omitting this section entirely still means
 |-------|------|---------|
 | `channel` | closed enum | The interaction channel: `"stdio"` (the spawned child's OS stdin pipe) or `"http"` (an HTTP-native interaction surface, e.g. an agent's loopback server). An unrecognized value is rejected at parse time. |
 
-`"http"` is documentary vocabulary (contract v1, CP-6.5-a option (i)): it names where the adapter's agent really takes interaction, so an HTTP-native agent declares `interaction` supported honestly. v1 ships no engine-side HTTP delivery — the engine does not branch on the declared channel, and `hekma agent send` still writes the child's stdin; an adapter whose agent cannot read stdin should declare `interaction` unsupported on OSes where that is true (an adapter whose ONLY capability key is declared unsupported everywhere is rejected as non-viable). A real HTTP send implementation is a post-v1 change under the [versioning policy](adapter-contract.md#versioning).
+`"http"` is documentary vocabulary (contract v1): it names where the adapter's agent really takes interaction, so an HTTP-native agent declares `interaction` supported honestly. v1 ships no engine-side HTTP delivery — the engine does not branch on the declared channel, and `hekma agent send` still writes the child's stdin; an adapter whose agent cannot read stdin should declare `interaction` unsupported on OSes where that is true (an adapter whose ONLY capability key is declared unsupported everywhere is rejected as non-viable). A real HTTP send implementation is a post-v1 change under the [versioning policy](adapter-contract.md#versioning).
 
 ### `[config]` — unified → native config mapping
 

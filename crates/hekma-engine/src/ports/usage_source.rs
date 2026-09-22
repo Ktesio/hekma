@@ -57,14 +57,25 @@ pub const USAGE_SENTINEL_PREFIX: &str = "KTESIO_USAGE ";
 /// timestamp) are added by the commit choke point when it constructs the full
 /// [`UsageEvent`] — this carries ONLY what the agent reports, so the port never
 /// mints a Run id or writes the ledger.
+///
+/// `cached_tokens` (story 14-6, D8) is the cached SUBSET of `input_tokens`
+/// under the ledger's INPUT-INCLUSIVE invariant (`0 <= cached <= input` — see
+/// [`crate::metering::parse`]'s module docs): the agent's reported
+/// `input_tokens` INCLUDES the cached portion. A sentinel line without the
+/// optional `cached_tokens` field parses as known-zero (the agent claimed no
+/// cached tokens — an honest conservative reading, never a fabricated count).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParsedUsage {
     /// The per-Run-monotonic replay-dedup ordinal the agent stamped (AC-A key).
     pub sequence: u64,
-    /// Input (prompt) tokens the agent reported.
+    /// Input (prompt) tokens the agent reported — INCLUSIVE of the cached
+    /// subset (`0 <= cached_tokens <= input_tokens`, the 14-6 invariant).
     pub input_tokens: u64,
     /// Output (completion) tokens the agent reported.
     pub output_tokens: u64,
+    /// The cached subset of `input_tokens` (story 14-6). A line without the
+    /// optional field reports known-zero.
+    pub cached_tokens: u64,
 }
 
 /// The wire shape of the `{json}` in a `KTESIO_USAGE {json}` sentinel line.
@@ -73,12 +84,15 @@ pub struct ParsedUsage {
 /// body. `deny_unknown_fields` keeps a typo'd field an honest parse failure (the
 /// line is skipped) rather than a silently-dropped value. Field names are
 /// snake_case (AD-14), matching the `usage_events` column names.
+/// `cached_tokens` is OPTIONAL (story 14-6): an absence parses as known-zero so
+/// every pre-14-6 emitter's line still parses byte-identically.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageLine {
     sequence: u64,
     input_tokens: u64,
     output_tokens: u64,
+    cached_tokens: Option<u64>,
 }
 
 /// Parse ONE captured agent-output line into a [`ParsedUsage`], or `None` if it
@@ -96,14 +110,28 @@ struct UsageLine {
 ///
 /// Pure — no I/O, no OS cfg. The leading/trailing whitespace of the whole line is
 /// tolerated (a captured line may carry a trailing `\r` on some platforms).
+///
+/// The optional `cached_tokens` field (story 14-6) is the cached SUBSET of
+/// `input_tokens` under the INPUT-INCLUSIVE invariant — a line whose cached
+/// count EXCEEDS its input count is malformed (nonsense under the invariant)
+/// and is skipped, exactly like a bad type.
 pub fn parse_usage_line(line: &str) -> Option<ParsedUsage> {
     let line = line.trim();
     let body = line.strip_prefix(USAGE_SENTINEL_PREFIX)?;
     let parsed: UsageLine = serde_json::from_str(body.trim()).ok()?;
+    // Absent optional field → known-zero (the agent claimed no cached tokens).
+    let cached_tokens = parsed.cached_tokens.unwrap_or(0);
+    // THE INPUT-INCLUSIVE INVARIANT (14-6): input_tokens includes the cached
+    // subset, so cached > input is a malformed report — skip the line, never a
+    // clamped or fabricated shape.
+    if cached_tokens > parsed.input_tokens {
+        return None;
+    }
     Some(ParsedUsage {
         sequence: parsed.sequence,
         input_tokens: parsed.input_tokens,
         output_tokens: parsed.output_tokens,
+        cached_tokens,
     })
 }
 
@@ -218,8 +246,10 @@ impl ObservedUsageSource {
     /// yields exactly the same AGENT-half shape the self-reported parser yields, so
     /// the two sources are indistinguishable downstream of the choke point (except
     /// the `engine-observed` tag the commit stamps). `input`/`output` map from the
-    /// OpenAI `prompt_tokens`/`completion_tokens` the listener parsed.
-    pub fn mint(&self, input: u64, output: u64) -> ParsedUsage {
+    /// OpenAI `prompt_tokens`/`completion_tokens` the listener parsed; `cached`
+    /// (story 14-6) is the cached SUBSET of `input` under the INPUT-INCLUSIVE
+    /// invariant (the parse layer enforces `cached <= input`).
+    pub fn mint(&self, input: u64, output: u64, cached: u64) -> ParsedUsage {
         let sequence = self
             .next_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -227,6 +257,7 @@ impl ObservedUsageSource {
             sequence,
             input_tokens: input,
             output_tokens: output,
+            cached_tokens: cached,
         }
     }
 }
@@ -245,17 +276,35 @@ impl Default for ObservedUsageSource {
 /// This is the ONE canonical formatter; the `fake_agent` emitter re-implements the
 /// same shape in pure `std` (it cannot depend on the engine), and the parser round-
 /// trips it — a unit test asserts they agree.
+///
+/// The optional `cached_tokens` field (story 14-6) is emitted ONLY when
+/// non-zero, so a no-cache event's line stays BYTE-IDENTICAL to the pre-14-6
+/// convention (an older line consumer never sees a field it does not know);
+/// the parser reads an absent field as known-zero, so the omission is lossless.
 pub fn format_usage_line(usage: &ParsedUsage) -> String {
-    format!(
-        "{USAGE_SENTINEL_PREFIX}{{\"sequence\":{},\"input_tokens\":{},\"output_tokens\":{}}}",
-        usage.sequence, usage.input_tokens, usage.output_tokens
-    )
+    if usage.cached_tokens > 0 {
+        format!(
+            "{USAGE_SENTINEL_PREFIX}{{\"sequence\":{},\"input_tokens\":{},\"output_tokens\":{},\
+             \"cached_tokens\":{}}}",
+            usage.sequence, usage.input_tokens, usage.output_tokens, usage.cached_tokens
+        )
+    } else {
+        format!(
+            "{USAGE_SENTINEL_PREFIX}{{\"sequence\":{},\"input_tokens\":{},\"output_tokens\":{}}}",
+            usage.sequence, usage.input_tokens, usage.output_tokens
+        )
+    }
 }
 
 /// Assemble a full [`UsageEvent`] from the agent-supplied [`ParsedUsage`] plus the
 /// engine-stamped fields (spine AD-7). The commit choke point calls this — it is
 /// the ONE place the two halves are joined, so the AD-7 minimum shape is
 /// constructed identically everywhere. Pure (no I/O).
+///
+/// The parsed cached count (story 14-6) is stamped as a KNOWN value (`Some`) —
+/// every freshly-assembled event knows its cached subset (known-zero allowed);
+/// `None` on the event type is reserved for a PRE-v7 ledger row's unknown
+/// cached count (the additive v7 column is NULL there).
 pub fn assemble_usage_event(
     parsed: &ParsedUsage,
     instance: &str,
@@ -268,6 +317,7 @@ pub fn assemble_usage_event(
         run_id,
         input_tokens: parsed.input_tokens,
         output_tokens: parsed.output_tokens,
+        cached_tokens: Some(parsed.cached_tokens),
         metering_source: metering_source.to_string(),
         sequence: parsed.sequence,
         occurred_at,
@@ -292,6 +342,7 @@ mod tests {
                 sequence: 2,
                 input_tokens: 11,
                 output_tokens: 22,
+                cached_tokens: 0,
             }
         );
     }
@@ -315,6 +366,9 @@ mod tests {
             "KTESIO_USAGE {\"sequence\":1,\"input_tokens\":1,\"output_tokens\":1,\"extra\":9}", // unknown field
             "KTESIO_USAGE {\"sequence\":\"x\",\"input_tokens\":1,\"output_tokens\":1}", // wrong type
             "KTESIO_USAGE ", // empty body
+            // 14-6: a cached count ABOVE the input total violates the
+            // INPUT-INCLUSIVE invariant (input includes cached) — malformed.
+            "KTESIO_USAGE {\"sequence\":1,\"input_tokens\":5,\"output_tokens\":1,\"cached_tokens\":6}",
         ];
         for line in bad {
             assert_eq!(parse_usage_line(line), None, "must skip: {line}");
@@ -330,6 +384,31 @@ mod tests {
         )
         .expect("trailing CR tolerated");
         assert_eq!(parsed.sequence, 0);
+    }
+
+    #[test]
+    fn parses_an_optional_cached_tokens_field() {
+        // 14-6: the optional `cached_tokens` field parses as the cached SUBSET of
+        // input_tokens (the INPUT-INCLUSIVE invariant — the agent's input_tokens
+        // already includes it).
+        let parsed = parse_usage_line(
+            "KTESIO_USAGE {\"sequence\":3,\"input_tokens\":100,\"output_tokens\":20,\"cached_tokens\":80}",
+        )
+        .expect("a line with cached_tokens parses");
+        assert_eq!(parsed.cached_tokens, 80);
+        assert_eq!(parsed.input_tokens, 100);
+    }
+
+    #[test]
+    fn a_pre_14_6_line_without_cached_tokens_is_known_zero() {
+        // BACKWARD COMPATIBILITY PIN: every pre-14-6 emitter's line (no
+        // cached_tokens field) still parses byte-identically, with the absent
+        // optional field read as known-ZERO (the agent claimed no cached tokens).
+        let parsed = parse_usage_line(
+            "KTESIO_USAGE {\"sequence\":1,\"input_tokens\":10,\"output_tokens\":20}",
+        )
+        .expect("the legacy line shape still parses");
+        assert_eq!(parsed.cached_tokens, 0);
     }
 
     #[test]
@@ -365,10 +444,24 @@ mod tests {
             sequence: 9,
             input_tokens: 123,
             output_tokens: 456,
+            cached_tokens: 0,
         };
         let line = format_usage_line(&usage);
         assert!(line.starts_with(USAGE_SENTINEL_PREFIX));
         assert_eq!(parse_usage_line(&line), Some(usage));
+        // A non-zero cached subset rides the line (14-6) and round-trips.
+        let cached = ParsedUsage {
+            sequence: 10,
+            input_tokens: 200,
+            output_tokens: 30,
+            cached_tokens: 150,
+        };
+        let cached_line = format_usage_line(&cached);
+        assert!(
+            cached_line.contains("\"cached_tokens\":150"),
+            "{cached_line}"
+        );
+        assert_eq!(parse_usage_line(&cached_line), Some(cached));
     }
 
     #[test]
@@ -377,20 +470,22 @@ mod tests {
         // (prompt→input, completion→output) onto a per-Run monotonic `sequence`
         // starting at 0, incrementing once per observed completion.
         let source = ObservedUsageSource::new();
-        let first = source.mint(128, 512);
+        let first = source.mint(128, 512, 100);
         assert_eq!(
             first,
             ParsedUsage {
                 sequence: 0,
                 input_tokens: 128,
                 output_tokens: 512,
+                cached_tokens: 100,
             }
         );
-        let second = source.mint(7, 3);
+        let second = source.mint(7, 3, 0);
         assert_eq!(second.sequence, 1, "sequence increments per observed event");
         assert_eq!(second.input_tokens, 7);
         assert_eq!(second.output_tokens, 3);
-        let third = source.mint(0, 0);
+        assert_eq!(second.cached_tokens, 0, "a cache miss mints known-zero");
+        let third = source.mint(0, 0, 0);
         assert_eq!(third.sequence, 2);
     }
 
@@ -399,7 +494,7 @@ mod tests {
         // The engine-minted ordinal must be UNIQUE within a Run (the dedup index),
         // and a FRESH source (a new Run) resets to 0 — mirroring the per-Run cursor.
         let run1 = ObservedUsageSource::new();
-        let seqs: Vec<u64> = (0..100).map(|_| run1.mint(1, 1).sequence).collect();
+        let seqs: Vec<u64> = (0..100).map(|_| run1.mint(1, 1, 0).sequence).collect();
         let mut sorted = seqs.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -413,7 +508,7 @@ mod tests {
         // A new Run's source starts fresh at 0 (the per-Run reset).
         let run2 = ObservedUsageSource::new();
         assert_eq!(
-            run2.mint(5, 5).sequence,
+            run2.mint(5, 5, 0).sequence,
             0,
             "a fresh Run resets the ordinal"
         );
@@ -428,6 +523,7 @@ mod tests {
             sequence: 4,
             input_tokens: 8,
             output_tokens: 16,
+            cached_tokens: 5,
         };
         let event = assemble_usage_event(
             &parsed,
@@ -440,6 +536,11 @@ mod tests {
         assert_eq!(event.run_id.as_str(), "run-xyz");
         assert_eq!(event.input_tokens, 8);
         assert_eq!(event.output_tokens, 16);
+        assert_eq!(
+            event.cached_tokens,
+            Some(5),
+            "a fresh event's cached is KNOWN"
+        );
         assert_eq!(event.metering_source, "self-reported");
         assert_eq!(event.sequence, 4);
         assert_eq!(event.occurred_at, "2026-07-06T00:00:00Z");

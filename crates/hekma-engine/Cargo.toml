@@ -1,6 +1,6 @@
 [package]
 name = "hekma-engine"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Ktesio agent-runner engine; its public API is the Embedding Interface"

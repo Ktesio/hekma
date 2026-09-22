@@ -101,6 +101,38 @@ impl Supervisor {
                 detail: "no live process handle is held in this engine session".to_string(),
             });
         };
+
+        // (3-acp) Story 14-1 (spine AD-19): the acp arm. The connection owns
+        // the child's stdin (taken from the handle at start), so the legacy
+        // pipe checks below do not apply. A prompt is ONE `session/prompt`
+        // request (ONE text ContentBlock) written through the connection's
+        // bounded-writer mutex, and this method returns IMMEDIATELY after the
+        // bounded write — the turn's chunks + final stopReason land
+        // asynchronously in the output log via the reader. A SECOND prompt
+        // while a turn is in flight is the surfaced typed refusal (ACP
+        // serializes turns per session); the first turn is unaffected.
+        if let Some(connection) = supervised.acp.as_ref() {
+            if connection.turn_in_flight() {
+                return Err(EngineError::AcpTurnInFlight {
+                    name: name.as_str().to_string(),
+                });
+            }
+            return match connection.send_prompt(text) {
+                Ok(()) => Ok(()),
+                Err(crate::acp::PromptError::InFlight) => Err(EngineError::AcpTurnInFlight {
+                    name: name.as_str().to_string(),
+                }),
+                Err(crate::acp::PromptError::TimedOut) => Err(EngineError::InteractionTimedOut {
+                    name: name.as_str().to_string(),
+                    timeout_secs: crate::ports::STDIN_WRITE_TIMEOUT.as_secs(),
+                }),
+                Err(err) => Err(EngineError::InteractionUnavailable {
+                    name: name.as_str().to_string(),
+                    detail: err.to_string(),
+                }),
+            };
+        }
+
         // Fix pass (CRITICAL finding, review of #79): a cheap, no-I/O check
         // FIRST — a handle whose prior write already exceeded the bounded
         // timeout is PERMANENTLY broken for the rest of this engine session
@@ -347,6 +379,16 @@ impl Supervisor {
     /// Run never re-reads a prior Run's already-captured lines.
     pub(super) fn agent_log_len(&self, registry: &Registry, name: &InstanceName) -> u64 {
         std::fs::metadata(registry.agent_output_log_path(name))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// The current byte length of an instance's captured STDERR log, or 0 if
+    /// it does not exist yet (story 14-3, T3) — the anchor for the acp kind's
+    /// stderr sentinel cursor, mirroring [`Self::agent_log_len`] exactly (the
+    /// same pre-spawn anchoring rule, its own crash-immune file).
+    pub(super) fn agent_stderr_log_len(&self, registry: &Registry, name: &InstanceName) -> u64 {
+        std::fs::metadata(registry.agent_stderr_log_path(name))
             .map(|m| m.len())
             .unwrap_or(0)
     }

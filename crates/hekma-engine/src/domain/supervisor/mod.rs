@@ -535,6 +535,30 @@ struct Supervised {
     /// with a loud diagnostic, so a permanently poisoned row cannot wedge the
     /// cursor (and silently strand every later usage event for the Run) forever.
     usage_park_attempts: Option<(u64, u32)>,
+    /// The STDERR sentinel channel's byte cursor (story 14-3, T3) — the
+    /// acp-kind twin of [`Supervised::usage_cursor`], anchored the same way
+    /// (at the captured stderr log's pre-spawn length) and advanced by the
+    /// SAME AI-41 discipline. An acp instance's stdout is the ACP protocol
+    /// stream, so its self-reported sentinel lines arrive on STDERR, which
+    /// the backend captures into `agent-stderr.log`; this cursor keeps the
+    /// two channels' drains disjoint. Zero for a non-acp instance (never
+    /// drained).
+    stderr_usage_cursor: u64,
+    /// The stderr sentinel channel's AI-41 park (the exact twin of
+    /// [`Supervised::usage_park_attempts`], per channel — a store error on
+    /// one channel must not wedge the other's retry identity).
+    stderr_usage_park_attempts: Option<(u64, u32)>,
+    /// Story 14-3 (T3): whether ANY well-formed `KTESIO_USAGE` sentinel line
+    /// has been parsed from either self-reported channel this Run. The honest
+    /// gap notice reports "lines seen" vs "no lines seen" from THIS flag (a
+    /// parse-time fact about the agent's behavior), never inferred from the
+    /// ledger. Resets with the Run (a fresh `Supervised` starts false).
+    sentinel_lines_seen: bool,
+    /// Story 14-3 (T2): whether this Run's instance is the builtin `acp`
+    /// kind. Gates the stderr sentinel drain (acp-only: every other kind's
+    /// sentinel channel is stdout) — a plain fact carried beside the handle
+    /// so the drain cadence never re-reads the registry per tick.
+    is_acp: bool,
     /// Story 12-4: the OBSERVED channel's park — `Some((pending, attempts))`
     /// while a store error keeps minted-but-uncommitted observed events parked
     /// (the analog of `usage_park_attempts`, which is the SELF-REPORTED
@@ -603,6 +627,17 @@ struct Supervised {
     /// freshly spawned process (whose `code: None` genuinely means "terminated by
     /// a signal" — `try_wait` had the authoritative `ExitStatus`).
     adopted: bool,
+    /// The instance's ACP connection (story 14-1, spine AD-19) — `Some` only
+    /// for a freshly started `acp` instance whose handshake + `session/new`
+    /// completed this engine lifetime. Holds the reader thread's shared
+    /// state, the bounded writer, the session id, the in-flight-turn flag,
+    /// and the surfaced-notice queue (drained by the reaper cadence through
+    /// `emit_diagnostic`). `None` for every other kind and for an ADOPTED
+    /// `acp` instance (its pipe halves died with the spawning engine; the
+    /// honest adoption note says so; `session/load` resume is story 14-2).
+    /// Dropping the `Supervised` drops the connection, which closes the
+    /// child's stdin — the connection teardown on stop/drop/terminal-settle.
+    acp: Option<crate::acp::AcpConnection>,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -917,6 +952,99 @@ impl Supervisor {
             None => {
                 let _ = std::io::stderr().write_all(line.as_bytes());
             }
+        }
+    }
+
+    // ---- ACP transport support (story 14-1, spine AD-19) ----
+
+    /// Drain ONE instance's ACP connection's surfaced notices through
+    /// `emit_diagnostic` (the choke point). The reader thread queues
+    /// malformed-line, permission-denial, usage-update, unhandled-message,
+    /// and stream-end facts WITHOUT ever taking the supervisor lock; the
+    /// supervisor's OWN cadence (the crash-reaper tick — this method's
+    /// callers) drains them HERE, under the supervisor lock the choke point
+    /// requires. Best-effort: an instance with no connection (or a dropped
+    /// one) is a no-op.
+    pub(super) fn drain_acp_notices_for(&mut self, name: &InstanceName) {
+        let Some(notices) = self
+            .running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+            .map(|connection| connection.drain_notices())
+        else {
+            return;
+        };
+        // The reader queues are bounded (overflow is announced INSIDE the
+        // drain), so this loop is bounded — the AD-17/AD-18 rule holds.
+        for notice in notices {
+            let line = format!("{}: {notice}", name.as_str());
+            self.emit_diagnostic(&line);
+        }
+    }
+
+    /// Drain EVERY running instance's ACP notices (the reaper-tick shape,
+    /// mirroring `drain_usage_all`/`drain_observed_all`). Called at the top
+    /// of [`Supervisor::poll_once`].
+    pub(super) fn drain_acp_notices_all(&mut self) {
+        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in names {
+            self.drain_acp_notices_for(&name);
+        }
+    }
+
+    /// The LATEST context-usage figure an instance's live ACP connection has
+    /// reported (story 14-3, T1), or `None` when the instance is not running,
+    /// is not the `acp` kind, or its agent has not sent a `usage_update` yet
+    /// this Run. The Fleet read (`fleet_entry_for`) surfaces it as the
+    /// `acp_context_usage` view — CONTEXT-grain by name, never a billing
+    /// figure. A short bounded read under the supervisor lock (the caller
+    /// already holds it), mirroring `current_run_id`'s shape.
+    pub(crate) fn acp_context_usage(
+        &self,
+        name: &InstanceName,
+    ) -> Option<crate::acp::AcpContextUsage> {
+        self.running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+            .and_then(|connection| connection.context_usage())
+    }
+
+    /// Whether ANY sentinel line has been seen for the instance this Run
+    /// (story 14-3, T3 — the gap notice's sentinel tier state). `false` when
+    /// the instance has no live supervision state (never started this
+    /// lifetime, or already torn down): the Fleet read then falls back to the
+    /// ledger-derived truth (no committed usage ⇒ none seen).
+    pub(crate) fn sentinel_lines_seen(&self, name: &InstanceName) -> bool {
+        self.running
+            .get(name)
+            .is_some_and(|supervised| supervised.sentinel_lines_seen)
+    }
+
+    /// Write `session/cancel` for an instance's in-flight ACP turn (the
+    /// stop path calls this BEFORE the termination ladder — spine AD-19:
+    /// cancel, then the normal stop proceeds). Best-effort + surfaced: a
+    /// cancellation that could not be WRITTEN (the bounded write timed out
+    /// or the pipe broke) emits ONE diagnostic naming why, and the stop
+    /// ladder still runs unchanged. When no turn is in flight, this is a
+    /// silent no-op (there is nothing to cancel — no diagnostic, no write).
+    pub(super) fn cancel_in_flight_acp_turn(&mut self, name: &InstanceName) {
+        let Some(connection) = self
+            .running
+            .get(name)
+            .and_then(|supervised| supervised.acp.as_ref())
+        else {
+            return;
+        };
+        if !connection.turn_in_flight() {
+            return;
+        }
+        if let Err(detail) = connection.cancel_turn() {
+            let note = format!(
+                "{}: the session/cancel for the in-flight ACP turn could not be delivered \
+                 ({detail}); the stop ladder proceeds regardless",
+                name.as_str(),
+            );
+            self.emit_diagnostic(&note);
         }
     }
 }

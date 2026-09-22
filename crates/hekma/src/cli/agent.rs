@@ -24,15 +24,87 @@ use hekma_engine::{
 use serde::Serialize;
 
 use crate::error::{
-    AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible, AgentDetachRefused,
-    AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
-    AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
+    AgentAcpTurnInFlight, AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible,
+    AgentDetachRefused, AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable,
+    AgentInvalidName, AgentInvalidTransition, AgentIo, AgentLaunchFailed, AgentManifestInvalid,
     AgentManifestNotFound, AgentManifestUnreadable, AgentMemoryHotSwap, AgentMemoryKindConflict,
     AgentNoCapabilities, AgentNoMeteringSource, AgentNotFound, AgentNotRunning,
     AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentStore,
     AgentUnknownConfigKey, AgentUnknownKind,
 };
 use crate::ui;
+
+/// The Usage CELL for one Fleet entry (story 14-3): an `acp` instance whose
+/// ledger holds NO billing-grade usage renders the honest `—` gap marker
+/// ([`FleetEntry::METERING_SEED_CELL`]) — per the epic-14 spec, its token/cost
+/// cells show not-AVAILABLE (the tiers are known: none produced a billing
+/// event), distinctly from a consumed zero. Every other entry renders the
+/// cumulative token cell exactly as before. `dollar_label` follows the same
+/// narrow-list/wide-show split as [`usage_cell`].
+fn usage_entry_cell(entry: &FleetEntry, dollar_label: DollarLabel) -> String {
+    match &entry.usage_gap {
+        Some(_) => FleetEntry::METERING_SEED_CELL.to_string(),
+        None => usage_cell(&entry.usage, dollar_label),
+    }
+}
+
+/// The WIDE `show` Usage cell for one Fleet entry (story 14-3): a gapped acp
+/// entry carries the FULL gap notice INLINE (`— (no billing-grade usage —
+/// tiers attempted: …)`) — the wide Value column never truncates, the same
+/// treatment as [`cost_row_value`]'s inert-dollar note — so the tiers
+/// attempted are legible where the operator reads detail. Everyone else gets
+/// [`usage_cell_show`].
+fn usage_entry_cell_show(entry: &FleetEntry) -> String {
+    match &entry.usage_gap {
+        Some(gap) => format!("{} ({})", FleetEntry::METERING_SEED_CELL, gap.notice),
+        None => usage_cell_show(&entry.usage),
+    }
+}
+
+/// The stderr gap NOTE for one gapped entry (story 14-3, AI-18 — the narrow
+/// `list` cell truncates to the bare `—`, so the full tier breakdown rides
+/// the stderr note channel, AD-12). Composed from the engine's structured
+/// notice; the CLI adds only the instance-name prefix.
+fn usage_gap_note(entry: &FleetEntry) -> String {
+    match &entry.usage_gap {
+        Some(gap) => format!("{}: {}", entry.name.as_str(), gap.notice),
+        None => String::new(),
+    }
+}
+
+/// The `show` "ACP context usage" row value (story 14-3, T1): the
+/// agent-reported CONTEXT figure in its OWN row — never inside the billing
+/// Usage/Cost rows — labeled context-grain and agent-reported, with the
+/// optional agent-reported cost verbatim (NOT routed through the currency
+/// module: it is the agent's own claim, not an engine-derived estimate, so
+/// no `$` figure of ours is involved). The honest absence when nothing has
+/// been reported this session.
+fn acp_context_cell(entry: &FleetEntry) -> String {
+    match &entry.acp_context_usage {
+        Some(usage) => {
+            let used = usage
+                .used
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let size = usage
+                .size
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let cost = match &usage.cost {
+                Some(cost) => format!(
+                    " · agent-reported cost {} {} (context-grain, NOT billed)",
+                    cost.amount, cost.currency
+                ),
+                None => String::new(),
+            };
+            format!("used {used} of {size} context tokens (agent-reported){cost}")
+        }
+        None => format!(
+            "{} (no usage_update reported this session)",
+            FleetEntry::METERING_SEED_CELL
+        ),
+    }
+}
 
 /// Retain/delete choice as parsed from the CLI flags.
 ///
@@ -471,8 +543,11 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     ];
     // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
     // falls back to zero usage / "unknown" source so `show` never fails on it.
+    // Story 14-3: the Usage cell routes through the gap-aware helper — a gapped
+    // acp instance shows the honest `—` + the full tier notice INLINE (the wide
+    // Value column never truncates).
     let usage_value = entry
-        .map(|e| usage_cell_show(&e.usage))
+        .map(usage_entry_cell_show)
         .unwrap_or_else(|| "in 0 / out 0".to_string());
     let metering_value = entry
         .map(|e| e.metering_source.clone())
@@ -488,7 +563,7 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     // inert note when no Rate is configured (AC-B: dollar features inert and SAY SO).
     let cost_value =
         cost_row_value(entry.and_then(|e| e.usage.cumulative_dollars.zip(e.usage.estimate_label)));
-    let rows = vec![
+    let mut rows = vec![
         vec![
             ui::TableCell::plain("State"),
             ui::TableCell::status(status.instance.state.as_str()),
@@ -525,6 +600,21 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
             ui::TableCell::plain(metering_value),
         ],
     ];
+    // Story 14-3 (T1): the ACP context-usage row — rendered for an `acp`
+    // instance only (the Fleet read carries the kind), holding the
+    // agent-reported CONTEXT figure in its own block, never inside the
+    // billing Usage/Cost rows above. A degraded Fleet read renders nothing
+    // (the row is entry-derived, like the budget/usage rows it extends).
+    let rows = match entry {
+        Some(acp_entry) if acp_entry.kind == "acp" => {
+            rows.push(vec![
+                ui::TableCell::plain("ACP context usage"),
+                ui::TableCell::plain(acp_context_cell(acp_entry)),
+            ]);
+            rows
+        }
+        _ => rows,
+    };
     ui::print_table(&title, &columns, &rows);
     // For a failed instance, surface the last-known cause (the crash / crash-loop
     // detail) so the operator sees WHY it failed and the active policy (AC9).
@@ -594,8 +684,8 @@ pub fn remove(
 const METERING_NOTE: &str =
     "usage + budget are real TOKEN counts from the Usage Ledger (budget '—' means \
      no budget configured); dollar figures appear only when a Rate is configured \
-     (cost.rate.input/output) and are labeled estimates — with no Rate, dollar \
-     features are inert.";
+     (cost.rate.input/output, optional cost.rate.cached) and are labeled estimates \
+     — with no Rate, dollar features are inert.";
 
 /// The guidance printed when the Fleet is EMPTY — shared by `list` and the
 /// Fleet-wide `usage` (fix pass, L3) so both surfaces say the same thing rather
@@ -651,8 +741,10 @@ const USAGE_LIST_HEADER: &str = "Usage (tok, est. $)";
 /// (estimated)`; InHeader → `in 120 / out 340 · $0.30`.
 fn usage_cell(usage: &UsageView, dollar_label: DollarLabel) -> String {
     let tokens = format!(
-        "in {} / out {}",
-        usage.cumulative_input_tokens, usage.cumulative_output_tokens
+        "in {} / out {}{}",
+        usage.cumulative_input_tokens,
+        usage.cumulative_output_tokens,
+        cached_suffix(usage.cumulative_cached_tokens)
     );
     match (usage.cumulative_dollars, usage.estimate_label) {
         (Some(dollars), label) => {
@@ -690,11 +782,26 @@ fn usage_cell_show(usage: &UsageView) -> String {
         .saturating_add(usage.current_run_output_tokens);
     if run_total > 0 {
         format!(
-            "cumulative {cumulative}; this run: in {} / out {}",
-            usage.current_run_input_tokens, usage.current_run_output_tokens
+            "cumulative {cumulative}; this run: in {} / out {}{}",
+            usage.current_run_input_tokens,
+            usage.current_run_output_tokens,
+            cached_suffix(usage.current_run_cached_tokens)
         )
     } else {
         cumulative
+    }
+}
+
+/// The optional ` / cached N` suffix for a token cell (story 14-6, D8) — the
+/// cached-token SUBSET of the cell's input figure under the INPUT-INCLUSIVE
+/// invariant. Rendered ONLY when the subset is KNOWN and non-zero: a known-zero
+/// stays off the cell (compact), and an UNKNOWN subset — a pre-v7 ledger row —
+/// stays off too, the honest absence (`—` on the wide `show` cell would overstate
+/// the row; omitting says less, never a fabricated `cached 0`).
+fn cached_suffix(cached: Option<u64>) -> String {
+    match cached {
+        Some(n) if n > 0 => format!(" / cached {n}"),
+        _ => String::new(),
     }
 }
 
@@ -826,8 +933,10 @@ fn cost_row_value(dollars: Option<(Micros, EstimateLabel)>) -> String {
 /// in-process; `list` prints the returned line to stdout as command output (AD-12).
 fn fleet_total_footer(totals: &FleetTotals) -> String {
     let tokens = format!(
-        "in {} / out {}",
-        totals.total_input_tokens, totals.total_output_tokens
+        "in {} / out {}{}",
+        totals.total_input_tokens,
+        totals.total_output_tokens,
+        cached_suffix(totals.total_cached_tokens)
     );
     // The count of metered-but-unpriced rows that make the dollar total a lower bound
     // is carried on `totals.unpriced_count` (the engine `domain` computed it alongside
@@ -954,8 +1063,15 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 // plus, with a Rate, the derived dollar rendered BARE (AI-45): the
                 // estimate qualifier lives in the Usage column HEADER
                 // ([`USAGE_LIST_HEADER`]), whose min_width keeps it for every
-                // width that can still render the header at all.
-                ui::TableCell::plain(usage_cell(&entry.usage, DollarLabel::InHeader)),
+                // width that can still render the header at all. Story 14-3: a
+                // gapped acp instance renders the honest `—` (muted, like the
+                // absent budget); the full tier notice rides the stderr note
+                // below, since this narrow cell truncates.
+                if entry.usage_gap.is_some() {
+                    ui::TableCell::muted(usage_entry_cell(entry, DollarLabel::InHeader))
+                } else {
+                    ui::TableCell::plain(usage_entry_cell(entry, DollarLabel::InHeader))
+                },
                 ui::TableCell::muted(entry.agent_home.clone()),
             ]
         })
@@ -966,6 +1082,13 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // note when partial, and a `—` (never $0.00) when no instance is Rate'd. It is
     // command output (a summary of the table above it), so it rides STDOUT (AD-12).
     println!("{}", fleet_total_footer(&listing.totals));
+    // Story 14-3 (AI-18): the gapped acp instances' usage-gap notes ride STDERR —
+    // the narrow Usage cell can only show the `—` token, so the tier breakdown
+    // (observed / sentinel / context state) is surfaced here, one note per gap,
+    // through the established note channel (AD-12).
+    for entry in entries.iter().filter(|e| e.usage_gap.is_some()) {
+        ui::note(usage_gap_note(entry));
+    }
     // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
     ui::note(METERING_NOTE);
     Ok(())
@@ -1071,8 +1194,10 @@ fn render_usage_instance(entry: &FleetEntry) {
         vec![
             ui::TableCell::plain("Cumulative tokens"),
             ui::TableCell::plain(format!(
-                "in {} / out {}",
-                usage.cumulative_input_tokens, usage.cumulative_output_tokens
+                "in {} / out {}{}",
+                usage.cumulative_input_tokens,
+                usage.cumulative_output_tokens,
+                cached_suffix(usage.cumulative_cached_tokens)
             )),
         ],
         vec![
@@ -1084,8 +1209,10 @@ fn render_usage_instance(entry: &FleetEntry) {
         vec![
             ui::TableCell::plain("Current-run tokens"),
             ui::TableCell::plain(format!(
-                "in {} / out {}",
-                usage.current_run_input_tokens, usage.current_run_output_tokens
+                "in {} / out {}{}",
+                usage.current_run_input_tokens,
+                usage.current_run_output_tokens,
+                cached_suffix(usage.current_run_cached_tokens)
             )),
         ],
         vec![
@@ -1910,7 +2037,9 @@ fn render_effective_config(
 /// THIS mode performs the extra `memory_status` read-back that fills
 /// `declared` (the DC-10 delivery fact: whether the injected path will actually
 /// reach the agent — `true` only for a `filesystem` backing whose adapter maps
-/// `memory.dir` (the `hermes` builtin does, via `HERMES_HOME`); `false` for a
+/// `memory.dir` (the `hermes` builtin does, via `HERMES_HOME`, and so does the
+/// `acp` builtin since epic 14's story 14-5 — the hermes-kind retirement
+/// parity); `false` for a
 /// mapping-less adapter and also for a `native` backing, where it means "no
 /// delivery is offered", not "the adapter declined")
 /// and `guarantee`; the human path stays byte-identical to its pre-freeze
@@ -2497,6 +2626,18 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 14-1 (spine AD-19): a second prompt targeted an `acp`
+        // instance while a turn was in flight — the surfaced typed refusal
+        // (ACP serializes turns per session; the first turn is unaffected).
+        EngineError::AcpTurnInFlight { name } => AgentAcpTurnInFlight {
+            message: format!(
+                "Agent Instance '{name}' already has an ACP turn in flight; the acp kind \
+                 serializes turns per session. Wait for the current turn to complete (its \
+                 stopReason lands in: hekma agent logs {name}), or stop the instance with: \
+                 hekma agent stop {name}"
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -2865,6 +3006,15 @@ mod tests {
                 ExitCode::InvalidState,
             ),
             (
+                // Story 14-1: the acp in-flight refusal — an invalid-state
+                // refusal (4), never a demotion to General.
+                "AcpTurnInFlight",
+                EngineError::AcpTurnInFlight {
+                    name: "acp-svc".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+            (
                 "InvalidName",
                 EngineError::InvalidName {
                     name: "Bad Name".to_string(),
@@ -3116,8 +3266,71 @@ mod tests {
                 hekma_engine::UsageTotals::zero(),
             ),
             metering_source: "self-reported".to_string(),
+            acp_context_usage: None,
+            usage_gap: None,
             agent_home: format!("/x/agents/{name}"),
         }
+    }
+
+    #[test]
+    fn usage_entry_cells_render_the_acp_gap_and_context_figures() {
+        // Story 14-3: a gapped acp entry renders the honest `—` in both cell
+        // widths; the wide show cell carries the FULL tier notice inline; a
+        // context figure renders in its own labeled cell (never inside the
+        // billing cells); a metered/non-acp entry renders as before.
+        let mut entry = sample_fleet_entry("acp-1");
+        entry.kind = "acp".to_string();
+        entry.usage_gap = Some(hekma_engine::UsageGapNotice::acp(false, false, true));
+
+        // The narrow list cell: the bare honest-— token (the notice rides the
+        // stderr note).
+        assert_eq!(
+            usage_entry_cell(&entry, DollarLabel::InHeader),
+            FleetEntry::METERING_SEED_CELL
+        );
+        // The wide show cell: `—` + the full notice, tiers named.
+        let show = usage_entry_cell_show(&entry);
+        assert!(show.starts_with(FleetEntry::METERING_SEED_CELL), "{show}");
+        assert!(show.contains("observed: not-configured"), "{show}");
+        assert!(show.contains("sentinel: no-lines-seen"), "{show}");
+        assert!(show.contains("context usage reported"), "{show}");
+        // The gap note names the instance for the stderr channel.
+        let note = usage_gap_note(&entry);
+        assert!(note.starts_with("acp-1: "), "{note}");
+        assert!(note.contains("never billed"), "{note}");
+
+        // The context figure cell: labeled agent-reported + context-grain,
+        // with the agent's own cost VERBATIM (no `$` formatting of ours).
+        entry.acp_context_usage = Some(hekma_engine::AcpContextUsageView {
+            used: Some(1200),
+            size: Some(200_000),
+            cost: Some(hekma_engine::AcpContextCostView {
+                amount: "0.0034".to_string(),
+                currency: "USD".to_string(),
+            }),
+        });
+        let context = acp_context_cell(&entry);
+        assert!(
+            context.contains("used 1200 of 200000 context tokens"),
+            "{context}"
+        );
+        assert!(context.contains("(agent-reported)"), "{context}");
+        assert!(
+            context.contains("agent-reported cost 0.0034 USD"),
+            "{context}"
+        );
+        assert!(
+            !context.contains('$'),
+            "no engine-formatted dollar: {context}"
+        );
+
+        // A non-acp entry (no gap, no context figure) renders the token cell.
+        let plain = sample_fleet_entry("mock-1");
+        assert_eq!(
+            usage_entry_cell(&plain, DollarLabel::InHeader),
+            usage_cell(&plain.usage, DollarLabel::InHeader)
+        );
+        assert!(acp_context_cell(&plain).contains("no usage_update reported"));
     }
 
     #[test]
@@ -3202,6 +3415,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: input,
                 output_tokens: output,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         );
@@ -3311,10 +3525,12 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals {
                 input_tokens: 40,
                 output_tokens: 60,
+                cached_tokens: Some(0),
             },
         );
         let shown = usage_cell_show(&running);
@@ -3329,6 +3545,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 100,
                 output_tokens: 250,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         );
@@ -3337,6 +3554,111 @@ mod tests {
         assert!(
             !shown.contains("this run"),
             "no fabricated run scope: {shown}"
+        );
+    }
+
+    #[test]
+    fn cached_tokens_render_only_when_known_and_non_zero() {
+        // Story 14-6 (D8) on the human cells: the cached subset renders as
+        // ` / cached N` ONLY when it is KNOWN and non-zero. A known-zero (a
+        // cache miss) stays off the cell (compact), and an UNKNOWN subset (a
+        // pre-v7 ledger row) stays off too — the honest absence, never a
+        // fabricated `cached 0`.
+        let cached = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cached_tokens: Some(800),
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&cached, DollarLabel::Inline),
+            "in 1200 / out 300 / cached 800",
+            "the known non-zero subset renders"
+        );
+        let zero = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 340,
+                cached_tokens: Some(0),
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&zero, DollarLabel::Inline),
+            "in 120 / out 340",
+            "a known-zero subset stays off the cell"
+        );
+        let unknown = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 120,
+                output_tokens: 340,
+                cached_tokens: None,
+            },
+            hekma_engine::UsageTotals::zero(),
+        );
+        assert_eq!(
+            usage_cell(&unknown, DollarLabel::InHeader),
+            "in 120 / out 340",
+            "an UNKNOWN subset is an honest absence, never cached 0"
+        );
+    }
+
+    #[test]
+    fn show_cell_carries_the_current_run_cached_subset() {
+        // The wide `show` cell's CURRENT-RUN scope carries its own cached subset
+        // the same way — known-nonzero renders, known-zero/unknown stays off.
+        let running = UsageView::new(
+            hekma_engine::UsageTotals {
+                input_tokens: 100,
+                output_tokens: 250,
+                cached_tokens: Some(0),
+            },
+            hekma_engine::UsageTotals {
+                input_tokens: 40,
+                output_tokens: 60,
+                cached_tokens: Some(25),
+            },
+        );
+        let shown = usage_cell_show(&running);
+        assert!(
+            shown.contains("this run: in 40 / out 60 / cached 25"),
+            "run-scope cached renders: {shown}"
+        );
+        assert!(
+            !shown.contains("cached 0"),
+            "the known-zero cumulative subset stays off: {shown}"
+        );
+    }
+
+    #[test]
+    fn fleet_footer_carries_the_fleet_cached_subset_when_known_nonzero() {
+        // The Fleet footer's cached sum: rendered only when known and non-zero;
+        // one unknown-cached row keeps the honest absence (no partial cached
+        // sum masquerading as complete).
+        let totals = FleetTotals::from_entries(&[
+            metered_fleet_entry("a", 1000, 200, Some(Micros(3_000_000))),
+            metered_fleet_entry("b", 500, 0, None),
+        ]);
+        // The metered_fleet_entry helper stamps known-zero subsets: no suffix.
+        let footer = fleet_total_footer(&totals);
+        assert!(
+            !footer.contains("cached"),
+            "known-zero sum stays off: {footer}"
+        );
+        // A real cached subset renders.
+        let mut entry = metered_fleet_entry("c", 1000, 0, None);
+        entry.usage.cumulative_cached_tokens = Some(800);
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[entry]));
+        assert!(footer.contains("in 1000 / out 0 / cached 800"), "{footer}");
+        // One UNKNOWN row poisons the Fleet cached sum to the honest absence.
+        let mut unknown = metered_fleet_entry("d", 10, 0, None);
+        unknown.usage.cumulative_cached_tokens = None;
+        let footer = fleet_total_footer(&FleetTotals::from_entries(&[unknown]));
+        assert!(
+            !footer.contains("cached"),
+            "unknown sum stays off: {footer}"
         );
     }
 
@@ -3797,6 +4119,7 @@ mod tests {
             hekma_engine::UsageTotals {
                 input_tokens: 120,
                 output_tokens: 340,
+                cached_tokens: Some(0),
             },
             hekma_engine::UsageTotals::zero(),
         )

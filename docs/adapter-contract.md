@@ -5,7 +5,7 @@ description: The versioned contract between the Hekma engine and every agent ada
 
 # Adapter Contract (v1)
 
-The **Adapter Contract** is the agreement between the Hekma engine and every agent adapter — native builtins and manifest adapters alike. An *agent* here is the third-party program an adapter makes runnable — a personal agent such as Hermes Agent or a coding agent such as opencode — never something Hekma authors. It lives in the `hekma-adapter-api` crate (the schema's single home), is versioned independently of the engine under its own semver, and is **frozen at v1 (`1.0.0`)** as of 2026-09-04 after validation against a second agent (opencode) and the story 6-4/6-5 conformance passes. This page is the contract's normative home: what an adapter implements, what the engine enforces, and the rules for changing any of it.
+The **Adapter Contract** is the agreement between the Hekma engine and every agent adapter — native builtins and manifest adapters alike. An *agent* here is the third-party program an adapter makes runnable — a personal agent such as Hermes Agent or a coding agent such as opencode — never something Hekma authors. It lives in the `hekma-adapter-api` crate (the schema's single home), is versioned independently of the engine under its own semver, and is **frozen at v1 (`1.0.0`)** as of 2026-09-04 after validation against a second agent (opencode) and its conformance passes. This page is the contract's normative home: what an adapter implements, what the engine enforces, and the rules for changing any of it.
 
 Everything here applies uniformly to both adapter kinds ("two kinds, one trait"): a native builtin declares the same shapes in code that a manifest adapter declares in `adapter.toml`. **One deliberate exception: version negotiation.** `contract_version` and the negotiation gate below are **manifest-only** — only a manifest adapter carries a `contract_version` and can fail negotiation; native builtins declare no contract version in code and are always compatible with the engine that ships them (a builtin and its engine release from the same build). The concrete manifest syntax is documented in [the manifest reference](manifest.md); the Conformance Test Kit ([testing](testing.md#the-conformance-test-kit)) proves an adapter honors the sections it can exercise.
 
@@ -34,18 +34,18 @@ Capabilities are declared **per OS** (`linux`, `macos`, `windows`) with one of t
 
 A capability with no entry for an OS projects to `unsupported`. A declaration must have at least one non-`unsupported` entry somewhere — an adapter that supports nothing is not viable and is rejected at registration. Modeled capabilities in v1: `pause` and `interaction`.
 
-Per-OS honesty is the adapter author's job: the contract lets an author declare any level on any OS and holds them to it; it does not police vendor OS-support stances (see R11 in the decisions below).
+Per-OS honesty is the adapter author's job: the contract lets an author declare any level on any OS and holds them to it; it does not police vendor OS-support stances (see the isolation-lever decision in the checkpoint record below).
 
 ## Lifecycle and stop semantics
 
 - **Start** is the only mandatory template. The resolved launch (exec/args/env) is snapshotted at registration.
-- **An omitted stop template is normative**: the engine's process termination (signal, then escalation) IS the stop; the TCK asserts the child process exits. Adapters to agents with a graceful-stop verb declare a stop template. There is no graceful-stop acknowledgment concept in v1 (R4): an agent's self-exit (e.g. an in-chat restart hand-off) is an unrequested exit handled by the crash/restart policy — any non-zero exit while Running is a crash, and the restart policy relaunches with the same persisted launch.
-- **Readiness vs liveness (R8)**: v1 defines no readiness concept distinct from process liveness and no endpoint-discovery surface. A supervisor that must know where an HTTP-native child listens should pin its port via the start template and own collision handling, or parse the child's documented startup line — that is an adapter-convention concern, not contract machinery.
-- **Agent-side abort (R10)** is out of contract scope: verbs are start/stop/pause/resume. An agent's own abort facility (e.g. ending one session's work inside a still-running server) is the agent's business; the contract's stop asserts process-level outcomes only.
+- **An omitted stop template is normative**: the engine's process termination (signal, then escalation) IS the stop; the TCK asserts the child process exits. Adapters to agents with a graceful-stop verb declare a stop template. There is no graceful-stop acknowledgment concept in v1: an agent's self-exit (e.g. an in-chat restart hand-off) is an unrequested exit handled by the crash/restart policy — any non-zero exit while Running is a crash, and the restart policy relaunches with the same persisted launch.
+- **Readiness vs liveness**: v1 defines no readiness concept distinct from process liveness and no endpoint-discovery surface. A supervisor that must know where an HTTP-native child listens should pin its port via the start template and own collision handling, or parse the child's documented startup line — that is an adapter-convention concern, not contract machinery.
+- **Agent-side abort** is out of contract scope: verbs are start/stop/pause/resume. An agent's own abort facility (e.g. ending one session's work inside a still-running server) is the agent's business; the contract's stop asserts process-level outcomes only.
 
 ## Interaction channels
 
-`[interaction].channel` is a closed enum: `stdio` (the spawned child's OS stdin pipe — the only channel the engine delivers through in v1) or `http` (an HTTP-native interaction surface, added at the v1 freeze via CP-6.5-a option (i)).
+`[interaction].channel` is a closed enum: `stdio` (the spawned child's OS stdin pipe — the only channel the engine delivers through in v1) or `http` (an HTTP-native interaction surface, added at the v1 freeze as the ratified channel-vocabulary option).
 
 `http` is **additive vocabulary, deliberately documentary**: the engine never branches on the declared channel — the stdin pipe follows the capability declaration (delivered iff the current-OS `interaction` level is `guaranteed`/`best-effort`, per the launcher rule above, never on the channel value), and `send_input` still writes the child's stdin (failing fast and typed where the declaration says unsupported). Its purpose is honesty and registerability: an HTTP-native agent (e.g. opencode, whose programmatic surface is `POST /session/:id/message` + SSE and whose spawned `serve` never reads stdin) declares `http` to name its real transport and registers with `interaction` supported instead of being forced into an all-unsupported (and therefore illegal) declaration. A real engine-side HTTP send implementation is a **post-v1** change under the versioning policy; the relaxation alternative (letting a single-capability adapter declare `unsupported` everywhere) was **declined** — the viability bar stays.
 
@@ -53,29 +53,29 @@ Per-OS honesty is the adapter author's job: the contract lets an author declare 
 
 ## Metering
 
-- `self-reported`: the agent's usage accounting reaches the engine as `KTESIO_USAGE {json}` sentinel lines on the captured stdout. **The channel is adapter-implemented** (contract v1): the stream may be native or synthesized by an adapter shim over the agent's own surfaces (SSE tails, session reads); a shim derives `sequence` from the agent's per-Run message ordinals so the `UNIQUE(instance, run, sequence)` replay-dedup invariant holds identically (R2). Delayed batches reconcile without double-counting in both variants.
+- `self-reported`: the agent's usage accounting reaches the engine as `KTESIO_USAGE {json}` sentinel lines on the captured stdout. **The channel is adapter-implemented** (contract v1): the stream may be native or synthesized by an adapter shim over the agent's own surfaces (SSE tails, session reads); a shim derives `sequence` from the agent's per-Run message ordinals so the `UNIQUE(instance, run, sequence)` replay-dedup invariant holds identically. Delayed batches reconcile without double-counting in both variants.
 - `engine-observed`: the engine meters the agent's model traffic through a per-instance loopback forward proxy — no agent cooperation needed.
 
-**Unknown-vs-zero is a contract stance** (R7): when the provider omits usage, an adapter must surface it as unknown — never coerce it to zero. A zero event asserts the provider reported zero; an absent event means the usage is unknown. (Hermes labels cost honesty; opencode silently coerces missing usage to zero — the contract sides with the label.)
+**Unknown-vs-zero is a contract stance**: when the provider omits usage, an adapter must surface it as unknown — never coerce it to zero. A zero event asserts the provider reported zero; an absent event means the usage is unknown. (Hermes labels cost honesty; opencode silently coerces missing usage to zero — the contract sides with the label.)
 
 ## Memory
 
-Memory Backing vocabulary is part of the frozen v1 surface, carried on `hekma agent memory attach|detach --json` (story 6-6's wire freeze; before it, the surface was human-output-only):
+Memory Backing vocabulary is part of the frozen v1 surface, carried on `hekma agent memory attach|detach --json` (frozen in the v1 wire set; before it, the surface was human-output-only):
 
 - **Kinds** (snake_case wire strings, verbatim): `filesystem` (an engine-managed directory inside the Agent Home, byte-durable across restarts) and `native` (an explicit delegation marker).
 - **Guarantee levels** (snake_case wire strings, verbatim): `managed_dir_byte_durable` and `home_persistence_only`.
 - The memory commands' outputs are reachable via `--json` (attach and detach emit versioned documents); the documents are frozen key-set-for-key-set by the compatibility tests, and the freeze landed as the ONE announced key-set edit (announced in the release notes). There is deliberately NO memory read verb in v1 — adding one (or touching these key-sets again) is a post-v1 change under the policy below, explicitly out of scope at the freeze.
 
-Adapters that cannot consume a memory directory are fine: the reserved `memory.dir` key is delivered only through the adapter's own declared mapping (delivery is offered, never imposed), and an unmapped key is delivered nowhere — never silently dropped into a file the agent will not read (R3).
+Adapters that cannot consume a memory directory are fine: the reserved `memory.dir` key is delivered only through the adapter's own declared mapping (delivery is offered, never imposed), and an unmapped key is delivered nowhere — never silently dropped into a file the agent will not read.
 
 ## Configuration delivery
 
 The `[config]` mapping turns documented unified keys into native mechanisms (`env`, `flag`, `file`). v1's normative stances from the second-agent validation:
 
-- **JSON-native config agents** (R5): the documented pattern is **env-content delivery** — the agent's config-content environment variable carries the runtime config (e.g. opencode's `OPENCODE_CONFIG_CONTENT`). A format-qualified `file` target (JSON alongside TOML) is **reserved post-v1**; the current `file` target renders TOML only.
+- **JSON-native config agents**: the documented pattern is **env-content delivery** — the agent's config-content environment variable carries the runtime config (e.g. opencode's `OPENCODE_CONFIG_CONTENT`). A format-qualified `file` target (JSON alongside TOML) is **reserved post-v1**; the current `file` target renders TOML only.
 - **`{env:VAR}` substitution honesty**: agents that substitute `{env:VAR}` placeholders and render an unset variable as a silent empty string impose a duty on the adapter — every substituted variable must be guaranteed set, or the render must fail with a named reason, before the child launches. This is the freeze's only behavioral rider; a silently-empty rendered config is a contract violation.
 - **Self-updating agents** must have their update-disable mechanism mapped and delivered by the start seam, and adapter docs must state whether the agent's config chain contains a higher-authority (managed/MDM) layer that could override supervisor-delivered values (so an operator can verify the pin survived).
-- **Isolation keys** (R6/R9): adapters document the environment levers that give each instance its own data/config roots (Hermes: `HERMES_HOME`; XDG-based agents: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). **Per-instance isolated roots inside each Agent Home are the recommended normative posture** — they make shared-root concurrency out of contract scope. Where a lever is an undocumented agent interface, the adapter must say so and re-validate per pinned release (undocumented levers are acceptable with that per-release obligation, not silently).
+- **Isolation keys**: adapters document the environment levers that give each instance its own data/config roots (Hermes: `HERMES_HOME`; XDG-based agents: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). **Per-instance isolated roots inside each Agent Home are the recommended normative posture** — they make shared-root concurrency out of contract scope. Where a lever is an undocumented agent interface, the adapter must say so and re-validate per pinned release (undocumented levers are acceptable with that per-release obligation, not silently).
 
 ### What is checked versus honored (the TCK's honest reach)
 
@@ -97,42 +97,42 @@ The contract carries a semantic version; **the engine states which contract vers
   ```
 
 - **When the gate runs** (manifest-kind scope, stated for operators): negotiation fires at **registration** and again whenever a start **re-reads the manifest from disk** — the legacy/launch-less start fallback. An instance with a persisted launch snapshot restarts from that snapshot without re-reading the manifest, so a post-registration edit of `adapter.toml` to a foreign major is fatal for a fallback-start instance and invisible to a snapshot-start one. That asymmetry is deliberate (a persisted launch is the engine's recorded truth; the fallback re-read is a fresh load), but it is an asymmetry: if you edit a manifest, re-register (or remove + register) rather than relying on the edit taking effect.
-- **Strict `X.Y.Z` parsing** (AI-6, resolved at the freeze): the manifest's `contract_version` must be a strict semver triple — no `v` prefix, no partial versions (`1`, `1.0`). Prerelease and build-metadata suffixes (`1.0.0-rc.1+build.5`) parse as semver; **negotiation compares majors only**, so a same-major prerelease manifest is compatible. Prerelease spellings are development-time conveniences, not a published compatibility promise — release tooling always publishes clean triples.
+- **Strict `X.Y.Z` parsing** (resolved at the freeze): the manifest's `contract_version` must be a strict semver triple — no `v` prefix, no partial versions (`1`, `1.0`). Prerelease and build-metadata suffixes (`1.0.0-rc.1+build.5`) parse as semver; **negotiation compares majors only**, so a same-major prerelease manifest is compatible. Prerelease spellings are development-time conveniences, not a published compatibility promise — release tooling always publishes clean triples.
 - **Pre-v1 (`0.x`) manifests are not grandfathered**: the contract was never published under 0.x, so the seed values (0.1.0–0.4.0) carry no back-compat obligation. They fail registration exactly like any other major mismatch.
 - **Within a major**, changes are additive (a new optional manifest section, a new enum variant, a new optional JSON field). Anything that removes or renumbers is breaking and requires the next major.
-- The Rust API of `hekma-adapter-api` is guarded by the CI `semver` job (`cargo-semver-checks`) on two baselines: an **armed in-repo baseline** that diffs the frozen surface against the contract-v1 freeze commit (`4119db3`) on every run, and the crates.io-published baseline once story 7-4 publishes the crates. The serialized wire shapes and exit codes are guarded by the workspace compatibility tests (`crates/hekma/tests/agent_cli.rs`), which fail CI on an unannounced change on all three OSes.
+- The Rust API of `hekma-adapter-api` is guarded by the CI `semver` job (`cargo-semver-checks`) on two baselines: an **armed in-repo baseline** that diffs the frozen surface against the contract-v1 freeze commit (`4119db3`) on every run, and the crates.io-published baseline once the crates publish to crates.io. The serialized wire shapes and exit codes are guarded by the workspace compatibility tests (`crates/hekma/tests/agent_cli.rs`), which fail CI on an unannounced change on all three OSes.
 
 ## Deprecation policy
 
-*Ratified by Islam, 2026-09-04 — quoted verbatim, the whole ratified policy:* **within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI.** The semver-checks enforcement for the Rust surface is **armed now** against the in-repo freeze-commit baseline (see the gate note below); the crates.io-published-baseline comparison arms at story 7-4's publish. Until then the announcement rule for non-Rust surfaces is enforced by the release-notes discipline itself. The ratified sentence names the Adapter Contract and its docs; it deliberately does not expand to other surfaces — each other surface's own announcement machinery (e.g. the `--json` key-set freeze rule) governs it in the meantime.
+*Ratified by Islam, 2026-09-04 — quoted verbatim, the whole ratified policy:* **within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI.** The semver-checks enforcement for the Rust surface is **armed now** against the in-repo freeze-commit baseline (see the gate note below); the crates.io-published-baseline comparison arms at the crates' first crates.io publish. Until then the announcement rule for non-Rust surfaces is enforced by the release-notes discipline itself. The ratified sentence names the Adapter Contract and its docs; it deliberately does not expand to other surfaces — each other surface's own announcement machinery (e.g. the `--json` key-set freeze rule) governs it in the meantime.
 
 ## The semver gate, stated plainly
 
 The CI `semver` job runs `cargo-semver-checks` on **two baselines**:
 
-1. **In-repo baseline (armed, #160):** every run diffs `hekma-adapter-api`'s public Rust surface against the contract-v1 freeze commit (`4119db3`) via `--baseline-rev`. Any breaking public-surface change vs the baseline — removal, rename, or signature — **fails CI red**, announced or not (announcement itself is review discipline; the gate cannot read intent). This closed the freeze's guard gap (retro finding A1), where no verification failed on a public-surface break during the pre-publish window.
-2. **crates.io baseline (dormant until 7-4):** the published-baseline comparison cannot fire until the crates publish to crates.io (story 7-4); today that leg checks crates.io, sees the 404, and emits a notice saying exactly that. It arms itself automatically at first publish, and its cache plumbing is already version-keyed and armed-ready.
+1. **In-repo baseline (armed):** every run diffs `hekma-adapter-api`'s public Rust surface against the contract-v1 freeze commit (`4119db3`) via `--baseline-rev`. Any breaking public-surface change vs the baseline — removal, rename, or signature — **fails CI red**, announced or not (announcement itself is review discipline; the gate cannot read intent). This closes the freeze's original guard gap, where no verification failed on a public-surface break during the pre-publish window.
+2. **crates.io baseline (dormant until first publish):** the published-baseline comparison cannot fire until the crates publish to crates.io; today that leg checks crates.io, sees the 404, and emits a notice saying exactly that. It arms itself automatically at first publish, and its cache plumbing is already version-keyed and armed-ready.
 
 What additionally protects the contract are the workspace compatibility tests and the review discipline.
 
-## Ratified checkpoint decisions (recorded)
+## Ratified freeze decisions (recorded)
 
-Story 6-5's paper validation of opencode raised six change proposals (CP-6.5-a…f) and eleven freeze risks (R1–R11). Every one carries an explicit verdict from the 6-6 checkpoint (ratified by Islam, 2026-09-04); none silently dropped. The story file (`_bmad-output/implementation-artifacts/spec-6-6-*.md`, Ratified-decisions section) records the one-line rationale for each; the normative text above is where the ratified decisions live.
+The pre-freeze paper validation of opencode raised six change proposals and eleven freeze risks. Every one carries an explicit ratified verdict (ratified by Islam, 2026-09-04); none silently dropped. The in-repo planning record holds the one-line rationale for each; the normative text above is where the ratified decisions live.
 
-| ID | Verdict |
+| Topic | Verdict |
 |----|---------|
-| CP-6.5-a / R1 | Option (i) ratified: `InteractionChannelKind::Http` added as v1 vocabulary, engine never branches on channel. Option (ii) — relaxing `has_any_support` — DECLINED. HTTP send implementation deferred post-v1. |
-| CP-6.5-b / R4 | Ratified (documentary): an omitted `[lifecycle.stop]` means engine signal-termination is the normative stop; TCK asserts child exit. No graceful-acknowledgment concept in v1. |
-| CP-6.5-c / R2 | Ratified (documentary): `self-reported` covers adapter-implemented shims; `sequence` derives from the agent's per-Run message ordinals; both sources carry the no-double-count guarantee. |
-| CP-6.5-d / R5 | Ratified (documentary): env-content delivery is the documented pattern for JSON-config agents; format-qualified `file` target reserved post-v1. PLUS the one behavioral rider: `{env:VAR}` substitution must guarantee set variables or fail the render with a named reason. |
-| CP-6.5-e | Ratified (documentary): self-updating agents must have their update pin mapped and delivered; adapter docs must disclose higher-authority config layers. Optional TCK assertion deferred. |
-| CP-6.5-f / R6 | Ratified (docs-only): isolation keys named per agent (opencode: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`) with the churn caveat — undocumented levers acceptable with per-release re-validation. |
-| R3 | Ratified: the memory wire froze in v1 — typed snake_case `GuaranteeLevel`/`MemoryBackingKind` strings adopted verbatim on the new `--json` documents (the ONE announced key-set edit); adapters that cannot consume `memory.dir` simply declare no mapping (delivered nowhere, honestly surfaced). |
-| R7 | Ratified: unknown-vs-zero stance — omitted usage is surfaced as unknown, never coerced to zero (surfaced-not-silent labels). |
-| R8 | Deferred-post-v1: no readiness/liveness distinction or endpoint-discovery surface in v1; pin-the-port or startup-line-parsing are adapter conventions. |
-| R9 | Recommended normative (docs-only): per-instance isolated roots for networked adapters; shared-root modes are out of contract scope. |
-| R10 | Deferred-post-v1: agent-side abort is out of contract; engine-owned termination semantics only, TCK asserts process-level outcomes. |
-| R11 | Docs-only: per-OS honesty is already the declaration's job — a windows `best_effort` cap for WSL-recommended agents is an adapter-author choice, not a contract mandate. |
+| Interaction channel vocabulary | Option (i) ratified: `InteractionChannelKind::Http` added as v1 vocabulary, engine never branches on channel. The alternative — relaxing `has_any_support` — DECLINED. HTTP send implementation deferred post-v1. |
+| Stop semantics | Ratified (documentary): an omitted `[lifecycle.stop]` means engine signal-termination is the normative stop; TCK asserts child exit. No graceful-acknowledgment concept in v1. |
+| Self-reported metering | Ratified (documentary): `self-reported` covers adapter-implemented shims; `sequence` derives from the agent's per-Run message ordinals; both sources carry the no-double-count guarantee. |
+| JSON-config delivery | Ratified (documentary): env-content delivery is the documented pattern for JSON-config agents; format-qualified `file` target reserved post-v1. PLUS the one behavioral rider: `{env:VAR}` substitution must guarantee set variables or fail the render with a named reason. |
+| Self-updating agents | Ratified (documentary): self-updating agents must have their update pin mapped and delivered; adapter docs must disclose higher-authority config layers. Optional TCK assertion deferred. |
+| Isolation keys | Ratified (docs-only): isolation keys named per agent (opencode: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`) with the churn caveat — undocumented levers acceptable with per-release re-validation. |
+| Memory wire freeze | Ratified: the memory wire froze in v1 — typed snake_case `GuaranteeLevel`/`MemoryBackingKind` strings adopted verbatim on the new `--json` documents (the ONE announced key-set edit); adapters that cannot consume `memory.dir` simply declare no mapping (delivered nowhere, honestly surfaced). |
+| Unknown-vs-zero | Ratified: omitted usage is surfaced as unknown, never coerced to zero (surfaced-not-silent labels). |
+| Readiness vs liveness | Deferred-post-v1: no readiness/liveness distinction or endpoint-discovery surface in v1; pin-the-port or startup-line-parsing are adapter conventions. |
+| Isolated-roots posture | Recommended normative (docs-only): per-instance isolated roots for networked adapters; shared-root modes are out of contract scope. |
+| Agent-side abort | Deferred-post-v1: agent-side abort is out of contract; engine-owned termination semantics only, TCK asserts process-level outcomes. |
+| Per-OS honesty | Docs-only: per-OS honesty is already the declaration's job — a windows `best_effort` cap for WSL-recommended agents is an adapter-author choice, not a contract mandate. |
 
 ## What changed at the freeze
 

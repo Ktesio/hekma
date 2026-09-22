@@ -81,7 +81,7 @@
 
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -179,6 +179,12 @@ pub struct WindowsProcess {
     /// agent process itself keeps writing to directly (never through any
     /// engine-held handle) for as long as it lives.
     log_capture: Option<LogCapture>,
+    /// Story 14-1 (spine AD-19): the child's stdout read half when
+    /// [`SpawnSpec::pipe_stdout`] was set — the `acp` transport's protocol
+    /// stream, held until the supervisor takes it via
+    /// [`ProcessBackend::take_stdout`]. `None` for every other spawn (file
+    /// redirect) and for every adopted handle.
+    stdout: Option<ChildStdout>,
 }
 
 // The raw Job / process HANDLEs are owned OS resources this struct is solely
@@ -366,9 +372,18 @@ impl ProcessBackend for WindowsBackend {
         // agent's `write()` to either stream succeeds or fails based ONLY
         // on this regular file, never on whether the engine process is even
         // still alive to read anything.
-        command.stdout(match stdout_target {
-            Some(file) => Stdio::from(file),
-            None => Stdio::null(),
+        // Story 14-1 (`SpawnSpec::pipe_stdout`): an `acp` spawn's stdout IS
+        // the protocol stream the connection's reader consumes (and
+        // re-records into the raw log), so the pipe replaces the direct
+        // file redirect for that one stream. Mirrors the Unix backend's
+        // identical branch (AD-4 — the framing is OS-uniform).
+        command.stdout(if spec.pipe_stdout {
+            Stdio::piped()
+        } else {
+            match stdout_target {
+                Some(file) => Stdio::from(file),
+                None => Stdio::null(),
+            }
         });
         command.stderr(match stderr_target {
             Some(file) => Stdio::from(file),
@@ -519,6 +534,9 @@ impl ProcessBackend for WindowsBackend {
             Some(s) => StdinState::Live(s),
             None => StdinState::NoPipe,
         };
+        // Story 14-1: capture the piped stdout when the caller asked for it
+        // (`spec.pipe_stdout` — the acp transport's protocol stream).
+        let stdout = child.stdout.take();
         // Story 4-2 (Task 3), fix pass (review of #80): a FRESHLY SPAWNED
         // handle gets the output-capture pipeline whenever `capture` is
         // `Some`. `spawn_output_capture` takes only the raw files' PATHS
@@ -541,6 +559,7 @@ impl ProcessBackend for WindowsBackend {
             start_time,
             stdin,
             log_capture,
+            stdout,
         })
     }
 
@@ -727,6 +746,10 @@ impl ProcessBackend for WindowsBackend {
             start_time: live_start,
             stdin: StdinState::NoPipe,
             log_capture: None,
+            // Story 14-1: no recoverable stdout pipe either — an adopted acp
+            // instance gets NO ACP connection (the surfaced adoption note is
+            // the supervisor's; story 14-2 adds the session resume).
+            stdout: None,
         }))
     }
 
@@ -751,6 +774,24 @@ impl ProcessBackend for WindowsBackend {
 
     fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture> {
         handle.log_capture.clone()
+    }
+
+    fn take_stdin(&self, handle: &mut Self::Handle) -> Option<StdinState> {
+        // Story 14-1: the acp transport takes exclusive ownership of the
+        // child's stdin (the connection's ONE bounded-writer mutex replaces
+        // the handle-map path). Mirrors the Unix backend's identical body —
+        // the mechanism has no OS-specific part.
+        match std::mem::replace(&mut handle.stdin, StdinState::NoPipe) {
+            state @ StdinState::Live(_) => Some(state),
+            other => {
+                handle.stdin = other;
+                None
+            }
+        }
+    }
+
+    fn take_stdout(&self, handle: &mut Self::Handle) -> Option<ChildStdout> {
+        handle.stdout.take()
     }
 }
 
@@ -1004,6 +1045,7 @@ mod tests {
             stderr_log_file: None,
             instance_name: "test".to_string(),
             pipe_stdin: false,
+            pipe_stdout: false,
             detach: false,
         }
     }

@@ -452,11 +452,27 @@ fn profile_dir(mut exe: PathBuf, hop: BinDir) -> PathBuf {
 /// [`fake_agent_bin`] for the full existence-vs-freshness contract and the
 /// CI guard that makes it safe.
 pub fn fake_agent_bin_in(hop: BinDir) -> PathBuf {
+    helper_bin_in(hop, "fake_agent")
+}
+
+/// Locate the `fake_acp_agent` test helper binary (story 14-1, spine AD-19)
+/// — the ACP sibling of [`fake_agent_bin`], resolved and on-demand-built by
+/// the SAME mechanism (the shared [`helper_bin_in`]; the CI guard note on
+/// [`fake_agent_bin`] applies to this binary identically: any job that
+/// spawns acp agents must build the helper explicitly BEFORE the suite).
+pub fn fake_acp_agent_bin() -> PathBuf {
+    helper_bin_in(BinDir::TestDeps, "fake_acp_agent")
+}
+
+/// The SHARED helper locator: resolve `target/<profile>/<name><EXE_SUFFIX>`
+/// from the running binary's hop, building the named `[[bin]]` on demand
+/// when absent. `fake_agent_bin_in` and [`fake_acp_agent_bin_in`]'s engine.
+fn helper_bin_in(hop: BinDir, name: &str) -> PathBuf {
     let dir = profile_dir(
         std::env::current_exe().expect("locate the running test executable"),
         hop,
     );
-    let candidate = dir.join(format!("fake_agent{}", std::env::consts::EXE_SUFFIX));
+    let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if candidate.exists() {
         return candidate;
     }
@@ -472,7 +488,7 @@ pub fn fake_agent_bin_in(hop: BinDir) -> PathBuf {
         let mut build = std::process::Command::new(&cargo);
         // A shimmed PATH (RUSTC_WRAPPER) must not break the build.
         build
-            .args(["build", "-p", "hekma-conformance", "--bin", "fake_agent"])
+            .args(["build", "-p", "hekma-conformance", "--bin", name])
             .env_remove("RUSTC_WRAPPER");
         // Match the PROFILE this binary runs in: a release example must not
         // fall back to a debug helper it would never find next to itself
@@ -490,7 +506,7 @@ pub fn fake_agent_bin_in(hop: BinDir) -> PathBuf {
         let status = build.status();
         if !matches!(status, Ok(s) if s.success() && candidate.exists()) {
             panic!(
-                "fake_agent binary not found at {} and an on-demand build did not produce it \
+                "{name} binary not found at {} and an on-demand build did not produce it \
                  (build status: {status:?}). Build `hekma-conformance` first.",
                 candidate.display()
             );

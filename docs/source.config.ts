@@ -1,4 +1,7 @@
+import { remarkMdxMermaid } from 'fumadocs-core/mdx-plugins';
 import { defineConfig, defineDocs } from 'fumadocs-mdx/config';
+
+
 
 const files = [
   'README.md',
@@ -32,4 +35,11 @@ export const docs = defineDocs({
   },
 });
 
-export default defineConfig();
+export default defineConfig({
+  // fumadocs-core's official converter: mermaid fences compile to
+  // `<Mermaid chart="…" />`, rendered client-side by the component mapped
+  // in components/mdx.tsx (docs/components/mermaid.tsx).
+  mdxOptions: {
+    remarkPlugins: [remarkMdxMermaid],
+  },
+});

@@ -1,0 +1,383 @@
+//! The ACP transport core (spine AD-19, epic-14 story 14-1): the engine
+//! speaks the Agent Client Protocol as a CLIENT over a `--kind acp`
+//! instance's stdio — newline-delimited JSON-RPC 2.0 (UTF-8, one message per
+//! `\n`, stdout purity), hand-rolled over `serde_json` ONLY (NO new crates;
+//! the official ACP SDK was rejected for v1 under NFR-8 — churn vs. the
+//! single-integer protocol version).
+//!
+//! Story 14-1 delivers the TRANSPORT CORE only — the module family:
+//!
+//! * [`codec`] — ndJSON + JSON-RPC 2.0 envelopes, the tolerated protocol
+//!   version set `{1}`, the DEFAULT client capabilities (advertise-nothing,
+//!   D3), and the request-params builders.
+//! * [`updates`] — the tolerant `session/update` parser: the v1
+//!   discriminator set plus a counted `Unhandled` catch-all;
+//!   `usage_update` is CONTEXT-grain and is SURFACED ONLY — never minted
+//!   into the billing ledger (the two usage grains must never mix; the
+//!   billing tiers are stories 14-3/14-6).
+//! * [`client`] — the bounded `initialize` → `session/new` handshake, the
+//!   version-tolerance refusal, and the `session/request_permission`
+//!   denial policy.
+//! * [`connection`] — the reader thread, the bounded sole-writer stdin
+//!   path, request-response correlation, the one-in-flight-turn flag, the
+//!   permission auto-denial, the surfaced-notice queue, and the teardown
+//!   (close stdin → reader EOF) on stop/drop/terminal-settle.
+//!
+//! Stories 14-6 and 14-5 are OTHER stories: cached tokens and the sentinel
+//! mode. Story 14-2 (session resume) rides HERE for its transport half — the
+//! handshake's `session/load` resume decision (`client`), the persisted-id
+//! read/write helpers, and the adoption/resume notes; the schema v8 column
+//! and the settle retention live in the store. 14-4 is the verification/docs
+//! sweep.
+//!
+//! This module is crate-INTERNAL (the transport is engine machinery; the
+//! public surface change for 14-1 is the `acp` builtin kind's registration
+//! availability only). OS-uniform (AD-4): everything here is cfg-free —
+//! ndJSON framing is identical on every platform.
+
+mod client;
+mod codec;
+mod connection;
+mod updates;
+
+use crate::domain::{EffectiveConfig, EngineError, InstanceName};
+use crate::domain::{ACP_ARGS_KEY, ACP_COMMAND_KEY};
+
+pub(crate) use client::handshake;
+pub(crate) use connection::{AcpConnection, AcpContextUsage, PromptError};
+
+/// The builtin `acp` kind (spine AD-19) — the native-adapter table key the
+/// `--kind acp` registration resolves through. The same `^[a-z0-9][a-z0-9_-]*$`
+/// token rule as every builtin kind (the spine's adapter-kind convention).
+pub(crate) const ACP_KIND: &str = "acp";
+
+/// Whether `kind` is the builtin `acp` kind (the supervisor's one dispatch
+/// point for the transport-specific start/send/stop behavior).
+pub(crate) fn is_acp_kind(kind: &str) -> bool {
+    kind == ACP_KIND
+}
+
+/// Resolve an `acp` instance's START LAUNCH from its unified config keys
+/// (spine AD-19 / the epic-14 I/O matrix): `acp.command` (REQUIRED — the
+/// executable to run) plus `acp.args` (OPTIONAL). The `acp` builtin declares
+/// NO code-declared launch (unlike `hermes`) because the launch is
+/// per-instance operator configuration — so `start` refuses HONESTLY,
+/// naming both keys, when `acp.command` is unset.
+///
+/// `acp.args` is TOLERANTLY typed: a TOML array of strings is used
+/// element-wise; a plain string is split on whitespace (a value carrying
+/// spaces cannot be expressed that way — hand-edit the instance
+/// `config.toml` with an array form for that); any other shape is a typed
+/// refusal. The resolution is PURE (a config read + validation) and runs
+/// BEFORE any persisted state change, so a refusal rejects the start with
+/// no spurious transition.
+pub(crate) fn resolve_acp_launch(
+    name: &InstanceName,
+    effective: &EffectiveConfig,
+) -> Result<crate::adapter::StartLaunch, EngineError> {
+    let refuse = |detail: String| EngineError::AdapterUnresolved {
+        name: name.as_str().to_string(),
+        detail,
+    };
+    let command = match effective.value(ACP_COMMAND_KEY) {
+        Some(toml::Value::String(command)) if !command.trim().is_empty() => {
+            command.trim().to_string()
+        }
+        Some(other) => {
+            return Err(refuse(format!(
+                "the config key '{ACP_COMMAND_KEY}' must be a non-empty string (the executable \
+                 to run); got {other}"
+            )))
+        }
+        None => {
+            return Err(refuse(format!(
+                "no launch command is configured for the acp kind; set the config keys \
+                 '{ACP_COMMAND_KEY}' (required, the ACP agent executable) and '{ACP_ARGS_KEY}' \
+                 (optional, its arguments) — e.g. `kt agent config set {name} {ACP_COMMAND_KEY} \
+                 /path/to/agent`",
+                name = name.as_str(),
+            )))
+        }
+    };
+    let args = match effective.value(ACP_ARGS_KEY) {
+        None => Vec::new(),
+        Some(toml::Value::Array(items)) => {
+            let mut args = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    toml::Value::String(arg) => args.push(arg.clone()),
+                    other => {
+                        return Err(refuse(format!(
+                            "the config key '{ACP_ARGS_KEY}' must be an array of strings; an \
+                             element is {other}"
+                        )))
+                    }
+                }
+            }
+            args
+        }
+        Some(toml::Value::String(value)) => value
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        Some(other) => {
+            return Err(refuse(format!(
+                "the config key '{ACP_ARGS_KEY}' must be an array of strings (or a \
+                 whitespace-separated string); got {other}"
+            )))
+        }
+    };
+    Ok(crate::adapter::StartLaunch {
+        exec: command,
+        args,
+        env: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Whether THIS spawn should pipe the child's stdout to the engine (the ACP
+/// transport needs the protocol stream) — true exactly for an `acp` kind
+/// that is NOT detached (a detached spawn gets `Stdio::null()` stdin and no
+/// transport, mirroring the detached interaction refusal; see
+/// [`SpawnSpec::pipe_stdin`] for the detach rationale).
+pub(crate) fn spawn_pipe_stdout(is_acp: bool, detach: bool) -> bool {
+    is_acp && !detach
+}
+
+/// The honest adoption note (story 14-1, extended by 14-2): an ADOPTED `acp`
+/// instance is re-held as a bare process — its ACP pipe halves died with the
+/// engine that spawned it, so this engine holds NO live connection for it
+/// (the adopted process is not re-piped; there is no OS-portable way to
+/// recover a stdio pipe from a bare fingerprint). The RESUME therefore rides
+/// the NEXT START's handshake: when a session id is persisted (story 14-2's
+/// v8 record column) the note says so — it will be offered via
+/// `session/load`; when none is on record, the note says THAT instead. The
+/// diagnostic names the condition + the remediation, surfaced-not-silent
+/// (AI-18). `session` is the persisted id from the adopted spawn record.
+pub(crate) fn adopted_acp_note(name: &str, session: Option<&str>) -> String {
+    let session_note = match session {
+        // The id itself stays in the state DB (functional); the note
+        // surfaces only the fact + the promise (no opaque tokens in logs —
+        // CodeQL cleartext-logging).
+        Some(_) => "a previous session is on record and will be offered via session/load at \
+             the next start (if the agent supports resuming)"
+            .to_string(),
+        None => "no previous session is on record — the next start opens a new session".to_string(),
+    };
+    format!(
+        "{name}: adopted an acp instance; the ACP connection is a pair of pipes that died \
+         with the previous engine process, so THIS engine holds no ACP session for it — \
+         send will refuse until the instance is stopped and started again; {session_note}"
+    )
+}
+
+/// The start path's ONE resume-outcome note (story 14-2, AI-18 — surfaced vs
+/// silent): `Some(note)` when the handshake's resume decision produced
+/// something an operator must hear — the session was RESUMED, or a persisted
+/// id could NOT be resumed (capability missing / load failed). `None` when a
+/// first start opened a fresh session (nothing was expected; a note on every
+/// start would be noise, and the honest absence is already visible in the
+/// record).
+pub(crate) fn resume_outcome_note(name: &str, outcome: &client::Handshake) -> Option<String> {
+    if outcome.resumed {
+        // The OUTCOME is what an operator acts on; the raw session id is
+        // deliberately NOT surfaced here (CodeQL cleartext-logging: opaque
+        // tokens stay out of log files — the full id lives in the state
+        // DB, where it is functional).
+        return Some(format!(
+            "{name}: resumed the previous ACP session via session/load"
+        ));
+    }
+    outcome
+        .resume_declined
+        .as_ref()
+        .map(|reason| format!("{name}: opening a new ACP session — {reason}"))
+}
+
+/// The `acp` kind's ACTIVE Metering Source (story 14-3, T2 — spine AD-19's
+/// tiered acquisition): `self-reported` by default, or — when the operator
+/// configures `metering.upstream_base_url` — the `engine-observed` loopback
+/// channel (the same key an `engine-observed` MANIFEST agent honors; the
+/// engine-observed pipeline behind it — listener, parse incl. cached tokens,
+/// ledger, budgets — is kind-agnostic, so this is wiring, not new metering).
+///
+/// WHY the config key is the opt-in: the builtin acp adapter registers a
+/// fixed `SelfReported` snapshot (a builtin declares no `[metering]` section;
+/// the sentinel tier must be the honest default), so the SNAPSHOT alone would
+/// lock every acp instance out of the observed channel. The operator's
+/// upstream key is the deliberate, existing opt-in gesture — setting it says
+/// "this agent's model traffic honors a base-URL override", which is exactly
+/// the observed channel's precondition. Pure (a config read); called by the
+/// start seam (to pick the source + start the listener) and the Fleet read
+/// (so the surfaced source matches what the start did).
+pub(crate) fn resolve_acp_metering_source(effective: &EffectiveConfig) -> &'static str {
+    if crate::domain::resolve_upstream_base_url(effective).is_some() {
+        "engine-observed"
+    } else {
+        "self-reported"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ConfigLayer, SourceLayer};
+    use toml::Value;
+
+    /// An `EffectiveConfig` from a single instance-layer TOML body (the
+    /// other layers empty) — the resolution input.
+    fn effective_from_instance(body: &str) -> EffectiveConfig {
+        let layers = [
+            ConfigLayer::empty(),
+            ConfigLayer::empty(),
+            ConfigLayer::parse(SourceLayer::Instance, "<test>", body).unwrap(),
+            ConfigLayer::empty(),
+        ];
+        crate::domain::resolve(layers)
+    }
+
+    fn launch_of(body: &str) -> Result<crate::adapter::StartLaunch, EngineError> {
+        let name = InstanceName::new("acp-1").unwrap();
+        resolve_acp_launch(&name, &effective_from_instance(body))
+    }
+
+    #[test]
+    fn launch_resolves_from_the_command_and_args_keys() {
+        // The string-form args (whitespace-split) is the CLI `config set`
+        // path; an absolute command resolves verbatim.
+        let launch =
+            launch_of("acp.command = '/usr/bin/some-acp-agent'\nacp.args = '--mode chunky'\n")
+                .unwrap();
+        assert_eq!(launch.exec, "/usr/bin/some-acp-agent");
+        assert_eq!(launch.args, vec!["--mode", "chunky"]);
+        assert!(launch.env.is_empty());
+    }
+
+    #[test]
+    fn launch_resolves_the_toml_array_args_form() {
+        // The hand-edited config.toml array form carries args with spaces.
+        let launch =
+            launch_of("acp.command = 'agent'\nacp.args = [\"--model\", \"gpt 4\"]\n").unwrap();
+        assert_eq!(launch.args, vec!["--model", "gpt 4"]);
+    }
+
+    #[test]
+    fn missing_or_empty_command_refuses_naming_both_keys() {
+        // Absent: the refusal NAMES both keys (the I/O matrix's honest
+        // refusal) and suggests the config set remediation.
+        let err = launch_of("").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(ACP_COMMAND_KEY), "{text}");
+        assert!(text.contains(ACP_ARGS_KEY), "{text}");
+        // An empty command is the same refusal shape (a present-but-empty
+        // value is not a launch).
+        let err = launch_of("acp.command = '   '\n").unwrap_err();
+        assert!(err.to_string().contains(ACP_COMMAND_KEY));
+        // A non-string command is a typed refusal.
+        let err = launch_of("acp.command = 7\n").unwrap_err();
+        assert!(err.to_string().contains("non-empty string"), "{err}");
+    }
+
+    #[test]
+    fn malformed_args_refuse_typed() {
+        // A non-string array element.
+        let err = launch_of("acp.command = 'agent'\nacp.args = [1]\n").unwrap_err();
+        assert!(err.to_string().contains(ACP_ARGS_KEY), "{err}");
+        // A non-array, non-string shape.
+        let err = launch_of("acp.command = 'agent'\nacp.args = 3\n").unwrap_err();
+        assert!(err.to_string().contains(ACP_ARGS_KEY), "{err}");
+        // Absent args are fine (empty argv).
+        let launch = launch_of("acp.command = 'agent'\n").unwrap();
+        assert!(launch.args.is_empty());
+    }
+
+    #[test]
+    fn kind_dispatch_and_the_adoption_note_are_stable() {
+        assert!(is_acp_kind("acp"));
+        assert!(!is_acp_kind("mock"));
+        assert!(!is_acp_kind("hermes"));
+        // The adoption note names the instance, the dead-pipe fact, and — for
+        // a recorded session (14-2) — the resume promise (surfaced-not-
+        // silent); the id-less variant names the honest absence instead.
+        let note = adopted_acp_note("acp-1", Some("fake-session-1"));
+        assert!(note.contains("acp-1"), "{note}");
+        // The raw id is deliberately NOT in the surfaced note (cleartext-
+        // logging discipline) — the promise is, and the id lives in the DB.
+        assert!(!note.contains("fake-session-1"), "{note}");
+        assert!(note.contains("a previous session is on record"), "{note}");
+        assert!(note.contains("session/load"), "{note}");
+        let bare = adopted_acp_note("acp-1", None);
+        assert!(bare.contains("no previous session"), "{bare}");
+        // The transport pipes stdout exactly for a non-detached acp spawn.
+        assert!(spawn_pipe_stdout(true, false));
+        assert!(!spawn_pipe_stdout(true, true));
+        assert!(!spawn_pipe_stdout(false, false));
+        // Silence an unused-import lint in the test module (Value is used
+        // only through the toml literals above on some compilers).
+        let _ = Value::from(1);
+    }
+
+    #[test]
+    fn resume_outcome_note_covers_resumed_declined_and_silent_fresh() {
+        use crate::acp::client::Handshake;
+        // A resumed session is surfaced, naming the id.
+        let resumed = Handshake {
+            session_id: "fake-session-1".to_string(),
+            load_session: true,
+            resumed: true,
+            resume_declined: None,
+        };
+        let note = resume_outcome_note("acp-1", &resumed).expect("resumed is surfaced");
+        assert!(
+            note.contains("acp-1") && note.contains("session/load"),
+            "{note}"
+        );
+        // The raw id is deliberately NOT in the surfaced note (cleartext-
+        // logging discipline) — it lives in the state DB.
+        assert!(!note.contains("fake-session-1"), "{note}");
+        // A declined resume is surfaced with the reason (capability missing).
+        let declined = Handshake {
+            session_id: "s-2".to_string(),
+            load_session: false,
+            resumed: false,
+            resume_declined: Some(
+                "the agent does not support resuming (no loadSession \
+                                   capability)"
+                    .to_string(),
+            ),
+        };
+        let note = resume_outcome_note("acp-2", &declined).expect("declined is surfaced");
+        assert!(note.contains("new ACP session"), "{note}");
+        assert!(note.contains("does not support resuming"), "{note}");
+        // A first start (no persisted id) owes NO note.
+        let fresh = Handshake {
+            session_id: "s-3".to_string(),
+            load_session: false,
+            resumed: false,
+            resume_declined: None,
+        };
+        assert!(resume_outcome_note("acp-3", &fresh).is_none());
+    }
+
+    #[test]
+    fn metering_source_resolves_self_reported_by_default_and_observed_on_the_upstream_key() {
+        // Story 14-3 (T2): the acp kind meters self-reported UNTIL the
+        // operator opts into the observed channel via the SAME upstream key
+        // an engine-observed manifest agent honors.
+        let bare = effective_from_instance("acp.command = 'agent'\n");
+        assert_eq!(resolve_acp_metering_source(&bare), "self-reported");
+        let opted_in = effective_from_instance(
+            "acp.command = 'agent'\n[metering]\nupstream_base_url = \"http://127.0.0.1:9\"\n",
+        );
+        assert_eq!(
+            resolve_acp_metering_source(&opted_in),
+            "engine-observed",
+            "metering.upstream_base_url is the observed opt-in for acp too"
+        );
+        // A secret-classified / empty upstream is NOT a URL (the same rule
+        // `resolve_upstream_base_url` applies to manifest agents) → no opt-in.
+        let empty = effective_from_instance(
+            "acp.command = 'agent'\n[metering]\nupstream_base_url = \"   \"\n",
+        );
+        assert_eq!(resolve_acp_metering_source(&empty), "self-reported");
+    }
+}

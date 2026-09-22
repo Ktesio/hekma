@@ -89,6 +89,12 @@
 //!   into SQLite's signed `i64` column (a positive `i64::MAX`) rather than a raw
 //!   `as i64` that bit-wraps NEGATIVE and poisons the billing SUM (the C1/C2
 //!   boundary). Default to the fixed sentinels when absent.
+//! * `--usage-cached-tokens <N>` (story 14-6)  stamp each emitted usage line with
+//!   an OPTIONAL `cached_tokens` field — the cached SUBSET of `input_tokens` under
+//!   the engine's INPUT-INCLUSIVE invariant. `0` (the default) omits the field, so
+//!   the emitted line stays byte-identical to the pre-14-6 convention. A test can
+//!   thus drive a cached-bearing event through the self-reported ingest path
+//!   end-to-end (ledger column + cost re-split + budget counting).
 //! * `--final-usage-no-newline` (story 3-1)  after the batch (+ any replay), emit
 //!   ONE more usage line WITHOUT a trailing newline (`sequence = emit_usage`), then
 //!   exit immediately. The process dies with a half-line in the log, so ONLY the
@@ -185,6 +191,11 @@ struct Opts {
     usage_input_tokens: Option<u64>,
     /// Override the per-event output-token sentinel (see `usage_input_tokens`).
     usage_output_tokens: Option<u64>,
+    /// The per-event cached-token SUBSET stamped on each usage line (story 14-6).
+    /// `0` = omit the optional field (the pre-14-6 line shape). MUST be
+    /// `<=` the input sentinel for the engine's parser to accept the line
+    /// (the INPUT-INCLUSIVE invariant — a larger cached count is malformed).
+    usage_cached_tokens: u64,
     /// Emit ONE final usage sentinel line WITHOUT a trailing newline, then exit
     /// promptly (story 3-1 H1 under-count test). Its `sequence` is `emit_usage` (one
     /// past the batch), so the TERMINAL drain-on-reap must consume the newline-less
@@ -226,14 +237,23 @@ const USAGE_OUTPUT_TOKENS: u64 = 20;
 ///
 /// MUST match the engine's `hekma_engine::ports::parse_usage_line` convention:
 /// the prefix `KTESIO_USAGE ` + a JSON object with snake_case `sequence`,
-/// `input_tokens`, `output_tokens`. This binary cannot depend on the engine, so it
+/// `input_tokens`, `output_tokens` — plus, since story 14-6, the OPTIONAL
+/// `cached_tokens` subset (emitted ONLY when non-zero, so a cache-miss line
+/// stays byte-identical to the pre-14-6 convention; the engine's parser reads
+/// an absent field as known-zero). This binary cannot depend on the engine, so it
 /// re-implements the shared shape in pure `std`; the engine's
 /// `format_and_parse_round_trip_agree_on_the_convention` test guards the two
 /// against drift. NO OS-cfg — the line is identical text on every OS.
-fn usage_line(sequence: u64, input_tokens: u64, output_tokens: u64) -> String {
-    format!(
-        "KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens}}}"
-    )
+fn usage_line(sequence: u64, input_tokens: u64, output_tokens: u64, cached_tokens: u64) -> String {
+    if cached_tokens > 0 {
+        format!(
+            "KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens},\"cached_tokens\":{cached_tokens}}}"
+        )
+    } else {
+        format!(
+            "KTESIO_USAGE {{\"sequence\":{sequence},\"input_tokens\":{input_tokens},\"output_tokens\":{output_tokens}}}"
+        )
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -256,6 +276,7 @@ fn parse() -> Opts {
     let mut replay_usage = false;
     let mut usage_input_tokens = None;
     let mut usage_output_tokens = None;
+    let mut usage_cached_tokens = 0;
     let mut final_usage_no_newline = false;
     let mut observed_calls = 0;
     let mut observed_stream_calls = 0;
@@ -284,6 +305,11 @@ fn parse() -> Opts {
             "--usage-output-tokens" => {
                 if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
                     usage_output_tokens = Some(n);
+                }
+            }
+            "--usage-cached-tokens" => {
+                if let Some(n) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    usage_cached_tokens = n;
                 }
             }
             "--final-usage-no-newline" => final_usage_no_newline = true,
@@ -395,6 +421,7 @@ fn parse() -> Opts {
         replay_usage,
         usage_input_tokens,
         usage_output_tokens,
+        usage_cached_tokens,
         final_usage_no_newline,
         observed_calls,
         observed_stream_calls,
@@ -520,17 +547,22 @@ fn main() {
     // DB, so this schedule is a nudge, not a timing dependency. Pure `std`, NO OS-cfg.
     let input_tokens = opts.usage_input_tokens.unwrap_or(USAGE_INPUT_TOKENS);
     let output_tokens = opts.usage_output_tokens.unwrap_or(USAGE_OUTPUT_TOKENS);
+    let cached_tokens = opts.usage_cached_tokens;
     for sequence in 0..opts.emit_usage {
         let _ = writeln!(
             stdout,
             "{}",
-            usage_line(sequence, input_tokens, output_tokens)
+            usage_line(sequence, input_tokens, output_tokens, cached_tokens)
         );
         let _ = stdout.flush();
         sleep(Duration::from_millis(20));
     }
     if opts.emit_usage > 0 && opts.replay_usage {
-        let _ = writeln!(stdout, "{}", usage_line(0, input_tokens, output_tokens));
+        let _ = writeln!(
+            stdout,
+            "{}",
+            usage_line(0, input_tokens, output_tokens, cached_tokens)
+        );
         let _ = stdout.flush();
     }
 
@@ -586,7 +618,7 @@ fn main() {
         let _ = write!(
             stdout,
             "{}",
-            usage_line(opts.emit_usage, input_tokens, output_tokens)
+            usage_line(opts.emit_usage, input_tokens, output_tokens, cached_tokens)
         );
         let _ = stdout.flush();
         std::process::exit(0);

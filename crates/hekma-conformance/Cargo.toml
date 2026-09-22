@@ -38,5 +38,12 @@ tempfile = { workspace = true }
 name = "hermes_shim"
 path = "src/bin/hermes_shim.rs"
 
+# Story 14-1 (spine AD-19): the scriptable ACP v1 agent the acp transport
+# tests point `acp.command` at (a REAL subprocess driven through the
+# handshake / prompt turns / permission denial / stop ladder).
+[[bin]]
+name = "fake_acp_agent"
+path = "src/bin/fake_acp_agent.rs"
+
 [lints]
 workspace = true

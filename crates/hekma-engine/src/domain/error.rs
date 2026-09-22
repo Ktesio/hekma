@@ -493,6 +493,22 @@ pub enum EngineError {
         timeout_secs: u64,
     },
 
+    /// A second `send` targeted an `acp` instance while a turn was already
+    /// in flight (story 14-1, spine AD-19: ACP serializes turns per session
+    /// — a concurrent prompt is REFUSED with this surfaced typed refusal,
+    /// never queued). The first turn is unaffected; its chunks + stopReason
+    /// continue landing asynchronously in the output log. Names the
+    /// instance.
+    #[error(
+        "Agent Instance '{name}' already has an ACP turn in flight; the acp kind serializes \
+         turns per session — wait for the current turn to complete (its stopReason lands in \
+         `kt agent logs`), or stop the instance"
+    )]
+    AcpTurnInFlight {
+        /// The instance the second prompt targeted.
+        name: String,
+    },
+
     /// A [`Supervisor::stop`](super::supervisor::Supervisor::stop) call sent
     /// SIGKILL (or the platform equivalent) but could not CONFIRM the
     /// process's death within the bounded window (fix pass, review of #80

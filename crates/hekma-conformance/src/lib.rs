@@ -66,7 +66,7 @@ pub use tck::{
 // The `fake_agent` locator lives in `test_support` (the shared test-support
 // home, parameterized over the cargo target subdir hop — story 10-1); the
 // crate-root path every suite already imports stays stable.
-pub use test_support::fake_agent_bin;
+pub use test_support::{fake_acp_agent_bin, fake_agent_bin};
 
 /// The kind string the mock adapter registers under.
 pub const MOCK_KIND: &str = "mock";

@@ -1011,11 +1011,26 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // a different, sanctioned shape ([`free_call`] excludes them) aiming the
     // spawned child's stdio, never the host process's.
     let stdio_reaches = scan(&src, &|line| {
-        free_call(line, "stdout")
-            || free_call(line, "stderr")
-            || (line.contains("use std::io")
-                && (line.contains("stdout") || line.contains("stderr")))
-            || line.contains("_print")
+        // The CHILD-stdio accessor family (story 14-1, spine AD-19) is the
+        // sanctioned child-pipe surface — the same shape as the backends'
+        // `command.stdout(Stdio::…)` setters above: `take_stdout`/`take_stdin`
+        // move the spawned child's OWN pipe halves out to the acp transport
+        // (and `pipe_stdout` names that SpawnSpec capability), they never
+        // touch the HOST process's stdio. Their signatures/calls carry the
+        // words but are not reaches, so they are excluded by name — a real
+        // process-stdio reach (`io::stdout(`/`io::stderr(`, the import
+        // forms, `_print` internals) still counts exactly as before.
+        let child_stdio_accessor = line.contains("take_stdout")
+            || line.contains("take_stdin")
+            || line.contains("pipe_stdout")
+            || line.contains("ChildStdout")
+            || line.contains("ChildStdin");
+        !child_stdio_accessor
+            && (free_call(line, "stdout")
+                || free_call(line, "stderr")
+                || (line.contains("use std::io")
+                    && (line.contains("stdout") || line.contains("stderr")))
+                || line.contains("_print"))
     });
     assert_eq!(
         stdio_reaches.len(),

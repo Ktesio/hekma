@@ -50,17 +50,50 @@ pub const MOCK_MEMORY_ENV_VAR: &str = "KTESIO_MEMORY_DIR";
 pub const HERMES_EXEC: &str = hekma_adapters_hermes::HERMES_EXEC;
 pub const HERMES_ARGS: [&str; 3] = hekma_adapters_hermes::HERMES_ARGS;
 
+/// The builtin `acp`'s code-declared env target for the reserved
+/// [`MEMORY_DIR_KEY`] leaf (story 14-5, the hermes-kind retirement path):
+/// when a `filesystem` Memory Backing is attached to an `acp` instance, the
+/// engine injects the managed memory dir at that key as an invocation
+/// override, and this mapping delivers it into the child's environment as
+/// `HERMES_HOME` — the SAME var the `hermes` builtin maps (the retirement
+/// parity item: a `hermes-acp` agent under the `acp` kind must receive its
+/// memory home exactly as it did under the legacy kind). When NO backing is
+/// attached the key is never injected, so the mapping is a no-op (the
+/// mapping application iterates only keys PRESENT in the effective config;
+/// the agent then falls back to its own default home chain — the documented
+/// fallback, identical to the hermes kind's).
+pub const ACP_MEMORY_HOME_ENV_VAR: &str = hekma_adapters_hermes::HERMES_HOME;
+
+/// The builtin `acp`'s code-declared env target for the reserved
+/// [`METERING_BASE_URL_KEY`] leaf (story 14-3, T2): when the operator opts an
+/// `acp` instance into the engine-observed channel (set
+/// `metering.upstream_base_url`), the engine starts its loopback forward
+/// listener and injects `http://127.0.0.1:<port>` at that key — this mapping
+/// delivers it into the child's environment under the DE-FACTO base-URL
+/// override convention most OpenAI-compatible agents honor. When the instance
+/// is NOT in observed mode the key is never injected, so the mapping is a
+/// no-op (the mapping application iterates only keys PRESENT in the effective
+/// config). One env var, deliberately: the observed pipeline's parse
+/// vocabulary (OpenAI/Anthropic/Gemini shapes) is broader than any one
+/// launch-env convention, and an agent that reads a different variable is
+/// still free to consume the listener URL however its operator configures it.
+pub const ACP_BASE_URL_ENV_VAR: &str = "OPENAI_BASE_URL";
+
 /// Resolve a native `kind` to a boxed builtin adapter, or `None` if unknown.
 ///
-/// The table carries two kinds: the inert `mock` (the conformance stand-in) and
-/// the launchable `hermes` builtin (story 6-2, the first launchable native
-/// adapter).
+/// The table carries three kinds: the inert `mock` (the conformance
+/// stand-in), the launchable `hermes` builtin (story 6-2, the first
+/// launchable native adapter), and the launchable `acp` builtin (story 14-1,
+/// spine AD-19 — the transport core; its START launch comes from the
+/// instance's `acp.command`/`acp.args` config keys at start time, so unlike
+/// hermes it declares no code-declared launch here).
 pub fn native(kind: &str) -> Option<Box<dyn AgentAdapter>> {
     match kind {
         "mock" => Some(Box::new(BuiltinMock::new())),
         hekma_adapters_hermes::HERMES_KIND => {
             Some(Box::new(hekma_adapters_hermes::HermesAdapter::new()))
         }
+        crate::acp::ACP_KIND => Some(Box::new(BuiltinAcp::new())),
         _ => None,
     }
 }
@@ -161,6 +194,100 @@ impl AgentAdapter for BuiltinMock {
     // Lifecycle ops use the trait's inert default bodies (execution is 1-4).
 }
 
+/// The engine's builtin `acp` adapter (story 14-1, spine AD-19): the
+/// registration half of the ACP transport core.
+///
+/// * **Metering Source = `SelfReported`** (the contract requires a viable
+///   source; the sentinel channel yields honest nothing for agents that do
+///   not emit — the designed last-resort honesty, AI-18/AD-8). The tiered
+///   acquisition (observed base-URL / sentinel mode / the honest `—` gap
+///   notice) is stories 14-3/14-5; `usage_update` surfacing is 14-3. This
+///   story implements the transport core only.
+/// * **Capabilities:** `interaction` GUARANTEED on every OS (the ACP
+///   transport IS the stdin/stdout pipe pair — without a piped stdin there
+///   is no transport) and `pause` guaranteed on Linux/macOS, best-effort on
+///   Windows — pause/resume keep PROCESS semantics for an `acp` instance
+///   (SIGSTOP/SIGCONT parity; the transport is untouched by a frozen
+///   process).
+/// * **No code-declared launch:** the launch comes from the instance's
+///   `acp.command`/`acp.args` unified config keys at start ([`crate::acp`]'s
+///   resolver; the start refuses honestly naming both keys when unset), so
+///   `native_launch("acp")` stays `None` and the start's acp branch resolves
+///   the launch from the effective config instead of the builtin table.
+/// * **No `contract_version` negotiation:** a builtin does not negotiate
+///   (epic-6 B3 precedent) — the acp kind never engages the adapter contract
+///   v1 (D5).
+/// * **Config mapping:** exactly TWO reserved leaves (both engine-injected
+///   only, never operator-set, so each is a no-op unless its machinery ran):
+///   `metering.base_url` → `OPENAI_BASE_URL` (story 14-3's observed opt-in)
+///   and `memory.dir` → `HERMES_HOME` (story 14-5's retirement parity — a
+///   filesystem Memory Backing delivers the managed dir to a `hermes-acp`
+///   agent under this kind exactly as the `hermes` kind does).
+///   `agent.*` pass-through still applies through the generic start seam.
+#[derive(Clone, Debug)]
+struct BuiltinAcp {
+    capabilities: CapabilityDeclaration,
+}
+
+impl BuiltinAcp {
+    fn new() -> Self {
+        let capabilities = CapabilityDeclaration::new()
+            .with(Capability::Pause, OsId::Linux, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Macos, SupportLevel::Guaranteed)
+            .with(Capability::Pause, OsId::Windows, SupportLevel::BestEffort)
+            .with(
+                Capability::Interaction,
+                OsId::Linux,
+                SupportLevel::Guaranteed,
+            )
+            .with(
+                Capability::Interaction,
+                OsId::Macos,
+                SupportLevel::Guaranteed,
+            )
+            .with(
+                Capability::Interaction,
+                OsId::Windows,
+                SupportLevel::Guaranteed,
+            );
+        Self { capabilities }
+    }
+}
+
+impl AgentAdapter for BuiltinAcp {
+    fn kind(&self) -> &str {
+        crate::acp::ACP_KIND
+    }
+
+    fn capabilities(&self) -> &CapabilityDeclaration {
+        &self.capabilities
+    }
+
+    fn metering_source(&self) -> MeteringSource {
+        MeteringSource::SelfReported
+    }
+
+    /// Story 14-3 (T2) + story 14-5 (the hermes retirement parity): the TWO
+    /// reserved leaves — `metering.base_url` → the child's `OPENAI_BASE_URL`
+    /// env (the engine-observed opt-in's delivery mechanism; a no-op unless
+    /// the engine injects it) and `memory.dir` → the child's `HERMES_HOME`
+    /// env (the filesystem Memory Backing's delivery, the SAME var the
+    /// `hermes` builtin maps, so a `hermes-acp` agent under this kind gets
+    /// its memory home exactly as under the legacy kind; a no-op unless a
+    /// backing is attached).
+    fn config_mapping(&self) -> ConfigMapping {
+        ConfigMapping::new()
+            .with(
+                crate::domain::METERING_BASE_URL_KEY,
+                ConfigTarget::env(ACP_BASE_URL_ENV_VAR),
+            )
+            .with(
+                crate::domain::MEMORY_DIR_KEY,
+                ConfigTarget::env(ACP_MEMORY_HOME_ENV_VAR),
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +304,70 @@ mod tests {
     fn unknown_kind_returns_none() {
         assert!(native("nope").is_none());
         assert!(native("").is_none());
+    }
+
+    #[test]
+    fn acp_kind_resolves_with_the_transport_shape() {
+        // Story 14-1: the launchable acp builtin resolves through the same
+        // table as mock/hermes. Metering source = self-reported (the honest
+        // last resort; the tiered billing acquisition is 14-3/14-5).
+        let adapter = native(crate::acp::ACP_KIND).expect("acp must resolve");
+        assert_eq!(adapter.kind(), crate::acp::ACP_KIND);
+        assert_eq!(adapter.metering_source(), MeteringSource::SelfReported);
+        let decl = adapter.capabilities();
+        for os in [OsId::Linux, OsId::Macos, OsId::Windows] {
+            // The transport IS the stdio pipe pair: interaction guaranteed
+            // everywhere; pause keeps process semantics (guaranteed on
+            // Linux/macOS, best-effort on Windows — the AD-4 exemplar shape).
+            assert_eq!(
+                decl.support(Capability::Interaction, os),
+                SupportLevel::Guaranteed,
+                "os={os}"
+            );
+            assert_eq!(
+                decl.support(Capability::Pause, os),
+                if os == OsId::Windows {
+                    SupportLevel::BestEffort
+                } else {
+                    SupportLevel::Guaranteed
+                },
+                "os={os}"
+            );
+        }
+        // No code-declared launch: the launch resolves from the instance's
+        // acp.command/acp.args config keys at start (the start's acp branch),
+        // so the builtin table's launch stays None — a registration snapshot
+        // with no launch, exactly like mock.
+        assert!(native_launch(crate::acp::ACP_KIND).is_none());
+        // Exactly TWO unified-key mappings: the reserved `metering.base_url`
+        // leaf → the child's `OPENAI_BASE_URL` env (story 14-3, T2 — the
+        // engine-observed opt-in's delivery mechanism, a no-op unless the
+        // engine injects it), and — story 14-5, the hermes retirement parity —
+        // the reserved `memory.dir` leaf → `HERMES_HOME`, the SAME var the
+        // `hermes` builtin maps, so a filesystem Memory Backing delivers to a
+        // `hermes-acp` agent under this kind exactly as under the legacy kind
+        // (a no-op unless a backing is attached).
+        let mapping = native_config_mapping(crate::acp::ACP_KIND).unwrap();
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(
+            mapping
+                .target(crate::domain::METERING_BASE_URL_KEY)
+                .unwrap()
+                .env_var(),
+            Some(ACP_BASE_URL_ENV_VAR)
+        );
+        assert_eq!(
+            mapping
+                .target(crate::domain::MEMORY_DIR_KEY)
+                .unwrap()
+                .env_var(),
+            Some(ACP_MEMORY_HOME_ENV_VAR)
+        );
+        assert_eq!(
+            ACP_MEMORY_HOME_ENV_VAR,
+            hekma_adapters_hermes::HERMES_HOME,
+            "the acp kind's memory home var must BE the hermes kind's (retirement parity)"
+        );
     }
 
     #[test]

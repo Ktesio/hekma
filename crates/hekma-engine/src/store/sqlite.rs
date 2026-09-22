@@ -29,15 +29,20 @@
 //! write-ahead spawn-record table (AD-5/AD-6). Story 3-1 adds v3: the Usage
 //! Ledger's `sequence` ordinal column + a `UNIQUE(instance_id, run_id,
 //! sequence)` dedup index, so a replayed usage batch is a DB-level no-op
-//! (AC-A). A DB ahead of this build is refused (forward-compat guard).
+//! (AC-A). A DB ahead of this build is refused (forward-compat guard). Story
+//! 14-6 adds v7: the Usage Ledger's additive `cached_tokens` +
+//! `cached_micros_per_1m` columns (both NULLABLE — a pre-v7 row's cached count
+//! is UNKNOWN, never a fabricated zero). Story 14-2 adds v8: the spawn
+//! record's NULLABLE `acp_session_id` (the last established ACP session id —
+//! NULL = never established, or a pre-v8 record).
 
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::domain::{
-    cost_micros, AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome,
-    RestartPolicy, RunId, UsageEvent, UsageTotals,
+    cost_micros_with_cached, AgentInstance, InstanceName, LifecycleState, Micros, Rate,
+    RecordOutcome, RestartPolicy, RunId, UsageEvent, UsageTotals,
 };
 use crate::ports::{
     MemoryBacking, MemoryBackingKind, ProcessFingerprint, SpawnRecord, StateStore, StoreError,
@@ -55,8 +60,21 @@ use crate::ports::{
 /// contributes $0 to the derived cost. v5 (story 5-1, AD-11): the
 /// `agent_memory_backing` table — one Memory Backing attachment row per instance
 /// as TYPED columns (never a JSON blob, DC-2), UNIQUE on the instance FK with
-/// `ON DELETE CASCADE`.
-const SCHEMA_VERSION: i64 = 6;
+/// `ON DELETE CASCADE`. v6 (story 12-1 AMENDMENT): the spawn record's `detached`
+/// flag. v7 (story 14-6, D8): two NULLABLE `usage_events` columns —
+/// `cached_tokens` (the event's cached-token subset under the INPUT-INCLUSIVE
+/// invariant; NULL = a pre-v7 row whose cached count is UNKNOWN) and
+/// `cached_micros_per_1m` (the cached-token Rate in force at commit, the v4
+/// no-retro-repricing pattern extended to the new price; NULL = unset → cached
+/// tokens price at that row's stored input rate). The dedup UNIQUE key
+/// `(instance_id, run_id, sequence)` is UNCHANGED. v8 (story 14-2, D4): the
+/// spawn record's NULLABLE `acp_session_id` — the last ACP session id the
+/// engine established for the instance, persisted so the NEXT start can offer
+/// it back via `session/load` (the resumed session; the ACP transport itself
+/// is a pipe pair that dies with the engine that held it, so the resume rides
+/// the next handshake, not the adopted process). NULL = a pre-v8 record, or no
+/// session established yet. Not part of any key; no column renamed/removed.
+const SCHEMA_VERSION: i64 = 8;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -181,6 +199,56 @@ const SCHEMA_V6: &str = "\
 ALTER TABLE agent_runtime ADD COLUMN detached INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Schema v7 DDL (story 14-6, D8): the Usage Ledger's cached-token columns.
+///
+/// ADDITIVE over the frozen `usage_events` columns, following the v4
+/// NULLABLE-column precedent exactly. TWO columns, because the cached PRICE
+/// must ride the row beside the cached COUNT for the same no-retro-repricing
+/// reason the v4 rate columns exist: the derived cost prices each row at the
+/// Rate in force at ITS commit, and the cached rate is part of that Rate —
+/// without the column, a later-set cached rate would silently re-price
+/// history.
+///
+/// * `cached_tokens INTEGER` (NULLABLE) — the event's cached-token SUBSET of
+///   `input_tokens` under the INPUT-INCLUSIVE invariant
+///   (`0 <= cached_tokens <= input_tokens`, enforced by the parse layer).
+///   NULL = a pre-v7 row (or an unknown count) — the honest absence a surface
+///   renders as `—`, never a fabricated zero. NOT part of the dedup UNIQUE key
+///   (the `(instance_id, run_id, sequence)` index is untouched).
+/// * `cached_micros_per_1m INTEGER` (NULLABLE) — the cached-token Rate in
+///   force at commit. NULL = unset at commit → the row's cached tokens price
+///   at its stored INPUT rate (the conservative default: overstates, never
+///   understates — AD-8).
+///
+/// No column is renamed/removed, so v1..v6 → v7 preserves every row (old rows
+/// read as NULL = unknown cached / unset cached rate).
+const SCHEMA_V7: &str = "\
+ALTER TABLE usage_events ADD COLUMN cached_tokens INTEGER;
+ALTER TABLE usage_events ADD COLUMN cached_micros_per_1m INTEGER;
+";
+
+/// Schema v8 DDL (story 14-2, D4): the spawn record's ACP session id.
+///
+/// ADDITIVE over the frozen `agent_runtime` columns, following the v6
+/// (single-column ALTER on the same table) and v7 (NULLABLE honesty) patterns
+/// exactly: ONE NULLABLE TEXT column.
+///
+/// * `acp_session_id TEXT` (NULLABLE) — the last ACP session id this engine
+///   established for the instance, written by the start path at the point the
+///   handshake establishes it (post-`session/new` / post-`session/load`).
+///   NULL = a pre-v8 record, or no session was established. The id is the
+///   durable input for the NEXT start's `session/load` resume offer (spine
+///   AD-19: the ACP transport is a pipe pair that dies with the engine that
+///   held it, so the session resume rides the next handshake — the adopted
+///   PROCESS itself is not re-piped). NOT part of any UNIQUE key; the
+///   `settle_spawn_record` retention re-seed (story 14-2) carries it onto the
+///   pid-0 seed row across a stop/crash settle so a later start can still
+///   offer it. No column is renamed/removed, so v1..v7 → v8 preserves every
+///   row (old rows read as NULL = no session on record).
+const SCHEMA_V8: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN acp_session_id TEXT;
+";
+
 /// A SQLite-backed state store over a single connection.
 ///
 /// One handle owns one connection. This story is single-threaded per handle
@@ -289,7 +357,7 @@ impl SqliteStore {
             .conn
             .prepare(
                 "SELECT run_id, input_tokens, output_tokens, metering_source, sequence, \
-                 occurred_at FROM usage_events WHERE instance_id = ?1 ORDER BY rowid",
+                 occurred_at, cached_tokens FROM usage_events WHERE instance_id = ?1 ORDER BY rowid",
             )
             .map_err(backend)?;
         let rows = stmt
@@ -306,6 +374,9 @@ impl SqliteStore {
                     // against any pre-clamping (pre-v3) row.
                     input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
                     output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    // Story 14-6: a NULL cached column (a pre-v7 row) reads as
+                    // the UNKNOWN absence (None), never a fabricated zero.
+                    cached_tokens: row.get::<_, Option<i64>>(6)?.map(|c| c.max(0) as u64),
                     metering_source: row.get::<_, String>(3)?,
                     sequence: row.get::<_, i64>(4)?.max(0) as u64,
                     occurred_at: row.get::<_, String>(5)?,
@@ -388,6 +459,12 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 6 {
         migrate_step(conn, 6, SCHEMA_V6)?;
     }
+    if version < 7 {
+        migrate_step(conn, 7, SCHEMA_V7)?;
+    }
+    if version < 8 {
+        migrate_step(conn, 8, SCHEMA_V8)?;
+    }
 
     Ok(())
 }
@@ -469,9 +546,10 @@ fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
     None
 }
 
-/// Sum the `(input_tokens, output_tokens)` columns of a per-instance/Run scope
-/// into [`UsageTotals`], with SATURATING `u64` semantics (story 3-1 overflow-safe
-/// read, C1/C2).
+/// Sum the `(input_tokens, output_tokens, cached_tokens)` columns of a
+/// per-instance/Run scope into [`UsageTotals`], with SATURATING `u64` semantics
+/// (story 3-1 overflow-safe read, C1/C2) and the story-14-6 unknown-cached
+/// propagation.
 ///
 /// Deliberately NOT a SQL `SUM(...)`: SQLite's `SUM` over `INTEGER`s accumulates in
 /// a signed `i64` and, on overflow, silently switches the result to a lossy
@@ -482,6 +560,12 @@ fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
 /// `saturating_add` on `u64`: an astronomically large scope caps at `u64::MAX`
 /// rather than wrapping or turning lossy. `stmt` is the caller's prepared statement
 /// (the scope predicate + its bound params differ between cumulative and per-Run).
+///
+/// The cached rollup (14-6): a row with a NULL `cached_tokens` (a pre-v7 row)
+/// has an UNKNOWN cached count — it poisons the scope's cached total into
+/// `None` (the honest absence a surface renders as `—`), NEVER a fabricated
+/// zero contribution. A scope with no rows at all keeps the truthful
+/// `Some(0)` from [`UsageTotals::zero`].
 fn sum_tokens_saturating(
     stmt: &mut rusqlite::Statement<'_>,
     params: impl rusqlite::Params,
@@ -490,16 +574,28 @@ fn sum_tokens_saturating(
         .query_map(params, |row| {
             let input: i64 = row.get(0)?;
             let output: i64 = row.get(1)?;
+            // Nullable cached column → Option (a pre-v7 row reads None = unknown).
+            let cached: Option<i64> = row.get(2)?;
             // Each stored value is non-negative (clamp_tokens on write), so `.max(0)`
             // is belt-and-suspenders against a hand-written legacy row.
-            Ok((input.max(0) as u64, output.max(0) as u64))
+            Ok((
+                input.max(0) as u64,
+                output.max(0) as u64,
+                cached.map(|c| c.max(0) as u64),
+            ))
         })
         .map_err(backend)?;
     let mut totals = UsageTotals::zero();
     for row in rows {
-        let (input, output) = row.map_err(backend)?;
+        let (input, output, cached) = row.map_err(backend)?;
         totals.input_tokens = totals.input_tokens.saturating_add(input);
         totals.output_tokens = totals.output_tokens.saturating_add(output);
+        match (cached, totals.cached_tokens) {
+            (Some(c), Some(sum)) => totals.cached_tokens = Some(sum.saturating_add(c)),
+            // One unknown-cached row makes the WHOLE scope's cached rollup
+            // unknown — never a partial sum masquerading as complete.
+            _ => totals.cached_tokens = None,
+        }
     }
     Ok(totals)
 }
@@ -516,7 +612,12 @@ fn sum_tokens_saturating(
 /// wrapping. Deliberately NOT a SQL expression: the rounding + saturation are the
 /// same pure Rust the evaluator trusts, so the Fleet cost + the enforced cost
 /// AGREE exactly (FR-22 "totals equal the Usage Ledger"). `stmt` selects
-/// `(input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m)`.
+/// `(input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m,
+/// cached_tokens, cached_micros_per_1m)` — the two story-14-6 columns feed
+/// [`cost_micros_with_cached`]: a row with a KNOWN cached subset prices its
+/// non-cached remainder at its input rate and its cached subset at its OWN
+/// stored cached rate (NULL cached rate → the conservative input-rate default;
+/// NULL cached COUNT → the whole input at the input rate).
 ///
 /// ## Rounding DIRECTION: per-row rounding ⇒ the total is an UPPER BOUND
 ///
@@ -548,22 +649,31 @@ fn sum_cost_saturating(
             // Nullable rate columns → Option (a pre-v4 / no-Rate row reads None).
             let rate_input: Option<i64> = row.get(2)?;
             let rate_output: Option<i64> = row.get(3)?;
+            // Story-14-6 columns: the nullable cached subset + the nullable
+            // cached rate in force at commit (both NULL on a pre-v7 row).
+            let cached: Option<i64> = row.get(4)?;
+            let rate_cached: Option<i64> = row.get(5)?;
             Ok((
                 input.max(0) as u64,
                 output.max(0) as u64,
                 rate_input,
                 rate_output,
+                cached.map(|c| c.max(0) as u64),
+                rate_cached.map(|r| r.max(0) as u64),
             ))
         })
         .map_err(backend)?;
     let mut total = Micros::ZERO;
     for row in rows {
-        let (input, output, rate_input, rate_output) = row.map_err(backend)?;
+        let (input, output, rate_input, rate_output, cached, rate_cached) = row.map_err(backend)?;
         // Only a row with BOTH directions priced contributes a cost; else $0 (the
         // honest "no Rate when consumed" state — AC-B).
         if let (Some(ri), Some(ro)) = (rate_input, rate_output) {
-            let rate = Rate::new(ri.max(0) as u64, ro.max(0) as u64);
-            total = total.saturating_add(cost_micros(input, output, &rate));
+            let mut rate = Rate::new(ri.max(0) as u64, ro.max(0) as u64);
+            if let Some(rc) = rate_cached {
+                rate = rate.with_cached(rc);
+            }
+            total = total.saturating_add(cost_micros_with_cached(input, output, cached, &rate));
         }
     }
     Ok(total)
@@ -721,6 +831,16 @@ impl StateStore for SqliteStore {
             ),
             None => (None, None),
         };
+        // Story 14-6 (no-retro-repricing, extended): the OPTIONAL cached-token
+        // Rate rides its own nullable column, so a later-set cached rate
+        // re-prices FUTURE rows only — exactly the v4 discipline applied to the
+        // new price. NULL = unset at commit → the row's cached tokens price at
+        // its stored input rate.
+        let rate_cached: Option<i64> = rate.and_then(|r| r.cached_micros_per_1m).map(clamp_tokens);
+        // Story 14-6: the event's cached-token SUBSET (the INPUT-INCLUSIVE
+        // invariant). `None` → NULL (the honest unknown, e.g. a legacy payload);
+        // a freshly-assembled event is always `Some` (known-zero allowed).
+        let cached_tokens: Option<i64> = event.cached_tokens.map(clamp_tokens);
         // One single-statement INSERT = one transaction (AD-6). A
         // UNIQUE(instance_id, run_id, sequence) violation means this exact event was
         // already recorded (a re-delivered batch) → classify DuplicateReplay (a
@@ -728,8 +848,8 @@ impl StateStore for SqliteStore {
         let result = self.conn.execute(
             "INSERT INTO usage_events \
              (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, \
-              sequence, input_micros_per_1m, output_micros_per_1m) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              sequence, input_micros_per_1m, output_micros_per_1m, cached_tokens, cached_micros_per_1m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 id,
                 event.run_id.as_str(),
@@ -744,6 +864,8 @@ impl StateStore for SqliteStore {
                 clamp_tokens(event.sequence),
                 rate_input,
                 rate_output,
+                cached_tokens,
+                rate_cached,
             ],
         );
         match result {
@@ -770,7 +892,10 @@ impl StateStore for SqliteStore {
         // can overflow to a lossy float / negative — see `sum_tokens_saturating`).
         let mut stmt = self
             .conn
-            .prepare("SELECT input_tokens, output_tokens FROM usage_events WHERE instance_id = ?1")
+            .prepare(
+                "SELECT input_tokens, output_tokens, cached_tokens \
+                 FROM usage_events WHERE instance_id = ?1",
+            )
             .map_err(backend)?;
         sum_tokens_saturating(&mut stmt, [id])
     }
@@ -790,7 +915,7 @@ impl StateStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT input_tokens, output_tokens \
+                "SELECT input_tokens, output_tokens, cached_tokens \
                  FROM usage_events WHERE instance_id = ?1 AND run_id = ?2",
             )
             .map_err(backend)?;
@@ -806,7 +931,8 @@ impl StateStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m \
+                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m, \
+                 cached_tokens, cached_micros_per_1m \
                  FROM usage_events WHERE instance_id = ?1",
             )
             .map_err(backend)?;
@@ -821,7 +947,8 @@ impl StateStore for SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m \
+                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m, \
+                 cached_tokens, cached_micros_per_1m \
                  FROM usage_events WHERE instance_id = ?1 AND run_id = ?2",
             )
             .map_err(backend)?;
@@ -837,18 +964,23 @@ impl StateStore for SqliteStore {
             })?;
         // Insert-or-replace on the UNIQUE instance_id, in one statement (AD-6:
         // one transaction per event — a single INSERT ... ON CONFLICT is atomic).
+        // `acp_session_id` rides the record (story 14-2): the start path commits
+        // the record BEFORE the handshake with None (clearing any retained id —
+        // this Run's session is being (re)established) and then UPDATEs the
+        // established id post-handshake via `set_acp_session_id`.
         self.conn
             .execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
-                  detached) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                  detached, acp_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
                  restart_count = excluded.restart_count, \
                  last_known_cause = excluded.last_known_cause, \
-                 detached = excluded.detached",
+                 detached = excluded.detached, \
+                 acp_session_id = excluded.acp_session_id",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -857,10 +989,87 @@ impl StateStore for SqliteStore {
                     record.restart_count as i64,
                     record.last_known_cause,
                     record.detach as i64,
+                    record.acp_session_id,
                 ],
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn set_acp_session_id(
+        &self,
+        name: &InstanceName,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        // The record must exist (the start path calls this right after the
+        // handshake, with the write-ahead record committed at spawn time; the
+        // settle-retention seed row is also a live row). A missing record is
+        // NotFound — the caller surfaces it (surfaced-not-silent); a silent
+        // no-op here would drop the resume id without a trace (AI-18).
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE agent_runtime SET acp_session_id = ?1 WHERE instance_id = ?2",
+                rusqlite::params![session_id, id],
+            )
+            .map_err(backend)?;
+        if rows == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, StoreError> {
+        // The story-14-2 settle: clear the live record (a clean stop, a crash
+        // reconcile, a terminal settle — the supervision facts die with the
+        // process) while RETAINING an established acp session id for the next
+        // start's resume offer. Returns whether an id was retained.
+        //
+        // For a record with NO acp session id (every non-acp kind, and an acp
+        // instance that never completed a handshake) this is byte-identical to
+        // `clear_spawn_record`: the row is deleted, nothing re-seeded. For a
+        // record WITH an id, a policy-only seed row (pid 0 — the exact shape
+        // `set_restart_policy` seeds and `adopt_orphans` already skips) is
+        // re-persisted carrying {policy, count, acp_session_id}, so the next
+        // start reads the id and offers it via `session/load`. Read + delete +
+        // (at most) one single-row INSERT — bounded metadata work (AD-17).
+        let Some(record) = self.get_spawn_record(name)? else {
+            return Ok(false);
+        };
+        // The record exists, so the instance row does too (the FK guarantees it).
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        self.conn
+            .execute("DELETE FROM agent_runtime WHERE instance_id = ?1", [id])
+            .map_err(backend)?;
+        if let Some(session_id) = record.acp_session_id.as_deref() {
+            self.conn
+                .execute(
+                    "INSERT INTO agent_runtime \
+                     (instance_id, pid, start_time, restart_policy, restart_count, \
+                      last_known_cause, acp_session_id) \
+                     VALUES (?1, 0, 0, ?2, ?3, NULL, ?4)",
+                    rusqlite::params![
+                        id,
+                        record.restart_policy.as_str(),
+                        record.restart_count as i64,
+                        session_id,
+                    ],
+                )
+                .map_err(backend)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), StoreError> {
@@ -882,7 +1091,7 @@ impl StateStore for SqliteStore {
         self.conn
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
-                 detached \
+                 detached, acp_session_id \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -898,7 +1107,7 @@ impl StateStore for SqliteStore {
             .conn
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
-                 r.last_known_cause, r.detached \
+                 r.last_known_cause, r.detached, r.acp_session_id \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1027,8 +1236,9 @@ impl StateStore for SqliteStore {
 }
 
 /// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
-/// restart_policy, restart_count, last_known_cause, detached` columns), decoding
-/// the policy wire form and clamping the integer columns into domain types.
+/// restart_policy, restart_count, last_known_cause, detached, acp_session_id`
+/// columns), decoding the policy wire form and clamping the integer columns
+/// into domain types.
 fn row_to_spawn_record(
     name: InstanceName,
     row: &rusqlite::Row<'_>,
@@ -1039,6 +1249,7 @@ fn row_to_spawn_record(
     let restart_count: i64 = row.get("restart_count").map_err(backend)?;
     let last_known_cause: Option<String> = row.get("last_known_cause").map_err(backend)?;
     let detached: i64 = row.get("detached").map_err(backend)?;
+    let acp_session_id: Option<String> = row.get("acp_session_id").map_err(backend)?;
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1051,6 +1262,7 @@ fn row_to_spawn_record(
         restart_count: restart_count.max(0) as u32,
         last_known_cause,
         detach: detached != 0,
+        acp_session_id,
     })
 }
 
@@ -1401,6 +1613,7 @@ mod tests {
             restart_count: count,
             last_known_cause: None,
             detach: false,
+            acp_session_id: None,
         }
     }
 
@@ -1444,6 +1657,153 @@ mod tests {
         let listed = store.list_spawn_records().unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].detach, "the list path keeps the detached flag");
+    }
+
+    // ---- Story 14-2 (D4): the spawn record's acp_session_id (schema v8) ----
+
+    #[test]
+    fn acp_session_id_round_trips_and_clears_with_the_record() {
+        // The v8 column rides the record both ways: Some on write, Some on
+        // read (get AND list — the reconcile input), None when absent, and a
+        // plain clear removes it with the row.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("acp-1", "acp", "/x/agents/acp-1"))
+            .unwrap();
+        let mut rec = record("acp-1", 21, 220, 0);
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("acp-1")).unwrap().unwrap();
+        assert_eq!(
+            back.acp_session_id.as_deref(),
+            Some("fake-session-1"),
+            "the session id must ride the record"
+        );
+        let listed = store.list_spawn_records().unwrap();
+        assert_eq!(listed[0].acp_session_id.as_deref(), Some("fake-session-1"));
+
+        // set_acp_session_id is the single UPDATE writer: set, clear, and
+        // None-reads honestly.
+        store
+            .set_acp_session_id(&name("acp-1"), Some("fake-session-2"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-2")
+        );
+        store.set_acp_session_id(&name("acp-1"), None).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
+            None
+        );
+        // And the fresh-start upsert (acp_session_id: None) overwrites any
+        // retained id — the Run's handshake re-establishes it.
+        rec.acp_session_id = Some("stale".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        let mut fresh = record("acp-1", 22, 230, 0);
+        fresh.acp_session_id = None;
+        store.upsert_spawn_record(&fresh).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id,
+            None,
+            "the fresh-spawn upsert clears a stale id"
+        );
+
+        // A record with NO id clears exactly as before (byte-identical to the
+        // pre-v8 clear: no seed row left behind).
+        store.clear_spawn_record(&name("acp-1")).unwrap();
+        assert!(store.get_spawn_record(&name("acp-1")).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_acp_session_id_for_a_missing_record_is_not_found() {
+        // The start path calls set_acp_session_id right after the handshake
+        // with the record committed; a missing row is an error the caller
+        // SURFACES (a silently dropped resume id would be a lie — AI-18).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("ghost", "acp", "/x/agents/ghost"))
+            .unwrap();
+        let err = store
+            .set_acp_session_id(&name("ghost"), Some("s-1"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn settle_spawn_record_retains_the_session_id_on_a_pid0_seed() {
+        // THE 14-2 settle: a record WITH a session id settles to a pid-0 seed
+        // row carrying {policy, count, acp_session_id} — the shape adoption
+        // skips (pid 0) and the next start reads the id from. A record
+        // WITHOUT an id settles byte-identically to a plain clear.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("acp-1", "acp", "/x/agents/acp-1"))
+            .unwrap();
+        let mut rec = record("acp-1", 31, 330, 2);
+        rec.last_known_cause = Some("crashed with code 1".to_string());
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+
+        let retained = store.settle_spawn_record(&name("acp-1")).unwrap();
+        assert!(retained, "an id-bearing record reports retention");
+        let back = store
+            .get_spawn_record(&name("acp-1"))
+            .unwrap()
+            .expect("the retention seed row exists");
+        assert_eq!(
+            back.fingerprint.pid, 0,
+            "the seed row is pid-0 (adoption skips it)"
+        );
+        assert_eq!(
+            back.acp_session_id.as_deref(),
+            Some("fake-session-1"),
+            "the id survives the settle"
+        );
+        assert_eq!(back.restart_policy, RestartPolicy::OnFailure);
+        assert_eq!(back.restart_count, 2, "the honest count rides the seed");
+        // set_acp_session_id still targets the seed row (the next start's
+        // post-handshake write lands on it after the fresh upsert replaces it).
+        store
+            .set_acp_session_id(&name("acp-1"), Some("next-run"))
+            .unwrap();
+        // Settling again is fine (idempotent in effect) and still retains.
+        assert!(store.settle_spawn_record(&name("acp-1")).unwrap());
+        assert_eq!(
+            store
+                .get_spawn_record(&name("acp-1"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("next-run")
+        );
+
+        // The id-less settle: nothing retained, no row left.
+        store
+            .create_instance(&sample("acp-2", "acp", "/x/agents/acp-2"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("acp-2", 32, 340, 0))
+            .unwrap();
+        let retained = store.settle_spawn_record(&name("acp-2")).unwrap();
+        assert!(!retained);
+        assert!(store.get_spawn_record(&name("acp-2")).unwrap().is_none());
+        // Settling an absent record is a success no-op.
+        assert!(!store.settle_spawn_record(&name("acp-2")).unwrap());
     }
 
     #[test]
@@ -1794,6 +2154,9 @@ mod tests {
             run_id: RunId::from_wire(run),
             input_tokens: input,
             output_tokens: output,
+            // A freshly-assembled event's cached subset is KNOWN (known-zero here
+            // — the helper's legacy shape); story-14-6 tests override it.
+            cached_tokens: Some(0),
             metering_source: "self-reported".to_string(),
             sequence: seq,
             occurred_at: "2026-07-06T00:00:00Z".to_string(),
@@ -1932,7 +2295,9 @@ mod tests {
 
         let per_row_total = store.cost_totals(&name("demo")).unwrap();
         // The single-aggregate price of the identical tokens (4 input tokens once).
-        let aggregate_once = cost_micros(4, 0, &rate);
+        // `None` cached routes through the cached-aware entry's conservative
+        // default, which IS the plain derivation (pinned in cost.rs unit tests).
+        let aggregate_once = cost_micros_with_cached(4, 0, None, &rate);
 
         assert_eq!(
             per_row_total,
@@ -2462,25 +2827,28 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: migrator steps 4 → 5 → 6 (each additive); user_version ==
-        // 6 and every prior row survives.
+        // Reopen: migrator steps 4 → 5 → 6 → 7 → 8 (each additive); user_version ==
+        // 8 and every prior row survives.
         let store = SqliteStore::open(&db).unwrap();
         // PINNED LITERAL (AI-66 #5): assert the actual version, never the
         // constant the migrator stamps from — comparing to SCHEMA_VERSION would
-        // pass even if the stamp and the constant drifted together. (The v6
-        // step, story 12-1 AMENDMENT, is the current last step; bump this
-        // literal when the next additive step lands.)
+        // pass even if the stamp and the constant drifted together. (The v8
+        // step, story 14-2, is the current last step; bump this literal when
+        // the next additive step lands.)
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 8);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
             UsageTotals {
                 input_tokens: 10,
                 output_tokens: 20,
+                // A pre-v7 row's cached subset is UNKNOWN — the honest absence,
+                // never a fabricated zero.
+                cached_tokens: None,
             }
         );
         // The new table exists and is usable on the migrated DB.
@@ -2560,6 +2928,250 @@ mod tests {
                 .unwrap()
                 .detach,
             "a post-v6 record round-trips the detached flag"
+        );
+    }
+
+    // ---- Story 14-6 (D8): the cached-token ledger columns (schema v7) ----
+
+    #[test]
+    fn migration_v6_db_upgrades_to_v7_preserving_rows_and_reading_null_cached_honestly() {
+        // The v6 → v7 additive step: a DB written at schema v6 (usage_events
+        // WITHOUT the cached columns) upgrades on open; every pre-existing row
+        // survives, and its cached subset reads as the UNKNOWN absence (NULL →
+        // None on the event read AND on the totals rollup) — never a fabricated
+        // zero (AI-18). Mirrors the v4→v5 / v5→v6 tests.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.execute_batch(SCHEMA_V6).unwrap();
+            conn.execute_batch("PRAGMA user_version = 6").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'registered', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO usage_events \
+                 (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, sequence, input_micros_per_1m, output_micros_per_1m) \
+                 VALUES (?1, 'run-old', 100, 50, 'self-reported', '2026-07-06T00:00:00Z', 0, 3000000, 15000000)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: the migrator steps 6 → 7 → 8, ADDING the NULLABLE columns; the
+        // legacy row's cached columns default to NULL.
+        let store = SqliteStore::open(&db).unwrap();
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8 (the
+        // v8 step, story 14-2, is the current last step).
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        // The row survived, tokens intact.
+        assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
+        // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
+        // both the event read and the totals rollup, never a fabricated zero.
+        let totals = store.usage_totals(&name("legacy")).unwrap();
+        assert_eq!(totals.input_tokens, 100);
+        assert_eq!(totals.output_tokens, 50);
+        assert_eq!(
+            totals.cached_tokens, None,
+            "a pre-v7 row's cached subset is UNKNOWN (NULL), never zero"
+        );
+        let events = store.usage_events(&name("legacy")).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cached_tokens, None);
+        // The legacy row keeps pricing at its persisted rate (the NULL cached
+        // subset prices the whole input at the input rate — the conservative
+        // default): 100 tokens x $3/1M = 300 micros + 50 tokens x $15/1M =
+        // 750 micros = 1050 micros, exactly the pre-14-6 derivation.
+        assert_eq!(
+            store.cost_totals(&name("legacy")).unwrap(),
+            Micros(1050),
+            "a pre-v7 row's cost is unchanged by the v7 columns"
+        );
+    }
+
+    #[test]
+    fn migration_v7_db_upgrades_to_v8_and_pre_v8_records_read_null_session_honestly() {
+        // Story 14-2 (D4): the v7 → v8 additive step — ONE NULLABLE
+        // `agent_runtime` column (the v6 single-column-ALTER pattern on the
+        // same table). A DB written at schema v7 upgrades on open; the legacy
+        // spawn record survives and its session id reads as the honest
+        // absence (NULL → None: never established, never a fabricated id),
+        // and a post-migration record round-trips the id. Mirrors the v6→v7
+        // test.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            SqliteStore::configure(&conn).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(SCHEMA_V2).unwrap();
+            conn.execute_batch(SCHEMA_V3).unwrap();
+            conn.execute_batch(SCHEMA_V4).unwrap();
+            conn.execute_batch(SCHEMA_V5).unwrap();
+            conn.execute_batch(SCHEMA_V6).unwrap();
+            conn.execute_batch(SCHEMA_V7).unwrap();
+            conn.execute_batch("PRAGMA user_version = 7").unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'acp', 'running', '/x', '2026-07-03T00:00:00Z', '2026-07-03T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = 'legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, detached) \
+                 VALUES (?1, 42, 77, 'on-failure', 0, 0)",
+                [id],
+            )
+            .unwrap();
+        }
+        // Reopen: the migrator steps 7 → 8, ADDING the nullable column; the
+        // legacy record survives with an honestly-unknown session state.
+        let store = SqliteStore::open(&db).unwrap();
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8.
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        let record = store
+            .get_spawn_record(&name("legacy"))
+            .unwrap()
+            .expect("the legacy spawn record survives the v8 migration");
+        assert_eq!(record.fingerprint, ProcessFingerprint::new(42, 77));
+        assert!(
+            record.acp_session_id.is_none(),
+            "a pre-v8 record has NO session id on record (NULL), never a fabricated one"
+        );
+        // And a post-migration record carries the id both ways (get + list).
+        let mut rec = record.clone();
+        rec.acp_session_id = Some("fake-session-1".to_string());
+        store.upsert_spawn_record(&rec).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("legacy"))
+                .unwrap()
+                .unwrap()
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-1")
+        );
+        assert_eq!(
+            store.list_spawn_records().unwrap()[0]
+                .acp_session_id
+                .as_deref(),
+            Some("fake-session-1")
+        );
+    }
+
+    #[test]
+    fn cached_tokens_round_trip_and_the_dedup_key_stays_unchanged() {
+        // 14-6: a cached-bearing event persists its subset (the INPUT-INCLUSIVE
+        // invariant: cached <= input) and reads back faithfully; the replay dedup
+        // key is UNCHANGED — a re-delivered event with a DIFFERENT cached count
+        // is still a recognized DuplicateReplay (the UNIQUE key does NOT gain
+        // the column).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let mut event = usage_event("demo", "run-1", 0, 1_000, 200);
+        event.cached_tokens = Some(800);
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        assert_eq!(
+            store.record_usage_event(&event, Some(rate)).unwrap(),
+            RecordOutcome::Inserted
+        );
+        // The totals rollup carries the KNOWN cached subset.
+        let totals = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(totals.input_tokens, 1_000);
+        assert_eq!(totals.output_tokens, 200);
+        assert_eq!(totals.cached_tokens, Some(800));
+        // THE DEDUP-KEY PIN: the same (run, sequence) with a different cached
+        // count is still a replay no-op — the column is not part of the key.
+        let mut replay = usage_event("demo", "run-1", 0, 1_000, 200);
+        replay.cached_tokens = Some(0);
+        assert_eq!(
+            store.record_usage_event(&replay, Some(rate)).unwrap(),
+            RecordOutcome::DuplicateReplay,
+            "the dedup UNIQUE key does NOT include cached_tokens"
+        );
+        assert_eq!(store.count_usage_events(&name("demo")).unwrap(), 1);
+    }
+
+    #[test]
+    fn cached_subset_prices_at_its_persisted_cached_rate_per_row() {
+        // No-retro-repricing, extended (14-6): the derived cost prices the
+        // non-cached remainder at the row's INPUT rate and the cached subset at
+        // the row's OWN stored CACHED rate. 1_000_000 input (800_000 cached) at
+        // $3/$0.30 per 1M + 0 output = 200_000x3 + 800_000x0.3 = $0.84.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let mut event = usage_event("demo", "run-1", 0, 1_000_000, 0);
+        event.cached_tokens = Some(800_000);
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        store.record_usage_event(&event, Some(rate)).unwrap();
+        assert_eq!(
+            store.cost_totals(&name("demo")).unwrap(),
+            Micros(840_000),
+            "(input - cached) at the input rate + cached at the cached rate"
+        );
+        assert_eq!(
+            store
+                .run_cost_totals(&name("demo"), &RunId::from_wire("run-1"))
+                .unwrap(),
+            Micros(840_000)
+        );
+    }
+
+    #[test]
+    fn an_unset_cached_rate_prices_cached_at_the_input_rate_conservatively() {
+        // THE CONSERVATIVE DEFAULT (AD-8) at the ledger read: a row with a KNOWN
+        // cached subset but NO cached rate in force (unset at commit → NULL)
+        // prices its WHOLE input at the input rate — identical to the pre-14-6
+        // derivation, so the cost can only overstate, never understate.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let mut event = usage_event("demo", "run-1", 0, 1_000_000, 0);
+        event.cached_tokens = Some(800_000);
+        let rate = Rate::new(3_000_000, 15_000_000);
+        store.record_usage_event(&event, Some(rate)).unwrap();
+        assert_eq!(
+            store.cost_totals(&name("demo")).unwrap(),
+            Micros(3_000_000),
+            "cached at the input rate = the plain whole-input cost"
         );
     }
 

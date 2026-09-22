@@ -1,6 +1,8 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
-import type { MDXComponents } from 'mdx/types';
 import type { ComponentPropsWithoutRef } from 'react';
+import type { MDXComponents } from 'mdx/types';
+
+import { Mermaid } from './mermaid';
 
 const routeByMarkdownFile = new Map([
   ['README.md', '/'],
@@ -58,6 +60,7 @@ function DocsLink(props: ComponentPropsWithoutRef<'a'>) {
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    Mermaid,
     a: DocsLink,
     ...components,
   } satisfies MDXComponents;

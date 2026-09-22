@@ -98,6 +98,14 @@ impl Supervisor {
         // effort per instance, exactly like the self-reported drain.
         self.drain_observed_all(registry);
 
+        // Then DRAIN each running acp instance's surfaced notices (story 14-1,
+        // spine AD-19): malformed lines, permission denials, usage updates,
+        // unhandled messages, and stream-end facts the reader thread queued
+        // WITHOUT ever taking the supervisor lock. Emitted here through
+        // `emit_diagnostic` (the choke point — we hold the lock), bounded by
+        // the queue cap per instance.
+        self.drain_acp_notices_all();
+
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
@@ -276,8 +284,9 @@ impl Supervisor {
             // dropped (which kills the group), so this is the last chance to
             // capture the flushed tail; a truncated mid-write line fails the
             // sentinel parse and is skipped, and the DB dedup key backstops the
-            // rest.
-            self.drain_usage_for(registry, &name, DrainMode::Terminal);
+            // rest. Story 14-3 (T3): an acp instance's stderr sentinel channel
+            // drains here too, under the same terminal rule (its own cursor).
+            self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
             // Drain any final ENGINE-OBSERVED usage still queued before the crashed
             // instance's listener is torn down (story 3-4): a completion parsed just
             // before the crash must land, not be lost when the `Supervised` is
@@ -327,9 +336,14 @@ impl Supervisor {
                         .running
                         .get(&name)
                         .and_then(|s| self.backend.log_capture(&s.handle));
+                    // Story 14-1: surface any queued acp notices BEFORE the
+                    // connection drops with the handle.
+                    self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
                     self.running.remove(&name);
-                    if registry.clear_spawn_record(&name).is_ok() {
+                    // Story 14-2: the settle retains an acp session id (see
+                    // the ordinary stop path); identical to a clear otherwise.
+                    if registry.settle_spawn_record(&name).is_ok() {
                         let _ = self.transition_with_log_capture(
                             registry,
                             &name,
@@ -346,6 +360,9 @@ impl Supervisor {
                     }
                     continue;
                 }
+                // Story 14-1: surface any queued acp notices before the
+                // requested-stop handle drop (the reader's EOF notice).
+                self.drain_acp_notices_for(&name);
                 self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
                 continue;
@@ -372,6 +389,10 @@ impl Supervisor {
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
             let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            // Story 14-1: surface any queued acp notices before the crashed
+            // instance's connection drops with the handle (the reader's EOF /
+            // malformed-line / permission facts must not die silently with it).
+            self.drain_acp_notices_for(&name);
             self.clear_poll_error_streak(&name);
             self.running.remove(&name);
             let base_detail = match crash {
@@ -528,17 +549,20 @@ impl Supervisor {
     /// does NOT adopt-attempt the dead/reused PID — the reconcile skips a pid-0
     /// record, exactly like a policy-only config seed), while RE-SEEDING the
     /// per-instance policy so `kt agent show` still reports the active Restart
-    /// Policy for the failed instance (AC9). Concretely: clear the record, then
-    /// re-persist the policy as a pid-0 seed. The failed CAUSE is not kept in the
-    /// record — it rides in the event log, which `instance_status` falls back to.
-    /// Best-effort (a store hiccup here is never a panic).
+    /// Policy for the failed instance (AC9). Concretely: settle the record
+    /// (clearing it, and — story 14-2 — retaining an established acp session
+    /// id on the pid-0 seed row so a later start can offer it via
+    /// `session/load`), then re-persist the policy as a pid-0 seed. The failed
+    /// CAUSE is not kept in the record — it rides in the event log, which
+    /// `instance_status` falls back to. Best-effort (a store hiccup here is
+    /// never a panic).
     fn settle_terminal_record(
         &self,
         registry: &Registry,
         name: &InstanceName,
         policy: RestartPolicy,
     ) {
-        let _ = registry.clear_spawn_record(name);
+        let _ = registry.settle_spawn_record(name);
         let _ = registry.set_restart_policy(name, policy);
     }
 
@@ -596,24 +620,60 @@ impl Supervisor {
                     // includes the run id, so even an overlapping sequence is safe.
                     let run_id = RunId::mint();
                     let usage_cursor = self.agent_log_len(registry, &name);
-                    let metering_source = registry.metering_source(&name).unwrap_or_else(|err| {
-                        // AI-46 (review loop 1): a registry read hiccup must
-                        // not SILENCE the stranded-listener diagnostic —
-                        // defaulting to `self-reported` here would skip the
-                        // one announcement an actually-observed orphan
-                        // needs. Announce the ambiguity loudly, then use
-                        // the neutral fallback for bookkeeping.
-                        let unclear = format!(
-                            "{}: the adopted instance's metering source could not be \
-                                 read ({err}); if it is engine-observed, its injected \
-                                 'metering.base_url' points at the PREVIOUS engine's dead \
-                                 loopback listener — stop the instance and start it again \
-                                 to re-anchor the listener",
-                            name.as_str(),
-                        );
-                        self.emit_diagnostic(&unclear);
-                        "self-reported".to_string()
-                    });
+                    // Story 14-3 (T3): the acp kind's stderr sentinel channel
+                    // anchors the same way (at the CURRENT end of the captured
+                    // stderr log, skipping pre-crash lines — the documented
+                    // adoption posture above, per channel).
+                    let stderr_usage_cursor = self.agent_stderr_log_len(registry, &name);
+                    // Story 14-3 (T2): the acp kind's ACTIVE source resolves
+                    // from its effective config (the same resolution the start
+                    // seam and the Fleet read use), so an adopted instance that
+                    // opted into the observed channel keeps surfacing that
+                    // source. A degraded config read falls back to the snapshot
+                    // value already resolved above (the AI-46 note stays the
+                    // loud path for a snapshot failure).
+                    let adopted_is_acp = registry
+                        .lookup(&name)
+                        .map(|instance| crate::acp::is_acp_kind(&instance.kind))
+                        .unwrap_or(false);
+                    let metering_source = if adopted_is_acp {
+                        registry
+                            .effective_config(&name, ConfigLayer::empty())
+                            .map(|effective| {
+                                crate::acp::resolve_acp_metering_source(&effective).to_string()
+                            })
+                            .unwrap_or_else(|err| {
+                                let unclear = format!(
+                                    "{}: the adopted acp instance's effective config could \
+                                     not be read ({err}); its metering source stays the \
+                                     snapshot value until the next start",
+                                    name.as_str(),
+                                );
+                                self.emit_diagnostic(&unclear);
+                                registry
+                                    .metering_source(&name)
+                                    .unwrap_or_else(|_| "self-reported".to_string())
+                            })
+                    } else {
+                        registry.metering_source(&name).unwrap_or_else(|err| {
+                            // AI-46 (review loop 1): a registry read hiccup must
+                            // not SILENCE the stranded-listener diagnostic —
+                            // defaulting to `self-reported` here would skip the
+                            // one announcement an actually-observed orphan
+                            // needs. Announce the ambiguity loudly, then use
+                            // the neutral fallback for bookkeeping.
+                            let unclear = format!(
+                                "{}: the adopted instance's metering source could not be \
+                                     read ({err}); if it is engine-observed, its injected \
+                                     'metering.base_url' points at the PREVIOUS engine's dead \
+                                     loopback listener — stop the instance and start it again \
+                                     to re-anchor the listener",
+                                name.as_str(),
+                            );
+                            self.emit_diagnostic(&unclear);
+                            "self-reported".to_string()
+                        })
+                    };
                     // Clone the Run context into `Supervised` — the AI-44
                     // enforcement call below borrows the same values afterwards.
                     self.clear_poll_error_streak(&name);
@@ -625,6 +685,15 @@ impl Supervisor {
                             metering_source: metering_source.clone(),
                             usage_cursor,
                             usage_park_attempts: None,
+                            // Story 14-3 (T3): the adopted instance's stderr
+                            // sentinel channel anchors fresh (no parked state
+                            // survives the prior engine).
+                            stderr_usage_cursor,
+                            stderr_usage_park_attempts: None,
+                            // A fresh (adopted) Run has seen no sentinel lines.
+                            sentinel_lines_seen: false,
+                            // Story 14-3 (T2): gates the stderr sentinel drain.
+                            is_acp: adopted_is_acp,
                             // Story 12-4: an adopted instance starts with no parked
                             // observed events (its prior engine's park died with it).
                             observed_park: None,
@@ -663,9 +732,37 @@ impl Supervisor {
                             // genuinely unreadable code falls to the
                             // unavailable-code cause there.
                             adopted: true,
+                            // Story 14-1 (spine AD-19): an ADOPTED acp instance
+                            // is re-held as a bare process — its ACP pipe
+                            // halves died with the engine that spawned it, so
+                            // NO connection is re-established here (the honest
+                            // note below says so; `session/load` resume is
+                            // story 14-2).
+                            acp: None,
                         },
                     );
                     adopted += 1;
+                    // Story 14-1 + 14-2: surface the acp adoption honesty —
+                    // the instance is alive but this engine holds no live ACP
+                    // connection for it (the pipe pair died with the previous
+                    // engine; the adopted process is not re-piped), so `send`
+                    // refuses until a stop→start re-establishes the transport.
+                    // The note ALSO names the persisted session state: the
+                    // recorded id (if any) will be offered via `session/load`
+                    // at the next start. Surfaced-not-silent (AI-18); the
+                    // diagnostic is emitted under the supervisor lock via the
+                    // choke point.
+                    let kind = registry
+                        .lookup(&name)
+                        .map(|instance| instance.kind)
+                        .unwrap_or_default();
+                    if crate::acp::is_acp_kind(&kind) {
+                        let note = crate::acp::adopted_acp_note(
+                            name.as_str(),
+                            record.acp_session_id.as_deref(),
+                        );
+                        self.emit_diagnostic(&note);
+                    }
                     // AI-46 (story 11-3): an adopted ENGINE-OBSERVED instance is
                     // stranded — the paragraph on `observed_listener: None`
                     // above documents it, but until now the engine said it
@@ -764,8 +861,12 @@ impl Supervisor {
                 TransitionCause::crashed(detail),
             );
         }
-        // Clear the stale record either way (its process is gone).
-        let _ = registry.clear_spawn_record(name);
+        // Settle the stale record either way (its process is gone). Story
+        // 14-2: the settle retains an established acp session id on a pid-0
+        // seed row — the crash the reconcile names is exactly when the NEXT
+        // start's `session/load` resume matters — and is byte-identical to a
+        // plain clear for records without one.
+        let _ = registry.settle_spawn_record(name);
     }
 
     // ---- internals ----

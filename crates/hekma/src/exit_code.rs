@@ -28,7 +28,7 @@
 //! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, + any unmapped error |
 //! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
-//! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict` |
+//! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict`, `AgentAcpTurnInFlight` (story 14-1: a second prompt while an acp turn is in flight) |
 //! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable`, `AgentDetachRefused` (story 12-1: a detached start of an engine-observed instance — the operation cannot be done for this instance) |
 //! | `6` | Timed out | `AgentInteractionTimedOut` |
 //!
@@ -53,11 +53,11 @@
 // code-1 diagnostics all fall through the catch-all arm (so they are NOT named in
 // `classify`), and are imported inside the test module where they are constructed.
 use crate::error::{
-    AgentCapabilityUnsupported, AgentDetachRefused, AgentDuplicateName, AgentInteractionTimedOut,
-    AgentInteractionUnavailable, AgentInvalidName, AgentInvalidTransition, AgentManifestNotFound,
-    AgentMemoryHotSwap, AgentMemoryKindConflict, AgentNotFound, AgentNotRunning,
-    AgentResumeUnsupported, AgentRunningRequiresForce, AgentStopUnconfirmed, AgentUnknownConfigKey,
-    AgentUnknownKind,
+    AgentAcpTurnInFlight, AgentCapabilityUnsupported, AgentDetachRefused, AgentDuplicateName,
+    AgentInteractionTimedOut, AgentInteractionUnavailable, AgentInvalidName,
+    AgentInvalidTransition, AgentManifestNotFound, AgentMemoryHotSwap, AgentMemoryKindConflict,
+    AgentNotFound, AgentNotRunning, AgentResumeUnsupported, AgentRunningRequiresForce,
+    AgentStopUnconfirmed, AgentUnknownConfigKey, AgentUnknownKind,
 };
 
 /// The documented, stable `hekma` process exit codes (story 4-3). A FROZEN v1
@@ -123,6 +123,9 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         || err.is::<AgentRunningRequiresForce>()
         || err.is::<AgentInvalidTransition>()
         || err.is::<AgentStopUnconfirmed>()
+        // Story 14-1 (spine AD-19): the acp in-flight turn refusal — an
+        // invalid-STATE refusal (the timing is wrong, not the capability).
+        || err.is::<AgentAcpTurnInFlight>()
         // Story 5-1: a Memory Backing cannot be hot-swapped (attach/detach need
         // a terminal state; no force escape) and kinds never conflict-overwrite.
         || err.is::<AgentMemoryHotSwap>()

@@ -87,6 +87,16 @@ pub const COST_RATE_INPUT_KEY: &str = "cost.rate.input";
 /// [`COST_RATE_INPUT_KEY`]. Absent → the Rate is inert (both directions required).
 pub const COST_RATE_OUTPUT_KEY: &str = "cost.rate.output";
 
+/// The engine-namespace config key for the OPTIONAL cached-token Rate (story
+/// 14-6, D8). A dollar-string leaf parsed to micros at write time, exactly like
+/// [`COST_RATE_INPUT_KEY`]. Absent → UNSET, and the event's cached tokens price
+/// AT THE INPUT RATE (the documented conservative default — the cheaper cache
+/// pricing would lower the derived cost, so omitting it can only overstate,
+/// never understate; AD-8). Only meaningful BESIDE a supplied Rate: the Rate
+/// still requires both directions (`cost.rate.input`/`cost.rate.output`), and a
+/// cached price with no Rate is inert with the rest of the dollar features.
+pub const COST_RATE_CACHED_KEY: &str = "cost.rate.cached";
+
 /// The engine-namespace config key for the PER-RUN dollar Cost Cap (story 3-3,
 /// FR-21). A dollar-string leaf parsed to micros at write time. Absent → the
 /// per-run dollar scope is unset (never breaches). A cap set with no Rate is inert
@@ -147,6 +157,20 @@ pub const METERING_BASE_URL_KEY: &str = "metering.base_url";
 /// configuration: it is deliberately never written to the effective-config
 /// snapshot (3-4's honest-provenance split, extended by 5-1's CORRECTION).
 pub const MEMORY_DIR_KEY: &str = "memory.dir";
+
+/// The engine-namespace config key for the builtin `acp` kind's launch
+/// executable (story 14-1, spine AD-19). REQUIRED at start: an `acp`
+/// instance whose `acp.command` is unset refuses honestly, naming both this
+/// key and [`ACP_ARGS_KEY`]. A validated KNOWN key (not `agent.*`
+/// pass-through); does NOT touch the Adapter Contract surface (builtin
+/// kinds do not negotiate — epic-6 B3 precedent).
+pub const ACP_COMMAND_KEY: &str = "acp.command";
+
+/// The engine-namespace config key for the builtin `acp` kind's launch
+/// arguments (story 14-1, spine AD-19). OPTIONAL: a TOML array of strings
+/// (element-wise) or a plain string (whitespace-split). A validated KNOWN
+/// key; see [`ACP_COMMAND_KEY`] for the contract.
+pub const ACP_ARGS_KEY: &str = "acp.args";
 
 /// The reserved pass-through namespace prefix (spine AD-9's `agent.*`), story
 /// 2-1 (AC7). A key under this prefix BYPASSES unknown-key validation and is
@@ -585,6 +609,9 @@ fn merge_table_into(
 /// strings parsed to micros + type-checked by [`validate_write`] (a malformed
 /// dollar value or one with sub-micro precision is rejected at write time, never
 /// silently defaulted); they are NOT `agent.*` pass-through.
+///
+/// Story 14-6 (D8) ADDS [`COST_RATE_CACHED_KEY`] — the OPTIONAL cached-token
+/// price, validated identically; unset → cached tokens price at the input rate.
 const KNOWN_KEYS: &[&str] = &[
     "model",
     BUDGET_TOKENS_PER_RUN_KEY,
@@ -592,6 +619,7 @@ const KNOWN_KEYS: &[&str] = &[
     BUDGET_BREACH_ACTION_KEY,
     COST_RATE_INPUT_KEY,
     COST_RATE_OUTPUT_KEY,
+    COST_RATE_CACHED_KEY,
     BUDGET_DOLLARS_PER_RUN_KEY,
     BUDGET_DOLLARS_CUMULATIVE_KEY,
     // Story 3-4 (engine-observed metering): the operator-set real-upstream URL, and
@@ -606,6 +634,14 @@ const KNOWN_KEYS: &[&str] = &[
     // CONTRACT_VERSION bump). The operator never sets it — it is a delivery
     // mechanism, not operator configuration, and is never persisted into the snapshot.
     MEMORY_DIR_KEY,
+    // Story 14-1 (spine AD-19, the builtin `acp` kind): the operator-set
+    // ACP launch keys. `acp.command` (REQUIRED at start — the executable)
+    // and `acp.args` (optional). Engine-namespace keys (NOT `agent.*`
+    // pass-through); they do NOT touch the Adapter Contract surface (the
+    // builtin kind does not negotiate — epic-6 B3 precedent). The start
+    // refuses honestly naming both keys when `acp.command` is unset.
+    ACP_COMMAND_KEY,
+    ACP_ARGS_KEY,
 ];
 
 /// Whether `key` is a recognized unified config key (an exact dotted-path match
@@ -763,6 +799,7 @@ fn validate_cost_value(key: &str, value: &str) -> Result<(), ConfigError> {
     match key {
         COST_RATE_INPUT_KEY
         | COST_RATE_OUTPUT_KEY
+        | COST_RATE_CACHED_KEY
         | BUDGET_DOLLARS_PER_RUN_KEY
         | BUDGET_DOLLARS_CUMULATIVE_KEY => {
             parse_dollars_to_micros(value)
@@ -924,9 +961,11 @@ fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
 /// because the supervisor re-resolves + re-reads here each time. The Rate REQUIRES
 /// BOTH directions to be "supplied" (Key design decision 2): a half-configured Rate
 /// (only input, or only output) resolves to `None` — inert, treated as no-Rate
-/// (AC-B), avoiding a silently-half-priced ledger. Absent cap scopes → `None`
-/// (never breach); the SAME `budget.breach_action` key governs a dollar breach
-/// (one action for both dimensions).
+/// (AC-B), avoiding a silently-half-priced ledger. The OPTIONAL
+/// [`COST_RATE_CACHED_KEY`] (story 14-6) attaches to a supplied Rate; unset → the
+/// conservative input-rate default for the event's cached tokens. Absent cap
+/// scopes → `None` (never breach); the SAME `budget.breach_action` key governs a
+/// dollar breach (one action for both dimensions).
 ///
 /// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
 /// somehow present but MALFORMED (slipped past write-validation via a hand-edited
@@ -938,8 +977,18 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
     // malformed direction → no Rate (inert).
     let input = cost_micros_leaf(effective, COST_RATE_INPUT_KEY);
     let output = cost_micros_leaf(effective, COST_RATE_OUTPUT_KEY);
+    // The OPTIONAL cached price (14-6): attached ONLY to a supplied Rate (it
+    // prices a subset of the input direction — without a Rate it prices
+    // nothing). Unset → the conservative input-rate default for cached tokens.
+    let cached = cost_micros_leaf(effective, COST_RATE_CACHED_KEY);
     let rate = match (input, output) {
-        (Some(i), Some(o)) => Some(Rate::new(micros_to_u64(i), micros_to_u64(o))),
+        (Some(i), Some(o)) => {
+            let base = Rate::new(micros_to_u64(i), micros_to_u64(o));
+            Some(match cached {
+                Some(c) => base.with_cached(micros_to_u64(c)),
+                None => base,
+            })
+        }
         _ => None,
     };
     let cap = CostCap {
@@ -1681,9 +1730,12 @@ mod tests {
         assert!(!is_known_key("restart.policy"));
         assert!(validate_write("restart.policy", "never").is_err());
         // `model` + the three story-3-2 Token-Budget keys + the four story-3-3 dollar
-        // keys (Rate ×2 + Cost Cap ×2) + the two story-3-4 engine-observed metering
+        // keys (Rate ×2 + Cost Cap ×2) + the story 14-6 optional cached-token Rate
+        // key + the two story-3-4 engine-observed metering
         // keys (the operator-set upstream URL + the engine-injected loopback base_url)
-        // + the story 5-1 engine-injected managed-memory key are the known set.
+        // + the story 5-1 engine-injected managed-memory key + the two story 14-1
+        // acp launch keys (`acp.command` required + `acp.args` optional, spine
+        // AD-19) are the known set.
         assert_eq!(
             KNOWN_KEYS,
             &[
@@ -1693,11 +1745,14 @@ mod tests {
                 "budget.breach_action",
                 "cost.rate.input",
                 "cost.rate.output",
+                "cost.rate.cached",
                 "budget.dollars.per_run",
                 "budget.dollars.cumulative",
                 "metering.upstream_base_url",
                 "metering.base_url",
                 "memory.dir",
+                "acp.command",
+                "acp.args",
             ]
         );
         // Story 3-4: both metering keys are known (a mapping can target them) and
@@ -2184,6 +2239,51 @@ mod tests {
         assert_eq!(cap.cumulative, Some(Micros(50_000_000)));
         // The SAME breach-action key governs the dollar breach.
         assert_eq!(action, BreachAction::Stop);
+    }
+
+    #[test]
+    fn resolve_cost_reads_the_optional_cached_rate_only_beside_a_supplied_rate() {
+        // Story 14-6 (D8): the OPTIONAL cached-token price attaches to a
+        // supplied Rate; unset → Rate::new's None (the conservative input-rate
+        // default for cached tokens); a cached price with NO Rate stays inert.
+        let full = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\ncached = \"0.30\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&full).0,
+            Some(Rate::new(3_000_000, 15_000_000).with_cached(300_000)),
+            "cached attaches when both directions are supplied"
+        );
+        // Unset cached → None on the Rate's cached field (the conservative default).
+        let no_cached = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ninput = \"3.00\"\noutput = \"15.00\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&no_cached).0,
+            Some(Rate::new(3_000_000, 15_000_000)),
+            "absent cached price -> None (cached prices at the input rate)"
+        );
+        // A cached price WITHOUT a full Rate is inert with the dollar features.
+        let orphan = resolve(one_layer(
+            SourceLayer::Instance,
+            "[cost.rate]\ncached = \"0.30\"\n",
+        ));
+        assert_eq!(
+            resolve_cost(&orphan).0,
+            None,
+            "no Rate -> the cached price prices nothing"
+        );
+    }
+
+    #[test]
+    fn validate_write_accepts_the_cached_rate_as_a_dollar_string() {
+        // Story 14-6: the cached-token Rate key is a known, dollar-string
+        // validated key (a malformed value is rejected at write time).
+        assert!(is_known_key(COST_RATE_CACHED_KEY));
+        assert!(validate_write(COST_RATE_CACHED_KEY, "0.30").is_ok());
+        assert!(validate_write(COST_RATE_CACHED_KEY, "three dollars").is_err());
     }
 
     #[test]

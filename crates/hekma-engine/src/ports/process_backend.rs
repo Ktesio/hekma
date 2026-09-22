@@ -157,6 +157,17 @@ pub struct SpawnSpec {
     /// re-adopts the surviving child through the EXISTING fingerprint path.
     /// `false` (every pre-12-1 caller) keeps today's kill-on-drop guarantee.
     pub detach: bool,
+    /// Whether to pipe the child's STDOUT to the engine instead of the
+    /// crash-immune file redirect (story 14-1, spine AD-19) — the `acp`
+    /// transport consumes the child's stdout as the protocol stream (ndJSON
+    /// over the pipe), and the connection's reader appends each raw line
+    /// back to `log_file` so the AD-12 raw record stays the honest record.
+    /// `false` (every pre-14-1 caller) keeps the direct file redirect
+    /// byte-for-byte. Detached acp spawns are NOT piped (no transport for a
+    /// detached start) — the supervisor resolves this bool, the backends
+    /// stay capability-agnostic dumb executors, exactly like
+    /// [`SpawnSpec::pipe_stdin`].
+    pub pipe_stdout: bool,
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -1274,6 +1285,33 @@ pub trait ProcessBackend {
     /// by the supervisor to send `Engine`-attributed lines (Task 4) via
     /// [`LogCapture::send_engine_line`], which writes SYNCHRONOUSLY.
     fn log_capture(&self, handle: &Self::Handle) -> Option<LogCapture>;
+
+    /// Move the handle's stdin write half OUT (story 14-1, spine AD-19) —
+    /// the `acp` transport takes exclusive ownership of the child's stdin so
+    /// every ACP write (prompt, cancellation, permission denial) serializes
+    /// through the connection's ONE bounded-writer mutex instead of the
+    /// handle map. `Some` only for a freshly spawned handle whose stdin is
+    /// still `Live` and not yet taken; `None` for an adopted handle, a
+    /// never-piped one, or after a prior take (the state becomes `NoPipe` —
+    /// the handle's own `has_stdin` honestly reads `false` afterwards).
+    /// Cheap: an enum swap, no I/O.
+    fn take_stdin(&self, handle: &mut Self::Handle) -> Option<StdinState> {
+        let _ = handle;
+        None
+    }
+
+    /// Move the handle's stdout read half OUT (story 14-1, spine AD-19) —
+    /// the `acp` transport consumes the child's stdout as the protocol
+    /// stream (the connection's reader thread appends each raw line back to
+    /// the instance's `agent.log`, keeping the AD-12 raw record honest).
+    /// `Some` only for a freshly spawned handle spawned with
+    /// [`SpawnSpec::pipe_stdout`] and not yet taken; `None` otherwise (an
+    /// adopted handle, a file-redirected stdout, or after a prior take).
+    /// Cheap: an `Option::take`, no I/O.
+    fn take_stdout(&self, handle: &mut Self::Handle) -> Option<std::process::ChildStdout> {
+        let _ = handle;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1341,6 +1379,7 @@ mod tests {
             stderr_log_file: None,
             instance_name: "x".to_string(),
             pipe_stdin: true,
+            pipe_stdout: false,
             detach: false,
         };
         let b = a.clone();

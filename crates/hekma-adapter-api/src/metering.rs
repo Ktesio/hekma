@@ -24,9 +24,16 @@
 //!   is recognized and **not** double-counted (the FR-19 "delayed batches
 //!   reconcile without double-counting" guarantee).
 //! * `input_tokens` / `output_tokens` — non-negative token counts for the event.
+//!   `input_tokens` is INCLUSIVE of any cached portion: the engine's ledger
+//!   stores `0 <= cached_tokens <= input_tokens` (the story-14-6 INPUT-INCLUSIVE
+//!   invariant).
+//! * `cached_tokens` — OPTIONAL (story 14-6): the cached SUBSET of
+//!   `input_tokens` the provider served from its prompt cache. An absent field
+//!   reads as known-zero, so every pre-14-6 emitter's line parses unchanged; a
+//!   value ABOVE `input_tokens` is malformed (the line is skipped).
 //!
 //! The engine stamps the Run id, the instance, the Metering Source, and the
-//! timestamp; the agent supplies only the three fields above. A malformed usage
+//! timestamp; the agent supplies only the fields above. A malformed usage
 //! line is a diagnostic (ignored), never fatal and never mixed into `kt`'s output.
 //! This is a DOCUMENTARY contract addition (no new trait method — the channel is a
 //! stdout convention), hence the additive `0.2.0 → 0.3.0` MINOR bump. The
