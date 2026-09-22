@@ -570,7 +570,8 @@ class ReleaseDocsTests(unittest.TestCase):
             check_release_sites,
             3,
             "three armed check-release sites: the fresh post-rename "
-            "baselines pinned to 54dc79c (hekma-adapter-api + hekma-engine) "
+            "baselines pinned to 1e71389 — the PR #193 epic-14 squash "
+            "(2026-09-22) — for hekma-adapter-api + hekma-engine, "
             "plus the crates.io release-to-release loop; "
             f"found {check_release_sites}",
         )
