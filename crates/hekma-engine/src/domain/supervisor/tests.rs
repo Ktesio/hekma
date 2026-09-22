@@ -2586,6 +2586,34 @@ fn detached_start_of_a_self_reported_instance_runs_and_stops_in_process() {
 }
 
 #[test]
+fn adopt_orphans_surfaces_the_park_loss_window_on_a_successful_adoption() {
+    // AI-18 (surfaced-not-silent), 2026-09-22 hardening: a successful
+    // adoption re-derives the ingest cursors at the CURRENT end of the logs,
+    // so usage the previous engine still held in memory at its death (its
+    // park) would be skipped SILENTLY unless the adoption says so. This pins
+    // the adoption-time diagnostic through the choke point (capture sink —
+    // it lands in the capture, never on stderr in tests).
+    let (_state, _manifest, registry) = setup_fake("parknote", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "parknote").unwrap();
+    // The engine "restarts": drop this supervisor — the detached handle is
+    // DISARMED, so the agent survives — and re-open over the same registry.
+    drop(sup);
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("adopted from a previous engine"),
+        "the adoption must surface the engine-restart fact: {text}"
+    );
+    assert!(
+        text.contains("goes unaccounted"),
+        "the adoption must name the un-flushed park window: {text}"
+    );
+}
+
+#[test]
 fn a_detached_start_force_clears_the_stdin_pipe_despite_guaranteed_interaction() {
     // Review round 2 (verification gap): the detached stdin force-clear
     // (`pipe_stdin && !detach` in `start_inner`) had NO test — the backend
