@@ -22,6 +22,10 @@ When working here:
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo test --workspace --all-targets`
   - `python3 scripts/check_docs.py`
+- At epic close, run the retrospective (`bmad-retrospective`) in the same
+  closeout as the merge checklist — the retro is part of closing, not a later
+  sweep (the 10/13/14 gap ran to a 2026-09-22 catch-up batch, and epic-13's
+  missing retro broke epic-14's follow-through chain).
 - A bare `cargo` uses the repo's MSRV pin (`rust-toolchain.toml` → Rust 1.96.1)
   while CI's latest-stable jobs run `cargo +stable` — and a version manager
   (mise/asdf) can override the pin via `RUSTUP_TOOLCHAIN`; see the Toolchain
