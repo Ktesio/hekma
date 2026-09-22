@@ -171,6 +171,11 @@ Homebrew tap repository.
 - [x] `python3 scripts/check_docs.py`
 - [x] Latest `main` CI and CodeQL checks are green.
 
+Note: a bare `cargo` runs the repo's MSRV pin (`rust-toolchain.toml` → Rust
+1.96.1), while CI's latest-stable jobs run `cargo +stable`; version managers
+(mise/asdf) can override the pin via `RUSTUP_TOOLCHAIN` — see
+[testing.md](testing.md) ("Toolchain").
+
 Evidence:
 
 - Local command output from the hardening work.
