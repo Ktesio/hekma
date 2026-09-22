@@ -66,6 +66,32 @@ STALE_PATTERNS = [
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+# Public docs state technical facts without BMAD sprint/planning provenance:
+# no story/epic work-item numbers, retro references, internal review-item IDs
+# (AI-N), change-proposal/risk-registry IDs (CP-N, R-N ranges), PR-number
+# provenance markers that name the planning registries, or pointers into the
+# planning artifacts. Architecture decisions (AD-N) and requirements
+# (FR-/NFR-N) are normative and intentionally NOT matched.
+PLANNING_PROVENANCE_RE = re.compile(
+    r"(?i)\bstory[ -]?\d"
+    r"|\bepic[ -]?\d+\b"
+    r"|\bretro\b"
+    r"|\bAI-\d+"
+    r"|\bCP-\d"
+    r"|\bR\d+[–-]R?\d*"
+    r"|_bmad-output"
+    r"|\bBMAD\b"
+)
+# Dated historical records exempt from the provenance rule: their older
+# sections are point-in-time release/authorization records, and only their
+# CURRENT top banners were reworded.
+PLANNING_PROVENANCE_EXEMPT = {
+    "CHANGELOG.md",
+    "docs/RELEASE_NOTES.md",
+    # Internal agent instructions (not developer docs): citing the retro
+    # record and the planning artifacts is deliberate there.
+    "AGENTS.md",
+}
 JSON_FENCE_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 BASH_FENCE_RE = re.compile(r"```(?:bash|sh|shell)\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 # The CLI command allowlist is shared by every shipped binary name —
@@ -111,6 +137,14 @@ def main() -> int:
         for pattern in STALE_PATTERNS:
             if pattern in text:
                 errors.append(f"{rel_path}: stale reference `{pattern}`")
+
+        if str(rel_path) not in PLANNING_PROVENANCE_EXEMPT:
+            for match in PLANNING_PROVENANCE_RE.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"{rel_path}:{line}: planning provenance in public docs: "
+                    f"`{match.group(0)}`"
+                )
 
         for match in LINK_RE.finditer(text):
             target = match.group(1).strip()

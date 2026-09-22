@@ -466,6 +466,7 @@ mod tests {
             run_id: super::super::RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,
+            cached_tokens: Some(0),
             metering_source: "self-reported".to_string(),
             sequence: seq,
             occurred_at: format!("2026-09-10T00:00:{seq:02}Z"),

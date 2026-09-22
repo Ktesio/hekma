@@ -18,7 +18,7 @@ Depend on the released version:
 
 ```toml
 [dependencies]
-hekma-engine = "0.4"
+hekma-engine = "0.5"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -36,8 +36,8 @@ reproducible and upgrades deliberate (the engine's public surface is
 CI-guarded against breaking changes between freezes, but a moving target is
 still a moving target).
 
-**Which SHA to pin:** the engine's current surface freeze is the epic-11
-merge commit (2026-09-14) — the CI semver gate guards the public surface
+**Which SHA to pin:** the engine's current surface freeze is the 2026-09-14
+merge commit — the CI semver gate guards the public surface
 against that exact baseline. Pin **any commit at or after it**; the newest
 `main` commit you are comfortable with is the right default. To fetch a
 current full SHA to pin:
@@ -52,7 +52,14 @@ in-repo forms compile against the same facade — see the [changelog](
 (`EngineError::ResumeUnsupported`, then the 0.3.0 detached-start surface:
 `EngineError::DetachRefused`, `SpawnRecord.detach`, and the
 `ProcessBackend::adopt` signature — exhaustive `match`es over
-`EngineError` need each new arm).
+`EngineError` need each new arm). The ACP backend (the `acp` builtin kind,
+shipping as 0.5.0) grows the surface additively the same way: `EngineError::AcpTurnInFlight`
+is a new exhaustive-match arm (exit-code row 4 — a second prompt while an
+`acp` turn is in flight), `SpawnSpec` gains the `pipe_stdout` field (the ACP
+transport owns the child's stdout; exhaustive struct literals need it), and
+`ProcessBackend::take_stdin`/`take_stdout` are NEW DEFAULTED trait methods
+(existing backends compile unchanged). The new builtin `acp` kind registers
+like any native kind and needs no contract negotiation.
 
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
@@ -74,21 +81,21 @@ surface `hekma` uses. The capabilities you will reach for first:
 | Facade | Purpose |
 |--------|---------|
 | `Engine::open(base)` | Open (or create) an engine rooted at a state directory; `None` uses the OS default. |
-| `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. |
+| `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
-| `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle (story 12-1); refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
+| `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle; refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
 | `resync_events` / `Blocking::resync_events` | Backfill the committed events a subscriber missed (below). |
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hekma agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
-| `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. |
+| `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
 with a reason and a remediation instead of panicking.
 
-### The detached-start host duty (story 12-1)
+### The detached-start host duty
 
 `start_detached` spawns a supervised agent whose handle is **disarmed**: your
 engine's exit — and the exit of every later engine that re-adopts it from the
@@ -311,9 +318,9 @@ does. Four instruments keep that statement honest:
   the facade alone and shares its assertions with the CLI suite, proving the
   library path and the CLI path behave identically
   ([the host test](https://github.com/Ktesio/hekma/blob/main/crates/hekma-engine/tests/uj3_library_host.rs)).
-- **The dependency-audit checkpoint (story 11-6, AI-48)** — when reviewing or
+- **The dependency-audit checkpoint** — when reviewing or
   bumping HTTP-stack dependencies (`hyper`/`hyper-util`/`reqwest`-family, and
-  since story 12-3 the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),
+  the TLS leg `hyper-rustls`/`rustls`/`tokio-rustls`/`webpki-roots`),
   check the tracing exposure: `hyper-util` links `tracing`, and its
   connection-pool events would carry the upstream host:port and timing IF a
   global `tracing-subscriber` were ever installed. The engine ships NO

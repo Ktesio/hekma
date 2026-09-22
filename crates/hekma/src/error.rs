@@ -181,6 +181,18 @@ pub struct AgentStopUnconfirmed {
     pub message: String,
 }
 
+/// Story 14-1 (spine AD-19): a second `send` targeted an `acp` instance while
+/// a turn was already in flight. The acp kind serializes turns per session —
+/// a concurrent prompt is REFUSED, never queued. Classified as exit `4`
+/// (Invalid state) — the instance is fine, the timing is not; no new
+/// exit-code number was minted (DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::agent::acp_turn_in_flight))]
+pub struct AgentAcpTurnInFlight {
+    pub message: String,
+}
+
 /// Story 12-1: a detached start (`hekma agent start --detach`) was requested for
 /// an instance whose configuration cannot be detached — v1's single refusal is
 /// the `engine-observed` metering channel, whose loopback forward listener

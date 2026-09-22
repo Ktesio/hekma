@@ -27,7 +27,7 @@
 //! forwarded `Authorization` header). It MUST NOT log, echo, persist, or leak
 //! request/response BODIES, HEADERS, or the auth key anywhere — not to the engine
 //! event log, the ledger, error messages, stderr, or the agent log. Bodies +
-//! headers are relayed UPSTREAM faithfully, but ONLY the two parsed integer token
+//! headers are relayed UPSTREAM faithfully, but ONLY the parsed integer token
 //! counts ever leave the proxy (into the queue → the ledger). Every error variant
 //! here carries ONLY a static op label + a transport-shaped detail — NEVER a body,
 //! a header value, or a URL with embedded credentials.
@@ -181,17 +181,19 @@ const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
     hyper::header::CONTENT_LENGTH,
 ];
 
-/// The shared queue of OBSERVED usage counts `(input_tokens, output_tokens)` the
-/// listener pushes and the supervisor's reaper drains (story 3-4 drive model).
+/// The shared queue of OBSERVED usage counts `(input_tokens, output_tokens,
+/// cached_tokens)` the listener pushes and the supervisor's reaper drains
+/// (story 3-4 drive model; the cached subset added by story 14-6, D8 — the
+/// cached SUBSET of input under the INPUT-INCLUSIVE invariant).
 ///
 /// This is the seam between the ASYNC listener task (event-driven, pushes as each
 /// completion response is parsed) and the SYNC supervisor choke point (the reaper
 /// cadence drains it and mints the per-Run `sequence`, then funnels into the SAME
 /// `ingest_usage`). A plain `Arc<Mutex<VecDeque<..>>>` — the push is O(1) and the
 /// contention is negligible (a few completions per reaper tick); no need for a
-/// channel or an async lock. Only the two parsed INTEGER counts ever enter it —
+/// channel or an async lock. Only the three parsed INTEGER counts ever enter it —
 /// NEVER a body, header, or key (the no-leak invariant).
-pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64)>>>;
+pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64, u64)>>>;
 
 /// Why the loopback forward listener could not START (story 3-4). `thiserror`
 /// only (no `miette` in the lib — conventions). Every variant carries ONLY a
@@ -539,17 +541,17 @@ async fn forward(
     // TERMINAL usage frame; anything else is parsed as one JSON completion. A miss
     // (no `usage`, malformed, a stream without the terminal frame) is a silent
     // skip — best-effort to the RUN, the agent still gets its faithful response
-    // below. ONLY the two integer counts enter the queue (no body/header/key ever
+    // below. ONLY the three integer counts enter the queue (no body/header/key ever
     // leaves the proxy).
     if is_sse(&res_parts.headers) {
-        if let Some((input, output)) = parse_openai_sse_usage(&res_collected) {
+        if let Some((input, output, cached)) = parse_openai_sse_usage(&res_collected) {
             if let Ok(mut q) = queue.lock() {
-                q.push_back((input, output));
+                q.push_back((input, output, cached));
             }
         }
-    } else if let Some((input, output)) = parse_openai_usage(&res_collected) {
+    } else if let Some((input, output, cached)) = parse_openai_usage(&res_collected) {
         if let Ok(mut q) = queue.lock() {
-            q.push_back((input, output));
+            q.push_back((input, output, cached));
         }
     }
 
@@ -1013,8 +1015,12 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(q) = queue.lock() {
-                if let Some(&(input, output)) = q.front() {
-                    assert_eq!((input, output), (9, 11), "usage metered over TLS");
+                if let Some(&(input, output, cached)) = q.front() {
+                    assert_eq!(
+                        (input, output, cached),
+                        (9, 11, 0),
+                        "usage metered over TLS"
+                    );
                     assert_eq!(q.len(), 1, "exactly one event for the streamed call");
                     break;
                 }
@@ -1204,8 +1210,12 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(q) = queue.lock() {
-                if let Some(&(input, output)) = q.front() {
-                    assert_eq!((input, output), (42, 58), "parsed usage mapped + queued");
+                if let Some(&(input, output, cached)) = q.front() {
+                    assert_eq!(
+                        (input, output, cached),
+                        (42, 58, 0),
+                        "parsed usage mapped + queued"
+                    );
                     break;
                 }
             }
@@ -1322,10 +1332,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(q) = queue.lock() {
-                if let Some(&(input, output)) = q.front() {
+                if let Some(&(input, output, cached)) = q.front() {
                     assert_eq!(
-                        (input, output),
-                        (11, 22),
+                        (input, output, cached),
+                        (11, 22, 0),
                         "usage parsed from de-chunked body"
                     );
                     break;
@@ -1614,8 +1624,12 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Ok(q) = queue.lock() {
-                if let Some(&(input, output)) = q.front() {
-                    assert_eq!((input, output), (42, 58), "the terminal frame's usage");
+                if let Some(&(input, output, cached)) = q.front() {
+                    assert_eq!(
+                        (input, output, cached),
+                        (42, 58, 0),
+                        "the terminal frame's usage"
+                    );
                     assert_eq!(q.len(), 1, "exactly ONE event per streamed completion");
                     break;
                 }

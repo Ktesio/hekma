@@ -875,6 +875,26 @@ impl Registry {
         Ok(())
     }
 
+    /// Persist the established ACP session id onto the instance's spawn record
+    /// (story 14-2, D4) — the start path's post-handshake write. Fails when no
+    /// record row exists (the caller surfaces it).
+    pub(crate) fn set_acp_session_id(
+        &self,
+        name: &InstanceName,
+        session_id: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        self.store.set_acp_session_id(name, session_id)?;
+        Ok(())
+    }
+
+    /// Settle the write-ahead spawn record (story 14-2): clear it while
+    /// RETAINING an established acp session id on a pid-0 seed row, so the
+    /// next start can offer it back via `session/load`. Returns whether an id
+    /// was retained. Idempotent.
+    pub(crate) fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, RegistryError> {
+        Ok(self.store.settle_spawn_record(name)?)
+    }
+
     /// Read an instance's write-ahead spawn record, or `None` if absent.
     pub(crate) fn spawn_record(
         &self,

@@ -1,5 +1,5 @@
 {
-  "repo": "Ktesio/ktesio",
+  "repo": "Ktesio/hekma",
   "project": {
     "owner": "Ktesio",
     "title": "Ktesio",
@@ -14,7 +14,12 @@
     "epic-6": 60,
     "epic-7": 61,
     "epic-8": 62,
-    "epic-9": 110
+    "epic-9": 110,
+    "epic-10": 194,
+    "epic-11": 195,
+    "epic-12": 196,
+    "epic-13": 197,
+    "epic-14": 198
   },
   "stories": {
     "1-1-restructure-into-the-five-crate-workspace-without-breaking-the-shipping-cli": 63,
@@ -49,13 +54,36 @@
     "7-3-embed-clean-no-tty-no-prompts-blocking-facade": 92,
     "7-4-prove-the-boundary-and-publish-the-crates": 93,
     "7-5-benchmark-the-performance-budgets": 94,
-    "8-1-relocate-the-install-lock-machinery-into-the-engine": 95,
+    "8-1-build-the-skills-provisioning-foundation-in-ktesio-engine-skills": 199,
     "8-2-provision-skills-to-a-managed-agent": 96,
     "8-3-manage-each-agents-skill-set-over-time": 97,
-    "8-4-deprecate-the-legacy-surface-loudly-and-kindly": 98,
+    "8-4-deprecate-the-legacy-surface-loudly-and-kindly-superseded": 98,
     "8-5-keep-every-install-channel-unbroken-through-the-pivot": 99,
-    "9-1-remove-the-legacy-skill-manager-command-surface": 111,
-    "9-2-rebrand-kt-identity-and-make-agent-list-show-canonical": 112,
-    "9-3-reconcile-architecture-and-skill-docs-and-rescope-ad16-epic8": 113
+    "9-1-remove-the-legacy-skill-manager-command-surface-modules-and-tests": 200,
+    "9-2-reposition-the-top-level-kt-identity-to-the-agent-runner": 201,
+    "9-3-reconcile-the-stale-architecture-and-skill-manager-docs-architect-owned": 202,
+    "10-1-one-test-support-home-for-the-embedding-suites": 203,
+    "10-2-host-provided-diagnostic-sink": 204,
+    "10-3-event-bus-resync-helper-ratified-subscriber-active-budget": 205,
+    "11-1-engine-robustness-batch": 206,
+    "11-2-config-secrets-batch": 207,
+    "11-3-memory-robustness-batch": 208,
+    "11-4-docs-docs-gate-process-batch": 209,
+    "11-5-cross-platform-ci-batch": 210,
+    "11-6-supervision-operations-decisions": 211,
+    "11-7-orchestration-review-process-batch": 212,
+    "12-1-detached-start-survives-the-cli-exit-ai-20-ratified-option-b": 213,
+    "12-2-streaming-usage-parse-ai-47b": 214,
+    "12-3-https-upstream-via-vendored-rustls-ring-ai-47a": 215,
+    "12-4-observed-drain-durability-retro-f3-fold": 216,
+    "13-1-close-the-memory-dir-strip-gap-on-the-invocation-override-path-epic-5-retro-a1": 217,
+    "13-2-renegotiate-the-contract-on-the-legacy-start-fallback-epic-6-retro-b1": 218,
+    "13-3-supervisor-module-boundary-the-split-study-epic-11-f-agg2-ad-18-carried-debt": 219,
+    "14-1-acp-transport-core-the-builtin-acp-kind-d1-d3-d6": 220,
+    "14-2-sessions-across-lifetimes-d4": 221,
+    "14-3-acp-usage-acquisition-tiered-honest-d2-amended-metering-is-critical": 222,
+    "14-6-cached-tokens-across-the-metering-pipeline-d8-acp-independent-foundation": 223,
+    "14-5-hermes-kind-deprecation-path-d7-islams-amendment-hermes-speaks-acp": 224,
+    "14-4-verification-docs": 225
   }
 }

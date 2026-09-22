@@ -88,6 +88,47 @@ impl Supervisor {
         let (kind, manifest_path, persisted_launch) = registry
             .adapter_launch_facts(&name)
             .map_err(registry_to_engine)?;
+        // Story 14-1 (spine AD-19): the acp kind's start behavior keys off the
+        // kind ONCE — its launch resolves from the instance's unified config
+        // keys (`acp.command`/`acp.args`, the resolver refuses honestly naming
+        // both keys when the command is unset), its spawn pipes BOTH stdio
+        // directions (the transport IS the pipe pair), and its stdout is the
+        // protocol stream the connection's reader consumes.
+        let is_acp = crate::acp::is_acp_kind(&kind);
+        // Story 14-2 (D4, spine AD-19): the session id PERSISTED by a previous
+        // Run — the resume offer for this start's handshake. Read BEFORE any
+        // side effect (a pure record read; the write-ahead commit at (6)
+        // clears it, and the established id is re-persisted post-handshake).
+        // A read failure is surfaced honestly and start proceeds without a
+        // resume offer (a fresh session) — surfaced-not-silent (AI-18).
+        let resume_session: Option<String> = if is_acp {
+            match registry.spawn_record(&name) {
+                Ok(record) => record.and_then(|r| r.acp_session_id),
+                Err(err) => {
+                    // A distinct local name (not `notice`): the embed-clean
+                    // audit pins the `emit_diagnostic(&notice)` shape to the
+                    // ONE memory-delivery route (DC-10).
+                    let resume_read_notice = format!(
+                        "{}: the previous ACP session id could not be read from the spawn \
+                         record ({err}); a fresh session will open",
+                        name.as_str(),
+                    );
+                    self.emit_diagnostic(&resume_read_notice);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // The Agent Home + effective config are resolved EARLIER than the
+        // (2b) block below because the acp launch needs the resolved config.
+        // Both are pure reads (no state change), so an early failure still
+        // rejects the start with no spurious transition — the same atomicity
+        // the later resolution had.
+        let home = registry.agent_home(&name);
+        let mut effective = registry
+            .effective_config(&name, crate::domain::ConfigLayer::empty())
+            .map_err(|e| config_to_engine(&name, e))?;
         // Prefer the launch SNAPSHOTTED at registration — this removes the fragile
         // start-time manifest re-read that dropped `args` on hosted CI runners
         // (the agent spawned with the right binary but ZERO args). Fall back to
@@ -97,8 +138,13 @@ impl Supervisor {
         // fallback RE-NEGOTIATES the contract version (retro #161): the file on
         // disk may have drifted since registration, and a manifest edited to a
         // foreign major must fail the start, not bypass the 6-6 load gate.
+        // THE acp EXCEPTION (story 14-1): the builtin declares NO launch by
+        // design (the launch is per-instance operator configuration), so the
+        // fallback resolves from the config keys instead of erroring
+        // NativeHasNoLaunch.
         let mut launch = match persisted_launch {
             Some(launch) => launch,
+            None if is_acp => crate::acp::resolve_acp_launch(&name, &effective)?,
             None => adapter::resolve_start_launch(&kind, manifest_path.as_deref())
                 .map_err(|e| launch_to_engine(&name, e))?,
         };
@@ -107,9 +153,21 @@ impl Supervisor {
         // snapshot — stamped on every UsageEvent ingested during this Run. Read here
         // (a pure snapshot read) before any side effect; a corrupt snapshot surfaces
         // the same way the launch-facts read above would.
-        let metering_source = registry
-            .metering_source(&name)
-            .map_err(registry_to_engine)?;
+        //
+        // Story 14-3 (T2, spine AD-19): the acp kind's ACTIVE source is resolved
+        // from its effective config instead of the (always self-reported) snapshot
+        // — the operator's `metering.upstream_base_url` key opts the instance into
+        // the engine-observed loopback channel, exactly the key an observed
+        // MANIFEST agent honors. The snapshot stays untouched (a registration
+        // record); the Fleet read resolves the same way, so the surfaced source
+        // matches what this start does.
+        let metering_source = if is_acp {
+            crate::acp::resolve_acp_metering_source(&effective).to_string()
+        } else {
+            registry
+                .metering_source(&name)
+                .map_err(registry_to_engine)?
+        };
 
         // Story 12-1 — the DETACHED REFUSAL for engine-observed instances,
         // BEFORE ANY SIDE EFFECT (no `starting` transition, no loopback
@@ -162,19 +220,15 @@ impl Supervisor {
         // (2b) Map the resolved unified config into the adapter's NATIVE mechanism
         // (story 2-2, FR-12) — still before any persisted state change, so a
         // config/mapping failure rejects the start cleanly (no spurious state
-        // change, no half-launched process). Resolve the instance's effective
-        // config (2-1's four-layer fold; empty invocation overrides for a plain
-        // start — the parameter is threaded so a future `start --set k=v` supplies
-        // it without an API change), the adapter's declared mapping (manifest
-        // `[config]` or the native code-declared table), then apply: known keys
-        // land in their declared native target (env → launch.env; flag →
-        // launch.args; file → a rendered file in the Agent Home), and `agent.*`
-        // pass-through leaves are delivered VERBATIM (AC6). The Agent Home already
-        // exists (created at registration); file targets render into it here.
-        let home = registry.agent_home(&name);
-        let mut effective = registry
-            .effective_config(&name, crate::domain::ConfigLayer::empty())
-            .map_err(|e| config_to_engine(&name, e))?;
+        // change, no half-launched process). The effective config + Agent Home
+        // were resolved EARLIER (above) because the acp kind's launch resolves
+        // from the config; this block maps them. Resolve the adapter's declared
+        // mapping (manifest `[config]` or the native code-declared table), then
+        // apply: known keys land in their declared native target (env →
+        // launch.env; flag → launch.args; file → a rendered file in the Agent
+        // Home), and `agent.*` pass-through leaves are delivered VERBATIM (AC6).
+        // The Agent Home already exists (created at registration); file targets
+        // render into it here.
         // (2b-memory-spoof) The reserved `memory.dir` key is a DELIVERY
         // MECHANISM, never operator configuration (story 5-1's CORRECTION; docs:
         // "the operator never set this key"). Strip any hand-set value from the
@@ -419,8 +473,15 @@ impl Supervisor {
         // and are never re-ingested under this fresh Run id. Capturing it HERE (not
         // after the readiness watch below) is essential: a fast agent emits its first
         // usage lines within the ~300ms readiness window, so a cursor set post-
-        // readiness would skip them — the ingestion bug this prevents.
+        // readiness would skip them — the ingestion bug this prevents. For an `acp`
+        // spawn (story 14-1) the READER appends the raw lines to this same file (the
+        // stdout is a pipe, not a redirect), so the cursor semantics are unchanged.
+        // Story 14-3 (T3): the acp kind's STDERR sentinel channel anchors the same
+        // way, at the captured stderr log's pre-spawn length — a prior Run's
+        // captured stderr lines stay behind the cursor, never re-ingested under
+        // this fresh Run id.
         let usage_cursor = self.agent_log_len(registry, &name);
+        let stderr_usage_cursor = self.agent_stderr_log_len(registry, &name);
 
         // (3) registered/stopped/failed → starting.
         self.transition(
@@ -435,12 +496,15 @@ impl Supervisor {
             exec: launch.exec.clone(),
             args: launch.args,
             env: launch.env,
-            working_dir: home,
-            log_file: Some(agent_log_path),
+            working_dir: home.clone(),
+            log_file: Some(agent_log_path.clone()),
             // Story 4-2 (AC-E): capture is unconditional, computed from the
             // SAME Registry path authority as `log_file` (never gated on
             // `pipe_stdin`/`Capability::Interaction` — that gate governs only
-            // the stdin *write* direction).
+            // the stdin *write* direction). For an `acp` spawn (story 14-1)
+            // the stdout capture file is fed by the connection's READER (the
+            // stdout itself is the protocol pipe) — the raw record stays
+            // byte-honest, and the tailer attribution machinery is unchanged.
             attributed_log_path: Some(registry.attributed_output_log_path(&name)),
             // Fix pass (review of #80): the crash-immune raw STDERR capture,
             // computed from the SAME path authority, paired 1:1:1 with
@@ -456,6 +520,13 @@ impl Supervisor {
             // handle has no recoverable pipe either), which is exactly the
             // behavior the spec's I/O matrix pins.
             pipe_stdin: pipe_stdin && !detach,
+            // Story 14-1: the acp transport ALSO pipes stdout (the protocol
+            // stream) — but a DETACHED acp spawn gets no transport at all
+            // (the pipe halves would die with the spawning CLI), mirroring
+            // the stdin force-clear above; the connection build below then
+            // refuses honestly. Every other kind keeps the crash-immune
+            // direct file redirect, byte-unchanged.
+            pipe_stdout: crate::acp::spawn_pipe_stdout(is_acp, detach),
             // The spawn-time disarm flag (see the port's `SpawnSpec::detach`
             // docs): the Unix handle skips its Drop killpg; the Windows spawn
             // never creates/assigns the kill-on-close Job Object.
@@ -500,6 +571,13 @@ impl Supervisor {
             // is the durable-detach promise across N commands, not just the
             // first.
             detach,
+            // Story 14-2: the fresh record commits WITHOUT a session id — the
+            // resume offer was read above (pre-commit), and the id THIS Run
+            // establishes lands right after the handshake via
+            // `set_acp_session_id`. Committing `None` here is what clears any
+            // settle-retained id: a Run whose handshake has not completed has,
+            // honestly, no session yet.
+            acp_session_id: None,
         };
         if let Err(e) = registry.write_spawn_record(&record) {
             // Persisting the record failed: kill the just-spawned process and
@@ -533,6 +611,106 @@ impl Supervisor {
                 format!("could not commit the write-ahead spawn record: {e}"),
             ));
         }
+
+        // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
+        // take ownership of the child's pipe halves, start the connection
+        // (the reader thread owns the stdout stream and re-records every raw
+        // line into `agent.log`), and drive the BOUNDED handshake (protocol
+        // version 1, DEFAULT client capabilities — advertise-nothing, D3; the
+        // Agent Home as cwd; `mcpServers: []`). Story 14-2 (D4): the
+        // handshake is RESUME-AWARE — the session id persisted by a previous
+        // Run (`resume_session`, read pre-commit above) is offered via
+        // `session/load` when the fresh agent advertises `loadSession`, with
+        // a `session/new` fallback + surfaced note otherwise; the id THIS Run
+        // establishes is persisted to the record post-handshake.
+        //
+        // Order: AFTER the write-ahead record commit (AD-5 — the spawn is a
+        // recorded, adoptable process from this point on; a handshake failure
+        // tears the process down explicitly and the stale record honestly
+        // reconciles, exactly like the record-commit-failure path above) and
+        // BEFORE the `starting → running` transition (the instance reaches
+        // `running` only once a session EXISTS). Bounded by
+        // [`crate::acp::HANDSHAKE_TIMEOUT`] across both round trips — the
+        // accepted AI-59/AD-17 bounded-wait shape (a hung agent refuses the
+        // start instead of wedging supervision); the engine locks are held
+        // for the wait exactly like `stop`'s KILL_CONFIRM window.
+        //
+        // Version tolerance: an agent countering a version outside the
+        // tolerated set {1} closes the transport + refuses the start
+        // (traffic-free — the error names both integers, never any payload).
+        let acp = if is_acp {
+            let stdin_state = self.backend.take_stdin(&mut handle);
+            let stdout = self.backend.take_stdout(&mut handle);
+            let capture = self.backend.log_capture(&handle);
+            match crate::acp::AcpConnection::start(
+                name.as_str(),
+                stdin_state,
+                stdout,
+                agent_log_path.clone(),
+                capture,
+            ) {
+                Ok(connection) => {
+                    match crate::acp::handshake(&connection, &home, resume_session.as_deref()) {
+                        Ok(outcome) => {
+                            // Story 14-2 (D4): persist the established session id
+                            // at the point the connection establishes it — the
+                            // durable input for the NEXT start's `session/load`
+                            // resume offer. A persist failure is surfaced (the
+                            // resume would be silently lost otherwise, AI-18) and
+                            // never fatal: the instance is running with a live
+                            // session regardless.
+                            if let Err(err) =
+                                registry.set_acp_session_id(&name, Some(&outcome.session_id))
+                            {
+                                // A distinct local name (not `notice`): the
+                                // embed-clean audit pins the
+                                // `emit_diagnostic(&notice)` shape to the ONE
+                                // memory-delivery route (DC-10).
+                                let persist_notice = format!(
+                                    "{}: the established ACP session id could not be persisted to \
+                                 the spawn record ({err}); the next start will open a fresh \
+                                 session instead of resuming",
+                                    name.as_str(),
+                                );
+                                self.emit_diagnostic(&persist_notice);
+                            }
+                            // The ONE resume-outcome note (AI-18): surfaced when
+                            // the session was resumed or a persisted id could not
+                            // be; silent on a first start's fresh session.
+                            if let Some(note) =
+                                crate::acp::resume_outcome_note(name.as_str(), &outcome)
+                            {
+                                self.emit_diagnostic(&note);
+                            }
+                            Some(connection)
+                        }
+                        Err(handshake_err) => {
+                            // Close + refuse: tear the transport down (closing
+                            // stdin), kill the just-spawned process through the
+                            // backend's bounded stop, and land the instance
+                            // `failed` with the traffic-free refusal detail.
+                            drop(connection);
+                            let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                            drop(handle);
+                            return Err(self.fail_launch_detail(
+                                registry,
+                                &name,
+                                format!("ACP handshake failed: {handshake_err}"),
+                            ));
+                        }
+                    }
+                }
+                Err(connection_err) => {
+                    // No transport (e.g. a detached acp spawn has no stdin
+                    // pipe): the same close + refuse shape.
+                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    drop(handle);
+                    return Err(self.fail_launch_detail(registry, &name, connection_err));
+                }
+            }
+        } else {
+            None
+        };
 
         // (7) starting → running (adapter ready, or a Restart Policy restart).
         let ready_cause = match restart {
@@ -580,6 +758,16 @@ impl Supervisor {
                 metering_source,
                 usage_cursor,
                 usage_park_attempts: None,
+                // Story 14-3 (T3): the stderr sentinel channel's fresh
+                // cursor + park (acp-only in practice; zero for the rest).
+                stderr_usage_cursor,
+                stderr_usage_park_attempts: None,
+                // A fresh Run has seen no sentinel lines yet (the gap
+                // notice's honest "no lines seen" until one arrives).
+                sentinel_lines_seen: false,
+                // Story 14-3 (T2): carried beside the handle so the drain
+                // cadence gates the stderr channel without a re-read.
+                is_acp,
                 // Story 12-4: a fresh Run starts with no parked observed events.
                 observed_park: None,
                 // A fresh Run starts with an EMPTY breach latch (story 3-2): the
@@ -594,6 +782,9 @@ impl Supervisor {
                 stop_unconfirmed: false,
                 // A fresh start (operator or restart) spawned this process itself.
                 adopted: false,
+                // Story 14-1: the acp transport lives with the handle (a fresh
+                // session for this Run; teardown drops with the Supervised).
+                acp,
             },
         );
 

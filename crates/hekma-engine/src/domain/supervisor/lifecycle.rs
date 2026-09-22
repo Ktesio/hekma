@@ -177,8 +177,10 @@ impl Supervisor {
                 // as the ordinary path below would have on confirmed death.
                 self.clear_poll_error_streak(&name);
                 self.running.remove(&name);
+                // Story 14-2: the settle retains an acp session id (see the
+                // ordinary stop path); identical to a clear otherwise.
                 registry
-                    .clear_spawn_record(&name)
+                    .settle_spawn_record(&name)
                     .map_err(registry_to_engine)?;
                 self.transition_with_log_capture(
                     registry,
@@ -213,13 +215,22 @@ impl Supervisor {
                 .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
 
+        // Story 14-1 (spine AD-19): for an `acp` instance with a turn in
+        // flight, write `session/cancel` FIRST (the bounded write; the agent
+        // aborts its turn), then proceed through the EXISTING stop ladder
+        // unchanged. Best-effort + surfaced: a cancellation that could not be
+        // delivered emits one diagnostic, and the ladder runs regardless.
+        // Pause/resume are untouched (process semantics for every kind).
+        self.cancel_in_flight_acp_turn(&name);
+
         // Drain any final self-reported usage the agent emitted before the stop, so
         // the last batch of a Run is not lost to the race between "agent printed it"
         // and "we killed the process" (story 3-1). TERMINAL drain: the process is
         // about to be gone, so a final newline-less usage line is consumed to
         // end-of-log rather than stranded (H1). Best-effort — a drain hiccup never
-        // blocks the stop.
-        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // blocks the stop. Story 14-3 (T3): an acp instance's stderr sentinel
+        // channel drains here too, under the same terminal rule (its own cursor).
+        self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
         // Drain any final ENGINE-OBSERVED usage still queued before the listener is
         // torn down (story 3-4): a completion the proxy parsed just before the stop
         // must land, not be lost when the `Supervised` (and its listener) is dropped
@@ -227,6 +238,10 @@ impl Supervisor {
         // loss — there is no next pass — and any parked buffer dies with the
         // instance.
         self.drain_observed_for(registry, &name, DrainMode::Terminal);
+        // Story 14-1: surface any queued acp notices before the transport
+        // tears down with the handle (malformed lines, permission denials,
+        // usage updates — surfaced, never lost silently to the stop).
+        self.drain_acp_notices_for(&name);
 
         // Ask the backend to stop the process (group/job). If we have no handle
         // for it (the row says running but this engine holds no handle AND orphan
@@ -304,18 +319,30 @@ impl Supervisor {
         // still be in `self.running` for its cursor/run_id/metering_source to be
         // read — hence strictly BEFORE `self.running.remove`. This mirrors the crash
         // reaper's proven drain-AFTER-observed-exit (see `poll_once`). Best-effort,
-        // like the pre-kill drain — a drain hiccup never blocks the stop.
-        self.drain_usage_for(registry, &name, DrainMode::Terminal);
+        // like the pre-kill drain — a drain hiccup never blocks the stop. The acp
+        // stderr sentinel channel (story 14-3, T3) rides the same rescue: its
+        // stderr cursor advanced in the pre-kill drain, so this pass ingests
+        // only the stderr bytes that arrived after it.
+        self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
+        // Story 14-1: one FINAL acp notice drain after the process is
+        // provably dead — the reader's EOF/stream-end notice is queued only
+        // once the kill closes the pipe, so this is the last chance to
+        // surface it before the connection drops with the handle below.
+        self.drain_acp_notices_for(&name);
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.clear_poll_error_streak(&name);
         self.running.remove(&name);
 
-        // Clear the write-ahead spawn record (AD-5): a cleanly-stopped instance
-        // must NOT be later adopted or reconciled-to-failed as an orphan. Cleared
+        // Settle the write-ahead spawn record (AD-5): a cleanly-stopped instance
+        // must NOT be later adopted or reconciled-to-failed as an orphan. Settled
         // BEFORE the terminal transition so the durable record leads the state.
+        // Story 14-2: the settle RETAINS an established acp session id on a
+        // pid-0 seed row (so the next start can offer it via `session/load`);
+        // for every record without one this is byte-identical to the plain
+        // clear.
         registry
-            .clear_spawn_record(&name)
+            .settle_spawn_record(&name)
             .map_err(registry_to_engine)?;
 
         // stopping → stopped, recording whether escalation happened (AC3).

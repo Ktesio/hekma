@@ -21,7 +21,7 @@ hekma agent register my-agent --manifest ./my-agent
 Arguments and options:
 
 - `<name>` — Fleet-unique instance name matching `^[a-z0-9][a-z0-9_-]*$`.
-- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`). Mutually exclusive with `--manifest`.
+- `--kind <kind>` — a native builtin adapter by kind (e.g. `mock`, `hermes`, `acp`). Mutually exclusive with `--manifest`.
 - `--manifest <path>` — a manifest adapter loaded from a directory (or an `adapter.toml` file). Mutually exclusive with `--kind`.
 
 Exactly one of `--kind` or `--manifest` is required. Registration validates the adapter's per-OS Capability Declaration and Metering Source **before** any state is written — an adapter with no capabilities or no viable metering source is rejected and nothing is created. On success it prints the engine-computed Agent Home path and the effective (current-OS) Capability Declaration.
@@ -29,6 +29,77 @@ Exactly one of `--kind` or `--manifest` is required. Registration validates the 
 The native `mock` kind is a fixture with no launch command; it registers and configures but cannot be started. Use a manifest adapter to run a real process, or the native `hermes` builtin to launch the real Hermes gateway (`hermes gateway run --external-supervisor`) under the engine's supervision — with filesystem Memory Backing attached, the gateway receives `HERMES_HOME` pointing at the instance's managed memory dir.
 
 **Without filesystem Memory Backing the gateway receives no `HERMES_HOME` at all and falls back to the agent's own default home.** A fleet of multiple unbacked hermes instances therefore all resolve the **same** unmanaged default home (documented fallback, not an error); attach Memory Backing (`hekma agent memory attach <name> --kind filesystem`, from a terminal state) to give each instance its own isolated home.
+
+The `acp` kind runs any agent that speaks the Agent Client Protocol (ACP) v1 — Hermes Agent among them, natively, via its `hermes-acp` entry point. The launch is per-instance configuration: set `acp.command` (required, the executable) and `acp.args` (optional) with `hekma agent config set`, then `start`/`send`/`stop` like any other instance; a `start` without `acp.command` is refused naming both keys.
+
+The `acp` kind's lifecycle semantics, where they differ from a plain process:
+
+- **`start` drives the handshake** — the engine spawns the configured executable and speaks the ACP v1 handshake over its stdio (`initialize` → the agent's capabilities → `session/new`) before the instance reaches `running`. An agent that counters with a protocol version outside the tolerated set (`{1}`) is refused: the connection closes and the instance lands `failed` with a surfaced, traffic-free reason. An agent whose agentCapabilities advertise `loadSession` supports session resume (below).
+- **`send` is one ACP turn** — the text becomes one `session/prompt` request (one text content block), and the command returns immediately; the agent's streamed chunks and the final stop reason land asynchronously in `hekma agent logs <name>` and the event stream. A **second `send` while a turn is still in flight is refused** with a dedicated diagnostic (exit code `4`): ACP serializes turns per session, and the first turn is unaffected — wait for its stop reason (`hekma agent logs <name>`) or `stop` the instance.
+- **`stop` cancels first** — when a turn is in flight, `stop` writes `session/cancel` before the ordinary graceful-then-forced termination ladder.
+- **An agent request for permission is answered denied** (the offered denial option, or `cancelled` when none fits) with one surfaced diagnostic per request — the client advertises no capabilities in v1 (no filesystem, no terminal, no elicitation).
+- **Sessions resume at the next start** — the established ACP session id is persisted at the handshake. If the engine dies (or the starting command exits, killing the child), the next command re-adopts the record and says so on stderr; the resume happens at the next `start`, which offers the persisted id via `session/load` when the agent advertised `loadSession`, and otherwise opens a fresh session with an honest note. A `send` to an adopted instance fails until that stop-and-start, because the ACP transport is a pair of pipes that died with the previous engine. For the same reason a `--detach` start of an `acp` instance cannot establish the transport: the launch lands `failed` with the reason on stderr (start it attached).
+- **Usage is two grains, never mixed** — an agent's `usage_update` notification (its session context window) is surfaced as context usage on `show`/`list`/`--json` under the additive `acp_context_usage` field and its own `show` row, and is **never** written to the billing ledger. Billing-grade tokens (input/output/cached) come from the metering tiers: the self-reported sentinel (under `acp` it rides the agent's **stderr**, since its stdout is the protocol stream) or the `engine-observed` loopback channel (set `metering.upstream_base_url` — the acp kind resolves that source the same way a manifest agent does). When no tier has produced billing-grade usage, the token/cost cells show the honest `—` and the full tier breakdown rides `show`/`list` (a stderr note on `list`, the inline value on `show`) and the additive `usage_gap` field on `--json` — naming the tiers attempted and the context-usage state, never a fabricated figure.
+
+> **Deprecation notice — the `hermes` kind.** The `hermes` builtin kind is **deprecated in favor of `--kind acp`**: Hermes Agent speaks the Agent Client Protocol natively (its `hermes-acp` entry point), and the generic `acp` kind runs it under the same supervision without a bespoke adapter. **New registrations should use `--kind acp`** (point `acp.command` at the `hermes-acp` executable). The `hermes` kind keeps working unchanged — this is an announcement, not a removal — and it will not be removed before a future **major** release, per the CLI-surface deprecation policy (announced ahead via these docs and the release notes; removal only at the stated major). Both migration parity items are shipped and tested with the `acp` kind: **metering** continues through the self-reported usage sentinel (under `acp` the sentinel channel is the agent's stderr, because its stdout is the ACP protocol stream), and **memory delivery** continues through `HERMES_HOME` — a `filesystem` Memory Backing attached to an `acp` instance is delivered into the agent's process environment exactly as under `hermes`.
+
+The whole journey, from registration to a clean stop (the engine runs for
+the duration of each command; `send` returns immediately and the turn
+streams in the background):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant E as Engine (per command)
+    participant A as ACP agent
+
+    Op->>E: agent config set <name> acp.command "…"
+    Op->>E: agent register <name> --kind acp
+    Op->>E: agent start <name>
+    E->>A: spawn → initialize → session/new
+    Note over E,A: state = running (session id persisted — schema v8)
+    Op->>E: agent send <name> "prompt"
+    E->>A: session/prompt (one text turn)
+    loop the turn (send already returned)
+        A-->>E: session/update → agent.log + events
+    end
+    A-->>E: prompt response (stopReason)
+    Op->>E: agent usage <name> / agent show <name>
+    Note over E: billing cells from the ledger ·<br/>context usage under acp_context_usage
+    Op->>E: agent stop <name>
+    E->>A: session/cancel (if a turn is in flight) → termination ladder
+    E-->>Op: state = stopped
+```
+
+And what a session survives — the engine does not: the agent (and its
+persisted session id) outlive any single command, and the resume happens
+at the next `start`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant E1 as Engine (start #1)
+    participant A as ACP agent (survives)
+    participant E2 as Engine (a later command)
+
+    Op->>E1: agent start <name>
+    E1->>A: initialize → session/new
+    Note over E1,A: session id PERSISTED on the spawn record (schema v8)
+    Note over E1: the engine exits (crash — or the command simply ends)
+    Note over A: the agent keeps running; the record survives
+    E2->>A: re-adopt (fingerprint match) — stderr names the recorded session id
+    Note over E2: the transport is not re-pipable: a send here fails honestly
+    Op->>E2: agent stop <name>
+    Op->>E2: agent start <name>
+    E2->>A: initialize (fresh pipes)
+    alt the agent advertised loadSession
+        E2->>A: session/load (the persisted id) — the conversation RESUMES
+    else resuming is not supported (or the load fails)
+        E2->>A: session/new + an honest note on stderr
+    end
+```
 
 ## `hekma agent list [--json]`
 
@@ -57,6 +128,8 @@ hekma agent show demo --json
 ```
 
 The runtime status includes the Lifecycle State, Restart Policy, restart count, the token budget and dollar Cost Cap, real usage token totals (cumulative and current-run), the derived dollar cost when a Rate exists, the active Metering Source, and — for a failed instance — the failed cause. `--json` emits the same `FleetEntry` shape a `list` row uses, wrapped with the Fleet `schema_version`.
+
+Two fields are **additive and `acp`-specific** (every other kind omits them): `acp_context_usage` — the agent's reported session context window (`used`/`size` plus its optional self-reported cost), a context-grain figure that is never part of the billing `usage` object and is present only while a live ACP connection has reported one; and `usage_gap` — present only for an `acp` instance whose Usage Ledger holds no billing-grade usage at all, carrying the tiers attempted (`observed`/`sentinel`), whether context usage was reported, and a one-line `notice` naming all three.
 
 ## `hekma agent usage [<name>] [--json]`
 
@@ -223,7 +296,7 @@ hekma agent remove my-agent --force
 Attach a Memory Backing to an Agent Instance. Two kinds exist, and each names its guarantee up front (NFR-7):
 
 - **`filesystem`** — an engine-managed directory inside the instance's Agent Home whose contents persist under your control and survive stop/start cycles and engine restarts byte-identically.
-- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hekma guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
+- **`native`** — an explicit delegation marker: memory semantics belong to the agent's own native mechanism; Hekma guarantees only that the Agent Home itself persists. Attaching it creates no directory, and — because a `native` **backing** delivers nothing — the engine performs no config delivery at start for it, `HERMES_HOME`-style override included; the agent's own mechanism locates its home. (This is about the backing kind, not the adapter: a `hermes` or `acp` instance attached a `filesystem` backing DOES receive `HERMES_HOME` — see the attach section below.)
 
 ```bash
 hekma agent memory attach demo --kind filesystem
@@ -241,7 +314,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 
 ### `memory attach --json`
 
-`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the injected path will actually reach the agent. `declared` reads `true` when the attached backing is `filesystem` AND the adapter's declared config mapping targets the reserved `memory.dir` key (the builtin `hermes` does — its mapping delivers `memory.dir` as `HERMES_HOME` — so a hermes instance with a filesystem backing reads `"declared": true`). It reads `false` when the mapping targets nothing, and also when the attached backing is `native` — for a `native` backing the `false` means "no delivery is offered", not "the adapter declined": nothing is delivered at start, so there is no delivery to declare.
+`--json` writes a single versioned document to stdout and nothing else there (diagnostics stay on stderr). The document carries the backing kind and guarantee level in their typed snake_case wire strings (frozen verbatim at the Adapter Contract v1 freeze), the engine-computed managed directory, and the delivery fact — whether the injected path will actually reach the agent. `declared` reads `true` when the attached backing is `filesystem` AND the adapter's declared config mapping targets the reserved `memory.dir` key (the builtin `hermes` does — its mapping delivers `memory.dir` as `HERMES_HOME` — and so does the `acp` builtin, so a hermes or acp instance with a filesystem backing reads `"declared": true`). It reads `false` when the mapping targets nothing, and also when the attached backing is `native` — for a `native` backing the `false` means "no delivery is offered", not "the adapter declined": nothing is delivered at start, so there is no delivery to declare.
 
 ```json
 {
@@ -254,7 +327,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
 }
 ```
 
-A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
+A `native` attach reads `"kind": "native"`, `"guarantee": "home_persistence_only"`, and `"declared": false` (no delivery is offered for a `native` backing — see above; this says nothing about the adapter, and a `hermes` or `acp` instance with a `filesystem` backing reads `true`). The `schema_version` is the memory document family's own (currently `1`); it is a compatibility surface — any key change is announced, never silent.
 
 For `filesystem`, the engine creates and owns the managed directory (it prints the exact path), never touches its contents — they are yours — and hands the path to the adapter at every start through the reserved `memory.dir` config key. Whether the agent actually receives it depends on the adapter declaring a config mapping for that key; if it declares none, Hekma says so on stderr at start and the directory guarantee holds regardless. For `native`, nothing is injected at start — the agent's memory mechanism is entirely its own.
 
@@ -351,6 +424,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
+| `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |
 | `budget.dollars.per_run` | dollar string | Per-run dollar Cost Cap (needs a Rate to enforce) |
 | `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
 | `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
@@ -358,7 +432,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 
 Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
-Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
+Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). The cached price is OPTIONAL: when set, an event's cached tokens (the subset the provider served from its prompt cache) price at the cached rate and the remaining input at the input rate; when unset, cached tokens price AT the input rate — a deliberate conservative default that can only overstate the cost, never understate it. Cached tokens ride inside `input_tokens` (the input is inclusive), so token budgets count them once, through the ordinary totals, and surfaces show a `/ cached N` suffix only when a known non-zero subset exists. Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
 
 ### Budget breaches and the pause action
 
@@ -376,7 +450,7 @@ Every `hekma` command returns one of these numeric exit codes, so failures can b
 | `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter manifest whose `contract_version` major does not match this engine's (the FR-30 negotiation gate — the error names both versions and the rule), an adapter declaring no capabilities or no metering source, a failed self-update |
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
-| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, or a stop that could not be confirmed |
+| `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, a stop that could not be confirmed, or a second `send` to an `acp` instance while an ACP turn is still in flight (the first turn is unaffected) |
 | `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `hekma agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `hekma agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `hekma agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
 

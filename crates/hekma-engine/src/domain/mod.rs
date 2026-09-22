@@ -35,21 +35,25 @@ pub use bus::{broadcast, EngineEvent, EVENT_BUS_CAPACITY};
 pub use config::{
     is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_cost, resolve_token_budget,
     resolve_upstream_base_url, secret_name, ConfigError, ConfigLayer, EffectiveConfig,
-    ResolvedValue, SourceLayer, BUDGET_BREACH_ACTION_KEY, BUDGET_DOLLARS_CUMULATIVE_KEY,
-    BUDGET_DOLLARS_PER_RUN_KEY, BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY,
-    COST_RATE_INPUT_KEY, COST_RATE_OUTPUT_KEY, MEMORY_DIR_KEY, METERING_BASE_URL_KEY,
-    METERING_UPSTREAM_BASE_URL_KEY, PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
+    ResolvedValue, SourceLayer, ACP_ARGS_KEY, ACP_COMMAND_KEY, BUDGET_BREACH_ACTION_KEY,
+    BUDGET_DOLLARS_CUMULATIVE_KEY, BUDGET_DOLLARS_PER_RUN_KEY, BUDGET_TOKENS_CUMULATIVE_KEY,
+    BUDGET_TOKENS_PER_RUN_KEY, COST_RATE_INPUT_KEY, COST_RATE_OUTPUT_KEY, MEMORY_DIR_KEY,
+    METERING_BASE_URL_KEY, METERING_UPSTREAM_BASE_URL_KEY, PASS_THROUGH_PREFIX, SECRET_MASK,
+    SECRET_PREFIX,
 };
 pub use cost::{
-    cost_micros, render_dollars, render_dollars_bare, CostCap, CostEvaluator, EstimateLabel,
-    Micros, Rate, MICROS_PER_DOLLAR,
+    cost_micros, cost_micros_with_cached, render_dollars, render_dollars_bare, CostCap,
+    CostEvaluator, EstimateLabel, Micros, Rate, MICROS_PER_DOLLAR,
 };
 pub use error::{EngineError, RegistryError};
 pub use event::{
     BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
     BUDGET_SCHEMA_VERSION, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION,
 };
-pub use fleet::{BudgetView, FleetEntry, FleetListing, FleetTotals, UsageView};
+pub use fleet::{
+    AcpContextCostView, AcpContextUsageView, BudgetView, FleetEntry, FleetListing, FleetTotals,
+    UsageGapNotice, UsageView,
+};
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};

@@ -56,6 +56,17 @@ pub struct SpawnRecord {
     /// keeps the story 1-6 adoption semantics byte-for-byte (the adopting
     /// engine owns what it re-holds and tears it down at ITS clean exit).
     pub detach: bool,
+    /// Story 14-2 (D4, spine AD-19): the last ACP session id this engine
+    /// established for an `acp` instance, written by the start path at the
+    /// point the handshake establishes it. `None` for every non-acp kind, for
+    /// a record whose handshake has not completed yet (the fresh-spawn record
+    /// commits with `None` and the id lands post-handshake), and for a pre-v8
+    /// record. The id is the durable input for the NEXT start's `session/load`
+    /// resume offer: the ACP transport itself is a pipe pair that dies with
+    /// the engine that held it (an adopted process is not re-piped), so the
+    /// resume rides the next handshake. `settle_spawn_record` retains the id
+    /// across a stop/crash settle on a pid-0 seed row.
+    pub acp_session_id: Option<String>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.
@@ -169,6 +180,32 @@ pub trait StateStore {
     /// not later adopted/failed as an orphan). Idempotent: clearing an absent
     /// record is success.
     fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), StoreError>;
+
+    /// Persist the established ACP session id onto the instance's spawn record
+    /// (story 14-2, D4, spine AD-19) — the single session-id WRITE, called by
+    /// the start path at the point the handshake establishes it
+    /// (post-`session/new` / post-`session/load`). `None` clears (a record
+    /// whose session is being re-established). Fails with
+    /// [`StoreError::NotFound`] when no record row exists — the caller
+    /// surfaces that (a dropped resume id must never vanish silently, AI-18).
+    fn set_acp_session_id(
+        &self,
+        name: &InstanceName,
+        session_id: Option<&str>,
+    ) -> Result<(), StoreError>;
+
+    /// Settle the write-ahead spawn record (story 14-2): clear the live
+    /// record — a clean stop, a crash reconcile, a terminal settle — while
+    /// RETAINING an established acp session id for the next start's resume
+    /// offer. When the cleared record carries an `acp_session_id`, a
+    /// policy-only seed row (pid 0 — the exact shape
+    /// [`StateStore::set_restart_policy`] seeds and adoption already skips)
+    /// is re-persisted carrying {policy, count, acp_session_id}. When it
+    /// carries none (every non-acp kind; an acp instance with no completed
+    /// handshake) this is byte-identical to [`StateStore::clear_spawn_record`].
+    /// Returns whether a session id was retained. Idempotent: settling an
+    /// absent record is success (`false`).
+    fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, StoreError>;
 
     /// Read the write-ahead spawn record for an instance, or `None` if absent.
     fn get_spawn_record(&self, name: &InstanceName) -> Result<Option<SpawnRecord>, StoreError>;

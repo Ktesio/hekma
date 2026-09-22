@@ -186,7 +186,7 @@ See the [command reference](docs/commands.md) for arguments, flags, and the unif
 If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a native adapter crate), the **Conformance Test Kit** proves it honors the Adapter Contract — the same controls, metering honesty, and capability declarations every built-in adapter is held to. Add one dev-dependency and one `#[test]`:
 
 ```toml
-# Pin a full commit SHA: until the crates publish (story 7-4) a bare `git =`
+# Pin a full commit SHA: until the crates publish a bare `git =`
 # dependency floats on this repo's default-branch HEAD, and a breaking
 # report-shape change would break your build without you moving. Update the
 # pin deliberately.

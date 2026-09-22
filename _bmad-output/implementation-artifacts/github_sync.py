@@ -23,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EPICS = ROOT / "_bmad-output/planning-artifacts/epics.md"
 MAP_FILE = Path(__file__).resolve().parent / "github-sync-map.json"
-REPO = "Ktesio/ktesio"
+REPO = "Ktesio/hekma"  # org migration 2026-09: ktesio -> hekma (old issue numbers carried over)
 OWNER = "Ktesio"
 PROJECT_TITLE = "Ktesio"
 
@@ -121,7 +121,10 @@ def project_item_urls(number: str) -> set[str]:
 def main() -> int:
     epics, stories = parse_epics()
     print(f"parsed: {len(epics)} epics, {len(stories)} stories")
-    assert len(epics) == 8 and len(stories) == 37, "unexpected counts — aborting"
+    # The oracle is epics.md — these counts track it (epics 1-14, 63 stories as of
+    # the 2026-09-20 sync; epics 13/14 added via correct-course). If this fires,
+    # epics.md changed shape: review the diff before syncing the mirror.
+    assert len(epics) == 14 and len(stories) == 63, "unexpected counts — aborting"
 
     ensure_labels()
     project = ensure_project()

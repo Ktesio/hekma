@@ -96,23 +96,40 @@ impl std::fmt::Display for RunId {
 /// output_tokens, metering_source, occurred_at}` — plus the replay-dedup
 /// `sequence` ordinal (the agent-supplied, per-Run-monotonic key that makes
 /// "no double-count on replay" a DB invariant via `UNIQUE(instance_id, run_id,
-/// sequence)`). Token counts are `u64` (matching the SQLite `INTEGER` column,
-/// decoded via `.max(0) as u64`). TOKENS ONLY — no dollars, no label, no budget
-/// (AD-8; those are later Epic-3 stories).
+/// sequence)`) and — since story 14-6 — the cached-token subset. Token counts are
+/// `u64` (matching the SQLite `INTEGER` column, decoded via `.max(0) as u64`).
+/// TOKENS ONLY — no dollars, no label, no budget (AD-8; those are later Epic-3
+/// stories).
 ///
 /// `Serialize`/`Deserialize` (snake_case) so it rides the AD-14
 /// [`UsageUpdateEvent`] wire and can round-trip through `kt --json` / the 7-2
 /// Host event bus without a second dialect.
+///
+/// **The cached subset (story 14-6, D8):** `cached_tokens` is the cached SUBSET
+/// of `input_tokens` under the ledger's INPUT-INCLUSIVE invariant
+/// (`0 <= cached_tokens <= input_tokens` — see [`crate::metering::parse`]'s
+/// module docs). `Some(n)` = the cached count is KNOWN (every freshly-committed
+/// event; `Some(0)` is a valid known-zero); `None` = UNKNOWN — a pre-v7 ledger
+/// row (the additive v7 column is NULL there) or a legacy wire payload
+/// (`#[serde(default)]`, so old JSON still deserializes). The dedup UNIQUE key
+/// is UNCHANGED (the cached count is not part of it).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// The Agent Instance this measurement belongs to (its unique name).
     pub instance: String,
     /// The Run (spine AD-7) this measurement was reported during.
     pub run_id: RunId,
-    /// Input (prompt) tokens the agent reported for this event.
+    /// Input (prompt) tokens the agent reported for this event — INCLUSIVE of
+    /// the cached subset (`0 <= cached_tokens <= input_tokens`, the 14-6
+    /// invariant).
     pub input_tokens: u64,
     /// Output (completion) tokens the agent reported for this event.
     pub output_tokens: u64,
+    /// The cached subset of `input_tokens` (story 14-6). `None` = unknown
+    /// (a pre-v7 ledger row); a freshly-committed event is always `Some`
+    /// (known-zero allowed). NOT part of the dedup key.
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
     /// The Metering Source that produced this event, as its wire string
     /// (`self-reported` / `engine-observed`). Frozen as a string so the ledger
     /// row is self-describing without depending on the adapter-api enum.
@@ -129,7 +146,8 @@ pub struct UsageEvent {
 impl UsageEvent {
     /// The total tokens (input + output) this single event reports. Saturating so
     /// a pathological pair near `u64::MAX` cannot overflow (it is a rollup helper,
-    /// not a correctness-critical sum).
+    /// not a correctness-critical sum). The cached subset (story 14-6) is NOT
+    /// added again — it rides INSIDE `input` (the INPUT-INCLUSIVE invariant).
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -141,24 +159,42 @@ impl UsageEvent {
 /// TOKENS ONLY (AD-8): input + output token sums, no dollars/headroom. An absent
 /// instance (or a Run with no events) totals [`UsageTotals::zero`] — a truthful
 /// zero, distinct from the Epic-1 "metering does not exist" absence.
+///
+/// **The cached rollup (story 14-6):** `cached_tokens` is the summed cached
+/// SUBSET of the scope's input tokens (the INPUT-INCLUSIVE invariant — cached
+/// rides INSIDE `input`, it is never added to the total again).
+/// `Some(sum)` = every contributing row's cached count is known (a scope with
+/// no rows at all is a truthful `Some(0)`); `None` = the scope CONTAINS a row
+/// whose cached count is unknown (a pre-v7 row) — the honest absence token a
+/// surface renders as `—`, never a fabricated zero (AI-18).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageTotals {
-    /// Summed input (prompt) tokens over the scope.
+    /// Summed input (prompt) tokens over the scope (INCLUSIVE of the cached
+    /// subset — the 14-6 invariant).
     pub input_tokens: u64,
     /// Summed output (completion) tokens over the scope.
     pub output_tokens: u64,
+    /// The summed cached subset of the input (story 14-6). `None` = the scope
+    /// contains at least one row with an UNKNOWN cached count (a pre-v7 row);
+    /// `Some(0)` = known-zero (including an empty scope).
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 impl UsageTotals {
-    /// The all-zero total (no events in scope).
+    /// The all-zero total (no events in scope). The cached rollup is a truthful
+    /// `Some(0)` — no rows means nothing unknown about the (empty) scope.
     pub const fn zero() -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: Some(0),
         }
     }
 
     /// The combined input + output tokens (saturating — see [`UsageEvent::total_tokens`]).
+    /// The cached subset is NOT added again: it rides inside `input` (the 14-6
+    /// INPUT-INCLUSIVE invariant), so token budgets enforce on this same total.
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
@@ -227,6 +263,7 @@ mod tests {
             run_id: RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,
+            cached_tokens: Some(0),
             metering_source: "self-reported".to_string(),
             sequence: seq,
             occurred_at: "2026-07-06T00:00:00Z".to_string(),
@@ -261,17 +298,19 @@ mod tests {
 
     #[test]
     fn usage_event_is_tokens_only_and_round_trips_snake_case() {
-        // AC4: the AD-7 minimum shape + the dedup ordinal, snake_case on the wire,
-        // NO dollar/label/budget field.
+        // AC4: the AD-7 minimum shape + the dedup ordinal + the 14-6 additive
+        // cached-subset field, snake_case on the wire, NO dollar/label/budget
+        // field.
         let event = sample_event(3);
         let value: serde_json::Value = serde_json::to_value(&event).unwrap();
-        // Exactly the AD-7 fields + sequence are present.
+        // Exactly the AD-7 fields + sequence + the additive cached_tokens.
         let obj = value.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(
             keys,
             vec![
+                "cached_tokens",
                 "input_tokens",
                 "instance",
                 "metering_source",
@@ -280,7 +319,7 @@ mod tests {
                 "run_id",
                 "sequence",
             ],
-            "UsageEvent must be the AD-7 minimum shape + sequence, nothing more"
+            "UsageEvent must be the AD-7 shape + sequence + the 14-6 cached subset, nothing more"
         );
         // No dollar/label/budget leaked in.
         assert!(obj.get("cost").is_none());
@@ -309,13 +348,51 @@ mod tests {
         assert_eq!(z.input_tokens, 0);
         assert_eq!(z.output_tokens, 0);
         assert_eq!(z.total_tokens(), 0);
+        // 14-6: an empty scope's cached rollup is a truthful KNOWN zero (nothing
+        // unknown about an empty scope), never the unknown-absence None.
+        assert_eq!(z.cached_tokens, Some(0));
         let t = UsageTotals {
             input_tokens: 100,
             output_tokens: 250,
+            cached_tokens: Some(40),
         };
         assert_eq!(t.total_tokens(), 350);
-        // Default is zero.
-        assert_eq!(UsageTotals::default(), UsageTotals::zero());
+        // The cached subset does NOT re-enter the total (the inclusive invariant:
+        // it rides inside input) — 350, not 390.
+        assert_eq!(
+            t.total_tokens(),
+            350,
+            "cached rides inside input, never added again"
+        );
+        // Default is the unknown-cached absence (a DEGRADED read's honest shape —
+        // `unwrap_or_default` on a failed ledger read must not fabricate zeros).
+        assert_eq!(
+            UsageTotals::default(),
+            UsageTotals {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_event_cached_token_additive_wire_back_compat() {
+        // 14-6: an OLD wire payload (pre-14-6 JSON, no cached_tokens key)
+        // deserializes to the UNKNOWN absence (None) — backward-additive, the
+        // usage-update schema version does NOT bump (per USAGE_SCHEMA_VERSION's
+        // own additive-field rule).
+        let old = r#"{"instance":"demo","run_id":"run-1","input_tokens":10,
+            "output_tokens":20,"metering_source":"self-reported","sequence":1,
+            "occurred_at":"2026-07-06T00:00:00Z"}"#;
+        let back: UsageEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(back.cached_tokens, None, "old payload -> unknown cached");
+        assert_eq!(back.input_tokens, 10);
+        // And a fresh payload round-trips the known subset.
+        let fresh = sample_event(1);
+        let json = serde_json::to_string(&fresh).unwrap();
+        let back: UsageEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fresh);
     }
 
     #[test]

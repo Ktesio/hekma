@@ -61,9 +61,10 @@ The workflow verifies that `Cargo.toml` version matches the tag without the lead
 
 ## Publishing the Engine Crates
 
-Story 7-4 prepared everything needed to publish the embedding crates
+Everything needed to publish the embedding crates
 (`hekma-engine` + `hekma-adapter-api`, plus the engine's builtin-adapter
-dependency `hekma-adapters-hermes`) and executed none of it. **Every HOLD
+dependency `hekma-adapters-hermes`) was prepared up front, and none of the
+publish steps execute until authorized. **Every HOLD
 gate below opens only on Islam's explicit go** (the standing non-negotiable:
 no deployments, no releases, no tags, nothing that costs money). Until that
 go, all four internal crate manifests still carry `publish = false` (pinned
@@ -159,7 +160,7 @@ tar -tzf target/package/hekma-adapter-api-0.2.0.crate
 
 (Read the version off the manifest; extract the `.crate` — a plain
 `.tar.gz` — and review the file list and metadata: license file present, no
-stray files, version and description match.) Release-surface changes (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata) get the TWO-PASS review treatment — see "Two-pass review covers the release surface (AI-55)" in `AGENTS.md`. Then, one at a time, each
+stray files, version and description match.) Release-surface changes (version bumps, RELEASE_NOTES/changelog entries, crates.io metadata) get the TWO-PASS review treatment — a primary pass plus an independent adversarial pass; see the two-pass review rule in `AGENTS.md`. Then, one at a time, each
 **HOLD — requires Islam's explicit go**:
 
 1. `cargo +stable publish --locked -p hekma-adapter-api`
@@ -255,7 +256,7 @@ widen a gate or an allowlist to make a baseline pass.
   go. Context: the gate forced the version (the crates.io release-to-release
   loop armed on main after `4e12ef8` and correctly demanded a bump for
   `EngineError::ResumeUnsupported`; the source bump landed as `d087ed0` with
-  the AI-55 two-pass record). Steps executed: package + tarball review
+  the two-pass record). Steps executed: package + tarball review
   (two-pass), `cargo +stable publish --locked -p ktesio-engine`, the
   from-crates.io host probe, and the step-5 docs flip. adapter-api and
   adapters-hermes stay at 0.1.0 (surfaces unchanged, semver-checked).
@@ -265,14 +266,15 @@ widen a gate or an allowlist to make a baseline pass.
   tarball review, `cargo +stable publish --locked -p ktesio-engine`, the
   from-crates.io host probe, the docs flip); the tag (step 6) is NOT opened.
   Context: the gate forced the version (the crates.io loop's second firing —
-  epic-12's DetachRefused / SpawnRecord.detach / ProcessBackend::adopt
-  against the published 0.2.0; the source bump landed as `394e660`).
+  the detached-start surface (`DetachRefused` / `SpawnRecord.detach` /
+  `ProcessBackend::adopt`) against the published 0.2.0; the source bump
+  landed as `394e660`).
 
 - **Publish go (v0.8.0 Hekma rename, full cutover):** GRANTED 2026-09-16 —
-  Islam's explicit go in the ktesio.dev working session ("187 merged, let's
-  go", then "Merged" for the name-correction PR #188 after #187 was found
-  to have merged the mistyped "Hemaka" tree; the correction landed as
-  54dc79c). Executed same day by the orchestrator:
+  Islam's explicit go in the ktesio.dev working session ("merged, let's
+  go", then "Merged" for the name correction after the first rename merge
+  was found to have merged the mistyped "Hemaka" tree; the correction
+  landed as 54dc79c). Executed same day by the orchestrator:
   - `hekma-adapter-api` 0.2.0, `hekma-adapters-hermes` 0.2.0,
     `hekma-engine` 0.4.0 published (each: tarball review, `cargo +stable
     publish --locked`, registry verify) + the from-crates.io host probe
@@ -300,7 +302,7 @@ widen a gate or an allowlist to make a baseline pass.
   the line until fresh `--baseline-rev` pins land on this change's
   main-side merge SHA (post-merge follow-up, mirrored in
   scripts/test_automation.py). Two-pass review of the release surface
-  completes before the tag (AI-55).
+  completes before the tag.
 - **Semver-baseline retire-or-keep — DECIDED: KEEP (2026-09-15, at the
   second published release as scheduled).** The in-repo freeze baselines
   (adapter-api @ 4119db3, engine @ bee7d48) stay as fast pre-publish guards:
