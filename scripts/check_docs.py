@@ -17,6 +17,13 @@ DOC_PATHS = [
     *ROOT.glob("docs/*.md"),
     *ROOT.glob("docs/design/*.md"),
 ]
+# docs/proposals/ is deliberately NOT gated (and therefore not scrubbed): it
+# holds point-in-time ratified ops records (the v0.8.0 ktesio→hekma migration
+# spec), is NOT in the fumadocs page tree (docs/source.config.ts lists pages
+# explicitly, proposals absent), and is referenced by public pages only as a
+# bare path. Resolves the 2026-09-20 scrub's "flagged for follow-up" as a
+# written decision instead of silence — add a file there only with this in
+# mind (2026-09-22 hardening batch).
 STALE_PATTERNS = [
     "github.com/imagdy/skills",
     "../specs/002-project-docs/quickstart.md",

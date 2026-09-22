@@ -1345,6 +1345,36 @@ source = "self-reported"
     }
 
     #[test]
+    fn resolve_start_launch_of_a_hermes_manifest_without_start_yields_no_start_template() {
+        // The 6-2 blind-19 complement (deferred, pinned by the 2026-09-22
+        // hardening batch): a manifest declaring kind hermes WITHOUT a
+        // [lifecycle.start] table yields NoStartTemplate — the code-declared
+        // builtin gateway launch is NOT a fallback for a manifest re-read
+        // that lacks its own start op. The manifest-present path never
+        // consults the builtin table; only the legacy no-manifest fallback
+        // does, and that path renegotiates the contract first (story 13-2).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "hermes"
+[lifecycle.stop]
+exec = "stopper"
+[capabilities.pause]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_start_launch("gw", Some(&path)).unwrap_err();
+        assert!(
+            matches!(err, LaunchResolveError::NoStartTemplate { .. }),
+            "a hermes manifest without [lifecycle.start] must not fall back to the \
+             builtin gateway launch, got {err}"
+        );
+    }
+
+    #[test]
     fn resolve_start_launch_renegotiates_a_drifted_contract_major() {
         // Retro #161 (finding B1): the launch-less/legacy start fallback
         // re-reads adapter.toml. A manifest EDITED to a foreign major after
