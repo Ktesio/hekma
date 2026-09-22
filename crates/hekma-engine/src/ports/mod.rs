@@ -89,6 +89,23 @@ pub enum StoreError {
         supported: i64,
     },
 
+    /// A memory-backing re-attach tried to CHANGE the kind on a row that
+    /// already holds one. Port-level A-6 (2026-09-22 hardening): the
+    /// registry's same-kind idempotence is the only sanctioned re-attach,
+    /// and the store now enforces it below the registry, so a caller that
+    /// bypasses the registry cannot silently replace the attachment's kind.
+    #[error(
+        "memory backing for '{name}' is already attached as '{attached}'; refusing the kind change to '{requested}' (detach first)"
+    )]
+    MemoryBackingKindConflict {
+        /// The instance name the row belongs to.
+        name: String,
+        /// The kind already stored on the row.
+        attached: String,
+        /// The kind the caller attempted to write.
+        requested: String,
+    },
+
     /// Any other backend failure (open, migrate, I/O, SQL execution).
     #[error("state store backend error: {0}")]
     Backend(String),

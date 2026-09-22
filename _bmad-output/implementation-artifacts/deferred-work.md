@@ -35,6 +35,11 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: SQLite migration steps are not crash-atomic — each SCHEMA_Vn batch runs before its `PRAGMA user_version` stamp, so a crash between them re-runs the batch on reopen and dies on "table already exists".
   evidence: Pre-existing pattern for V1→V4 (this story only followed it for V5); never observed in the wild because the batch+stamp window is milliseconds and desktop state DBs are small. Proper fix = wrap each step in BEGIN IMMEDIATE…COMMIT across ALL versions, one focused migration-hardening change.
+  resolved: story 11-3 (B3, PR #181 / bee7d48) 2026-09-11 — `migrate_step` runs each
+  version's DDL and its user_version stamp inside ONE BEGIN IMMEDIATE transaction,
+  with the legacy-freeze fail-loud contract pinned (`migration_legacy_freeze_in_the_alter_window_fails_loud`)
+  (marker appended by the 2026-09-22 hardening batch; the fix shipped before the
+  convention caught up).
 
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Semantic split between store and registry — `StateStore::upsert_memory_backing` documents REPLACE-on-re-attach (kind + timestamp overwritten) while `Registry::attach_memory` promises idempotent re-attach keeps the original timestamp and never changes kind; any future caller bypassing the registry guard can violate the A-6 invariant through sanctioned store behavior.
@@ -146,9 +151,18 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: A detached child that exits long after its handle dropped is reaped only once at drop — a long-lived embedding host can accumulate zombie entries until the host exits (kt CLI processes exit immediately, so CLI usage is unaffected).
   evidence: epic-12 step-04 edge-case-hunter (round 1, 2026-09-15) — a lazy-reaper arm in the backend (poll detached children this process spawned) is a small design task for an embedding-focused story.
+  resolved: 2026-09-22 hardening batch — the detached arm of `UnixProcess::drop`
+  hands a still-alive child to `spawn_detached_reaper` (a blocking wait thread,
+  AD-12 thread precedent; zero shared state), pinned by
+  `a_detached_handle_dropped_while_the_child_is_alive_reaps_the_later_exit`
+  (ECHILD observable).
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: In-memory park loss at engine death (observed pending buffer + self-reported parked tail die with the process) is acknowledged only in a code comment — the AI-18 comment-only-caveat shape; the crash window skips un-drained usage silently at adoption (cursor re-drifts to log end).
   evidence: epic-12 step-04 blind-hunter (round 1, 2026-09-15) — pre-existing crash-window family from Epic 3; an adoption-time diagnostic naming the possible un-flushed usage window would make it surfaced-not-silent.
+  resolved: 2026-09-22 hardening batch — the successful-adoption path emits the
+  park-loss note through the DiagnosticSink choke point
+  (`domain/supervisor/reaper.rs` adopt_orphans), pinned by
+  `adopt_orphans_surfaces_the_park_loss_window_on_a_successful_adoption`.
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md` (story 12-1, triaged 2026-09-15 from the windows-latest CI hang)
   summary: On Windows, a DETACHED agent ends up holding its spawning `kt` command's stdio pipe write-ends — any script that CAPTURES `kt agent start --detach` output (pipes) blocks until the agent exits; interactive terminals are unaffected (no pipes).
   evidence: the CLI detach test's forensic harness (agent_cli.rs `run_kt_agent_bounded`, 56ee766) proved kt EXITS (~1s, try_wait Ok(Some)) while its stdout/stderr pipes never EOF; std's spawn is documented to restrict inheritance to the child's own three stdio handles (attribute list), so the leak mechanism is unexpected — investigate (suspects: the Stdio::from(file) inheritable-dup path interacting with the job assignment, or a std behavior change) before fixing (candidates: explicit handle pinning at the Windows detached spawn, or DETACHED_PROCESS when the capture files already carry the output).

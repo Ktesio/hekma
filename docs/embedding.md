@@ -18,7 +18,7 @@ Depend on the released version:
 
 ```toml
 [dependencies]
-hekma-engine = "0.5"
+hekma-engine = "0.6"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -53,7 +53,7 @@ in-repo forms compile against the same facade — see the [changelog](
 `EngineError::DetachRefused`, `SpawnRecord.detach`, and the
 `ProcessBackend::adopt` signature — exhaustive `match`es over
 `EngineError` need each new arm). The ACP backend (the `acp` builtin kind,
-shipping as 0.5.0) grows the surface additively the same way: `EngineError::AcpTurnInFlight`
+shipping as 0.6.0) grows the surface additively the same way: `EngineError::AcpTurnInFlight`
 is a new exhaustive-match arm (exit-code row 4 — a second prompt while an
 `acp` turn is in flight), `SpawnSpec` gains the `pipe_stdout` field (the ACP
 transport owns the child's stdout; exhaustive struct literals need it), and

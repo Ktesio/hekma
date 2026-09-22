@@ -729,6 +729,28 @@ fn verified_spawn_start_time(pid: u32, exec: &str) -> Result<u64, BackendError> 
 const START_TIME_READ_ATTEMPTS: usize = 3;
 const START_TIME_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// Hand a still-alive DETACHED child to a blocking reaper thread (2026-09-22
+/// hardening — the deferred detached-child zombie-reaping task). The disarmed
+/// drop deliberately leaves the agent running, but the child REMAINS this
+/// process's child until it exits, and the drop's inline `try_wait` only
+/// covers a child that exits BEFORE the drop. The thread blocks in `wait` and
+/// reaps whenever the exit arrives, so its lifetime is exactly the child's
+/// remaining lifetime — the AD-12 dedicated-thread precedent (the output
+/// tailer, the ACP reader), with no shared state and no global registry.
+///
+/// If the thread cannot spawn, the behavior degrades to the pre-fix shape
+/// (the zombie is reaped at process exit). There is no diagnostic sink
+/// reachable from a `Drop` on the backend, so the failure is documented here
+/// rather than surfaced — the spawn path would already have failed loudly on
+/// the resource exhaustion that could cause it.
+fn spawn_detached_reaper(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("hekma-detached-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 impl Drop for UnixProcess {
     /// Kill the process group on drop so a dropped handle never leaks the agent
     /// (or any child it spawned). This is what keeps `kt agent start` — which
@@ -771,8 +793,25 @@ impl Drop for UnixProcess {
         }
         // Story 12-1: the detached disarm — no group kill on drop. Reap only.
         if self.detached {
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.try_wait();
+            // Already exited by drop time: reap inline (short-lived detached
+            // start never leaves a zombie in its spawning process).
+            let already_exited = self
+                .child
+                .as_mut()
+                .map(|child| matches!(child.try_wait(), Ok(Some(_))))
+                .unwrap_or(false);
+            if already_exited {
+                return;
+            }
+            // Still alive (2026-09-22 hardening, the deferred
+            // zombie-reaping task): hand the child to a blocking reaper
+            // thread so the exit is reaped whenever it comes — a
+            // long-lived embedding host that drops a detached handle and
+            // keeps running otherwise accumulates one zombie per exited
+            // detached child (the kt CLI is unaffected either way: the
+            // spawning process exits and init reaps).
+            if let Some(child) = self.child.take() {
+                spawn_detached_reaper(child);
             }
             return;
         }
@@ -1238,6 +1277,45 @@ mod tests {
             "stop on the adopted detached handle must terminate the agent \
              (ps stat = '{stat}')"
         );
+    }
+
+    #[test]
+    fn a_detached_handle_dropped_while_the_child_is_alive_reaps_the_later_exit() {
+        // 2026-09-22 hardening (the deferred detached-child zombie-reaping
+        // task): the disarmed drop of a handle whose child is STILL ALIVE
+        // hands the child to a blocking reaper thread — a long-lived
+        // embedding host that drops a detached handle and keeps running must
+        // not accumulate one zombie per exited detached child. The
+        // observable: after the child self-exits, a waitpid(WNOHANG) from
+        // THIS process (the child's parent) reports ECHILD — reaped — where
+        // the pre-fix behavior left a zombie answering waitpid successfully
+        // forever. (The drop's inline try_wait cannot cover this case: the
+        // child exits AFTER the drop.)
+        let backend = UnixBackend::new();
+        let mut detached_spec = spec("sleep", &["1"]);
+        detached_spec.pipe_stdin = false;
+        detached_spec.detach = true;
+        let proc = backend.spawn(&detached_spec).expect("spawn detached sleep");
+        let pid = nix::unistd::Pid::from_raw(proc.pid as i32);
+        drop(proc); // disarmed; the child is alive → the reaper thread owns the exit
+        use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Err(nix::errno::Errno::ECHILD) => break, // reaped — the fix's effect
+                Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
+                    // Exited, not yet reaped by the reaper thread — brief wait.
+                }
+                Ok(_) => { /* still alive */ }
+                Err(e) => panic!("unexpected waitpid error: {e}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached child was neither reaped by the reaper thread nor \
+                 exited in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     #[test]

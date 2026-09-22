@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "hekma-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "directories",

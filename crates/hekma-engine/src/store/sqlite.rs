@@ -1189,6 +1189,32 @@ impl StateStore for SqliteStore {
             .ok_or_else(|| StoreError::NotFound {
                 name: backing.name.as_str().to_string(),
             })?;
+        // Port-level A-6 (2026-09-22 hardening, below the registry): a
+        // kind-CHANGE on an existing row is REJECTED with a typed error — the
+        // registry's same-kind idempotent re-attach is the only sanctioned
+        // re-attach, so a caller bypassing the registry cannot silently
+        // replace the attachment's kind through this store. A same-kind
+        // upsert keeps the store's documented REPLACE-on-re-attach shape (the
+        // registry passes the ORIGINAL timestamp, so idempotence holds end to
+        // end; see Registry::attach_memory).
+        let existing_kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM agent_memory_backing WHERE instance_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(attached) = existing_kind {
+            if attached != backing.kind.as_str() {
+                return Err(StoreError::MemoryBackingKindConflict {
+                    name: backing.name.as_str().to_string(),
+                    attached,
+                    requested: backing.kind.as_str().to_string(),
+                });
+            }
+        }
         // Insert-or-replace on the UNIQUE instance_id, in one statement (AD-6:
         // one transaction per mutation). Exactly ONE backing per instance.
         self.conn
@@ -3201,8 +3227,10 @@ mod tests {
     }
 
     #[test]
-    fn upsert_memory_backing_replaces_the_row_on_re_attach() {
-        // UNIQUE(instance_id): a re-attach REPLACES kind + timestamp (exactly one row).
+    fn upsert_memory_backing_replaces_the_row_on_same_kind_re_attach() {
+        // UNIQUE(instance_id): a SAME-KIND re-attach REPLACES the timestamp
+        // (exactly one row; the registry passes the ORIGINAL timestamp so
+        // idempotence holds end to end — Registry::attach_memory).
         let store = SqliteStore::open_in_memory().unwrap();
         store
             .create_instance(&sample("demo", "mock", "/x/agents/demo"))
@@ -3217,13 +3245,56 @@ mod tests {
         store
             .upsert_memory_backing(&backing(
                 "demo",
-                MemoryBackingKind::Native,
+                MemoryBackingKind::Filesystem,
                 "2026-08-01T00:00:00Z",
             ))
             .unwrap();
         let got = store.get_memory_backing(&name("demo")).unwrap().unwrap();
-        assert_eq!(got.kind, MemoryBackingKind::Native);
+        assert_eq!(got.kind, MemoryBackingKind::Filesystem);
         assert_eq!(got.attached_at, "2026-08-01T00:00:00Z");
+    }
+
+    #[test]
+    fn upsert_memory_backing_rejects_a_kind_change_and_keeps_the_row() {
+        // Port-level A-6 (2026-09-22 hardening, below the registry): a
+        // kind-CHANGE on an existing row is a typed error — a caller
+        // bypassing the registry cannot silently replace the attachment's
+        // kind — and the row survives the refusal untouched (kind AND
+        // timestamp).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_memory_backing(&backing(
+                "demo",
+                MemoryBackingKind::Filesystem,
+                "2026-07-30T00:00:00Z",
+            ))
+            .unwrap();
+        let err = store
+            .upsert_memory_backing(&backing(
+                "demo",
+                MemoryBackingKind::Native,
+                "2026-08-01T00:00:00Z",
+            ))
+            .unwrap_err();
+        // The row survives the refusal untouched (kind AND timestamp) —
+        // checked before the destructure shadows the `name` helper.
+        let got = store.get_memory_backing(&name("demo")).unwrap().unwrap();
+        assert_eq!(got.kind, MemoryBackingKind::Filesystem);
+        assert_eq!(got.attached_at, "2026-07-30T00:00:00Z");
+        let StoreError::MemoryBackingKindConflict {
+            name,
+            attached,
+            requested,
+        } = err
+        else {
+            panic!("expected MemoryBackingKindConflict, got {err:?}");
+        };
+        assert_eq!(name, "demo");
+        assert_eq!(attached, MemoryBackingKind::Filesystem.as_str());
+        assert_eq!(requested, MemoryBackingKind::Native.as_str());
     }
 
     #[test]
