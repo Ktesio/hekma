@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "09-22-2026 19:26"
+last_updated: "09-22-2026 21:51"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -224,7 +224,7 @@ action_items:
   - id: AI-7
     epic: 1
     owner: "story 1-6"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs resume(): resume fail-fasts when the effective
       pause level reads Unsupported, which could strand a `paused` instance with no
@@ -236,7 +236,7 @@ action_items:
   - id: AI-8
     epic: 1
     owner: "story 1-6"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs signal_backend()/pause(): a guaranteed pause
       when this engine holds no in-memory handle returns Ok and records the plain
@@ -249,7 +249,7 @@ action_items:
   - id: AI-9
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs pause() (guaranteed path): signals SIGSTOP
       THEN persists state=paused — opposite to stop()'s persist-first order. A set_state
@@ -291,7 +291,7 @@ action_items:
   - id: AI-12
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs poll_once: a persistent backend.poll error
       is swallowed as `Err(_) => None` (treat as alive), so a permanently un-pollable
@@ -300,7 +300,7 @@ action_items:
   - id: AI-13
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs (~609-612): an ADOPTED process that exits
       non-zero reports Exited{code:None} (a non-child's exit code is unrecoverable),
@@ -310,7 +310,7 @@ action_items:
   - id: AI-14
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine backends/{unix,windows}: a fingerprint-read failure at
       spawn writes start_time=0 as a sentinel; if such a process is later still alive,
@@ -322,7 +322,7 @@ action_items:
   - id: AI-15
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt cli/agent.rs `show --json`: builds the single entry via facade.fleet().find(name)
       — an O(N) full-fleet scan for one instance, and it inherits fleet()'s SILENT
@@ -333,7 +333,7 @@ action_items:
   - id: AI-16
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine engine.rs fleet_entry_for re-reads the spawn record per
       instance while Engine::fleet already holds the registry lock (an N+1 read shape).
@@ -353,7 +353,7 @@ action_items:
   - id: AI-18
     epic: 1
     owner: "tech-writer / project-context"
-    status: open
+    status: done
     severity: low
     action: "Document the 'honest state / surfaced-not-silent' pattern as a project
       principle + code-review checklist item, with the three Epic-1 exemplars (1-5
@@ -399,7 +399,7 @@ action_items:
   - id: AI-21
     epic: 1
     owner: "orchestrator playbook"
-    status: open
+    status: done
     severity: low
     action: "Codify the away-mode / interruption recovery drill used this epic: on
       a subagent cut-off (session limit) or API stall, VERIFY true state from disk
@@ -410,7 +410,7 @@ action_items:
   - id: AI-22
     epic: 1
     owner: "tech-writer"
-    status: open
+    status: done
     severity: low
     action: "AI-17 deferred: contributor docs (CONTRIBUTING.md, AGENTS.md, PR template,
       etc.) still say bare `cargo` and don't note the local-MSRV-pin vs CI-stable
@@ -429,7 +429,7 @@ action_items:
   - id: AI-24
     epic: 2
     owner: "a config/IO-touching story"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine registry.rs set_config (~635): the accepted-write path
       uses a non-atomic std::fs::write (no temp-file + rename), so a crash mid-write
@@ -440,7 +440,7 @@ action_items:
   - id: AI-25
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt cli/agent.rs `config get <name> <intermediate.table.path>`: reports
       'no effective value' for a table-prefix path even though child leaves exist
@@ -449,7 +449,7 @@ action_items:
   - id: AI-26
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt main.rs `config set`: a value beginning with '-' is rejected by clap
       (parsed as a flag) and fails loudly. If verbatim-parity for arbitrary values
@@ -459,7 +459,7 @@ action_items:
   - id: AI-27
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine adapter/mod.rs config-mapping application: a config/pass-through
       Env target (agent.<TAIL> or a known-key Env target) silently SHADOWS a same-named
@@ -472,7 +472,7 @@ action_items:
   - id: AI-28
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine config-file render (File target) + set_config both use
       non-atomic std::fs::write; a crash mid-write truncates the native config, and
@@ -499,7 +499,7 @@ action_items:
   - id: AI-30
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "story 2-3 review nits (cosmetic): (a) kt cli/agent.rs config_json docstring
       (~716) names value_display/source_label accessors it doesn't call (uses display()/source.as_str())
@@ -542,7 +542,7 @@ action_items:
   - id: AI-33
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "2-4 adversarial audit MEDIUM (doc part fixed IN 2-4; behavior-change
       deferred): a secret:NAME mapped to a `flag` ConfigTarget is delivered as cleartext
@@ -557,7 +557,7 @@ action_items:
   - id: AI-34
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "Pre-existing (NOT introduced by 2-4): RUSTDOCFLAGS=\"-D warnings\" cargo
       doc --document-private-items fails on kt/src/main.rs:324 — the ^[a-z0-9][a-z0-9_-]*$
@@ -621,7 +621,7 @@ action_items:
   - id: AI-39
     epic: 2
     owner:
-    status: open
+    status: done
     severity: medium
     action: "Promote the AI-33 argv/secret boundary from DOCUMENTED to ENFORCED-at-runtime:
       warn (or refuse + steer to env/file) when a secret: value resolves into a Flag
@@ -630,7 +630,7 @@ action_items:
   - id: AI-40
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "Bundle sliding doc debt into ONE tech-writer story: the three open Epic-1
       doc items (AI-18/19/21) + two Epic-2 recipes (the git rebase --onto <squash>
@@ -640,7 +640,7 @@ action_items:
   - id: AI-41
     epic: 3
     owner:
-    status: open
+    status: done
     severity: medium
     action: "3-1 ledger M3: a transient store error on the usage INSERT (SQLITE_BUSY
       under WAL contention, disk full) silently drops the event — Supervisor::drain_usage_for
@@ -668,7 +668,7 @@ action_items:
   - id: AI-43
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-1 AC-C literal wording (primary review Low-3): the active Metering
       Source is surfaced in `kt agent show` (human + --json) and `list --json`, but
@@ -680,7 +680,7 @@ action_items:
   - id: AI-44
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-2 budget enforcement crash-gap: enforcement runs only on a fresh Inserted
       usage event, and adopt_orphans (engine.rs) re-holds handles WITHOUT re-evaluating
@@ -694,7 +694,7 @@ action_items:
   - id: AI-45
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-3 FR-23 consistency: the Fleet `list` Usage column's inline DERIVED-COST
       dollar (usage_cell) has the same truncatable-label shape as the Budget cell
@@ -737,7 +737,7 @@ action_items:
   - id: AI-48
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-4 latent tracing exposure: hyper-util (client-legacy) links `tracing`;
       SAFE today (no tracing-subscriber in the tree → events are no-ops; hyper's own
@@ -1330,7 +1330,7 @@ action_items:
       seam in agent_cli.rs. The story 5-1 deferral whose forcing function (epic 6)
       has passed. [epic-6 retro C2, med]"
     owner: "first test-heavy story"
-    status: open
+    status: in-progress
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-6-docs-hygiene-batch"
     epic: 6
@@ -1341,7 +1341,7 @@ action_items:
       + hermes troubleshooting entry, testing.md TCK editorial pass. [epic-6 retro
       D1-D7, low]"
     owner: "first docs-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-7-memory-json-partial-state"
     epic: 6
@@ -1359,7 +1359,7 @@ action_items:
       but still listed open); one architecture.md sentence on the engine-to-adapters-hermes
       normal edge. [epic-6 retro C1/C6/C7, low]"
     owner: "orchestrator chore"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-9-carry-forward-bind-or-retire"
     epic: 6
@@ -1402,7 +1402,7 @@ action_items:
       missing — CLI-level both directions proven. Also correct the deferred-work 5-2
       entry direction note. [epic-5 retro A5, low]"
     owner: "next engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-5-ad18-lock-model-ratification"
     epic: 5
@@ -1533,7 +1533,7 @@ action_items:
       change log or correct its loop-2 wording (R4). Owner: next docs-touching change,
       coordinated with the routed Windows story. [epic-12 retro action 4, MED]"
     owner: "next docs-touching change"
-    status: open
+    status: in-progress
     ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
   - id: "epic-12-retro-item-99-c6ecadb-seam-test-or-documented-accept-e"
     epic: 12
@@ -1542,7 +1542,7 @@ action_items:
       reconciliation) or record the accept, next time the Windows backend is touched.
       [epic-12 retro action 5, LOW]"
     owner: "next Windows-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
   - id: "epic-10-retro-item-100-deferred-work-md-resolved-marker-hygiene"
     epic: 10
@@ -1550,15 +1550,7 @@ action_items:
       marker (story 10-2, PR #180 / b590dc8, 2026-09-10) to the 7-3 host-provided-diagnostic-sink
       entry and sweep for other shipped-but-unmarked entries so still-open stays greppable."
     owner: "agent"
-    status: open
-    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-09-22.md"
-  - id: "epic-10-retro-item-101-deferred-work-md-resolved-marker-hygiene"
-    epic: 10
-    action: "deferred-work.md resolved:-marker hygiene: append the missing resolved
-      marker (story 10-2, PR #180 / b590dc8, 2026-09-10) to the 7-3 host-provided-diagnostic-sink
-      entry and sweep for other shipped-but-unmarked entries so still-open stays greppable."
-    owner: "agent"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-09-22.md"
   - id: "epic-14-retro-item-102-run-bmad-retrospective-at-epic-close-add"
     epic: 14
@@ -1568,7 +1560,7 @@ action_items:
       catch-up batch; epic-13 retro was missing entirely, breaking epic-14 follow-through
       chain."
     owner: "Islam ratify / agent apply"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-14-retro-2026-09-22.md"
   - id: "epic-14-retro-item-103-action-item-ledger-drift-run-the-propose"
     epic: 14
@@ -1580,5 +1572,5 @@ action_items:
       proposed done; epic-6-retro-item-5 proposed in-progress; genuinely-open items
       verified and stay."
     owner: "Islam confirm / agent execute"
-    status: open
+    status: done
     ref: "_bmad-output/implementation-artifacts/epic-14-retro-2026-09-22.md"
