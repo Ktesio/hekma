@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Idempotent GitHub sync for the Ktesio BMAD pivot plan.
+"""RETIRED 2026-09-20 — do not run. Idempotent GitHub sync for the Ktesio BMAD pivot plan.
+
+GitHub Issues are no longer the project mirror: Fibery is (Ktesio workspace,
+Product Development space, the "Hekma" Product — epics as Features, stories as
+Tasks, per AGENTS.md "Project mirror: Fibery"). This script is kept only as the
+historical record of what used to be mirrored; it refuses to run.
 
 Parses _bmad-output/planning-artifacts/epics.md (source of truth), then:
   1. ensures the BMAD label set exists
@@ -19,6 +24,15 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+# Retirement guard (2026-09-20, Islam's directive). Re-enabling requires a new
+# explicit directive and removing this block AND the AGENTS.md mirror section.
+sys.stderr.write(
+    "github_sync.py is RETIRED (2026-09-20): GitHub issues are no longer the\n"
+    "project mirror — Fibery is (Product Development / Hekma). See AGENTS.md\n"
+    '"Project mirror: Fibery". Exiting without changes.\n'
+)
+sys.exit(1)
 
 ROOT = Path(__file__).resolve().parents[2]
 EPICS = ROOT / "_bmad-output/planning-artifacts/epics.md"
