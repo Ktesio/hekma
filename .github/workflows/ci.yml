@@ -474,12 +474,19 @@ jobs:
           # detection) grandfathered until epic 8 relocates/deprecates them
           # (AC-4 amendment, ratified 2026-07-02; paths updated for the
           # v0.8.0 crates/kt -> crates/hekma move), plus engine integration
-          # TESTS: the symlink-containment test (memory.rs:605, story 5-1) is
-          # the one honestly unix-gated suite there under the AI-35 disclosure
-          # convention ("the test does not exist on Windows" rather than
-          # passing vacuously) — adoption/interaction suites deliberately use
-          # NO cfg (data-driven OS ids); no production code may use cfg.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/'
+          # TEST files enumerated ONE BY ONE (2026-09-22 hardening: the old
+          # directory-wide tests/ allowlist let any future test file add
+          # OS-cfg silently; the teeth are per-file now) — each with its
+          # justification:
+          #   * atomic_config_writes.rs — 11-2's atomic-write tests inject
+          #     failure via unix-only syscalls; the suite is #[cfg(unix)].
+          #   * memory.rs — the symlink-containment test (story 5-1) is the
+          #     honestly unix-gated suite under the AI-35 disclosure
+          #     convention ("the test does not exist on Windows" rather than
+          #     passing vacuously).
+          # adoption/interaction suites deliberately use NO cfg (data-driven
+          # OS ids); no production code may use cfg outside backends/.
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -497,10 +504,10 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/ and crates/hekma-engine/tests/ (legacy kt self-update files are grandfathered until epic 8)."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, and the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs). A new cfg use in any other test file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
             exit 1
           fi
-          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
+          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites."
       - name: Enforce single currency-formatting module (story 3-3, AD-8)
         shell: bash
         run: |

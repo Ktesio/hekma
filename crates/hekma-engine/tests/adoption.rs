@@ -1171,7 +1171,7 @@ fn ai13_adopted_process_exit_records_the_unavailable_exit_code_cause() {
     // exit code via GetExitCodeProcess, so a Windows adopted exit carries its
     // true code in the cause and the "code unavailable" arm there means a
     // genuinely unreadable code. That read cannot run on this Unix host, so
-    // the Windows half is proven by the cfg(windows)-hosted backend tests
+    // the Windows half is proven by the Windows-hosted backend tests
     // (spawn seam + gone-pid read) plus the cross-compile check; this Unix
     // test pins the Unix-shaped cause text.
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
