@@ -12,6 +12,18 @@ the artifacts are the project's sprint record, and clones need the tooling).
 Treat them as real, versioned project files — keep them current in the same
 changes that make them stale.
 
+## Project mirror: Fibery
+
+The project's tracking mirror is **Fibery** (Ktesio workspace → Product
+Development → the **Hekma** Product): epics are Features, stories are Tasks,
+and open deferred work lives under the "Hardening & Housekeeping Backlog"
+feature. Names keep the BMAD numbering (`Epic N`, `Story N.M`). The
+GitHub-issue mirror (`_bmad-output/implementation-artifacts/github_sync.py`)
+was retired 2026-09-20 and the script refuses to run. From now on, every
+epic, story, retrospective, and deferred item is mirrored to Fibery in the
+same change that lands it in the repo. The BMAD artifacts remain the oracle
+(`sprint-status.yaml`, `epics.md`, `deferred-work.md`); Fibery reflects them.
+
 When working here:
 
 - Prefer the public docs in `README.md` and `docs/` for current, shipping
