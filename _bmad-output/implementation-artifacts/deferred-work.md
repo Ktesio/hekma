@@ -14,8 +14,17 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 ## From AI-17 (pin workspace toolchain to 1.96.1) — review, 2026-07-06
 
 - **Contributor docs still tell contributors to run bare `cargo` (fmt/clippy/test).** With the new `rust-toolchain.toml`, bare `cargo` resolves to the MSRV (1.96.1) locally for contributors without a `RUSTUP_TOOLCHAIN` override, while CI's fmt/clippy/test jobs now gate on latest `stable` (explicit `+stable`). This local-vs-CI toolchain skew is intentional but is not documented in the other contributor-facing files. Consider a one-line note (or a `+stable` reproduction hint) in: `CONTRIBUTING.md` (~L89-91), `docs/contributing.md` (~L15-24), `AGENTS.md` (~L14-16), `.github/pull_request_template.md` (~L7-9), `docs/github-repository-audit-checklist.md` (~L167-169), `.agents/skills/kt-release/SKILL.md` (~L58), and `scripts/prepare_kt_release.py` (~L244-246). `docs/testing.md` already documents the split; the rest do not. Low severity (surfaces as an occasional new-stable clippy/rustfmt CI nit, not a shipped bug).
+  resolved: 2026-09-22 hardening batch (after docs/contributing.md + the PR template
+  landed the note earlier) — CONTRIBUTING.md, the repository-audit checklist, and
+  .agents/skills/kt-release/SKILL.md now carry the MSRV-vs-+stable note; the
+  named scripts/prepare_kt_release.py path no longer exists (the script lives in
+  the skill, whose reference was fixed to the full path).
 
 - **Coverage CI job rebuilds `cargo-tarpaulin` on every fresh runner (no binary cache).** Pre-existing (predates AI-17): the `coverage` job in `.github/workflows/ci.yml` runs an unguarded `cargo install cargo-tarpaulin` with no `~/.cargo/bin` cache, so it recompiles tarpaulin (~several minutes) every run. The `semver` job already added a `${{ runner.os }}-cargo-semver-checks-bin` cache + `command -v` guard (AI-1); the coverage job could adopt the same pattern for symmetry and CI speed.
+  resolved: the AI-23 coverage-cache work — the coverage job now has a dedicated
+  `cargo-tarpaulin-bin` cache step (restore-keys seeded) plus the `command -v`
+  guarded `cargo +stable install` (marker appended by the 2026-09-22 hardening
+  batch; the fix shipped before the convention caught up).
 
 ## From Story 5-1 (managed filesystem Memory Backing) — three-layer review, 2026-08-23
 

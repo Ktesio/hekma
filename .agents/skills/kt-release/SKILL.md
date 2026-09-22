@@ -49,13 +49,16 @@ python3 .agents/skills/kt-release/scripts/prepare_kt_release.py --confirm-major
 
 ## Helper Script
 
-Use `scripts/prepare_kt_release.py` as the source of truth for the release sequence. It performs these steps:
+Use `.agents/skills/kt-release/scripts/prepare_kt_release.py` as the source of truth for the release sequence. It performs these steps:
 
 - Validate repository identity and clean release state.
 - Fetch `origin main` and tags.
 - Infer the release kind and target version.
 - Update the root `Cargo.toml` (`[workspace.package]` version, inherited by the `hekma` package in `crates/hekma/`) and `Cargo.lock`.
 - Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace --all-targets`.
+  (a bare `cargo` runs the repo's MSRV pin — `rust-toolchain.toml` → 1.96.1 —
+  while CI's latest-stable jobs run `cargo +stable`; see docs/testing.md,
+  "Toolchain").
 - Commit `Cargo.toml` and `Cargo.lock` with `chore(release): bump version to X.Y.Z` and `--signoff`.
 - Push `HEAD:main`.
 - Create and push the lightweight `vX.Y.Z` tag.
