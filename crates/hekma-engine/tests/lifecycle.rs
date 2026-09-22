@@ -21,34 +21,12 @@ use tempfile::TempDir;
 /// Write a manifest whose `[lifecycle.start]` exec points at `fake_agent` with
 /// `args`, into `dir`, and return the dir path.
 fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
-    let bin = hekma_conformance::fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    // Shared fixture builder (test-support consolidation, 2026-09-22): the
+    // exact pre-consolidation local shape — contract v1, fake_agent exec,
+    // the suite's guaranteed capabilities, self-reported metering.
+    hekma_conformance::test_support::ManifestFixture::new(kind, args)
+        .guaranteed_on_all_oses("interaction")
+        .write(dir);
 }
 
 /// Open an engine over a fresh temp state dir.

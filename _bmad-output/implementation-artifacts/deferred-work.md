@@ -48,6 +48,13 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Integration test helpers (fake-manifest writer, dump polling, tree snapshotting in tests/memory.rs) duplicate shapes already living in sibling integration files rather than a shared test-support utility.
   evidence: Same pattern grew per-file across registration/lifecycle/pause/interaction/logs/metering; each story copied the smallest shape it needed. Cost compounds across Epics 6–7 when manifest fixtures evolve (e.g. contract_version bumps touch N copies). Candidate: a `tests/support/` module (or `ktesio-conformance` test-fixture exports) once Epic 6's conformance kit forces the shape anyway. **Census update (Epic-7 review, 2026-09-09):** the duplication has grown — alongside `uj3::write_flow_manifest` there are now FIVE more near-identical manifest TOML writers (three in `crates/ktesio-engine/tests/events_subscription.rs` — `write_fake_manifest`/`write_lingering_manifest`/`write_crash_once_manifest` — the perf-budgets harness's `write_heartbeat_manifest`, and the embedding quickstart's `write_manifest`, the last deliberately standalone host code a consolidation must NOT absorb), plus two lag-accumulating `try_recv` drain implementations. A consolidation pass should fold the test-side writers into one shared fixture export and note which copies are load-bearing.
+  resolved: 2026-09-22 hardening batch — the seven identical write_fake_manifest copies
+  (budget, crash, fleet_totals, metering, lifecycle, cost, adoption) now delegate to
+  `hekma_conformance::test_support::ManifestFixture` (the perf harness already used
+  `heartbeat` since 10-3). The four remaining local writers (interaction, pause,
+  observed_metering, memory) are genuinely parametrized per-suite shapes
+  (runtime capability levels / injected config sections), not duplication — the
+  consolidation is complete under the census's own load-bearing-copies rule.
 
 ## Deferred from: code review of 5-2-delegate-to-native-memory-with-an-explicit-boundary (2026-08-24)
 
