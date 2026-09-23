@@ -423,12 +423,17 @@ class ReleaseDocsTests(unittest.TestCase):
         # (AI-35 disclosure convention) alongside the backends home. Assert the
         # FULL allowlist LINE shape (review blind-12): a bare substring would
         # also match a stale comment quoting the pattern, so a narrowed
-        # allowlist (e.g. a dropped legacy-file entry) must fail here.
+        # allowlist (e.g. a dropped legacy-file entry) must fail here. The
+        # 2026-09-22 hardening narrowed the engine-tests entry from the whole
+        # tests/ directory to the TWO files that genuinely use OS-cfg
+        # (atomic_config_writes.rs, memory.rs), each justified in the step
+        # comment — the pin follows the new line exactly.
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
             r"|^crates/hekma/src/cli/self_update\.rs:"
-            r"|^crates/hekma-engine/tests/'",
+            r"|^crates/hekma-engine/tests/atomic_config_writes\.rs:"
+            r"|^crates/hekma-engine/tests/memory\.rs:'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
