@@ -905,3 +905,189 @@ fn agent_request_unsupported_line(id: u64) -> String {
         "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32601,\"message\":\"unsupported\"}}}}"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `AcpNotice` arm formats with its contract's key phrases (the
+    /// surfaced-not-silent wording is part of the product surface — a Display
+    /// arm that panics or drops a fact is a bug). 2026-09-23 coverage batch.
+    #[test]
+    fn every_acp_notice_arm_formats() {
+        let notices = [
+            AcpNotice::MalformedLine {
+                line_number: 3,
+                total: 2,
+                detail: "not json".to_string(),
+            },
+            AcpNotice::UnhandledUpdate {
+                discriminator: "weird".to_string(),
+                total: 1,
+            },
+            AcpNotice::UnhandledUpdate {
+                discriminator: "<missing>".to_string(),
+                total: 2,
+            },
+            AcpNotice::UnhandledAgentRequest {
+                method: "fs/read".to_string(),
+            },
+            AcpNotice::PermissionDenied {
+                outcome: "denied via 'deny'".to_string(),
+            },
+            AcpNotice::UsageUpdate {
+                used: Some(1200),
+                size: Some(200_000),
+                cost: Some(("0.0034".to_string(), "USD".to_string())),
+            },
+            AcpNotice::UsageUpdate {
+                used: None,
+                size: None,
+                cost: None,
+            },
+            AcpNotice::UnexpectedResponse { id: 42 },
+            AcpNotice::Ended {
+                detail: "stdout read failed".to_string(),
+            },
+        ];
+        let texts: Vec<String> = notices.iter().map(AcpNotice::message).collect();
+        assert!(texts[0].contains("malformed line #3"), "{}", texts[0]);
+        assert!(texts[0].contains("stream continues"), "{}", texts[0]);
+        assert!(texts[1].contains("'weird'"), "{}", texts[1]);
+        assert!(texts[2].contains("<missing>"), "{}", texts[2]);
+        assert!(texts[3].contains("method-not-found"), "{}", texts[3]);
+        assert!(texts[4].contains("refused"), "{}", texts[4]);
+        assert!(texts[5].contains("1200 of 200000"), "{}", texts[5]);
+        assert!(texts[5].contains("NOT billed"), "{}", texts[5]);
+        assert!(texts[6].contains("unknown"), "{}", texts[6]);
+        assert!(!texts[6].contains("NOT billed"), "{}", texts[6]);
+        assert!(texts[7].contains("protocol desync"), "{}", texts[7]);
+        assert!(texts[8].contains("stdout read failed"), "{}", texts[8]);
+    }
+
+    /// The `PromptError`/`WriteError` Display arms (the send path's typed
+    /// refusals) format with their operator-facing facts.
+    #[test]
+    fn prompt_and_write_error_arms_format() {
+        assert!(PromptError::NoSession
+            .to_string()
+            .contains("no ACP session is established"));
+        assert!(PromptError::InFlight
+            .to_string()
+            .contains("already in flight"));
+        assert!(PromptError::TimedOut
+            .to_string()
+            .contains("not consuming its stdin"));
+        assert!(PromptError::Write("broken".to_string())
+            .to_string()
+            .contains("bounded write to the agent failed: broken"));
+        assert!(WriteError::TimedOut
+            .to_string()
+            .contains("not consuming its stdin"));
+        assert_eq!(WriteError::Failed("boom".to_string()).to_string(), "boom");
+    }
+
+    /// `AcpConnection::start` refuses, traffic-free and launch-fatal, when
+    /// either pipe half is missing (both error arms, each naming the fact).
+    #[test]
+    fn start_requires_both_pipe_halves() {
+        let err = AcpConnection::start(
+            "halves",
+            None,
+            None,
+            std::env::temp_dir().join("acp-halves-test-raw.log"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("no stdin pipe"), "{err}");
+        let err = AcpConnection::start(
+            "halves",
+            Some(StdinState::NoPipe),
+            None,
+            std::env::temp_dir().join("acp-halves-test-raw.log"),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("no stdout pipe"), "{err}");
+    }
+
+    /// A live connection WITHOUT a completed handshake has no session:
+    /// `send_prompt` refuses with `NoSession` and `cancel_turn` refuses with
+    /// its no-session fact — the pre-handshake send/cancel arms.
+    #[test]
+    fn send_and_cancel_without_a_session_are_refused() {
+        let child = std::process::Command::new(
+            std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
+        )
+        .args(["build", "-p", "hekma-conformance", "--bin", "fake_agent"])
+        .status()
+        .expect("run cargo for the fake agent build");
+        assert!(child.success(), "fake_agent build failed");
+        let bin = hekma_conformance::fake_agent_bin();
+        let mut sleeper = std::process::Command::new(&bin)
+            .arg("--linger-ms")
+            .arg("15000")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the fake agent for the pipe halves");
+        let stdin = sleeper.stdin.take().expect("stdin pipe");
+        let stdout = sleeper.stdout.take().expect("stdout pipe");
+        let conn = AcpConnection::start(
+            "nosession",
+            Some(StdinState::Live(stdin)),
+            Some(stdout),
+            std::env::temp_dir().join("acp-nosession-test-raw.log"),
+            None,
+        )
+        .expect("start with both halves");
+        let err = conn.send_prompt("hello").unwrap_err();
+        assert_eq!(err, PromptError::NoSession);
+        let err = conn.cancel_turn().unwrap_err();
+        assert!(err.contains("no ACP session is established"), "{err}");
+        // The Debug impl (the operations surface) names the session state.
+        let debug = format!("{conn:?}");
+        assert!(debug.contains("AcpConnection"), "{debug}");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// The notice queue is BOUNDED: overflowing it drops the OLDEST notices
+    /// and the drain announces the loss (surfaced-not-silent — the loss is
+    /// never silent).
+    #[test]
+    fn queue_overflow_drops_the_oldest_and_announces_it() {
+        let conn = AcpConnection {
+            inner: Arc::new(Inner {
+                stdin: std::sync::Mutex::new(StdinState::NoPipe),
+                pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+                session_id: std::sync::Mutex::new(None),
+                load_session: std::sync::atomic::AtomicBool::new(false),
+                prompt_id: std::sync::Mutex::new(None),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+                notices: std::sync::Mutex::new(Notices::default()),
+                context_usage: std::sync::Mutex::new(None),
+            }),
+        };
+        for n in 0..(MAX_QUEUED_NOTICES + 4) {
+            conn.inner.push_notice(AcpNotice::UnhandledUpdate {
+                discriminator: format!("d{n}"),
+                total: n as u64,
+            });
+        }
+        let drained = conn.drain_notices();
+        // The announcement leads, then the MAX surviving notices.
+        assert_eq!(drained.len(), MAX_QUEUED_NOTICES + 1);
+        assert!(
+            drained[0].contains("were dropped"),
+            "the overflow announcement must lead the drain: {}",
+            drained[0]
+        );
+        assert!(
+            drained[1].contains("'d4'"),
+            "the oldest SURVIVING notice follows the announcement: {}",
+            drained[1]
+        );
+    }
+}

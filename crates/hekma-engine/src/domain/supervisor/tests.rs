@@ -4397,3 +4397,68 @@ fn start_creates_the_attached_managed_memory_dir_when_absent() {
     );
     let _ = sup.stop(&registry, "memcreate", Some(Duration::from_secs(5)));
 }
+
+#[test]
+fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
+    // AI-12 loop-2 invariants (L2+L3 — the epic-11-retro-item-2 first half,
+    // written by the 2026-09-23 coverage batch): a PERSISTENT environmental
+    // poll failure (an injected fault shared by every handle in the tick) is
+    // granted crash-input credit for at most
+    // MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS consecutive ticks; the very next
+    // tick escalates with a ONE-TIME diagnostic naming the cap, and past it
+    // per-handle crash-input credit resumes (an un-pollable handle is
+    // crash-detected again instead of being shielded forever).
+    // TWO instances faulted together: >1 distinct errored handle makes the
+    // tick ENVIRONMENTAL (a procfs/sysctl-style outage), which shields the
+    // handles from crash-input credit — bounded by the cap.
+    let (_state, _manifest, registry) = setup_fake("envcap-a", &["--linger-ms", "600000"]);
+    registry
+        .register_with_adapter(
+            "envcap-b",
+            &AdapterRef::Manifest(_manifest.path().join("adapter.toml")),
+        )
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "envcap-a").unwrap();
+    sup.start(&registry, "envcap-b").unwrap();
+    let pid_a = sup.backend.pid(
+        &sup.running
+            .get(&InstanceName::new("envcap-a").unwrap())
+            .unwrap()
+            .handle,
+    );
+    let pid_b = sup.backend.pid(
+        &sup.running
+            .get(&InstanceName::new("envcap-b").unwrap())
+            .unwrap()
+            .handle,
+    );
+    sup.arm_poll_fault(pid_a);
+    sup.arm_poll_fault(pid_b);
+
+    // 40 granted environmental ticks: no escalation, no crash input.
+    for tick in 0..40 {
+        let _ = sup.poll_once(&registry);
+        assert!(
+            state_of(&registry, "envcap-a") == LifecycleState::Running
+                && state_of(&registry, "envcap-b") == LifecycleState::Running,
+            "tick {tick}: an environmental failure within the cap must not crash the handles"
+        );
+        assert!(
+            !sink_text(&buffer).contains("no longer"),
+            "tick {tick}: the escalation must not fire before the cap"
+        );
+    }
+    // Tick 41: the cap trips — the one-time escalation lands in the sink.
+    let _ = sup.poll_once(&registry);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("no longer"),
+        "the cap escalation must surface exactly past the cap: {text}"
+    );
+    let escalated = text
+        .matches("environmental poll failure has persisted")
+        .count();
+    assert_eq!(escalated, 1, "the escalation is ONE-TIME: {text}");
+}
