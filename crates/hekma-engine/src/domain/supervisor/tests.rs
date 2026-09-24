@@ -4482,4 +4482,9 @@ fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
         .matches("environmental poll failure has persisted")
         .count();
     assert_eq!(escalated, 1, "the escalation is ONE-TIME: {text}");
+    // Clean stops: the two fake agents are instrumented under tarpaulin, so a
+    // handle-drop SIGKILL here would leave partial profraw files that crash
+    // llvm_profparser at the coverage-merge step (unreachable-on-incomplete).
+    let _ = sup.stop(&registry, "envcap-a", Some(Duration::from_secs(5)));
+    let _ = sup.stop(&registry, "envcap-b", Some(Duration::from_secs(5)));
 }
