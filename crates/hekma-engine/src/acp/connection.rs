@@ -1014,25 +1014,25 @@ mod tests {
     /// A live connection WITHOUT a completed handshake has no session:
     /// `send_prompt` refuses with `NoSession` and `cancel_turn` refuses with
     /// its no-session fact — the pre-handshake send/cancel arms.
+    ///
+    /// The pipe halves come from a plain `cargo --version` spawn: the
+    /// refusal fires BEFORE any I/O, so the child's lifetime is irrelevant
+    /// (no waits, no reads — the pipes are just held handles), and a src/
+    /// test must not touch the hekma-conformance edge (the AD-2 dependency
+    /// law) nor race nextest's own build outputs with an in-test cargo
+    /// build (the Windows fake_agent.exe file-lock lesson, 2026-09-24).
     #[test]
     fn send_and_cancel_without_a_session_are_refused() {
-        let child = std::process::Command::new(
+        let mut child = std::process::Command::new(
             std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
         )
-        .args(["build", "-p", "hekma-conformance", "--bin", "fake_agent"])
-        .status()
-        .expect("run cargo for the fake agent build");
-        assert!(child.success(), "fake_agent build failed");
-        let bin = hekma_conformance::fake_agent_bin();
-        let mut sleeper = std::process::Command::new(&bin)
-            .arg("--linger-ms")
-            .arg("15000")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the fake agent for the pipe halves");
-        let stdin = sleeper.stdin.take().expect("stdin pipe");
-        let stdout = sleeper.stdout.take().expect("stdout pipe");
+        .arg("--version")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a piped process for the pipe halves");
+        let stdin = child.stdin.take().expect("stdin pipe");
+        let stdout = child.stdout.take().expect("stdout pipe");
         let conn = AcpConnection::start(
             "nosession",
             Some(StdinState::Live(stdin)),
@@ -1045,11 +1045,11 @@ mod tests {
         assert_eq!(err, PromptError::NoSession);
         let err = conn.cancel_turn().unwrap_err();
         assert!(err.contains("no ACP session is established"), "{err}");
-        // The Debug impl (the operations surface) names the session state.
+        // The Debug impl (the operations surface) names the connection.
         let debug = format!("{conn:?}");
         assert!(debug.contains("AcpConnection"), "{debug}");
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// The notice queue is BOUNDED: overflowing it drops the OLDEST notices
