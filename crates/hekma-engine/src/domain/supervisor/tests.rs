@@ -4344,3 +4344,56 @@ fn default_constructs_the_standard_supervisor() {
     // non-panicking, pinned so the impl block stays honest.
     let _ = Supervisor::default();
 }
+
+#[test]
+fn start_refuses_a_symlinked_managed_memory_dir_and_surfaces_the_log_error() {
+    // The start-time twin of the attach-side symlink guard (2026-09-23
+    // coverage batch): a symlink planted between attach and start is refused
+    // LOUD pre-transition — EngineError::Log naming the symlink refusal —
+    // and the agent is never launched.
+    let (_state, _manifest, registry) = setup_fake("symlinkmem", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("symlinkmem").unwrap();
+    registry
+        .attach_memory(name.as_str(), MemoryBackingKind::Filesystem)
+        .unwrap();
+    let managed = registry.paths().agent_memory_dir(&name);
+    // Ensure the managed dir exists, then swap it for a symlink to elsewhere.
+    std::fs::create_dir_all(&managed).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::remove_dir(&managed).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), &managed).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(outside.path(), &managed).unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let err = sup.start(&registry, "symlinkmem").unwrap_err();
+    let EngineError::Log { detail, .. } = &err else {
+        panic!("expected EngineError::Log for the symlinked memory dir, got {err:?}");
+    };
+    assert!(
+        detail.contains("symlink"),
+        "the refusal must name the symlink guard: {detail}"
+    );
+}
+
+#[test]
+fn start_creates_the_attached_managed_memory_dir_when_absent() {
+    // The create_dir_all arm of the start-time memory-dir delivery (2026-09-23
+    // coverage batch): attach records the managed dir; a start after the dir
+    // was removed (an operator cleanup) re-creates it instead of failing.
+    let (_state, _manifest, registry) = setup_fake("memcreate", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("memcreate").unwrap();
+    registry
+        .attach_memory(name.as_str(), MemoryBackingKind::Filesystem)
+        .unwrap();
+    let managed = registry.paths().agent_memory_dir(&name);
+    std::fs::remove_dir_all(&managed).unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "memcreate").unwrap();
+    assert!(
+        managed.is_dir(),
+        "the start must re-create the attached managed memory dir"
+    );
+    let _ = sup.stop(&registry, "memcreate", Some(Duration::from_secs(5)));
+}
