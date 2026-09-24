@@ -4358,13 +4358,34 @@ fn start_refuses_a_symlinked_managed_memory_dir_and_surfaces_the_log_error() {
         .unwrap();
     let managed = registry.paths().agent_memory_dir(&name);
     // Ensure the managed dir exists, then swap it for a symlink to elsewhere.
+    // Created via commands so this suite stays free of compile-time cfg (the
+    // OS-cfg gate's allowlist is per-file and this file is not on it): `ln -s`
+    // on unix, a directory junction on windows — symlink_metadata reports both
+    // as symlinks, which is all the refusal guard under test looks for.
     std::fs::create_dir_all(&managed).unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::remove_dir(&managed).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.path(), &managed).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(outside.path(), &managed).unwrap();
+    let linked = if std::env::consts::OS == "windows" {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&managed)
+            .arg(outside.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(outside.path())
+            .arg(&managed)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        linked,
+        "the test requires a directory symlink at {managed:?}"
+    );
 
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let err = sup.start(&registry, "symlinkmem").unwrap_err();
