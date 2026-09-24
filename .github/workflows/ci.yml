@@ -89,13 +89,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
-    # doctest pass. 25 gives headroom now that the heavy hekma-engine integration
-    # tests are SERIALIZED (the `engine-integration-serial` max-threads=1 test-group
-    # in .config/nextest.toml) — the source fix for the x86-ubuntu `adoption` hang
-    # (#106), where concurrent heavy process-spawning wedged the 2-core runner into
-    # an uninterruptible D-state. nextest's per-test kill-timeout (see
-    # .config/nextest.toml) remains the cross-OS per-test hang guard.
-    timeout-minutes: 25
+    # doctest pass. 25 was calibrated when the suite fit (the heavy hekma-engine
+    # integration tests are SERIALIZED — the `engine-integration-serial`
+    # max-threads=1 test-group in .config/nextest.toml, the #106 x86-ubuntu
+    # `adoption` hang fix); the suite has since GROWN past 1,295 nextest tests
+    # (epics 12-14), and the windows-latest leg now rides the 25-minute wall
+    # under runner contention — GitHub marks a job timeout as CANCELLED, so
+    # three consecutive runs died silently at ~25m05s (2026-09-22/23, the
+    # #235 window; bisect: identical Rust content green at the #193 merge
+    # run). 40 restores real headroom. nextest's per-test kill-timeout (see
+    # .config/nextest.toml) remains the cross-OS per-test hang guard; the
+    # residual Windows slow-runner flake family (TCK observed-section 30s
+    # contention timeouts + a still-unidentified silent stall) is chartered
+    # under epic-12 retro item 95 (see #236).
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
