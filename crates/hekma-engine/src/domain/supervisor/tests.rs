@@ -4408,4 +4408,83 @@ fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
         .matches("environmental poll failure has persisted")
         .count();
     assert_eq!(escalated, 1, "the escalation is ONE-TIME: {text}");
+    // Clean stops: the two fake agents are instrumented under tarpaulin, so a
+    // handle-drop SIGKILL here would leave partial profraw files that crash
+    // llvm_profparser at the coverage-merge step (unreachable-on-incomplete).
+    let _ = sup.stop(&registry, "envcap-a", Some(Duration::from_secs(5)));
+    let _ = sup.stop(&registry, "envcap-b", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn start_refuses_a_symlinked_managed_memory_dir_and_surfaces_the_log_error() {
+    // The start-time twin of the attach-side symlink guard (2026-09-23
+    // coverage batch): a symlink planted between attach and start is refused
+    // LOUD pre-transition — EngineError::Log naming the symlink refusal —
+    // and the agent is never launched.
+    let (_state, _manifest, registry) = setup_fake("symlinkmem", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("symlinkmem").unwrap();
+    registry
+        .attach_memory(name.as_str(), MemoryBackingKind::Filesystem)
+        .unwrap();
+    let managed = registry.paths().agent_memory_dir(&name);
+    // Ensure the managed dir exists, then swap it for a symlink to elsewhere.
+    // Created via commands so this suite stays free of compile-time cfg (the
+    // OS-cfg gate's allowlist is per-file and this file is not on it): `ln -s`
+    // on unix, a directory junction on windows — symlink_metadata reports both
+    // as symlinks, which is all the refusal guard under test looks for.
+    std::fs::create_dir_all(&managed).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::remove_dir(&managed).unwrap();
+    let linked = if std::env::consts::OS == "windows" {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&managed)
+            .arg(outside.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(outside.path())
+            .arg(&managed)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        linked,
+        "the test requires a directory symlink at {managed:?}"
+    );
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let err = sup.start(&registry, "symlinkmem").unwrap_err();
+    let EngineError::Log { detail, .. } = &err else {
+        panic!("expected EngineError::Log for the symlinked memory dir, got {err:?}");
+    };
+    assert!(
+        detail.contains("symlink"),
+        "the refusal must name the symlink guard: {detail}"
+    );
+}
+
+#[test]
+fn start_creates_the_attached_managed_memory_dir_when_absent() {
+    // The create_dir_all arm of the start-time memory-dir delivery (2026-09-23
+    // coverage batch): attach records the managed dir; a start after the dir
+    // was removed (an operator cleanup) re-creates it instead of failing.
+    let (_state, _manifest, registry) = setup_fake("memcreate", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("memcreate").unwrap();
+    registry
+        .attach_memory(name.as_str(), MemoryBackingKind::Filesystem)
+        .unwrap();
+    let managed = registry.paths().agent_memory_dir(&name);
+    std::fs::remove_dir_all(&managed).unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "memcreate").unwrap();
+    assert!(
+        managed.is_dir(),
+        "the start must re-create the attached managed memory dir"
+    );
+    let _ = sup.stop(&registry, "memcreate", Some(Duration::from_secs(5)));
 }
