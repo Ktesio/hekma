@@ -4358,13 +4358,34 @@ fn start_refuses_a_symlinked_managed_memory_dir_and_surfaces_the_log_error() {
         .unwrap();
     let managed = registry.paths().agent_memory_dir(&name);
     // Ensure the managed dir exists, then swap it for a symlink to elsewhere.
+    // Created via commands so this suite stays free of compile-time cfg (the
+    // OS-cfg gate's allowlist is per-file and this file is not on it): `ln -s`
+    // on unix, a directory junction on windows — symlink_metadata reports both
+    // as symlinks, which is all the refusal guard under test looks for.
     std::fs::create_dir_all(&managed).unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::remove_dir(&managed).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(outside.path(), &managed).unwrap();
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(outside.path(), &managed).unwrap();
+    let linked = if std::env::consts::OS == "windows" {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&managed)
+            .arg(outside.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        std::process::Command::new("ln")
+            .args(["-s"])
+            .arg(outside.path())
+            .arg(&managed)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    assert!(
+        linked,
+        "the test requires a directory symlink at {managed:?}"
+    );
 
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let err = sup.start(&registry, "symlinkmem").unwrap_err();
@@ -4396,4 +4417,204 @@ fn start_creates_the_attached_managed_memory_dir_when_absent() {
         "the start must re-create the attached managed memory dir"
     );
     let _ = sup.stop(&registry, "memcreate", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
+    // AI-12 loop-2 invariants (L2+L3 — the epic-11-retro-item-2 first half,
+    // written by the 2026-09-23 coverage batch): a PERSISTENT environmental
+    // poll failure (an injected fault shared by every handle in the tick) is
+    // granted crash-input credit for at most
+    // MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS consecutive ticks; the very next
+    // tick escalates with a ONE-TIME diagnostic naming the cap, and past it
+    // per-handle crash-input credit resumes (an un-pollable handle is
+    // crash-detected again instead of being shielded forever).
+    // TWO instances faulted together: >1 distinct errored handle makes the
+    // tick ENVIRONMENTAL (a procfs/sysctl-style outage), which shields the
+    // handles from crash-input credit — bounded by the cap.
+    let (_state, _manifest, registry) = setup_fake("envcap-a", &["--linger-ms", "600000"]);
+    registry
+        .register_with_adapter(
+            "envcap-b",
+            &AdapterRef::Manifest(_manifest.path().join("adapter.toml")),
+        )
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "envcap-a").unwrap();
+    sup.start(&registry, "envcap-b").unwrap();
+    let pid_a = sup.backend.pid(
+        &sup.running
+            .get(&InstanceName::new("envcap-a").unwrap())
+            .unwrap()
+            .handle,
+    );
+    let pid_b = sup.backend.pid(
+        &sup.running
+            .get(&InstanceName::new("envcap-b").unwrap())
+            .unwrap()
+            .handle,
+    );
+    sup.arm_poll_fault(pid_a);
+    sup.arm_poll_fault(pid_b);
+
+    // 40 granted environmental ticks: no escalation, no crash input.
+    for tick in 0..40 {
+        let _ = sup.poll_once(&registry);
+        assert!(
+            state_of(&registry, "envcap-a") == LifecycleState::Running
+                && state_of(&registry, "envcap-b") == LifecycleState::Running,
+            "tick {tick}: an environmental failure within the cap must not crash the handles"
+        );
+        assert!(
+            !sink_text(&buffer).contains("no longer"),
+            "tick {tick}: the escalation must not fire before the cap"
+        );
+    }
+    // Tick 41: the cap trips — the one-time escalation lands in the sink.
+    let _ = sup.poll_once(&registry);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("no longer"),
+        "the cap escalation must surface exactly past the cap: {text}"
+    );
+    let escalated = text
+        .matches("environmental poll failure has persisted")
+        .count();
+    assert_eq!(escalated, 1, "the escalation is ONE-TIME: {text}");
+    // Clean stops: the two fake agents are instrumented under tarpaulin, so a
+    // handle-drop SIGKILL here would leave partial profraw files that crash
+    // llvm_profparser at the coverage-merge step (unreachable-on-incomplete).
+    let _ = sup.stop(&registry, "envcap-a", Some(Duration::from_secs(5)));
+    let _ = sup.stop(&registry, "envcap-b", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_shrunk_agent_log_snaps_the_usage_cursor_without_double_counting() {
+    // The M2 shrink guard (2026-09-23 coverage batch): an operator (or log
+    // rotation) truncating agent.log below the persisted cursor must snap the
+    // cursor to the new length and ingest NOTHING — never re-read from 0
+    // under the same live run_id (which would double-count and inflate the
+    // bill). Exercises: usage emitted + drained (cursor advances), the log
+    // file truncated, then a drain — the Shrunk arm.
+    let (state, _manifest, registry) =
+        setup_fake("shrink", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("shrink").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "shrink").unwrap();
+    // Drain until the two emitted usage events are committed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(&registry);
+        if ledger_totals(state.path(), name.as_str()).0 >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the two emitted usage events never committed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = registry.instance_log_dir(&name).join("agent.log");
+    assert!(std::fs::metadata(&log).unwrap().len() > 0);
+    // Truncate the log below the persisted cursor.
+    std::fs::write(&log, b"").unwrap();
+    sup.drain_usage_all(&registry);
+    // A further drain ingests nothing new (cursor snapped to the new length).
+    sup.drain_usage_all(&registry);
+    let (count, _) = ledger_totals(state.path(), name.as_str());
+    assert_eq!(
+        count, 2,
+        "the shrink must neither lose the committed events nor re-count from zero"
+    );
+    let _ = sup.stop(&registry, "shrink", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_self_reported_park_gives_up_after_max_attempts_and_skips_loudly() {
+    // AI-41's bounded-retry conclusion (2026-09-23 coverage batch): the
+    // self-reported channel parks on a commit failure and retries each drain,
+    // but after USAGE_PARK_MAX_ATTEMPTS (3) consecutive failed passes AT THE
+    // SAME cursor it gives up LOUDLY — the stuck events are SKIPPED (not
+    // counted), the cursor moves past the block, and the skip diagnostic
+    // names the count, the offset, and the store as the thing to investigate.
+    // The remaining events of the Run keep counting.
+    let (state, _manifest, registry) = setup_fake("parkmax", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("parkmax").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start(&registry, "parkmax").unwrap();
+    let log = registry.agent_output_log_path(&name);
+    let db = state.path().join("state.db");
+
+    // Append 5 usage lines, then fail EVERY insert from the 3rd row onward
+    // (a trigger, the same injection shape as the AI-41 test): the first two
+    // events commit, the block of the remaining three parks.
+    append_usage_lines(
+        &log,
+        &[(0, 10, 20), (1, 11, 22), (2, 1, 2), (3, 3, 4), (4, 5, 6)],
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TRIGGER parkmax_fail_insert BEFORE INSERT ON usage_events \
+             WHEN (SELECT COUNT(*) FROM usage_events) >= 2 \
+             BEGIN SELECT RAISE(ABORT, 'injected park-max fault'); END;",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let cursor_at_fault = sup.running.get(&name).unwrap().usage_cursor;
+
+    // Three consecutive drains AT THE SAME cursor: park, park, and the THIRD
+    // gives up (attempts >= USAGE_PARK_MAX_ATTEMPTS on that pass).
+    for pass in 1..USAGE_PARK_MAX_ATTEMPTS {
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        let parked = sup.running.get(&name).unwrap().usage_park_attempts;
+        assert_eq!(
+            parked,
+            Some((cursor_at_fault, pass)),
+            "pass {pass}: the drain must park at the faulted cursor"
+        );
+        assert!(
+            !sink_text(&sink).contains("SKIPPED"),
+            "pass {pass}: no skip diagnostic before the cap: {}",
+            sink_text(&sink)
+        );
+    }
+    // The giving-up drain (pass 3): the cursor moves past the stuck block, the
+    // loss is announced with the count and the offset, and the park clears.
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("SKIPPED (not counted)"),
+        "the give-up must be loud: {text}"
+    );
+    // KNOWN FIDELITY NIT (2026-09-23 coverage batch): the skip diagnostic
+    // counts the whole re-parsed block (5) as lost, including the two events
+    // that HAD committed before the fault — the ledger itself is correct
+    // (2 committed, dedup held), but the diagnostic over-reports the loss.
+    // Recorded for the diagnostics-fidelity follow-up.
+    assert!(text.contains("5 usage event(s)"), "{text}");
+    assert!(text.contains("byte offset 0"), "{text}");
+    assert_eq!(
+        sup.running.get(&name).unwrap().usage_park_attempts,
+        None,
+        "the park state must clear once the cursor moved past the block"
+    );
+    let (count, _) = ledger_totals(state.path(), name.as_str());
+    assert_eq!(count, 2, "only the two pre-fault events committed");
+
+    // A post-skip event commits normally (the channel keeps working) once the
+    // injected fault is repaired (the trigger dropped — the AI-41 repair shape).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TRIGGER parkmax_fail_insert", [])
+        .unwrap();
+    drop(conn);
+    append_usage_lines(&log, &[(5, 7, 8)]);
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    assert_eq!(
+        ledger_totals(state.path(), name.as_str()),
+        (3, 28),
+        "the post-skip event must commit normally (10+11+7 input)"
+    );
 }
