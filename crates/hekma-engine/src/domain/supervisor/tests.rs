@@ -4488,3 +4488,133 @@ fn the_environmental_tick_cap_escalates_once_then_resumes_crash_credit() {
     let _ = sup.stop(&registry, "envcap-a", Some(Duration::from_secs(5)));
     let _ = sup.stop(&registry, "envcap-b", Some(Duration::from_secs(5)));
 }
+
+#[test]
+fn a_shrunk_agent_log_snaps_the_usage_cursor_without_double_counting() {
+    // The M2 shrink guard (2026-09-23 coverage batch): an operator (or log
+    // rotation) truncating agent.log below the persisted cursor must snap the
+    // cursor to the new length and ingest NOTHING — never re-read from 0
+    // under the same live run_id (which would double-count and inflate the
+    // bill). Exercises: usage emitted + drained (cursor advances), the log
+    // file truncated, then a drain — the Shrunk arm.
+    let (state, _manifest, registry) =
+        setup_fake("shrink", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("shrink").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "shrink").unwrap();
+    // Drain until the two emitted usage events are committed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(&registry);
+        if ledger_totals(state.path(), name.as_str()).0 >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the two emitted usage events never committed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let log = registry.instance_log_dir(&name).join("agent.log");
+    assert!(std::fs::metadata(&log).unwrap().len() > 0);
+    // Truncate the log below the persisted cursor.
+    std::fs::write(&log, b"").unwrap();
+    sup.drain_usage_all(&registry);
+    // A further drain ingests nothing new (cursor snapped to the new length).
+    sup.drain_usage_all(&registry);
+    let (count, _) = ledger_totals(state.path(), name.as_str());
+    assert_eq!(
+        count, 2,
+        "the shrink must neither lose the committed events nor re-count from zero"
+    );
+    let _ = sup.stop(&registry, "shrink", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_self_reported_park_gives_up_after_max_attempts_and_skips_loudly() {
+    // AI-41's bounded-retry conclusion (2026-09-23 coverage batch): the
+    // self-reported channel parks on a commit failure and retries each drain,
+    // but after USAGE_PARK_MAX_ATTEMPTS (3) consecutive failed passes AT THE
+    // SAME cursor it gives up LOUDLY — the stuck events are SKIPPED (not
+    // counted), the cursor moves past the block, and the skip diagnostic
+    // names the count, the offset, and the store as the thing to investigate.
+    // The remaining events of the Run keep counting.
+    let (state, _manifest, registry) = setup_fake("parkmax", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("parkmax").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start(&registry, "parkmax").unwrap();
+    let log = registry.agent_output_log_path(&name);
+    let db = state.path().join("state.db");
+
+    // Append 5 usage lines, then fail EVERY insert from the 3rd row onward
+    // (a trigger, the same injection shape as the AI-41 test): the first two
+    // events commit, the block of the remaining three parks.
+    append_usage_lines(
+        &log,
+        &[(0, 10, 20), (1, 11, 22), (2, 1, 2), (3, 3, 4), (4, 5, 6)],
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "CREATE TRIGGER parkmax_fail_insert BEFORE INSERT ON usage_events \
+             WHEN (SELECT COUNT(*) FROM usage_events) >= 2 \
+             BEGIN SELECT RAISE(ABORT, 'injected park-max fault'); END;",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let cursor_at_fault = sup.running.get(&name).unwrap().usage_cursor;
+
+    // Three consecutive drains AT THE SAME cursor: park, park, and the THIRD
+    // gives up (attempts >= USAGE_PARK_MAX_ATTEMPTS on that pass).
+    for pass in 1..USAGE_PARK_MAX_ATTEMPTS {
+        sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+        let parked = sup.running.get(&name).unwrap().usage_park_attempts;
+        assert_eq!(
+            parked,
+            Some((cursor_at_fault, pass)),
+            "pass {pass}: the drain must park at the faulted cursor"
+        );
+        assert!(
+            !sink_text(&sink).contains("SKIPPED"),
+            "pass {pass}: no skip diagnostic before the cap: {}",
+            sink_text(&sink)
+        );
+    }
+    // The giving-up drain (pass 3): the cursor moves past the stuck block, the
+    // loss is announced with the count and the offset, and the park clears.
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("SKIPPED (not counted)"),
+        "the give-up must be loud: {text}"
+    );
+    // KNOWN FIDELITY NIT (2026-09-23 coverage batch): the skip diagnostic
+    // counts the whole re-parsed block (5) as lost, including the two events
+    // that HAD committed before the fault — the ledger itself is correct
+    // (2 committed, dedup held), but the diagnostic over-reports the loss.
+    // Recorded for the diagnostics-fidelity follow-up.
+    assert!(text.contains("5 usage event(s)"), "{text}");
+    assert!(text.contains("byte offset 0"), "{text}");
+    assert_eq!(
+        sup.running.get(&name).unwrap().usage_park_attempts,
+        None,
+        "the park state must clear once the cursor moved past the block"
+    );
+    let (count, _) = ledger_totals(state.path(), name.as_str());
+    assert_eq!(count, 2, "only the two pre-fault events committed");
+
+    // A post-skip event commits normally (the channel keeps working) once the
+    // injected fault is repaired (the trigger dropped — the AI-41 repair shape).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DROP TRIGGER parkmax_fail_insert", [])
+        .unwrap();
+    drop(conn);
+    append_usage_lines(&log, &[(5, 7, 8)]);
+    sup.drain_usage_for(&registry, &name, DrainMode::MidRun);
+    assert_eq!(
+        ledger_totals(state.path(), name.as_str()),
+        (3, 28),
+        "the post-skip event must commit normally (10+11+7 input)"
+    );
+}
