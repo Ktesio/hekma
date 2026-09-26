@@ -1092,12 +1092,20 @@ jobs:
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, hekma-engine LAST (see the WHY comment above).
           set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma hekma-engine
+          # The conformance test-support BINS (fake_agent, fake_acp_agent,
+          # hermes_shim) are excluded from instrumentation: their lines are
+          # not part of any crate's gate, but the acp_lifecycle suite's stop
+          # ladder SIGKILLs spawned fake_acp_agent children, and a killed
+          # instrumented process leaves a PARTIAL profraw that crashes
+          # llvm_profparser at the merge ("parser failure: Nom(Eof)",
+          # deterministic since epic-14 — 2026-09-26 diagnosis).
           for pkg in "$@"; do
             echo "::group::tarpaulin -p $pkg"
             echo "--- resources before $pkg ---"
             free -h || true
             df -h / || true
             cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              --exclude-files 'crates/hekma-conformance/src/bin/*' \
               -p "$pkg" --out Lcov --output-dir "cov/$pkg"
             echo "::endgroup::"
           done
