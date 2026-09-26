@@ -1004,6 +1004,11 @@ jobs:
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
       - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+        env:
+          # TEMPORARY (2026-09-26): the llvm_profparser panic (Nom(Eof) on a
+          # partial profraw after the acp_lifecycle run) needs its full
+          # backtrace to pin the parse path. Remove once root-caused.
+          RUST_BACKTRACE: full
         # WHY the split (#101): a single `cargo tarpaulin --workspace` instruments
         # the ENTIRE graph (tokio + bundled-SQLite C + a 13-crate hyper stack) and
         # runs all ~1075 tests instrumented; even after the AI-23 fixes (dedicated
