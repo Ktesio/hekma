@@ -7754,3 +7754,30 @@ fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
         settle.stdout
     );
 }
+
+#[test]
+fn lifecycle_error_arms_on_a_missing_instance_exit_3_diagnostics_only() {
+    // The 2026-09-26 coverage batch: the resume/send/logs/pause/stop Err
+    // arms — each maps AgentNotFound through map_engine_error to exit 3 with
+    // a stderr diagnostic and EMPTY stdout (results only on success).
+    let (ctx, state) = registered_mock("real");
+    for args in [
+        vec!["agent", "resume", "ghost"],
+        vec!["agent", "send", "ghost", "hello"],
+        vec!["agent", "logs", "ghost"],
+        vec!["agent", "pause", "ghost"],
+        vec!["agent", "stop", "ghost"],
+    ] {
+        let run = run_hekma_agent(&args, &ctx.project_dir, state.project_dir.as_path());
+        assert_eq!(run.code, Some(3), "args={args:?}; stderr={}", run.stderr);
+        assert!(
+            run.stdout.is_empty(),
+            "no result output on failure; args={args:?} stdout={}",
+            run.stdout
+        );
+        assert!(
+            !run.stderr.is_empty(),
+            "the failure must carry a diagnostic; args={args:?}"
+        );
+    }
+}
