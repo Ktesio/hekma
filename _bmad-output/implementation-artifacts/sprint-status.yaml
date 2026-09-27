@@ -1500,7 +1500,15 @@ action_items:
       (crates/hekma-conformance/src/uj3.rs:418), log_file_captures_child_stdout spawn
       start-time race (crates/hekma-engine/src/backends/unix/mod.rs:1042), two_engines
       embed_clean concurrency (crates/hekma-engine/tests/embed_clean.rs:323). Reproduce
-      under load; fix the race or add principled tolerance (no blind retry). [epic-12
+      under load; fix the race or add principled tolerance (no blind retry). WINDOWS EXTENSION (2026-09-23, hardening-session bisect): the same family
+      is red on windows-latest — tck::tests::engine_observed_manifest_adapter_passes_the_observed_section
+      hits the 30s SECTION_TIMEOUT waiting for 3 engine-observed rows (have 2) under
+      runner contention (self-heals on nextest TRY 2; identical Rust content green at
+      the 17:01Z #193 merge run, red at 19:51Z with only docs/ci-python deltas), AND a
+      second symptom: one engine test HANGS (identity not yet pinned — the job burns
+      its 25m timeout, nextest 'Cancelling due to interrupt: 1 test still running').
+      Same charter: reproduce under load, fix the race or add principled tolerance
+      (no blind retry). [epic-12
       retro action 1, MED]"
     owner: "next CI-touching story"
     status: open
