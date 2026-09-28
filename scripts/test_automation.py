@@ -215,13 +215,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("--workspace --fail-under 95", ci)
         # The per-crate tarpaulin invocation shape (llvm + skip-clean + timeout 180 +
         # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
+        # Whitespace-normalized (line-continuation backslashes and indentation
+        # collapsed): the 2026-09-28 bounded retry loop (#239) wraps the
+        # invocation in an `if`, which necessarily re-indents the continuation
+        # lines — the STRUCTURE (the full flag sequence, in order) is the pin,
+        # not the column it starts at.
+        ci_flat = " ".join(ci.replace("\\\n", " ").split())
         self.assertIn(
-            'cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 '
-            "--verbose \\\n              --exclude-files "
-            "'crates/hekma-conformance/src/bin/*' \\\n"
-            '              -p "$pkg" --out Lcov --output-dir '
-            '"cov/$pkg"',
-            ci,
+            "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
+            "--verbose --exclude-files 'crates/hekma-conformance/src/bin/*' "
+            '-p "$pkg" --out Lcov --output-dir "cov/$pkg"',
+            ci_flat,
         )
         # The exact five workspace crates, lightest → heaviest with hekma-engine
         # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers logged).
