@@ -258,7 +258,7 @@ fn adoption_helper_subprocess() {
             facade.start("ghost").unwrap();
             // Crash: exit without dropping the engine. Both survive; the parent
             // test kills `ghost` explicitly to make it a gone-process orphan.
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // Start `phantom` (long linger, reliably alive); after the crash the
         // PARENT test kills it, so the new engine finds a `running` row whose
@@ -268,7 +268,7 @@ fn adoption_helper_subprocess() {
                 .register_with_adapter("phantom", &AdapterRef::Manifest(manifest.clone()))
                 .unwrap();
             facade.start("phantom").unwrap();
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // Start `nap`, pause it, then crash (exit without drop). The paused
         // process survives (on Unix it is SIGSTOP'd — still a live, stopped
@@ -279,7 +279,7 @@ fn adoption_helper_subprocess() {
                 .unwrap();
             facade.start("nap").unwrap();
             facade.pause("nap").unwrap();
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // AI-13: start `mortal` under a `never` Restart Policy, then crash. The
         // parent adopts the live process and later kills it — the reaper's crash
@@ -294,7 +294,7 @@ fn adoption_helper_subprocess() {
                 .set_restart_policy("mortal", RestartPolicy::Never)
                 .unwrap();
             facade.start("mortal").unwrap();
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // AI-44: start `budgeted` under a cumulative token ceiling the emitted
         // usage ALREADY crosses, wait until at least one event is durably
@@ -356,7 +356,7 @@ fn adoption_helper_subprocess() {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         "budgeted_survivor" => {
             facade
@@ -409,7 +409,7 @@ fn adoption_helper_subprocess() {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // AI-44 (loop 2): the WARN breach-action variant — the same budget +
         // usage setup as `budgeted_survivor`, but `budget.breach_action = "warn"`,
@@ -468,7 +468,7 @@ fn adoption_helper_subprocess() {
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // AI-46: start `obssurv` as an ENGINE-OBSERVED instance (engine 1 binds
         // its loopback forward listener), then crash. The listener dies with
@@ -491,7 +491,7 @@ fn adoption_helper_subprocess() {
                 .set_config("obssurv", "metering.upstream_base_url", &dead_upstream)
                 .unwrap();
             facade.start("obssurv").unwrap();
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // Story 12-1: start `detachee` DETACHED, then let the engine drop
         // CLEANLY (no crash simulation — the disarm makes clean-exit survival
@@ -523,7 +523,7 @@ fn adoption_helper_subprocess() {
                 .unwrap();
             facade.start("clean").unwrap();
             facade.stop("clean", Some(Duration::from_secs(5))).unwrap();
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         // WHOLE-FLEET REBOOT setup (story 1-7, AC-B). Register several instances
         // in DIFFERENT states, then crash (exit without drop):
@@ -562,7 +562,7 @@ fn adoption_helper_subprocess() {
 
             // Crash: exit WITHOUT dropping the engine. `worker` survives (the
             // parent kills it to model the reboot); `finished` already stopped.
-            std::process::exit(0);
+            hekma_conformance::exit_helper_subprocess(0);
         }
         other => panic!("unknown adoption helper mode: {other}"),
     }

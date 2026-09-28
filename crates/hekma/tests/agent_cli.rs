@@ -104,7 +104,7 @@ fn agent_cli_start_helper_subprocess() {
     engine.blocking().start(&name).expect("helper start");
     // Exit WITHOUT dropping `engine` (crash semantics): the started process
     // survives and re-parents to init, ready for the next command to adopt.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 #[test]
@@ -2783,7 +2783,7 @@ fn agent_cli_uj3_breach_helper_subprocess() {
     uj3::assert_paused_entry(&entry);
     // Exit WITHOUT dropping `engine` (no handle Drop → no kill): the breach-
     // paused process survives exactly as after an engine crash (story 1-6).
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 /// Re-exec this test binary into [`agent_cli_uj3_breach_helper_subprocess`]

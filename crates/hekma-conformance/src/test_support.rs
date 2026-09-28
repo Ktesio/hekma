@@ -515,6 +515,46 @@ fn helper_bin_in(hop: BinDir, name: &str) -> PathBuf {
     candidate
 }
 
+/// Exit a re-exec'd helper subprocess, keeping the coverage merge complete.
+///
+/// The crash-shape suites (adoption, acp_lifecycle, interaction, logs)
+/// re-exec the TEST BINARY ITSELF as a helper subprocess and then exit it
+/// mid-test — the crash IS the test (`std::process::exit` without dropping
+/// the engine, so no kill-on-drop runs). Under coverage that exit is a
+/// landmine: the helper is instrumented (it IS the test binary), it
+/// inherits the parent's `LLVM_PROFILE_FILE`, and its profile write rides
+/// the exit path — where it raced tarpaulin's per-binary merge on a loaded
+/// CI runner and left a PARTIAL profraw in the merge set
+/// (`llvm_profparser` panics: "llvm_profparsers works on complete data";
+/// 2026-09-28, #239 — the run-to-run flip on the same SHA proved the race).
+///
+/// Under coverage the profile is therefore written EXPLICITLY here, before
+/// the exit, while the process is fully alive (the LLVM-documented API for
+/// exactly this situation); the exit path's own atexit write is idempotent.
+/// Outside coverage the cfg arm compiles out and this is a plain exit.
+pub fn exit_helper_subprocess(code: i32) -> ! {
+    #[cfg(tarpaulin)]
+    {
+        extern "C" {
+            /// LLVM's profile-runtime entry point (linked into every
+            /// instrumented binary): serialize the current counters to the
+            /// `LLVM_PROFILE_FILE` path NOW. Returns 0 on success; a
+            /// failure is best-effort here — the exit path's own write
+            /// still runs after, and skipping the exit would change the
+            /// crash semantics the test exists to exercise.
+            fn __llvm_profile_write_file() -> i32;
+        }
+        // SAFETY: a C-ABI runtime function with no preconditions beyond the
+        // profile runtime being initialized — which it is, by definition,
+        // under `--cfg=tarpaulin -Cinstrument-coverage` (this arm only
+        // compiles there).
+        unsafe {
+            let _ = __llvm_profile_write_file();
+        }
+    }
+    std::process::exit(code)
+}
+
 /// Locate the `fake_agent` test helper binary (story 1.4, AD-3) from a TEST
 /// binary ([`BinDir::TestDeps`] — see [`fake_agent_bin_in`] for the
 /// parameterized form, and `BinDir::Examples` for the perf-budgets

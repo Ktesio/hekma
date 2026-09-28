@@ -1313,7 +1313,7 @@ fn acp_helper_subprocess() {
     facade.start(name).unwrap();
     // Crash semantics: exit without dropping (no kill-on-drop, no record
     // settle). The lingering agent survives with its session state intact.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 /// The D4 composition, end to end: start ATTACHED → the engine process dies

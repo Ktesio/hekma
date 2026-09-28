@@ -528,7 +528,7 @@ fn interaction_adoption_helper_subprocess() {
     // Crash: exit WITHOUT dropping the engine, so the kill-on-drop handle
     // never fires and the agent (its own session leader) survives, re-parented
     // to init.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 #[test]
