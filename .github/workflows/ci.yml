@@ -184,6 +184,14 @@ jobs:
           # hermes.rs), so a cached stale copy would silently shadow the
           # committed launcher's current arg surface (--crash-* family).
           cargo +stable build -p hekma-conformance --bin hermes_shim
+          # fake_acp_agent gets the SAME freshness guard (the locator's own
+          # contract, story 14-1: "any job that spawns acp agents must build
+          # the helper explicitly BEFORE the suite"): the acp_lifecycle suite
+          # resolves it at target/debug/fake_acp_agent via the same
+          # exists()-only locator (hekma_conformance::fake_acp_agent_bin), and
+          # this Cargo.lock-keyed cache can hold a stale copy just the same.
+          rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
+          cargo +stable build -p hekma-conformance --bin fake_acp_agent
           cargo +stable nextest run --workspace --all-targets --no-run
       - name: Run tests (nextest)
         # Single unified run for all three OSes (#106). The x86-ubuntu `adoption`
@@ -1004,12 +1012,13 @@ jobs:
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
       - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
-        # TEMPORARY (2026-09-26): the llvm_profparser panic (Nom(Eof) on a
-        # partial profraw after the acp_lifecycle run) needs its full
-        # backtrace to pin the parse path. Remove once root-caused.
-        # (RUST_BACKTRACE rides the step's EXISTING env block below — a
-        # second env: key here is a duplicate mapping key and GitHub
-        # startup-fails the whole workflow.)
+        # NOTE for future env additions: RUST_BACKTRACE rode this step's env
+        # block 2026-09-26/27 to pin the llvm_profparser partial-profraw
+        # panic; it is GONE now (root-caused — see the fake_acp_agent guard
+        # below). Adding a SECOND `env:` key on one step is a duplicate
+        # mapping key: GitHub does not deduplicate the way PyYAML does, and
+        # the workflow STARTUP-FAILS with zero jobs, taking every required
+        # check down with it (#238/#239).
         # WHY the split (#101): a single `cargo tarpaulin --workspace` instruments
         # the ENTIRE graph (tokio + bundled-SQLite C + a 13-crate hyper stack) and
         # runs all ~1075 tests instrumented; even after the AI-23 fixes (dedicated
@@ -1046,10 +1055,6 @@ jobs:
         env:
           RUST_TEST_THREADS: "1"
           CARGO_PROFILE_DEV_DEBUG: "1"
-          # TEMPORARY (2026-09-26): full backtrace for the llvm_profparser
-          # Nom(Eof) panic on partial profraw after the acp_lifecycle run;
-          # remove once root-caused.
-          RUST_BACKTRACE: "full"
         shell: bash
         run: |
           set -euo pipefail
@@ -1092,6 +1097,29 @@ jobs:
           # fake_agent above (review-of-6-2, vg-o1) — its locator also accepts
           # a merely-EXISTING target/debug/hermes_shim.
           cargo +stable build -p hekma-conformance --bin hermes_shim
+          # fake_acp_agent: THE ROOT CAUSE of the llvm_profparser panic that
+          # killed this job through 2026-09-27 ("parser failure: Nom(Eof)" /
+          # "llvm_profparsers works on complete data", deterministic since
+          # epic-14, diagnosed 2026-09-26, backtrace pinned to parse_bytes on
+          # 2026-09-27). This job pre-builds fake_agent and hermes_shim plain,
+          # but NOT fake_acp_agent — so the acp_lifecycle suite's locator fell
+          # to the ON-DEMAND build, which inherits the ambient instrumented
+          # RUSTFLAGS from tarpaulin. Every spawned ACP child was therefore
+          # instrumented; the stop ladder's SIGKILL rung left a PARTIAL
+          # profraw per killed child; the merge parse hit it and panicked
+          # (or, when it didn't, the run lost children's hits and dipped the
+          # aggregate). The explicit PLAIN build below puts an
+          # UNINSTRUMENTED helper at target/debug/fake_acp_agent BEFORE the
+          # tarpaulin runs: tarpaulin compiles the bin only as a --test
+          # artifact and never uplifts it to that path, so the plain copy
+          # survives, spawned children write NO profraws at all, and the
+          # panic is structurally impossible. (The bin stays excluded from
+          # the coverage denominator via --exclude-files — the documented
+          # helper posture, docs/testing.md — so plain vs instrumented is
+          # gate-neutral.) Freshness guard for the same Cargo.lock-keyed
+          # cache reason as fake_agent above.
+          rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
+          cargo +stable build -p hekma-conformance --bin fake_acp_agent
           # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
           # on a since-disproven "runner contention" theory) could never converge:
           # the failure above is DETERMINISTIC, so every attempt re-hit it. It
@@ -1104,11 +1132,12 @@ jobs:
           set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma hekma-engine
           # The conformance test-support BINS (fake_agent, fake_acp_agent,
           # hermes_shim) are excluded from instrumentation: their lines are
-          # not part of any crate's gate, but the acp_lifecycle suite's stop
-          # ladder SIGKILLs spawned fake_acp_agent children, and a killed
-          # instrumented process leaves a PARTIAL profraw that crashes
-          # llvm_profparser at the merge ("parser failure: Nom(Eof)",
-          # deterministic since epic-14 — 2026-09-26 diagnosis).
+          # not part of any crate's gate. This exclusion is the REPORT-side
+          # defense; the PANIC-side defense is the explicit plain build of
+          # all three helpers above (a killed instrumented child leaves a
+          # PARTIAL profraw that crashes llvm_profparser at the merge —
+          # deterministic since epic-14, root-caused 2026-09-28: see the
+          # fake_acp_agent guard).
           for pkg in "$@"; do
             echo "::group::tarpaulin -p $pkg"
             echo "--- resources before $pkg ---"
