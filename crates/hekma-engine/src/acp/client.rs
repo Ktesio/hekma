@@ -397,4 +397,23 @@ mod tests {
         };
         assert!(write.to_string().contains("session/new"), "{write}");
     }
+
+    // 2026-09-28 coverage batch: the remaining Display arms — the
+    // start-refusal surface renders these, so their facts are pinned too.
+    #[test]
+    fn remaining_handshake_error_arms_render_their_facts() {
+        assert!(HandshakeError::MissingProtocolVersion
+            .to_string()
+            .contains("protocolVersion"));
+        let malformed = HandshakeError::MalformedResponse {
+            method: "initialize",
+            detail: "no usable version".to_string(),
+        };
+        let text = malformed.to_string();
+        assert!(text.contains("initialize"), "{text}");
+        assert!(text.contains("no usable version"), "{text}");
+        assert!(HandshakeError::MissingSessionId
+            .to_string()
+            .contains("sessionId"));
+    }
 }

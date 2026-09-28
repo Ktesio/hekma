@@ -413,4 +413,41 @@ mod tests {
         // session/cancel names the session and nothing else.
         assert_eq!(session_cancel_params("s-9"), json!({"sessionId": "s-9"}));
     }
+
+    // 2026-09-28 coverage batch: the reader surfaces codec errors through
+    // Display (the malformed-line notice renders `{err}`), so every arm's
+    // wording is product surface and pinned here.
+    #[test]
+    fn every_codec_error_display_arm_renders_its_fact() {
+        assert_eq!(CodecError::NotJson.to_string(), "line is not valid JSON");
+        assert_eq!(
+            CodecError::NotAnObject.to_string(),
+            "line is valid JSON but not an object"
+        );
+        assert_eq!(
+            CodecError::Unclassifiable.to_string(),
+            "line is neither a JSON-RPC response nor a notification"
+        );
+        assert_eq!(
+            CodecError::UnusableId.to_string(),
+            "response id is not an unsigned integer"
+        );
+    }
+
+    #[test]
+    fn a_non_string_method_and_a_request_with_a_non_u64_id_are_typed_refusals() {
+        // A `method` that is not a string cannot be routed as either a
+        // request or a notification — unclassifiable (the as_str guard).
+        assert_eq!(
+            parse_line(r#"{"method":5,"params":{}}"#).unwrap_err(),
+            CodecError::Unclassifiable
+        );
+        // A REQUEST (method + id) whose id is not a u64 is unusable too —
+        // the guard is distinct from the response-side one the round-trip
+        // test exercises.
+        assert_eq!(
+            parse_line(r#"{"method":"fs/read","id":"abc"}"#).unwrap_err(),
+            CodecError::UnusableId
+        );
+    }
 }
