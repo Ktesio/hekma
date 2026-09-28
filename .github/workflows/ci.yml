@@ -1136,12 +1136,13 @@ jobs:
           # merge.
           rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
           cargo +stable build -p hekma-conformance --bin fake_acp_agent
-          # NO RETRY WRAPPER. The former 3-attempt whole-job retry (PR #117, built
-          # on a since-disproven "runner contention" theory) could never converge:
-          # the failure above is DETERMINISTIC, so every attempt re-hit it. It
-          # stays removed -- the coverage steps below run exactly ONCE. (The
-          # per-crate split, swap, and disk reclaim are a SEPARATE OOM mitigation
-          # and stay untouched.)
+          # NO RETRY WRAPPER for the STALE-HELPER failure: that failure (the
+          # guard above) is DETERMINISTIC — a stale binary re-fails every
+          # attempt, so retrying could never converge. It stays removed.
+          # The tarpaulin invocations below DO carry a bounded per-crate
+          # retry (see the loop) for the SEPARATE llvm_profparser panic
+          # family — a proven same-SHA flip (2026-09-28, #239), where a
+          # bounded retry converges.
           rm -rf cov && mkdir -p cov
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, hekma-engine LAST (see the WHY comment above).
@@ -1160,9 +1161,30 @@ jobs:
             echo "--- resources before $pkg ---"
             free -h || true
             df -h / || true
-            cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
-              --exclude-files 'crates/hekma-conformance/src/bin/*' \
-              -p "$pkg" --out Lcov --output-dir "cov/$pkg"
+            # Bounded per-crate retry (2026-09-28, #239): the llvm_profparser
+            # merge intermittently dies on "llvm_profparsers works on complete
+            # data" — a same-SHA run-to-run flip, so this converges. Each
+            # attempt starts with a CLEAN profraw set: tarpaulin's merge walks
+            # the WHOLE directory (minus pre-existing files), so a prior
+            # attempt's partial file would poison every later merge. Earlier
+            # crates' tracefiles are already safe in cov/. The root-cause loop
+            # stays open: panics ship the profraws in the diagnostics
+            # artifact below.
+            attempt=1
+            while true; do
+              rm -rf target/tarpaulin/profraws
+              if cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+                  --exclude-files 'crates/hekma-conformance/src/bin/*' \
+                  -p "$pkg" --out Lcov --output-dir "cov/$pkg"; then
+                break
+              elif [ "$attempt" -lt 4 ]; then
+                attempt=$((attempt + 1))
+                echo "::warning::tarpaulin -p $pkg failed (attempt $((attempt - 1))/4) — retrying with a clean profraw set"
+              else
+                echo "::error::tarpaulin -p $pkg failed on all 4 attempts"
+                exit 1
+              fi
+            done
             echo "::endgroup::"
           done
           # Merge the per-crate tracefiles into the workspace aggregate. The
@@ -1246,7 +1268,11 @@ jobs:
         # ALWAYS — a gate failure ships its own evidence: merged.info carries
         # the per-line DA records, so a CI-vs-local uncovered gap is diffable
         # instead of guessed at (the failed-step log blob truncates; observed
-        # 2026-09-28, #239).
+        # 2026-09-28, #239). The PROFRAWS ride along for the llvm_profparser
+        # panic family: a panic job's directory holds the partial file(s)
+        # themselves — header-declared size vs actual bytes answers WHO wrote
+        # an incomplete profile, which the logs cannot (the panicking job's
+        # runner discards them otherwise).
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1254,5 +1280,6 @@ jobs:
           path: |
             cov/merged.info
             cov/summary.txt
+            target/tarpaulin/profraws/
           retention-days: 7
           if-no-files-found: ignore
