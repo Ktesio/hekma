@@ -675,6 +675,7 @@ fn run_helper(mode: &str, root: &Path) -> (String, PathBuf, PathBuf) {
         .env(STATE_ENV, &state)
         .env(EXPECTED_ENV, &expected)
         .env(CAPTURED_ENV, &captured)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         // `.output()` captures stderr into the result by default.
         .output()
         .expect("run the diagnostic-sink helper subprocess");

@@ -1341,6 +1341,7 @@ fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "acp_helper_subprocess", "--nocapture"])
         .env("KTESIO_ACP_STATE", base.path())
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run the acp helper subprocess");
     assert!(

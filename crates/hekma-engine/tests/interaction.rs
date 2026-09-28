@@ -498,6 +498,7 @@ fn run_engine1(state: &Path, manifest: &Path) {
             "--nocapture",
         ])
         .env("KTESIO_INTERACTION_ADOPTION_HELPER", "1")
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .env("KTESIO_INTERACTION_ADOPTION_STATE", state)
         .env("KTESIO_INTERACTION_ADOPTION_MANIFEST", manifest)
         .status()

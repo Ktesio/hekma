@@ -1116,13 +1116,18 @@ jobs:
           # helper posture, docs/testing.md — so plain vs instrumented is
           # gate-neutral.) Freshness guard for the same Cargo.lock-keyed
           # cache reason as fake_agent above.
-          # The SECOND source was the crash-shape suites' re-exec'd HELPER
-          # SUBPROCESSES (adoption/acp_lifecycle/interaction/logs/agent_cli):
-          # the helper IS the instrumented test binary, and its
-          # std::process::exit profile write raced the per-binary merge
-          # (run-to-run flip on the same SHA, 2026-09-28). Fixed in Rust:
-          # hekma_conformance::exit_helper_subprocess writes the profile
-          # EXPLICITLY before exiting (cfg(tarpaulin)-gated).
+          # The SECOND source was the re-exec'd HELPER SUBPROCESSES of the
+          # crash-shape suites (adoption/acp_lifecycle/interaction/logs/
+          # agent_cli): the helper IS the instrumented test binary, and a
+          # profraw of its writing ends up in the binary's merge set — where
+          # it parsed as INCOMPLETE on a loaded runner (run-to-run flip on
+          # the same SHA, 2026-09-28). An explicit in-helper profile write
+          # BEFORE its forced exit did NOT stop the panic (the next push
+          # still lost an attempt) — so the fix is at the SPAWN: every
+          # re-exec site redirects LLVM_PROFILE_FILE to a scratch path via
+          # hekma_conformance::helper_profile_env() (the runtime reads the
+          # path at INIT, so the parent must set it), and the helper's
+          # profraw never enters the merge set at all. DETERMINISTIC.
           # RESIDUAL (surfaced, not silent): two SIGKILL channels cannot
           # pre-write their profile — agent_cli.rs's hung-CLI harness kill
           # and acp_lifecycle.rs's real-agent probe kill. Both fire only on
@@ -1205,6 +1210,22 @@ jobs:
           echo "::group::merged coverage summary"
           lcov --summary cov/merged.info --ignore-errors inconsistent 2>&1 | tee cov/summary.txt
           echo "::endgroup::"
+          # The gate number MUST survive a failed job: the step LOG blob for a
+          # failed step can truncate (observed 2026-09-28 — the merged number
+          # was unrecoverable from the #239 gate failure). The step SUMMARY is
+          # a separate surface that does not truncate, and the per-crate lines
+          # make a local-vs-CI gap attributable to a specific crate.
+          {
+            echo "## Coverage gate (per-crate split, #101)"
+            echo '```'
+            cat cov/summary.txt
+            for pkg in "$@"; do
+              if [ -s "cov/$pkg/lcov.info" ]; then
+                echo "$pkg: $(lcov --summary "cov/$pkg/lcov.info" --ignore-errors inconsistent 2>&1 | grep -E 'lines\.\.\.' | sed 's/^ *//')"
+              fi
+            done
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           lines_pair="$(grep -E '^[[:space:]]*lines[.]*:' cov/summary.txt \
             | sed -E 's/.*\(([0-9]+) of ([0-9]+) lines\).*/\1 \2/' | head -1)"
           hit="${lines_pair%% *}"
@@ -1221,3 +1242,17 @@ jobs:
             echo "::error::Merged workspace coverage ${pct}% (${hit}/${found} lines) is below the 95% gate (#101 per-crate split + lcov merge)."
             exit 1
           fi
+      - name: Upload the coverage measurement (diagnostics)
+        # ALWAYS — a gate failure ships its own evidence: merged.info carries
+        # the per-line DA records, so a CI-vs-local uncovered gap is diffable
+        # instead of guessed at (the failed-step log blob truncates; observed
+        # 2026-09-28, #239).
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-measurement
+          path: |
+            cov/merged.info
+            cov/summary.txt
+          retention-days: 7
+          if-no-files-found: ignore

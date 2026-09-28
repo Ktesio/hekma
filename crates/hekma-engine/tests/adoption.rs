@@ -204,6 +204,7 @@ fn run_engine1(mode: &str, state: &Path, manifest: &Path) {
         .env("KTESIO_ADOPTION_HELPER", mode)
         .env("KTESIO_ADOPTION_STATE", state)
         .env("KTESIO_ADOPTION_MANIFEST", manifest)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run engine-1 helper subprocess");
     assert!(

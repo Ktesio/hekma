@@ -837,6 +837,7 @@ fn run_engine1(state: &Path, manifest: &Path) {
         .env("KTESIO_LOGS_ADOPTION_HELPER", "1")
         .env("KTESIO_LOGS_ADOPTION_STATE", state)
         .env("KTESIO_LOGS_ADOPTION_MANIFEST", manifest)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run engine-1 helper subprocess");
     assert!(
@@ -1120,6 +1121,7 @@ fn run_crash_helper(state: &Path, manifest: &Path) {
         .env("KTESIO_CRASH_HELPER", "1")
         .env("KTESIO_CRASH_STATE", state)
         .env("KTESIO_CRASH_MANIFEST", manifest)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run crash-kill helper subprocess");
     assert!(

@@ -82,6 +82,7 @@ fn start_via_surviving_engine(state_dir: &Path, name: &str) {
         ])
         .env("KTESIO_CLI_START_HELPER", name)
         .env("KTESIO_STATE_DIR", state_dir)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run cli start helper subprocess");
     assert!(
@@ -2800,6 +2801,7 @@ fn start_via_uj3_breach_helper(state_dir: &Path, name: &str) {
         ])
         .env("KTESIO_CLI_UJ3_BREACH_HELPER", name)
         .env("KTESIO_CLI_UJ3_REEXEC_ARMED", "1")
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .env("KTESIO_STATE_DIR", state_dir)
         .status()
         .expect("run uj3 breach helper subprocess");
@@ -7610,6 +7612,7 @@ fn acp_e2e_sentinel_turn_lands_the_ledger_and_clears_the_gap_through_the_binary(
         ])
         .env("KTESIO_ACP_TURN_HELPER", name)
         .env("KTESIO_STATE_DIR", state_dir)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run acp turn helper subprocess");
     assert!(
