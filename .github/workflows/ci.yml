@@ -1173,6 +1173,27 @@ jobs:
             attempt=1
             while true; do
               rm -rf target/tarpaulin/profraws
+              # Re-assert the PLAIN helpers before EVERY attempt. Evidence
+              # (2026-09-29, the #239 diagnostics artifact): on CI the
+              # helpers are INSTRUMENTED by the time the spawning suites run
+              # — tarpaulin's own builds of the conformance package's bins
+              # during the job leave uplifted instrumented copies at
+              # target/debug/fake_* (the artifact census: 13 hekma_engine-
+              # prefixed profraws, 3040-byte child profiles, multi-pid
+              # families in every spawning suite — versus exactly ONE file
+              # per binary on a local run). An instrumented agent spawned by
+              # the ENGINE inherits the TEST's LLVM_PROFILE_FILE (the
+              # spawn-time redirect only covers the test-binary re-execs),
+              # writes into the merge set, and the stop ladder's SIGKILL
+              # leaves it partial. The top-of-job guard above is therefore
+              # NOT enough; every attempt re-asserts plain helpers. Their
+              # own coverage stays excluded (--exclude-files, docs/testing.md
+              # posture), so plain vs instrumented is gate-neutral.
+              rm -f target/debug/fake_agent target/debug/fake_agent.exe
+              rm -f target/debug/hermes_shim target/debug/hermes_shim.exe
+              rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
+              cargo +stable build -p hekma-conformance --bin fake_agent \
+                --bin hermes_shim --bin fake_acp_agent
               if cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
                   --exclude-files 'crates/hekma-conformance/src/bin/*' \
                   -p "$pkg" --out Lcov --output-dir "cov/$pkg"; then
