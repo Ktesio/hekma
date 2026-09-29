@@ -89,13 +89,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
-    # doctest pass. 25 gives headroom now that the heavy hekma-engine integration
-    # tests are SERIALIZED (the `engine-integration-serial` max-threads=1 test-group
-    # in .config/nextest.toml) — the source fix for the x86-ubuntu `adoption` hang
-    # (#106), where concurrent heavy process-spawning wedged the 2-core runner into
-    # an uninterruptible D-state. nextest's per-test kill-timeout (see
-    # .config/nextest.toml) remains the cross-OS per-test hang guard.
-    timeout-minutes: 25
+    # doctest pass. 25 was calibrated when the suite fit (the heavy hekma-engine
+    # integration tests are SERIALIZED — the `engine-integration-serial`
+    # max-threads=1 test-group in .config/nextest.toml, the #106 x86-ubuntu
+    # `adoption` hang fix); the suite has since GROWN past 1,295 nextest tests
+    # (epics 12-14), and the windows-latest leg now rides the 25-minute wall
+    # under runner contention — GitHub marks a job timeout as CANCELLED, so
+    # three consecutive runs died silently at ~25m05s (2026-09-22/23, the
+    # #235 window; bisect: identical Rust content green at the #193 merge
+    # run). 40 restores real headroom. nextest's per-test kill-timeout (see
+    # .config/nextest.toml) remains the cross-OS per-test hang guard; the
+    # residual Windows slow-runner flake family (TCK observed-section 30s
+    # contention timeouts + a still-unidentified silent stall) is chartered
+    # under epic-12 retro item 95 (see #236).
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -474,12 +481,19 @@ jobs:
           # detection) grandfathered until epic 8 relocates/deprecates them
           # (AC-4 amendment, ratified 2026-07-02; paths updated for the
           # v0.8.0 crates/kt -> crates/hekma move), plus engine integration
-          # TESTS: the symlink-containment test (memory.rs:605, story 5-1) is
-          # the one honestly unix-gated suite there under the AI-35 disclosure
-          # convention ("the test does not exist on Windows" rather than
-          # passing vacuously) — adoption/interaction suites deliberately use
-          # NO cfg (data-driven OS ids); no production code may use cfg.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/'
+          # TEST files enumerated ONE BY ONE (2026-09-22 hardening: the old
+          # directory-wide tests/ allowlist let any future test file add
+          # OS-cfg silently; the teeth are per-file now) — each with its
+          # justification:
+          #   * atomic_config_writes.rs — 11-2's atomic-write tests inject
+          #     failure via unix-only syscalls; the suite is #[cfg(unix)].
+          #   * memory.rs — the symlink-containment test (story 5-1) is the
+          #     honestly unix-gated suite under the AI-35 disclosure
+          #     convention ("the test does not exist on Windows" rather than
+          #     passing vacuously).
+          # adoption/interaction suites deliberately use NO cfg (data-driven
+          # OS ids); no production code may use cfg outside backends/.
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -497,10 +511,10 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/ and crates/hekma-engine/tests/ (legacy kt self-update files are grandfathered until epic 8)."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, and the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs). A new cfg use in any other test file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
             exit 1
           fi
-          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files."
+          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites."
       - name: Enforce single currency-formatting module (story 3-3, AD-8)
         shell: bash
         run: |
@@ -726,12 +740,18 @@ jobs:
           # FRESH POST-RENAME BASELINES (pinned 2026-09-16, after the
           # hekma-* publishes, to 54dc79c — the PR #188 correction merge,
           # the first main-side rev carrying the hekma-* package names).
-          # Same-name baseline diffing works again from here; the rename
+          # EPIC-14 NOTE (resolved 2026-09-22): both baselines bumped to
+          # 1e71389 — the PR #193 epic-14 squash — for the announced
+          # hekma-engine 0.4.0→0.5.0 extension (`EngineError::
+          # AcpTurnInFlight` + `SpawnSpec.pipe_stdout`); the #181/#184
+          # post-merge step. adapter-api's epic-14 diff was semver-clean
+          # (doc comments only); its baseline rides the same rev.
+          # Same-name baseline diffing works from here on; the rename
           # surface checks above stay as the old-vs-new compat guard.
           # BASELINE-REV CONSTRAINT: main-history revs only; bump here AND
           # in scripts/test_automation.py together at the next freeze.
-          cargo +stable semver-checks check-release -p hekma-adapter-api --baseline-rev 54dc79c46f2c538762a4743898c3014e34ffcfe8
-          cargo +stable semver-checks check-release -p hekma-engine --baseline-rev 54dc79c46f2c538762a4743898c3014e34ffcfe8
+          cargo +stable semver-checks check-release -p hekma-adapter-api --baseline-rev 1e713898f7b0b805dff83bd80e24febe99ca957f
+          cargo +stable semver-checks check-release -p hekma-engine --baseline-rev 1e713898f7b0b805dff83bd80e24febe99ca957f
           for crate in hekma-engine hekma-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
@@ -984,6 +1004,11 @@ jobs:
           sudo swapon /mnt/covswap
           echo "after:"; df -h / /mnt; free -h
       - name: Enforce coverage (per-crate split + merged aggregate gate, #101)
+        env:
+          # TEMPORARY (2026-09-26): the llvm_profparser panic (Nom(Eof) on a
+          # partial profraw after the acp_lifecycle run) needs its full
+          # backtrace to pin the parse path. Remove once root-caused.
+          RUST_BACKTRACE: full
         # WHY the split (#101): a single `cargo tarpaulin --workspace` instruments
         # the ENTIRE graph (tokio + bundled-SQLite C + a 13-crate hyper stack) and
         # runs all ~1075 tests instrumented; even after the AI-23 fixes (dedicated
@@ -1072,12 +1097,20 @@ jobs:
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, hekma-engine LAST (see the WHY comment above).
           set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma hekma-engine
+          # The conformance test-support BINS (fake_agent, fake_acp_agent,
+          # hermes_shim) are excluded from instrumentation: their lines are
+          # not part of any crate's gate, but the acp_lifecycle suite's stop
+          # ladder SIGKILLs spawned fake_acp_agent children, and a killed
+          # instrumented process leaves a PARTIAL profraw that crashes
+          # llvm_profparser at the merge ("parser failure: Nom(Eof)",
+          # deterministic since epic-14 — 2026-09-26 diagnosis).
           for pkg in "$@"; do
             echo "::group::tarpaulin -p $pkg"
             echo "--- resources before $pkg ---"
             free -h || true
             df -h / || true
             cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              --exclude-files 'crates/hekma-conformance/src/bin/*' \
               -p "$pkg" --out Lcov --output-dir "cov/$pkg"
             echo "::endgroup::"
           done

@@ -9,6 +9,8 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
+> **Unreleased — port-level memory-backing kind invariant (hardening batch).** The state store now refuses a re-attach that changes the attached kind (`StoreError::MemoryBackingKindConflict`, new exhaustive-enum variant; detach first, then attach). CLI behavior is unchanged — the registry always enforced this. `hekma-engine` → **0.6.0**.
+
 > **Compatibility notice — announced ahead of the next release (Adapter Contract v1 freeze).**
 > Per the deprecation policy ratified by Islam on 2026-09-04 (*within a major, deprecations announced ≥1 minor ahead via CHANGELOG/RELEASE_NOTES + doc notices; removals only at next major; enforced by semver-checks CI*):
 >
