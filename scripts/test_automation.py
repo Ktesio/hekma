@@ -217,7 +217,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
         self.assertIn(
             'cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 '
-            "--verbose \\\n              -p \"$pkg\" --out Lcov --output-dir "
+            "--verbose \\\n              --exclude-files "
+            "'crates/hekma-conformance/src/bin/*' \\\n"
+            '              -p "$pkg" --out Lcov --output-dir '
             '"cov/$pkg"',
             ci,
         )
@@ -423,12 +425,17 @@ class ReleaseDocsTests(unittest.TestCase):
         # (AI-35 disclosure convention) alongside the backends home. Assert the
         # FULL allowlist LINE shape (review blind-12): a bare substring would
         # also match a stale comment quoting the pattern, so a narrowed
-        # allowlist (e.g. a dropped legacy-file entry) must fail here.
+        # allowlist (e.g. a dropped legacy-file entry) must fail here. The
+        # 2026-09-22 hardening narrowed the engine-tests entry from the whole
+        # tests/ directory to the TWO files that genuinely use OS-cfg
+        # (atomic_config_writes.rs, memory.rs), each justified in the step
+        # comment — the pin follows the new line exactly.
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
             r"|^crates/hekma/src/cli/self_update\.rs:"
-            r"|^crates/hekma-engine/tests/'",
+            r"|^crates/hekma-engine/tests/atomic_config_writes\.rs:"
+            r"|^crates/hekma-engine/tests/memory\.rs:'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
@@ -570,7 +577,8 @@ class ReleaseDocsTests(unittest.TestCase):
             check_release_sites,
             3,
             "three armed check-release sites: the fresh post-rename "
-            "baselines pinned to 54dc79c (hekma-adapter-api + hekma-engine) "
+            "baselines pinned to 1e71389 — the PR #193 epic-14 squash "
+            "(2026-09-22) — for hekma-adapter-api + hekma-engine, "
             "plus the crates.io release-to-release loop; "
             f"found {check_release_sites}",
         )

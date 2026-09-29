@@ -28,7 +28,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 
 [workspace.dependencies]
 # Internal crates
-hekma-engine = { path = "crates/hekma-engine", version = "0.5.0" }
+hekma-engine = { path = "crates/hekma-engine", version = "0.6.0" }
 hekma-adapter-api = { path = "crates/hekma-adapter-api", version = "0.2.0" }
 hekma-adapters-hermes = { path = "crates/hekma-adapters-hermes", version = "0.2.0" }
 

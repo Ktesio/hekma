@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "09-19-2026 05:28"
+last_updated: "09-22-2026 21:51"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -106,6 +106,7 @@ development_status:
   10-1-embedding-test-support-consolidation: done  # 🎉 MERGED to main 2026-09-10 as b590dc8 (PR #180, epic-10). test_support module: 11 builders + 2 drains + 3 locators consolidated; zero assertion changes.  # 2026-09-10: consolidated into ktesio-conformance test_support (ManifestFixture presets, unified drains, BinDir locator). Zero assertion changes; 1114 tests green; 95.24%.  # one test-support home for the manifest builders + drains (issue #164)
   10-2-host-provided-diagnostic-sink: done  # 🎉 MERGED as b590dc8 (PR #180). DiagnosticSink (opt-in, default stderr byte-identical); audit allowlist emptied with count==1 choke-point pins; rotation + panic-safety + Arc-share tested.  # 2026-09-10: DiagnosticSink (opt-in, default stderr byte-identical), both AD-12 diagnostics routed through one choke point; audit allowlist EMPTY with count==1 choke-point pins; 5 sink tests + negative teeth. 1119 tests, 95.26%.  # additive public API; removes the 2 audit allowlist entries
   10-3-event-bus-resync-and-subscriber-budget: done  # 🎉 MERGED as b590dc8 (PR #180). resync_events backfill helper (crash-window remedy, family-major, torn-tail honest) + subscriber-active budget gated (CPU 0.25pts, RSS 2MiB, p99 100ms).  # 2026-09-10: resync_events (committed-truth backfill as EngineEvents, family-major ordering, backfill-then-subscribe contract, torn-tail tolerant, cursor continuation) + subscriber-active budget GATED in the perf harness (CPU delta 0.25pts, RSS 2MiB, read-p99 100ms — ratified from observed ~zero fan-out cost). 4 integration + 7 unit tests. Deferred-work 7-2/7-5 entries resolved.  # subscribe-with-backfill helper + ratified subscriber-active budget
+  epic-10-retrospective: done  # 2026-09-22 — epic-10-retro-2026-09-22.md (accepted-with-open-items; the 10/13/14 catch-up batch — the key was never created at epic close, added by the retro run).
   epic-11: done  # 🎉 COMPLETE 2026-09-14: MERGED to main as bee7d48 (PR #181, epic-11 squash) — all 7 stories landed; the engine semver baseline was bumped to bee7d48 as the ratified post-merge follow-up; AI-20/AI-47 remain OPEN awaiting Islam's product calls. Opened 2026-09-10 by sprint change proposal (sprint-change-proposal-2026-09-10-cleanup.md, Islam-approved): Technical Debt & Process Cleanup — 65 retro action items organized into 7 thematic stories
   epic-11-retrospective: done
   11-1-engine-robustness-batch: done  # 🎉 MERGED to main 2026-09-14 as bee7d48 (PR #181, epic-11 squash). AI-4/7/8/9/12/13/14/15/16/41/44 — implemented 2026-09-11: AI-12 poll-error streak → crash input (pure poll_verdict helper + streak-clear pins); AI-13 adopted exit-code-unavailable crash cause; AI-14 spawn fails closed on fingerprint-read failure (unix+windows, no start_time=0 sentinel); AI-15 Engine::fleet_entry single-instance facade + show --json uses it (NotFound → exit 3 preserved); AI-16 fleet() batched spawn-record map (N+1 killed, other per-instance reads untouched); AI-41 ledger INSERT failure parks the drain cursor + retries (dedup-key safe); AI-44 budgets re-evaluated at adoption (over-budget run enforced at Engine::open); AI-7 ResumeUnsupported CLI arm (exit 5) + rustdoc; AI-8 guaranteed-no-handle pause cause pinned; AI-9 persist-first pause order test. Battery green (fmt/clippy/test 1153/check_docs); embed_clean sink pin re-reviewed for the new AI-41 diagnostic route; uj3 shared breach assertion now per-(dimension, Run). Loop 1 review 2026-09-11: AI-12 re-derived (same-tick cross-handle corroboration systemic guard + truncated last-error cause text + cfg(test) supervisor-side poll-fault seam with both-direction wiring tests — backend-global seam rejected by the embed-clean zero-global-cell audit) + all 13 review patches applied; battery 1158 green. Post-review CI fix b2cfe75 (2026-09-14, proven on the PR's windows-latest legs): the AI-9 test's Leg-A directory-rename injection and both frozen-heartbeat probes are data-driven-OsId runtime skips on Windows (tests/pause.rs idiom — the rename is a sharing violation while the child holds agent.log open; AD-4 cooperative pause means no real suspension to probe), while the persist-first LEDGER legs (B + resume) run on every OS
@@ -134,16 +135,18 @@ development_status:
   # agent becomes a backend via the builtin `acp` kind; frozen contract v1 NOT engaged (B3 precedent);
   # honest unmetered v1 (D2); minimal capability advertisement (D3); session persistence + load (D4).
   # PRD gains FR-40 + SM-1 note; architecture gains AD-19 at 14-1's spec stage.
-  epic-14: done  # 🎉 ALL SIX STORIES COMPLETE 2026-09-20 on feat/epic-14-acp-backend-support (PR #193): 14-1 transport (3833c28), 14-6 cached tokens (a94c9b1), 14-3 usage acquisition (rode 2684d9e, documented), 14-2 sessions (e9f0f51), 14-5 hermes retirement path (101b6a5), 14-4 verification+docs (final). Windows CI red fixed en route (cooperative cancel + best-effort signals). MERGE CHECKLIST at squash: move the semver baseline SHA in ci.yml (--baseline-rev + cat-file probe) AND scripts/test_automation.py to the squash commit; hekma-engine 0.5.0 (AcpTurnInFlight + SpawnSpec.pipe_stdout announced) rides the next publish; epic-14 retro per convention.
-  14-1-acp-transport-core-builtin-acp-kind: done  # 🎉 LANDED 2026-09-19/20 (commit 3833c28): src/acp/ (codec/client/updates/connection, 2029 lines), fake_acp_agent + acp_lifecycle 8 e2e + ~17 unit, supervisor spawn/send/stop wiring, detached-acp honest refusal. ANNOUNCED BREAKS (AI-55 two-pass done): EngineError::AcpTurnInFlight (exhaustive enum — hosts need the arm) + SpawnSpec.pipe_stdout (trait methods take_stdin/take_stdout DEFAULTED) → hekma-engine 0.5.0; banners in RELEASE_NOTES + CHANGELOG. embed_clean audit: child-stdio-accessor exemption added, the one process-stdio reach still pinned. MERGE CHECKLIST (the #181/#184 precedent, do at the epic's merge): move the semver baseline SHA in ci.yml (--baseline-rev + cat-file probe) AND scripts/test_automation.py to the epic-14 squash commit; engine 0.5.0 rides the next publish.
+  epic-14: done  # 🎉 ALL SIX STORIES COMPLETE 2026-09-20 on feat/epic-14-acp-backend-support (PR #193): 14-1 transport (3833c28), 14-6 cached tokens (a94c9b1), 14-3 usage acquisition (rode 2684d9e, documented), 14-2 sessions (e9f0f51), 14-5 hermes retirement path (101b6a5), 14-4 verification+docs (final). Windows CI red fixed en route (cooperative cancel + best-effort signals). MERGE CHECKLIST at squash: move the semver baseline SHA in ci.yml (--baseline-rev + cat-file probe) AND scripts/test_automation.py to the squash commit; hekma-engine 0.5.0 (AcpTurnInFlight + SpawnSpec.pipe_stdout announced) rides the next publish; epic-14 retro per convention. 🎉 MERGED to main 2026-09-22 as 1e71389 (PR #193, epic-14 one-PR squash); semver baseline moved to 1e71389 in ci.yml + scripts/test_automation.py (PR #229, #181/#184 precedent). MERGE CHECKLIST from the in-progress note: DONE.
+  14-1-acp-transport-core-builtin-acp-kind: done  # 🎉 LANDED 2026-09-19/20 (commit 3833c28): src/acp/ (codec/client/updates/connection, 2029 lines), fake_acp_agent + acp_lifecycle 8 e2e + ~17 unit, supervisor spawn/send/stop wiring, detached-acp honest refusal. ANNOUNCED BREAKS (AI-55 two-pass done): EngineError::AcpTurnInFlight (exhaustive enum — hosts need the arm) + SpawnSpec.pipe_stdout (trait methods take_stdin/take_stdout DEFAULTED) → hekma-engine 0.5.0; banners in RELEASE_NOTES + CHANGELOG. embed_clean audit: child-stdio-accessor exemption added, the one process-stdio reach still pinned. MERGE CHECKLIST (the #181/#184 precedent, do at the epic's merge): move the semver baseline SHA in ci.yml (--baseline-rev + cat-file probe) AND scripts/test_automation.py to the epic-14 squash commit; engine 0.5.0 rides the next publish. 🎉 MERGED to main 2026-09-22 as 1e71389 (PR #193); semver baseline moved to 1e71389 (PR #229). MERGE CHECKLIST: DONE.
   14-2-acp-sessions-across-lifetimes: done  # 🎉 LANDED 2026-09-20 (commit e9f0f51): schema v8 (nullable acp_session_id on the spawn record, crash-atomic in the v6/v7 style), the resume decision order in the handshake (persisted+loadSession-advertised → session/load; unsupported → new+note; load failure → fallback+note; none → silent new), adoption is NOT re-piped (stdio died with the spawner — ratified during the story) so resume rides the NEXT start's handshake and the adoption note names the recorded id; settle RETAINS the id so a later start of a finished instance resumes; detach composition preserved. Fake agent --advertise-load/--fail-load/--linger-on-eof. 4 store + 5 lifecycle tests. Docs sweep → 14-4.
   14-3-acp-usage-acquisition-tiered: done  # 🎉 LANDED 2026-09-20 — content rode commit 2684d9e (the CI-fix commit swept it via git add -A during concurrent subagent work; documented in the follow-up commit + PR body): T1 usage_update → per-instance context-grain surfacing (acp_context_usage in show/--json, never billed), T2 the observed opt-in (metering.upstream_base_url resolves the acp kind's ACTIVE source to engine-observed; listener URL as OPENAI_BASE_URL env via a one-target builtin mapping; observed pipeline untouched), T3 a NEW stderr sentinel channel (the old drain read agent.log/stdout only — acp stdout is protocol-pure; own cursor + AI-41 park), and the honest — gap notice (usage_gap: observed/sentinel/context_usage_reported + notice) in show --json + list stderr. Tests: acp_lifecycle +3, observed +1, resolver/mapping/fleet/kt-render pins. Deferred: docs sweep + kt e2e → 14-4.
   14-6-cached-tokens-across-the-metering-pipeline: done  # 🎉 LANDED 2026-09-20 (commit a94c9b1): the D8 chain end to end for both kinds — parse 3 shapes w/ the INPUT-INCLUSIVE invariant enforced at the seam (Anthropic exclusive counters normalized at parse; cache-creation bills as input), schema v7 (cached_tokens + cached_micros_per_1m, both NULLABLE — the no-retro-repricing pattern extended; dedup key unchanged), optional Rate cached rate w/ the conservative input-rate default, budgets enforce via the inclusive input (never-added-again e2e pinned), surfaces distinguish; Gemini shape deferred (no upstream shape exists — documented seam); Anthropic 1.25× write premium documented-approximate. No schema change needed in 14-3 anymore — the foundation exists.
+  epic-14-retrospective: done  # 2026-09-22 — epic-14-retro-2026-09-22.md (accepted-with-open-items; the 10/13/14 catch-up batch — the key was never created at epic close, added by the retro run).
   14-4-acp-verification-and-docs: done  # 🎉 LANDED 2026-09-20 — the epic's final story: 3 binary-level e2e (register/refusal/handshake/gap surfaces; full turn lands 40/20/25-cached through the binary; adopted-survivor resume note, unix), the six-page docs sweep (commands/agents/troubleshooting/architecture/testing/embedding), real_gemini_acp_smoke armed (honest skip; binary absent), spec closeout (all checkboxes ticked + Closeout change-log entry), and the semver/dependency proofs (zero new packages; adapter-api diff = doc comments + relicense metadata only, semver-clean). EPIC 14 COMPLETE.
   14-5-hermes-kind-deprecation-path: done  # 🎉 LANDED 2026-09-20: parity verdict = the acp kind ALREADY metered hermes-shaped agents (same channel-generic stderr sentinel drain); the proof hole closed (fake agent now emits the hermes-shaped line incl. cached_tokens; exactly-once asserted). HERMES_HOME under acp via the mapping machinery (memory.dir → HERMES_HOME leaf, pinned by composition + end-to-end echo tests; unbacked fallback unchanged). Deprecation ANNOUNCEMENT in commands/agents/CHANGELOG/RELEASE_NOTES (hermes keeps working; removal at a future MAJOR). real_hermes_acp_smoke armed, honest-skip (binary absent here). No hermes behavior changed.
   13-1-close-the-memory-dir-strip-gap-on-the-invocation-override-path: done  # RESOLVED 2026-09-19: the delivery defect was ALREADY closed by 11-3 (bee7d48 — override-branch strip supervisor.rs:1191-1205 + engine-observed pin observed_metering.rs:826, mutation-verified); 13-1's net change is the genuinely-missing LOCAL-path pin (tests/memory.rs a_hand_set_memory_dir_never_reaches_a_plain_start_surfaces, +102, mutation-verified with a positive control). Retro item epic-5-retro-item-1 reconciled closed.
   13-2-renegotiate-the-contract-on-the-legacy-start-fallback: done  # RESOLVED-PRE-EXISTING 2026-09-19: closed by 7b1a70c2 (PR #172, 2026-09-07, retro item #2) — fallback re-parse negotiates (adapter/mod.rs:338-352 → LaunchResolveError::ContractIncompatible), bypass tests at mod.rs:1348/:1390, docs corrected in the same PR; verified at HEAD, zero code change in epic-13. Retro item epic-6-retro-item-2 reconciled closed.
   13-3-supervisor-module-boundary-split-study: done  # spec stage (supervisor-split-study-2026-09-19.md, options A/B/C) ratified A+B by Islam 2026-09-19; implemented in two compile-gated commits: commit 1 = tests -> supervisor/tests.rs (9101 -> 4775-line supervisor.rs) + embed_clean walker recognizes tests.rs/tests/ test regions; commit 2 = production directory split mod.rs(core+transitions)/spawn/lifecycle/reaper/usage/interaction (pure impl-block moves, 11 cross-family fns widened pub(super), audit path pins updated to the family files). Lock model untouched per AD-18.
+  epic-13-retrospective: done  # 2026-09-22 — epic-13-retro-2026-09-22.md (accepted-with-open-items; the 10/13/14 catch-up batch — the key was never created at epic close, added by the retro run).
   # Epic 9 (retire the legacy skill-manager CLI) — added via correct-course 2026-07-13
   # (sprint-change-proposal-2026-07-13.md); runs NEXT, before Epic 4 (AI-51). Islam-ratified
   # 2026-07-14: CLEAN REMOVAL at v0.6.0; remove top-level `kt list`/`kt show`; PRD FR-37/38
@@ -221,7 +224,7 @@ action_items:
   - id: AI-7
     epic: 1
     owner: "story 1-6"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs resume(): resume fail-fasts when the effective
       pause level reads Unsupported, which could strand a `paused` instance with no
@@ -233,7 +236,7 @@ action_items:
   - id: AI-8
     epic: 1
     owner: "story 1-6"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs signal_backend()/pause(): a guaranteed pause
       when this engine holds no in-memory handle returns Ok and records the plain
@@ -246,7 +249,7 @@ action_items:
   - id: AI-9
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs pause() (guaranteed path): signals SIGSTOP
       THEN persists state=paused — opposite to stop()'s persist-first order. A set_state
@@ -288,7 +291,7 @@ action_items:
   - id: AI-12
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs poll_once: a persistent backend.poll error
       is swallowed as `Err(_) => None` (treat as alive), so a permanently un-pollable
@@ -297,7 +300,7 @@ action_items:
   - id: AI-13
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine supervisor.rs (~609-612): an ADOPTED process that exits
       non-zero reports Exited{code:None} (a non-child's exit code is unrecoverable),
@@ -307,7 +310,7 @@ action_items:
   - id: AI-14
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine backends/{unix,windows}: a fingerprint-read failure at
       spawn writes start_time=0 as a sentinel; if such a process is later still alive,
@@ -319,7 +322,7 @@ action_items:
   - id: AI-15
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt cli/agent.rs `show --json`: builds the single entry via facade.fleet().find(name)
       — an O(N) full-fleet scan for one instance, and it inherits fleet()'s SILENT
@@ -330,7 +333,7 @@ action_items:
   - id: AI-16
     epic: 1
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine engine.rs fleet_entry_for re-reads the spawn record per
       instance while Engine::fleet already holds the registry lock (an N+1 read shape).
@@ -350,7 +353,7 @@ action_items:
   - id: AI-18
     epic: 1
     owner: "tech-writer / project-context"
-    status: open
+    status: done
     severity: low
     action: "Document the 'honest state / surfaced-not-silent' pattern as a project
       principle + code-review checklist item, with the three Epic-1 exemplars (1-5
@@ -396,7 +399,7 @@ action_items:
   - id: AI-21
     epic: 1
     owner: "orchestrator playbook"
-    status: open
+    status: done
     severity: low
     action: "Codify the away-mode / interruption recovery drill used this epic: on
       a subagent cut-off (session limit) or API stall, VERIFY true state from disk
@@ -407,7 +410,7 @@ action_items:
   - id: AI-22
     epic: 1
     owner: "tech-writer"
-    status: open
+    status: done
     severity: low
     action: "AI-17 deferred: contributor docs (CONTRIBUTING.md, AGENTS.md, PR template,
       etc.) still say bare `cargo` and don't note the local-MSRV-pin vs CI-stable
@@ -426,7 +429,7 @@ action_items:
   - id: AI-24
     epic: 2
     owner: "a config/IO-touching story"
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine registry.rs set_config (~635): the accepted-write path
       uses a non-atomic std::fs::write (no temp-file + rename), so a crash mid-write
@@ -437,7 +440,7 @@ action_items:
   - id: AI-25
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt cli/agent.rs `config get <name> <intermediate.table.path>`: reports
       'no effective value' for a table-prefix path even though child leaves exist
@@ -446,7 +449,7 @@ action_items:
   - id: AI-26
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "kt main.rs `config set`: a value beginning with '-' is rejected by clap
       (parsed as a flag) and fails loudly. If verbatim-parity for arbitrary values
@@ -456,7 +459,7 @@ action_items:
   - id: AI-27
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine adapter/mod.rs config-mapping application: a config/pass-through
       Env target (agent.<TAIL> or a known-key Env target) silently SHADOWS a same-named
@@ -469,7 +472,7 @@ action_items:
   - id: AI-28
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "ktesio-engine config-file render (File target) + set_config both use
       non-atomic std::fs::write; a crash mid-write truncates the native config, and
@@ -496,7 +499,7 @@ action_items:
   - id: AI-30
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "story 2-3 review nits (cosmetic): (a) kt cli/agent.rs config_json docstring
       (~716) names value_display/source_label accessors it doesn't call (uses display()/source.as_str())
@@ -539,7 +542,7 @@ action_items:
   - id: AI-33
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "2-4 adversarial audit MEDIUM (doc part fixed IN 2-4; behavior-change
       deferred): a secret:NAME mapped to a `flag` ConfigTarget is delivered as cleartext
@@ -554,7 +557,7 @@ action_items:
   - id: AI-34
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "Pre-existing (NOT introduced by 2-4): RUSTDOCFLAGS=\"-D warnings\" cargo
       doc --document-private-items fails on kt/src/main.rs:324 — the ^[a-z0-9][a-z0-9_-]*$
@@ -618,7 +621,7 @@ action_items:
   - id: AI-39
     epic: 2
     owner:
-    status: open
+    status: done
     severity: medium
     action: "Promote the AI-33 argv/secret boundary from DOCUMENTED to ENFORCED-at-runtime:
       warn (or refuse + steer to env/file) when a secret: value resolves into a Flag
@@ -627,7 +630,7 @@ action_items:
   - id: AI-40
     epic: 2
     owner:
-    status: open
+    status: done
     severity: low
     action: "Bundle sliding doc debt into ONE tech-writer story: the three open Epic-1
       doc items (AI-18/19/21) + two Epic-2 recipes (the git rebase --onto <squash>
@@ -637,7 +640,7 @@ action_items:
   - id: AI-41
     epic: 3
     owner:
-    status: open
+    status: done
     severity: medium
     action: "3-1 ledger M3: a transient store error on the usage INSERT (SQLITE_BUSY
       under WAL contention, disk full) silently drops the event — Supervisor::drain_usage_for
@@ -665,7 +668,7 @@ action_items:
   - id: AI-43
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-1 AC-C literal wording (primary review Low-3): the active Metering
       Source is surfaced in `kt agent show` (human + --json) and `list --json`, but
@@ -677,7 +680,7 @@ action_items:
   - id: AI-44
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-2 budget enforcement crash-gap: enforcement runs only on a fresh Inserted
       usage event, and adopt_orphans (engine.rs) re-holds handles WITHOUT re-evaluating
@@ -691,7 +694,7 @@ action_items:
   - id: AI-45
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-3 FR-23 consistency: the Fleet `list` Usage column's inline DERIVED-COST
       dollar (usage_cell) has the same truncatable-label shape as the Budget cell
@@ -734,7 +737,7 @@ action_items:
   - id: AI-48
     epic: 3
     owner:
-    status: open
+    status: done
     severity: low
     action: "3-4 latent tracing exposure: hyper-util (client-legacy) links `tracing`;
       SAFE today (no tracing-subscriber in the tree → events are no-ops; hyper's own
@@ -1327,7 +1330,7 @@ action_items:
       seam in agent_cli.rs. The story 5-1 deferral whose forcing function (epic 6)
       has passed. [epic-6 retro C2, med]"
     owner: "first test-heavy story"
-    status: open
+    status: in-progress
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-6-docs-hygiene-batch"
     epic: 6
@@ -1338,7 +1341,7 @@ action_items:
       + hermes troubleshooting entry, testing.md TCK editorial pass. [epic-6 retro
       D1-D7, low]"
     owner: "first docs-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-7-memory-json-partial-state"
     epic: 6
@@ -1356,7 +1359,7 @@ action_items:
       but still listed open); one architecture.md sentence on the engine-to-adapters-hermes
       normal edge. [epic-6 retro C1/C6/C7, low]"
     owner: "orchestrator chore"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-6-retro-2026-09-04.md"
   - id: "epic-6-retro-item-9-carry-forward-bind-or-retire"
     epic: 6
@@ -1399,7 +1402,7 @@ action_items:
       missing — CLI-level both directions proven. Also correct the deferred-work 5-2
       entry direction note. [epic-5 retro A5, low]"
     owner: "next engine-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts/epic-5-retro-2026-09-10.md"
   - id: "epic-5-retro-item-5-ad18-lock-model-ratification"
     epic: 5
@@ -1497,7 +1500,15 @@ action_items:
       (crates/hekma-conformance/src/uj3.rs:418), log_file_captures_child_stdout spawn
       start-time race (crates/hekma-engine/src/backends/unix/mod.rs:1042), two_engines
       embed_clean concurrency (crates/hekma-engine/tests/embed_clean.rs:323). Reproduce
-      under load; fix the race or add principled tolerance (no blind retry). [epic-12
+      under load; fix the race or add principled tolerance (no blind retry). WINDOWS EXTENSION (2026-09-23, hardening-session bisect): the same family
+      is red on windows-latest — tck::tests::engine_observed_manifest_adapter_passes_the_observed_section
+      hits the 30s SECTION_TIMEOUT waiting for 3 engine-observed rows (have 2) under
+      runner contention (self-heals on nextest TRY 2; identical Rust content green at
+      the 17:01Z #193 merge run, red at 19:51Z with only docs/ci-python deltas), AND a
+      second symptom: one engine test HANGS (identity not yet pinned — the job burns
+      its 25m timeout, nextest 'Cancelling due to interrupt: 1 test still running').
+      Same charter: reproduce under load, fix the race or add principled tolerance
+      (no blind retry). [epic-12
       retro action 1, MED]"
     owner: "next CI-touching story"
     status: open
@@ -1530,7 +1541,7 @@ action_items:
       change log or correct its loop-2 wording (R4). Owner: next docs-touching change,
       coordinated with the routed Windows story. [epic-12 retro action 4, MED]"
     owner: "next docs-touching change"
-    status: open
+    status: in-progress
     ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
   - id: "epic-12-retro-item-99-c6ecadb-seam-test-or-documented-accept-e"
     epic: 12
@@ -1539,5 +1550,35 @@ action_items:
       reconciliation) or record the accept, next time the Windows backend is touched.
       [epic-12 retro action 5, LOW]"
     owner: "next Windows-touching story"
-    status: open
+    status: done
     ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
+  - id: "epic-10-retro-item-100-deferred-work-md-resolved-marker-hygiene"
+    epic: 10
+    action: "deferred-work.md resolved:-marker hygiene: append the missing resolved
+      marker (story 10-2, PR #180 / b590dc8, 2026-09-10) to the 7-3 host-provided-diagnostic-sink
+      entry and sweep for other shipped-but-unmarked entries so still-open stays greppable."
+    owner: "agent"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-10-retro-2026-09-22.md"
+  - id: "epic-14-retro-item-102-run-bmad-retrospective-at-epic-close-add"
+    epic: 14
+    action: "Run bmad-retrospective at epic close: add it to the epic merge checklist
+      (beside the semver-baseline step) so the retro is part of closing, not a later
+      sweep — epics 10/13/14 completed 2026-09-10/19/20 and retroed only in the 2026-09-22
+      catch-up batch; epic-13 retro was missing entirely, breaking epic-14 follow-through
+      chain."
+    owner: "Islam ratify / agent apply"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-14-retro-2026-09-22.md"
+  - id: "epic-14-retro-item-103-action-item-ledger-drift-run-the-propose"
+    epic: 14
+    action: "Action-item ledger drift: run the proposed --set-action-status batch
+      (listed with sources in epic-14-retro-2026-09-22.md action item 2) — 30+ items
+      that landed in the epic-11 batches (AI-7/8/9/12/13/14/15/16/41/44 row 11-1;
+      AI-24/26/27/28/33/39 row 11-2; AI-18/19/21/22/25/30/34/43/45 row 11-4; AI-48
+      row 11-6; AI-40 superseded-by-11-4; epic-6-retro-item-6/8; epic-5-retro-item-4)
+      proposed done; epic-6-retro-item-5 proposed in-progress; genuinely-open items
+      verified and stay."
+    owner: "Islam confirm / agent execute"
+    status: done
+    ref: "_bmad-output/implementation-artifacts/epic-14-retro-2026-09-22.md"
