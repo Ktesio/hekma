@@ -125,4 +125,4 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # https+SSE composition test). DEV-DEPENDENCY ONLY — never a shipping artifact,
 # NFR-8's runtime-lean policy is untouched. rcgen's default `ring` backend is
 # the SAME ring provider the TLS stack above ships, so no extra C build.
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
