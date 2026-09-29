@@ -4,6 +4,11 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — port-level memory-backing kind invariant (hardening batch).**
+> Announced ahead of the release that ships it:
+>
+> - **`StoreError::MemoryBackingKindConflict`** — new variant on the exhaustive `StoreError` enum (hosts matching exhaustively need the arm or `_`). The state store now enforces the memory-backing kind invariant BELOW the registry: a re-attach that changes the attached kind on an existing row is refused with this typed error (detach first, then attach the new kind) instead of silently replacing it. Same-kind re-attaches are unchanged, and the CLI's behavior is unchanged (the registry always guarded this) — only a caller driving the `StateStore` port directly could ever observe the refusal. `hekma-engine` → **0.6.0**.
+
 > **Unreleased — ACP backend support (the builtin `acp` kind).**
 > Announced ahead of the release that ships it:
 >

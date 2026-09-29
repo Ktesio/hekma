@@ -12,6 +12,18 @@ the artifacts are the project's sprint record, and clones need the tooling).
 Treat them as real, versioned project files — keep them current in the same
 changes that make them stale.
 
+## Project mirror: Fibery
+
+The project's tracking mirror is **Fibery** (Ktesio workspace → Product
+Development → the **Hekma** Product): epics are Features, stories are Tasks,
+and open deferred work lives under the "Hardening & Housekeeping Backlog"
+feature. Names keep the BMAD numbering (`Epic N`, `Story N.M`). The
+GitHub-issue mirror (`_bmad-output/implementation-artifacts/github_sync.py`)
+was retired 2026-09-20 and the script refuses to run. From now on, every
+epic, story, retrospective, and deferred item is mirrored to Fibery in the
+same change that lands it in the repo. The BMAD artifacts remain the oracle
+(`sprint-status.yaml`, `epics.md`, `deferred-work.md`); Fibery reflects them.
+
 When working here:
 
 - Prefer the public docs in `README.md` and `docs/` for current, shipping
@@ -22,6 +34,10 @@ When working here:
   - `cargo clippy --workspace --all-targets -- -D warnings`
   - `cargo test --workspace --all-targets`
   - `python3 scripts/check_docs.py`
+- At epic close, run the retrospective (`bmad-retrospective`) in the same
+  closeout as the merge checklist — the retro is part of closing, not a later
+  sweep (the 10/13/14 gap ran to a 2026-09-22 catch-up batch, and epic-13's
+  missing retro broke epic-14's follow-through chain).
 - A bare `cargo` uses the repo's MSRV pin (`rust-toolchain.toml` → Rust 1.96.1)
   while CI's latest-stable jobs run `cargo +stable` — and a version manager
   (mise/asdf) can override the pin via `RUSTUP_TOOLCHAIN`; see the Toolchain

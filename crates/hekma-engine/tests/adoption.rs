@@ -32,39 +32,12 @@ use tempfile::TempDir;
 
 /// Write a manifest whose `[lifecycle.start]` exec is `fake_agent` + `args`.
 fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
-    let bin = hekma_conformance::fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "best-effort"
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    // Shared fixture builder (test-support consolidation, 2026-09-22): the
+    // exact pre-consolidation local shape (pause + interaction guaranteed).
+    hekma_conformance::test_support::ManifestFixture::new(kind, args)
+        .guaranteed_on_all_oses("pause")
+        .guaranteed_on_all_oses("interaction")
+        .write(dir);
 }
 
 /// The engine-observed variant of [`write_fake_manifest`] (the
@@ -1171,7 +1144,7 @@ fn ai13_adopted_process_exit_records_the_unavailable_exit_code_cause() {
     // exit code via GetExitCodeProcess, so a Windows adopted exit carries its
     // true code in the cause and the "code unavailable" arm there means a
     // genuinely unreadable code. That read cannot run on this Unix host, so
-    // the Windows half is proven by the cfg(windows)-hosted backend tests
+    // the Windows half is proven by the Windows-hosted backend tests
     // (spawn seam + gone-pid read) plus the cross-compile check; this Unix
     // test pins the Unix-shaped cause text.
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {

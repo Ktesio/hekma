@@ -25,12 +25,13 @@
 //! edition 2024), so EVERY spawn-dependent phase lives inside ONE `#[test]`
 //! function running sequentially over one instance in ONE engine, and the
 //! mutation happens ONCE at that test's start (before any other thread this
-//! test spawns) and is RESTORED at that test's teardown (review blind-3), so
-//! any test added to this binary later starts from a pristine environment.
-//! Out-of-band probes borrowed from adoption.rs (`kill -0`, `tasklist`)
-//! resolve through the preserved remainder of PATH. Tests that need NO
-//! process spawn (declaration surface, config composition) stay independent
-//! `#[test]` fns and never touch the environment.
+//! test spawns) and is RESTORED by the `PathGuard`'s `Drop` (review blind-3,
+//! panic-safe: the restore runs even if an assert between install and end-of-
+//! test fires), so any test added to this binary later starts from a pristine
+//! environment. Out-of-band probes borrowed from adoption.rs (`kill -0`,
+//! `tasklist`) resolve through the preserved remainder of PATH. Tests that
+//! need NO process spawn (declaration surface, config composition) stay
+//! independent `#[test]` fns and never touch the environment.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -366,6 +367,56 @@ fn hermes_model_key_is_a_documented_noop_and_unbacked_gets_no_hermes_home() {
 // THE single PATH-dependent test: sequential lifecycle phases over one engine.
 // ---------------------------------------------------------------------------
 
+/// RAII guard for the test's process-global `PATH` mutation — review blind-3's
+/// save/restore, made panic-safe. `Drop` restores the saved value (or deletes
+/// the variable when it was absent) EVEN IF an assert between install and
+/// end-of-test fires: the test harness catches the panic, but the unwinding
+/// stack still drops the guard, so a test added to this binary later starts
+/// from the pristine environment the module doc promises regardless of how
+/// the single PATH-dependent test ends.
+struct PathGuard {
+    original: Option<std::ffi::OsString>,
+}
+
+impl PathGuard {
+    /// Prepend `dir` to the current `PATH`, returning the guard that restores
+    /// it on drop.
+    fn prepend(dir: &Path) -> Self {
+        let original = std::env::var_os("PATH").map(|v| v.to_os_string());
+        let joined = {
+            let mut paths: Vec<PathBuf> =
+                std::env::split_paths(std::env::var_os("PATH").as_deref().unwrap_or_default())
+                    .collect();
+            paths.insert(0, dir.to_path_buf());
+            std::env::join_paths(paths).expect("join PATH")
+        };
+        // SAFETY: edition 2024 requires the unsafe block for set_var; the
+        // race analysis lives on the call site's SAFETY comment (process-
+        // global mutation, one test per binary under nextest, no other test
+        // in this file touches PATH). The guard's Drop restores
+        // unconditionally.
+        unsafe {
+            std::env::set_var("PATH", &joined);
+        }
+        PathGuard { original }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(original) => unsafe {
+                std::env::set_var("PATH", original);
+            },
+            // The variable may be absent on exotic runners; deleting it
+            // reproduces that pristine state.
+            None => unsafe {
+                std::env::remove_var("PATH");
+            },
+        }
+    }
+}
+
 /// Copy the committed `hermes_shim` launcher onto PATH as `hermes<EXE_SUFFIX>`
 /// and return the shim path (module doc documents why PATH is mutated here).
 ///
@@ -426,8 +477,8 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
         }
     }
 
-    // SAFETY: PATH is mutated here and RESTORED at the end of this test (see
-    // teardown below); it runs once, at this single test's start, before any
+    // SAFETY: PATH is mutated here and RESTORED by the `PathGuard`'s Drop
+    // (see the struct below); it runs once, at this single test's start, before any
     // child is spawned by the engine threads below (edition 2024 requires the
     // unsafe block for set_var). Race analysis: a test binary's set_var can
     // only affect THIS process — other test binaries are separate processes
@@ -438,18 +489,10 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     // sequentially. Within THIS binary the load-bearing fact holds under
     // either harness: no other test in this file reads or writes PATH — which
     // is exactly why ALL spawn-dependent phases live inside THIS one function
-    // (the mutation is process-global). Restoring at teardown keeps the
-    // process-global state clean for any test added here later (review blind-3).
-    let original_path = std::env::var_os("PATH").map(|v| v.to_os_string());
-    let joined = {
-        let mut paths: Vec<PathBuf> =
-            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-        paths.insert(0, shim_dir.path().to_path_buf());
-        std::env::join_paths(paths).expect("join PATH")
-    };
-    unsafe {
-        std::env::set_var("PATH", &joined);
-    }
+    // (the mutation is process-global). The guard restores unconditionally —
+    // happy path AND panic unwind — keeping the process-global state clean
+    // for any test added here later (review blind-3).
+    let _path_guard = PathGuard::prepend(shim_dir.path());
 
     let state = TempDir::new().unwrap();
     let engine = open(&state);
@@ -1002,16 +1045,8 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
 
     // Teardown.
     let _ = facade.stop("gw", Some(Duration::from_secs(5)));
-    // Review blind-3: restore the process-global PATH mutation so any test
-    // added to this binary later starts from the pristine environment. The
-    // variable may be absent on exotic runners; deleting it reproduces that.
-    if let Some(original) = original_path {
-        unsafe {
-            std::env::set_var("PATH", original);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var("PATH");
-        }
-    }
+    // Review blind-3: `_path_guard`'s Drop restores the process-global PATH
+    // mutation (or deletes the variable when it was absent on exotic
+    // runners) — unconditionally, panic unwind included — so the restore no
+    // longer rides on this trailing code running.
 }

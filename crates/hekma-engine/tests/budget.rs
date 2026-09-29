@@ -43,40 +43,13 @@ const TOKENS_PER_EVENT: u64 = 30;
 /// Action is a real (cross-OS) suspension and its committed `paused` state is
 /// deterministic.
 fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
-    let bin = hekma_conformance::fake_agent_bin();
-    let args_toml = args
-        .iter()
-        .copied()
-        .map(|a| format!("{a:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = format!(
-        r#"
-contract_version = "1.0.0"
-
-[adapter]
-kind = "{kind}"
-
-[lifecycle.start]
-exec = {exec:?}
-args = [{args_toml}]
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-[metering]
-source = "self-reported"
-"#,
-        exec = bin.to_string_lossy(),
-    );
-    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+    // Shared fixture builder (test-support consolidation, 2026-09-22): the
+    // exact pre-consolidation local shape — contract v1, fake_agent exec,
+    // the suite's guaranteed capabilities, self-reported metering.
+    hekma_conformance::test_support::ManifestFixture::new(kind, args)
+        .guaranteed_on_all_oses("interaction")
+        .guaranteed_on_all_oses("pause")
+        .write(dir);
 }
 
 fn open(base: &TempDir) -> Engine {
