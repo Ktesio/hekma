@@ -1090,4 +1090,201 @@ mod tests {
             drained[1]
         );
     }
+
+    // ---- 2026-09-28 coverage batch: the route_inbound protocol-error arms,
+    // driven directly (NO subprocess, NO I/O waits — the connection is built
+    // in-process and the write paths are fire-and-forget over NoPipe). ----
+
+    /// A live-shaped connection with NO stdin pipe: every route's response
+    /// write fails with the defensive Control error, which the routing code
+    /// fire-and-forgets — so the notice queue is the observable.
+    fn routing_connection() -> AcpConnection {
+        AcpConnection {
+            inner: Arc::new(Inner {
+                stdin: std::sync::Mutex::new(StdinState::NoPipe),
+                pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+                next_id: std::sync::atomic::AtomicU64::new(1),
+                session_id: std::sync::Mutex::new(None),
+                load_session: std::sync::atomic::AtomicBool::new(false),
+                prompt_id: std::sync::Mutex::new(None),
+                shutdown: std::sync::atomic::AtomicBool::new(false),
+                notices: std::sync::Mutex::new(Notices::default()),
+                context_usage: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_unsupported_agent_request_is_answered_method_not_found_and_surfaced() {
+        let conn = routing_connection();
+        let mut total = 0;
+        let inbound =
+            codec::parse_line(r#"{"jsonrpc":"2.0","id":9,"method":"fs/read","params":{}}"#)
+                .unwrap()
+                .unwrap();
+        route_inbound("cov", &conn, None, inbound, &mut total);
+        let drained = conn.drain_notices();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(drained[0].contains("fs/read"), "{}", drained[0]);
+        // The request is ANSWERED (method-not-found) and surfaced — the
+        // unhandled count tracks session UPDATES only, so it stays put.
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn a_permission_request_without_a_denial_option_is_cancelled_and_surfaced() {
+        let conn = routing_connection();
+        let mut total = 0;
+        let inbound = codec::parse_line(
+            r#"{"jsonrpc":"2.0","id":4,"method":"session/request_permission","params":{"options":[{"kind":"allow_once","name":"Allow","id":"a"}]}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        route_inbound("cov", &conn, None, inbound, &mut total);
+        let drained = conn.drain_notices();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        // No deny option offered → CANCELLED (D3: never an allow), and the
+        // refusal is surfaced with the agent's own option identity absent.
+        assert!(drained[0].contains("cancelled"), "{}", drained[0]);
+        // A permission request is ANSWERED, not "unhandled" — the count
+        // must not move.
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn an_unknown_notification_is_surfaced_with_the_running_total() {
+        let conn = routing_connection();
+        let mut total = 0;
+        let line = r#"{"jsonrpc":"2.0","method":"session/weird"}"#;
+        route_inbound(
+            "cov",
+            &conn,
+            None,
+            codec::parse_line(line).unwrap().unwrap(),
+            &mut total,
+        );
+        route_inbound(
+            "cov",
+            &conn,
+            None,
+            codec::parse_line(line).unwrap().unwrap(),
+            &mut total,
+        );
+        let drained = conn.drain_notices();
+        assert_eq!(drained.len(), 2, "{drained:?}");
+        assert!(
+            drained[0].contains("<notification:session/weird>"),
+            "{}",
+            drained[0]
+        );
+        // The SECOND notice names the running total (2), not a per-line 1.
+        assert!(
+            drained[1].contains("2 unhandled update(s)"),
+            "{}",
+            drained[1]
+        );
+    }
+
+    #[test]
+    fn a_usage_update_records_context_grain_and_is_surfaced_never_billed() {
+        let conn = routing_connection();
+        let mut total = 0;
+        let inbound = codec::parse_line(
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"usage_update","used":1200,"size":200000,"cost":{"amount":0.0034,"currency":"USD"}}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        route_inbound("cov", &conn, None, inbound, &mut total);
+        // Recorded on the connection for show/fleet (story 14-3)…
+        let usage = conn.context_usage().expect("context usage recorded");
+        assert_eq!(usage.used, Some(1200));
+        assert_eq!(usage.size, Some(200_000));
+        assert_eq!(usage.cost, Some(("0.0034".to_string(), "USD".to_string())));
+        // …and surfaced as CONTEXT-grain, never a billing figure.
+        let drained = conn.drain_notices();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(drained[0].contains("1200 of 200000"), "{}", drained[0]);
+        assert!(drained[0].contains("NOT billed"), "{}", drained[0]);
+    }
+
+    #[test]
+    fn a_response_with_an_unknown_id_is_a_surfaced_protocol_desync() {
+        let conn = routing_connection();
+        let mut total = 0;
+        let inbound =
+            codec::parse_line(r#"{"jsonrpc":"2.0","id":999,"result":{"stopReason":"end_turn"}}"#)
+                .unwrap()
+                .unwrap();
+        route_inbound("cov", &conn, None, inbound, &mut total);
+        let drained = conn.drain_notices();
+        assert_eq!(drained.len(), 1, "{drained:?}");
+        assert!(drained[0].contains("999"), "{}", drained[0]);
+        assert!(drained[0].contains("protocol desync"), "{}", drained[0]);
+    }
+
+    #[test]
+    fn prompt_and_cancel_with_a_session_over_a_dead_pipe_fail_on_the_failed_arm() {
+        // A session IS established, but the stdin half is gone: both sends
+        // fail with the typed Failed mapping (NOT a fabricated timeout).
+        let conn = routing_connection();
+        conn.set_session_id("s-1".to_string());
+        let err = conn.send_prompt("hello").unwrap_err();
+        assert!(
+            matches!(err, PromptError::Write(ref detail) if detail.contains("no stdin pipe")),
+            "{err:?}"
+        );
+        let err = conn.cancel_turn().unwrap_err();
+        assert!(err.contains("no stdin pipe"), "{err}");
+    }
+
+    #[test]
+    fn an_unopenable_raw_log_is_surfaced_and_the_transport_lives_on() {
+        // Plant a FILE where the raw log's PARENT directory should be, so
+        // the reader's open fails on every OS — the raw record is lost (an
+        // Ended notice says so, naming the path) while the protocol stream
+        // keeps being read (the transport must not die for a logging
+        // failure). Unique per test process; the guard file is removed at
+        // the end.
+        let guard =
+            std::env::temp_dir().join(format!("hekma-acp-raw-guard-{}", std::process::id()));
+        let _ = std::fs::remove_file(&guard);
+        std::fs::write(&guard, b"not a directory").expect("plant the raw-log guard file");
+        let mut child = std::process::Command::new(
+            std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
+        )
+        .arg("--version")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a piped process for the pipe halves");
+        let conn = AcpConnection::start(
+            "rawlog",
+            Some(StdinState::Live(child.stdin.take().expect("stdin pipe"))),
+            Some(child.stdout.take().expect("stdout pipe")),
+            guard.join("raw.log"),
+            None,
+        )
+        .expect("start succeeds — the raw log is best-effort");
+        // The reader thread pushes the notice asynchronously: poll committed
+        // state inside a bounded budget (the house determinism posture), and
+        // ACCUMULATE drains so a notice drained by an earlier poll is kept.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen: Vec<String> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            seen.extend(conn.drain_notices());
+            if seen.iter().any(|n| n.contains("could not be opened")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let hit = seen
+            .iter()
+            .find(|n| n.contains("could not be opened"))
+            .expect("the raw-log-loss notice must surface within the budget");
+        assert!(hit.contains("raw agent log"), "{hit}");
+        assert!(hit.contains("the transport continues"), "{hit}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&guard);
+    }
 }

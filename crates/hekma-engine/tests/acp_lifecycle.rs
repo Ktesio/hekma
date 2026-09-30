@@ -1313,7 +1313,7 @@ fn acp_helper_subprocess() {
     facade.start(name).unwrap();
     // Crash semantics: exit without dropping (no kill-on-drop, no record
     // settle). The lingering agent survives with its session state intact.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 /// The D4 composition, end to end: start ATTACHED → the engine process dies
@@ -1341,6 +1341,7 @@ fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "acp_helper_subprocess", "--nocapture"])
         .env("KTESIO_ACP_STATE", base.path())
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run the acp helper subprocess");
     assert!(

@@ -837,6 +837,7 @@ fn run_engine1(state: &Path, manifest: &Path) {
         .env("KTESIO_LOGS_ADOPTION_HELPER", "1")
         .env("KTESIO_LOGS_ADOPTION_STATE", state)
         .env("KTESIO_LOGS_ADOPTION_MANIFEST", manifest)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run engine-1 helper subprocess");
     assert!(
@@ -886,7 +887,7 @@ fn logs_adoption_helper_subprocess() {
     // test's doc comment for why this distinction does not change AC-H's
     // OWN claim (which is specifically about the attributed, followable
     // view `read_agent_log`/`read_agent_log_since` expose).
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 #[test]
@@ -1120,6 +1121,7 @@ fn run_crash_helper(state: &Path, manifest: &Path) {
         .env("KTESIO_CRASH_HELPER", "1")
         .env("KTESIO_CRASH_STATE", state)
         .env("KTESIO_CRASH_MANIFEST", manifest)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run crash-kill helper subprocess");
     assert!(
@@ -1151,7 +1153,7 @@ fn crash_kill_helper_subprocess() {
     // possible after spawning, maximizing the chance a live pipe's read end
     // would already be gone by the time the child's very next write()
     // happens.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 /// Read the `yes` process's pid directly out of the state DB (the write-

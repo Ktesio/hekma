@@ -657,6 +657,18 @@ mod tests {
     }
 
     #[test]
+    fn write_atomic_via_refuses_a_target_that_names_no_file() {
+        // 2026-09-28 coverage batch: the guard arm — a target whose path has
+        // NO file-name component (a filesystem root) is an InvalidInput
+        // refusal naming the path, never a mysterious rename failure
+        // downstream. The guard fires before any I/O, so nothing is touched.
+        let err = write_atomic_via(&std::env::temp_dir(), std::path::Path::new("/"), b"bytes")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("names no file"), "{err}");
+    }
+
+    #[test]
     fn write_atomically_concurrent_same_target_writes_are_collision_safe() {
         // Review-1 patch 1: two THREADS overwriting the SAME target in one
         // process — the pid + thread-id + counter temp names never collide, so
