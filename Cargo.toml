@@ -24,7 +24,7 @@ homepage = "https://github.com/Ktesio/hekma"
 repository = "https://github.com/Ktesio/hekma"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(tarpaulin)'] }
 
 [workspace.dependencies]
 # Internal crates

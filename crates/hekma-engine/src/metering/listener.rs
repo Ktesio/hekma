@@ -893,7 +893,7 @@ mod tests {
         .expect("self-signed cert");
         let cert_der = cert.cert.der().clone();
         let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
         );
         // (2) The TLS upstream server: a std thread running a BLOCKING rustls
         // handshake + relay (no tokio needed server-side; no extra dep).

@@ -82,6 +82,7 @@ fn start_via_surviving_engine(state_dir: &Path, name: &str) {
         ])
         .env("KTESIO_CLI_START_HELPER", name)
         .env("KTESIO_STATE_DIR", state_dir)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run cli start helper subprocess");
     assert!(
@@ -104,7 +105,7 @@ fn agent_cli_start_helper_subprocess() {
     engine.blocking().start(&name).expect("helper start");
     // Exit WITHOUT dropping `engine` (crash semantics): the started process
     // survives and re-parents to init, ready for the next command to adopt.
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 #[test]
@@ -2783,7 +2784,7 @@ fn agent_cli_uj3_breach_helper_subprocess() {
     uj3::assert_paused_entry(&entry);
     // Exit WITHOUT dropping `engine` (no handle Drop → no kill): the breach-
     // paused process survives exactly as after an engine crash (story 1-6).
-    std::process::exit(0);
+    hekma_conformance::exit_helper_subprocess(0);
 }
 
 /// Re-exec this test binary into [`agent_cli_uj3_breach_helper_subprocess`]
@@ -2800,6 +2801,7 @@ fn start_via_uj3_breach_helper(state_dir: &Path, name: &str) {
         ])
         .env("KTESIO_CLI_UJ3_BREACH_HELPER", name)
         .env("KTESIO_CLI_UJ3_REEXEC_ARMED", "1")
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .env("KTESIO_STATE_DIR", state_dir)
         .status()
         .expect("run uj3 breach helper subprocess");
@@ -7610,6 +7612,7 @@ fn acp_e2e_sentinel_turn_lands_the_ledger_and_clears_the_gap_through_the_binary(
         ])
         .env("KTESIO_ACP_TURN_HELPER", name)
         .env("KTESIO_STATE_DIR", state_dir)
+        .env("LLVM_PROFILE_FILE", hekma_conformance::helper_profile_env())
         .status()
         .expect("run acp turn helper subprocess");
     assert!(

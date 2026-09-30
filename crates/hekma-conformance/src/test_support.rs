@@ -515,6 +515,66 @@ fn helper_bin_in(hop: BinDir, name: &str) -> PathBuf {
     candidate
 }
 
+/// Exit a re-exec'd helper subprocess, keeping the coverage merge complete.
+///
+/// The crash-shape suites (adoption, acp_lifecycle, interaction, logs)
+/// re-exec the TEST BINARY ITSELF as a helper subprocess and then exit it
+/// mid-test — the crash IS the test (`std::process::exit` without dropping
+/// the engine, so no kill-on-drop runs). Under coverage that exit is a
+/// landmine: the helper is instrumented (it IS the test binary) and its
+/// profile write rode the exit path — where it raced tarpaulin's per-binary
+/// merge on a loaded CI runner and left a PARTIAL profraw in the merge set
+/// (`llvm_profparser` panics: "llvm_profparsers works on complete data";
+/// 2026-09-28, #239 — the run-to-run flip on the same SHA proved the race).
+///
+/// The DETERMINISTIC half of the fix is [`helper_profile_env`]: the
+/// SPAWNING parent redirects `LLVM_PROFILE_FILE` for the helper, so the
+/// helper's profile never lands in the merge set at all (the runtime reads
+/// the path at init, so the parent must set it — a change inside the helper
+/// is too late). This explicit write is the BELT to that braces: it
+/// completes the helper's REDIRECTED scratch profile while the process is
+/// fully alive, instead of relying on the exit path. Outside coverage the
+/// cfg arm compiles out and this is a plain exit.
+pub fn exit_helper_subprocess(code: i32) -> ! {
+    #[cfg(tarpaulin)]
+    {
+        extern "C" {
+            /// LLVM's profile-runtime entry point (linked into every
+            /// instrumented binary): serialize the current counters to the
+            /// `LLVM_PROFILE_FILE` path NOW. Returns 0 on success; a
+            /// failure is best-effort here — the exit path's own write
+            /// still runs after, and skipping the exit would change the
+            /// crash semantics the test exists to exercise.
+            fn __llvm_profile_write_file() -> i32;
+        }
+        // SAFETY: a C-ABI runtime function with no preconditions beyond the
+        // profile runtime being initialized — which it is, by definition,
+        // under `--cfg=tarpaulin -Cinstrument-coverage` (this arm only
+        // compiles there).
+        unsafe {
+            let _ = __llvm_profile_write_file();
+        }
+    }
+    std::process::exit(code)
+}
+
+/// The `LLVM_PROFILE_FILE` value for a re-exec'd helper subprocess: a
+/// timestamped-scratch path OUTSIDE tarpaulin's `target/tarpaulin/profraws`
+/// merge set. See [`exit_helper_subprocess`] for why the helper must never
+/// write into the merge set; the SPAWNING parent applies this via
+/// `Command::env("LLVM_PROFILE_FILE", helper_profile_env())` — the runtime
+/// reads the path at init, so setting it inside the helper is too late.
+/// The `%p` pattern keeps concurrent helpers' scratch files distinct; the
+/// helper's own coverage data still lands there (complete, useless to the
+/// gate — the helper is test-harness code, excluded from every crate's
+/// denominator by posture).
+pub fn helper_profile_env() -> String {
+    format!(
+        "{}hekma-helper-cov-%p.profraw",
+        std::env::temp_dir().display()
+    )
+}
+
 /// Locate the `fake_agent` test helper binary (story 1.4, AD-3) from a TEST
 /// binary ([`BinDir::TestDeps`] — see [`fake_agent_bin_in`] for the
 /// parameterized form, and `BinDir::Examples` for the perf-budgets
