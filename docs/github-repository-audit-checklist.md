@@ -24,13 +24,13 @@ source of truth.
 - [x] Auto-merge and update-branch support are enabled.
 - [x] Merge commits and rebase merges are disabled.
 - [x] Squash merge is the only allowed merge method.
-- [ ] Repository license is source-available (Ktesio Noncommercial-Attribution License 1.0.0, a custom license); GitHub shows it as "Other" / a non-standard license.
+- [x] Repository license is detected by GitHub as Apache-2.0.
 
 Evidence:
 
 - `gh api repos/Ktesio/hekma`
 - `gh api repos/Ktesio/hekma/license`
-- Observed: `license.spdx_id` is `null` and GitHub displays the custom license as "Other"; the fetched `LICENSE` is titled "Ktesio Noncommercial-Attribution License 1.0.0" (PolyForm Noncommercial 1.0.0 terms plus the Attribution condition).
+- Observed (2026-10-02): `license.spdx_id` is `Apache-2.0` and GitHub displays "Apache License 2.0"; the fetched `LICENSE` is the Apache License 2.0 text (Hekma is Apache-2.0 since v0.9.0).
 
 ## Branch And Tag Rulesets
 
@@ -109,7 +109,7 @@ Evidence:
 ## Community Health Files
 
 - [x] `README.md` exists.
-- [x] `LICENSE` exists and contains the Ktesio Noncommercial-Attribution License 1.0.0 text (PolyForm Noncommercial 1.0.0 terms plus the Attribution condition) with a commercial-use notice.
+- [x] `LICENSE` exists and is canonical Apache-2.0 text.
 - [x] `SECURITY.md` exists.
 - [x] `CONTRIBUTING.md` exists.
 - [x] `CODE_OF_CONDUCT.md` exists.
