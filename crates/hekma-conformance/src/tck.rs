@@ -3192,6 +3192,81 @@ env = "MODEL"
         let _ = facade.stop("tck-subject", Some(Duration::from_secs(5)));
     }
 
+    /// A subject that delivers its DECLARED env mapping but swallows the
+    /// `agent.*` pass-through fails the config section at the pass-through
+    /// arm specifically — the reason names the swallowed `agent.*` key and
+    /// the env lines the dump DID land, distinguishing it from the
+    /// declared-mapping miss above (triage without a rerun).
+    #[test]
+    fn config_mapping_reports_a_swallowed_agent_passthrough() {
+        let (dir, facade) = helper_engine();
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-nopass-")
+            .tempdir()
+            .expect("tempdir");
+        let bin = crate::fake_agent_bin();
+        // The dump path is WRITABLE (unlike the never-arrives twin above):
+        // the declared `model` mapping lands in it, so the section gets PAST
+        // the declared-rule loop and is failed by the pass-through check
+        // alone — the arm under test.
+        let dump = scratch.path().join("config-dump.txt");
+        let manifest = format!(
+            r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "tck-nopass-adapter"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--dump", {dump:?}, "--linger-ms", "600000", "--drop-env", "TCK_PROBE"]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"
+"#,
+            exec = bin.to_string_lossy(),
+            dump = dump.to_string_lossy(),
+        );
+        std::fs::write(scratch.path().join("adapter.toml"), manifest).expect("write manifest");
+        facade
+            .register_with_adapter(
+                "tck-subject",
+                &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            )
+            .expect("register nopass subject");
+        let rules = match config_probe_scope(&scratch.path().join("adapter.toml")) {
+            Ok(ConfigScope::Env(rules)) => rules,
+            other => panic!("expected env rules, got {other:?}"),
+        };
+        // The poll budget must give the DECLARED mapping's dump write time to
+        // land on a loaded runner (unlike the never-arrives twin, this test
+        // REQUIRES the model line to be found) while still bounding the
+        // pass-through miss wait — 3s covers both.
+        let err = config_mapping_inner(&facade, dir.path(), rules, Duration::from_secs(3))
+            .expect_err("the pass-through can never arrive");
+        assert!(
+            err.contains("pass-through key was not delivered verbatim"),
+            "{err}"
+        );
+        // The reason is TRIAGE-GRADE: it names the swallowed key's env var
+        // and carries the dump sample (`dump_env_lines` samples the FIRST 5
+        // env lines, so the sample content itself is ambient-env-dependent —
+        // pinned only as non-empty here, the missing `env=TCK_PROBE=…` line
+        // above is the assertion that matters).
+        assert!(err.contains("env=TCK_PROBE=verbatim-1"), "{err}");
+        assert!(err.contains("dump at"), "{err}");
+        assert!(!err.contains("no env= lines"), "{err}");
+        let _ = facade.stop("tck-subject", Some(Duration::from_secs(5)));
+    }
+
     /// A memory probe whose dump artifact can never appear fails the
     /// delivery proof with its reason — and the probe is stopped and
     /// detached on the way out (no leaked attachment).
