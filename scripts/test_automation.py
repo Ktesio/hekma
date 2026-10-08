@@ -750,6 +750,25 @@ class ReleaseDocsTests(unittest.TestCase):
         # undecided decision (docs/release-process.md decision log).
         self.assertIn("publish = false", conformance, "hekma-conformance")
 
+    def test_conformance_git_pin_points_at_a_real_hekma_conformance_rev(self) -> None:
+        # The third-party dev-dependency examples pin a git rev because the
+        # kit is not published yet; the rev MUST name a commit where the crate
+        # actually exists as `hekma-conformance` (post-rename). The pre-rename
+        # commit 20ddc204… only has `ktesio-conformance`, so a copy of the
+        # README snippet failed to resolve. Current pin: the v0.9.0 release
+        # commit — update deliberately (same rule as the snippet's comment).
+        pin = "14fbf772710e9151f7a90be8d504a4f67bd95531"
+        for rel in ("README.md", "docs/testing.md"):
+            doc = (release_docs.ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn(
+                f'hekma-conformance = {{ git = "https://github.com/Ktesio/hekma", rev = "{pin}" }}',
+                doc,
+                rel,
+            )
+        # The stale pre-rename rev must not creep back into either example.
+        for rel in ("README.md", "docs/testing.md"):
+            doc = (release_docs.ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotIn("20ddc204403a5c412e0e3249d4609dd47c30854e", doc, rel)
 
     def test_ci_enforces_msrv_floor(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
