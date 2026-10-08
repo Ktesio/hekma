@@ -194,7 +194,7 @@ If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a
 # The kit is not published to a registry yet — depend on it by git until
 # then (a workspace-relative path like `../hekma-conformance` only works
 # inside this repository; a git dependency works for any third party):
-hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "20ddc204403a5c412e0e3249d4609dd47c30854e" }  # pin a current rev
+hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "14fbf772710e9151f7a90be8d504a4f67bd95531" }  # pin a current rev
 ```
 
 ```rust
