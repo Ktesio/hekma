@@ -139,8 +139,8 @@ def render_release_body(tag: str, previous_tag: str | None, commits: list[Commit
             "> **Coming from `kt` (Ktesio ≤ 0.7.0)?** Your data directory is "
             "untouched and `kt self-update` cannot reach this release by "
             "design — re-run the installer (or `cargo install hekma "
-            "--force` / `brew upgrade ktesio/tap/hekma`). See the "
-            "[migration guide](https://hekma.ktesio.dev/migration).",
+            "--force` / `brew upgrade ktesio/tap/hekma). See the "
+            "[migration guide](https://hekma.ktesio.dev/docs/migration/).",
             "",
         ]
     lines += ["## Downloads", ""]
