@@ -32,6 +32,17 @@
 //! `tasklist`) resolve through the preserved remainder of PATH. Tests that
 //! need NO process spawn (declaration surface, config composition) stay
 //! independent `#[test]` fns and never touch the environment.
+//!
+//! **HERMES_HOME discipline:** the same hermeticity rule covers the one
+//! environment VARIABLE this suite's assertions reason about. The child env
+//! the shim dumps is INHERITED-plus-injected, so an ambient `HERMES_HOME`
+//! (e.g. a test battery launched from inside an agent-CLI session that sets
+//! its own) masquerades as an engine injection and false-fires the Phase-K
+//! "native backing must NOT inject" assertion. The engine's contract is to
+//! inject the managed dir, never to police inherited vars, so the test owns
+//! its baseline: the single spawn-dependent test scrubs `HERMES_HOME` up
+//! front via the `EnvGuard` (the `PathGuard`'s twin — same once-at-start,
+//! restore-on-Drop, panic-safe discipline).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -417,6 +428,57 @@ impl Drop for PathGuard {
     }
 }
 
+/// Scrub-and-restore guard for ONE environment variable — the twin of
+/// [`PathGuard`] for the OTHER process-global input these tests must own:
+/// `HERMES_HOME`. The var NAME is the engine's delivery var for the hermes
+/// builtin, but a test process can INHERIT a value from its surroundings —
+/// the observed case (2026-10-08) is running the battery from inside an
+/// agent-CLI session whose own `HERMES_HOME=/home/…/.hermes` leaks into the
+/// spawned gateway child (the shim dumps the FULL inherited environment), so
+/// Phase K's "a native backing must NOT inject HERMES_HOME" assertion reads
+/// an INHERITED var as an injected one and false-fires. The engine never
+/// SCRUBS inherited vars (its contract is to inject the managed dir, not to
+/// police the ambient environment), so the test must establish its own
+/// hermetic baseline: remove the var up front, restore exactly what was
+/// there on Drop (panic unwind included — the same review blind-3 guarantee
+/// the PATH guard carries). Same discipline as PATH: the mutation happens
+/// ONCE at the single spawn-dependent test's start, before any child exists.
+struct EnvGuard {
+    var: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    /// Remove `var` from the environment, returning the guard that restores
+    /// it on drop.
+    fn scrub(var: &'static str) -> Self {
+        let original = std::env::var_os(var).map(|v| v.to_os_string());
+        // SAFETY: edition 2024 requires the unsafe block for remove_var; the
+        // race analysis lives on the call site's SAFETY comment (process-
+        // global mutation, one test per binary under nextest, no other test
+        // in this file touches this var). The guard's Drop restores
+        // unconditionally — happy path AND panic unwind.
+        unsafe {
+            std::env::remove_var(var);
+        }
+        EnvGuard { var, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(original) => unsafe {
+                std::env::set_var(self.var, original);
+            },
+            // Absent before the scrub: restore that pristine absence.
+            None => unsafe {
+                std::env::remove_var(self.var);
+            },
+        }
+    }
+}
+
 /// Copy the committed `hermes_shim` launcher onto PATH as `hermes<EXE_SUFFIX>`
 /// and return the shim path (module doc documents why PATH is mutated here).
 ///
@@ -493,6 +555,16 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     // happy path AND panic unwind — keeping the process-global state clean
     // for any test added here later (review blind-3).
     let _path_guard = PathGuard::prepend(shim_dir.path());
+
+    // SAFETY: the HERMES_HOME scrub mutates process-global state in THIS
+    // process only; the same race analysis as the PATH guard above holds
+    // (nextest = one test per process; this file's spawn-dependent phases
+    // all live inside THIS function; no other test in this file reads or
+    // writes HERMES_HOME — the composition tests assert the engine's
+    // launch.env MAP, not the process environment). The guard restores the
+    // inherited value unconditionally on Drop, panic unwind included, so
+    // the ambient environment is handed back exactly as received.
+    let _hermes_home_guard = EnvGuard::scrub("HERMES_HOME");
 
     let state = TempDir::new().unwrap();
     let engine = open(&state);
