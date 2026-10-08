@@ -73,7 +73,7 @@ You can also download a release archive from [GitHub Releases](https://github.co
 
 ```bash
 git clone https://github.com/Ktesio/hekma.git
-cd ktesio
+cd hekma
 cargo install --path .
 ```
 

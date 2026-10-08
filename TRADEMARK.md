@@ -4,7 +4,7 @@ This document explains how the Ktesio name, logo, and related project identity m
 
 The goal is simple:
 
-- The Ktesio source code is available for noncommercial use, contribution, and reuse under the project license; commercial use requires the owner's written permission.
+- The Ktesio source code is open for use, contribution, and reuse, including commercial use, under the project license (Apache-2.0).
 - The Ktesio name and official project identity remain controlled by the project maintainers.
 - Forks, integrations, articles, plugins, and community work are welcome, but they must not confuse users about what is official.
 
