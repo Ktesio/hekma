@@ -21,6 +21,21 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("Initial release history", body)
         self.assertEqual(1, body.count("| Platform | Target | Archive | Checksum |"))
 
+    def test_rename_banner_links_canonical_docs_url(self) -> None:
+        # The site lives at /docs/<page>/ since the docs restructure; the
+        # flat /migration form only survives as a legacy 301. Generated
+        # release bodies must carry the canonical URL so they never depend
+        # on the redirect (and stay correct if the 301 is ever retired).
+        body = release_docs.render_release_body("v1.2.3", None, [])
+
+        self.assertIn("https://hekma.ktesio.dev/docs/migration/", body)
+        self.assertNotIn("https://hekma.ktesio.dev/migration)", body)
+
+    def test_rename_banner_absent_before_v0_8_0(self) -> None:
+        body = release_docs.render_release_body("v0.7.2", None, [])
+
+        self.assertNotIn("migration guide", body)
+
     def test_asset_table_has_all_tier_one_targets_and_checksums(self) -> None:
         table = "\n".join(release_docs.render_asset_table("v1.2.3"))
 
