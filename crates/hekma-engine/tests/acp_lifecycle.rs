@@ -851,6 +851,24 @@ fn probe_binary_present(bin: &str) -> bool {
     }
 }
 
+/// The explicit opt-OUT for the real-agent smokes. A machine can have a
+/// REAL agent CLI installed yet be unable to SERVE a smoke: the observed
+/// case (2026-10-08) is a logged-out Gemini CLI whose `session/new` answers
+/// JSON-RPC `-32000` ("Gemini API key is missing or not configured") —
+/// indistinguishable, by design, from any other handshake failure, because
+/// the engine surfaces error-response CODES only, never the agent-authored
+/// message (the traffic-free diagnostic rule, `acp/connection.rs`). On such
+/// a machine the smoke is testing the LOGIN state, not the engine, and
+/// fails red on every local battery. Set `HEKMA_TEST_REAL_AGENT_SMOKES=0`
+/// (or `=false`) to skip both smokes VISIBLY — the skip prints a stderr
+/// note (surfaced, not silent; AI-18) — while CI runners (no binaries
+/// present) keep the ordinary skip-unless-present posture untouched.
+fn real_smokes_opted_out() -> bool {
+    std::env::var("HEKMA_TEST_REAL_AGENT_SMOKES")
+        .map(|v| matches!(v.trim(), "0" | "false" | "FALSE" | "False"))
+        .unwrap_or(false)
+}
+
 /// Story 14-5, the REAL-AGENT smoke: a real `hermes-acp` binary (Hermes
 /// Agent's native ACP entry point) driven under the `acp` kind — register
 /// with a launch command → start (the ACP handshake) → send (one prompt
@@ -863,6 +881,13 @@ fn probe_binary_present(bin: &str) -> bool {
 /// story (the deprecation is an announcement, not a removal).
 #[test]
 fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
+    if real_smokes_opted_out() {
+        eprintln!(
+            "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
+             (this machine opted out of driving real agent CLIs)"
+        );
+        return;
+    }
     // `hermes-acp` is Hermes' ACP entry point; plain `hermes` is the gateway
     // CLI and does NOT speak ACP on stdio by default, so it is not a valid
     // acp-kind launch and is deliberately not probed as a fallback.
@@ -912,6 +937,13 @@ fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
 /// cannot be the ACP agent this smoke exists to prove).
 #[test]
 fn real_gemini_acp_smoke_register_start_send_stop_when_present() {
+    if real_smokes_opted_out() {
+        eprintln!(
+            "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
+             (this machine opted out of driving real agent CLIs)"
+        );
+        return;
+    }
     if !probe_binary_present("gemini") {
         return; // the honest skip: no real agent on this machine.
     }
@@ -947,7 +979,13 @@ fn real_gemini_acp_smoke_register_start_send_stop_when_present() {
         }
     }
     let started = started.unwrap_or_else(|| {
-        panic!("real gemini start failed under every known ACP flag spelling: {last_err:?}")
+        panic!(
+            "real gemini start failed under every known ACP flag spelling: {last_err:?}\n\
+             note: a -32000 answering session/new is how a PRESENT but logged-out \
+             Gemini CLI refuses (it needs a login or an API key before it will open \
+             a session); log the CLI in, or set HEKMA_TEST_REAL_AGENT_SMOKES=0 to \
+             skip the real-agent smokes on a machine that only hosts the binary."
+        )
     });
     assert_eq!(started.state, LifecycleState::Running);
 
