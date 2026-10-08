@@ -337,19 +337,32 @@ class ReleaseDocsTests(unittest.TestCase):
         # The page list is read from the site's own registry at probe time.
         self.assertIn("jq -r '.pages[] | select(startswith(\"---\") | not)' docs/meta.json", probe)
         # v0.8.0, amended 2026-09-18: the probe checks the CANONICAL host
-        # only — docs.ktesio.dev was retired (owner repurposes it), so
-        # there is no legacy-redirect leg anymore.
-        self.assertIn('base="https://hekma.ktesio.dev"', probe)
+        # only — the retired legacy host is repurposed by the owner, so
+        # there is no legacy-host leg anymore.
+        # Amended again 2026-10-08 (site restructure): the canonical pages
+        # live on the /docs/ MOUNT with trailing slashes. The probe was born
+        # flat and red-failed every scheduled run for three weeks while the
+        # site was healthy — these pins hold it to the mount so that class
+        # of drift lands as a red probe fix, not three weeks of noise.
+        self.assertIn('base="https://hekma.ktesio.dev/docs"', probe)
         self.assertIn("hekma.ktesio.dev page is DOWN", probe)
         self.assertIn("expected 200", probe)
         self.assertNotIn("docs.ktesio.dev", probe)
         # The two special-case URL mappings mirror docs/lib/source.ts's
-        # slugs(): README is the site root, RELEASE_NOTES serves at
-        # /release-notes.
-        self.assertIn("README) url=\"$base/\"", probe)
-        self.assertIn('RELEASE_NOTES) url="$base/release-notes"', probe)
+        # slugs(): README is the docs index (/docs/), RELEASE_NOTES serves
+        # at /docs/release-notes/.
+        self.assertIn('README) url="$base/"', probe)
+        self.assertIn('RELEASE_NOTES) url="$base/release-notes/"', probe)
+        # The restructure's contracts, pinned: the landing page carries its
+        # title marker, and the legacy flat URLs (baked into published
+        # release bodies and deprecated-crate READMEs) must keep 301ing to
+        # the exact mount URL — a dropped redirect dangles public links.
+        self.assertIn('marker="Hekma: run AI agents like services"', probe)
+        self.assertIn('RELEASE_NOTES) flat="$base/release-notes" want="$mount/release-notes/"', probe)
+        self.assertIn("legacy flat URL broke", probe)
         # The newest-page content marker (a bare 200 is not enough).
         self.assertIn('marker="Release Notes"', probe)
+        self.assertIn('url="https://hekma.ktesio.dev/docs/release-notes/"', probe)
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the

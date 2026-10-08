@@ -9,10 +9,22 @@ name: Docs Probe
 #
 # v0.8.0 Hekma rename (amended 2026-09-18): the probe checks the
 # CANONICAL host hekma.ktesio.dev (every registered page must answer
-# HTTP 200) plus the installer URLs at cli.ktesio.dev. The legacy
-# retired legacy host is repurposed by the owner for
-# something else, so there is no redirect and nothing to probe here;
-# old docs links must point at the canonical host.
+# HTTP 200) plus the installer URLs at cli.ktesio.dev. The retired
+# legacy host is repurposed by the owner for something else, so there
+# is no redirect and nothing to probe there; old docs links must point
+# at the canonical host.
+#
+# Site restructure (amended 2026-10-08): hekma.ktesio.dev now serves a
+# static landing page at `/` and the docs app under a `/docs/` mount
+# with trailing-slash URLs (`/docs/get-started/`). The old flat URLs
+# (`/get-started`) live on as 301 redirects to the mount — they are
+# baked into already-published release bodies and the deprecated
+# crates' READMEs, so they must keep resolving. The probe was born
+# flat and red-failed EVERY scheduled run for three weeks (Sep 18 –
+# Oct 8, 2026) while the site was healthy the whole time: the watcher
+# itself had rotted, exactly the failure mode it exists to catch — in
+# the probe. It now checks the canonical mount, the landing page's
+# title marker, and the legacy flat→mount redirect contract.
 #
 # Deliberately a SEPARATE workflow with no `needs:` coupling and no
 # dependency on the CI job graph: the probe must run (and fail) even when
@@ -43,16 +55,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Probe every registered docs page for HTTP 200 (canonical host)
+      - name: Probe every registered docs page for HTTP 200 (canonical /docs/ mount)
         # The page list is the SITE's own registry, read from docs/meta.json at
         # probe time (not a hand-copied list that can drift): every entry that
         # is a real page (the `---…---` entries are section SEPARATORS, not
-        # pages) must answer HTTP 200 at https://hekma.ktesio.dev/<page>.
+        # pages) must answer HTTP 200 on the /docs/ mount WITH the trailing
+        # slash (the mount answers 308 without it; the slashed form is what
+        # the docs app links and what search indexes hold).
         #
         # URL mapping: docs/meta.json names SOURCE files; two special cases
         # get non-obvious URLs, mapped by docs/lib/source.ts's `slugs()` —
-        #   * `README` is the site ROOT (`/`), not `/README`;
-        #   * `RELEASE_NOTES` serves at `/release-notes`.
+        #   * `README` is the docs index (`/docs/`), not `/docs/README`;
+        #   * `RELEASE_NOTES` serves at `/docs/release-notes/`.
         # Those two mappings MUST be updated together with docs/lib/source.ts.
         #
         # Every failure is RECORDED and named (never fail-fast on the first
@@ -62,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="https://hekma.ktesio.dev"
+          base="https://hekma.ktesio.dev/docs"
           dead=0
           pages="$(jq -r '.pages[] | select(startswith("---") | not)' docs/meta.json)"
           if [ -z "$pages" ]; then
@@ -72,8 +86,8 @@ jobs:
           while IFS= read -r page; do
             case "$page" in
               README) url="$base/" ;;
-              RELEASE_NOTES) url="$base/release-notes" ;;
-              *) url="$base/$page" ;;
+              RELEASE_NOTES) url="$base/release-notes/" ;;
+              *) url="$base/$page/" ;;
             esac
             code="$(curl --silent --show-error --output /dev/null \
               --write-out '%{http_code}' --max-time 30 "$url")" || code=000
@@ -85,10 +99,82 @@ jobs:
             fi
           done <<< "$pages"
           if [ "$dead" -gt 0 ]; then
-            echo "::error::$dead of $(printf '%s\n' "$pages" | wc -l | tr -d ' ') registered docs pages are not serving HTTP 200 on the canonical host."
+            echo "::error::$dead of $(printf '%s\n' "$pages" | wc -l | tr -d ' ') registered docs pages are not serving HTTP 200 on the canonical /docs/ mount."
             exit 1
           fi
-          echo "Canonical probe green: every registered page serves HTTP 200."
+          echo "Canonical probe green: every registered page serves HTTP 200 on the /docs/ mount."
+
+      - name: Probe the landing page (site root)
+        # The restructured site serves a static landing at `/` — distinct
+        # from the docs app's `/docs/` index, and the first thing every
+        # visitor and old bookmark hits. A 200 alone cannot distinguish it
+        # from an edge error page, so it must also carry its own title
+        # marker. Keep the marker in step with the landing's <title>.
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://hekma.ktesio.dev/"
+          marker="Hekma: run AI agents like services"
+          code="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' --max-time 30 "$url")" || code=000
+          if [ "$code" != "200" ]; then
+            echo "::error::landing page is DOWN: $url answered HTTP $code (expected 200). The Cloudflare Pages deploy is stale — redeploy the site."
+            exit 1
+          fi
+          body="$(curl --silent --show-error --max-time 30 "$url")" || body=""
+          # NOTE: `grep -q` EXITS on first match, SIGPIPEing a `printf |`
+          # writer; under `set -o pipefail` that turns a MATCHING pipeline
+          # into failure 141 (a healthy 53KB landing page false-reds the
+          # probe). A herestring feeds grep without a writer process —
+          # no pipe, no SIGPIPE, no false red. (The original release-notes
+          # step carried the same latent bug; fixed here too.)
+          if grep -q "$marker" <<<"$body"; then
+            echo "ok   $url serves 200 and carries the landing title marker."
+          else
+            echo "::error::$url answered 200 but is missing the \"$marker\" title marker — the landing deploy is wrong, or the title changed without this probe (update them together)."
+            exit 1
+          fi
+
+      - name: Probe the legacy flat URLs still redirect to the mount
+        # The flat URLs (`/get-started`) are baked into already-published
+        # release bodies and the deprecated crates' READMEs (e.g.
+        # https://hekma.ktesio.dev/migration), so each must keep answering
+        # 301 with a Location EXACTLY equal to its canonical mount URL — a
+        # deploy that drops the redirects breaks every published link. The
+        # flat README URL is the landing itself (200, probed above), so it
+        # has no redirect leg.
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://hekma.ktesio.dev"
+          mount="https://hekma.ktesio.dev/docs"
+          dead=0
+          pages="$(jq -r '.pages[] | select(startswith("---") | not) | select(. != "README")' docs/meta.json)"
+          if [ -z "$pages" ]; then
+            echo "::error::docs/meta.json yielded no non-README pages — the registry read is broken or the separators changed shape."
+            exit 1
+          fi
+          while IFS= read -r page; do
+            case "$page" in
+              RELEASE_NOTES) flat="$base/release-notes" want="$mount/release-notes/" ;;
+              *) flat="$base/$page" want="$mount/$page/" ;;
+            esac
+            got="$(curl --silent --show-error --output /dev/null \
+              --write-out '%{http_code} %{redirect_url}' --max-time 30 "$flat")" || got="000 "
+            code="${got%% *}"
+            loc="${got#* }"
+            if [ "$code" = "301" ] && [ "$loc" = "$want" ]; then
+              echo "ok   $flat -> 301 $want"
+            else
+              echo "::error::legacy flat URL broke: $flat answered \"$got\" (expected 301 with Location $want). Published links (release bodies, deprecated-crate READMEs) now dangle — restore the redirect."
+              dead=$((dead + 1))
+            fi
+          done <<< "$pages"
+          if [ "$dead" -gt 0 ]; then
+            echo "::error::$dead legacy flat URLs no longer redirect to the /docs/ mount."
+            exit 1
+          fi
+          echo "Legacy redirect probe green: every flat URL 301s to the canonical mount."
 
       - name: Probe the canonical installer URLs (cli.ktesio.dev)
         # The v0.8.0 install commands point at cli.ktesio.dev/hekma/install.sh|.ps1
@@ -118,17 +204,17 @@ jobs:
         # A 200 alone cannot distinguish the real page from a CDN/edge error
         # page that happens to answer 200, so the NEWEST registered page (the
         # last entry in docs/meta.json — RELEASE_NOTES, served at
-        # /release-notes) must also carry its content marker: the page's own
-        # `<title>`/h1 text. A structurally-200-but-contentless deploy fails
-        # here. Update the marker together with the page's title (or when the
-        # newest entry in docs/meta.json changes).
+        # /docs/release-notes/) must also carry its content marker: the page's
+        # own `<title>`/h1 text. A structurally-200-but-contentless deploy
+        # fails here. Update the marker together with the page's title (or
+        # when the newest entry in docs/meta.json changes).
         shell: bash
         run: |
           set -euo pipefail
-          url="https://hekma.ktesio.dev/release-notes"
+          url="https://hekma.ktesio.dev/docs/release-notes/"
           marker="Release Notes"
           body="$(curl --silent --show-error --max-time 30 "$url")" || body=""
-          if printf '%s' "$body" | grep -q "$marker"; then
+          if grep -q "$marker" <<<"$body"; then
             echo "ok   $url carries the content marker \"$marker\"."
           else
             echo "::error::$url answered without the \"$marker\" content marker — the page is 200 but its content is wrong/empty (stale or broken deploy)."
