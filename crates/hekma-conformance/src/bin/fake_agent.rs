@@ -63,6 +63,14 @@
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
+//! * `--drop-env <NAME>` (repeatable)  a LYING-SUBJECT mode for the conformance
+//!   kit's declared-but-failing row: the process still RECEIVES the named env
+//!   var (the engine's delivery is faithful) but omits it from the `--dump`
+//!   artifact — the observable shape of a real adapter that declares a mapping
+//!   yet swallows the delivered value. The TCK's config section fails such a
+//!   subject at the missing dump line, naming the swallowed var. Pure `std`,
+//!   NO OS-cfg.
+//!
 //! * `--dump <path>` (story 2-2)  write a small observation file at startup: the
 //!   full received argv (one `arg=<token>` line each) followed by every
 //!   environment variable (one `env=<KEY>=<VALUE>` line each). The engine's
@@ -225,6 +233,10 @@ struct Opts {
     /// readiness (story 4-1 fix pass, HIGH finding). `false` = no sniff (the
     /// default; existing tests are unaffected).
     sniff_stdin_at_startup: bool,
+    /// Omit these env vars from the `--dump` artifact (a lying-subject mode
+    /// for the conformance kit's declared-but-failing row; see `write_dump`).
+    /// Empty = dump the full environment (the default).
+    drop_env: Vec<String>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -283,6 +295,7 @@ fn parse() -> Opts {
     let mut observed_auth = None;
     let mut echo_stdin = false;
     let mut sniff_stdin_at_startup = false;
+    let mut drop_env: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -342,6 +355,13 @@ fn parse() -> Opts {
             }
             "--echo-stdin" => echo_stdin = true,
             "--sniff-stdin-at-startup" => sniff_stdin_at_startup = true,
+            // A lying-subject mode: omit the named env var from the `--dump`
+            // artifact (see `write_dump`). Repeatable, one name per flag.
+            "--drop-env" => {
+                if let Some(name) = args.next() {
+                    drop_env.push(name);
+                }
+            }
             "--spawn-child" => spawn_child = true,
             "--linger-ms" => {
                 if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -428,6 +448,7 @@ fn parse() -> Opts {
         observed_auth,
         echo_stdin,
         sniff_stdin_at_startup,
+        drop_env,
     }
 }
 
@@ -515,7 +536,7 @@ fn main() {
     // Story 2-2: dump the received argv + environment so the config-mapping proof
     // can observe a mapped unified key that landed as a native FLAG (in the args)
     // or ENV var (in the environment), without racing on stdout capture.
-    write_dump(&opts.dump);
+    write_dump(&opts.dump, &opts.drop_env);
 
     // Story 4-1: a dedicated thread reads stdin line-by-line and echoes each as
     // `stdin: <line>` to the captured log — the deterministic vehicle a test
@@ -830,7 +851,7 @@ fn post_streaming_completion(base_url: &str, auth: Option<&str>) -> std::io::Res
 /// greps this for a mapped FLAG (an `arg=--model` / `arg=<value>` pair) or ENV var
 /// (an `env=MODEL=<value>` line). Best-effort so it never fails the process.
 #[cfg(not(tarpaulin_include))]
-fn write_dump(path: &Option<PathBuf>) {
+fn write_dump(path: &Option<PathBuf>, drop_env: &[String]) {
     let Some(path) = path else { return };
     let mut body = String::new();
     for arg in std::env::args() {
@@ -839,6 +860,14 @@ fn write_dump(path: &Option<PathBuf>) {
         body.push('\n');
     }
     for (key, value) in std::env::vars() {
+        // `--drop-env <NAME>`: a LYING-SUBJECT mode for the conformance kit's
+        // declared-but-failing row — the process RECEIVES the env var (the
+        // engine's delivery is faithful) but omits it from its own dump, the
+        // way a real adapter that swallows an env var would. The config
+        // section's dump-poll then observes the miss it must report.
+        if drop_env.iter().any(|d| d == &key) {
+            continue;
+        }
         body.push_str("env=");
         body.push_str(&key);
         body.push('=');
