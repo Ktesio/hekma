@@ -40,7 +40,20 @@
 //!   `reject_once` denial) and read the response; then emit the chunks +
 //!   `end_turn`. The engine must answer DENIED and surface one diagnostic;
 //!   the turn proceeds to completion so the test can observe both facts.
-//!
+//! * `noisy-updates` — for each `session/prompt`, the turn's chunks are
+//!   wrapped in a deliberately NOISY envelope: a blank framing line before
+//!   and after the chunk sequence, plus `session/update` notifications
+//!   carrying UNKNOWN `sessionUpdate` discriminators (a future-protocol
+//!   addition shape). The engine must skip the blank lines without a
+//!   malformed-line diagnostic, count + surface each unknown discriminator
+//!   (never fatal), and still complete the turn (`end_turn`).
+//! * `exit-on-prompt` — answers `initialize` + `session/new` cleanly, then
+//!   on the FIRST `session/prompt` prints nothing and EXITS the process
+//!   (stdout closes mid-turn). The engine's reader must surface the Ended
+//!   notice, fail any still-registered waiter with the stream-ended error,
+//!   clear the in-flight turn marker, and the reaper must land the instance
+//!   `failed` with a crashed cause (restart policy `never`).
+
 //! ## Story 14-3 modes (the metering tiers)
 //!
 //! * `usage-update` — for each `session/prompt`, first emit ONE
@@ -148,6 +161,45 @@ fn emit_chunks() {
     for n in 1..=3 {
         emit(&message_chunk(n));
     }
+}
+
+/// The `noisy-updates` turn body: the chunk sequence wrapped in blank
+/// framing lines and interleave UNKNOWN `sessionUpdate` discriminators —
+/// the tolerance envelope. Blank lines must be skipped silently (they are
+/// not malformed); unknown discriminators must be counted + surfaced (never
+/// fatal); the turn still reaches `end_turn`.
+#[cfg(not(tarpaulin_include))]
+fn emit_noisy_envelope() {
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout); // blank framing line BEFORE the chunks
+    let _ = stdout.flush();
+    emit(&unknown_update("future_feature_update"));
+    emit(&message_chunk(1));
+    emit(&unknown_update("user_idle_state"));
+    let _ = writeln!(stdout); // a blank line BETWEEN updates
+    let _ = stdout.flush();
+    emit(&message_chunk(2));
+    emit(&message_chunk(3));
+    emit(&unknown_update("context_compaction"));
+    let _ = writeln!(stdout); // blank framing line AFTER the chunks
+    let _ = stdout.flush();
+}
+
+/// One `session/update` notification carrying an UNKNOWN discriminator —
+/// the future-protocol-addition shape the tolerant parser must classify as
+/// `Unhandled` (counted + surfaced, never fatal).
+#[cfg(not(tarpaulin_include))]
+fn unknown_update(discriminator: &str) -> serde_json::Value {
+    notification(
+        "session/update",
+        serde_json::json!({
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": discriminator,
+                "sample": "payload-shape-the-engine-does-not-know",
+            },
+        }),
+    )
 }
 
 /// The `usage_update` notification for one turn (story 14-3, T1): the
@@ -452,6 +504,18 @@ fn main() {
                 }
             }
             ("session/prompt", _) => {
+                if mode == "exit-on-prompt" {
+                    // Print nothing for the prompt and EXIT: stdout closes
+                    // MID-TURN, the exact death shape a crashed agent
+                    // produces. The engine's reader must surface the Ended
+                    // notice, fail any still-registered waiter with the
+                    // stream-ended error, clear the in-flight marker, and
+                    // the reaper must land the instance `failed` (a restart
+                    // policy of `never` keeps it down).
+                    eprintln!("fake_acp_agent: exit-on-prompt: exiting without a response");
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(7);
+                }
                 if mode == "permission-request" {
                     // Ask the CLIENT for permission (an agent→client request,
                     // method + id), then WAIT for the response before
@@ -547,7 +611,17 @@ fn main() {
                     emit_stderr_sentinel(next_turn_sequence);
                     next_turn_sequence += 1;
                 }
-                emit_chunks();
+                if mode == "noisy-updates" {
+                    // The noisy envelope: blank framing lines around the
+                    // chunk sequence, plus UNKNOWN `sessionUpdate`
+                    // discriminators (the future-protocol-addition shape).
+                    // The engine must skip the blanks without a
+                    // malformed-line diagnostic, count + surface each
+                    // unknown discriminator, and still reach `end_turn`.
+                    emit_noisy_envelope();
+                } else {
+                    emit_chunks();
+                }
                 emit(&response(
                     id,
                     serde_json::json!({ "stopReason": "end_turn" }),
