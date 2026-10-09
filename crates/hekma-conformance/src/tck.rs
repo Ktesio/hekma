@@ -64,7 +64,11 @@
 //!   naming the gap.
 //! * `metering_self_reported` — a probe emits 3 sentinel batches (10 in /
 //!   20 out); the ledger and Fleet totals agree exactly; a replayed
-//!   sequence-0 batch does not double-count.
+//!   sequence-0 batch does not double-count. The Fleet-equality failure
+//!   reason is itself pinned by a harness test that drives the same pipeline
+//!   with a LYING subject (off-sentinel token counts via the probe's
+//!   `--usage-input-tokens`), so the totals check cannot be deleted
+//!   silently.
 //! * `metering_engine_observed` — for EngineObserved adapters only: a
 //!   loopback upstream stub (Content-Length responses, the fixed 30/70/100
 //!   usage body), the operator sets the real upstream, and 3 forwarded calls
@@ -1772,6 +1776,34 @@ fn replay_row_defect(rows: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The Fleet-equality contract as a PURE decision over the observed Fleet
+/// cells: totals must equal `batches ×` the per-event sentinels EXACTLY (the
+/// FR-22 discipline — a fabricated or dropped cell is a billing lie), and the
+/// metering-source cell must read the wire string the section ran under.
+/// Unit-tested directly (including the mismatched-source arm a healthy engine
+/// cannot exhibit) so the detection itself is pinned.
+fn fleet_totals_defect(
+    cumulative_input: u64,
+    cumulative_output: u64,
+    batches: u64,
+    metering_source: &str,
+) -> Result<(), String> {
+    let want_in = batches * USAGE_INPUT_TOKENS;
+    let want_out = batches * USAGE_OUTPUT_TOKENS;
+    if cumulative_input != want_in || cumulative_output != want_out {
+        return Err(format!(
+            "fleet totals must equal the ledger exactly: got ({cumulative_input}, \
+             {cumulative_output}), want ({want_in}, {want_out})"
+        ));
+    }
+    if metering_source != "self-reported" {
+        return Err(format!(
+            "fleet metering_source must be 'self-reported', got {metering_source:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Self-reported metering: a probe emits 3 sentinel batches (10 in / 20 out);
 /// the ledger gains EXACTLY 3 rows; a replayed sequence-0 batch does not
 /// double-count; Fleet totals equal the ledger exactly.
@@ -1787,6 +1819,18 @@ fn self_reported_metering_inner(
     facade: &::hekma_engine::Blocking<'_>,
     state_dir: &Path,
 ) -> Result<(), String> {
+    self_reported_metering_inner_with(facade, state_dir, &[])
+}
+
+/// [`self_reported_metering_inner`] with EXTRA probe args — the seam the
+/// failure-reason tests ride to drive the very same pipeline with a LYING
+/// subject (off-sentinel token counts via `fake_agent --usage-input-tokens`)
+/// without weakening the honest section run.
+fn self_reported_metering_inner_with(
+    facade: &::hekma_engine::Blocking<'_>,
+    state_dir: &Path,
+    extra_probe_args: &[&str],
+) -> Result<(), String> {
     let probe_kind = "tck-meter-probe";
     let dir = tempfile::Builder::new()
         .prefix("ktesio-tck-meter-")
@@ -1794,16 +1838,18 @@ fn self_reported_metering_inner(
         .map_err(|e| format!("probe tempdir: {e}"))?;
     // ONE probe proves BOTH halves (landing + dedup): `--emit-usage 3` emits
     // the 3 distinct events, `--replay-usage` re-sends sequence 0 afterward.
+    let mut probe_args = vec![
+        "--emit-usage",
+        "3",
+        "--replay-usage",
+        "--linger-ms",
+        "600000",
+    ];
+    probe_args.extend_from_slice(extra_probe_args);
     write_probe_manifest(
         dir.path(),
         probe_kind,
-        &[
-            "--emit-usage",
-            "3",
-            "--replay-usage",
-            "--linger-ms",
-            "600000",
-        ],
+        &probe_args,
         None,
         "guaranteed",
         "self-reported",
@@ -1826,25 +1872,15 @@ fn self_reported_metering_inner(
     let rows = usage_row_count(state_dir, probe_kind);
     replay_row_defect(rows)?;
 
-    // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out).
+    // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out), and the
+    // metering-source cell reads the wire string the section ran under.
     let entry = fleet_entry(facade, probe_kind)?;
-    let want_in = 3 * USAGE_INPUT_TOKENS;
-    let want_out = 3 * USAGE_OUTPUT_TOKENS;
-    if entry.usage.cumulative_input_tokens != want_in
-        || entry.usage.cumulative_output_tokens != want_out
-    {
-        return Err(format!(
-            "fleet totals must equal the ledger exactly: got ({}, {}), want \
-             ({want_in}, {want_out})",
-            entry.usage.cumulative_input_tokens, entry.usage.cumulative_output_tokens
-        ));
-    }
-    if entry.metering_source != "self-reported" {
-        return Err(format!(
-            "fleet metering_source must be 'self-reported', got {:?}",
-            entry.metering_source
-        ));
-    }
+    fleet_totals_defect(
+        entry.usage.cumulative_input_tokens,
+        entry.usage.cumulative_output_tokens,
+        EXPECTED_SELF_REPORTED_ROWS,
+        &entry.metering_source,
+    )?;
 
     let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
     Ok(())
@@ -3453,6 +3489,65 @@ env = "MODEL"
         assert!(replay_row_defect(under)
             .unwrap_err()
             .contains(&format!("got {under}")));
+    }
+
+    /// `fleet_totals_defect`: the honest cells pass; inflated and dropped
+    /// totals each fail naming both observed and wanted pairs; the
+    /// mismatched-source arm (a healthy engine cannot exhibit it) fails
+    /// naming the wire string it read.
+    #[test]
+    fn fleet_totals_defect_pins_all_three_arms() {
+        let batches = EXPECTED_SELF_REPORTED_ROWS;
+        let want_in = batches * USAGE_INPUT_TOKENS;
+        let want_out = batches * USAGE_OUTPUT_TOKENS;
+
+        // The honest cells.
+        assert_eq!(
+            fleet_totals_defect(want_in, want_out, batches, "self-reported"),
+            Ok(())
+        );
+
+        // A subject that over-reports its input tokens (e.g. `--usage-input-tokens 11`).
+        let err = fleet_totals_defect(want_in + 3, want_out, batches, "self-reported").unwrap_err();
+        assert!(
+            err.contains("fleet totals must equal the ledger exactly"),
+            "{err}"
+        );
+        assert!(err.contains("got (33, 60)"), "{err}");
+        assert!(err.contains("want (30, 60)"), "{err}");
+
+        // A subject that drops its output tokens.
+        let err = fleet_totals_defect(want_in, 0, batches, "self-reported").unwrap_err();
+        assert!(err.contains("got (30, 0)"), "{err}");
+
+        // The source cell: right totals, wrong wire string.
+        let err = fleet_totals_defect(want_in, want_out, batches, "engine-observed").unwrap_err();
+        assert!(
+            err.contains("fleet metering_source must be 'self-reported', got \"engine-observed\""),
+            "{err}"
+        );
+    }
+
+    /// A LYING subject drives the real `self_reported_metering_inner`
+    /// pipeline end-to-end: `--usage-input-tokens 11` emits 3 honest-shaped
+    /// batches with off-sentinel counts, so the ledger lands exactly 3 rows
+    /// (dedup passes) while the Fleet-equality arm — and ONLY that arm —
+    /// fails with the triage-grade reason. Pins the previously unexecuted
+    /// `fleet totals must equal the ledger exactly` failure path.
+    #[test]
+    fn self_reported_metering_fails_when_the_subject_lies_about_its_tokens() {
+        let (dir, facade) = helper_engine();
+        let err =
+            self_reported_metering_inner_with(&facade, dir.path(), &["--usage-input-tokens", "11"])
+                .expect_err("a lying subject must fail the fleet-equality check");
+        assert!(
+            err.contains("fleet totals must equal the ledger exactly"),
+            "{err}"
+        );
+        // Triage-grade: both observed and wanted pairs in the reason — the
+        // operator sees the 33-vs-30 inflation without a rerun.
+        assert!(err.contains("got (33, 60)"), "{err}");
+        assert!(err.contains("want (30, 60)"), "{err}");
     }
 
     /// `pause_demo`: Guaranteed is a REAL suspension on Unix and an honest
