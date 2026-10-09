@@ -6550,6 +6550,160 @@ fn logs_follow_json_emits_an_incremental_batch_as_valid_ndjson() {
 }
 
 #[test]
+fn logs_follow_reports_rotation_instead_of_silently_claiming_completeness() {
+    // Story 4-2, AC-D/AC-H: when the current log generation shrinks below the
+    // follow cursor (a rotation happened since the last poll), `--follow` must
+    // print ONE honest notice rather than silently claim completeness — and the
+    // notice rides on STDERR (AD-12), never into the stream a caller parses.
+    //
+    // Both `note_if_rotated` call sites are pinned by ONE test because they are
+    // one contract observed at two instants of the same loop:
+    //
+    //   1. the steady-state poll loop (a rotation observed while the instance
+    //      is still `running`), and
+    //   2. the bounded final drain (a rotation observed after the instance
+    //      left `running` — the drain re-checks on every retry, so a rotation
+    //      landing inside the [`FOLLOW_FINAL_DRAIN_BOUND`] window is reported
+    //      through the same notice).
+    //
+    // The rotation itself is simulated ON DISK (the engine's own
+    // `read_agent_log_since_on_rotation` test does the same): the current
+    // generation is replaced by a FRESH, SHORTER file, exactly the shape the
+    // writer leaves after a size-triggered rotate. Driving a real 10 MiB
+    // rotation through a live agent would pin the test to the writer's
+    // threshold rather than the follow loop's detection contract.
+    //
+    // Cross-OS by construction: a `registered` (never-started) instance is not
+    // `running`, so the loop reaches the final-drain exit path on every OS —
+    // the same cross-OS spine the incremental-NDJSON test above relies on.
+    let (ctx, state) = registered_mock("rot");
+    let state_dir = state.project_dir.as_path();
+    append_captured_log_lines(
+        state_dir,
+        "rot",
+        &[captured(
+            "rot",
+            hekma_engine::LogStream::AgentOut,
+            "backlog line",
+        )],
+    );
+
+    // Redirect the follow child's stdout/stderr to FILES so the parent can
+    // poll for committed output while the child is still running (the same
+    // file-poll harness as the incremental-NDJSON test).
+    let out_path = ctx.project_dir.join("follow-stdout.ndjson");
+    let err_path = ctx.project_dir.join("follow-stderr.txt");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+        .args(["agent", "logs", "rot", "--follow", "--json"])
+        .current_dir(&ctx.project_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdout(std::fs::File::create(&out_path).expect("create follow stdout file"))
+        .stderr(std::fs::File::create(&err_path).expect("create follow stderr file"))
+        .spawn()
+        .expect("spawn hekma agent logs --follow --json");
+
+    // POLL until the initial backlog is committed to stdout — once it is
+    // visible, the one-shot read has returned and its cursor sits at the end
+    // of the (pre-rotation) current generation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let seen = std::fs::read_to_string(&out_path).unwrap_or_default();
+        if seen.contains("backlog line") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "follow never emitted its initial backlog; stdout so far={seen}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Simulate the rotation ON DISK, the way the real writer does it: stage the
+    // fresh generation in the same directory and RENAME it over the current
+    // file (atomic — a concurrent reader sees the old or the new generation,
+    // never a torn prefix; `rotate_generations` itself renames). Replacing the
+    // file with an in-place truncate+write would expose a torn read to the
+    // follow poll. The next `read_agent_log_since(name, cursor)` call —
+    // whichever call site makes it — must observe the shrink and report it.
+    let log_path = attributed_output_log_path(state_dir, "rot");
+    let old_len = std::fs::metadata(&log_path)
+        .expect("stat the pre-rotation log")
+        .len();
+    let after_rotation = captured(
+        "rot",
+        hekma_engine::LogStream::Engine,
+        // Deliberately SHORTER than the backlog line: a rotation leaves a
+        // fresh current generation whose byte length is below the cursor.
+        "fresh",
+    );
+    let staged = log_path
+        .parent()
+        .expect("the instance log dir")
+        .join("output.log.rotation-fixture");
+    std::fs::write(
+        &staged,
+        format!("{}\n", serde_json::to_string(&after_rotation).unwrap()),
+    )
+    .expect("stage the fresh post-rotation generation");
+    std::fs::rename(&staged, &log_path).expect("rotate: atomically replace the current generation");
+    let new_len = std::fs::metadata(&log_path)
+        .expect("stat the rotated log")
+        .len();
+    assert!(
+        new_len < old_len,
+        "the fixture must genuinely shrink the current generation ({new_len} !< {old_len})"
+    );
+
+    // Follow must end on its own (the instance is not running) — never hang.
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < exit_deadline,
+            "hekma agent logs --follow must not hang after a rotation on a non-running instance"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "follow must exit 0; stderr={}",
+        std::fs::read_to_string(&err_path).unwrap_or_default()
+    );
+
+    // The rotation notice is a NOTICE — stderr only (AD-12), naming the
+    // instance and the re-read command, never mixed into the NDJSON stream.
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    assert!(
+        stderr.contains("output rotated"),
+        "the rotation notice must reach stderr; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("`hekma agent logs rot`"),
+        "the notice must name the plain re-read command for instance 'rot'; stderr={stderr}"
+    );
+
+    // And the notice must be the ONLY extra channel content: stdout stays pure
+    // NDJSON — the backlog the one-shot dump emitted. The post-rotation line
+    // never re-appears there through the follow loop (a Shrunk pass delivers
+    // NO lines by design), so the wire stays exactly what was dumped.
+    let stdout = std::fs::read_to_string(&out_path).expect("read follow stdout");
+    let texts = assert_ndjson_log_lines(&stdout, "rot");
+    assert_eq!(
+        texts,
+        vec!["backlog line"],
+        "a Shrunk pass delivers no lines, so stdout must stay exactly the initial dump",
+    );
+    assert!(
+        new_len > 0,
+        "the rotated fixture must be non-empty (sanity)"
+    );
+}
+
+#[test]
 fn logs_json_survives_a_consumer_that_stops_reading_and_still_exits_zero() {
     // Fix pass (M1): `hekma agent logs --json | head -5` used to PANIC. Rust ignores
     // SIGPIPE, so `println!` hit `ErrorKind::BrokenPipe`, unwrapped, and aborted
