@@ -30,7 +30,8 @@
     "typescript": "^6.0.3"
   },
   "overrides": {
-    "postcss": "^8.5.26"
+    "postcss": "^8.5.26",
+    "katex": "^0.18.2"
   },
   "engines": {
     "node": ">=20.9.0"
