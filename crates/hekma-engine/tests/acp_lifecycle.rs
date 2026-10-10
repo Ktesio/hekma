@@ -1542,3 +1542,60 @@ fn adopted_survivor_surfaces_the_recorded_session_and_the_next_start_resumes() {
 
     let _ = engine2.blocking().stop(name, None).expect("stop");
 }
+
+/// The not-draining row: an agent that completes the handshake but then
+/// stops reading its stdin forever (`no-read`) turns a prompt LARGER than
+/// any OS pipe buffer (1 MiB; the largest default buffer is 64 KiB) into a
+/// blocked bounded write — surfaced as the typed `InteractionTimedOut`
+/// after the full bound (5s), NOT an EPIPE and NOT a hang. The channel is
+/// then PERMANENTLY poisoned for this engine session: the second send
+/// fails FAST (no second 5s wait) through the generic
+/// `InteractionUnavailable` mapping, and `stop` still terminates the
+/// parked child cleanly (no turn was ever in flight — the marker is only
+/// set AFTER a successful write).
+#[test]
+fn a_prompt_to_an_agent_that_stops_draining_times_out_then_fails_fast() {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "acp-no-read";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "no-read", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    // 1 MiB of plain ASCII — larger than every supported OS's default pipe
+    // buffer, and unescaped by the codec (no JSON-escaping of 'x').
+    let huge = "x".repeat(1024 * 1024);
+    let err = blocking.send_input(name, &huge).unwrap_err();
+    assert!(
+        matches!(err, EngineError::InteractionTimedOut { ref name, timeout_secs: 5 } if name == "acp-no-read"),
+        "expected the typed not-draining timeout, got {err:?}"
+    );
+
+    // The poisoned channel: the SECOND send must fail FAST (the bounded
+    // writer's timeout state is permanent for this engine session — no
+    // second 5s wait) and through the generic mapping, with a detail that
+    // honestly names the stdin channel.
+    let started_at = Instant::now();
+    let err = blocking.send_input(name, "again").unwrap_err();
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "the second refusal must be immediate, took {:?}",
+        started_at.elapsed()
+    );
+    match err {
+        EngineError::InteractionUnavailable { ref detail, .. } => assert!(
+            detail.contains("stdin"),
+            "the refusal must name the stdin channel honestly: {detail}"
+        ),
+        other => panic!("expected the generic interaction-unavailable mapping, got {other:?}"),
+    }
+
+    // Stop is unaffected: the in-flight marker was never set (only a
+    // successful write sets it), so the ladder terminates the parked child
+    // without waiting on any turn.
+    let stopped = blocking.stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
