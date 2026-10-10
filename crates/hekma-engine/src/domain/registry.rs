@@ -1864,6 +1864,48 @@ mod tests {
     }
 
     #[test]
+    fn register_rolls_back_when_adapter_snapshot_cannot_be_written() {
+        // Sibling of the config.toml rollback arm: the snapshot write is the
+        // LAST step of materialize_home, so its failure must roll back a row
+        // whose config.toml write already SUCCEEDED — proving the rollback
+        // sweeps a partially-populated home, not just an empty one. Same
+        // injection as the config arm: pre-create adapter.json AS A DIRECTORY
+        // so std::fs::write fails with a typed RegistryError::Io naming the
+        // snapshot path (the AD-6 atomicity contract, third leg).
+        let tmp = TempDir::new().unwrap();
+        let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        // materialize_home's earlier steps must be ABLE to succeed, so seed
+        // only the snapshot path — agents/demo/ and config.toml are writable.
+        let snapshot_as_dir = reg.paths().agent_home(&name).join(ADAPTER_SNAPSHOT_FILE);
+        std::fs::create_dir_all(&snapshot_as_dir).unwrap();
+
+        let err = reg.register("demo", "mock").unwrap_err();
+        match err {
+            RegistryError::Io { name: n, path, .. } => {
+                assert_eq!(n, "demo");
+                assert!(
+                    path.ends_with(ADAPTER_SNAPSHOT_FILE),
+                    "the error must name the snapshot write; path={path}"
+                );
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // Row rolled back.
+        assert!(reg.list().unwrap().is_empty());
+        assert!(matches!(
+            reg.lookup(&name),
+            Err(RegistryError::NotFound { .. })
+        ));
+        // The home (including the SUCCEEDED config.toml and the injected
+        // snapshot directory) is swept by the rollback — nothing partial.
+        assert!(
+            !reg.paths().agent_home(&name).exists(),
+            "the registration rollback must remove the partially-populated home"
+        );
+    }
+
+    #[test]
     fn register_orphan_row_when_rollback_delete_also_fails() {
         // F2 compound failure: materialize_home fails (file at the agents dir)
         // AND the rollback delete fails (delete-blocking trigger). The result
