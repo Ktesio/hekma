@@ -448,6 +448,109 @@ fn malformed_line_is_surfaced_and_the_stream_continues() {
     let _ = blocking.stop(name, None).expect("stop");
 }
 
+/// The tolerance envelope: a turn wrapped in BLANK framing lines and UNKNOWN
+/// `sessionUpdate` discriminators (the future-protocol-addition shape) must
+/// neither trip the malformed-line path nor kill the stream. The blanks are
+/// skipped SILENTLY (they are framing, not garbage); each unknown
+/// discriminator is counted + surfaced with its name and the honest running
+/// total (spine AD-19's tolerant-parser contract, pinned end to end through
+/// the real subprocess — the unit tests pin the parser, this pins the
+/// reader's routing of it).
+#[test]
+fn noisy_updates_are_counted_surfaced_and_the_turn_still_completes() {
+    let base = TempDir::new().unwrap();
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open(&base, Some(&shared));
+    let name = "acp-noisy";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "noisy-updates", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    blocking.send_input(name, "noisy turn").expect("send");
+
+    // The turn still completes — tolerance is never fatal.
+    poll_until("the turn completes through the noise", || {
+        log_texts(&engine, name)
+            .iter()
+            .any(|t| t.contains("acp: turn complete (stopReason: end_turn)"))
+    });
+
+    // All three unknown discriminators were counted + surfaced, each with
+    // its running total (1, 2, 3 — the honest cumulative count).
+    poll_until("all three unhandled updates surfaced with totals", || {
+        let captured = sink_text(&shared);
+        captured.contains("unhandled session update 'future_feature_update'")
+            && captured.contains("unhandled session update 'user_idle_state'")
+            && captured.contains("unhandled session update 'context_compaction'")
+            && captured.contains("1 unhandled update(s) so far")
+            && captured.contains("2 unhandled update(s) so far")
+            && captured.contains("3 unhandled update(s) so far")
+    });
+
+    // The blank framing lines were NOT malformed lines: the malformed-line
+    // diagnostic never fired for them (the counter text is absent — the
+    // sink's whole history proves the negative).
+    let captured = sink_text(&shared);
+    assert!(
+        !captured.contains("malformed line #"),
+        "blank framing lines must not trip the malformed-line path: {captured}"
+    );
+
+    let _ = blocking.stop(name, None).expect("stop");
+}
+
+/// The mid-turn death shape: the agent exits without answering the prompt
+/// (stdout closes while the turn is in flight). The reader must surface the
+/// Ended notice, the still-registered prompt waiter is failed with the
+/// stream-ended error (teardown courtesy — a bounded waiter never waits out
+/// its timeout), the in-flight marker is cleared (no phantom turn on a dead
+/// transport), and the reaper lands the instance `failed` with a crashed
+/// cause under a `never` restart policy.
+#[test]
+fn agent_exit_mid_turn_surfaces_ended_fails_the_waiter_and_lands_failed() {
+    let base = TempDir::new().unwrap();
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open(&base, Some(&shared));
+    let name = "acp-exit-mid-turn";
+    register_acp(&engine, base.path(), name);
+    // `never` keeps the crash down (the default `on-failure` would restart
+    // it) — this test pins the failure landing, not the restart loop. The
+    // policy lives on the record (SQLite), not the config keys.
+    engine
+        .blocking()
+        .set_restart_policy(name, hekma_engine::RestartPolicy::Never)
+        .expect("set restart policy");
+    configure_and_start(&engine, name, "exit-on-prompt", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    blocking
+        .send_input(name, "the turn that never answers")
+        .expect("send");
+
+    // The reaper detects the death and lands the instance `failed`.
+    poll_until("the dead agent lands failed", || {
+        blocking
+            .list()
+            .expect("list")
+            .into_iter()
+            .any(|i| i.name.as_str() == name && i.state == LifecycleState::Failed)
+    });
+
+    // The transport death was surfaced through the diagnostic sink —
+    // surfaced-not-silent (AI-18).
+    poll_until("the stream-ended diagnostic surfaced", || {
+        sink_text(&shared).contains("the agent's stdout stream ended (end of stream")
+    });
+
+    let _ = blocking.stop(name, None);
+}
+
 /// The permission-request row: the agent's `session/request_permission` is
 /// answered DENIED via the offered `reject_once` option, exactly one
 /// surfaced diagnostic names the refusal, and the turn proceeds to
