@@ -26,8 +26,11 @@ impl Supervisor {
     }
 
     /// The injected poll error for `pid`, when the seam is armed (cfg(test)).
+    /// `pub(super)`: the stuck-stop retry branch in `lifecycle.rs` fronts the
+    /// SAME seam at its own (second) `backend.poll` site, mirroring this
+    /// module's phase-1 probe.
     #[cfg(test)]
-    fn injected_poll_fault(&self, pid: u32) -> Option<BackendError> {
+    pub(super) fn injected_poll_fault(&self, pid: u32) -> Option<BackendError> {
         self.poll_fault_pids
             .contains(&pid)
             .then(|| BackendError::Control {

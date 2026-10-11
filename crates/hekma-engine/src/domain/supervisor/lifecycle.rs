@@ -149,15 +149,31 @@ impl Supervisor {
         // `poll_once_ignores_an_exit_during_a_requested_stop_not_a_crash`
         // exercises) takes the ORIGINAL, unchanged path below.
         if instance.state == LifecycleState::Stopping {
+            // AI-12 wiring seam (cfg(test)), the second poll site: the armed
+            // pid's poll fails with an injected error HERE too, driving the
+            // retry branch's error map (EngineError::Backend) without staging
+            // a real procfs outage — same probe shape as `poll_once`'s phase
+            // 1 (short immutable borrows BEFORE the mutable handle borrow).
+            #[cfg(test)]
+            let injected = {
+                let pid = self
+                    .running
+                    .get(&name)
+                    .map(|supervised| self.backend.pid(&supervised.handle));
+                pid.and_then(|pid| self.injected_poll_fault(pid))
+            };
+            #[cfg(not(test))]
+            let injected = None;
             let stuck = match self.running.get_mut(&name) {
                 Some(supervised) if supervised.stop_unconfirmed => {
-                    let status = self
-                        .backend
-                        .poll(&mut supervised.handle)
-                        .map_err(|source| EngineError::Backend {
-                            name: name.as_str().to_string(),
-                            source,
-                        })?;
+                    let status = match injected {
+                        Some(source) => Err(source),
+                        None => self.backend.poll(&mut supervised.handle),
+                    }
+                    .map_err(|source| EngineError::Backend {
+                        name: name.as_str().to_string(),
+                        source,
+                    })?;
                     let log_capture = self.backend.log_capture(&supervised.handle);
                     Some((status, log_capture))
                 }
