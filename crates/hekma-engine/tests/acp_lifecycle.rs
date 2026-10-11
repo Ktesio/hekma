@@ -402,13 +402,19 @@ fn stop_cancels_the_turn_then_terminates() {
         started_stop.elapsed()
     );
 
-    // The cancel was DELIVERED: the fake agent logs it to STDERR (its own
-    // diagnostic channel — stdout stays pure ACP), so the raw stderr
-    // capture carries the fact.
-    let stderr = std::fs::read_to_string(agent_stderr_path(base.path(), name)).unwrap_or_default();
+    // The cancel was DELIVERED — and the DELIVERY is what the engine can
+    // prove. The agent's own stderr receipt (`session/cancel received`) is
+    // written by the CHILD's reader thread, which the stop ladder's SIGTERM
+    // can kill before it is ever scheduled under load, so that child-side
+    // receipt is inherently racy (issue #264). The ENGINE, however, knows
+    // the bounded write succeeded the moment `cancel_turn` returns Ok — it
+    // records an `engine`-attributed line synchronously BEFORE the ladder
+    // starts, so the attributed log carries the durable proof.
+    let logs = log_texts(&engine, name);
     assert!(
-        stderr.contains("session/cancel received"),
-        "the agent must have received the cancel: {stderr}"
+        logs.iter()
+            .any(|t| t.contains("acp: session/cancel delivered")),
+        "the engine must have recorded the cancel delivery: {logs:?}"
     );
 }
 
