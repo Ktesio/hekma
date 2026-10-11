@@ -53,7 +53,14 @@
 //!   notice, fail any still-registered waiter with the stream-ended error,
 //!   clear the in-flight turn marker, and the reaper must land the instance
 //!   `failed` with a crashed cause (restart policy `never`).
-
+//! * `no-read` — completes the handshake normally (initialize answered,
+//!   `session/new` forwarded), then the process STOPS DRAINING its stdin
+//!   forever: the defect model for a stuck agent whose input pipe fills.
+//!   A prompt larger than the OS pipe buffer blocks the engine's bounded
+//!   writer past its timeout — the honest "not draining" surface — without
+//!   ever closing the pipe (an exit would turn the block into an EPIPE,
+//!   a different failure).
+//!
 //! ## Story 14-3 modes (the metering tiers)
 //!
 //! * `usage-update` — for each `session/prompt`, first emit ONE
@@ -348,6 +355,7 @@ fn main() {
         Eof,
     }
     let (tx, rx) = mpsc::channel::<Inbound>();
+    let reader_mode = mode.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = std::io::BufReader::new(stdin.lock());
@@ -407,6 +415,34 @@ fn main() {
                                 .and_then(|p| p.get("sessionId"))
                                 .and_then(|s| s.as_str())
                                 .map(str::to_string);
+                            if reader_mode == "no-read" && method == "session/new" {
+                                // The `no-read` defect model: the session is
+                                // established (this line IS forwarded so the
+                                // main loop answers it — the engine's
+                                // handshake completes and `start` reports
+                                // `running`), but the process then STOPS
+                                // DRAINING its stdin — no thread ever reads
+                                // the pipe again. The next prompt larger
+                                // than the OS pipe buffer therefore blocks
+                                // the engine's bounded writer for its full
+                                // timeout: the honest "agent is not
+                                // draining" surface. Parking forever (not
+                                // exiting) is what makes it a NON-GRACEFUL
+                                // stuck agent — an exit would close the pipe
+                                // and turn the blocked write into an EPIPE.
+                                let _ = tx.send(Inbound::Request {
+                                    id,
+                                    method,
+                                    session_id,
+                                });
+                                eprintln!(
+                                    "fake_acp_agent: no-read: parking after session/new; \
+                                     stdin will not be drained again"
+                                );
+                                loop {
+                                    std::thread::sleep(Duration::from_secs(3600));
+                                }
+                            }
                             let _ = tx.send(Inbound::Request {
                                 id,
                                 method,
