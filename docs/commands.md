@@ -322,7 +322,7 @@ The human confirmation names the kind and prints one boundary sentence stating e
   "instance": "demo",
   "kind": "filesystem",
   "guarantee": "managed_dir_byte_durable",
-  "dir": "/home/you/.local/share/hekma/agents/demo/memory",
+  "dir": "/home/you/.local/share/ktesio/agents/demo/memory",
   "declared": true
 }
 ```
