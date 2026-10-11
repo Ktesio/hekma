@@ -1945,6 +1945,14 @@ mod tests {
         // not the `<default via KTESIO_STATE_DIR>` placeholder, which would hide
         // the actual path that failed. Save/restore the shared env.
         const OFFENDING: &str = "relative/base";
+        // Hold the shared env lock from the paths tests module: this test
+        // mutates the process-global KTESIO_STATE_DIR, which the paths
+        // env-family tests also touch — without the lock the mutation
+        // windows can interleave under default --test-threads and both
+        // tests observe phantom ConflictingStateDir failures.
+        let _env_guard = crate::paths::tests::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os(crate::paths::STATE_DIR_ENV);
         std::env::set_var(crate::paths::STATE_DIR_ENV, OFFENDING);
         let result = Registry::open(None);
