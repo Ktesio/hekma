@@ -4987,3 +4987,199 @@ fn poll_once_drops_the_handle_when_the_instance_row_is_gone_mid_crash() {
         "the row must stay gone, not resurrect as failed: {lookup:?}"
     );
 }
+
+/// Drain `name`'s captured stdout usage sentinels until at least `want` events
+/// are committed in the ledger (the manual-cadence idiom `a_shrunk_agent_log…`
+/// uses — the reaper is never raced; the drain is driven by the TEST).
+fn drain_until_committed(
+    sup: &mut Supervisor,
+    registry: &Registry,
+    state: &Path,
+    name: &str,
+    want: i64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(registry);
+        if ledger_totals(state, name).0 >= want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: {want} usage events never committed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
+    // The `enforce_stop` Err arm (budget.rs story 3-2, "best-effort: a stop
+    // error is logged, never a crash"): a `stop` Breach Action whose lifecycle
+    // write fails must (1) STILL have recorded the breach event FIRST (FR-21),
+    // (2) surface the "could not be honored" breadcrumb through the engine's
+    // diagnostic sink, and (3) leave the supervisor ALIVE with the breach
+    // latch spent (a second drain of the same scope fires nothing).
+    //
+    // The lifecycle write is sabotaged with the AI-9 Leg-B idiom (instance.log
+    // replaced by a directory → the append fails with a typed Log error) AFTER
+    // the budget is armed and the agent is running, and BEFORE the manual
+    // drain that would commit the breaching event. The breach log
+    // (`breaches.log`) is a DIFFERENT file and keeps working, which is exactly
+    // the "record FIRST, act best-effort" ordering under proof.
+    let (state, _manifest, registry) =
+        setup_fake("stopfail", &["--emit-usage", "5", "--linger-ms", "600000"]);
+    let name = InstanceName::new("stopfail").unwrap();
+    // Budget armed so event 1 (30 tokens) crosses a cumulative ceiling of 30.
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "30")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "stop")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "stopfail").unwrap();
+
+    // Wait until the breaching event is IN THE LOG but not yet drained (the
+    // manual cadence owns ingestion), then sabotage the lifecycle append.
+    let agent_log = registry.agent_output_log_path(&name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(&agent_log)
+            .map(|c| c.matches("KTESIO_USAGE").count())
+            .unwrap_or(0)
+            >= 1
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "usage sentinel never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let instance_log = registry.instance_log_path(&name);
+    std::fs::remove_file(&instance_log).unwrap();
+    std::fs::create_dir(&instance_log).unwrap();
+
+    // THE DRAIN: commit the breaching event, trip enforcement, sabotage bites.
+    sup.drain_usage_all(&registry);
+
+    // (1) FR-21: the breach was recorded FIRST despite the failed stop.
+    let breaches = Supervisor::read_breach_events(&registry, "stopfail").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "exactly one breach for the single crossing: {breaches:?}"
+    );
+    assert_eq!(breaches[0].action.as_str(), "stop");
+    assert_eq!(breaches[0].scope, BreachScope::Cumulative);
+
+    // (2) The breadcrumb reached the sink, naming the instance + the honest
+    // reason (the typed Log error the sabotaged append surfaced).
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("stopfail: budget breach stop could not be honored:"),
+        "the enforcement breadcrumb must name the instance and the failure: {text}"
+    );
+    assert!(
+        text.contains("instance.log"),
+        "the surfaced error must name the sabotaged lifecycle log: {text}"
+    );
+
+    // (3) Best-effort means the supervisor survives: the `running → stopping`
+    // persist COMMITS before the sabotaged append (persist-first, the AI-9
+    // contract), so the row honestly reads `stopping` — a failed enforcement
+    // never crashed the supervisor, never faked a terminal state, and the
+    // handle is retained for a later reconciliation.
+    assert_eq!(
+        state_of(&registry, "stopfail"),
+        LifecycleState::Stopping,
+        "persist-first: the committed transition must read stopping"
+    );
+
+    // Latch: a further drain of the same scope records NOTHING new (one
+    // breach per (dimension, scope) per Run).
+    sup.drain_usage_all(&registry);
+    let after = Supervisor::read_breach_events(&registry, "stopfail").unwrap();
+    assert_eq!(after.len(), 1, "the breach latch must be spent: {after:?}");
+
+    // Repair the lifecycle log so the teardown can append its terminal event,
+    // and flip the row back to `running` so the stop passes the transition
+    // gate ((stopping, Stop) is not a valid command row). A direct store
+    // UPDATE is the test-only seam (the supervisor's own set_state goes
+    // through the registry; this reaches past it deliberately — the state
+    // predates the sabotage, it is not a behavior under test).
+    std::fs::remove_dir(&instance_log).unwrap();
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute(
+            "UPDATE agent_instances SET state = 'running' WHERE name = 'stopfail'",
+            [],
+        )
+        .unwrap();
+    }
+    let _ = sup.stop(&registry, "stopfail", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_malformed_instance_config_disarms_enforcement_without_a_crash() {
+    // The `enforce_budget` config-read guard (usage.rs, the `let Ok(…)` early
+    // return): a MALFORMED on-disk instance config layer must degrade to "no
+    // budget / no Rate" — the usage event still COMMITS, no breach fires, no
+    // crash, and (the control leg) the byte-identical flow with a WELL-FORMED
+    // config DOES fire the breach, proving the disarm is the config's fault.
+    let (state, _manifest, registry) =
+        setup_fake("cfgbrk", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("cfgbrk").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "30")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "cfgbrk").unwrap();
+
+    // Corrupt the instance config layer AFTER arming: a malformed TOML layer
+    // makes `effective_config` Err → enforcement disarms (best-effort, AD-12).
+    // The armed bytes are saved first — the control leg restores them verbatim
+    // (the same write path that armed the budget, replayed byte-for-byte).
+    let config_path = registry.paths().instance_config(&name);
+    let armed_config = std::fs::read(&config_path).unwrap();
+    std::fs::write(&config_path, b"not = = toml [").unwrap();
+
+    // Commit the breaching events under the corrupted config: usage ingestion
+    // is config-independent (60 tokens ≥ the 30 ceiling would have tripped a
+    // stop/warn on the FIRST event — twice over).
+    drain_until_committed(&mut sup, &registry, state.path(), "cfgbrk", 2);
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "cfgbrk")
+            .unwrap()
+            .len(),
+        0,
+        "a malformed config layer must disarm enforcement (no breach fired)"
+    );
+    // The events still COMMITTED (billing honesty is config-independent) and
+    // the instance is untouched.
+    assert_eq!(ledger_totals(state.path(), "cfgbrk").0, 2);
+    assert_eq!(state_of(&registry, "cfgbrk"), LifecycleState::Running);
+
+    // CONTROL LEG: restore the armed layer byte-for-byte and start a NEW Run —
+    // the per-Run latch resets on start, and the cumulative total (60) is
+    // already past the 30 ceiling, so the first committed event of the new
+    // run fires the breach the corrupted config suppressed.
+    std::fs::write(&config_path, &armed_config).unwrap();
+    let _ = sup.stop(&registry, "cfgbrk", Some(Duration::from_secs(5)));
+    sup.start(&registry, "cfgbrk").unwrap();
+    drain_until_committed(&mut sup, &registry, state.path(), "cfgbrk", 4);
+    let breaches = Supervisor::read_breach_events(&registry, "cfgbrk").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the repaired config must re-arm enforcement: {breaches:?}"
+    );
+    assert_eq!(breaches[0].action.as_str(), "warn");
+    assert_eq!(state_of(&registry, "cfgbrk"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "cfgbrk", Some(Duration::from_secs(5)));
+}
