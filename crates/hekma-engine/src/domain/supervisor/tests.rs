@@ -1186,6 +1186,61 @@ fn stop_retry_on_a_stuck_unconfirmed_instance_polls_cheaply_no_compounding() {
 }
 
 #[test]
+fn stop_retry_on_a_stuck_unconfirmed_instance_maps_a_poll_failure_honestly() {
+    // The stuck-retry branch's poll-ERROR map (the alive/self-heal rows are
+    // pinned by the two tests above): when the cheap reconciliation poll
+    // itself FAILS (a procfs-style outage), the retry must surface the
+    // typed `EngineError::Backend` naming the instance — never a panic,
+    // never a silent fall-through to the ordinary path below (which would
+    // misread the still-`stopping` row as an invalid transition and lose
+    // the poll failure). Driven through the AI-12 cfg(test) poll-fault
+    // seam, fronted at this second `backend.poll` site exactly as
+    // `poll_once` fronts it in phase 1.
+    let (_state, _manifest, registry) = setup_fake("stuckpoll", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "stuckpoll").unwrap();
+    let name = InstanceName::new("stuckpoll").unwrap();
+
+    // The stuck-retry premise: row `stopping`, handle retained, flagged.
+    registry.set_state(&name, LifecycleState::Stopping).unwrap();
+    sup.running.get_mut(&name).unwrap().stop_unconfirmed = true;
+
+    // Arm the poll fault for THIS handle's pid, then retry the stop.
+    let pid = sup.backend.pid(&sup.running.get(&name).unwrap().handle);
+    sup.arm_poll_fault(pid);
+
+    let start = Instant::now();
+    let err = sup.stop(&registry, "stuckpoll", None).unwrap_err();
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(&err, EngineError::Backend { name, source: BackendError::Control { op, .. } }
+            if name == "stuckpoll" && *op == "poll"),
+        "the poll failure must surface as the typed Backend error naming the \
+             instance and the poll op, got {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the error map must stay on the cheap-poll path (no new signal, no new \
+             wait): {elapsed:?}"
+    );
+    // The map `?`-returns BEFORE any state change: the row is untouched and
+    // the flagged handle retained for a later retry.
+    assert_eq!(state_of(&registry, "stuckpoll"), LifecycleState::Stopping);
+    assert!(
+        sup.running.contains_key(&name),
+        "the flagged handle must be retained across the poll failure"
+    );
+
+    // Teardown: disarm is impossible (the seam holds for the supervisor's
+    // lifetime), so kill through the backend directly — a real stop of a
+    // live process, never the faulted poll.
+    let supervised = sup.running.get_mut(&name).unwrap();
+    let _ = sup
+        .backend
+        .stop(&mut supervised.handle, Duration::from_secs(2));
+}
+
+#[test]
 fn stop_retry_self_heals_once_the_stuck_process_actually_exits() {
     // The self-healing counterpart: once the process behind a
     // stop_unconfirmed handle has ACTUALLY died (the OS condition that
@@ -2275,6 +2330,20 @@ fn read_agent_log_since_on_an_invalid_name_is_invalid_name() {
     let state = tempfile::tempdir().unwrap();
     let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     let err = Supervisor::read_agent_log_since(&registry, "Not Valid!", 0).unwrap_err();
+    assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
+}
+
+#[test]
+fn restart_on_an_invalid_name_is_invalid_name() {
+    // The restart path's name-validation arm (lifecycle.rs): a malformed name
+    // rejects with the uniform `InvalidName` BEFORE any record read or start
+    // side effect — same posture as the read paths above.
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let err = sup
+        .restart(&registry, "Not Valid!", 1, Duration::from_millis(1))
+        .unwrap_err();
     assert!(matches!(err, EngineError::InvalidName { .. }), "{err:?}");
 }
 
@@ -4099,6 +4168,89 @@ fn a_post_commit_signal_failure_emits_the_divergence_breadcrumb_and_returns_err(
     // normal stop lands (stop does not consult `signal_backend`).
     sup.stop(&registry, "sigfault", Some(Duration::from_millis(600)))
         .unwrap();
+}
+
+#[test]
+fn a_post_commit_signal_failure_on_resume_advises_stop_only_and_stop_lands() {
+    // AI-9 (loop 2) — the RESUME half of the post-commit signal-failure
+    // branch (the pause half is pinned directly above). The row is `paused`,
+    // persist-first commits `paused → running`, THEN the cfg(test) seam
+    // makes `signal_backend` fail, so the ledger says `running` while the
+    // process (on Unix) is still SIGSTOP'd — the resume remediation must
+    // advise `stop` ONLY (`resume` is now the INVALID transition; only
+    // stop's escalation reaches a suspended process), the breadcrumb must
+    // name the committed state, and the seam's own op arm must read
+    // `resume`. The advice is then proven REAL: the trailing stop really
+    // terminates the still-suspended process. On Windows the backend's
+    // pause is a cooperative no-op, so the physical freeze premise degrades
+    // to "the signal merely failed" — every committed-state and breadcrumb
+    // assertion below still holds there; only the freeze is Unix-real.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("sigresume", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("sigresume").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "sigresume").unwrap();
+    let sink = install_capture_sink(&mut sup);
+
+    // A REAL pause first: the row reaches `paused` through the production
+    // path (on Unix the process is genuinely SIGSTOP'd from here on).
+    sup.pause(&registry, "sigresume").unwrap();
+    assert_eq!(state_of(&registry, "sigresume"), LifecycleState::Paused);
+
+    // Then the seam: the resume's transition COMMITS, the signal fails.
+    sup.arm_signal_fault(name.clone());
+    let err = sup.resume(&registry, "sigresume").unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Backend { .. }),
+        "the post-commit resume signal failure must surface as the Backend error, got {err:?}"
+    );
+    // The seam's own op arm must read `resume` (the command mapping in
+    // `signal_backend`), and the injected why must ride the error chain.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("process control operation 'resume' failed"),
+        "the fault must carry the resume op arm: {rendered}"
+    );
+    assert!(
+        rendered.contains("injected cfg(test) signal fault"),
+        "the injected why must ride through: {rendered}"
+    );
+    // The divergence breadcrumb: committed state named, stop advised ONLY
+    // (a `resume` recommendation would be the now-invalid transition).
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("says 'running'"),
+        "the breadcrumb must name the COMMITTED state: {text}"
+    );
+    assert!(
+        text.contains("may diverge"),
+        "the breadcrumb must state the divergence: {text}"
+    );
+    assert!(
+        text.contains("kt agent stop sigresume"),
+        "the resume remediation must lead with `stop`: {text}"
+    );
+    assert!(
+        !text.contains("kt agent resume"),
+        "the resume remediation must NEVER advise `resume` (the row already says running): {text}"
+    );
+    // Persist-first held: the committed transition survived the signal failure.
+    assert_eq!(
+        state_of(&registry, "sigresume"),
+        LifecycleState::Running,
+        "persist-first: the committed resume transition must survive the signal failure"
+    );
+
+    // The remediation is REAL advice: stop truly terminates the process —
+    // on Unix the escalation ladder reaches the still-SIGSTOP'd child that
+    // a plain SIGTERM exit could not.
+    sup.stop(&registry, "sigresume", Some(Duration::from_millis(600)))
+        .unwrap();
+    assert_eq!(state_of(&registry, "sigresume"), LifecycleState::Stopped);
+    assert!(
+        !sup.running.contains_key(&name),
+        "the handle must be released by the terminal stop"
+    );
 }
 
 #[test]
