@@ -1,5 +1,7 @@
 use super::*;
 use crate::adapter::{AdapterRef, StartLaunch};
+use crate::domain::RegistryError;
+use crate::domain::RemoveDisposition;
 use crate::domain::RestartPolicy;
 use std::time::Instant;
 
@@ -4616,5 +4618,220 @@ fn the_self_reported_park_gives_up_after_max_attempts_and_skips_loudly() {
         ledger_totals(state.path(), name.as_str()),
         (3, 28),
         "the post-skip event must commit normally (10+11+7 input)"
+    );
+}
+
+#[test]
+fn crash_cause_vocabulary_is_honest_for_exit_codes_and_signals() {
+    // The two plain-exit `crash_detail` arms (AI-13's vocabulary): a child
+    // that exits WITH a code names the code; a child killed by a signal (no
+    // code on Unix) says "terminated by signal" WITHOUT inventing a code or
+    // blaming adoption (it is this engine's child). Both through the real
+    // `poll_once` crash path, `never` policy, cause read from the event log.
+    // `--crash-after-ms 500` lets the start's readiness probe (300ms window)
+    // pass FIRST — an immediate death trips the launch guard instead of the
+    // reaper (the sibling tests above use the same shape).
+    let (_state, _manifest, registry) = setup_fake(
+        "codexit",
+        &["--crash-after-ms", "500", "--crash-with", "42"],
+    );
+    registry
+        .set_restart_policy(&InstanceName::new("codexit").unwrap(), RestartPolicy::Never)
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "codexit").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = sup.poll_once(&registry);
+        if state_of(&registry, "codexit") == LifecycleState::Failed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clean-code exit was never crash-detected"
+        );
+    }
+    let events = Supervisor::read_events(&registry, "codexit").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.new_state, LifecycleState::Failed);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("process exited unexpectedly with code 42"),
+        "the cause must name the observed exit code: {cause}"
+    );
+    assert!(
+        !cause.contains("terminated by signal"),
+        "a coded exit must not claim a signal: {cause}"
+    );
+    assert!(
+        !cause.contains("exit code unavailable"),
+        "a coded exit must not claim the adopted-unavailable arm: {cause}"
+    );
+}
+
+#[test]
+fn crash_cause_for_a_signal_death_says_signal_without_inventing_a_code() {
+    // The `Exited(None)` NON-adopted arm: kill the held child out-of-band
+    // with SIGKILL — on Unix `try_wait` yields no code — so the cause must
+    // say "terminated by signal" and must NOT invent a code, claim the
+    // adopted arm, or stay silent. The kill goes through the SAME portable
+    // `ProcessBackend::stop` the `heals` test above uses (cfg-free at this
+    // call site; OS mechanics live in backends/), then the REAL poll loop
+    // observes the corpse. Windows skips: a Windows stop TerminateProcess
+    // exit carries a code, so the None-arm is not honestly reachable there.
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let (_state, _manifest, registry) = setup_fake("sigdeath", &["--linger-ms", "600000"]);
+    registry
+        .set_restart_policy(
+            &InstanceName::new("sigdeath").unwrap(),
+            RestartPolicy::Never,
+        )
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "sigdeath").unwrap();
+    let name = InstanceName::new("sigdeath").unwrap();
+    {
+        let supervised = sup.running.get_mut(&name).unwrap();
+        sup.backend
+            .stop(&mut supervised.handle, Duration::from_secs(5))
+            .expect("the out-of-band kill must succeed promptly");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = sup.poll_once(&registry);
+        if state_of(&registry, "sigdeath") == LifecycleState::Failed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the signal death was never crash-detected"
+        );
+    }
+    let events = Supervisor::read_events(&registry, "sigdeath").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.new_state, LifecycleState::Failed);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("terminated by signal"),
+        "a code-less child exit must say signal: {cause}"
+    );
+    assert!(
+        !cause.contains("exit code unavailable"),
+        "a child death must not claim the adopted arm: {cause}"
+    );
+    assert!(
+        !cause.contains("with code"),
+        "a code-less exit must not invent a code: {cause}"
+    );
+}
+
+#[test]
+fn persistent_poll_failure_with_a_live_sibling_handle_names_no_sole_handle() {
+    // The `sole_handle: false` corroboration leg (line 417's `""` arm): TWO
+    // held handles, only ONE faulting, is NOT an environmental tick (one
+    // errored handle corroborates nothing) — the faulting handle's streak
+    // grows per-handle and trips normally, and its crash cause must NOT
+    // carry the "ONLY held handle" caveat (a sibling was held all along).
+    // The healthy sibling stays running throughout: no collateral crash.
+    let (_state, _manifest, registry) =
+        setup_two_fakes(["lone", "sib"], &["--linger-ms", "600000"]);
+    registry
+        .set_restart_policy(&InstanceName::new("lone").unwrap(), RestartPolicy::Never)
+        .unwrap();
+    registry
+        .set_restart_policy(&InstanceName::new("sib").unwrap(), RestartPolicy::Never)
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "lone").unwrap();
+    sup.start(&registry, "sib").unwrap();
+    let lone = InstanceName::new("lone").unwrap();
+    let pid = sup.backend.pid(&sup.running.get(&lone).unwrap().handle);
+    sup.arm_poll_fault(pid);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let plans = sup.poll_once(&registry);
+        if state_of(&registry, "lone") == LifecycleState::Failed {
+            assert!(
+                plans.is_empty(),
+                "a `never` policy must not schedule a restart"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the faulting handle never tripped"
+        );
+    }
+    // The sibling survives the whole episode.
+    assert_eq!(state_of(&registry, "sib"), LifecycleState::Running);
+    assert!(sup.running.contains_key(&InstanceName::new("sib").unwrap()));
+    // The cause names the persistent failure and the last error, but NOT the
+    // only-held-handle caveat — a sibling WAS held.
+    let events = Supervisor::read_events(&registry, "lone").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.new_state, LifecycleState::Failed);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("persistent poll failure"),
+        "the per-handle trip must be named: {cause}"
+    );
+    assert!(
+        cause.contains("last error:"),
+        "the last error text must be carried (AI-12b): {cause}"
+    );
+    assert!(
+        !cause.contains("ONLY held handle"),
+        "a crash with a live sibling must not claim sole-handle corroboration: {cause}"
+    );
+}
+
+#[test]
+fn poll_once_drops_the_handle_when_the_instance_row_is_gone_mid_crash() {
+    // The row-gone arm (lines 304-308): the held process exits while its
+    // registry row has been removed out-of-band (an operator remove --force
+    // racing the reaper). The reaper must drop the handle and CLEAR the
+    // streak bookkeeping — no failed transition onto a deleted row, no
+    // panic, no stale streak bequeathed to a future same-named instance.
+    let (_state, _manifest, registry) = setup_fake(
+        "ghostrow",
+        &["--crash-after-ms", "500", "--crash-with", "7"],
+    );
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "ghostrow").unwrap();
+    let name = InstanceName::new("ghostrow").unwrap();
+    // One clean poll first: the process may have exited before we removed
+    // the row; only proceed while the handle is still held.
+    let _ = sup.poll_once(&registry);
+    if !sup.running.contains_key(&name) {
+        // It already crashed under us — restart it for a deterministic leg.
+        sup.start(&registry, "ghostrow").unwrap();
+    }
+    registry
+        .remove("ghostrow", RemoveDisposition::Retain, /* force */ true)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = sup.poll_once(&registry);
+        if !sup.running.contains_key(&name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reaper never dropped the row-gone handle"
+        );
+    }
+    // The row-gone arm leaves NO transition events on a deleted row (the
+    // remove already took them) and no streak residue.
+    assert!(
+        sup.poll_error_streaks.is_empty() && sup.poll_last_errors.is_empty(),
+        "the dropped handle must leave no streak or last-error bookkeeping"
+    );
+    let lookup = registry.lookup(&name);
+    assert!(
+        matches!(lookup, Err(RegistryError::NotFound { .. })),
+        "the row must stay gone, not resurrect as failed: {lookup:?}"
     );
 }
