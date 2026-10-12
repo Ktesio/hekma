@@ -1038,13 +1038,35 @@ impl Supervisor {
         if !connection.turn_in_flight() {
             return;
         }
-        if let Err(detail) = connection.cancel_turn() {
-            let note = format!(
-                "{}: the session/cancel for the in-flight ACP turn could not be delivered \
-                 ({detail}); the stop ladder proceeds regardless",
-                name.as_str(),
-            );
-            self.emit_diagnostic(&note);
+        match connection.cancel_turn() {
+            Ok(()) => {
+                // The cancel WAS written — record that fact on a channel the
+                // stop ladder cannot preempt. The agent's own receipt (a
+                // stderr line, say) lives in the CHILD's process: the SIGTERM
+                // the ladder sends moments later can kill it before its
+                // reader thread is ever scheduled to write, so child-side
+                // evidence of a delivered cancel is inherently racy under
+                // load. This engine-attributed line is appended
+                // SYNCHRONOUSLY here (send_engine_line's on-return durability
+                // contract), BEFORE the ladder starts, so it is the durable
+                // record of the delivery.
+                if let Some(capture) = self.log_capture_for(name) {
+                    capture.send_engine_line(LogLine::new(
+                        name.as_str(),
+                        LogStream::Engine,
+                        "acp: session/cancel delivered for the in-flight turn",
+                        now_rfc3339(),
+                    ));
+                }
+            }
+            Err(detail) => {
+                let note = format!(
+                    "{}: the session/cancel for the in-flight ACP turn could not be delivered \
+                     ({detail}); the stop ladder proceeds regardless",
+                    name.as_str(),
+                );
+                self.emit_diagnostic(&note);
+            }
         }
     }
 }
