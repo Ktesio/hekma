@@ -2826,8 +2826,7 @@ source = "self-reported"
             .unwrap();
         assert!(
             warnings.is_empty(),
-            "an unreadable snapshot yields no steering: {} warning(s)",
-            warnings.len()
+            "an unreadable snapshot yields no steering"
         );
         let eff = reg
             .effective_config(&snap_name, ConfigLayer::empty())
@@ -2849,8 +2848,7 @@ source = "self-reported"
             .unwrap();
         assert!(
             warnings.is_empty(),
-            "a corrupted manifest yields no steering: {} warning(s)",
-            warnings.len()
+            "a corrupted manifest yields no steering"
         );
         let eff = reg
             .effective_config(&mfn_name, ConfigLayer::empty())
