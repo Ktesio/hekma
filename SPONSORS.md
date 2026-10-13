@@ -1,25 +1,24 @@
-# Sponsoring Ktesio
+# Sponsoring Hekma
 
-Ktesio is a source-available CLI for sharing, distributing, and installing agent skills.
+Hekma is an open-source runtime that runs AI agents like services: it supervises their lifecycle, meters real token usage, and enforces dollar budgets. It ships under Apache-2.0 as a Ktesio project.
 
-The goal of Ktesio is to make skills portable, discoverable, installable, and reusable across AI agents and developer workflows.
+The goal of Hekma is to make agents dependable infrastructure — supervised, observable, and budgeted like any other service.
 
 Sponsorship helps keep the project maintained, independent, and useful for the wider community.
 
-## Why sponsor Ktesio?
+## Why sponsor Hekma?
 
-Sponsor Ktesio if you believe agent skills should be easy to package, share, install, and reuse.
+Sponsor Hekma if you believe agents should run as supervised, metered, budgeted services instead of ad-hoc processes.
 
 Your sponsorship helps fund:
 
 - Continued development and maintenance
 - Cross-platform release binaries for macOS, Windows, and Linux
 - Better documentation and examples
-- Registry and manifest design
+- Agent adapter development and integration testing
 - Security improvements
-- Compatibility testing
+- Compatibility testing across runtimes and operating systems
 - Community support
-- Future support for agents, not only skills
 
 ## Sponsorship options
 
@@ -45,7 +44,7 @@ Sponsor recognition does not mean control over the project.
 
 Sponsorship supports the project, but it does not buy ownership, trademark rights, release rights, or maintainer authority.
 
-The Ktesio name, official releases, project direction, and governance remain controlled by the project maintainers.
+The Hekma and Ktesio names, official releases, project direction, and governance remain controlled by the project maintainers.
 
 Sponsors may suggest features, report issues, fund specific work, or support priorities, but maintainers make final project decisions.
 
@@ -53,12 +52,11 @@ Sponsors may suggest features, report issues, fund specific work, or support pri
 
 Sponsorship is especially welcome from:
 
-- Developers using Ktesio
+- Developers using Hekma
 - Teams building agent tooling
 - Companies building AI developer platforms
-- Organizations interested in portable agent skills
-- Registry, marketplace, or package ecosystem builders
-- Teams that want reliable skill distribution for internal agents
+- Organizations running agents in production
+- Platform teams that need metered, budget-capped agent workloads
 
 ## Funded work
 
@@ -66,13 +64,11 @@ Sponsors may fund general maintenance or specific areas of work.
 
 Examples:
 
-- Improved installer experience
-- Stable manifest schema
-- Skill validation and security checks
-- Registry support
+- Improved supervision and lifecycle controls
+- New agent adapters
+- Metering and budget enforcement features
 - Better examples and documentation
-- CI/release automation
-- Agent support
+- CI and release automation
 - Enterprise-friendly workflows
 
 If you want to fund a specific feature, please open a discussion first so we can align on scope, expectations, and whether the feature fits the project.
@@ -83,11 +79,11 @@ Sponsorship does not include:
 
 - Ownership of the project
 - Exclusive control over roadmap
-- Permission to use the Ktesio name as your own product
+- Permission to use the Hekma or Ktesio names as your own product
 - Guaranteed feature delivery unless separately agreed
 - Private support unless explicitly agreed
-- Endorsement by the Ktesio project
-- Permission to publish official-looking Ktesio releases
+- Endorsement by the project
+- Permission to publish official-looking Hekma releases
 
 For brand and trademark rules, see `TRADEMARK.md`.
 
@@ -95,11 +91,11 @@ For brand and trademark rules, see `TRADEMARK.md`.
 
 Company sponsorship is welcome.
 
-Companies can sponsor Ktesio to support:
+Companies can sponsor Hekma to support:
 
 - Project sustainability
 - Tooling they depend on
-- Features useful to their teams
+- Features useful for their teams
 - Security and reliability improvements
 - Long-term ecosystem health
 
@@ -107,6 +103,6 @@ For larger sponsorships, please contact the maintainer to discuss the best path.
 
 ## Thank you
 
-Every sponsorship helps keep Ktesio moving forward.
+Every sponsorship helps keep Hekma moving forward.
 
-Thank you for supporting independent, source-available infrastructure for agent skills.
+Thank you for supporting independent, open-source infrastructure for running AI agents.
