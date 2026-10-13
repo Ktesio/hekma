@@ -2664,18 +2664,15 @@ source = "self-reported"
         assert_eq!(warnings.len(), 1, "exactly one steering warning");
         assert!(
             warnings[0].contains("model"),
-            "names the key: {}",
-            warnings[0]
+            "names the config key with the steering warning"
         );
         assert!(
             warnings[0].contains("FLAG"),
-            "names the flag-target leak risk: {}",
-            warnings[0]
+            "names the flag-target leak risk"
         );
         assert!(
             warnings[0].contains("env") && warnings[0].contains("file"),
-            "names the env/file alternative: {}",
-            warnings[0]
+            "names the env/file alternative"
         );
 
         // The value is persisted as the reference (the write is unaffected).

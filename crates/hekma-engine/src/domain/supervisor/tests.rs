@@ -375,7 +375,10 @@ fn start_emits_one_diagnostic_when_a_secret_resolves_into_a_flag_target() {
         .set_config(&name, "model", &format!("secret:{env_key}"))
         .unwrap();
     assert_eq!(warnings.len(), 1, "the set-time warning fires (AI-33)");
-    assert!(warnings[0].contains("model"), "{}", warnings[0]);
+    assert!(
+        warnings[0].contains("model"),
+        "names the config key with the steering warning"
+    );
 
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
