@@ -357,7 +357,7 @@ jobs:
         # so a red (regression) run's numbers are preserved too — that is
         # exactly when the record matters most.
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-budgets-report
           path: perf-budgets-report.json
@@ -1295,7 +1295,7 @@ jobs:
         # an incomplete profile, which the logs cannot (the panicking job's
         # runner discards them otherwise).
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-measurement
           path: |
