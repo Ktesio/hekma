@@ -353,7 +353,10 @@ fn extract_from_zip(
         let mut file = archive.by_index(index).map_err(|error| SelfUpdateFailed {
             message: format!("Could not read release archive entry: {error}"),
         })?;
-        let path = Path::new(file.name());
+        let entry_name = file.name().map_err(|error| SelfUpdateFailed {
+            message: format!("Could not read release archive entry name: {error}"),
+        })?;
+        let path = Path::new(entry_name.as_ref());
         if let Some(name) = wanted_binary_name(path.file_name().and_then(|n| n.to_str()), wanted) {
             let mut binary = Vec::new();
             file.read_to_end(&mut binary)
