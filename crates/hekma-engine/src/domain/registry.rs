@@ -1978,6 +1978,78 @@ mod tests {
     }
 
     #[test]
+    fn open_maps_conflicting_state_dirs_naming_the_alias_value() {
+        // AI-4 sibling arm: HEKMA_STATE_DIR and KTESIO_STATE_DIR both set to
+        // DIFFERENT absolute paths is PathError::ConflictingStateDir — the
+        // registry mapping must surface RegistryError::Io whose `path` names
+        // the ALIAS value (the source error text itself quotes both). Save and
+        // restore both names; hold the shared env lock for the same
+        // interleaving hazard as the relative-base test above.
+        let alias = TempDir::new().unwrap();
+        let legacy = TempDir::new().unwrap();
+        let _env_guard = crate::paths::tests::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_alias = std::env::var_os(crate::paths::STATE_DIR_ENV_ALIAS);
+        let prev_legacy = std::env::var_os(crate::paths::STATE_DIR_ENV);
+        std::env::set_var(crate::paths::STATE_DIR_ENV_ALIAS, alias.path());
+        std::env::set_var(crate::paths::STATE_DIR_ENV, legacy.path());
+        let result = Registry::open(None);
+        std::env::set_var(crate::paths::STATE_DIR_ENV_ALIAS, ""); // neutralize first
+        std::env::set_var(crate::paths::STATE_DIR_ENV, "");
+        match prev_alias {
+            Some(v) => std::env::set_var(crate::paths::STATE_DIR_ENV_ALIAS, v),
+            None => std::env::remove_var(crate::paths::STATE_DIR_ENV_ALIAS),
+        }
+        match prev_legacy {
+            Some(v) => std::env::set_var(crate::paths::STATE_DIR_ENV, v),
+            None => std::env::remove_var(crate::paths::STATE_DIR_ENV),
+        }
+        let err = match result {
+            Ok(_) => panic!("expected Io from conflicting state dirs, got Ok"),
+            Err(e) => e,
+        };
+        match err {
+            RegistryError::Io { path, .. } => {
+                assert_eq!(
+                    path,
+                    alias.path().to_string_lossy(),
+                    "path must name the alias (HEKMA) value"
+                );
+            }
+            other => panic!("expected Io from conflicting state dirs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_record_registry_pass_through_round_trips_and_clears() {
+        // The registry's write-ahead-record surface (write → read → clear) is a
+        // thin pass-through to the store; pin it once at the REGISTRY layer —
+        // the only production caller of clear_spawn_record (the reaper's
+        // clean-stop path) discards the Result, so nothing else exercises its
+        // Ok arm.
+        let (_tmp, reg) = open_temp();
+        reg.register("demo", "mock").unwrap();
+        let name = InstanceName::new("demo").unwrap();
+        assert!(reg.spawn_record(&name).unwrap().is_none());
+
+        let record = SpawnRecord {
+            name: name.clone(),
+            fingerprint: crate::ports::ProcessFingerprint::new(4321, 987_654),
+            restart_policy: RestartPolicy::OnFailure,
+            restart_count: 0,
+            last_known_cause: None,
+            detach: false,
+            acp_session_id: None,
+        };
+        reg.write_spawn_record(&record).unwrap();
+        assert_eq!(reg.spawn_record(&name).unwrap(), Some(record));
+
+        reg.clear_spawn_record(&name).unwrap();
+        assert!(reg.spawn_record(&name).unwrap().is_none());
+    }
+
+    #[test]
     fn remove_delete_succeeds_when_home_already_gone() {
         // F6 TOCTOU: if the Agent Home is already absent, a Delete removal must
         // succeed (desired end state already holds) rather than fail with
@@ -2727,6 +2799,63 @@ source = "self-reported"
             .unwrap()
             .is_empty(),
             "a secret on a known key the adapter maps NOWHERE is quiet (Decision 6 no-op)"
+        );
+    }
+
+    #[test]
+    fn set_config_steering_stays_quiet_when_facts_degrade() {
+        // AI-33 degradation contract: steering is BEST-EFFORT and must never
+        // fail (or complicate) an otherwise-valid write. Sabotage the two
+        // facts it consults AFTER registration — (a) the adapter.json snapshot
+        // becomes unreadable, (b) the manifest referenced by a snapshot turns
+        // into garbage TOML — and the secret-onto-flag-target write still
+        // SUCCEEDS with ZERO warnings (the honest degraded answer: no facts,
+        // no steering), and the value still persists.
+        let (_tmp, reg) = open_temp();
+
+        // (a) unreadable adapter.json: pre-register the flag-target instance,
+        // then plant a DIRECTORY at the snapshot path.
+        let manifest = TempDir::new().unwrap();
+        register_flag_target_instance(&reg, "snpgone", manifest.path());
+        let snap_name = InstanceName::new("snpgone").unwrap();
+        let snapshot_path = reg.paths().agent_home(&snap_name).join("adapter.json");
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).unwrap();
+        let warnings = reg
+            .set_config(&snap_name, "model", "secret:SOME_SECRET")
+            .unwrap();
+        assert!(
+            warnings.is_empty(),
+            "an unreadable snapshot yields no steering"
+        );
+        let eff = reg
+            .effective_config(&snap_name, ConfigLayer::empty())
+            .unwrap();
+        assert_eq!(
+            eff.value("model"),
+            Some(&toml::Value::String("secret:SOME_SECRET".into()))
+        );
+
+        // (b) manifest garbage: register a SECOND instance sharing the same
+        // manifest DIRECTORY, then corrupt the shared adapter.toml in place.
+        // The steering resolve re-reads the manifest; a from_toml_str failure
+        // is LaunchResolveError::ManifestUnreadable — quiet, per the contract.
+        register_flag_target_instance(&reg, "mfnbad", manifest.path());
+        let mfn_name = InstanceName::new("mfnbad").unwrap();
+        std::fs::write(manifest.path().join("adapter.toml"), b"not = [valid toml").unwrap();
+        let warnings = reg
+            .set_config(&mfn_name, "model", "secret:SOME_SECRET")
+            .unwrap();
+        assert!(
+            warnings.is_empty(),
+            "a corrupted manifest yields no steering"
+        );
+        let eff = reg
+            .effective_config(&mfn_name, ConfigLayer::empty())
+            .unwrap();
+        assert_eq!(
+            eff.value("model"),
+            Some(&toml::Value::String("secret:SOME_SECRET".into()))
         );
     }
 
