@@ -3334,6 +3334,36 @@ mod tests {
     }
 
     #[test]
+    fn gap_and_context_absence_arms_render_the_honest_empty_forms() {
+        // The None arms the happy-path test above leaves unpinned: a fleet
+        // WITHOUT a usage gap renders NO stderr note content (the empty string
+        // — `list` skips the note line entirely), and an agent-reported
+        // context figure WITHOUT an agent-reported cost renders the token
+        // halves with no cost fragment — neither a placeholder nor a
+        // zero-cost claim of ours.
+        // No gap → no stderr note channel content.
+        let plain = sample_fleet_entry("mock-2");
+        assert_eq!(usage_gap_note(&plain), "");
+        // A context figure with NO agent-reported cost: the token halves still
+        // render, and no cost fragment appears.
+        let mut entry = sample_fleet_entry("acp-2");
+        entry.acp_context_usage = Some(hekma_engine::AcpContextUsageView {
+            used: Some(7),
+            size: Some(9),
+            cost: None,
+        });
+        let context = acp_context_cell(&entry);
+        assert!(
+            context.contains("used 7 of 9 context tokens (agent-reported)"),
+            "{context}"
+        );
+        assert!(
+            !context.contains("cost"),
+            "no cost fragment without an agent-reported cost: {context}"
+        );
+    }
+
+    #[test]
     fn fleet_json_emits_versioned_document_with_budget_seed_and_real_usage() {
         // The `list --json` document is a versioned FleetListing whose per-entry
         // `budget` is the honest JSON null seed (never 0) while `usage` is a real
@@ -4279,6 +4309,31 @@ mod tests {
             "a store failure must surface as AgentStore: {store}"
         );
         assert!(store.to_string().contains("database is locked"));
+
+        // A malformed config layer (AC8) names the layer + source path + the
+        // underlying detail so the operator can point at the exact file to
+        // fix, and classifies as a general error (1) — a broken file is not
+        // the user's command line's fault.
+        let malformed = map_config_error(ConfigError::MalformedLayer {
+            layer: hekma_engine::SourceLayer::Instance,
+            path: "/x/agents/demo/config.toml".to_string(),
+            detail: "expected `=`".to_string(),
+        });
+        assert_eq!(classify(malformed.as_ref()), ExitCode::General);
+        assert!(
+            malformed.downcast_ref::<AgentConfig>().is_some(),
+            "a malformed layer must surface as AgentConfig: {malformed}"
+        );
+        let text = malformed.to_string();
+        assert!(
+            text.contains("config layer at '/x/agents/demo/config.toml'"),
+            "the diagnostic must name the layer and its path: {text}"
+        );
+        assert!(text.contains("expected `=`"), "{text}");
+        assert!(
+            text.contains("Fix the TOML"),
+            "the remediation must state what to do: {text}"
+        );
     }
 
     #[test]

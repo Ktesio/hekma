@@ -1549,6 +1549,56 @@ fn pause_best_effort_prints_qualifier_note_to_stderr_only_unix() {
 }
 
 #[test]
+fn resume_on_a_seeded_paused_row_prints_running_and_exits_zero() {
+    // Story 1-5 AC2 at the CLI: `hekma agent resume` prints the confirmation +
+    // the new Lifecycle State (`running`) to stdout and exits 0.
+    //
+    // Why the row is seeded `paused` rather than paused live: each `hekma`
+    // command is a short-lived engine whose handle Drop kills the child on
+    // clean exit (single-lifetime boundary, story 1-6 — the note in
+    // `pause_prints_paused_state_and_exits_zero_guaranteed_unix`), so a
+    // SIGSTOP'd child never survives the pause command to be resumed by a
+    // LATER invocation; within-one-engine-lifetime resume semantics are
+    // pinned by `crates/hekma-engine/tests/pause.rs`. Seeding the row mirrors
+    // the running-guard precedent (`force_state_running`); the engine's AI-8
+    // no-handle arm then persists the transition with the honest
+    // best-effort-cause naming the missing session handle and still returns
+    // Ok — the real CLI shape for resuming a paused instance from a fresh
+    // engine session. Cross-OS by construction: the mock declares pause
+    // guaranteed (Linux/macOS) and best-effort (Windows), and BOTH levels
+    // transition `paused → running` + return Ok here.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_hekma_agent(
+        &["agent", "register", "rz", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    force_state_paused(state_dir, "rz");
+
+    let resumed = run_hekma_agent(&["agent", "resume", "rz"], &ctx.project_dir, state_dir);
+    assert!(
+        resumed.success,
+        "resume on a paused row should exit 0; stderr={}",
+        resumed.stderr
+    );
+    assert!(
+        resumed.stdout.contains("Resumed Agent Instance"),
+        "stdout should carry the resume confirmation; stdout={}",
+        resumed.stdout
+    );
+    assert!(
+        resumed.stdout.contains("running"),
+        "stdout should print the new Lifecycle State (running); stdout={}",
+        resumed.stdout
+    );
+
+    // Teardown: settle the row (idempotent stop; no live process exists).
+    run_hekma_agent(&["agent", "stop", "rz"], &ctx.project_dir, state_dir);
+}
+
+#[test]
 fn pause_unsupported_exits_nonzero_quoting_the_declaration_unix() {
     // Runtime-skip on Windows (data-driven OS id, NO `#[cfg]` — this file is
     // outside the backends allowlist). Like the best-effort case above, this test
