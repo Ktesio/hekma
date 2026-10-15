@@ -62,6 +62,23 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIsNone(release_docs.semver_key("1.2.3"))
         self.assertIsNone(release_docs.semver_key("v1.2.3-beta"))
 
+    def test_pretag_rehearsal_keeps_the_previous_tag_lower_bound(self) -> None:
+        # Pre-tag dry run: the tag has no ref yet, so HEAD stands in for it —
+        # but the previous release's lower bound must survive, or the
+        # rehearsal aggregates full history instead of the pending range.
+        self.assertEqual(
+            "v0.9.0..HEAD",
+            release_docs.resolve_rev("v0.10.0", "v0.9.0", tag_exists=False),
+        )
+        # Post-tag (the release workflow): the exact tag range.
+        self.assertEqual(
+            "v0.9.0..v0.10.0",
+            release_docs.resolve_rev("v0.10.0", "v0.9.0", tag_exists=True),
+        )
+        # No previous tag (fresh history, or CI's v0.0.0 smoke on a
+        # tag-less shallow checkout): bare HEAD.
+        self.assertEqual("HEAD", release_docs.resolve_rev("v0.0.0", None, tag_exists=False))
+
     def test_release_workflow_contains_expected_asset_and_release_steps(self) -> None:
         workflow = (release_docs.ROOT / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8"
