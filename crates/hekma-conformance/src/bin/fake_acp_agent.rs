@@ -101,6 +101,23 @@
 //! lines), so it is excluded from coverage — its behavior is proven by the
 //! spawning tests.
 
+//! ## Story 15-1 modes (the real-agent dialect pins)
+//!
+//! * `opencode-dialect` — the handshake + turn shapes observed against the
+//!   REAL opencode v2 ACP server (`opencode acp`, v2.0.28, 2026-10-16):
+//!   the `initialize` response carries `authMethods` and a RICH
+//!   `agentCapabilities` object (`mcpCapabilities`, `promptCapabilities`,
+//!   `sessionCapabilities`, `_meta`) alongside the tolerated
+//!   `protocolVersion`; the `session/new` response carries `configOptions`
+//!   alongside the `sessionId`; and the turn rides an
+//!   `available_commands_update` plus a `usage_update` WITH a `cost` block
+//!   before the message chunks. The engine must tolerate every extra
+//!   sibling field (handshake still succeeds), classify both known update
+//!   kinds (no `unhandled` notice for either), surface the CONTEXT-grain
+//!   usage, and still complete the turn. No engine branch ever names
+//!   opencode — this mode exists so the TOLERANCE contract stays pinned
+//!   against a scripted twin of a real dialect.
+
 //! ## Story 14-2 modes (sessions across lifetimes, D4)
 //!
 //! * `--advertise-load` — the `initialize` response advertises
@@ -213,6 +230,27 @@ fn unknown_update(discriminator: &str) -> serde_json::Value {
             "update": {
                 "sessionUpdate": discriminator,
                 "sample": "payload-shape-the-engine-does-not-know",
+            },
+        }),
+    )
+}
+
+/// The `available_commands_update` notification for one turn (story 15-1):
+/// the real opencode v2 shape — the agent's slash-command roster riding the
+/// ordinary update stream. A KNOWN update kind the engine classifies (never
+/// an `unhandled` notice) and deliberately does not echo as its own line.
+#[cfg(not(tarpaulin_include))]
+fn available_commands_update() -> serde_json::Value {
+    notification(
+        "session/update",
+        serde_json::json!({
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    { "name": "init", "description": "guided AGENTS.md setup" },
+                    { "name": "compact", "description": "Compact the session" }
+                ],
             },
         }),
     )
@@ -497,13 +535,30 @@ fn main() {
                 if advertise_load {
                     agent_capabilities.insert("loadSession".to_string(), true.into());
                 }
-                emit(&response(
-                    id,
-                    serde_json::json!({
-                        "protocolVersion": version,
-                        "agentCapabilities": agent_capabilities,
-                    }),
-                ));
+                let mut initialize_result = serde_json::json!({
+                    "protocolVersion": version,
+                    "agentCapabilities": agent_capabilities,
+                });
+                if mode == "opencode-dialect" {
+                    // Story 15-1: the real opencode v2 initialize shape —
+                    // rich capabilities + an authMethods array riding
+                    // ALONGSIDE the fields the handshake actually reads.
+                    initialize_result["agentCapabilities"] = serde_json::json!({
+                        "loadSession": advertise_load,
+                        "mcpCapabilities": { "http": true, "sse": false },
+                        "promptCapabilities": { "embeddedContext": true, "image": true },
+                        "sessionCapabilities": {
+                            "additionalDirectories": {}, "close": {}, "delete": {},
+                            "fork": {}, "list": {}, "resume": {}
+                        },
+                        "_meta": { "fake/dialect": "opencode-dialect" }
+                    });
+                    initialize_result["authMethods"] = serde_json::json!([
+                        { "id": "opencode", "description": "Run `opencode auth login`",
+                          "isAuthenticated": false }
+                    ]);
+                }
+                emit(&response(id, initialize_result));
                 if mode == "version-counter" {
                     // The engine will close the connection; exit promptly so
                     // the refusal test does not wait on a lingering child.
@@ -518,10 +573,22 @@ fn main() {
                 }
             }
             ("session/new", _) => {
-                emit(&response(
-                    id,
-                    serde_json::json!({ "sessionId": SESSION_ID, "mcpServers": [] }),
-                ));
+                let mut new_result =
+                    serde_json::json!({ "sessionId": SESSION_ID, "mcpServers": [] });
+                if mode == "opencode-dialect" {
+                    // Story 15-1: the real opencode v2 session/new shape —
+                    // a configOptions array the engine must ignore while
+                    // reading the sessionId sibling.
+                    new_result["configOptions"] = serde_json::json!([
+                        { "id": "model", "name": "Model", "category": "model",
+                          "type": "select", "currentValue": "fake/free",
+                          "options": [
+                              { "value": "fake/free", "name": "Fake Free" },
+                              { "value": "fake/paid", "name": "Fake Paid" }
+                          ] }
+                    ]);
+                }
+                emit(&response(id, new_result));
             }
             ("session/load", _) => {
                 // Story 14-2: the resume request. Receipt is logged to STDERR
@@ -675,6 +742,15 @@ fn main() {
                 if mode == "sentinel-stderr" {
                     emit_stderr_sentinel(next_turn_sequence);
                     next_turn_sequence += 1;
+                }
+                if mode == "opencode-dialect" {
+                    // Story 15-1: the real opencode v2 turn preamble — a
+                    // slash-command roster change plus a CONTEXT-grain
+                    // usage_update carrying a cost block (the exact shapes
+                    // observed against `opencode acp` v2.0.28), before the
+                    // ordinary chunk sequence.
+                    emit(&available_commands_update());
+                    emit(&usage_update());
                 }
                 if mode == "noisy-updates" {
                     // The noisy envelope: blank framing lines around the
