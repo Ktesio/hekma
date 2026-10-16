@@ -2,9 +2,9 @@
 title: 'Detached continuation: run persistence, honest logs between commands, paused-stray handling, supervision indicator'
 type: 'bugfix'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '9f58225a15a6d093fd7213db0a8c2f7b9fe34522'
-review_loop_iteration: 0
+review_loop_iteration: 0  # implemented 2026-10-16 on feat/detached-continuation
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/sprint-status.yaml'
 ---
@@ -60,13 +60,13 @@ Investigated 2026-10-16 (anchors verified):
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `ports/state_store.rs` + `store/sqlite.rs` -- v9 additive migration: nullable `run_id` on `spawn_records`; record field + row builder + trio; write site spawn.rs:562 -- durable Run identity.
-- [ ] `reaper.rs` -- resume the persisted run_id at adoption (:640) instead of minting; mint only when None (pre-v9) or the process is genuinely new; build the durable latch by seeding `breached_scopes` from breaches.log events already recorded for that run_id.
-- [ ] `reaper.rs` -- pause×detach: SIGCONT a paused DETACHED child at handle drop BEFORE release + note; adoption-time note (not auto-resume) for stranded paused rows.
-- [ ] `interaction.rs` + `cli/agent.rs` -- raw agent.log fallback read (labeled un-attributed, once-per-session) when the attributed log is stale/absent; follow loop surfaces the qualifier.
-- [ ] `domain/fleet.rs` + `engine.rs` + `cli/agent.rs` -- supervision indicator: additive FleetEntry field composed from `record.detach` + live-handle truth; compact human marker + honest `—`; re-pin frozen key-set/schema tests + fixtures.
-- [ ] Docs — `docs/commands.md` (detach section: run continuation, logs fallback qualifier, paused-release semantics), `docs/architecture.md` run-model note; CHANGELOG/RELEASE_NOTES announcements (additive JSON field).
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-2 row.
+- [x] `ports/state_store.rs` + `store/sqlite.rs` -- v9 additive migration: nullable `run_id` on `spawn_records`; record field + row builder + trio; write site spawn.rs:562 -- durable Run identity.
+- [x] `reaper.rs` -- resume the persisted run_id at adoption (:640) instead of minting; mint only when None (pre-v9) or the process is genuinely new; build the durable latch by seeding `breached_scopes` from breaches.log events already recorded for that run_id.
+- [x] `reaper.rs` -- pause×detach: SIGCONT a paused DETACHED child at handle drop BEFORE release + note; adoption-time note (not auto-resume) for stranded paused rows.
+- [x] `interaction.rs` + `cli/agent.rs` -- raw agent.log fallback read (labeled un-attributed, once-per-session) when the attributed log is stale/absent; follow loop surfaces the qualifier.
+- [x] `domain/fleet.rs` + `engine.rs` + `cli/agent.rs` -- supervision indicator: additive FleetEntry field composed from `record.detach` + live-handle truth; compact human marker + honest `—`; re-pin frozen key-set/schema tests + fixtures.
+- [x] Docs — `docs/commands.md` (detach section: run continuation, logs fallback qualifier, paused-release semantics), `docs/architecture.md` run-model note; CHANGELOG/RELEASE_NOTES announcements (additive JSON field).
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-2 row.
 
 **Acceptance Criteria:**
 - Given a detached instance breached in Run R and N subsequent commands, then breaches.log holds exactly ONE event per breached scope for R (no re-fire) and the action fired once.
