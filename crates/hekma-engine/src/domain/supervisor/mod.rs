@@ -1331,6 +1331,11 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
         TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
         TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),
+        // Story 15-2 review round 1: the suffix spells the WIRE TAG
+        // (`detached-resumed`) verbatim — unlike the free-text neighbors
+        // (`launch error`), this edge is new enough to keep greppable against
+        // the `cause.kind` a `--json` consumer sees in the same line's JSON.
+        TransitionCause::DetachedResumed { detail } => format!(" (detached-resumed: {detail})"),
         TransitionCause::Crashed { detail } => format!(" (crashed: {detail})"),
         TransitionCause::Restarted { count, waited_ms } => {
             format!(" (restart #{count}, waited {waited_ms}ms)")

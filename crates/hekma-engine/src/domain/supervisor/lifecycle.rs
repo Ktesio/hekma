@@ -723,4 +723,238 @@ impl Supervisor {
             source,
         })
     }
+
+    /// Story 15-2 (Fibery 178): release DETACHED paused handles at engine
+    /// close — the never-stranded-frozen guarantee.
+    ///
+    /// A detached child paused by an operator is frozen for exactly as long
+    /// as SOME engine holds its handle. When the holding command's engine
+    /// exits, the handle drops DISARMED (story 12-1) — nothing kills the
+    /// child, but equally nothing ever SIGCONTs it: it stayed SIGSTOPped and
+    /// unsupervised between commands, forever, unless the operator happened
+    /// to run `resume`. This pass closes that: for every held handle whose
+    /// spawn record is DETACHED and whose row reads `paused` for an
+    /// OPERATOR pause, RESUME the child BEFORE the handle is released (the
+    /// caller runs this at engine close, while `self.running` still holds
+    /// the handles) and record the honest `paused → running` edge with the
+    /// [`TransitionCause::DetachedResumed`] cause — never a plain `resume`
+    /// command, which would claim an operator action that never happened.
+    ///
+    /// REVIEW ROUND 1 — the OPERATOR/BREACH distinction (the round's
+    /// headline): a BUDGET-BREACH pause is NOT resumed. The breach pause's
+    /// transition carries the [`TransitionCause::BudgetExceeded`] cause (the
+    /// classifier below reads it from the transition record), and resuming
+    /// such a child here would run the agent in the ratified
+    /// ENFORCEMENT-FREE between-commands window (story 12-1: no budget
+    /// enforcement exists between commands) while the seeded latch
+    /// suppresses re-enforcement at the next adoption — un-doing AI-44's
+    /// spend-stop exactly where nobody is watching. Leaving it SIGSTOPped is
+    /// the only reading consistent with both ratified principles; the freeze
+    /// is SURFACED with a note naming why, and the next command's adoption
+    /// names the stranded-paused state again (the stranded-paused note).
+    ///
+    /// Semantics contract (deliberate, documented in `docs/commands.md`): an
+    /// operator `pause` of a detached instance holds only while an engine
+    /// session holds the instance; at that session's exit the child is
+    /// resumed and the row moves to `running`, both surfaced through the
+    /// note. A breach pause instead holds INTO the between-commands window
+    /// until a later command explicitly resumes or stops the instance. A
+    /// NON-detached paused handle is untouched here — its drop already kills
+    /// the group (the story 1-6 no-survivor guarantee), so there is nothing
+    /// to strand. Best-effort per instance: a resume-signal failure is
+    /// SURFACED (the note names it) and the child is still released — the
+    /// pass never blocks engine teardown on one instance.
+    pub(crate) fn release_detached_paused(&mut self, registry: &Registry) {
+        // Pass 1 (immutable): collect the candidates. The spawn record is the
+        // durable detach truth (the same source adoption and the Fleet
+        // indicator read); the row's `paused` state is the pause truth. Both
+        // reads degrade to "not a candidate" (an unreadable record/state never
+        // blocks teardown — the handle then simply drops as before).
+        let candidates: Vec<InstanceName> = self
+            .running
+            .keys()
+            .filter(|name| {
+                let detached = registry
+                    .spawn_record(name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.detach);
+                let paused = registry
+                    .lookup(name)
+                    .map(|inst| inst.state)
+                    .is_ok_and(|state| state == LifecycleState::Paused);
+                detached && paused
+            })
+            .cloned()
+            .collect();
+        // Pass 2: classify, probe, then resume-or-freeze-or-reconcile, one
+        // instance at a time.
+        for name in candidates {
+            let Some(supervised) = self.running.get_mut(&name) else {
+                continue;
+            };
+            // REVIEW ROUND 1, the ALREADY-DEAD probe: the row may read
+            // `paused` for a child that has SINCE EXITED (a suspended
+            // process can die by signal; an adopted row can outlive its
+            // process). Probing BEFORE the resume means the pass never
+            // records a fake `paused → running` for a corpse — the exited
+            // child is RECONCILED on the crashed path instead. A poll ERROR
+            // degrades to the resume attempt below (a single un-pollable
+            // read is not crash evidence — that is poll_once's corroboration
+            // discipline, AI-12 — and teardown must not invent a crash).
+            if let Ok(ProcessStatus::Exited { code }) = self.backend.poll(&mut supervised.handle) {
+                self.reconcile_released_exit(registry, &name, code);
+                continue;
+            }
+            if classify_pause_kind(registry, &name) == PauseKind::Breach {
+                // The enforcement freeze holds into the enforcement-free
+                // window (see the method docs): NO SIGCONT, NO transition —
+                // the row honestly keeps reading `paused` — and the note
+                // names why (AI-18: the pass did SOMETHING surprising, so it
+                // says so). The handle still drops disarmed below exactly as
+                // before; the NEXT command's adoption surfaces the
+                // stranded-paused note again.
+                self.emit_diagnostic(&format!(
+                    "{}: the paused detached child was NOT resumed at engine release — it was \
+                     paused by a BUDGET BREACH, and resuming it here would run it unsupervised \
+                     in the enforcement-free between-commands window; it stays suspended until \
+                     a later command resumes or stops it",
+                    name.as_str(),
+                ));
+                continue;
+            }
+            match self.backend.resume(&mut supervised.handle) {
+                Ok(()) => {
+                    let detail = "resumed at engine release: a detached child is never \
+                                  left SIGSTOPped and unsupervised between commands";
+                    let cause = TransitionCause::detached_resumed(detail);
+                    // REVIEW ROUND 1: exactly ONE note per outcome, keyed on
+                    // the transition write — a success note and a failure
+                    // note can no longer both fire (or the unconditional
+                    // "row is now running" contradict the failed write).
+                    match self.transition(
+                        registry,
+                        &name,
+                        LifecycleState::Paused,
+                        LifecycleState::Running,
+                        cause,
+                    ) {
+                        Ok(_) => self.emit_diagnostic(&format!(
+                            "{}: paused detached child resumed at engine release (SIGCONT before \
+                             the handle was released) — a detached instance is only paused while \
+                             an engine session holds it; the row is now 'running'",
+                            name.as_str(),
+                        )),
+                        Err(err) => {
+                            // The child IS resumed but the row still says
+                            // paused — surfaced, never silent (AI-18);
+                            // teardown continues.
+                            self.emit_diagnostic(&format!(
+                                "{}: the detached paused child was resumed at engine release, \
+                                 but recording the paused→running transition failed ({err}) — \
+                                 the row may read 'paused' until the next command adopts it",
+                                name.as_str(),
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    // The matrix's error arm: the note names the failure; the
+                    // child is still released (the map drops the disarmed
+                    // handle below exactly as before — no kill, no hold).
+                    self.emit_diagnostic(&format!(
+                        "{}: the paused detached child could NOT be resumed at engine \
+                         release ({err}) — it stays suspended after this command exits; \
+                         `hekma agent resume {}` from a later command is the recovery",
+                        name.as_str(),
+                        name.as_str(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Reconcile a paused DETACHED child that has ALREADY EXITED by the time
+    /// the release pass probes it (review round 1): record the honest
+    /// `paused → failed` crash edge — never a fake `paused → running` resume
+    /// — and settle the stale record so the next open does not
+    /// adopt-attempt a dead pid (mirroring [`Supervisor::reconcile_orphan_failed`]'s
+    /// settle). No restart plan: the engine is tearing down; the Restart
+    /// Policy is the NEXT open's decision (its adoption already reconciles a
+    /// dead pid identically).
+    fn reconcile_released_exit(&self, registry: &Registry, name: &InstanceName, code: Option<i32>) {
+        let detail = match code {
+            Some(code) => {
+                format!(
+                    "paused detached child exited before engine release (exited with code {code})"
+                )
+            }
+            None => "paused detached child exited before engine release (exit code unavailable \
+                     — adopted process is not this engine's child)"
+                .to_string(),
+        };
+        if self
+            .transition(
+                registry,
+                name,
+                LifecycleState::Paused,
+                LifecycleState::Failed,
+                TransitionCause::crashed(detail.clone()),
+            )
+            .is_err()
+        {
+            // Persisting the crash transition failed; leave the record for
+            // the next open's reconcile (best-effort — teardown continues).
+        }
+        let _ = registry.settle_spawn_record(name);
+        self.emit_diagnostic(&format!(
+            "{}: the paused detached child had already exited when this engine released it — \
+             reconciled to 'failed' ({detail}); no resume was attempted for a dead process",
+            name.as_str(),
+        ));
+    }
+}
+
+/// Why a `paused` row is paused (story 15-2 review round 1) — the release
+/// pass's OPERATOR/BREACH classifier, shared with adoption's
+/// stranded-paused note.
+///
+/// Reads the instance's transition record (`instance.log`) BACKWARDS for the
+/// most recent `→ paused` edge: a [`TransitionCause::BudgetExceeded`] edge is
+/// a [`PauseKind::Breach`] pause (the enforcement freeze must hold into the
+/// enforcement-free between-commands window); any other cause — an operator
+/// `Command`("pause") or a best-effort qualifier — is [`PauseKind::Operator`].
+/// The MOST RECENT edge wins, so an operator pause AFTER a breach pause is an
+/// operator pause (and vice versa).
+///
+/// Degradation is deliberate: a missing/unreadable log or no `→ paused` edge
+/// classifies as OPERATOR — the freeze applies only on POSITIVE budget
+/// evidence, so an unreadable record can never strand a child frozen forever
+/// (the pass's original guarantee keeps holding exactly when its evidence is
+/// weakest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PauseKind {
+    /// An operator `pause` (or an unreadable/absent record — the fail-safe
+    /// default): the release pass resumes the child.
+    Operator,
+    /// A budget-breach pause (the last `→ paused` edge carries
+    /// [`TransitionCause::BudgetExceeded`]): the release pass leaves the
+    /// child SIGSTOPped with a surfaced note.
+    Breach,
+}
+
+/// Classify why `name`'s row reads `paused` (see [`PauseKind`]).
+pub(super) fn classify_pause_kind(registry: &Registry, name: &InstanceName) -> PauseKind {
+    let events = super::read_events_from(&registry.instance_log_path(name)).unwrap_or_default();
+    let last_pause = events
+        .iter()
+        .rev()
+        .find(|event| event.new_state == LifecycleState::Paused);
+    match last_pause {
+        Some(event) => match &event.cause {
+            TransitionCause::BudgetExceeded { .. } => PauseKind::Breach,
+            _ => PauseKind::Operator,
+        },
+        None => PauseKind::Operator,
+    }
 }

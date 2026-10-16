@@ -52,7 +52,7 @@ pub use event::{
 };
 pub use fleet::{
     AcpContextCostView, AcpContextUsageView, BudgetView, FleetEntry, FleetListing, FleetTotals,
-    UsageGapNotice, UsageView,
+    Supervision, UsageGapNotice, UsageView,
 };
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;

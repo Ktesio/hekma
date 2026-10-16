@@ -614,13 +614,17 @@ impl Supervisor {
                     // (running/paused). AI-7: a paused process is now resumable.
                     //
                     // Metering across a crash/adoption (story 3-1, documented
-                    // assumption): the pre-crash Run id lived only in the crashed
-                    // engine's memory, so the adopted instance opens a NEW Run and
-                    // begins ingestion at the CURRENT end of its agent-output log
-                    // (skipping pre-crash lines). This keeps per-run totals honest for
-                    // the post-adoption span without re-attributing (or double-
-                    // counting) the old Run's already-captured usage; the DB dedup key
-                    // includes the run id, so even an overlapping sequence is safe.
+                    // assumption; story 15-2 AMENDED): the Run id now RIDES the
+                    // spawn record, so the adopted instance RESUMES the previous
+                    // engine's Run instead of opening a new one — per-run totals
+                    // keep accumulating under the same id across commands. The
+                    // ingestion cursor still anchors at the CURRENT end of the
+                    // agent-output log (skipping pre-adoption lines), so nothing
+                    // is re-attributed or double-counted: the DB dedup key
+                    // includes the run id, and the pre-adoption lines were either
+                    // already committed under this same Run or were never
+                    // ingested by the dead engine (the park-loss note above
+                    // names that window).
                     //
                     // AI-18 (surfaced-not-silent, 2026-09-22 hardening): the cursor
                     // re-derivation skips everything the previous engine had NOT
@@ -637,7 +641,119 @@ impl Supervisor {
                          recoverable and goes unaccounted",
                         name.as_str(),
                     ));
-                    let run_id = RunId::mint();
+                    // Story 15-2: RESUME the persisted Run id (the durable Run
+                    // identity on the spawn record, schema v9) instead of
+                    // minting — a detached instance is ONE Run across the N
+                    // commands of its life, so per-run token/dollar totals keep
+                    // accumulating under the same id and an already-recorded
+                    // breach for this Run is spent (the latch below seeds from
+                    // breaches.log). A record with NO id is a pre-v9 record
+                    // (pid-0 policy seeds were skipped above): mint, PERSIST the
+                    // mint back onto the record, and surface a ONE-TIME note —
+                    // the next command resumes the id, so both are genuinely
+                    // once-per-upgrade, not once-per-command.
+                    let run_id = match record.run_id.clone() {
+                        Some(persisted) => persisted,
+                        None => {
+                            // Review round 1: the mint note comes AFTER the
+                            // successful write-back (the Err arm carries the
+                            // failure) — a note printed before the write
+                            // could claim "persisted" of an id that never
+                            // landed.
+                            let minted = RunId::mint();
+                            match registry.set_spawn_run_id(&name, &minted, &record.fingerprint) {
+                                Ok(()) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the spawn record predates durable Run ids — a fresh \
+                                         Run id was minted for it and persisted; per-run totals and \
+                                         breach state continue under it from the next command on",
+                                        name.as_str(),
+                                    ));
+                                }
+                                // Surfaced-not-silent (AI-18): without the
+                                // write-back every later command mints AGAIN
+                                // (the pre-v9 behavior) — the operator must
+                                // hear that, not infer it from resetting
+                                // per-run totals. (The CAS names the rarer
+                                // concurrent stop→start loss itself, where
+                                // the winner's fresh Run id — not a fresh
+                                // mint — is what the next command resumes.)
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: could not persist the minted Run id onto the \
+                                         spawn record ({err}) — each later command mints a \
+                                         fresh Run until a write succeeds (or, if a concurrent \
+                                         stop→start replaced the record, resumes ITS fresh Run)",
+                                        name.as_str(),
+                                    ));
+                                }
+                            }
+                            minted
+                        }
+                    };
+                    // Story 15-2: the DURABLE latch — seed the in-memory
+                    // per-Run breach latch from the breaches ALREADY RECORDED
+                    // for the resumed Run (breaches.log keys every event by
+                    // run_id; the append-only durable record IS the spent
+                    // check). The adoption-time enforce_budget call below
+                    // still evaluates — but an already-recorded
+                    // (dimension, scope) short-circuits, so a breach that
+                    // fired before the engine change does NOT re-record a
+                    // duplicate breaches.log line or re-fire the action
+                    // (Fibery 205), while a genuinely un-recorded crossing
+                    // still fires exactly once (AI-44, now durable: the
+                    // crash-between-record-and-action window self-heals on
+                    // the FIRST adoption, not the next usage event).
+                    //
+                    // Review round 1, ACTION FILTER: only events whose ACTION
+                    // equals the CURRENTLY-CONFIGURED action for their
+                    // dimension seed the latch — a reconfigured action
+                    // (e.g. `warn` → `pause`) must fire ONCE under the
+                    // resumed Run, not stay suppressed forever by the idempotence
+                    // latch keyed only on (dimension, scope). A config read
+                    // that fails degrades to an EMPTY latch (fail-open toward
+                    // one extra enforcement pass — the same direction as the
+                    // corrupt-log arm below; the enforcement call itself
+                    // returns early on a failed config read, so the seed is
+                    // moot in exactly that case).
+                    let (token_action, cost_action) = registry
+                        .effective_config(&name, ConfigLayer::empty())
+                        .map(|effective| {
+                            let (_budget, token_action) = config::resolve_token_budget(&effective);
+                            let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+                            (token_action, cost_action)
+                        })
+                        .unwrap_or((BreachAction::Pause, BreachAction::Pause));
+                    let breach_log_events =
+                        super::read_breach_events_from(&registry.instance_breach_log_path(&name));
+                    let breach_log_events = match breach_log_events {
+                        Ok(events) => events,
+                        Err(detail) => {
+                            // Review round 1 (AI-18): the corrupt log's
+                            // fail-open is SURFACED, never silent — the
+                            // operator hears that the durable spent-check
+                            // was unreadable and the latch degrades to
+                            // empty (one extra enforcement pass may re-fire,
+                            // a duplicate breaches.log line may land).
+                            self.emit_diagnostic(&format!(
+                                "{}: the instance's breach log could not be read \
+                                 ({detail}) — the breach latch degrades to empty, so an \
+                                 already-recorded breach may fire (and re-record) ONCE \
+                                 more under the resumed Run",
+                                name.as_str(),
+                            ));
+                            Vec::new()
+                        }
+                    };
+                    let breached_scopes = breach_log_events
+                        .into_iter()
+                        .filter(|event| event.run_id == run_id.as_str())
+                        .filter(|event| match event.dimension {
+                            BreachDimension::Tokens => event.action == token_action,
+                            BreachDimension::Dollars => event.action == cost_action,
+                        })
+                        .map(|event| (event.dimension, event.scope))
+                        .collect::<std::collections::HashSet<_>>();
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
                     // anchors the same way (at the CURRENT end of the captured
@@ -716,10 +832,16 @@ impl Supervisor {
                             // Story 12-4: an adopted instance starts with no parked
                             // observed events (its prior engine's park died with it).
                             observed_park: None,
-                            // The adopted instance opens a NEW Run (the pre-crash
-                            // run_id died with the crashed engine), so its breach latch
-                            // starts empty too (story 3-2).
-                            breached_scopes: std::collections::HashSet::new(),
+                            // Story 15-2: the DURABLE latch — seeded above from
+                            // the breaches already recorded for the RESUMED Run
+                            // (breaches.log keys events by run_id). The adopted
+                            // Run is the SAME Run the previous engine held (the
+                            // id resumed from the spawn record), so a breach
+                            // that already fired for it is spent here — once per
+                            // RUN, not once per command (AI-44's intent, made
+                            // durable). A fresh Run (stop→start) still begins
+                            // with an empty latch at the spawn site.
+                            breached_scopes,
                             // ENGINE-OBSERVED across a crash/adoption (story 3-4,
                             // tracked follow-up — NOT just a metering gap): the pre-crash
                             // listener died with the crashed engine, but the already-
@@ -814,6 +936,56 @@ impl Supervisor {
                         );
                         self.emit_diagnostic(&strand);
                     }
+                    // Story 15-2: the stranded-paused adoption note (AI-18 +
+                    // Fibery 178): an adopted PAUSED row is held paused —
+                    // adoption NEVER auto-resumes (the pinned AI-7
+                    // stays-paused contract) — and until now that fact went
+                    // unsaid: a paused row whose previous engine died mid-pause
+                    // looks exactly like a healthy operator pause on every
+                    // surface. Name it, and name the way out. For a DETACHED
+                    // row the note also states the release semantics — which
+                    // REVIEW ROUND 1 now splits by pause kind (the release
+                    // pass's classifier, shared here): an OPERATOR pause is
+                    // healed at the releasing session's exit, while a
+                    // BUDGET-BREACH pause deliberately holds into the
+                    // enforcement-free between-commands window (resuming it
+                    // would run the agent unsupervised while the seeded latch
+                    // suppresses re-enforcement — un-doing AI-44's
+                    // spend-stop).
+                    if registry
+                        .lookup(&name)
+                        .map(|inst| inst.state)
+                        .is_ok_and(|state| state == LifecycleState::Paused)
+                    {
+                        let resume_hint = if record.detach {
+                            if super::lifecycle::classify_pause_kind(registry, &name)
+                                == super::lifecycle::PauseKind::Breach
+                            {
+                                "it was paused by a BUDGET BREACH, so the freeze holds \
+                                 between commands too — this engine's exit does NOT resume it \
+                                 (the between-commands window is enforcement-free; resuming it \
+                                 there would run it unsupervised past its ceiling); it stays \
+                                 suspended until a later command resumes or stops it"
+                            } else {
+                                "it stays paused only while THIS engine session holds \
+                                 it; on this session's exit the child is resumed \
+                                 (SIGCONT) and the row moves to running — never left \
+                                 frozen and unsupervised"
+                            }
+                        } else {
+                            "it stays paused until an engine session resumes or \
+                             stops it"
+                        };
+                        self.emit_diagnostic(&format!(
+                            "{}: adopted a PAUSED instance (its previous engine died \
+                             mid-pause, or it was paused before that engine exited) — \
+                             adoption never auto-resumes; {}; `hekma agent resume {}` \
+                             (or `stop`) is the explicit path",
+                            name.as_str(),
+                            resume_hint,
+                            name.as_str(),
+                        ));
+                    }
                     // AI-44: re-evaluate budgets for the JUST-ADOPTED instance
                     // NOW, before returning — the durable ledger survived the
                     // engine crash, so an instance already past its ceiling must
@@ -822,12 +994,15 @@ impl Supervisor {
                     // never for a quiet agent). This is the SAME AD-7
                     // enforcement stage `ingest_usage` runs: a live config read,
                     // the committed per-run + cumulative ledger totals, the pure
-                    // evaluators, record-first-then-act. The fresh Run's breach
-                    // latch is empty (inserted above), so a surviving breach
-                    // fires exactly once here; the action (default pause) goes
-                    // through the normal lifecycle path with the handle just
-                    // re-held. Best-effort by contract: an enforcement error is
-                    // a diagnostic, never an adoption failure.
+                    // evaluators, record-first-then-act. Story 15-2: the call is
+                    // deliberately NOT gated — an over-budget adopted Run is
+                    // still ACTED UPON here — but the latch seeded above makes a
+                    // breach already recorded for the RESUMED Run a no-op, so
+                    // the action fires once per RUN, not once per command. The
+                    // action (default pause) goes through the normal lifecycle
+                    // path with the handle just re-held. Best-effort by
+                    // contract: an enforcement error is a diagnostic, never an
+                    // adoption failure.
                     self.enforce_budget(registry, &name, &run_id, &metering_source);
                 }
                 Ok(None) => {

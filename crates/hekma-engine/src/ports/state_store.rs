@@ -67,6 +67,17 @@ pub struct SpawnRecord {
     /// resume rides the next handshake. `settle_spawn_record` retains the id
     /// across a stop/crash settle on a pid-0 seed row.
     pub acp_session_id: Option<String>,
+    /// Story 15-2: the Run id (spine AD-7) this spawn opened, minted by the
+    /// start/restart path and committed WITH the write-ahead record — the
+    /// durable Run identity. `None` for a pre-v9 record (adoption mints and
+    /// writes one back, surfacing a one-time note) and for the pid-0 policy /
+    /// settle-retained seed rows (a stopped or never-started instance has no
+    /// current Run; the next `start` mints fresh). ADOPTION resumes the
+    /// persisted id instead of minting, so per-run budgets/usage and the
+    /// breach latch survive across the N commands of a detached instance's
+    /// life; a genuine restart (stop→start, or the reaper's restart path)
+    /// rewrites the record with a freshly minted id and the Run resets.
+    pub run_id: Option<RunId>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.
@@ -194,6 +205,41 @@ pub trait StateStore {
         session_id: Option<&str>,
     ) -> Result<(), StoreError>;
 
+    /// Persist the current [`RunId`] onto the instance's spawn record (story
+    /// 15-2) — the durable Run identity's single WRITE beside the start path's
+    /// record commit. The ADOPTION path is the other caller: for a pre-v9
+    /// record (whose `run_id` reads `None`) it mints one and writes it back so
+    /// the back-compat mint + its one-time note are genuinely one-time (the
+    /// NEXT command resumes the id instead of minting again).
+    ///
+    /// The UPDATE is a COMPARE-AND-SET on the `fingerprint` the caller read
+    /// the record under (`WHERE ... AND pid = ? AND start_time = ?`, story
+    /// 15-2 review round 1): if a CONCURRENT stop→start replaced the record
+    /// between the read and this write, the fresh record's own Run id wins —
+    /// a stale adoption mint must never stomp it (the losing write surfaces
+    /// as [`StoreError::Backend`] naming the race, never a silent `Ok`).
+    /// Fails with [`StoreError::NotFound`] when no record row exists (a
+    /// dropped Run identity must never vanish silently, AI-18).
+    ///
+    /// DEFAULTED (compile-compatible for external implementors, 0.6→0.7): a
+    /// store that has not implemented durable Run identity fails LOUD with
+    /// [`StoreError::Backend`] naming the operation — the engine surfaces
+    /// that as the write-failure diagnostic (every re-adoption mints a fresh
+    /// Run, the documented pre-v9 posture), never a silent no-op.
+    fn set_spawn_run_id(
+        &self,
+        _name: &InstanceName,
+        _run_id: &RunId,
+        _fingerprint: &ProcessFingerprint,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Backend(
+            "this StateStore implementation does not override set_spawn_run_id \
+             (story 15-2 durable run identity): the engine surfaces this write failure \
+             and keeps the documented pre-v9 mint-per-adoption posture"
+                .to_string(),
+        ))
+    }
+
     /// Settle the write-ahead spawn record (story 14-2): clear the live
     /// record — a clean stop, a crash reconcile, a terminal settle — while
     /// RETAINING an established acp session id for the next start's resume
@@ -256,4 +302,151 @@ pub trait StateStore {
     /// Read the attached [`MemoryBacking`] for an instance, or `None` if nothing
     /// is attached.
     fn get_memory_backing(&self, name: &InstanceName) -> Result<Option<MemoryBacking>, StoreError>;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Story 15-2 review round 1: the DEFAULTED trait-method body is a covered
+    //! seam — an external store that has not implemented durable Run identity
+    //! must fail LOUD (a named Backend error the engine surfaces as the
+    //! write-failure diagnostic), never a silent `Ok(())` that would let the
+    //! mint appear persisted while nothing was written.
+
+    use super::*;
+
+    /// A store that implements NOTHING — every call hits a defaulted body or
+    /// an unimplemented required method (only the defaulted seam is called).
+    struct BareStore;
+
+    impl StateStore for BareStore {
+        fn create_instance(&self, _instance: &AgentInstance) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn get_instance(&self, _name: &InstanceName) -> Result<Option<AgentInstance>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn list_instances(&self) -> Result<Vec<AgentInstance>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn delete_instance(&self, _name: &InstanceName) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn set_state(
+            &self,
+            _name: &InstanceName,
+            _state: LifecycleState,
+        ) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn count_usage_events(&self, _name: &InstanceName) -> Result<u64, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn record_usage_event(
+            &self,
+            _event: &UsageEvent,
+            _rate: Option<Rate>,
+        ) -> Result<RecordOutcome, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn usage_totals(&self, _name: &InstanceName) -> Result<UsageTotals, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn run_usage_totals(
+            &self,
+            _name: &InstanceName,
+            _run_id: &RunId,
+        ) -> Result<UsageTotals, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn cost_totals(&self, _name: &InstanceName) -> Result<Micros, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn run_cost_totals(
+            &self,
+            _name: &InstanceName,
+            _run_id: &RunId,
+        ) -> Result<Micros, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn upsert_spawn_record(&self, _record: &SpawnRecord) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn clear_spawn_record(&self, _name: &InstanceName) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn set_acp_session_id(
+            &self,
+            _name: &InstanceName,
+            _session_id: Option<&str>,
+        ) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn settle_spawn_record(&self, _name: &InstanceName) -> Result<bool, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn get_spawn_record(
+            &self,
+            _name: &InstanceName,
+        ) -> Result<Option<SpawnRecord>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn list_spawn_records(&self) -> Result<Vec<SpawnRecord>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn set_restart_count(
+            &self,
+            _name: &InstanceName,
+            _restart_count: u32,
+            _last_known_cause: Option<&str>,
+        ) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn set_restart_policy(
+            &self,
+            _name: &InstanceName,
+            _policy: RestartPolicy,
+        ) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn upsert_memory_backing(&self, _backing: &MemoryBacking) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn clear_memory_backing(&self, _name: &InstanceName) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn get_memory_backing(
+            &self,
+            _name: &InstanceName,
+        ) -> Result<Option<MemoryBacking>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+    }
+
+    #[test]
+    fn the_defaulted_set_spawn_run_id_fails_loud_naming_the_seam() {
+        // NEVER Ok: a silent default would let the engine believe the minted
+        // Run id was persisted (the one-time note would fire) while every
+        // later command silently minted again — the exact pre-v9 behavior
+        // the loud default exists to surface (AI-18).
+        let err = BareStore
+            .set_spawn_run_id(
+                &InstanceName::new("away").unwrap(),
+                &RunId::mint(),
+                &ProcessFingerprint::new(42, 7),
+            )
+            .unwrap_err();
+        match err {
+            StoreError::Backend(detail) => {
+                assert!(
+                    detail.contains("does not override set_spawn_run_id"),
+                    "the default must NAME the seam: {detail}"
+                );
+                assert!(
+                    detail.contains("pre-v9 mint-per-adoption posture"),
+                    "the default must name the documented fallback posture: {detail}"
+                );
+            }
+            other => panic!("the defaulted body must return Backend, got {other:?}"),
+        }
+    }
 }

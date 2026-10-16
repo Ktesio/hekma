@@ -2026,6 +2026,10 @@ fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
             " (best-effort: windows)",
         ),
         (
+            TransitionCause::detached_resumed("at engine release"),
+            " (detached-resumed: at engine release)",
+        ),
+        (
             TransitionCause::crashed("exit code 1"),
             " (crashed: exit code 1)",
         ),
@@ -5185,4 +5189,421 @@ fn a_malformed_instance_config_disarms_enforcement_without_a_crash() {
     assert_eq!(breaches[0].action.as_str(), "warn");
     assert_eq!(state_of(&registry, "cfgbrk"), LifecycleState::Running);
     let _ = sup.stop(&registry, "cfgbrk", Some(Duration::from_secs(5)));
+}
+
+// ---------------------------------------------------------------------------
+// Story 15-2 review round 1 — the money-class paths as NON-SKIPPED in-crate
+// unit tests (the e2e legs skip on the linux-x86 CI leg; these run on every
+// leg, so the ubuntu coverage leg executes them): the latch seeding (the
+// corrupt-log surfaced fail-open + the action filter) and the release pass's
+// arms (operator resume vs breach freeze + the already-dead probe).
+// ---------------------------------------------------------------------------
+
+/// Kill a process (and its session group) out-of-band — the same std-only,
+/// cfg-free shape `tests/adoption.rs::kill_pid` uses (branch on the runtime
+/// OS id and shell out; no OS-cfg is allowed in this file).
+fn test_kill_pid(pid: u32) {
+    match OsId::current() {
+        OsId::Windows => {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .status();
+        }
+        _ => {
+            for target in [format!("-{pid}"), pid.to_string()] {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &target])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+/// Drive the manual drain cadence until `name`'s row reads `want` (the
+/// in-crate tests own ingestion — no reaper loop is running).
+fn drain_until_state(sup: &mut Supervisor, registry: &Registry, name: &str, want: LifecycleState) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(registry);
+        if state_of(registry, name) == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: the row never reached {want} (now {:?})",
+            state_of(registry, name)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn latch_seeding_surfaces_a_corrupt_breach_log_and_fails_open() {
+    // Review round 1 (AI-18 + the fail-open contract): an unreadable
+    // breaches.log must (1) SURFACE its degradation — the operator hears the
+    // durable spent-check was unreadable — and (2) still fail OPEN: the
+    // latch seeds EMPTY, so the adoption-time re-evaluation of the
+    // still-over-ceiling run RE-FIRES (the "pause could not be honored"
+    // breadcrumb on the already-paused row is the observable of the
+    // un-suppressed enforcement attempt). The seeded control is the
+    // headline e2e: a readable log makes the same re-evaluation a no-op.
+    let (_state, _manifest, registry) = setup_pause_guaranteed(
+        "corruptlatch",
+        &["--emit-usage", "3", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("corruptlatch").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+
+    // Engine 1 (in-crate): the breach fires + the default pause action lands
+    // (the pause-guaranteed fixture keeps the action honorable on every OS).
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "corruptlatch").unwrap();
+    drain_until_state(&mut sup, &registry, "corruptlatch", LifecycleState::Paused);
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "corruptlatch")
+            .unwrap()
+            .len(),
+        1,
+        "the breach fired exactly once under the first engine"
+    );
+    // Drop the (disarmed, detached) handle — the child survives, paused.
+    drop(sup);
+
+    // Corrupt the durable spent-check: garbage in breaches.log.
+    let breach_log = registry.instance_breach_log_path(&name);
+    std::fs::write(&breach_log, "not json at all\n").unwrap();
+
+    // Engine 2 adopts: the seeding READ fails → surfaced + EMPTY latch →
+    // the over-ceiling re-evaluation is NOT suppressed.
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup2);
+    sup2.adopt_orphans(&registry);
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("corruptlatch: the instance's breach log could not be read"),
+        "the corrupt-log fail-open must be SURFACED (AI-18): {text}"
+    );
+    assert!(
+        text.contains("breach latch degrades to empty"),
+        "the note must name the empty-latch degradation: {text}"
+    );
+    assert!(
+        text.contains("budget breach pause could not be honored"),
+        "the EMPTY latch must let the over-ceiling re-evaluation re-fire \
+         (fail-open, never fail-silent): {text}"
+    );
+    // The row honestly keeps reading paused (adoption never auto-resumes;
+    // the re-fired pause of an already-paused row is the no-op breadcrumb).
+    assert_eq!(state_of(&registry, "corruptlatch"), LifecycleState::Paused);
+    // Teardown: the stop ladder reaches the (Unix: suspended) child.
+    sup2.stop(&registry, "corruptlatch", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn latch_seeding_filters_by_the_currently_configured_action() {
+    // Review round 1 (the ACTION filter): a breach recorded under the OLD
+    // action (`warn`) does NOT seed the latch once the action is
+    // RECONFIGURED (`pause`) — the reconfigured action must fire ONCE under
+    // the RESUMED Run (the operator changed the guardrail; the change must
+    // take effect, not stay suppressed by an idempotence key that predates
+    // it). Observable: a SECOND breach event under the SAME run id, this one
+    // carrying the new action and landing the pause.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("refire", &["--emit-usage", "3", "--linger-ms", "600000"]);
+    let name = InstanceName::new("refire").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+
+    // Engine 1: the warn breach fires, the row keeps RUNNING.
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "refire").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(&registry);
+        if Supervisor::read_breach_events(&registry, "refire")
+            .map(|events| events.len() == 1)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the warn breach never fired");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state_of(&registry, "refire"),
+        LifecycleState::Running,
+        "the warn action transitions nothing"
+    );
+    let first_run = Supervisor::read_breach_events(&registry, "refire").unwrap()[0]
+        .run_id
+        .clone();
+    drop(sup);
+
+    // Reconfigure: warn → pause.
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
+        .unwrap();
+
+    // Engine 2 adopts: the warn event does NOT seed the latch (action
+    // mismatch), so the still-over-ceiling cumulative fires the NEW action
+    // once, under the RESUMED run id.
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    sup2.adopt_orphans(&registry);
+    assert_eq!(
+        state_of(&registry, "refire"),
+        LifecycleState::Paused,
+        "the reconfigured pause action must land at adoption"
+    );
+    let events = Supervisor::read_breach_events(&registry, "refire").unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "exactly one breach PER ACTION under the resumed Run: {events:?}"
+    );
+    assert_eq!(events[0].action.as_str(), "warn");
+    assert_eq!(events[1].action.as_str(), "pause");
+    assert_eq!(
+        events[1].run_id, first_run,
+        "the re-fire is under the RESUMED run id (no fresh Run minted)"
+    );
+    sup2.stop(&registry, "refire", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_release_pass_resumes_an_operator_paused_detached_child() {
+    // The OPERATOR arm: an operator `pause` of a detached child holds only
+    // while an engine session holds it — the release pass SIGCONTs the child
+    // BEFORE the handle drops, records the honest `paused → running` edge
+    // under the dedicated `detached-resumed` cause, and surfaces the note.
+    let (_state, _manifest, registry) = setup_pause_guaranteed("opu", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "opu").unwrap();
+    sup.pause(&registry, "opu").unwrap();
+    assert_eq!(state_of(&registry, "opu"), LifecycleState::Paused);
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "opu"),
+        LifecycleState::Running,
+        "the operator-paused detached child must be resumed at release"
+    );
+    let events = Supervisor::read_events(&registry, "opu").unwrap();
+    let release = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the release edge must be recorded");
+    let cause = serde_json::to_string(&release.cause).unwrap();
+    assert!(
+        cause.contains("detached-resumed"),
+        "the release edge carries the dedicated cause: {cause}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("opu: paused detached child resumed at engine release"),
+        "the resume note must surface: {text}"
+    );
+    assert!(
+        !text.contains("was NOT resumed at engine release"),
+        "an operator pause must never read as the breach freeze: {text}"
+    );
+    sup.stop(&registry, "opu", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_release_pass_freezes_a_breach_paused_detached_child() {
+    // The BREACH arm (review round 1's headline): a BUDGET-BREACH pause is
+    // NOT resumed at release — resuming it would run the agent unsupervised
+    // in the enforcement-free between-commands window while the seeded latch
+    // suppresses re-enforcement (un-doing AI-44's spend-stop). The row keeps
+    // honestly reading `paused`, NO paused→running edge is recorded, and the
+    // freeze is surfaced with a note naming why.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("brz", &["--emit-usage", "3", "--linger-ms", "600000"]);
+    let name = InstanceName::new("brz").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "brz").unwrap();
+    // The breach pause lands through the real enforcement path (the paused
+    // edge carries the BudgetExceeded cause the classifier reads).
+    drain_until_state(&mut sup, &registry, "brz", LifecycleState::Paused);
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "brz"),
+        LifecycleState::Paused,
+        "the breach-paused detached child must stay frozen at release"
+    );
+    let events = Supervisor::read_events(&registry, "brz").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "no paused→running edge may be recorded for the breach freeze: {events:?}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("brz: the paused detached child was NOT resumed at engine release"),
+        "the freeze must be surfaced: {text}"
+    );
+    assert!(
+        text.contains("paused by a BUDGET BREACH"),
+        "the note must name WHY (the breach freeze): {text}"
+    );
+    assert!(
+        !text.contains("row is now 'running'"),
+        "the success note must not fire for the freeze arm: {text}"
+    );
+    // Teardown: the stop ladder reaches the (Unix: suspended) child.
+    sup.stop(&registry, "brz", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_release_pass_reconciles_an_already_dead_paused_child() {
+    // The ALREADY-DEAD probe (review round 1): a paused row whose child has
+    // SINCE EXITED (here: killed out-of-band while suspended) must never be
+    // recorded `paused → running` for a corpse — the pass reconciles on the
+    // crashed path instead: `paused → failed` with a crashed cause naming
+    // the release-time discovery, the stale record settled, and a surfaced
+    // note. No resume is attempted for a dead process.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("deadpa", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("deadpa").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "deadpa").unwrap();
+    sup.pause(&registry, "deadpa").unwrap();
+    assert_eq!(state_of(&registry, "deadpa"), LifecycleState::Paused);
+
+    // The child dies while the row reads paused (a suspended process killed
+    // by signal — the release-time discovery premise).
+    let pid = {
+        let supervised = sup.running.get(&name).unwrap();
+        sup.backend.pid(&supervised.handle)
+    };
+    test_kill_pid(pid);
+    // Bounded wait until the death is reaped (poll reaps the direct child).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let exited = {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .poll(&mut supervised.handle)
+                .map(|status| status.is_exited())
+                .unwrap_or(true)
+        };
+        if exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the killed child never registered as exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "deadpa"),
+        LifecycleState::Failed,
+        "the dead paused child reconciles to failed, never to running"
+    );
+    let events = Supervisor::read_events(&registry, "deadpa").unwrap();
+    let reconcile = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Failed)
+        .expect("the crashed reconcile edge must be recorded");
+    let cause = serde_json::to_string(&reconcile.cause).unwrap();
+    assert!(
+        cause.contains("crashed") && cause.contains("exited before engine release"),
+        "the reconcile edge carries the crashed cause naming the discovery: {cause}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("deadpa: the paused detached child had already exited"),
+        "the reconcile must be surfaced: {text}"
+    );
+    // The stale record was settled: no live spawn record survives the dead
+    // child (a later open never adopt-attempts the pid).
+    assert!(
+        registry.spawn_record(&name).unwrap().is_none()
+            || registry
+                .spawn_record(&name)
+                .unwrap()
+                .is_some_and(|record| record.fingerprint.pid == 0),
+        "the settled record is gone or a pid-0 seed"
+    );
+}
+
+#[test]
+fn a_pre_v9_mint_write_failure_surfaces_the_per_command_mint_note() {
+    // Review round 1 (item 4): the "minted and persisted" note must come
+    // AFTER a successful `set_spawn_run_id` write — and the FAILURE arm must
+    // be covered, not just compiled. The write is sabotaged deterministically
+    // with a SQL BEFORE UPDATE trigger (no code seam: the registry owns its
+    // SqliteStore), so the adoption's back-compat mint for a pre-v9 record
+    // (run_id NULL) hits the Err arm and the surfaced-not-silent diagnostic
+    // fires — while the adoption itself still completes (best-effort by
+    // contract).
+    let (state, _manifest, registry) = setup_fake("mintfail", &["--linger-ms", "600000"]);
+
+    // Engine 1: a live detached child + a record whose run_id is NULLed into
+    // the pre-v9 shape (the back-compat mint's premise).
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "mintfail").unwrap();
+    drop(sup);
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute(
+            "UPDATE agent_runtime SET run_id = NULL \
+             WHERE instance_id = (SELECT id FROM agent_instances WHERE name = 'mintfail')",
+            [],
+        )
+        .unwrap();
+        // The sabotage: every run_id UPDATE for this instance ABORTS.
+        conn.execute_batch(
+            "CREATE TRIGGER block_mintfail_run_id BEFORE UPDATE OF run_id ON agent_runtime \
+             WHEN NEW.instance_id = (SELECT id FROM agent_instances WHERE name = 'mintfail') \
+             BEGIN SELECT RAISE(ABORT, 'sabotaged run_id write'); END;",
+        )
+        .unwrap();
+    }
+
+    // Engine 2 adopts: the mint's write-back FAILS → the Err diagnostic (the
+    // note says each later command mints again), and the "minted and
+    // persisted" note NEVER fires.
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup2);
+    sup2.adopt_orphans(&registry);
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("mintfail: could not persist the minted Run id onto the spawn record"),
+        "the mint write failure must be surfaced: {text}"
+    );
+    assert!(
+        !text.contains("minted for it and persisted"),
+        "the success note must never claim a persisted id that did not land: {text}"
+    );
+    // The adoption still completed — the live child is held (row running).
+    assert_eq!(state_of(&registry, "mintfail"), LifecycleState::Running);
+    sup2.stop(&registry, "mintfail", Some(Duration::from_secs(5)))
+        .unwrap();
 }

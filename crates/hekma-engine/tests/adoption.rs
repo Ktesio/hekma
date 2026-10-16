@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 
 use hekma_engine::{
     AdapterRef, DiagnosticSink, Engine, FleetEntry, LifecycleState, RemoveDisposition,
-    RestartPolicy,
+    RestartPolicy, Supervision,
 };
+use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 
 /// Write a manifest whose `[lifecycle.start]` exec is `fake_agent` + `args`.
@@ -492,6 +493,87 @@ fn adoption_helper_subprocess() {
                 .set_config("obssurv", "metering.upstream_base_url", &dead_upstream)
                 .unwrap();
             facade.start("obssurv").unwrap();
+            hekma_conformance::exit_helper_subprocess(0);
+        }
+        // Story 15-2: start `awaybud` DETACHED under a cumulative ceiling the
+        // emitted usage crosses, wait until the breach pause lands, then let
+        // the helper return NORMALLY — the engine's CLEAN drop runs the
+        // paused-detached RELEASE pass. Review round 1: a BREACH pause (the
+        // only pause this helper fabricates) is NOT resumed at release — the
+        // enforcement freeze holds into the enforcement-free between-commands
+        // window, surfaced by the releasing engine's note, and the row keeps
+        // reading `paused` for the parent's adoption assertions.
+        "detached_budgeted_survivor" => {
+            facade
+                .register_with_adapter("awaybud", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade
+                .set_config("awaybud", "budget.tokens.cumulative", "15")
+                .unwrap();
+            facade.start_detached("awaybud").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let paused = facade
+                    .instance_status("awaybud")
+                    .map(|s| s.instance.state == LifecycleState::Paused)
+                    .unwrap_or(false);
+                if paused {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the breach pause never landed before the clean exit"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // CLEAN exit: the match arm ends, `engine` drops, the release
+            // pass classifies the breach pause and LEAVES the child
+            // SIGSTOPped (the surfaced freeze note) — no
+            // exit_helper_subprocess here.
+        }
+        // Story 15-2: start `away` DETACHED with ONE usage event and NO
+        // budget, then exit cleanly. The parent arms the budget AFTERWARD —
+        // fabricating the crash-gap (over-ceiling usage, breach NEVER
+        // recorded) the next adoption must enforce (AI-44, durable leg).
+        "detached_plain_survivor" => {
+            facade
+                .register_with_adapter("away", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade.start_detached("away").unwrap();
+            let db = state.join("state.db");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let count: i64 = rusqlite::Connection::open(&db)
+                    .and_then(|conn| {
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM usage_events e \
+                             JOIN agent_instances i ON i.id = e.instance_id \
+                             WHERE i.name = 'away'",
+                            [],
+                            |r| r.get(0),
+                        )
+                    })
+                    .unwrap_or(0);
+                if count >= 1 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "usage never committed before the exit"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // Story 15-2: start `strand` DETACHED, PAUSE it, then CRASH (exit
+        // without drop) — the paused child stays SIGSTOPped with a `paused`
+        // row and NO supervising engine: the Fibery 178 stranded condition
+        // the next adoption must NAME (not auto-resume).
+        "detached_paused_crash" => {
+            facade
+                .register_with_adapter("strand", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade.start_detached("strand").unwrap();
+            facade.pause("strand").unwrap();
             hekma_conformance::exit_helper_subprocess(0);
         }
         // Story 12-1: start `detachee` DETACHED, then let the engine drop
@@ -1246,20 +1328,33 @@ fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused()
         LifecycleState::Paused,
         "adopting an over-budget PAUSED row must keep the row paused"
     );
-    // The breach IS recorded (FR-21 — record-first, regardless of the action) —
-    // and specifically for the ADOPTED Run: engine 1 already recorded its own
-    // crossing breach, so the AI-44 adoption-time re-evaluation is proven by a
-    // breach under the adopted Run's FRESH run id (a second distinct run).
+    // The breach IS recorded (FR-21 — record-first, regardless of the action).
+    // Story 15-2 re-pin: the adopted instance RESUMES engine 1's Run (the
+    // durable run_id on the spawn record) instead of minting a fresh one, and
+    // the adoption-time re-evaluation SEEDS its latch from the breach engine 1
+    // already recorded for that Run — so exactly ONE breach exists, under the
+    // RESUMED run id, with no per-command duplicate (Fibery 205). AI-44's
+    // intent holds: the over-budget run WAS acted upon (engine 1's pause, the
+    // row under proof) — once per Run, not once per command.
     let breaches = facade.budget_breach_events("napbud").unwrap();
-    assert!(
-        !breaches.is_empty(),
-        "the adoption-time re-evaluation must record the breach for a paused over-budget row"
+    assert_eq!(
+        breaches.len(),
+        1,
+        "one breach per (dimension, scope) per RESUMED Run — no adoption \
+         duplicate: {breaches:?}"
     );
-    let breach_runs: std::collections::HashSet<&str> =
-        breaches.iter().map(|b| b.run_id.as_str()).collect();
-    assert!(
-        breach_runs.len() >= 2,
-        "the adopted Run's own breach must be recorded (AI-44): {breaches:?}"
+    let db_run_id: String = rusqlite::Connection::open(state.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT r.run_id FROM agent_runtime r \
+             JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = 'napbud'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        breaches[0].run_id, db_run_id,
+        "the recorded breach belongs to the RESUMED (persisted) Run id"
     );
     // No strand: the adopted process is alive and a stop lands cleanly.
     assert!(pid_alive(pid), "the paused agent must still be alive");
@@ -1337,26 +1432,45 @@ fn ai44_adopting_an_over_budget_run_enforces_the_budget() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    // The breach is durably RECORDED (FR-21 — regardless of the action taken) —
-    // and specifically for the ADOPTED Run: engine 1 already recorded its own
-    // crossing breach, so the AI-44 adoption-time re-evaluation is proven by a
-    // breach under the adopted Run's FRESH run id (a second distinct run).
+    // The breach is durably RECORDED (FR-21 — regardless of the action taken).
+    // Story 15-2 re-pin: the adopted instance RESUMES engine 1's Run (the
+    // durable run_id), and the adoption-time re-evaluation's seeded latch makes
+    // engine 1's already-recorded breach SPENT — exactly one breach exists,
+    // under the RESUMED run id, with no duplicate (Fibery 205). AI-44's intent
+    // holds — the over-budget run was acted upon (engine 1's pause landed; the
+    // row under proof is that action's durable result) — once per Run, not
+    // once per command. The engine-2-open with NO pre-recorded breach (the
+    // true crash-gap leg: budgets armed only AFTER the crash) is pinned by
+    // `adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption`
+    // below.
     let breaches = facade.budget_breach_events("budgeted").unwrap();
-    assert!(
-        !breaches.is_empty(),
-        "a budget breach event must exist after adopting an over-budget run"
+    assert_eq!(
+        breaches.len(),
+        1,
+        "one breach per RESUMED Run — the adoption must not re-fire a spent \
+         breach: {breaches:?}"
     );
-    let breach_runs: std::collections::HashSet<&str> =
-        breaches.iter().map(|b| b.run_id.as_str()).collect();
-    assert!(
-        breach_runs.len() >= 2,
-        "the adopted Run's own breach must be recorded (AI-44): {breaches:?}"
+    let db_run_id: String = rusqlite::Connection::open(state.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT r.run_id FROM agent_runtime r \
+             JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = 'budgeted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        breaches[0].run_id, db_run_id,
+        "the recorded breach belongs to the RESUMED (persisted) Run id"
     );
     // The agent was PAUSED (not killed): still alive, no longer emitting usage.
     assert!(
         pid_alive(pid),
         "the breach pause must leave the process alive (suspended/cooperative)"
     );
+    // Story 15-2: per-run usage CONTINUED — the resumed Run's committed usage
+    // is visible through the Fleet read's current-run totals (the whole point
+    // of the durable Run identity: per-run totals no longer reset per command).
     let fleet = facade.fleet().unwrap();
     let entry = fleet
         .iter()
@@ -1366,6 +1480,12 @@ fn ai44_adopting_an_over_budget_run_enforces_the_budget() {
     assert!(
         committed >= 1,
         "the pre-crash usage must be in the ledger (committed input tokens: {committed})"
+    );
+    assert!(
+        entry.usage.current_run_input_tokens >= 1,
+        "the CURRENT-RUN totals must reflect the RESUMED Run's committed usage \
+         (per-run totals survive the engine change): {:?}",
+        entry.usage
     );
 
     // Teardown: stop (works from paused), confirm no orphan.
@@ -1407,25 +1527,31 @@ fn ai44_adopting_an_over_budget_warn_run_records_the_breach_without_a_transition
     let pid = wait_for_agent_pid(&agent_log_path(state.path(), "budgeted"));
     assert!(pid_alive(pid), "budgeted must survive the engine crash");
 
-    // Engine 2: open → adopt → budgets re-evaluated → warn + record, NO
-    // transition. Deterministic gate: the breach must exist under BOTH runs
-    // (engine 1's own + the adopted Run's fresh id) before asserting.
+    // Engine 2: open → adopt → budgets re-evaluated → the seeded latch makes
+    // engine 1's warn breach SPENT (no duplicate), still NO transition.
+    // Story 15-2 re-pin: the Run is RESUMED (not re-minted), so exactly ONE
+    // breach exists — under engine 1's run id, now the adopted Run's own.
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let breaches = facade.budget_breach_events("budgeted").unwrap();
-        let breach_runs: std::collections::HashSet<&str> =
-            breaches.iter().map(|b| b.run_id.as_str()).collect();
-        if breach_runs.len() >= 2 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the adoption-time warn breach never fired for the adopted Run: {breach_runs:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let breaches = facade.budget_breach_events("budgeted").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "one warn breach per RESUMED Run — no adoption duplicate: {breaches:?}"
+    );
+    let db_run_id: String = rusqlite::Connection::open(state.path().join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT r.run_id FROM agent_runtime r \
+             JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = 'budgeted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        breaches[0].run_id, db_run_id,
+        "the warn breach belongs to the RESUMED (persisted) Run id"
+    );
     // The configured WARN action transitioned NOTHING: the adopted row stays
     // `running` ...
     let status = facade.instance_status("budgeted").unwrap();
@@ -1914,4 +2040,488 @@ fn ai11_remove_of_a_live_instance_terminates_it_and_leaves_no_orphan() {
         "a reopened engine must not resurrect a removed instance"
     );
     assert!(!pid_alive(pid), "no orphan process may remain after remove");
+}
+
+// ---------------------------------------------------------------------------
+// Story 15-2 — detached continuation: the durable Run, the seeded breach
+// latch, the paused-detached release, and the stranded-paused note.
+// ---------------------------------------------------------------------------
+
+/// Whether a pid's scheduler state reads `T` (SIGSTOP-suspended) — the
+/// Linux-only probe for "the child really froze / really woke". Off Linux the
+/// path is absent, so the probe reports `false` and the callers' assertions
+/// degrade to the durable row/transition evidence instead.
+fn proc_pid_is_stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.split_whitespace().next() == Some("T"))
+        })
+        .unwrap_or(false)
+}
+
+/// The record's persisted `run_id` for an instance (NULL → None) — the
+/// durable Run identity under proof.
+fn record_run_id(state: &Path, name: &str) -> Option<String> {
+    rusqlite::Connection::open(state.join("state.db"))
+        .unwrap()
+        .query_row(
+            "SELECT r.run_id FROM agent_runtime r \
+             JOIN agent_instances i ON i.id = r.instance_id WHERE i.name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
+}
+
+#[test]
+fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
+    // Story 15-2's headline (Fibery 205/206): a DETACHED instance is ONE Run
+    // across the N commands of its life. Engine 1 (the helper, a real separate
+    // process) starts `awaybud` detached under a cumulative ceiling its first
+    // usage event crosses: the breach fires ONCE (recorded under the Run id
+    // committed with the spawn record) and the breach action pauses it; the
+    // helper's CLEAN exit then runs the paused-detached release pass, which
+    // review round 1 REFINED: a BREACH pause is NOT resumed (the freeze holds
+    // into the enforcement-free between-commands window) — engine 2 adopts a
+    // PAUSED child and RESUMES the same Run, and its seeded latch makes the
+    // recorded breach SPENT — no duplicate breach, no re-fired action. A THIRD
+    // engine proves the once-per-RUN (not per-command) shape again. The
+    // control leg then stops + starts the instance: a FRESH Run mints, the
+    // latch resets, and the still-over-ceiling cumulative enforces again
+    // under the new Run id (the unchanged genuine-restart semantics).
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "3", "--linger-ms", "600000"],
+    );
+
+    run_engine1("detached_budgeted_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "awaybud"));
+    assert!(
+        pid_alive(pid),
+        "the detached agent must survive the command exit"
+    );
+    let first_run = record_run_id(state.path(), "awaybud").expect("the record carries the Run id");
+
+    // Engine 2: adopt + resume the Run. The row reads `paused` — engine 1's
+    // release pass FROZE the breach-paused child at ITS exit (the review
+    // round 1 refinement: resuming it would run it unsupervised in the
+    // enforcement-free between-commands window while the seeded latch
+    // suppresses re-enforcement).
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
+    let facade = engine.blocking();
+    let status = facade.instance_status("awaybud").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Paused,
+        "engine 1's release pass must have left the breach-paused detached \
+         child SIGSTOPped (the enforcement freeze holds between commands)"
+    );
+    // The Linux probe corroborates the freeze physically.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(
+            proc_pid_is_stopped(pid),
+            "the breach-paused child must still read SIGSTOP-suspended after release"
+        );
+    }
+    // And adoption SAYS so (AI-18): the stranded-paused note names the
+    // BREACH-freeze semantics for a detached row (the next command's
+    // visibility — the releasing engine's own note went to ITS stderr).
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
+    assert!(
+        sink.contains("awaybud: adopted a PAUSED instance"),
+        "the stranded-paused adoption note must surface: {sink}"
+    );
+    assert!(
+        sink.contains("paused by a BUDGET BREACH"),
+        "the adoption note must name the breach-freeze semantics: {sink}"
+    );
+    // NO release edge was ever recorded: the only paused edge is the breach
+    // itself (the BudgetExceeded cause the classifier reads).
+    let events = facade.transition_events("awaybud").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "the breach freeze records no paused→running edge: {events:?}"
+    );
+    let last_pause = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("the breach pause edge exists");
+    let cause = serde_json::to_string(&last_pause.cause).unwrap();
+    assert!(
+        cause.contains("budget-exceeded"),
+        "the paused edge carries the budget cause the classifier reads: {cause}"
+    );
+    // The breach fired EXACTLY ONCE — under the RESUMED Run — and the seeded
+    // latch made the adoption-time re-evaluation a no-op (Fibery 205).
+    let breaches = facade.budget_breach_events("awaybud").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "one breach per Run, not per command: {breaches:?}"
+    );
+    assert_eq!(breaches[0].run_id, first_run);
+    // Per-run usage CONTINUED (Fibery 206): the current-Run totals are scoped
+    // to the RESUMED Run and are non-zero in this LATER command.
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet.iter().find(|e| e.name.as_str() == "awaybud").unwrap();
+    assert_eq!(
+        entry.supervision,
+        Some(Supervision::Detached),
+        "the Fleet indicator must read detached for the live detached record"
+    );
+    assert!(
+        entry.usage.current_run_input_tokens >= 1,
+        "the current-Run totals must carry the RESUMED Run's committed usage: {:?}",
+        entry.usage
+    );
+    // The record still names the SAME Run — engine 2 resumed, never re-minted.
+    assert_eq!(
+        record_run_id(state.path(), "awaybud").as_deref(),
+        Some(first_run.as_str())
+    );
+
+    // Engine 3: a second intervening command changes nothing (once per RUN)
+    // — including at ITS release: the breach freeze holds again (the row
+    // still reads paused; still no release edge).
+    drop(engine);
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    let breaches = facade.budget_breach_events("awaybud").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "a third command must not re-fire the spent breach: {breaches:?}"
+    );
+    assert_eq!(
+        facade.instance_status("awaybud").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the breach freeze holds across every intervening command"
+    );
+    assert_eq!(
+        record_run_id(state.path(), "awaybud").as_deref(),
+        Some(first_run.as_str())
+    );
+
+    // CONTROL LEG (the genuine-restart semantics, unchanged): stop + start
+    // DETACHED again → a FRESH Run mints, the latch resets, and the cumulative
+    // total (still over the ceiling) enforces again under the NEW Run id.
+    facade
+        .stop("awaybud", Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until_gone(pid, "stop must terminate the detached agent");
+    let fleet = facade.fleet().unwrap();
+    let entry = fleet.iter().find(|e| e.name.as_str() == "awaybud").unwrap();
+    assert_eq!(
+        entry.supervision, None,
+        "a STOPPED instance (record cleared) must never imply supervised"
+    );
+    facade.start_detached("awaybud").unwrap();
+    let second_run =
+        record_run_id(state.path(), "awaybud").expect("the fresh start persists a fresh Run id");
+    assert_ne!(
+        first_run, second_run,
+        "a genuine restart mints a FRESH Run (the latch resets with it)"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let breaches = facade.budget_breach_events("awaybud").unwrap();
+        if breaches.len() == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the still-over-ceiling cumulative must enforce again under the \
+             fresh Run: {breaches:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let breaches = facade.budget_breach_events("awaybud").unwrap();
+    assert_eq!(breaches[1].run_id, second_run);
+    // Teardown: stop the instance (breach-paused under the fresh Run; the
+    // stop ladder reaches the suspended child).
+    facade
+        .stop("awaybud", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption() {
+    // AI-44's crash-gap leg, made durable by story 15-2: the usage is
+    // committed under the RESUMED Run but the breach was NEVER recorded
+    // (engine 1 ran un-budgeted; the budget is armed only afterward). The
+    // next adoption's re-evaluation MUST fire — record under the RESUMED Run
+    // id + the configured pause action — proving the seeded latch never
+    // silences a genuinely un-recorded crossing.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "1", "--linger-ms", "600000"],
+    );
+
+    // Engine 1 (the helper): detached, ONE usage event (30 tokens), NO budget.
+    run_engine1("detached_plain_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "away"));
+    assert!(pid_alive(pid));
+    let run = record_run_id(state.path(), "away").expect("the record carries the Run id");
+
+    // Engine 2 (no budget yet): adopt + resume; arm the ceiling AFTERWARD.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    assert!(
+        facade.budget_breach_events("away").unwrap().is_empty(),
+        "no breach exists yet (the budget was never armed)"
+    );
+    facade
+        .set_config("away", "budget.tokens.cumulative", "15")
+        .unwrap();
+    drop(engine);
+
+    // Engine 3: adopt → re-evaluate → the crash-gap breach FIRES, under the
+    // RESUMED Run id, with the (default) pause action.
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    let breaches = facade.budget_breach_events("away").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the adoption-time re-evaluation must fire for an un-recorded crossing: {breaches:?}"
+    );
+    assert_eq!(
+        breaches[0].run_id, run,
+        "the crash-gap breach is recorded under the RESUMED Run id"
+    );
+    assert_eq!(breaches[0].action.as_str(), "pause");
+    assert_eq!(
+        facade.instance_status("away").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the breach pause lands through the normal lifecycle path"
+    );
+    // The child really suspended (Linux probe; the row + transition carry the
+    // fact everywhere else).
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(
+            proc_pid_is_stopped(pid),
+            "the breach-paused child must read SIGSTOP-suspended"
+        );
+    }
+    // Dropping engine 3 runs the release pass: detached + BREACH-paused →
+    // review round 1's FREEZE (the enforcement hold continues into the
+    // between-commands window; no SIGCONT, no paused→running edge) — surfaced
+    // by the next adoption's stranded-paused note.
+    drop(engine);
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    assert_eq!(
+        facade.instance_status("away").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the release pass must leave the breach-paused detached child frozen"
+    );
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(
+            proc_pid_is_stopped(pid),
+            "the breach-paused child must stay SIGSTOP-suspended after release"
+        );
+    }
+    let events = facade.transition_events("away").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "the breach freeze records no paused→running edge: {events:?}"
+    );
+    facade.stop("away", Some(Duration::from_secs(5))).unwrap();
+    wait_until_gone(pid, "stop must terminate the frozen detached agent");
+}
+
+#[test]
+fn adopting_a_stranded_paused_detached_row_keeps_it_paused_and_names_it() {
+    // Fibery 178: an engine DIED mid-pause of a DETACHED child — the row is
+    // `paused`, the child SIGSTOPped, and nobody supervises it. The next
+    // adoption must keep it paused (the pinned AI-7 stays-paused contract —
+    // adoption NEVER auto-resumes) and SURFACE the stranded-paused state with
+    // the release semantics named. Releasing THAT engine then heals the strand
+    // (SIGCONT + paused→running at its exit) — never stranded frozen forever.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
+
+    run_engine1("detached_paused_crash", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "strand"));
+    assert!(
+        pid_alive(pid),
+        "the paused detached child survives the crash"
+    );
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(
+            proc_pid_is_stopped(pid),
+            "premise: the stranded child is SIGSTOP-suspended"
+        );
+    }
+
+    // Adopt with the sink installed from the first moment.
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
+    let facade = engine.blocking();
+    // The pinned AI-7 contract: adoption keeps the row PAUSED.
+    assert_eq!(
+        facade.instance_status("strand").unwrap().instance.state,
+        LifecycleState::Paused,
+        "adoption must keep a stranded paused row paused (AI-7)"
+    );
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(proc_pid_is_stopped(pid), "the child stays suspended");
+    }
+    // And SAYS so (AI-18): the stranded-paused note names the instance, the
+    // never-auto-resumes contract, the resume path, and — for a detached row —
+    // the release-at-exit semantics.
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
+    assert!(
+        sink.contains("strand: adopted a PAUSED instance"),
+        "the stranded-paused adoption note must surface: {sink}"
+    );
+    assert!(
+        sink.contains("adoption never auto-resumes"),
+        "the note must state the stays-paused contract: {sink}"
+    );
+    assert!(
+        sink.contains("resumed (SIGCONT) and the row moves to running"),
+        "the detached variant must name the release-at-exit semantics: {sink}"
+    );
+    // The OPERATOR variant must NOT read as the breach freeze (review round
+    // 1's distinction, pinned both ways across the e2e pair).
+    assert!(
+        !sink.contains("paused by a BUDGET BREACH"),
+        "an operator pause must never read as the breach freeze: {sink}"
+    );
+
+    // Releasing THIS engine heals the strand: SIGCONT + paused→running.
+    drop(engine);
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let facade = engine.blocking();
+    assert_eq!(
+        facade.instance_status("strand").unwrap().instance.state,
+        LifecycleState::Running,
+        "the release pass must heal the stranded paused row at engine exit"
+    );
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(!proc_pid_is_stopped(pid), "the child woke at release");
+    }
+    let events = facade.transition_events("strand").unwrap();
+    let release = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the heal edge must be recorded");
+    let cause = serde_json::to_string(&release.cause).unwrap();
+    assert!(
+        cause.contains("detached-resumed"),
+        "the heal edge carries the dedicated cause: {cause}"
+    );
+    facade.stop("strand", Some(Duration::from_secs(5))).unwrap();
+    wait_until_gone(pid, "stop must terminate the healed detached child");
+}
+
+#[test]
+fn a_pre_v9_spawn_record_mints_a_run_once_persists_it_and_notes_it_once() {
+    // The I/O matrix's pre-v9 row: a record whose run_id column reads NULL
+    // (written before the v9 migration) is adopted by a v9 engine → the id is
+    // MINTED (the back-compat default), PERSISTED back onto the record, and
+    // noted — ONCE. The next command RESUMES that minted id (no second mint,
+    // no second note).
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(
+        manifest.path(),
+        "svc",
+        &["--emit-usage", "1", "--linger-ms", "600000"],
+    );
+
+    run_engine1("detached_plain_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "away"));
+    assert!(pid_alive(pid));
+    // Fabricate the pre-v9 record: NULL the run_id column in place.
+    rusqlite::Connection::open(state.path().join("state.db"))
+        .unwrap()
+        .execute(
+            "UPDATE agent_runtime SET run_id = NULL \
+             WHERE instance_id = (SELECT id FROM agent_instances WHERE name = 'away')",
+            [],
+        )
+        .unwrap();
+    assert_eq!(record_run_id(state.path(), "away"), None);
+
+    // The adopting engine mints + persists + notes — once.
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
+    assert_eq!(
+        sink.matches("predates durable Run ids").count(),
+        1,
+        "the pre-v9 mint note fires exactly once: {sink}"
+    );
+    let minted = record_run_id(state.path(), "away").expect("the mint is persisted");
+    assert!(!minted.is_empty());
+    drop(engine);
+
+    // The NEXT command resumes the minted id — no second mint, no second note.
+    let shared2 = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared2))
+            .unwrap();
+    let facade = engine.blocking();
+    let sink2 = String::from_utf8_lossy(&shared2.lock().unwrap()).into_owned();
+    assert!(
+        !sink2.contains("predates durable Run ids"),
+        "the mint note must be one-time (the id resumed): {sink2}"
+    );
+    assert_eq!(
+        record_run_id(state.path(), "away").as_deref(),
+        Some(minted.as_str())
+    );
+    facade.stop("away", Some(Duration::from_secs(5))).unwrap();
+    wait_until_gone(pid, "stop must terminate the detached agent");
 }

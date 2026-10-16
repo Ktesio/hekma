@@ -477,16 +477,66 @@ pub struct FleetEntry {
     /// and every other kind omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_gap: Option<UsageGapNotice>,
+    /// The supervision indicator (story 15-2, Fibery 176) — whether this
+    /// instance's spawn RECORD says the process is DETACHED (survives engine
+    /// exits; the record's durable `detach` flag) or SESSION-bound (dies
+    /// with the engine session that spawned it). RECORD truth, not a live
+    /// process probe (review round 1): composed from the ALREADY-LOADED
+    /// spawn record — the same source adoption reads — and a record whose
+    /// process is gone is reconciled away at `Engine::open`, so a stale
+    /// record never outlives the read that surfaces it. `Some(...)`
+    /// exactly when a live-process record exists (a pid-0 policy/settle
+    /// seed is not supervision), `None` (field omitted) when the record is
+    /// cleared — a stopped or never-started instance never implies
+    /// supervised (an honest absence the human cells render as `—`).
+    /// ADDITIVE + absent-when-none (`skip_serializing_if`), the
+    /// `acp_context_usage` pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<Supervision>,
     /// Absolute Agent Home path (engine-computed; the path authority).
     pub agent_home: String,
+}
+
+/// How an instance's live process is supervised (story 15-2, Fibery 176) —
+/// the Fleet-facing answer to "what happens to this agent when the command
+/// exits?". Kebab-case on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Supervision {
+    /// Spawned with `--detach` (story 12-1): the process survives engine
+    /// exits; every later command re-adopts it disarmed and RESUMES its
+    /// durable Run (story 15-2).
+    Detached,
+    /// Bound to an engine session (the default): the process — spawned or
+    /// adopted — is killed at the engine's clean exit (the story 1-6
+    /// no-survivor guarantee).
+    Session,
+}
+
+impl Supervision {
+    /// The stable wire/label form (`"detached"` / `"session"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Supervision::Detached => "detached",
+            Supervision::Session => "session",
+        }
+    }
+}
+
+impl std::fmt::Display for Supervision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl FleetEntry {
     /// The human-readable ABSENCE token rendered in a Fleet cell that has no value
     /// (story 1-7). A single `—` — used for the `budget` cell of an UN-budgeted
-    /// instance (no budget configured — story 3-2 keeps this honest absence) and
-    /// wherever else a truthful "nothing here" is shown. Kept here so `list` and
-    /// `show` render the SAME token.
+    /// instance (no budget configured — story 3-2 keeps this honest absence) and,
+    /// since story 15-2, for the SUPERVISION cell of an instance with no live
+    /// spawn record (a stopped/never-started instance never implies supervised —
+    /// the same honest-nothing token, so `list` and `show` render the SAME mark
+    /// for both absences). Kept here so `list` and `show` render the SAME token.
     pub const METERING_SEED_CELL: &'static str = "—";
 }
 
@@ -731,6 +781,9 @@ mod tests {
             metering_source: "self-reported".to_string(),
             acp_context_usage: None,
             usage_gap: None,
+            // Story 15-2: no spawn record in this fixture — the honest absence
+            // (a registered instance is not supervised).
+            supervision: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }
