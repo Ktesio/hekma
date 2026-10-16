@@ -381,6 +381,10 @@ Generate release notes without publishing anything:
 python3 scripts/generate_release_docs.py v0.1.0 --output-dir target/release-docs-test
 ```
 
+Before the tag exists, the generator ranges `previous-tag..HEAD` — the rehearsal
+matches what the tag workflow will produce for that release (after the tag
+exists, the range is `previous-tag..tag` exactly).
+
 Update local docs for inspection:
 
 ```bash

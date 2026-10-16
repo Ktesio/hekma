@@ -92,10 +92,22 @@ def semver_key(tag: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
+def resolve_rev(tag: str, previous_tag: str | None, tag_exists: bool) -> str:
+    """Pick the `git log` revision range that feeds a release's commit list.
+
+    Post-tag (the release workflow runs after `git push origin vTAG`), the
+    range is `previous..tag`. Pre-tag — the documented local dry run of a
+    version that has no tag yet — the release commit is HEAD, so HEAD
+    stands in for the tag while the previous tag's lower bound survives;
+    collapsing to bare `HEAD` there aggregates full history into the
+    rehearsal instead of the pending release's range.
+    """
+    end = tag if tag_exists else "HEAD"
+    return f"{previous_tag}..{end}" if previous_tag else end
+
+
 def commits_for_range(tag: str, previous_tag: str | None) -> list[Commit]:
-    rev = f"{previous_tag}..{tag}" if previous_tag else tag
-    if not ref_exists(tag):
-        rev = "HEAD"
+    rev = resolve_rev(tag, previous_tag, tag_exists=ref_exists(tag))
     output = git("log", "--format=%H%x01%s", rev)
     commits: list[Commit] = []
     for line in output.splitlines():
