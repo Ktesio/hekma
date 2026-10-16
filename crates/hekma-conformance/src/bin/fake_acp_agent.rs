@@ -53,6 +53,15 @@
 //!   notice, fail any still-registered waiter with the stream-ended error,
 //!   clear the in-flight turn marker, and the reaper must land the instance
 //!   `failed` with a crashed cause (restart policy `never`).
+//! * `garbage-on-prompt` — the NON-UTF-8 sibling of `exit-on-prompt`: the
+//!   same clean handshake, but on the FIRST `session/prompt` the agent
+//!   writes RAW INVALID-UTF-8 BYTES to stdout and exits. A 0xFF start byte
+//!   cannot begin any valid sequence, so the engine's reader `read_line`
+//!   FAILS with an io error instead of observing a clean EOF — the Ended
+//!   notice must name the READ failure (not the end-of-stream wording),
+//!   the still-pending prompt waiter is failed by the same teardown
+//!   courtesy, and the reaper lands the instance `failed` (restart policy
+//!   `never`).
 //! * `no-read` — completes the handshake normally (initialize answered,
 //!   `session/new` forwarded), then the process STOPS DRAINING its stdin
 //!   forever: the defect model for a stuck agent whose input pipe fills.
@@ -551,6 +560,26 @@ fn main() {
                     eprintln!("fake_acp_agent: exit-on-prompt: exiting without a response");
                     let _ = std::io::stdout().flush();
                     std::process::exit(7);
+                }
+                if mode == "garbage-on-prompt" {
+                    // The NON-UTF-8 death shape: raw invalid bytes on the
+                    // protocol stream instead of a response. The engine's
+                    // reader `read_line` FAILS with an io error (InvalidData)
+                    // — a DIFFERENT arm than `exit-on-prompt`'s clean EOF —
+                    // so the Ended notice must name the read failure and the
+                    // pending waiter is failed by the same teardown
+                    // courtesy. The bytes: 0xFF and 0xFE can never start a
+                    // valid UTF-8 sequence, and 0xC3 0x28 pairs a leader
+                    // with a non-continuation byte — any one of them trips
+                    // the validator; the trailing newline terminates the
+                    // "line" so the error surfaces on this read, not the
+                    // next. Exit right after: nothing further is readable.
+                    eprintln!("fake_acp_agent: garbage-on-prompt: writing invalid UTF-8 instead of a response");
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout();
+                    let _ = stdout.write_all(&[0xFF, 0xFE, 0xC3, 0x28, b'\n']);
+                    let _ = stdout.flush();
+                    std::process::exit(6);
                 }
                 if mode == "permission-request" {
                     // Ask the CLIENT for permission (an agent→client request,
