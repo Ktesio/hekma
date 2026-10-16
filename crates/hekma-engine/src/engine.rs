@@ -688,12 +688,10 @@ impl Engine {
         // stopped row can never imply supervised. Computed BEFORE the
         // `failed_cause` fold below consumes the record.
         let supervision = record.as_ref().and_then(|record| {
-            (record.fingerprint.pid != 0).then(|| {
-                if record.detach {
-                    crate::domain::Supervision::Detached
-                } else {
-                    crate::domain::Supervision::Session
-                }
+            (record.fingerprint.pid != 0).then_some(if record.detach {
+                crate::domain::Supervision::Detached
+            } else {
+                crate::domain::Supervision::Session
             })
         });
         let restart_policy = record

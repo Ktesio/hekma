@@ -3071,19 +3071,19 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: migrator steps 4 → 5 → 6 → 7 → 8 (each additive); user_version ==
-        // 8 and every prior row survives.
+        // Reopen: migrator steps 4 → 5 → 6 → 7 → 8 → 9 (each additive); user_version ==
+        // 9 and every prior row survives.
         let store = SqliteStore::open(&db).unwrap();
         // PINNED LITERAL (AI-66 #5): assert the actual version, never the
         // constant the migrator stamps from — comparing to SCHEMA_VERSION would
-        // pass even if the stamp and the constant drifted together. (The v8
-        // step, story 14-2, is the current last step; bump this literal when
+        // pass even if the stamp and the constant drifted together. (The v9
+        // step, story 15-2, is the current last step; bump this literal when
         // the next additive step lands.)
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -3218,16 +3218,16 @@ mod tests {
             )
             .unwrap();
         }
-        // Reopen: the migrator steps 6 → 7 → 8, ADDING the NULLABLE columns; the
+        // Reopen: the migrator steps 6 → 7 → 8 → 9, ADDING the NULLABLE columns; the
         // legacy row's cached columns default to NULL.
         let store = SqliteStore::open(&db).unwrap();
-        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8 (the
-        // v8 step, story 14-2, is the current last step).
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 9 (the
+        // v9 step, story 15-2, is the current last step).
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -3300,12 +3300,12 @@ mod tests {
         // Reopen: the migrator steps 7 → 8, ADDING the nullable column; the
         // legacy record survives with an honestly-unknown session state.
         let store = SqliteStore::open(&db).unwrap();
-        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 8.
+        // PINNED LITERAL (AI-66 #5 discipline): the migrated version is 9.
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()
