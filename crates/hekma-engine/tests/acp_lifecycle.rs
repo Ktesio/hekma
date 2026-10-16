@@ -557,6 +557,65 @@ fn agent_exit_mid_turn_surfaces_ended_fails_the_waiter_and_lands_failed() {
     let _ = blocking.stop(name, None);
 }
 
+/// The NON-UTF-8 stream death: instead of a clean EOF, the agent's stdout
+/// carries raw invalid UTF-8 mid-turn (a 0xFF start byte cannot begin any
+/// valid sequence). The reader's `read_line` FAILS with an io error, so the
+/// Ended notice must name the READ failure — not the end-of-stream wording
+/// — and the still-registered prompt waiter is failed by the same teardown
+/// courtesy (a bounded waiter never waits out its timeout). The reaper
+/// lands the instance `failed` under a `never` restart policy, exactly like
+/// the clean-EOF sibling above.
+#[test]
+fn garbage_on_prompt_surfaces_the_read_failure_and_lands_failed() {
+    let base = TempDir::new().unwrap();
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open(&base, Some(&shared));
+    let name = "acp-garbage-on-prompt";
+    register_acp(&engine, base.path(), name);
+    // `never` keeps the crash down (the default `on-failure` would restart
+    // it) — this test pins the failure landing, not the restart loop.
+    engine
+        .blocking()
+        .set_restart_policy(name, hekma_engine::RestartPolicy::Never)
+        .expect("set restart policy");
+    configure_and_start(&engine, name, "garbage-on-prompt", &[]);
+
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let blocking = engine.blocking();
+    blocking
+        .send_input(name, "the turn that answers in garbage bytes")
+        .expect("send");
+
+    // The reader hit the invalid bytes and the reaper landed the death.
+    poll_until("the garbage agent lands failed", || {
+        blocking
+            .list()
+            .expect("list")
+            .into_iter()
+            .any(|i| i.name.as_str() == name && i.state == LifecycleState::Failed)
+    });
+
+    // The transport death is surfaced through the diagnostic sink, and the
+    // wording names the READ failure with the io error's own words — the
+    // invalid-UTF-8 death must NOT read as the clean-EOF exit above.
+    poll_until("the stdout read-failure diagnostic surfaced", || {
+        sink_text(&shared).contains("stdout read failed")
+    });
+    let captured = sink_text(&shared);
+    assert!(
+        captured.contains("stream did not contain valid UTF-8"),
+        "the io error's own words surface: {captured}"
+    );
+    assert!(
+        !captured.contains("end of stream (the agent closed stdout or exited)"),
+        "a read failure must not read as the clean-EOF death: {captured}"
+    );
+
+    let _ = blocking.stop(name, None);
+}
+
 /// The permission-request row: the agent's `session/request_permission` is
 /// answered DENIED via the offered `reject_once` option, exactly one
 /// surfaced diagnostic names the refusal, and the turn proceeds to
