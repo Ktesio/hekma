@@ -213,7 +213,20 @@ pub trait StateStore {
     /// NEXT command resumes the id instead of minting again). Fails with
     /// [`StoreError::NotFound`] when no record row exists (a dropped Run
     /// identity must never vanish silently, AI-18).
-    fn set_spawn_run_id(&self, name: &InstanceName, run_id: &RunId) -> Result<(), StoreError>;
+    ///
+    /// DEFAULTED (compile-compatible for external implementors, 0.6→0.7): a
+    /// store that has not implemented durable Run identity fails LOUD with
+    /// [`StoreError::Backend`] naming the operation — the engine surfaces
+    /// that as the write-failure diagnostic (every re-adoption mints a fresh
+    /// Run, the documented pre-v9 posture), never a silent no-op.
+    fn set_spawn_run_id(&self, _name: &InstanceName, _run_id: &RunId) -> Result<(), StoreError> {
+        Err(StoreError::Backend(
+            "this StateStore implementation does not override set_spawn_run_id \
+             (story 15-2 durable run identity): the engine surfaces this write failure \
+             and keeps the documented pre-v9 mint-per-adoption posture"
+                .to_string(),
+        ))
+    }
 
     /// Settle the write-ahead spawn record (story 14-2): clear the live
     /// record — a clean stop, a crash reconcile, a terminal settle — while
