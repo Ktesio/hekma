@@ -887,6 +887,21 @@ impl Registry {
         Ok(())
     }
 
+    /// Persist the current [`RunId`] onto the instance's spawn record (story
+    /// 15-2) — the adoption path's back-compat write for a pre-v9 record.
+    /// The write is a compare-and-set on the `fingerprint` the caller read
+    /// the record under (a concurrent stop→start's fresh Run id is never
+    /// stomped). Fails when no record row exists (the caller surfaces it).
+    pub(crate) fn set_spawn_run_id(
+        &self,
+        name: &InstanceName,
+        run_id: &crate::domain::RunId,
+        fingerprint: &crate::ports::ProcessFingerprint,
+    ) -> Result<(), RegistryError> {
+        self.store.set_spawn_run_id(name, run_id, fingerprint)?;
+        Ok(())
+    }
+
     /// Settle the write-ahead spawn record (story 14-2): clear it while
     /// RETAINING an established acp session id on a pid-0 seed row, so the
     /// next start can offer it back via `session/load`. Returns whether an id
@@ -2041,6 +2056,7 @@ mod tests {
             last_known_cause: None,
             detach: false,
             acp_session_id: None,
+            run_id: None,
         };
         reg.write_spawn_record(&record).unwrap();
         assert_eq!(reg.spawn_record(&name).unwrap(), Some(record));

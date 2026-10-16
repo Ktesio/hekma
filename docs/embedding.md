@@ -61,6 +61,34 @@ transport owns the child's stdout; exhaustive struct literals need it), and
 (existing backends compile unchanged). The new builtin `acp` kind registers
 like any native kind and needs no contract negotiation.
 
+The **0.7.0** detached-continuation surface grows the embedding API the same
+additive way — three things a host needs to know before pinning it:
+
+- **`SpawnRecord.run_id: Option<RunId>` is a new PUBLIC field** — exhaustive
+  struct literals constructing a `SpawnRecord` (a custom `StateStore`
+  returning synthetic records, a test fixture) need the field. `None` is the
+  honest "no current Run"; the engine mints and persists one on first
+  adoption of a pre-v9 record.
+- **`StateStore::set_spawn_run_id(name, run_id, fingerprint)` is a NEW
+  DEFAULTED trait method** — existing store implementations compile
+  unchanged, and the default body fails LOUD (`StoreError::Backend` naming
+  the seam) rather than silently returning `Ok`: a store that has not
+  implemented durable Run identity surfaces the write failure through the
+  engine's diagnostic path, keeping the documented pre-v9
+  mint-per-adoption posture. The SQLite implementation compare-and-sets on
+  the spawn record's fingerprint, so a concurrent stop→start's fresh Run id
+  is never stomped by a stale adoption mint.
+- **A SEMANTIC change hosts should model**: pausing a DETACHED instance now
+  holds only while an `Engine` object for it is alive. Dropping/releasing
+  the engine SIGCONTs an OPERATOR-paused detached child before the handle
+  is released (recording the `paused → running` edge under the new
+  `TransitionCause::DetachedResumed` arm — exhaustive `TransitionCause`
+  matches need it); a BUDGET-BREACH-paused child deliberately stays frozen
+  into the enforcement-free window instead. A host that keeps long-lived
+  `Engine` objects gets the old hold-forever behavior for free; a host that
+  opens an engine per operation gets the release semantics above.
+
+
 Two things to know before depending: the engine's minimum supported Rust is
 **1.96.1** (the workspace `rust-version`; any toolchain at or above it
 builds), and Hekma is fully open source under the

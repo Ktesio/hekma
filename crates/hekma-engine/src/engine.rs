@@ -151,6 +151,28 @@ impl Drop for Engine {
         // Stop the background reaper when the engine goes away (its supervised
         // handles drop with the supervisor, killing spawned processes).
         self.reaper.abort();
+        // Story 15-2 (Fibery 178): before the supervised handles drop with the
+        // supervisor, release every DETACHED PAUSED one — SIGCONT the child
+        // and record paused→running — so a detached child is never left
+        // SIGSTOPped and unsupervised between commands. This runs while
+        // `inner` still holds the supervisor's handle map (the Arc teardown
+        // happens after this body), and BEFORE the map drops. Plain sync work
+        // on the dropping thread (locks + one DB write per released instance):
+        // `drop` may run inside a host's async context, so this deliberately
+        // does NOT enter the runtime. A POISONED lock is recovered via
+        // `into_inner` rather than panicking — a panic inside `Drop` would
+        // abort the whole process, and the release pass is best-effort by
+        // contract.
+        let inner = Arc::clone(&self.inner);
+        let registry = inner
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut supervisor = inner
+            .supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        supervisor.release_detached_paused(&registry);
     }
 }
 
@@ -658,6 +680,20 @@ impl Engine {
             Some(map) => map.get(&instance.name).cloned(),
             None => registry.spawn_record(&instance.name).unwrap_or(None),
         };
+        // Story 15-2 (Fibery 176): the supervision indicator, composed from
+        // the spawn record ALREADY in hand (the same `record.detach` source
+        // adoption reads — no new read). A pid-0 record is a policy/settle
+        // SEED, not supervision: a never-started or stopped instance reads
+        // `None` (the honest absence a human cell renders as `—`), so a
+        // stopped row can never imply supervised. Computed BEFORE the
+        // `failed_cause` fold below consumes the record.
+        let supervision = record.as_ref().and_then(|record| {
+            (record.fingerprint.pid != 0).then_some(if record.detach {
+                crate::domain::Supervision::Detached
+            } else {
+                crate::domain::Supervision::Session
+            })
+        });
         let restart_policy = record
             .as_ref()
             .map(|r| r.restart_policy)
@@ -833,6 +869,9 @@ impl Engine {
             metering_source,
             acp_context_usage,
             usage_gap,
+            // Story 15-2: detached vs session-bound (from the spawn record;
+            // `None` — omitted — for a stopped / never-started instance).
+            supervision,
             agent_home: instance.agent_home,
         }
     }
@@ -1379,6 +1418,27 @@ impl Engine {
         .await
     }
 
+    /// The RAW `agent.log` FALLBACK follow read (story 15-2, Fibery 207) —
+    /// `hekma agent logs --follow`'s companion poll for the
+    /// between-commands window of a detached instance. See
+    /// [`Supervisor::read_raw_output_since`]'s docs for the honesty rules
+    /// (the un-attributed qualifier the CALLER surfaces once per session,
+    /// the live-capture guard, and the `None`-cursor priming).
+    pub async fn read_raw_output_since(
+        &self,
+        name: &str,
+        cursor: Option<u64>,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.read_raw_output_since(&registry, &name, cursor)
+        })
+        .await
+    }
+
     /// Run a blocking closure on tokio's blocking pool and await its result.
     ///
     /// Centralizes the `spawn_blocking` bridge so every async wrapper follows the
@@ -1560,6 +1620,18 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.read_agent_log_since(name, cursor))
+    }
+
+    /// Blocking [`Engine::read_raw_output_since`] (story 15-2) — the raw
+    /// `agent.log` fallback follow read.
+    pub fn read_raw_output_since(
+        &self,
+        name: &str,
+        cursor: Option<u64>,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.read_raw_output_since(name, cursor))
     }
 
     /// Blocking [`Engine::instance_status`] (story 1-6, AC9).

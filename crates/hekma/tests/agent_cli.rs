@@ -3286,11 +3286,13 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
     // dollar value BARE (via render_dollars_bare), so there is no inline estimate
     // label in the cell to mangle, and the header carries the label instead.
     //
-    // COLUMNS=116 is chosen so the Budget header + cell AND the Usage header all
-    // render in full while the other columns (Agent Home) absorb the truncation
-    // pressure — the columns under test are fully observable. (AI-45 widened the
-    // Usage header to "Usage (tok, est. $)", which costs the table five columns of
-    // slack; 116 restores the room 110 used to give the Budget cell.)
+    // COLUMNS is chosen so the Budget header + cell AND the Usage header all
+    // render in full while the other columns (Agent Home) absorb the
+    // truncation pressure — the columns under test are fully observable.
+    // (AI-45 widened the Usage header to "Usage (tok, est. $)", which cost the
+    // table five columns of slack; 116 restored the room 110 used to give the
+    // Budget cell. Story 15-2's Supervision column costs 12 more — the
+    // previous 116 no longer left the Usage header whole, so this pins 128.)
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -3317,7 +3319,7 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
         &["agent", "list"],
         &ctx.project_dir,
         state_dir,
-        &[("COLUMNS", "116")],
+        &[("COLUMNS", "128")],
     );
     assert!(human.success, "list should exit 0; stderr={}", human.stderr);
 
@@ -5501,9 +5503,13 @@ fn logs_on_an_unregistered_name_is_not_found() {
 // value for the same reason.
 
 /// The FROZEN `FleetEntry` key-set — the per-instance object shared by
-/// `list --json` (rows) and `show --json` (`instance`). `failed_cause` is
-/// `skip_serializing_if` and absent for a healthy instance, so it is not in
-/// the always-present set asserted here.
+/// `list --json` (rows) and `show --json` (`instance`). Two fields are
+/// `skip_serializing_if` and therefore absent when their condition does not
+/// hold, so they are not in the always-present set asserted here:
+/// `failed_cause` (absent for a healthy instance) and `supervision` (story
+/// 15-2's CONDITIONAL-FIELD example: present exactly when a live spawn
+/// record exists — `detached`/`session` — and omitted for a stopped or
+/// never-started instance, which must never imply supervised).
 const FLEET_ENTRY_KEYS: &[&str] = &[
     "agent_home",
     "budget",
@@ -7986,5 +7992,366 @@ fn lifecycle_error_arms_on_a_missing_instance_exit_3_diagnostics_only() {
             !run.stderr.is_empty(),
             "the failure must carry a diagnostic; args={args:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 15-2 — the supervision indicator + the raw logs fallback, at the CLI.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_and_show_surface_the_supervision_indicator() {
+    // Fibery 176: the Fleet surfaces must distinguish a DETACHED instance
+    // (survives engine exits) from a session-bound one and from a STOPPED row
+    // (record cleared — never an implied supervised). The human `list` gains
+    // the compact Supervision column; the human `show` gains the row;
+    // `show --json` carries the ADDITIVE `supervision` field when a live
+    // record exists and OMITS it once the instance stops (the frozen absence,
+    // `skip_serializing_if`).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+    let reg = run_hekma_agent_bounded(
+        &[
+            "agent",
+            "register",
+            "detachy",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+        REGISTER_BOUND,
+    );
+    assert!(!reg.timed_out, "register leg hung");
+    let mut orphan_guard = StopOrphanOnDrop {
+        name: "detachy",
+        working_dir: ctx.project_dir.as_path(),
+        state_dir,
+        timeout_arg: "5".to_string(),
+        armed: true,
+    };
+
+    // Before any start: a REGISTERED row never implies supervised — the human
+    // cells show the honest `—` and `show --json` omits the field entirely.
+    // (COLUMNS=160: the compact table truncates headers at the default width —
+    // the AI-43 discipline — so the header assertion needs the roomy render.)
+    let listed = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(
+        listed.success,
+        "list should exit 0; stderr={}",
+        listed.stderr
+    );
+    assert!(
+        listed.stdout.contains("Supervision"),
+        "the list table carries the Supervision column: {}",
+        listed.stdout
+    );
+    let shown = run_hekma_agent(&["agent", "show", "detachy"], &ctx.project_dir, state_dir);
+    assert!(shown.success, "stderr={}", shown.stderr);
+    // Pin the ABSENCE CELL EXACTLY (review round 1): the loose `contains('—')`
+    // was satisfied by the budget row alone — parse the Supervision ROW's own
+    // cell and assert it is exactly the honest `—` token.
+    let supervision_row = shown
+        .stdout
+        .lines()
+        .find(|line| line.contains("Supervision"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the show table carries the Supervision row: {}",
+                shown.stdout
+            )
+        });
+    let cells: Vec<&str> = supervision_row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        vec!["Supervision", "—"],
+        "the registered row's Supervision cell is EXACTLY the honest absence: {supervision_row}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(
+        &run_hekma_agent(
+            &["agent", "show", "detachy", "--json"],
+            &ctx.project_dir,
+            state_dir,
+        )
+        .stdout,
+    )
+    .expect("show --json is pure JSON");
+    assert!(
+        doc["instance"].get("supervision").is_none(),
+        "a never-started instance omits the field (never implies supervised): {doc}"
+    );
+
+    // THE SESSION LEG (review round 1): a live NON-DETACHED start must read
+    // `session` on ALL THREE surfaces. A session-bound child dies at the
+    // FIRST adopting command's engine drop (the story 1-6 kill-on-drop
+    // guarantee), so each surface gets its own freshly-started instance via
+    // the surviving-engine harness (the helper engine "crashes" without
+    // dropping, leaving a live adoptable process whose record reads
+    // detach=false).
+    let session_instance = |tag: &str| -> String {
+        let name = format!("sessy-{tag}");
+        let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+        let reg = run_hekma_agent_bounded(
+            &[
+                "agent",
+                "register",
+                &name,
+                "--manifest",
+                m.to_str().unwrap(),
+            ],
+            &ctx.project_dir,
+            state_dir,
+            REGISTER_BOUND,
+        );
+        assert!(!reg.timed_out, "register leg hung");
+        assert!(reg.run.success, "stderr={}", reg.run.stderr);
+        start_via_surviving_engine(state_dir, &name);
+        wait_for_agent_pid(state_dir, &name);
+        name
+    };
+
+    // (a) `list`: the compact `session` marker in the Supervision column.
+    session_instance("list");
+    let listed = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(
+        listed.success,
+        "list should exit 0; stderr={}",
+        listed.stderr
+    );
+    assert!(
+        listed.stdout.contains("session"),
+        "the live session-bound record renders the session marker: {}",
+        listed.stdout
+    );
+    assert!(
+        !listed.stdout.contains("detached"),
+        "the session leg must not render the detached marker: {}",
+        listed.stdout
+    );
+    // (b) `show`: the Supervision row names `session` EXACTLY.
+    let name = session_instance("show");
+    let shown = run_hekma_agent(&["agent", "show", &name], &ctx.project_dir, state_dir);
+    assert!(shown.success, "stderr={}", shown.stderr);
+    let supervision_row = shown
+        .stdout
+        .lines()
+        .find(|line| line.contains("Supervision"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the show table carries the Supervision row: {}",
+                shown.stdout
+            )
+        });
+    let cells: Vec<&str> = supervision_row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        vec!["Supervision", "session"],
+        "the live session-bound row's Supervision cell is exactly 'session': {supervision_row}"
+    );
+    // (c) `show --json`: the additive field carries the wire value.
+    let name = session_instance("json");
+    let json = run_hekma_agent(
+        &["agent", "show", &name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("pure JSON");
+    assert_eq!(
+        doc["instance"]["supervision"],
+        serde_json::json!("session"),
+        "the session-bound record carries the session wire value: {doc}"
+    );
+    // Each session-bound child was killed by its one adopting command's
+    // engine drop (kill-on-drop); settle the rows with a best-effort stop so
+    // later legs start from a clean table.
+    for tag in ["list", "show", "json"] {
+        let _ = run_hekma_agent(
+            &["agent", "stop", &format!("sessy-{tag}")],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
+
+    // A DETACHED start: every later command re-adopts the live record — the
+    // indicator reads `detached` on all three surfaces.
+    let run = run_hekma_agent_bounded(
+        &["agent", "start", "detachy", "--detach"],
+        &ctx.project_dir,
+        state_dir,
+        LEG_BOUND,
+    );
+    assert!(!run.timed_out, "the detached start leg hung");
+    assert!(run.run.success, "stderr={}", run.run.stderr);
+    let pid = wait_for_agent_pid(state_dir, "detachy");
+    assert!(
+        pid_alive(pid),
+        "the detached child is alive after the start exit"
+    );
+
+    let listed = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(
+        listed.stdout.contains("detached"),
+        "the live detached record renders the detached marker: {}",
+        listed.stdout
+    );
+    let shown = run_hekma_agent(&["agent", "show", "detachy"], &ctx.project_dir, state_dir);
+    assert!(
+        shown.stdout.contains("Supervision") && shown.stdout.contains("detached"),
+        "the show row names detached: {}",
+        shown.stdout
+    );
+    let json = run_hekma_agent(
+        &["agent", "show", "detachy", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("pure JSON");
+    assert_eq!(
+        doc["instance"]["supervision"],
+        serde_json::json!("detached"),
+        "the additive JSON field carries the wire value: {doc}"
+    );
+    // The list --json rows carry the SAME field (the same FleetEntry).
+    let listed: serde_json::Value = serde_json::from_str(
+        &run_hekma_agent(&["agent", "list", "--json"], &ctx.project_dir, state_dir).stdout,
+    )
+    .expect("pure JSON");
+    let entry = listed["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "detachy")
+        .expect("the detached row");
+    assert_eq!(entry["supervision"], serde_json::json!("detached"));
+
+    // STOP clears the record: the absence returns everywhere.
+    let stopped = run_hekma_agent(&["agent", "stop", "detachy"], &ctx.project_dir, state_dir);
+    assert!(stopped.success, "stderr={}", stopped.stderr);
+    orphan_guard.armed = false;
+    let json = run_hekma_agent(
+        &["agent", "show", "detachy", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("pure JSON");
+    assert!(
+        doc["instance"].get("supervision").is_none(),
+        "a stopped row never implies supervised: {doc}"
+    );
+    let listed = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(
+        !listed.stdout.contains("detached"),
+        "the stopped row renders the absence, not a stale marker: {}",
+        listed.stdout
+    );
+}
+
+#[test]
+fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() {
+    // Story 15-2 (Fibery 207): a line a live tailer never attributed (written
+    // straight to the raw agent.log while no engine session held the
+    // instance) APPEARS in a later command's `logs --follow` — human mode
+    // renders it like any line, `--json` emits it as a real NDJSON LogLine
+    // (stdout stays pure NDJSON), and the un-attributed qualifier rides
+    // STDERR exactly once per session. The instance is REGISTERED (never
+    // started), so the follow loop exits on its own after the final drain.
+    let (ctx, state) = registered_mock("rawcat");
+    let state_dir = state.project_dir.as_path();
+    // The backlog exists BEFORE the command starts: priming must SKIP it
+    // (it is not re-emitted), which the thread-appended line below then
+    // proves by being the ONLY raw line on stdout.
+    let raw_log = agent_log_path(state_dir, "rawcat");
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    std::fs::write(&raw_log, "pre-existing backlog line\n").unwrap();
+
+    for (mode, json) in [("human", false), ("json", true)] {
+        // A line written WHILE the follow command runs (after its raw cursor
+        // prime, before its first poll).
+        let append_log = raw_log.clone();
+        let appender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&append_log)
+                .expect("open the raw log");
+            writeln!(file, "raw fallback line for {mode}").expect("append");
+        });
+        let mut args = vec!["agent", "logs", "rawcat", "--follow"];
+        if json {
+            args.push("--json");
+        }
+        let run = run_hekma_agent(&args, &ctx.project_dir, state_dir);
+        appender.join().expect("the appender thread");
+        assert!(run.success, "[{mode}] stderr={}", run.stderr);
+        // The NEW raw line appears; the pre-existing backlog does NOT.
+        assert!(
+            run.stdout
+                .contains(&format!("raw fallback line for {mode}")),
+            "[{mode}] the between-commands raw line must stream: stdout={}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("pre-existing backlog line"),
+            "[{mode}] priming must not replay the raw backlog: stdout={}",
+            run.stdout
+        );
+        // The un-attributed qualifier rides STDERR, exactly once.
+        assert!(
+            run.stderr.contains("un-attributed raw passthrough"),
+            "[{mode}] the qualifier must surface on stderr: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.stderr.matches("un-attributed raw passthrough").count(),
+            1,
+            "[{mode}] the qualifier is once-per-session, not per-poll: {}",
+            run.stderr
+        );
+        if json {
+            // stdout stays PURE NDJSON: every non-empty line parses, and the
+            // raw line arrives as a real LogLine with the agent-out stream.
+            let mut saw_raw = false;
+            for line in run.stdout.lines().filter(|l| !l.trim().is_empty()) {
+                let value: serde_json::Value = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("[{mode}] stdout is not pure NDJSON ({e}): {line}"));
+                if value["text"] == format!("raw fallback line for {mode}") {
+                    saw_raw = true;
+                    assert_eq!(value["stream"], serde_json::json!("agent-out"), "{value}");
+                    assert_eq!(
+                        value["schema_version"],
+                        serde_json::json!(hekma_engine::LOG_SCHEMA_VERSION),
+                        "{value}"
+                    );
+                }
+            }
+            assert!(
+                saw_raw,
+                "[{mode}] the raw line is a real LogLine: {}",
+                run.stdout
+            );
+        }
     }
 }

@@ -558,6 +558,16 @@ impl Supervisor {
         // attempt count. The fingerprint is the PID-reuse guard for later
         // orphan adoption. A record-commit failure fails the start (leaving the
         // instance `failed`) — we must not run an unrecorded supervised process.
+        //
+        // Story 15-2: the Run id is minted HERE, BEFORE the record commit, and
+        // rides the record — the durable Run identity. A later engine (any
+        // intervening command, or a crash restart) ADOPTS this process and
+        // RESUMES this Run instead of minting its own, so per-run budgets /
+        // usage and the breach latch survive across commands. Every genuine
+        // (re)spawn — operator start, stop→start, or a Restart Policy restart —
+        // flows through here, so each rewrites the record with a FRESH id: the
+        // Run resets exactly when a new process is spawned, never on adoption.
+        let run_id = RunId::mint();
         let restart_count = restart.map(|(attempt, _)| attempt).unwrap_or(0);
         let record = SpawnRecord {
             name: name.clone(),
@@ -578,6 +588,9 @@ impl Supervisor {
             // settle-retained id: a Run whose handshake has not completed has,
             // honestly, no session yet.
             acp_session_id: None,
+            // Story 15-2: the durable Run identity (minted just above, so the
+            // id is durable from the first moment the process is supervised).
+            run_id: Some(run_id.clone()),
         };
         if let Err(e) = registry.write_spawn_record(&record) {
             // Persisting the record failed: kill the just-spawned process and
@@ -733,12 +746,13 @@ impl Supervisor {
             ready_cause,
             self.backend.log_capture(&handle),
         )?;
-        // Mint the fresh Run id for this `starting`→terminal span (spine AD-7). Each
-        // `starting` — operator start OR restart (story 1-6) — mints a distinct id
-        // (AC-B), so a restarted instance opens a NEW Run whose per-run totals never
-        // bleed in the previous Run's usage. The ingestion cursor was anchored at the
-        // pre-spawn log length (above), so this Run ingests all of its own output.
-        let run_id = RunId::mint();
+        // The Run id was minted BEFORE the record commit (story 15-2 — the
+        // durable Run identity; see step (6)): each `starting` — operator start
+        // OR restart (story 1-6) — still gets a DISTINCT id (AC-B), so a
+        // restarted instance opens a NEW Run whose per-run totals never bleed
+        // in the previous Run's usage. The ingestion cursor was anchored at the
+        // pre-spawn log length (above), so this Run ingests all of its own
+        // output.
         // Story 3-4: an `engine-observed` instance holds its listener + a fresh
         // per-Run observed `sequence` minter (built here with the just-minted
         // run_id, so the ordinal resets per Run — the AD-7 Run boundary + the dedup

@@ -112,10 +112,11 @@ pub use domain::{
     EffectiveConfig, EngineError, EngineEvent, EstimateLabel, FleetEntry, FleetListing,
     FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState, LogLine,
     LogStream, Micros, NameError, Rate, Registry, RegistryError, RemoveDisposition, ResolvedValue,
-    RestartPolicy, ResyncBatch, ResyncCursor, RunId, SourceLayer, TokenBudget, TransitionCause,
-    TransitionEvent, UsageEvent, UsageGapNotice, UsageTotals, UsageUpdateEvent, UsageView,
-    BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, FLEET_SCHEMA_VERSION,
-    LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK, USAGE_SCHEMA_VERSION,
+    RestartPolicy, ResyncBatch, ResyncCursor, RunId, SourceLayer, Supervision, TokenBudget,
+    TransitionCause, TransitionEvent, UsageEvent, UsageGapNotice, UsageTotals, UsageUpdateEvent,
+    UsageView, BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION,
+    FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK,
+    USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EventSubscription, InstanceStatus};
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary

@@ -357,6 +357,157 @@ impl Supervisor {
         }
     }
 
+    /// The RAW `agent.log` FALLBACK read (story 15-2, Fibery 207) — honest
+    /// un-attributed passthrough for the between-commands window.
+    ///
+    /// A detached instance's stdout keeps appending to the crash-immune RAW
+    /// `agent.log` for as long as the process lives, but the ATTRIBUTED
+    /// capture (`logs/output.log`) only grows while a live engine's tailer
+    /// thread runs — which dies with the engine that spawned it. Between
+    /// commands (the whole point of `--detach`), `agent logs --follow` in a
+    /// NEW command therefore saw nothing new. This read closes that gap: it
+    /// tails the RAW file directly, byte-cursor shaped EXACTLY like
+    /// [`Supervisor::read_agent_log_since`] (a returned cursor below the one
+    /// passed in = the file shrank — `agent.log` is never rotated, so that is
+    /// a truncation, and the caller surfaces it the same way as a rotation).
+    ///
+    /// Honesty rules (the "un-attributed" label, AI-18):
+    /// * Each raw line is returned as a [`LogLine`] with `stream = agent-out`
+    ///   — TRUE (agent.log is the stdout-only capture) — and `at` = the time
+    ///   THIS READ observed it, the same semantic the attributed tailer's
+    ///   stamp has. What the raw line genuinely lacks is REAL-TIME
+    ///   attribution: the write may have happened long before the read. The
+    ///   CALLER surfaces that qualifier ONCE per session on stderr (never
+    ///   per-poll), which is why this returns plain [`LogLine`]s: `--json`
+    ///   stays pure NDJSON and the frozen [`crate::domain::LOG_SCHEMA_VERSION`]
+    ///   surface is untouched.
+    /// * GUARD — only an instance with NO live capture in THIS engine session
+    ///   falls back: a supervisor that holds a live tailer gets
+    ///   `(vec![], current_len)`, because the tailer is already attributing
+    ///   those same bytes (a fallback read here would DOUBLE-report them).
+    ///   Every CLI command's engine re-holds ADOPTED handles
+    ///   (`log_capture: None`), so the fallback is what a new command's
+    ///   `--follow` streams from; an embedding host that spawned the instance
+    ///   in-process keeps the attributed pipeline untouched.
+    /// * `cursor: None` PRIMES the loop: it returns `(vec![], current_len)`
+    ///   so the caller streams only lines written after it started (the
+    ///   pre-existing raw backlog is already visible through the attributed
+    ///   generations where the tailer ever ran; replaying all of `agent.log`
+    ///   would duplicate it).
+    /// * Absent file → an honest empty read (cursor 0) — "both absent →
+    ///   honest empty" in the story's matrix.
+    /// * INCREMENTAL (review round 1): the poll reads only the TAIL from the
+    ///   byte cursor (metadata length + seek + read), never the whole file —
+    ///   `--follow` polls every 300ms for an unbounded session, and a
+    ///   whole-file re-read per poll made that O(file×polls). The shrink
+    ///   check (cursor > current length) reads the same metadata, so the
+    ///   truncation detection the caller relies on is unchanged.
+    pub fn read_raw_output_since(
+        &self,
+        registry: &Registry,
+        name: &str,
+        cursor: Option<u64>,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let path = registry.agent_output_log_path(&name);
+        // The length probe (cheap metadata read — never file content): an
+        // absent file is an honest length 0.
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        // PRIME (or the live-capture guard): no lines, cursor at the current
+        // end. The guard MUST advance the cursor too — otherwise the moment
+        // the tailer dies the next poll would dump the whole attributed
+        // backlog as raw lines.
+        let live_capture = self
+            .running
+            .get(&name)
+            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some());
+        let cursor = match cursor {
+            None => return Ok((Vec::new(), len)),
+            Some(_) if live_capture => return Ok((Vec::new(), len)),
+            Some(cursor) => cursor,
+        };
+        // SHRINK: agent.log is never rotated, so a length below the cursor is
+        // a truncation — snap to the new end, deliver nothing (the caller's
+        // dedicated raw-shrink notice names it; read_events_from's "missing
+        // file → empty" precedent keeps the absent-file case honest too).
+        if cursor > len {
+            return Ok((Vec::new(), len));
+        }
+        // THE TAIL-ONLY READ: seek to the cursor and read forward — never a
+        // whole-file read per poll. A file that vanished between the probe
+        // and the open degrades to an honest empty read at the probed length.
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), len));
+            }
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        // The capacity hint covers the expected tail (the probed delta);
+        // `read_to_end` grows past it if the file grew between probe and
+        // read — the read is bounded by the FILE, never a fixed cap.
+        let mut tail = Vec::with_capacity(usize::try_from(len - cursor).unwrap_or(usize::MAX));
+        if let Err(e) = file
+            .seek(SeekFrom::Start(cursor))
+            .and_then(|_| file.read_to_end(&mut tail))
+        {
+            return Err(EngineError::Log {
+                name: name.as_str().to_string(),
+                path: path.to_string_lossy().into_owned(),
+                detail: e.to_string(),
+            });
+        }
+        // The SAME complete-line plan the attributed follow uses, relative to
+        // the tail (cursor 0): a trailing partial line stays unconsumed, and
+        // the returned cursor advances by exactly the consumed bytes.
+        match plan_follow(&tail, 0) {
+            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), cursor + new_cursor)),
+            FollowPlan::Consume { range, new_cursor } => {
+                let mut lines = Vec::new();
+                if !range.is_empty() {
+                    for raw in String::from_utf8_lossy(&tail[range]).lines() {
+                        if raw.trim().is_empty() {
+                            continue;
+                        }
+                        // The attributed view strips trailing newlines
+                        // (`LogLine::text`'s contract); match it so the two
+                        // streams render identically. The timestamp is the
+                        // READ time — the qualifier's one honest caveat.
+                        lines.push(LogLine::new(
+                            name.as_str(),
+                            LogStream::AgentOut,
+                            raw,
+                            now_rfc3339(),
+                        ));
+                    }
+                }
+                Ok((lines, cursor + new_cursor))
+            }
+        }
+    }
+
     /// Ensure the per-instance log directory exists (AD-12 seed).
     pub(super) fn ensure_log_dir(
         &self,

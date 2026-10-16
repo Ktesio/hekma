@@ -1261,3 +1261,139 @@ fn crash_kill_experiment_a_default_sigpipe_process_survives_an_engine_crash() {
         "the yes process must be killable directly after the experiment",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 15-2 — the RAW `agent.log` fallback read (the between-commands window).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn raw_fallback_streams_new_agent_log_lines_with_read_time_attribution() {
+    // The fallback read: an instance with NO live tailer in this engine
+    // session (here: registered, never started — the same `log_capture: None`
+    // shape every adopted handle has) streams NEW raw `agent.log` lines as
+    // honest LogLines — `agent-out` stream (agent.log is stdout-only), `at` =
+    // the READ time, text newline-stripped. `None` primes at the current end
+    // (nothing replayed); a trailing PARTIAL line stays unconsumed; a shrink
+    // snaps the cursor.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("raw", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "raw");
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    std::fs::write(&raw_log, "pre-existing raw line\n").unwrap();
+
+    // PRIME: no lines, cursor at the current end (the backlog is NOT
+    // replayed — it stays visible through the attributed generations).
+    let (lines, cursor) = facade.read_raw_output_since("raw", None).unwrap();
+    assert!(lines.is_empty(), "priming replays nothing: {lines:?}");
+    assert_eq!(cursor, "pre-existing raw line\n".len() as u64);
+
+    // NEW lines stream — as LogLines with the honest read-time attribution.
+    std::fs::write(
+        &raw_log,
+        "pre-existing raw line\nfresh raw one\nfresh raw two",
+    )
+    .unwrap();
+    let (lines, next) = facade.read_raw_output_since("raw", Some(cursor)).unwrap();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.stream, l.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(LogStream::AgentOut, "fresh raw one")],
+        "complete lines only, agent-out attributed, newline-stripped: {lines:?}"
+    );
+    assert_eq!(lines[0].instance, "raw");
+    assert_eq!(lines[0].schema_version, hekma_engine::LOG_SCHEMA_VERSION);
+    assert!(
+        !lines[0].at.is_empty(),
+        "the read-time timestamp is stamped"
+    );
+    // The PARTIAL trailing line (no newline) stays unconsumed.
+    assert_eq!(next, cursor + "fresh raw one\n".len() as u64);
+    let (none, same) = facade.read_raw_output_since("raw", Some(next)).unwrap();
+    assert!(none.is_empty());
+    assert_eq!(same, next);
+
+    // Completing the line releases it.
+    std::fs::write(
+        &raw_log,
+        "pre-existing raw line\nfresh raw one\nfresh raw two\n",
+    )
+    .unwrap();
+    let (lines, _) = facade.read_raw_output_since("raw", Some(next)).unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].text, "fresh raw two");
+
+    // A SHRINK (agent.log is never rotated — this is a truncation) snaps the
+    // cursor with no lines and no error.
+    std::fs::write(&raw_log, "short\n").unwrap();
+    let (lines, snapped) = facade.read_raw_output_since("raw", Some(next)).unwrap();
+    assert!(lines.is_empty(), "a shrink emits nothing: {lines:?}");
+    assert_eq!(
+        snapped,
+        "short\n".len() as u64,
+        "the cursor snaps to the new end"
+    );
+
+    // An absent file is an honest empty read (cursor 0), never an error.
+    std::fs::remove_file(&raw_log).unwrap();
+    let (lines, cursor) = facade.read_raw_output_since("raw", None).unwrap();
+    assert!(lines.is_empty());
+    assert_eq!(cursor, 0);
+}
+
+#[test]
+fn raw_fallback_is_suppressed_while_a_live_tailer_attributes_the_same_bytes() {
+    // The live-capture guard: while THIS engine session holds a live tailer
+    // for the instance (a fresh in-process start), the fallback read returns
+    // NO lines even though agent.log keeps growing — the tailer is already
+    // attributing those bytes, and a fallback read here would double-report
+    // them. The cursor still advances, so nothing dumps when the tailer later
+    // dies.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_logs_manifest(
+        manifest.path(),
+        "svc",
+        &["--heartbeat-ms", "30", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    facade.start("svc").unwrap();
+    // Wait until the raw file has content the guard must decline to re-emit.
+    let raw_log = agent_log_path(state.path(), "svc");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::metadata(&raw_log)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no raw output ever appeared"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (lines, cursor) = facade.read_raw_output_since("svc", Some(0)).unwrap();
+    assert!(
+        lines.is_empty(),
+        "a live tailer suppresses the fallback (no double-reporting): {lines:?}"
+    );
+    assert_eq!(
+        cursor,
+        std::fs::metadata(&raw_log).unwrap().len(),
+        "the suppressed read still advances the cursor to the current end"
+    );
+
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
