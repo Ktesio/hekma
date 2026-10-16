@@ -2,7 +2,7 @@
 title: 'ACP 100%: real-agent verification for OpenCode + Hermes under the acp kind'
 type: 'feature'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'done' # review triaged + gates green 2026-10-16; PR open
 baseline_commit: '9f58225a15a6d093fd7213db0a8c2f7b9fe34522'
 review_loop_iteration: 0
 context:
@@ -106,12 +106,17 @@ behavior).
 
 ## Spec Change Log
 
+- (Review round 1, 2026-10-16) Blind-hunter + verification-gap findings applied as patches (no loopback): the turn smokes now prove TURN COMPLETION (sentinel + the stopReason-bearing result both required) and ASSERT the context-grain `acp_context_usage` figure instead of assuming it; start failures re-panic with the auth hint + env lever; the dialect pin gained a thought chunk, a legacy-spelling chunk, and the deterministic reply-reconstruction assertion (`chunk-1chunk-2chunk-3-legacy`, thought excluded) so `agent_reply_text` can never regress unverified; docs fixed (dangling troubleshooting ref removed, XDG isolation sentence hedged as unverified, disarm-value wording, one canonical hermes pin spelling); Design Notes' turn bound corrected to the implemented 180s. KEEP: the skip-unless-present posture and the opt-in default-off turn env (both survived review).
+- (Closeout, 2026-10-16) All tasks complete; three-layer review triaged (9 patches, 1 defer — skip-note visibility under libtest capture, 2 rejects — documented-posture precedents); gates green; sprint-status 15-1 → done; Fibery Task/382 mirrored (In Review with the PR at PR-open time).
+
 ## Design Notes
 
 - Turn-end detection: prefer a poll on the retained log surface (public read seam
   used by `agent logs`) for the sentinel reply string over any new engine API —
-  keeps the smoke at the operator's eye level. Bounded window (≤120s) with a
-  red-on-timeout diagnostic naming the opt-in env.
+  keeps the smoke at the operator's eye level. Bounded window (≤180s —
+  generous for a real model; a timeout is a red naming the env lever) with a
+  red-on-timeout diagnostic that DISTINGUISHES a paraphrasing model (reply
+  text present, sentinel absent) from a dead/authless turn (no reply at all).
 - The reply sentinel must be forced-lowercase-unique (e.g. `hekma-acp-turn-ok-<pid>`);
   thought chunks may echo it — assert on an agent_message (text content) shape or
   the raw line's content field, tolerant of chunking.

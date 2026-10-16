@@ -256,6 +256,43 @@ fn available_commands_update() -> serde_json::Value {
     )
 }
 
+/// One `agent_thought_chunk` (story 15-1): the (extended-)thinking stream a
+/// real agent interleaves with its visible reply. The classifier knows the
+/// kind; the reply RECONSTRUCTION must exclude it (thoughts are not the
+/// agent's message), which the dialect pin asserts via the thought's
+/// distinctive never-in-the-reply token.
+#[cfg(not(tarpaulin_include))]
+fn thought_chunk() -> serde_json::Value {
+    notification(
+        "session/update",
+        serde_json::json!({
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "thought-never-in-the-reply" },
+            },
+        }),
+    )
+}
+
+/// One LEGACY-spelling message chunk (`agent_text_message_chunk`, story
+/// 15-1): the pre-rename ACP vocabulary a real agent may still emit. The
+/// engine classifies the legacy name, and the reply reconstruction
+/// concatenates it — pinned by its distinctive suffix.
+#[cfg(not(tarpaulin_include))]
+fn legacy_text_chunk() -> serde_json::Value {
+    notification(
+        "session/update",
+        serde_json::json!({
+            "sessionId": SESSION_ID,
+            "update": {
+                "sessionUpdate": "agent_text_message_chunk",
+                "content": { "type": "text", "text": "-legacy" },
+            },
+        }),
+    )
+}
+
 /// The `usage_update` notification for one turn (story 14-3, T1): the
 /// CONTEXT-grain figure — a fixed `used`/`size` plus the optional
 /// agent-reported cost block, so the engine's surfacing (diagnostic + the
@@ -747,10 +784,15 @@ fn main() {
                     // Story 15-1: the real opencode v2 turn preamble — a
                     // slash-command roster change plus a CONTEXT-grain
                     // usage_update carrying a cost block (the exact shapes
-                    // observed against `opencode acp` v2.0.28), before the
-                    // ordinary chunk sequence.
+                    // observed against `opencode acp` v2.0.28), then a
+                    // thought chunk and — after the ordinary chunk sequence —
+                    // ONE legacy-spelling text chunk, so the update
+                    // classifier's thought/message discrimination and the
+                    // reply reconstruction's legacy tolerance are both
+                    // pinned deterministically (no real binary needed).
                     emit(&available_commands_update());
                     emit(&usage_update());
+                    emit(&thought_chunk());
                 }
                 if mode == "noisy-updates" {
                     // The noisy envelope: blank framing lines around the
@@ -762,6 +804,12 @@ fn main() {
                     emit_noisy_envelope();
                 } else {
                     emit_chunks();
+                    if mode == "opencode-dialect" {
+                        // The legacy ACP spelling of the message chunk — a
+                        // real-agent compatibility shape the reconstruction
+                        // must still concatenate.
+                        emit(&legacy_text_chunk());
+                    }
                 }
                 emit(&response(
                     id,

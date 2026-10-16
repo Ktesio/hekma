@@ -95,10 +95,14 @@ The **turn-COMPLETION smokes** go one step further — a real prompt turn driven
 to completion (the reply text asserted RECONSTRUCTED from the retained
 chunk stream, because real agents split even a one-token reply across
 several `agent_message_chunk` updates): `real_opencode_acp_turn_completes_when_opted_in`
-and `real_hermes_acp_turn_completes_when_opted_in`. They make REAL model
+and `real_hermes_acp_turn_completes_when_opted_in`. Completion means BOTH the
+sentinel reply in the reconstructed text AND the turn's own end (the
+stopReason-bearing prompt result in the retained log), plus the context-grain
+`acp_context_usage` figure asserted (not assumed). They make REAL model
 calls, so they are OPT-IN via `HEKMA_TEST_REAL_AGENT_TURNS=1` (default off,
 visible skip note — binary presence alone never arms a possibly-costly
-call; unset or `0` disarms):
+call; any non-affirmative value — unset, `0`, `false` — disarms; run with
+`--nocapture` to see the skip notes, libtest captures stderr otherwise):
 
 ```bash
 HEKMA_TEST_REAL_AGENT_TURNS=1 cargo test -p hekma-engine --test acp_lifecycle real_ -- --nocapture --test-threads=1

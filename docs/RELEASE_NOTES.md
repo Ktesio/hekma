@@ -9,7 +9,7 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
-> **Unreleased — ACP verified against real OpenCode + Hermes agents.** opencode v2's native ACP server (`opencode acp`) is a run-verified `acp`-kind backend (`acp.command = opencode`, `acp.args = acp`; verified at `v2.0.28` — full prompt turn, reply retained, clean stop), and Hermes via `hermes-acp` carries a real-run pin (`v0.21.7+500`). New opt-in turn-completion smokes (`HEKMA_TEST_REAL_AGENT_TURNS=1`) prove full turns against both; the real opencode dialect shapes are pinned against the contract twin. No engine behavior changed — validation and docs moved forward (`docs/agents.md`).
+> **Unreleased — ACP verified against real OpenCode + Hermes agents.** opencode v2's native ACP server (`opencode acp`) is a run-verified `acp`-kind backend (`acp.command = opencode`, `acp.args = acp`; verified at `v2.0.28` — full prompt turn, reply retained, clean stop), and Hermes via `hermes-acp` carries a real-run pin (`v0.21.7+500.g8f81791`). New opt-in turn-completion smokes (`HEKMA_TEST_REAL_AGENT_TURNS=1`) prove full turns against both; the real opencode dialect shapes are pinned against the contract twin. No engine behavior changed — validation and docs moved forward (`docs/agents.md`).
 
 > **Unreleased — port-level memory-backing kind invariant (hardening batch).** The state store now refuses a re-attach that changes the attached kind (`StoreError::MemoryBackingKindConflict`, new exhaustive-enum variant; detach first, then attach). CLI behavior is unchanged — the registry always enforced this. `hekma-engine` → **0.6.0**.
 

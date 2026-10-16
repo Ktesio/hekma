@@ -174,3 +174,9 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: On Windows, a DETACHED agent ends up holding its spawning `kt` command's stdio pipe write-ends — any script that CAPTURES `kt agent start --detach` output (pipes) blocks until the agent exits; interactive terminals are unaffected (no pipes).
   evidence: the CLI detach test's forensic harness (agent_cli.rs `run_kt_agent_bounded`, 56ee766) proved kt EXITS (~1s, try_wait Ok(Some)) while its stdout/stderr pipes never EOF; std's spawn is documented to restrict inheritance to the child's own three stdio handles (attribute list), so the leak mechanism is unexpected — investigate (suspects: the Stdio::from(file) inheritable-dup path interacting with the job assignment, or a std behavior change) before fixing (candidates: explicit handle pinning at the Windows detached spawn, or DETACHED_PROCESS when the capture files already carry the output).
   routed: engine Windows detached-spawn handle handling — next Windows-touching story.
+
+## Deferred from: three-layer review of spec-15-1 (2026-10-16)
+
+- source_spec: `spec-15-1-acp-real-agent-verification-opencode-hermes`
+  summary: The real-agent smokes' visible skip NOTES (both the HEKMA_TEST_REAL_AGENT_SMOKES=0 opt-out and the HEKMA_TEST_REAL_AGENT_TURNS unset skip) are eprintln'd but INVISIBLE under a plain `cargo test` run — libtest captures stderr of passing tests, so the surfaced-not-silent posture only shows under the documented `--nocapture` commands; testing.md now says so.
+  evidence: Verification-gap reviewer (review round 1): `turn_smokes_enabled`/`real_smokes_opted_out` notes emit via eprintln; a plain harness run shows `... ok` with no note. Pre-existing family behavior (the 14-4 gemini opt-out note has the same shape); a harness-level fix (e.g. a --format jitter or a note-via-test-name) is a test-infra decision beyond this story.
