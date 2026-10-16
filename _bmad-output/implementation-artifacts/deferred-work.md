@@ -91,19 +91,44 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK polling helpers hard-code engine storage internals (usage_events/agent_instances SQLite schema, agents/<name>/logs/agent.log path, adapter.json snapshot layout) instead of public engine seams.
   evidence: Story 6-4 adversarial review (blind-hunter); coupling is intra-workspace and CI-tested today, but breaks silently if engine storage/layout changes. Switch to public engine APIs (e.g. read_agent_log) when available.
+  resolved: story 15-3 (2026-10-17) — every read with an existing public seam now routes through it
+  (read_agent_log for log polls incl. the heartbeat-freeze proof, O(1) fleet_entry for the
+  registered metering source, adapter::resolve for the --dump pair, EnginePaths for every
+  state-root-relative path); the two reads with NO seam (usage row counts, the registered-snapshot
+  launch boolean) stay direct with the frozen-v1 residual coupling documented on the helpers and in
+  docs/adapter-contract.md — no silent breakage remains.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK usage/observed row-count helpers conflate DB open/query errors with zero rows, producing misleading "have 0" timeout reasons instead of the actual error.
   evidence: Story 6-4 adversarial review (blind-hunter + edge-case-hunter); diagnostic polish only — the section still fails on timeout. Propagate Result through the helpers when touched next.
+  resolved: story 15-3 (2026-10-17) — usage_row_count/observed_row_count return Result with named
+  open/query errors, the shared wait poll propagates the FIRST read error immediately (never a
+  "have 0" timeout), and the inverted pin (usage_row_helpers_name_db_errors_and_propagate_them_
+  immediately) proves the immediacy under the full 30s budget.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: All post-registration pre-section failures (tempdir, Engine::open, snapshot read) are mislabeled "registration failed" across all 8 report sections.
   evidence: Story 6-4 adversarial review (blind-hunter + edge-case-hunter EC1); needs a stage-differentiated error type plus new covered arms — deferred to avoid thinning the 95% coverage margin in this story.
+  resolved: story 15-3 (2026-10-17) — the Stage enum (StateRoot/EngineOpen/Registration/
+  CapabilitiesRead/SnapshotRead) renders per-stage prefixes on every selected section; all five
+  arms pure-render-pinned, Registration keeps the byte-identical compat prefix, StateRoot has a
+  real unusable-root trigger, SnapshotRead's corruption shapes are helper-level pinned (the engine
+  rewrites the snapshot at registration, so a post-registration corruption is not cheaply
+  reachable through the pipeline).
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
   summary: TCK harness is non-configurable — private 30s section timeout, fixed temp state root, no per-section selection — limiting third-party CI environments.
   evidence: Story 6-4 adversarial review (blind-hunter); API-surface design beyond story 6-4's captured intent; candidate for a future ergonomics story alongside the 6-6 contract freeze.
+  resolved: story 15-3 (2026-10-17) — additive TckConfig (section_timeout, state_root,
+  SectionSelection) + run_conformance_with; run_conformance/run_mock_conformance delegate to the
+  Default byte-for-byte (both consumer suites green untouched), subset runs yield fewer entries in
+  the fixed order with the report shape unchanged (schema_version stays 1).
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-epic-6-retro-remediation.md` (epic-6 retro #163/B11 residual)
   summary: The subject-declared `memory.dir` delivery proof covers only the hermes builtin (an engine test over the shim `--dump` seam); a THIRD-PARTY manifest adapter's own declared delivery is still proven only on the TCK probe twin's env var — the memory section has no subject-delivery leg for manifest subjects.
   evidence: Retro remediation review (blind-hunter finding on the remediation diff, 2026-09-05): closing it generally needs a subject `--dump` seam convention for manifest adapters, which is a contract/docs decision (document the `--dump` proof convention) rather than test-only work.
+  resolved: story 15-3 (2026-10-17, Fibery 174) — the `--dump` subject-delivery convention is
+  documented in docs/adapter-contract.md, and the TCK memory section carries the manifest-subject
+  leg: a manifest subject declaring memory.dir whose launch carries `--dump <path>` gets its OWN
+  delivery proven (dump echoes the managed dir through its declared env var; a `--drop-env`
+  negative control proves the leg runs); adapters without a seam keep the probe-twin proof.
 
 ## Deferred from: implementation of spec-7-2-subscribe-to-engine-events-with-stable-schemas (review triage, 2026-09-09)
 

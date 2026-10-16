@@ -2,7 +2,7 @@
 title: 'TCK hardening: public seams where they exist, error honesty, stage-differentiated failures, configurability'
 type: 'refactor'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'implemented'
 baseline_commit: 'e8392650eb57bde401dbf4f8e1703733a22a991c'
 review_loop_iteration: 0
 context:
@@ -57,13 +57,13 @@ Investigated 2026-10-16 (anchors verified; all `crates/hekma-conformance/src/tck
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hekma-conformance/src/tck.rs` -- route log reads through `read_agent_log`(+`_since`), metering-source through `fleet_entry`, the agent-home literal through `agent_home`, the dump-args read through `adapter::resolve` (source semantics documented in a comment + docs) -- public seams where they exist.
-- [ ] `crates/hekma-conformance/src/tck.rs` -- `usage_row_count`/`observed_row_count` return `Result<u64, String>`; `wait_for_usage_rows_for` + the observed poll propagate the first read error immediately; row-count reads route the state.db path through `PathLayout` and carry a documented residual-coupling comment (frozen v1 schema, intra-workspace, CI-tested).
-- [ ] `crates/hekma-conformance/src/tck.rs` -- stage enum (StateRoot/EngineOpen/Registration/CapabilitiesRead/SnapshotRead) with per-stage rendered prefixes; pure render unit test covers every arm; Registration keeps a real trigger (nonexistent manifest), SnapshotRead gains a real corrupt-state trigger where cheap.
-- [ ] `crates/hekma-conformance/src/tck.rs` + `lib.rs` -- additive `TckConfig` (section_timeout, state_root, sections) + `run_conformance_with`; `run_conformance` = Default delegation; subset selection yields fewer entries; unit tests for defaults/overrides/subset.
-- [ ] `docs/adapter-contract.md` -- "What is checked": configurability + resolve-from-source + residual-coupling notes.
-- [ ] `docs/adapter-contract.md` + `crates/hekma-conformance/src/tck.rs` -- the `--dump` SUBJECT-DELIVERY proof convention (Fibery 174): document the convention (a manifest adapter that declares config delivery SHOULD provide a `--dump` seam the TCK drives to prove the SUBJECT received the delivered values — closing the gap where only the hermes builtin's delivery had a subject leg) and give the TCK memory section its manifest-subject `--dump` leg (assert the subject's dump echoes the delivered memory dir; keep the env-var probe leg for adapters without a dump seam, with the honest reason string).
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-3 row; deferred-work.md: mark the four 6-4 findings resolved by this story.
+- [x] `crates/hekma-conformance/src/tck.rs` -- route log reads through `read_agent_log`(+`_since`), metering-source through `fleet_entry`, the agent-home literal through `agent_home`, the dump-args read through `adapter::resolve` (source semantics documented in a comment + docs) -- public seams where they exist.
+- [x] `crates/hekma-conformance/src/tck.rs` -- `usage_row_count`/`observed_row_count` return `Result<u64, String>`; `wait_for_usage_rows_for` + the observed poll propagate the first read error immediately; row-count reads route the state.db path through `PathLayout` and carry a documented residual-coupling comment (frozen v1 schema, intra-workspace, CI-tested).
+- [x] `crates/hekma-conformance/src/tck.rs` -- stage enum (StateRoot/EngineOpen/Registration/CapabilitiesRead/SnapshotRead) with per-stage rendered prefixes; pure render unit test covers every arm; Registration keeps a real trigger (nonexistent manifest), SnapshotRead gains a real corrupt-state trigger where cheap.
+- [x] `crates/hekma-conformance/src/tck.rs` + `lib.rs` -- additive `TckConfig` (section_timeout, state_root, sections) + `run_conformance_with`; `run_conformance` = Default delegation; subset selection yields fewer entries; unit tests for defaults/overrides/subset.
+- [x] `docs/adapter-contract.md` -- "What is checked": configurability + resolve-from-source + residual-coupling notes.
+- [x] `docs/adapter-contract.md` + `crates/hekma-conformance/src/tck.rs` -- the `--dump` SUBJECT-DELIVERY proof convention (Fibery 174): document the convention (a manifest adapter that declares config delivery SHOULD provide a `--dump` seam the TCK drives to prove the SUBJECT received the delivered values — closing the gap where only the hermes builtin's delivery had a subject leg) and give the TCK memory section its manifest-subject `--dump` leg (assert the subject's dump echoes the delivered memory dir; keep the env-var probe leg for adapters without a dump seam, with the honest reason string).
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-3 row; deferred-work.md: mark the four 6-4 findings resolved by this story.
 
 **Acceptance Criteria:**
 - Given a state.db that fails to open, when the usage sections run, then the section fails FAST with the open error named (no 30s "have 0" timeout) — the inverted pin proves it.

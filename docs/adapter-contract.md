@@ -86,6 +86,18 @@ The contract's duties split into two classes, and adapter authors should know wh
 
 The report never asserts more than its sections exercised; "conformant" means every machine-checkable duty held, not that the honor-system duties were proven.
 
+#### The `--dump` subject-delivery convention
+
+A manifest adapter that declares config delivery (any `[config]` mapping, and in particular the reserved `memory.dir` key) **SHOULD** also provide a `--dump <path>` seam in its `[lifecycle.start]` args: an agent-side flag that writes the delivered environment (one `env=<VAR>=<VALUE>` line per variable) to `<path>` — absolute, or relative to the Agent Home. The TCK drives that seam to prove the SUBJECT itself received the delivered values: the config section proves every declared env rule through the subject's dump, and the memory section's manifest-subject leg proves the managed Memory Backing dir reached the subject's own declared env var (closing the gap where only the hermes builtin's subject delivery had a proof). Adapters without a dump seam are not penalized — the TCK's probe twin still proves the engine seam on an identical declaration, and a native subject's own delivery is the engine-side hermes pass's proof — but a dump-less manifest's own subject-level delivery stays unproven by the kit.
+
+The dump-pair read is **resolve-from-SOURCE**: the TCK re-resolves the adapter's declaration through the engine's public `adapter::resolve`, not the registration-time launch snapshot the engine starts from. If you edit a manifest after registration, the two diverge — re-register (the same advice the version-negotiation section gives for the fallback-start asymmetry).
+
+#### Configured runs and the kit's honest couplings
+
+The harness is configurable (`run_conformance_with` + `TckConfig`): a per-poll section timeout (default 30s), a caller-owned state root used as-is (default: a fresh hermetic tempdir), and a section subset (default: all eight; a subset yields FEWER report entries in the same fixed order — the report is complete *for the selected set*, and the JSON shape is unchanged). A pre-section failure renders its own stage prefix (`state root preparation failed:` / `engine open failed:` / `registration failed:` / `capability projection read failed:` / `registered adapter read failed:`) on every selected section, so a report consumer can tell where the pipeline stopped.
+
+Reads route through public engine seams where they exist (`read_agent_log` for log polls, the O(1) `fleet_entry` for the registered metering source, `adapter::resolve` for the dump pair, the engine's public path layout for every state-root-relative path). Two residual couplings remain, documented rather than hidden: the usage-event ROW COUNTS (the replay-dedup proof — the ledger exposes token totals, not row counts) and the registered-snapshot launch BOOLEAN query the frozen contract-v1 `usage_events`/`adapter.json` shapes directly. Both are intra-workspace and CI-tested: an engine schema change breaks the kit loudly, never silently.
+
 ## Versioning
 
 The contract carries a semantic version; **the engine states which contract versions it accepts and rejects mismatches informatively** (FR-30):

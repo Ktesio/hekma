@@ -41,6 +41,21 @@
 //! its code-declared launch offers no `--dump <path>` seam to observe
 //! delivered config through.
 //!
+//! ## Configured runs (spec 15-3)
+//!
+//! [`run_conformance_with`] takes a [`TckConfig`]: a per-poll section
+//! timeout (default 30s), a caller-owned state root used as-is (default: a
+//! fresh hermetic tempdir), and a section subset (default: all eight —
+//! [`run_conformance`] delegates to the default config byte-for-byte). A
+//! subset yields FEWER report entries in the same fixed order and the same
+//! shape; completeness is "complete for the selected set". Reads route
+//! through public engine seams where they exist ([`Blocking::read_agent_log`]
+//! for log polls, `fleet_entry` for the registered metering source,
+//! `adapter::resolve` for the `--dump` pair, the engine's public path layout
+//! for every state-root-relative path); the two frozen-v1 residual reads
+//! (usage-event row counts; the registered-snapshot launch boolean) are
+//! documented on their helpers.
+//!
 //! ## Sections
 //!
 //! * `capability_edges` — the persisted effective projection matches the
@@ -96,11 +111,16 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use hekma_adapter_api::{Capability, MeteringSource, OsId, SupportLevel};
+use hekma_engine::domain::InstanceName;
+use hekma_engine::paths::EnginePaths;
 use hekma_engine::{AdapterRef, Engine, LifecycleState, MemoryBackingKind, RestartPolicy};
 
-/// How long any single section's poll may run before it fails the section
-/// (never the harness) with a timeout reason. Generous: this covers a loaded
-/// CI runner plus the engine reaper's ~250ms cadence.
+/// How long any single section's poll may run by DEFAULT before it fails the
+/// section (never the harness) with a timeout reason. Generous: this covers a
+/// loaded CI runner plus the engine reaper's ~250ms cadence. A configured
+/// run overrides it via [`TckConfig::section_timeout`] (spec 15-3); this
+/// constant stays the [`Default`] and the value every pre-config harness
+/// call (`run_conformance` / `run_mock_conformance`) keeps using.
 const SECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `agent.*` pass-through key the config-mapping section sets. The engine
@@ -282,6 +302,39 @@ impl TckAdapter {
         }
     }
 
+    /// The env var the subject's declaration maps the reserved `memory.dir`
+    /// key to, when it maps one (the memory section's manifest-subject `--dump`
+    /// leg delivers through it — spec 15-3, Fibery 174). Same source and same
+    /// error honesty as [`TckAdapter::declares_memory_dir`]: a manifest
+    /// re-read/parse failure is `Err` (never a collapsed `None`).
+    fn memory_dir_env_target(&self) -> Result<Option<String>, String> {
+        match self {
+            TckAdapter::Manifest(dir) => {
+                let path = dir.join("adapter.toml");
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("could not re-read {}: {e}", path.display()))?;
+                let manifest = ::hekma_adapter_api::Manifest::from_toml_str(&text)
+                    .map_err(|e| format!("could not re-parse {}: {e}", path.display()))?;
+                Ok(manifest
+                    .config_mapping()
+                    .target(::hekma_engine::domain::MEMORY_DIR_KEY)
+                    .and_then(|target| match target {
+                        ::hekma_adapter_api::ConfigTarget::Env { env } => Some(env.clone()),
+                        _ => None,
+                    }))
+            }
+            TckAdapter::Native(kind) => Ok(::hekma_engine::adapter::native_config_mapping(kind)
+                .and_then(|mapping| {
+                    mapping
+                        .target(::hekma_engine::domain::MEMORY_DIR_KEY)
+                        .and_then(|target| match target {
+                            ::hekma_adapter_api::ConfigTarget::Env { env } => Some(env.clone()),
+                            _ => None,
+                        })
+                })),
+        }
+    }
+
     /// Whether the adapter's declaration maps the reserved `memory.dir` key.
     /// For a MANIFEST adapter this re-reads the `adapter.toml` file the caller
     /// supplied (that file IS the declaration the engine registered — the
@@ -336,6 +389,130 @@ pub mod section_ids {
     pub const INTERACTION: &str = "interaction";
 }
 
+/// One selectable TCK section — the typed form of a [`section_ids`] stable
+/// id (spec 15-3). Selecting sections by TYPE keeps a misconfigured run a
+/// compile error instead of a runtime typo the report would have to surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TckSection {
+    /// See [`section_ids::CAPABILITY_EDGES`].
+    CapabilityEdges,
+    /// See [`section_ids::LIFECYCLE`].
+    Lifecycle,
+    /// See [`section_ids::PAUSE`].
+    Pause,
+    /// See [`section_ids::CONFIG_MAPPING`].
+    ConfigMapping,
+    /// See [`section_ids::METERING_SELF_REPORTED`].
+    MeteringSelfReported,
+    /// See [`section_ids::METERING_ENGINE_OBSERVED`].
+    MeteringEngineObserved,
+    /// See [`section_ids::MEMORY`].
+    Memory,
+    /// See [`section_ids::INTERACTION`].
+    Interaction,
+}
+
+impl TckSection {
+    /// Every section, in the fixed pipeline order (the report's documented
+    /// entry order — selection never reorders).
+    pub const ALL: [TckSection; 8] = [
+        TckSection::CapabilityEdges,
+        TckSection::Lifecycle,
+        TckSection::Pause,
+        TckSection::ConfigMapping,
+        TckSection::MeteringSelfReported,
+        TckSection::MeteringEngineObserved,
+        TckSection::Memory,
+        TckSection::Interaction,
+    ];
+
+    /// The section's stable report id (the machine-readable contract).
+    pub fn id(&self) -> &'static str {
+        match self {
+            TckSection::CapabilityEdges => section_ids::CAPABILITY_EDGES,
+            TckSection::Lifecycle => section_ids::LIFECYCLE,
+            TckSection::Pause => section_ids::PAUSE,
+            TckSection::ConfigMapping => section_ids::CONFIG_MAPPING,
+            TckSection::MeteringSelfReported => section_ids::METERING_SELF_REPORTED,
+            TckSection::MeteringEngineObserved => section_ids::METERING_ENGINE_OBSERVED,
+            TckSection::Memory => section_ids::MEMORY,
+            TckSection::Interaction => section_ids::INTERACTION,
+        }
+    }
+}
+
+/// Which sections a configured run executes (spec 15-3). Selection is a
+/// FILTER over the fixed pipeline order: the report's entries stay in that
+/// order, and completeness is re-specified as "complete for the selected
+/// set" — a subset run yields FEWER [`SectionReport`] entries, never a new
+/// shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SectionSelection {
+    /// Every section — today's behavior (the [`Default`]).
+    #[default]
+    All,
+    /// Only the listed sections. An EMPTY list selects nothing: the report
+    /// carries zero entries and `is_conformant()` reads vacuously `true` —
+    /// callers almost always want [`SectionSelection::All`] or a non-empty
+    /// list, and this arm is pinned by test rather than rejected at runtime
+    /// (the harness's contract is a report, never a panic).
+    Only(Vec<TckSection>),
+}
+
+impl SectionSelection {
+    /// The selected stable section ids, in the fixed pipeline order.
+    fn selected_ids(&self) -> Vec<&'static str> {
+        match self {
+            SectionSelection::All => TckSection::ALL.iter().map(|s| s.id()).collect(),
+            SectionSelection::Only(list) => TckSection::ALL
+                .iter()
+                .filter(|s| list.contains(s))
+                .map(|s| s.id())
+                .collect(),
+        }
+    }
+}
+
+/// A configured conformance run (spec 15-3): today's behavior as the
+/// [`Default`], with the knobs third-party CI environments asked for
+/// (Fibery 173). Additive surface — [`run_conformance`] and
+/// [`run_mock_conformance`] delegate to a `Default` config and are
+/// byte-for-byte unchanged.
+#[derive(Clone, Debug)]
+pub struct TckConfig {
+    /// The per-poll budget every section's bounded wait uses (state polls,
+    /// dump/log/row polls). The default (30s) covers a loaded CI runner;
+    /// a tight CI can shrink it with the usual timeout-flake trade-off.
+    pub section_timeout: Duration,
+    /// A caller-owned state root used AS-IS instead of the harness's fresh
+    /// hermetic tempdir: `None` (the default) creates the tempdir, `Some(p)`
+    /// hands `p` to the engine verbatim (no swap, no cleanup — the caller
+    /// owns the root and whatever the run leaves in it). A root that exists
+    /// but is not a directory fails the run's state-root stage with a named
+    /// reason.
+    pub state_root: Option<PathBuf>,
+    /// Which sections execute (the default runs all eight).
+    pub sections: SectionSelection,
+}
+
+impl Default for TckConfig {
+    fn default() -> Self {
+        Self {
+            section_timeout: SECTION_TIMEOUT,
+            state_root: None,
+            sections: SectionSelection::default(),
+        }
+    }
+}
+
+impl TckConfig {
+    /// [`TckConfig::default`] — the pre-config behavior (30s timeout, fresh
+    /// hermetic tempdir, every section).
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// The full mock/manifest conformance pass: run every section against a
 /// manifest adapter and return the report. A thin wrapper over
 /// [`run_conformance`].
@@ -345,24 +522,80 @@ pub fn run_mock_conformance(manifest_dir: &Path) -> ConformanceReport {
 
 /// The public harness entry point: register the caller's adapter with a fresh
 /// engine over a hermetic temp state root, run every applicable section, and
-/// return the report. A registration failure (a contract violation before any
-/// section can run) yields the complete all-`fail` report — never a panic.
+/// return the report. Byte-for-byte today's behavior — a thin delegation to
+/// [`run_conformance_with`] over a [`Default`] [`TckConfig`] (spec 15-3's
+/// additivity proof: this signature and its consumer suites never change).
 pub fn run_conformance(adapter: &TckAdapter) -> ConformanceReport {
-    catch_report(adapter, || {
-        // A registration failure IS a complete all-`fail` report, not a
-        // separate error surface: the detail string just fills every
-        // section's reason.
-        conformance_inner(adapter)
-            .map_err(|detail| registration_failure_report(adapter, detail))
+    run_conformance_with(adapter, &TckConfig::default())
+}
+
+/// [`run_conformance`] with caller configuration (spec 15-3): a custom
+/// per-poll section timeout, a caller-owned state root used as-is, and/or a
+/// subset of the sections. A pre-section pipeline failure still yields the
+/// COMPLETE all-`fail` report — for the SELECTED set — with each stage's own
+/// prefix naming where the pipeline stopped (never a blanket "registration
+/// failed").
+pub fn run_conformance_with(adapter: &TckAdapter, config: &TckConfig) -> ConformanceReport {
+    catch_report(adapter, config, || {
+        // A stage failure IS a complete all-`fail` report for the selected
+        // set, not a separate error surface: the rendered stage reason just
+        // fills every selected section's entry.
+        conformance_inner(adapter, config)
+            .map_err(|(stage, detail)| stage_failure_report(adapter, config, stage.render(&detail)))
             .unwrap_or_else(|report| report)
     })
 }
 
+/// Which pre-section pipeline stage failed (spec 15-3: stage-differentiated
+/// failures). Before this, EVERY post-tempdir error rendered as "registration
+/// failed" across all eight sections — a mislabel that hid where the pipeline
+/// actually stopped. Every selected section's failure reason now carries the
+/// stage's OWN rendered prefix, so a report consumer can tell an engine-open
+/// failure from a registration failure without parsing prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// Preparing the harness state root (the hermetic tempdir, or validating
+    /// a caller-configured root before the engine touches it).
+    StateRoot,
+    /// Opening the engine over the state root.
+    EngineOpen,
+    /// Registering the subject adapter.
+    Registration,
+    /// Reading the subject's effective capability projection.
+    CapabilitiesRead,
+    /// Reading the registered adapter facts (the public Fleet view + the
+    /// registered launch snapshot).
+    SnapshotRead,
+}
+
+impl Stage {
+    /// The rendered failure prefix for this stage. The Registration arm's
+    /// string is the pre-15-3 reason prefix verbatim — the one compatibility
+    /// point with reports consumers may have pinned.
+    fn prefix(self) -> &'static str {
+        match self {
+            Stage::StateRoot => "state root preparation failed",
+            Stage::EngineOpen => "engine open failed",
+            Stage::Registration => "registration failed",
+            Stage::CapabilitiesRead => "capability projection read failed",
+            Stage::SnapshotRead => "registered adapter read failed",
+        }
+    }
+
+    /// Render the stage's all-sections failure reason for `detail`
+    /// (`"<stage prefix>: <detail>"`). Pure — unit-tested over every arm.
+    fn render(self, detail: &str) -> String {
+        format!("{}: {detail}", self.prefix())
+    }
+}
+
 /// The never-panic boundary: run `op` and, if it panics, return the complete
-/// all-`fail` report naming the panic (the payload's message when it is a
-/// string, a generic note otherwise). One place — the entry point flows
-/// through here.
-fn catch_report<F>(adapter: &TckAdapter, op: F) -> ConformanceReport
+/// all-`fail` report for the selected set naming the panic (the payload's
+/// message when it is a string, a generic note otherwise). One place — the
+/// entry point flows through here. A panic is NOT a stage failure, so the
+/// reason carries no stage prefix — just the honest "the harness itself
+/// panicked" naming.
+fn catch_report<F>(adapter: &TckAdapter, config: &TckConfig, op: F) -> ConformanceReport
 where
     F: FnOnce() -> ConformanceReport,
 {
@@ -377,35 +610,80 @@ where
                 .map(|s| (*s).to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "non-string panic payload".to_string());
-            registration_failure_report(adapter, format!("the harness itself panicked: {message}"))
+            stage_failure_report(
+                adapter,
+                config,
+                format!("the harness itself panicked: {message}"),
+            )
         }
     }
 }
 
-/// [`run_conformance`]'s pipeline; `Err` carries the registration-failure
-/// detail that fills every section's reason.
-fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> {
-    let state = tempfile::Builder::new()
-        .prefix("ktesio-tck-")
-        .tempdir()
-        .map_err(|e| format!("state tempdir: {e}"))?;
-    let engine =
-        Engine::open(Some(state.path().to_path_buf())).map_err(|e| format!("engine open: {e}"))?;
+/// The harness's state root: the hermetic tempdir (the default) or a
+/// caller-owned root used as-is ([`TckConfig::state_root`]).
+enum StateRoot {
+    /// The harness-created tempdir (dropped — cleaned up — with the run).
+    Hermetic(tempfile::TempDir),
+    /// The caller's root: never swapped, never cleaned up by the harness.
+    Caller(PathBuf),
+}
+
+impl StateRoot {
+    fn path(&self) -> &Path {
+        match self {
+            StateRoot::Hermetic(dir) => dir.path(),
+            StateRoot::Caller(root) => root,
+        }
+    }
+}
+
+/// Prepare the run's state root per `config` (the [`Stage::StateRoot`]
+/// pipeline step): the default hermetic tempdir, or the caller's root
+/// validated to be usable AS-IS. A configured root that exists but is not a
+/// directory fails HERE — with the root named — instead of deep inside the
+/// engine's tree creation, so the StateRoot stage's failure reason is the
+/// operator-actionable one.
+fn prepare_state_root(config: &TckConfig) -> Result<StateRoot, String> {
+    match &config.state_root {
+        None => tempfile::Builder::new()
+            .prefix("ktesio-tck-")
+            .tempdir()
+            .map(StateRoot::Hermetic)
+            .map_err(|e| e.to_string()),
+        Some(root) => {
+            if root.exists() && !root.is_dir() {
+                return Err(format!(
+                    "the configured state root {} exists but is not a directory",
+                    root.display()
+                ));
+            }
+            Ok(StateRoot::Caller(root.clone()))
+        }
+    }
+}
+
+/// [`run_conformance_with`]'s pipeline; `Err` carries the failed
+/// [`Stage`] plus its detail — every selected section's reason will carry
+/// the stage's rendered prefix.
+fn conformance_inner(
+    adapter: &TckAdapter,
+    config: &TckConfig,
+) -> Result<ConformanceReport, (Stage, String)> {
+    let state = prepare_state_root(config).map_err(|e| (Stage::StateRoot, e))?;
+    let engine = Engine::open(Some(state.path().to_path_buf()))
+        .map_err(|e| (Stage::EngineOpen, e.to_string()))?;
     let facade = engine.blocking();
+    let timeout = config.section_timeout;
 
     let registered = facade
         .register_with_adapter("tck-subject", &adapter.adapter_ref())
-        .map_err(|e| format!("register: {e}"))?;
+        .map_err(|e| (Stage::Registration, e.to_string()))?;
 
     // The declaration under test, read from the engine's own projection (the
     // adapter as REGISTERED — the source of every applicability decision).
     let capabilities = facade
         .effective_capabilities("tck-subject")
-        .map_err(|e| format!("effective capabilities: {e}"))?;
-
-    // The subject manifest path (manifest adapters only) — the config section
-    // reads the DECLARED mapping rules from it.
-    let subject_manifest_path = adapter.manifest_path();
+        .map_err(|e| (Stage::CapabilitiesRead, e.to_string()))?;
 
     // The subject's declared `memory.dir` delivery fact (the memory section's
     // applicability input): manifest subjects read their own adapter.toml;
@@ -415,11 +693,12 @@ fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> 
     // B11) — it must never collapse to "declares nothing".
     let declares_memory_dir = adapter.declares_memory_dir();
 
-    // The registered adapter snapshot (the launchability + metering truth).
-    let snapshot = read_snapshot(state.path(), "tck-subject")?;
+    // The registered adapter facts (the launchability + metering truth).
+    let snapshot = read_registered_facts(&facade, state.path(), "tck-subject")
+        .map_err(|e| (Stage::SnapshotRead, e))?;
 
-    // Launchable ⇔ the snapshot carries a resolved `launch` (present AND
-    // non-null): a manifest adapter that declares `[lifecycle.start]`. A
+    // Launchable ⇔ the registration snapshotted a resolved `launch` (present
+    // AND non-null): a manifest adapter that declares `[lifecycle.start]`. A
     // native builtin (or a launchless manifest) is not launchable — the
     // harness's declaration probes still cover the shared seams.
     let launchable = snapshot.launch;
@@ -453,112 +732,136 @@ fn conformance_inner(adapter: &TckAdapter) -> Result<ConformanceReport, String> 
         .find(|(c, _)| *c == Capability::Interaction)
         .map(|(_, level)| *level);
 
+    // Section selection (spec 15-3): a FILTER over the fixed pipeline order.
+    // A section not in the selected set is neither run nor reported — the
+    // report is complete FOR THE SELECTED SET (fewer entries, same shape).
+    let selected = config.sections.selected_ids();
+    let selected = |id: &str| selected.contains(&id);
+
     let mut sections = Vec::new();
 
-    sections.push(SectionReport {
-        section: section_ids::CAPABILITY_EDGES.to_string(),
-        result: run_capability_edges(&facade, "tck-subject", &capabilities),
-    });
+    if selected(section_ids::CAPABILITY_EDGES) {
+        sections.push(SectionReport {
+            section: section_ids::CAPABILITY_EDGES.to_string(),
+            result: run_capability_edges(&facade, "tck-subject", &capabilities),
+        });
+    }
 
-    sections.push(SectionReport {
-        section: section_ids::LIFECYCLE.to_string(),
-        result: if launchable {
-            run_lifecycle(&facade, "tck-subject")
-        } else {
-            SectionResult::NotApplicable {
-                reason: "the registered adapter declares no launchable [lifecycle.start] \
-                         template, so no live lifecycle can be driven"
-                    .to_string(),
-            }
-        },
-    });
-
-    sections.push(SectionReport {
-        section: section_ids::PAUSE.to_string(),
-        result: run_pause_section(
-            &facade,
-            state.path(),
-            "tck-subject",
-            launchable,
-            pause_level,
-        ),
-    });
-
-    sections.push(SectionReport {
-        section: section_ids::CONFIG_MAPPING.to_string(),
-        result: if launchable {
-            run_config_mapping(&facade, state.path(), subject_manifest_path.as_deref())
-        } else {
-            SectionResult::NotApplicable {
-                reason: "no launchable agent to observe the delivered config".to_string(),
-            }
-        },
-    });
-
-    sections.push(SectionReport {
-        section: section_ids::METERING_SELF_REPORTED.to_string(),
-        result: match (&snapshot.metering_source, launchable) {
-            (MeteringSource::SelfReported, true) => {
-                run_self_reported_metering(&facade, state.path())
-            }
-            (_, false) => SectionResult::NotApplicable {
-                reason: "no launchable agent to emit usage".to_string(),
+    if selected(section_ids::LIFECYCLE) {
+        sections.push(SectionReport {
+            section: section_ids::LIFECYCLE.to_string(),
+            result: if launchable {
+                run_lifecycle(&facade, "tck-subject", timeout)
+            } else {
+                SectionResult::NotApplicable {
+                    reason: "the registered adapter declares no launchable [lifecycle.start] \
+                             template, so no live lifecycle can be driven"
+                        .to_string(),
+                }
             },
-            (other, true) => SectionResult::NotApplicable {
-                reason: format!(
-                    "the declaration declares {} metering, so the self-reported section \
-                     does not apply",
-                    other.as_str()
+        });
+    }
+
+    if selected(section_ids::PAUSE) {
+        sections.push(SectionReport {
+            section: section_ids::PAUSE.to_string(),
+            result: run_pause_section(&facade, "tck-subject", launchable, pause_level, timeout),
+        });
+    }
+
+    if selected(section_ids::CONFIG_MAPPING) {
+        sections.push(SectionReport {
+            section: section_ids::CONFIG_MAPPING.to_string(),
+            result: if launchable {
+                run_config_mapping(&facade, state.path(), adapter, timeout)
+            } else {
+                SectionResult::NotApplicable {
+                    reason: "no launchable agent to observe the delivered config".to_string(),
+                }
+            },
+        });
+    }
+
+    if selected(section_ids::METERING_SELF_REPORTED) {
+        sections.push(SectionReport {
+            section: section_ids::METERING_SELF_REPORTED.to_string(),
+            result: match (&snapshot.metering_source, launchable) {
+                (MeteringSource::SelfReported, true) => {
+                    run_self_reported_metering(&facade, state.path(), timeout)
+                }
+                (_, false) => SectionResult::NotApplicable {
+                    reason: "no launchable agent to emit usage".to_string(),
+                },
+                (other, true) => SectionResult::NotApplicable {
+                    reason: format!(
+                        "the declaration declares {} metering, so the self-reported section \
+                         does not apply",
+                        other.as_str()
+                    ),
+                },
+            },
+        });
+    }
+
+    if selected(section_ids::METERING_ENGINE_OBSERVED) {
+        sections.push(SectionReport {
+            section: section_ids::METERING_ENGINE_OBSERVED.to_string(),
+            result: match (&snapshot.metering_source, launchable) {
+                (MeteringSource::EngineObserved, true) => {
+                    run_engine_observed_metering(&facade, state.path(), timeout)
+                }
+                (_, false) => SectionResult::NotApplicable {
+                    reason: "no launchable agent to observe".to_string(),
+                },
+                (other, true) => SectionResult::NotApplicable {
+                    reason: format!(
+                        "the declaration declares {} metering, so the engine-observed section \
+                         does not apply",
+                        other.as_str()
+                    ),
+                },
+            },
+        });
+    }
+
+    if selected(section_ids::MEMORY) {
+        sections.push(SectionReport {
+            section: section_ids::MEMORY.to_string(),
+            result: match &declares_memory_dir {
+                // A declaration we cannot re-read is a FAIL naming the cause —
+                // never a `not_applicable` derived from a fabricated "maps
+                // nothing" (retro #163, finding B11).
+                Err(detail) => SectionResult::fail(format!(
+                    "the declaration could not be re-read to decide the memory section's \
+                     applicability: {detail}"
+                )),
+                Ok(declares) => run_memory(
+                    &facade,
+                    state.path(),
+                    adapter,
+                    launchable,
+                    *declares,
+                    timeout,
                 ),
             },
-        },
-    });
+        });
+    }
 
-    sections.push(SectionReport {
-        section: section_ids::METERING_ENGINE_OBSERVED.to_string(),
-        result: match (&snapshot.metering_source, launchable) {
-            (MeteringSource::EngineObserved, true) => {
-                run_engine_observed_metering(&facade, state.path())
-            }
-            (_, false) => SectionResult::NotApplicable {
-                reason: "no launchable agent to observe".to_string(),
+    if selected(section_ids::INTERACTION) {
+        sections.push(SectionReport {
+            section: section_ids::INTERACTION.to_string(),
+            result: match (launchable, interaction_level) {
+                (true, Some(level)) => run_interaction(&facade, level, timeout),
+                (false, _) => SectionResult::NotApplicable {
+                    reason: "no launchable agent to interact with".to_string(),
+                },
+                (true, None) => SectionResult::NotApplicable {
+                    reason: "the declaration declares no interaction capability on this OS"
+                        .to_string(),
+                },
             },
-            (other, true) => SectionResult::NotApplicable {
-                reason: format!(
-                    "the declaration declares {} metering, so the engine-observed section \
-                     does not apply",
-                    other.as_str()
-                ),
-            },
-        },
-    });
-
-    sections.push(SectionReport {
-        section: section_ids::MEMORY.to_string(),
-        result: match &declares_memory_dir {
-            // A declaration we cannot re-read is a FAIL naming the cause —
-            // never a `not_applicable` derived from a fabricated "maps
-            // nothing" (retro #163, finding B11).
-            Err(detail) => SectionResult::fail(format!(
-                "the declaration could not be re-read to decide the memory section's \
-                 applicability: {detail}"
-            )),
-            Ok(declares) => run_memory(&facade, state.path(), launchable, *declares),
-        },
-    });
-
-    sections.push(SectionReport {
-        section: section_ids::INTERACTION.to_string(),
-        result: match (launchable, interaction_level) {
-            (true, Some(level)) => run_interaction(&facade, state.path(), level),
-            (false, _) => SectionResult::NotApplicable {
-                reason: "no launchable agent to interact with".to_string(),
-            },
-            (true, None) => SectionResult::NotApplicable {
-                reason: "the declaration declares no interaction capability on this OS".to_string(),
-            },
-        },
-    });
+        });
+    }
 
     // Finalize: stop everything the harness left running — the subject and
     // any probe twin a failed section orphaned via `?` on its way out.
@@ -589,90 +892,109 @@ fn stop_leftovers(facade: &::hekma_engine::Blocking<'_>) {
     }
 }
 
-/// The report shape when registration itself failed (every section reports the
-/// registration failure — the caller sees a complete, machine-readable report
-/// rather than an error type).
-fn registration_failure_report(adapter: &TckAdapter, detail: String) -> ConformanceReport {
+/// The report shape when a pre-section pipeline stage failed: every section
+/// OF THE SELECTED SET reports the same rendered stage failure — the caller
+/// sees a complete, machine-readable report (complete FOR THE SELECTED SET,
+/// spec 15-3) rather than an error type. `reason` is the fully rendered
+/// stage detail (or, for the panic path, the panic naming).
+fn stage_failure_report(
+    adapter: &TckAdapter,
+    config: &TckConfig,
+    reason: String,
+) -> ConformanceReport {
     let kind = adapter.kind_label();
-    let fail = || SectionResult::Fail {
-        reason: format!("registration failed: {detail}"),
-    };
     ConformanceReport {
         schema_version: REPORT_SCHEMA_VERSION,
         contract_version: ::hekma_adapter_api::CONTRACT_VERSION.to_string(),
         adapter_kind: kind,
-        sections: vec![
-            SectionReport {
-                section: section_ids::CAPABILITY_EDGES.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::LIFECYCLE.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::PAUSE.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::CONFIG_MAPPING.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::METERING_SELF_REPORTED.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::METERING_ENGINE_OBSERVED.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::MEMORY.to_string(),
-                result: fail(),
-            },
-            SectionReport {
-                section: section_ids::INTERACTION.to_string(),
-                result: fail(),
-            },
-        ],
+        sections: config
+            .sections
+            .selected_ids()
+            .into_iter()
+            .map(|id| SectionReport {
+                section: id.to_string(),
+                result: SectionResult::Fail {
+                    reason: reason.clone(),
+                },
+            })
+            .collect(),
     }
 }
 
-/// The registered adapter snapshot: the parts the TCK's applicability decisions
-/// are derived from (metering source + launch presence), read from the
-/// engine-written `adapter.json` — the registered truth, not a caller-supplied
-/// copy.
+/// The registered adapter facts: the parts the TCK's applicability decisions
+/// are derived from (metering source + launch presence).
 #[derive(Debug)]
 struct AdapterSnapshot {
-    /// The declared Metering Source, as its wire string.
+    /// The declared Metering Source.
     metering_source: MeteringSource,
-    /// Whether the snapshot carries a resolved launch (present AND non-null).
+    /// Whether the registration snapshotted a resolved launch (present AND
+    /// non-null).
     launch: bool,
 }
 
-/// Read + minimally parse the engine's adapter snapshot for `name`.
-fn read_snapshot(state_dir: &Path, name: &str) -> Result<AdapterSnapshot, String> {
-    let home = state_dir.join("agents").join(name);
-    let text = std::fs::read_to_string(home.join("adapter.json"))
-        .map_err(|e| format!("read adapter snapshot: {e}"))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("parse adapter snapshot: {e}"))?;
-    let metering_source = match value
-        .get("metering_source")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| "adapter snapshot carries no metering_source".to_string())?
-    {
+/// Read the registered adapter facts for `name` through PUBLIC seams where
+/// they exist (spec 15-3):
+///
+/// * the Metering Source comes from `fleet_entry(name).metering_source` —
+///   the PERSISTED registered snapshot through the public Fleet view, a
+///   strictly better read than re-parsing `adapter.json` by hand;
+/// * whether the registration snapshotted a launch has NO public seam (the
+///   engine's `AdapterSnapshot` is private and no public API surfaces the
+///   launch-boolean) — that ONE read stays direct, with the residual
+///   coupling documented on [`registered_launch_present`] below.
+fn read_registered_facts(
+    facade: &::hekma_engine::Blocking<'_>,
+    state_root: &Path,
+    name: &str,
+) -> Result<AdapterSnapshot, String> {
+    let entry = fleet_entry(facade, name)?;
+    let metering_source = match entry.metering_source.as_str() {
         "self-reported" => MeteringSource::SelfReported,
         "engine-observed" => MeteringSource::EngineObserved,
-        other => return Err(format!("unknown metering_source {other:?} in the snapshot")),
+        other => {
+            return Err(format!(
+                "the fleet entry carries an unknown metering_source {other:?}"
+            ))
+        }
     };
-    // `launch` present AND non-null ⇔ the adapter carries a resolved
-    // registration-time launch (manifest + `[lifecycle.start]`).
-    let launch = value.get("launch").map(|l| !l.is_null()).unwrap_or(false);
+    let launch = registered_launch_present(state_root, name)?;
     Ok(AdapterSnapshot {
         metering_source,
         launch,
     })
+}
+
+/// The engine-written adapter snapshot's file name. RESIDUAL COUPLING
+/// (documented, spec 15-3): the registered-snapshot launch read has no
+/// public seam, so the TCK reads the engine's private-by-design
+/// `adapter.json` layout directly. Frozen contract v1, intra-workspace, and
+/// CI-tested (the engine's own suites break first if the layout moves);
+/// a layout change breaks THIS read loudly, never silently.
+const REGISTERED_SNAPSHOT_FILE: &str = "adapter.json";
+
+/// Whether the registration snapshotted a resolved launch for `name`
+/// (present AND non-null ⇔ a manifest adapter that declared
+/// `[lifecycle.start]`). Read from the engine-written registered snapshot
+/// through the PUBLIC path layout ([`engine_home`] — never a hand-joined
+/// `agents/<name>` literal); the JSON key is the frozen-v1 snapshot shape
+/// (see [`REGISTERED_SNAPSHOT_FILE`]'s residual-coupling note).
+fn registered_launch_present(state_root: &Path, name: &str) -> Result<bool, String> {
+    let home = engine_home(state_root, name)?;
+    let text = std::fs::read_to_string(home.join(REGISTERED_SNAPSHOT_FILE))
+        .map_err(|e| format!("read adapter snapshot: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse adapter snapshot: {e}"))?;
+    Ok(value.get("launch").map(|l| !l.is_null()).unwrap_or(false))
+}
+
+/// The subject's Agent Home through the engine's PUBLIC path layout
+/// ([`EnginePaths`]) — the spec 15-3 rule: no `agents/<name>` (or
+/// `state.db`) path literal is hand-joined anywhere in the kit.
+fn engine_home(state_root: &Path, name: &str) -> Result<PathBuf, String> {
+    let name = InstanceName::new(name).map_err(|e| format!("instance name '{name}': {e}"))?;
+    Ok(EnginePaths::new(Some(state_root.to_path_buf()))
+        .map_err(|e| format!("resolve the engine path layout: {e}"))?
+        .agent_home(&name))
 }
 
 // ---------------------------------------------------------------------
@@ -680,18 +1002,10 @@ fn read_snapshot(state_dir: &Path, name: &str) -> Result<AdapterSnapshot, String
 // ---------------------------------------------------------------------
 
 /// Poll the committed lifecycle state (via the public read) until it reaches
-/// `want`, or report timeout.
+/// `want`, or report timeout. `budget` is the run's configured section
+/// timeout (spec 15-3) — the harness tests pass a tiny budget to prove the
+/// timeout arm.
 fn wait_for_state(
-    facade: &::hekma_engine::Blocking<'_>,
-    name: &str,
-    want: LifecycleState,
-) -> Result<(), String> {
-    wait_for_state_for(facade, name, want, SECTION_TIMEOUT)
-}
-
-/// [`wait_for_state`] with an explicit deadline budget (the section timeout by
-/// default; the harness tests pass a tiny budget to prove the timeout arm).
-fn wait_for_state_for(
     facade: &::hekma_engine::Blocking<'_>,
     name: &str,
     want: LifecycleState,
@@ -739,112 +1053,178 @@ fn dump_contains_env_for(dump: &Path, var: &str, value: &str, budget: Duration) 
     }
 }
 
+// RESIDUAL COUPLING (documented, spec 15-3): the usage-event ROW COUNT — the
+// replay-dedup proof's committed evidence — has NO public engine seam (the
+// ledger reads expose token totals, not row counts). The two counters below
+// query the frozen contract-v1 `usage_events` / `agent_instances` schema
+// (`hekma-engine`'s store) directly. The coupling is intra-workspace and
+// CI-tested: an engine schema change breaks this kit's build/tests loudly,
+// never silently. What 15-3 DID fix here: the state.db path routes through
+// the engine's public path layout (never a hand-joined literal), and every
+// open/query error is a NAMED `Err` propagated immediately — never collapsed
+// to `0` and never timed out as a misleading "have 0".
+
+/// Open a read-only-purpose connection to the state DB through the engine's
+/// public path layout.
+fn open_state_db(state_root: &Path) -> Result<rusqlite::Connection, String> {
+    let db = EnginePaths::new(Some(state_root.to_path_buf()))
+        .map_err(|e| format!("resolve the engine path layout: {e}"))?
+        .state_db();
+    rusqlite::Connection::open(&db).map_err(|e| format!("open {}: {e}", db.display()))
+}
+
 /// Count committed usage rows for `name` via a direct read-only connection to
 /// the same state DB the engine commits to (committed STATE, never a guess).
-fn usage_row_count(state_dir: &Path, name: &str) -> u64 {
-    rusqlite::Connection::open(state_dir.join("state.db"))
-        .map(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM usage_events e \
-                 JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u64)
-            .unwrap_or(0)
-        })
-        .unwrap_or(0)
+/// A DB that fails to open or query is `Err` with the error named (spec
+/// 15-3's error honesty: never conflated with "zero rows").
+fn usage_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
+    open_state_db(state_root)?
+        .query_row(
+            "SELECT COUNT(*) FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .map_err(|e| format!("count usage rows for '{name}': {e}"))
 }
 
-/// Poll the committed usage-row count until it reaches `expected`.
-fn wait_for_usage_rows(state_dir: &Path, name: &str, expected: u64) -> Result<(), String> {
-    wait_for_usage_rows_for(state_dir, name, expected, SECTION_TIMEOUT)
+/// Count committed ENGINE-OBSERVED usage rows for `name` (same residual
+/// coupling as [`usage_row_count`]; same error honesty).
+fn observed_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
+    open_state_db(state_root)?
+        .query_row(
+            "SELECT COUNT(*) FROM usage_events e \
+             JOIN agent_instances i ON i.id = e.instance_id \
+             WHERE i.name = ?1 AND e.metering_source = 'engine-observed'",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .map_err(|e| format!("count engine-observed rows for '{name}': {e}"))
 }
 
-/// [`wait_for_usage_rows`] with an explicit deadline budget.
-fn wait_for_usage_rows_for(
-    state_dir: &Path,
+/// Poll a committed row count (either counter) until it reaches `expected`.
+/// The FIRST read error propagates IMMEDIATELY as the section's named fail
+/// reason — spec 15-3's error honesty: a DB error is never hidden behind a
+/// 30s "have 0" timeout. This is the shared poll both metering sections use
+/// (the engine-observed section's former inline loop was deduped into it).
+fn wait_for_rows_for(
+    state_root: &Path,
     name: &str,
     expected: u64,
     budget: Duration,
+    what: &str,
+    count: fn(&Path, &str) -> Result<u64, String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + budget;
     loop {
-        let count = usage_row_count(state_dir, name);
-        if count >= expected {
+        let have = count(state_root, name)?;
+        if have >= expected {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for {expected} committed usage rows (have {count})"
+                "timed out waiting for {expected} {what} (have {have})"
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Count committed ENGINE-OBSERVED usage rows for `name`.
-fn observed_row_count(state_dir: &Path, name: &str) -> u64 {
-    rusqlite::Connection::open(state_dir.join("state.db"))
-        .map(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM usage_events e \
-                 JOIN agent_instances i ON i.id = e.instance_id \
-                 WHERE i.name = ?1 AND e.metering_source = 'engine-observed'",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n.max(0) as u64)
-            .unwrap_or(0)
-        })
-        .unwrap_or(0)
+/// [`wait_for_rows_for`] over the all-rows counter, with the run's budget.
+fn wait_for_usage_rows_for(
+    state_root: &Path,
+    name: &str,
+    expected: u64,
+    budget: Duration,
+) -> Result<(), String> {
+    wait_for_rows_for(
+        state_root,
+        name,
+        expected,
+        budget,
+        "committed usage rows",
+        usage_row_count,
+    )
 }
 
-/// The fleet entry for `name`, or a failure reason.
+/// [`wait_for_rows_for`] over the engine-observed counter, with the run's
+/// budget.
+fn wait_for_observed_rows_for(
+    state_root: &Path,
+    name: &str,
+    expected: u64,
+    budget: Duration,
+) -> Result<(), String> {
+    wait_for_rows_for(
+        state_root,
+        name,
+        expected,
+        budget,
+        "engine-observed rows",
+        observed_row_count,
+    )
+}
+
+/// The fleet entry for `name` through the engine's O(1) keyed public read
+/// (spec 15-3: replaces the kit's own linear scan over `fleet()`). The
+/// entry's `metering_source` cell reads the PERSISTED registered snapshot.
 fn fleet_entry(
     facade: &::hekma_engine::Blocking<'_>,
     name: &str,
 ) -> Result<::hekma_engine::FleetEntry, String> {
-    let fleet = facade
-        .fleet()
-        .map_err(|e| format!("fleet read failed: {e}"))?;
-    fleet
-        .into_iter()
-        .find(|e| e.name.as_str() == name)
-        .ok_or_else(|| format!("fleet entry '{name}' missing"))
+    facade
+        .fleet_entry(name)
+        .map_err(|e| format!("fleet entry read failed: {e}"))
 }
 
-/// The agent's captured-output log path (the engine-owned layout leaf tests
-/// may observe).
-fn agent_log_path(state_dir: &Path, name: &str) -> PathBuf {
-    state_dir
-        .join("agents")
-        .join(name)
-        .join("logs")
-        .join("agent.log")
+/// The agent's captured-output log lines through the PUBLIC read seam —
+/// `read_agent_log`'s attributed view (spec 15-3: the kit no longer reads
+/// the `agents/<name>/logs/agent.log` layout directly). The exact-line and
+/// `heartbeat`-prefix checks over these texts are unchanged from the
+/// file-read era; a read error is the section's named fail reason.
+fn read_log_texts(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+) -> Result<Vec<String>, String> {
+    let (lines, _) = facade
+        .read_agent_log(name)
+        .map_err(|e| format!("read_agent_log('{name}') failed: {e}"))?;
+    Ok(lines.into_iter().map(|line| line.text).collect())
 }
 
-/// [`wait_for_log_line`] with an explicit deadline budget.
-fn wait_for_log_line_for(log: &Path, wanted: &str, budget: Duration) -> Result<(), String> {
+/// Poll the agent's attributed log (the public read) until `wanted` appears
+/// as a WHOLE line, or the budget expires naming what was waited for. A read
+/// error propagates immediately as the named fail reason.
+fn wait_for_log_line(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    wanted: &str,
+    budget: Duration,
+) -> Result<(), String> {
     let deadline = std::time::Instant::now() + budget;
     loop {
-        if let Ok(contents) = std::fs::read_to_string(log) {
-            if contents.lines().any(|line| line == wanted) {
-                return Ok(());
-            }
+        let texts = read_log_texts(facade, name)?;
+        if texts.iter().any(|text| text == wanted) {
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("never observed {wanted:?} in {}", log.display()));
+            return Err(format!(
+                "never observed {wanted:?} in {name}'s captured log"
+            ));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-/// Count `heartbeat <n>` lines in an agent's captured output log.
-fn heartbeat_lines(agent_log: &Path) -> usize {
-    std::fs::read_to_string(agent_log)
-        .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
-        .unwrap_or(0)
+/// Count `heartbeat <n>` lines in an agent's attributed log (the public
+/// read) — the real-suspension freeze proof's counter.
+fn heartbeat_count(facade: &::hekma_engine::Blocking<'_>, name: &str) -> Result<usize, String> {
+    Ok(read_log_texts(facade, name)?
+        .iter()
+        .filter(|text| text.starts_with("heartbeat "))
+        .count())
 }
 
 // ---------------------------------------------------------------------
@@ -1023,23 +1403,31 @@ fn into_section_result(result: Result<(), String>) -> SectionResult {
 
 /// Lifecycle: start → running, full event sequence on stop, and the CRASH leg
 /// on a twin instance (Never policy → failed, no restart).
-fn run_lifecycle(facade: &::hekma_engine::Blocking<'_>, name: &str) -> SectionResult {
-    into_section_result(lifecycle_inner(facade, name))
+fn run_lifecycle(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    timeout: Duration,
+) -> SectionResult {
+    into_section_result(lifecycle_inner(facade, name, timeout))
 }
 
 /// [`run_lifecycle`]'s pipeline.
-fn lifecycle_inner(facade: &::hekma_engine::Blocking<'_>, name: &str) -> Result<(), String> {
+fn lifecycle_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     // Start → running.
     facade
         .start(name)
         .map_err(|e| format!("start failed: {e}"))?;
-    wait_for_state(facade, name, LifecycleState::Running)?;
+    wait_for_state(facade, name, LifecycleState::Running, timeout)?;
 
     // Stop → stopped (bounded window; the fixture agents linger until told).
     facade
         .stop(name, Some(Duration::from_secs(5)))
         .map_err(|e| format!("stop failed: {e}"))?;
-    wait_for_state(facade, name, LifecycleState::Stopped)?;
+    wait_for_state(facade, name, LifecycleState::Stopped, timeout)?;
 
     // The full transition-event sequence for one clean run.
     let events = facade
@@ -1062,7 +1450,7 @@ fn lifecycle_inner(facade: &::hekma_engine::Blocking<'_>, name: &str) -> Result<
     }
 
     // The CRASH leg on a TCK-authored twin.
-    run_crash_leg(facade).map_or(Ok(()), Err)
+    run_crash_leg(facade, timeout).map_or(Ok(()), Err)
 }
 
 /// The crash leg. The harness registers a second instance from its OWN crash
@@ -1070,12 +1458,12 @@ fn lifecycle_inner(facade: &::hekma_engine::Blocking<'_>, name: &str) -> Result<
 /// readiness window, exit code 7), arms a Never policy, starts it, and waits
 /// for the reaper to land `failed`. Returns `None` on success, `Some(reason)`
 /// on failure.
-fn run_crash_leg(facade: &::hekma_engine::Blocking<'_>) -> Option<String> {
-    crash_leg_inner(facade).err()
+fn run_crash_leg(facade: &::hekma_engine::Blocking<'_>, timeout: Duration) -> Option<String> {
+    crash_leg_inner(facade, timeout).err()
 }
 
 /// [`run_crash_leg`]'s pipeline.
-fn crash_leg_inner(facade: &::hekma_engine::Blocking<'_>) -> Result<(), String> {
+fn crash_leg_inner(facade: &::hekma_engine::Blocking<'_>, timeout: Duration) -> Result<(), String> {
     let dir = tempfile::Builder::new()
         .prefix("ktesio-tck-crash-")
         .tempdir()
@@ -1107,7 +1495,7 @@ fn crash_leg_inner(facade: &::hekma_engine::Blocking<'_>) -> Result<(), String> 
     facade
         .start("tck-crash")
         .map_err(|e| format!("crash-leg start failed: {e}"))?;
-    wait_for_state(facade, "tck-crash", LifecycleState::Failed)
+    wait_for_state(facade, "tck-crash", LifecycleState::Failed, timeout)
         .map_err(|e| format!("crash-leg never detected the crash: {e}"))?;
     let status = facade
         .instance_status("tck-crash")
@@ -1171,10 +1559,10 @@ fn crash_leg_defect(
 ///   honestly declares "unsupported here" is CONFORMANT.
 fn run_pause_section(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     name: &str,
     launchable: bool,
     level: Option<SupportLevel>,
+    timeout: Duration,
 ) -> SectionResult {
     // A launch-less registration has no process to suspend — the section does
     // not apply (derived from the registration shape, never a per-adapter
@@ -1217,7 +1605,7 @@ fn run_pause_section(
         return SectionResult::NotApplicable { reason };
     }
 
-    into_section_result(pause_applicable_inner(facade, state_dir, name, level))
+    into_section_result(pause_applicable_inner(facade, name, level, timeout))
 }
 
 /// Which pause semantics an APPLICABLE declaration can honestly demonstrate
@@ -1254,14 +1642,14 @@ fn pause_demo(level: SupportLevel, os: OsId) -> PauseDemo {
 /// subject, prove the declared semantics, stop exactly once at the end).
 fn pause_applicable_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     name: &str,
     level: SupportLevel,
+    timeout: Duration,
 ) -> Result<(), String> {
     facade
         .start(name)
         .map_err(|e| format!("start failed: {e}"))?;
-    wait_for_state(facade, name, LifecycleState::Running)?;
+    wait_for_state(facade, name, LifecycleState::Running, timeout)?;
 
     // Guaranteed on Windows never reaches here (the section gate reports it
     // not_applicable via `pause_demo`); everything else is applicable.
@@ -1269,7 +1657,7 @@ fn pause_applicable_inner(
         pause_demo(level, OsId::current()),
         PauseDemo::RealSuspension
     ) {
-        pause_guaranteed_inner(facade, state_dir, name)
+        pause_guaranteed_inner(facade, name, timeout)
     } else {
         pause_best_effort_inner(facade, name)
     };
@@ -1288,8 +1676,8 @@ fn pause_applicable_inner(
 /// → growth). Does NOT stop the instance (the caller owns the single stop).
 fn pause_guaranteed_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     name: &str,
+    timeout: Duration,
 ) -> Result<(), String> {
     // 1) The SUBJECT's own pause/resume (states + plain command causes).
     let paused = facade
@@ -1304,7 +1692,7 @@ fn pause_guaranteed_inner(
     facade
         .resume(name)
         .map_err(|e| format!("resume failed: {e}"))?;
-    wait_for_state(facade, name, LifecycleState::Running)?;
+    wait_for_state(facade, name, LifecycleState::Running, timeout)?;
 
     // 2) The REAL-suspension proof on a TCK-OWNED probe (a 50ms heartbeat the
     // caller's manifest need not carry), mirroring the engine suite's freeze
@@ -1333,9 +1721,9 @@ fn pause_guaranteed_inner(
     facade
         .start(probe_kind)
         .map_err(|e| format!("pause probe start failed: {e}"))?;
-    wait_for_state(facade, probe_kind, LifecycleState::Running)?;
+    wait_for_state(facade, probe_kind, LifecycleState::Running, timeout)?;
 
-    let freeze_failure = prove_heartbeat_freeze(facade, state_dir, probe_kind, SECTION_TIMEOUT);
+    let freeze_failure = prove_heartbeat_freeze(facade, probe_kind, timeout);
 
     // Teardown of the probe (subject is the caller's; it stops at section end).
     let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
@@ -1394,34 +1782,33 @@ fn guaranteed_cause_defect(events: &[::hekma_engine::TransitionEvent]) -> Result
 /// The heartbeat-freeze proof against a RUNNING probe with a live 50ms
 /// heartbeat: pause → settle → baseline → 1s watch never grows → after equals
 /// baseline → resume → grows again. `budget` bounds the two bounded waits (the
-/// first-heartbeat startup wait and the post-SIGCONT growth wait) — the
-/// section timeout by default. Returns `None` on success.
+/// first-heartbeat startup wait and the post-SIGCONT growth wait) — the run's
+/// configured section timeout. Reads the heartbeat lines through the PUBLIC
+/// `read_agent_log` seam (spec 15-3). Returns `None` on success.
 fn prove_heartbeat_freeze(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     probe: &str,
     budget: Duration,
 ) -> Option<String> {
-    heartbeat_freeze_inner(facade, state_dir, probe, budget).err()
+    heartbeat_freeze_inner(facade, probe, budget).err()
 }
 
 /// [`prove_heartbeat_freeze`]'s pipeline.
 fn heartbeat_freeze_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     probe: &str,
     budget: Duration,
 ) -> Result<(), String> {
-    let log = agent_log_path(state_dir, probe);
     let deadline = std::time::Instant::now() + budget;
     loop {
-        if heartbeat_lines(&log) >= 2 {
+        if heartbeat_count(facade, probe)? >= 2 {
             break;
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "the pause probe's heartbeat never started at {}",
-                log.display()
+                "the pause probe's heartbeat never started (no heartbeat lines in {probe}'s \
+                 captured log after {}ms)",
+                budget.as_millis()
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1432,10 +1819,10 @@ fn heartbeat_freeze_inner(
         .map_err(|e| format!("probe pause failed: {e}"))?;
 
     std::thread::sleep(Duration::from_millis(200)); // let SIGSTOP + in-flight lines settle
-    let baseline = heartbeat_lines(&log);
+    let baseline = heartbeat_count(facade, probe)?;
     let watch_until = std::time::Instant::now() + Duration::from_millis(1000);
     while std::time::Instant::now() < watch_until {
-        let now = heartbeat_lines(&log);
+        let now = heartbeat_count(facade, probe)?;
         if now > baseline {
             return Err(format!(
                 "heartbeat must NOT grow while paused (real SIGSTOP): baseline {baseline}, saw {now}"
@@ -1443,7 +1830,7 @@ fn heartbeat_freeze_inner(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let after = heartbeat_lines(&log);
+    let after = heartbeat_count(facade, probe)?;
     if after != baseline {
         return Err(format!(
             "heartbeat count must be unchanged across the whole paused window: \
@@ -1464,7 +1851,7 @@ fn heartbeat_freeze_inner(
     // The heartbeat grows again after SIGCONT.
     let deadline = std::time::Instant::now() + budget;
     loop {
-        if heartbeat_lines(&log) > after {
+        if heartbeat_count(facade, probe)? > after {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -1540,10 +1927,11 @@ fn best_effort_cause_defect(events: &[::hekma_engine::TransitionEvent]) -> Resul
 /// verbatim (its tail IS the env var name, no mapping involved).
 fn run_config_mapping(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
-    subject_manifest: Option<&Path>,
+    state_root: &Path,
+    adapter: &TckAdapter,
+    timeout: Duration,
 ) -> SectionResult {
-    let Some(path) = subject_manifest else {
+    let Some(path) = adapter.manifest_path() else {
         // A NATIVE subject's launch is code-declared contract (the adapter
         // crate owns it — e.g. the hermes gateway argv): the harness cannot
         // author a `--dump <path>` pair into it, so delivered config has no
@@ -1562,7 +1950,7 @@ fn run_config_mapping(
     // The declaration decides applicability (pure, unit-tested): nothing
     // declared, or nothing ENV-deliverable, means there is nothing this
     // section could honestly prove.
-    match config_probe_scope(path) {
+    match config_probe_scope(&path) {
         Err(e) => SectionResult::fail(e),
         Ok(ConfigScope::Undeclared) => SectionResult::NotApplicable {
             reason: "the declaration declares no [config] rules, so there is no unified-key \
@@ -1577,9 +1965,10 @@ fn run_config_mapping(
         },
         Ok(ConfigScope::Env(rules)) => into_section_result(config_mapping_inner(
             facade,
-            state_dir,
+            state_root,
+            &adapter.adapter_ref(),
             rules,
-            SECTION_TIMEOUT,
+            timeout,
         )),
     }
 }
@@ -1636,12 +2025,13 @@ fn config_probe_scope(subject_manifest: &Path) -> Result<ConfigScope, String> {
 }
 
 /// [`run_config_mapping`]'s pipeline for a MANIFEST subject with the given
-/// env-mapped rules. `poll_budget` bounds the dump-artifact poll (the section
-/// timeout by default; the harness tests pass a tiny budget to prove the
-/// not-delivered arm).
+/// env-mapped rules. `poll_budget` bounds the dump-artifact poll (the run's
+/// configured section timeout; the harness tests pass a tiny budget to prove
+/// the not-delivered arm).
 fn config_mapping_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    adapter_ref: &AdapterRef,
     declared: Vec<(String, String)>,
     poll_budget: Duration,
 ) -> Result<(), String> {
@@ -1654,17 +2044,24 @@ fn config_mapping_inner(
     // matrix), never aborts the suite.
     let name = "tck-subject";
 
-    // The subject's own `--dump <path>` pair (from its committed launch
-    // snapshot) is the delivery-evidence artifact. A manifest that accepts no
-    // `--dump <path>` cannot prove delivered config — the section reports the
-    // gap (the TCK does not invent config delivery).
-    let dump_token = read_launch_dump_path(state_dir, name).ok_or(
-        "the registered launch carries no `--dump <path>` pair; the TCK requires \
+    // The subject's own `--dump <path>` pair, RESOLVED FROM SOURCE through
+    // the public `adapter::resolve` seam (spec 15-3). SOURCE semantics,
+    // stated plainly: the engine STARTS from the registration-time launch
+    // snapshot (private — no public seam), so a manifest edited AFTER
+    // registration diverges from what this read sees; if you edit a
+    // manifest, re-register (the same advice the contract's versioning
+    // section gives). A manifest that accepts no `--dump <path>` cannot
+    // prove delivered config — the section reports the gap (the TCK does
+    // not invent config delivery).
+    let dump_token = resolve_launch_dump_pair(adapter_ref)?.ok_or(
+        "the resolved launch carries no `--dump <path>` pair; the TCK requires \
          manifest subjects to accept `--dump <path>` so delivered config is provable",
     )?;
     // The dump path is the MANIFEST'S choice: absolute, or relative to the
-    // subject's Agent Home (the process CWD the engine execs it with).
-    let home = state_dir.join("agents").join(name);
+    // subject's Agent Home (the process CWD the engine execs it with) — the
+    // home routed through the engine's public path layout, never a
+    // hand-joined `agents/<name>` literal (spec 15-3).
+    let home = engine_home(state_root, name)?;
     let dump = if std::path::Path::new(&dump_token).is_absolute() {
         std::path::PathBuf::from(dump_token)
     } else {
@@ -1688,7 +2085,7 @@ fn config_mapping_inner(
     facade
         .start(name)
         .map_err(|e| format!("start failed: {e}"))?;
-    wait_for_state(facade, name, LifecycleState::Running)?;
+    wait_for_state(facade, name, LifecycleState::Running, poll_budget)?;
 
     // Every DECLARED env rule must receive the set value under its OWN env
     // var; a miss names the dump lines that DID land (triage without a rerun).
@@ -1722,20 +2119,31 @@ fn config_mapping_inner(
     Ok(())
 }
 
-/// The token following `--dump` in the subject's committed launch snapshot
-/// (`adapter.json` → launch.args), when present.
-fn read_launch_dump_path(state_dir: &Path, name: &str) -> Option<String> {
-    let home = state_dir.join("agents").join(name);
-    let text = std::fs::read_to_string(home.join("adapter.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let args = value.get("launch")?.get("args")?.as_array()?;
-    let mut args = args.iter().filter_map(|a| a.as_str());
+/// The token following `--dump` in a launch's args, when present. Pure over
+/// the args slice — unit-tested for every missing shape.
+fn dump_token_from_args(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--dump" {
-            return args.next().map(|p| p.to_string());
+            return args.next().cloned();
         }
     }
     None
+}
+
+/// The token following `--dump` in the subject's launch, resolved FROM
+/// SOURCE through the public `hekma_engine::adapter::resolve` seam (spec
+/// 15-3): the engine parses + validates the adapter's declaration and
+/// carries its resolved `[lifecycle.start]` launch. A resolve failure is a
+/// NAMED fail reason (the I/O matrix's "--dump args check" row). See
+/// [`config_mapping_inner`]'s comment for the source-vs-registered-snapshot
+/// semantics (post-registration manifest edits diverge; re-register).
+fn resolve_launch_dump_pair(adapter_ref: &AdapterRef) -> Result<Option<String>, String> {
+    let resolved = ::hekma_engine::adapter::resolve(adapter_ref)
+        .map_err(|e| format!("resolve the adapter's declaration: {e}"))?;
+    Ok(resolved
+        .launch()
+        .and_then(|l| dump_token_from_args(&l.args)))
 }
 
 /// The env lines the dump artifact actually carries (bounded sample) — or an
@@ -1809,17 +2217,19 @@ fn fleet_totals_defect(
 /// double-count; Fleet totals equal the ledger exactly.
 fn run_self_reported_metering(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    timeout: Duration,
 ) -> SectionResult {
-    into_section_result(self_reported_metering_inner(facade, state_dir))
+    into_section_result(self_reported_metering_inner(facade, state_root, timeout))
 }
 
 /// [`run_self_reported_metering`]'s pipeline.
 fn self_reported_metering_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    timeout: Duration,
 ) -> Result<(), String> {
-    self_reported_metering_inner_with(facade, state_dir, &[])
+    self_reported_metering_inner_with(facade, state_root, timeout, &[])
 }
 
 /// [`self_reported_metering_inner`] with EXTRA probe args — the seam the
@@ -1828,7 +2238,8 @@ fn self_reported_metering_inner(
 /// without weakening the honest section run.
 fn self_reported_metering_inner_with(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    timeout: Duration,
     extra_probe_args: &[&str],
 ) -> Result<(), String> {
     let probe_kind = "tck-meter-probe";
@@ -1866,10 +2277,11 @@ fn self_reported_metering_inner_with(
     // The 3 DISTINCT events commit; the replayed sequence-0 line is then
     // drained as a no-op. Wait for 3 rows, settle past the replay drain, and
     // require the count to STAY exactly 3 (an absolute count — a floor-poll
-    // would hide a genuine over-count).
-    wait_for_usage_rows(state_dir, probe_kind, EXPECTED_SELF_REPORTED_ROWS)?;
+    // would hide a genuine over-count). A row-count read error propagates
+    // immediately as this section's named fail reason (spec 15-3).
+    wait_for_usage_rows_for(state_root, probe_kind, EXPECTED_SELF_REPORTED_ROWS, timeout)?;
     std::thread::sleep(Duration::from_millis(800));
-    let rows = usage_row_count(state_dir, probe_kind);
+    let rows = usage_row_count(state_root, probe_kind)?;
     replay_row_defect(rows)?;
 
     // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out), and the
@@ -1893,15 +2305,17 @@ fn self_reported_metering_inner_with(
 /// Content-Length.
 fn run_engine_observed_metering(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    timeout: Duration,
 ) -> SectionResult {
-    into_section_result(engine_observed_metering_inner(facade, state_dir))
+    into_section_result(engine_observed_metering_inner(facade, state_root, timeout))
 }
 
 /// [`run_engine_observed_metering`]'s pipeline.
 fn engine_observed_metering_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    timeout: Duration,
 ) -> Result<(), String> {
     let probe_kind = "tck-obs-probe";
     let dir = tempfile::Builder::new()
@@ -1942,20 +2356,11 @@ fn engine_observed_metering_inner(
         .start(probe_kind)
         .map_err(|e| format!("probe start failed: {e}"))?;
 
-    // Wait for the observed rows to commit (the reaper drains the listener).
-    let deadline = std::time::Instant::now() + SECTION_TIMEOUT;
-    loop {
-        let count = observed_row_count(state_dir, probe_kind);
-        if count >= OBSERVED_CALLS {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for {OBSERVED_CALLS} engine-observed rows (have {count})"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Wait for the observed rows to commit (the reaper drains the listener) —
+    // through the SAME shared poll as the self-reported section (spec 15-3
+    // deduped the former inline loop), so a row-count read error propagates
+    // immediately instead of timing out as "have 0".
+    wait_for_observed_rows_for(state_root, probe_kind, OBSERVED_CALLS, timeout)?;
 
     // Fleet totals EQUAL the ledger exactly: N × (30 in, 70 out).
     let entry = fleet_entry(facade, probe_kind)?;
@@ -1985,15 +2390,26 @@ fn engine_observed_metering_inner(
 }
 
 /// Memory Backing: attach → status reports the attachment AND the declared
-/// delivery fact → a probe twin with the same declaration RECEIVES the managed
-/// dir through ITS declared env var → detach clears it. NotApplicable when the
-/// adapter declares no `memory.dir` mapping (delivery is offered, not imposed
-/// — the honesty rule) or registers nothing launchable.
+/// delivery fact → a probe twin with the same declaration RECEIVES the
+/// managed dir through ITS declared env var → detach clears it. NotApplicable
+/// when the adapter declares no `memory.dir` mapping (delivery is offered,
+/// not imposed — the honesty rule) or registers nothing launchable.
+///
+/// Spec 15-3 (Fibery 174) adds the manifest-subject `--dump` leg: a MANIFEST
+/// subject whose launch carries the `--dump <path>` convention ALSO gets its
+/// own delivery proven on the subject itself (the subject's dump must echo
+/// the managed dir through the subject's OWN declared env var) — closing the
+/// gap where only the hermes builtin's subject delivery had a proof leg.
+/// Subjects WITHOUT a dump seam (native builtins, dump-less manifests) keep
+/// the env-var probe leg as the delivery proof, with the same honest reasons
+/// as before.
 fn run_memory(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    adapter: &TckAdapter,
     launchable: bool,
     declares_memory_dir: bool,
+    timeout: Duration,
 ) -> SectionResult {
     if !launchable {
         return SectionResult::NotApplicable {
@@ -2010,16 +2426,17 @@ fn run_memory(
                 .to_string(),
         };
     }
-    into_section_result(memory_inner(facade, state_dir, SECTION_TIMEOUT))
+    into_section_result(memory_inner(facade, state_root, adapter, timeout))
 }
 
 /// [`run_memory`]'s pipeline (the declaration gates already passed).
-/// `poll_budget` bounds the dump-artifact poll (the section timeout by
-/// default; the harness tests pass a tiny budget to prove the not-delivered
+/// `poll_budget` bounds the dump-artifact polls (the run's configured section
+/// timeout; the harness tests pass a tiny budget to prove the not-delivered
 /// arm).
 fn memory_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
+    state_root: &Path,
+    adapter: &TckAdapter,
     poll_budget: Duration,
 ) -> Result<(), String> {
     // Attach BEFORE any start (hot-swap is rejected by design). The SECTION's
@@ -2030,7 +2447,7 @@ fn memory_inner(
         .prefix("ktesio-tck-memory-")
         .tempdir()
         .map_err(|e| format!("probe tempdir: {e}"))?;
-    let dump = state_dir.join("tck-memory-dump.txt");
+    let dump = state_root.join("tck-memory-dump.txt");
     let dump_str = dump.to_string_lossy().into_owned();
     // The probe DECLARES the reserved key → its own env var (never a mock
     // constant), so the dump proof checks THAT var only.
@@ -2114,7 +2531,115 @@ fn memory_inner(
     {
         return Err("memory_status still reports an attachment".to_string());
     }
-    Ok(())
+
+    // The manifest-subject `--dump` leg (spec 15-3, Fibery 174): the probe
+    // twin above proves the ENGINE seam; this proves the SUBJECT's own
+    // declared delivery when the subject carries the `--dump <path>`
+    // convention. Adapters without a dump seam keep the probe leg as their
+    // delivery proof — surfaced by the leg's absence being a documented,
+    // tested skip, never a fabricated one.
+    subject_memory_delivery(facade, state_root, adapter, poll_budget)
+}
+
+/// The SUBJECT's own declared `memory.dir` delivery, proven through the
+/// `--dump <path>` seam the adapter's launch declares (the convention
+/// `docs/adapter-contract.md` documents for manifest adapters): attach a
+/// filesystem backing to the subject, start it, and require the subject's
+/// dump to echo the managed dir under the subject's OWN declared env var —
+/// then detach. Only runs for a MANIFEST subject whose resolved launch
+/// carries `--dump <path>`; everything else (native builtins, dump-less
+/// manifests) returns `Ok(())` after the probe leg has already proven the
+/// engine seam on a twin.
+fn subject_memory_delivery(
+    facade: &::hekma_engine::Blocking<'_>,
+    state_root: &Path,
+    adapter: &TckAdapter,
+    poll_budget: Duration,
+) -> Result<(), String> {
+    let name = "tck-subject";
+    let TckAdapter::Manifest(_) = adapter else {
+        // A NATIVE subject's launch is code-declared contract (no harness-
+        // authorable `--dump` pair); the shipping builtin's own subject
+        // delivery is proven by the engine's hermes pass over its shim seam.
+        return Ok(());
+    };
+    // Resolve-from-source, the same seam + semantics the config section uses
+    // (a post-registration manifest edit diverges; re-register).
+    let Some(dump_token) = resolve_launch_dump_pair(&adapter.adapter_ref())? else {
+        // No dump seam declared: the probe leg above already proved delivery
+        // on a twin with the same declaration shape.
+        return Ok(());
+    };
+    // The subject's own declared env target for the reserved key (the
+    // declaration gate already proved a mapping exists; a re-read failure is
+    // a named error, consistent with `declares_memory_dir`).
+    let env_var = adapter.memory_dir_env_target()?.ok_or(
+        "the subject's declaration maps 'memory.dir' to no ENV target, so the dump \
+                echo has no provable channel",
+    )?;
+
+    let managed = facade
+        .attach_memory(name, MemoryBackingKind::Filesystem)
+        .map_err(|e| {
+            format!("subject attach_memory failed (is the subject still running?): {e}")
+        })?;
+    let outcome = subject_memory_dump_echo(
+        facade,
+        state_root,
+        name,
+        &env_var,
+        &managed,
+        &dump_token,
+        poll_budget,
+    );
+    // The subject must be TERMINAL before detach (the hermes pass's rule);
+    // stop is idempotent, and a failed proof must not orphan the attachment.
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    let detach = facade
+        .detach_memory(name)
+        .map_err(|e| format!("subject detach_memory failed: {e}"));
+    outcome.and(detach)
+}
+
+/// Start the subject and prove its dump echoes `env=<env_var>=<managed>`
+/// exactly (the same exact-value proof the probe leg and the hermes pass
+/// use). Stops the subject again on every exit path.
+fn subject_memory_dump_echo(
+    facade: &::hekma_engine::Blocking<'_>,
+    state_root: &Path,
+    name: &str,
+    env_var: &str,
+    managed: &Path,
+    dump_token: &str,
+    poll_budget: Duration,
+) -> Result<(), String> {
+    facade
+        .start(name)
+        .map_err(|e| format!("subject start failed: {e}"))?;
+    // From here the subject is RUNNING with its declared linger; stop it on
+    // EVERY exit path (the caller detaches after the terminal state).
+    let outcome = (|| {
+        wait_for_state(facade, name, LifecycleState::Running, poll_budget)?;
+        let home = engine_home(state_root, name)?;
+        let dump = if std::path::Path::new(dump_token).is_absolute() {
+            std::path::PathBuf::from(dump_token)
+        } else {
+            home.join(dump_token)
+        };
+        let managed_str = managed.to_string_lossy().into_owned();
+        if !dump_contains_env_for(&dump, env_var, &managed_str, poll_budget) {
+            return Err(format!(
+                "the manifest subject never received the managed memory dir through its own \
+                 declared env var {env_var} (expected env={env_var}={managed_str}; dump at {} \
+                 showed: {})",
+                dump.display(),
+                dump_env_lines(&dump)
+            ));
+        }
+        Ok(())
+    })();
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    outcome
 }
 
 /// Interaction, honest per the declared level:
@@ -2124,17 +2649,17 @@ fn memory_inner(
 ///   exist; the message names the declaration).
 fn run_interaction(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     level: SupportLevel,
+    timeout: Duration,
 ) -> SectionResult {
-    into_section_result(interaction_inner(facade, state_dir, level))
+    into_section_result(interaction_inner(facade, level, timeout))
 }
 
 /// [`run_interaction`]'s pipeline.
 fn interaction_inner(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     level: SupportLevel,
+    timeout: Duration,
 ) -> Result<(), String> {
     let probe_kind = "tck-interaction-probe";
     let dir = tempfile::Builder::new()
@@ -2179,24 +2704,23 @@ fn interaction_inner(
     }
 
     // Guaranteed/BestEffort: delivery proof via the echo line.
-    interaction_delivery(facade, state_dir, probe_kind, SECTION_TIMEOUT)
+    interaction_delivery(facade, probe_kind, timeout)
 }
 
 /// The delivery half of the interaction proof: `send_input` must reach the
-/// running agent (the echo line lands in its captured log) within `budget`.
-/// Extracted so the never-echoes arm is provable directly (a probe launched
-/// WITHOUT `--echo-stdin`).
+/// running agent (the echo line lands in its captured log, read through the
+/// PUBLIC `read_agent_log` seam — spec 15-3) within `budget`. Extracted so
+/// the never-echoes arm is provable directly (a probe launched WITHOUT
+/// `--echo-stdin`).
 fn interaction_delivery(
     facade: &::hekma_engine::Blocking<'_>,
-    state_dir: &Path,
     probe_kind: &str,
     budget: Duration,
 ) -> Result<(), String> {
     facade
         .send_input(probe_kind, "tck-echo-line")
         .map_err(|e| format!("send_input failed: {e}"))?;
-    let log = agent_log_path(state_dir, probe_kind);
-    wait_for_log_line_for(&log, "stdin: tck-echo-line", budget)?;
+    wait_for_log_line(facade, probe_kind, "stdin: tck-echo-line", budget)?;
     let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
     Ok(())
 }
@@ -2514,8 +3038,9 @@ mod tests {
     }
 
     /// The registration-failure report is complete and honest: 8 fail entries
-    /// with the detail string, and the kind label is derived without
-    /// resolving anything.
+    /// carrying the REGISTRATION stage's rendered prefix (the pre-15-3 string,
+    /// kept verbatim for consumers that pinned it), and the kind label is
+    /// derived without resolving anything.
     #[test]
     fn registration_failure_report_is_complete() {
         // A manifest dir that does not exist → registration fails.
@@ -2530,7 +3055,83 @@ mod tests {
                 SectionResult::Fail { reason } => {
                     assert!(
                         reason.starts_with("registration failed: "),
-                        "reason must name registration: {reason}"
+                        "reason must name the registration stage: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every pipeline stage renders its OWN prefix (spec 15-3's pure render
+    /// seam — the all-sections failure reason names WHERE the pipeline
+    /// stopped, so an engine-open failure is no longer mislabeled
+    /// "registration failed"). All five arms pinned; the Registration arm's
+    /// string is the pre-15-3 prefix verbatim.
+    #[test]
+    fn stage_prefixes_render_per_stage() {
+        assert_eq!(
+            Stage::StateRoot.render("nope"),
+            "state root preparation failed: nope"
+        );
+        assert_eq!(Stage::EngineOpen.render("nope"), "engine open failed: nope");
+        assert_eq!(
+            Stage::Registration.render("nope"),
+            "registration failed: nope"
+        );
+        assert_eq!(
+            Stage::CapabilitiesRead.render("nope"),
+            "capability projection read failed: nope"
+        );
+        assert_eq!(
+            Stage::SnapshotRead.render("nope"),
+            "registered adapter read failed: nope"
+        );
+        // The compat pin: the registration arm is byte-identical to the
+        // pre-15-3 reason prefix (the one string external consumers may
+        // have matched on).
+        assert!(Stage::Registration
+            .render("detail")
+            .starts_with("registration failed: "));
+    }
+
+    /// The StateRoot stage triggers FOR REAL on an unusable configured root
+    /// (the I/O matrix's configured-invocation row): a root that exists but
+    /// is a regular file fails every SELECTED section with the state-root
+    /// prefix — proving both the stage arm and the selected-set failure
+    /// report in one drive.
+    #[test]
+    fn unusable_state_root_fails_the_state_root_stage_for_the_selected_set() {
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-badroot-")
+            .tempdir()
+            .expect("tempdir");
+        let not_a_dir = scratch.path().join("not-a-dir");
+        std::fs::write(&not_a_dir, "a file, not a directory").expect("write blocker");
+        let config = TckConfig {
+            state_root: Some(not_a_dir.clone()),
+            sections: SectionSelection::Only(vec![TckSection::Pause, TckSection::Memory]),
+            ..TckConfig::default()
+        };
+        let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+        assert!(!report.is_conformant());
+        assert_eq!(
+            report.sections.len(),
+            2,
+            "the failure report covers exactly the selected set"
+        );
+        let got: Vec<&str> = report.sections.iter().map(|s| s.section.as_str()).collect();
+        assert_eq!(got, vec![section_ids::PAUSE, section_ids::MEMORY]);
+        for entry in report.sections.iter() {
+            match &entry.result {
+                SectionResult::Fail { reason } => {
+                    assert!(
+                        reason.starts_with("state root preparation failed: "),
+                        "reason must name the state-root stage: {reason}"
+                    );
+                    assert!(
+                        reason.contains("not a directory"),
+                        "reason must name the root's defect: {reason}"
                     );
                 }
                 other => panic!("expected Fail, got {other:?}"),
@@ -2746,86 +3347,158 @@ source = "self-reported"
         (dir, leaked.blocking())
     }
 
-    /// `read_snapshot` accepts the two real snapshot shapes and reports a
-    /// DISTINCT reason for each corrupt shape (missing file, bad JSON, no
-    /// metering_source, unknown metering_source).
+    /// `read_registered_facts` (spec 15-3's seam read): the metering source
+    /// comes from the public `fleet_entry` view and the launch boolean from
+    /// the engine-written snapshot (routed through the public path layout).
+    /// Real shapes are proven on REGISTERED probes; each corruption arm
+    /// (unknown fleet name, missing/unparseable snapshot) reports a DISTINCT
+    /// named reason. This is the SnapshotRead stage's helper-level corrupt
+    /// trigger — through the full pipeline the engine (re)writes the
+    /// snapshot at registration, so a post-registration corruption is not
+    /// cheaply reachable there (the stage's prefix is pinned by the pure
+    /// render test above).
     #[test]
-    fn read_snapshot_accepts_real_shapes_and_reports_each_corruption() {
-        let dir = tempfile::Builder::new()
-            .prefix("ktesio-tck-snap-")
+    fn read_registered_facts_accepts_real_shapes_and_reports_each_corruption() {
+        let (dir, facade) = helper_engine();
+
+        // Unknown fleet name: the public view read fails, named.
+        let err = read_registered_facts(&facade, dir.path(), "no-such-instance").unwrap_err();
+        assert!(err.contains("fleet entry read failed"), "{err}");
+
+        // A real self-reported launchable probe: both facts read through the
+        // seams.
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-facts-")
             .tempdir()
             .expect("tempdir");
-        let home = dir.path().join("agents").join("snap");
-        std::fs::create_dir_all(&home).expect("mkdir");
+        write_probe_manifest(
+            scratch.path(),
+            "tck-facts-probe",
+            &["--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            None,
+        )
+        .expect("write facts manifest");
+        facade
+            .register_with_adapter(
+                "tck-facts",
+                &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            )
+            .expect("register facts probe");
+        let facts = read_registered_facts(&facade, dir.path(), "tck-facts").expect("real shape");
+        assert_eq!(facts.metering_source, MeteringSource::SelfReported);
+        assert!(
+            facts.launch,
+            "a manifest with [lifecycle.start] snapshotted a launch"
+        );
 
-        // Missing file.
-        let err = read_snapshot(dir.path(), "snap").unwrap_err();
-        assert!(err.contains("read adapter snapshot"), "{err}");
-
-        // Unparseable JSON.
-        std::fs::write(home.join("adapter.json"), "not json at all").unwrap();
-        let err = read_snapshot(dir.path(), "snap").unwrap_err();
+        // The engine's home is the public layout's home (no hand-joined
+        // literal). The launch-boolean read (the residual-coupled half)
+        // reports each corruption with a named reason — never a fabricated
+        // `false`. NOTE: corrupting the snapshot ALSO degrades the public
+        // Fleet row's metering_source cell to "unknown" (the row composes
+        // from the same snapshot), so these arms drive the launch read
+        // directly — `read_registered_facts` itself then fails on EITHER
+        // named arm, which its own asserts below pin.
+        let snapshot = engine_home(dir.path(), "tck-facts")
+            .expect("home")
+            .join("adapter.json");
+        std::fs::write(&snapshot, "not json at all").expect("corrupt snapshot");
+        let err = registered_launch_present(dir.path(), "tck-facts").unwrap_err();
         assert!(err.contains("parse adapter snapshot"), "{err}");
-
-        // No metering_source field.
-        std::fs::write(home.join("adapter.json"), "{}").unwrap();
-        let err = read_snapshot(dir.path(), "snap").unwrap_err();
-        assert!(err.contains("no metering_source"), "{err}");
-
-        // Unknown metering_source value.
-        std::fs::write(home.join("adapter.json"), r#"{"metering_source":"bogus"}"#).unwrap();
-        let err = read_snapshot(dir.path(), "snap").unwrap_err();
+        // Through the composed read, the same corruption surfaces as the
+        // fleet arm's honest "unknown" — a NAMED error, never a fabricated
+        // metering source.
+        let err = read_registered_facts(&facade, dir.path(), "tck-facts").unwrap_err();
         assert!(err.contains("unknown metering_source"), "{err}");
 
-        // The two real shapes: self-reported with no launch, engine-observed
-        // with a resolved launch.
-        std::fs::write(
-            home.join("adapter.json"),
-            r#"{"metering_source":"self-reported","launch":null}"#,
-        )
-        .unwrap();
-        let snap = read_snapshot(dir.path(), "snap").expect("self-reported snapshot");
-        assert_eq!(snap.metering_source, MeteringSource::SelfReported);
-        assert!(!snap.launch);
+        std::fs::remove_file(&snapshot).expect("remove snapshot");
+        let err = registered_launch_present(dir.path(), "tck-facts").unwrap_err();
+        assert!(err.contains("read adapter snapshot"), "{err}");
 
+        // A parseable snapshot WITHOUT a launch key is an honest `false`
+        // (the native-builtin shape; `#[serde(default)]` on the engine side).
         std::fs::write(
-            home.join("adapter.json"),
-            r#"{"metering_source":"engine-observed","launch":{"args":["a"]}}"#,
+            &snapshot,
+            r#"{"kind":"x","metering_source":"self-reported"}"#,
         )
-        .unwrap();
-        let snap = read_snapshot(dir.path(), "snap").expect("engine-observed snapshot");
-        assert_eq!(snap.metering_source, MeteringSource::EngineObserved);
-        assert!(snap.launch);
+        .expect("launchless snapshot");
+        assert!(!(registered_launch_present(dir.path(), "tck-facts").expect("launchless")));
     }
 
-    /// `read_launch_dump_path` finds the token after `--dump` in the launch
-    /// snapshot and reports None for every shape that lacks one.
+    /// `dump_token_from_args` finds the token after `--dump` in a launch's
+    /// args and reports `None` for every shape that lacks one (the pure
+    /// half of the spec 15-3 --dump seam read).
     #[test]
-    fn read_launch_dump_path_finds_the_pair_or_none() {
-        let dir = tempfile::Builder::new()
-            .prefix("ktesio-tck-dump-")
-            .tempdir()
-            .expect("tempdir");
-        let home = dir.path().join("agents").join("dump");
-        std::fs::create_dir_all(&home).expect("mkdir");
-
-        // No snapshot at all.
-        assert!(read_launch_dump_path(dir.path(), "dump").is_none());
-
-        let write = |body: &str| std::fs::write(home.join("adapter.json"), body).unwrap();
-        // No launch / no args / `--dump` as the LAST token.
-        write("{}");
-        assert!(read_launch_dump_path(dir.path(), "dump").is_none());
-        write(r#"{"launch":{}}"#);
-        assert!(read_launch_dump_path(dir.path(), "dump").is_none());
-        write(r#"{"launch":{"args":["--dump"]}}"#);
-        assert!(read_launch_dump_path(dir.path(), "dump").is_none());
+    fn dump_token_from_args_finds_the_pair_or_none() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        // No args / no `--dump` / `--dump` as the LAST token.
+        assert_eq!(dump_token_from_args(&args(&[])), None);
+        assert_eq!(dump_token_from_args(&args(&["--linger-ms", "5"])), None);
+        assert_eq!(dump_token_from_args(&args(&["--dump"])), None);
         // The hit: the token after `--dump`.
-        write(r#"{"launch":{"args":["--linger-ms","5","--dump","d.txt"]}}"#);
         assert_eq!(
-            read_launch_dump_path(dir.path(), "dump"),
+            dump_token_from_args(&args(&["--linger-ms", "5", "--dump", "d.txt"])),
             Some("d.txt".to_string())
         );
+    }
+
+    /// `resolve_launch_dump_pair` resolves the pair FROM SOURCE through the
+    /// public `adapter::resolve` seam: a real manifest's launch yields its
+    /// `--dump` token, a dump-less launch yields `None`, and a resolve
+    /// failure (the I/O matrix's named-fail-reason row) is a named `Err`.
+    #[test]
+    fn resolve_launch_dump_pair_resolves_from_source_with_named_errors() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-dumppair-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            dir.path(),
+            "tck-dump-pair",
+            &["--dump", "config-dump.txt", "--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            None,
+        )
+        .expect("write dump-pair manifest");
+        assert_eq!(
+            resolve_launch_dump_pair(&AdapterRef::Manifest(dir.path().to_path_buf())),
+            Ok(Some("config-dump.txt".to_string()))
+        );
+
+        // A launch with no --dump pair resolves cleanly to None.
+        let bare = tempfile::Builder::new()
+            .prefix("ktesio-tck-barepair-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            bare.path(),
+            "tck-bare-pair",
+            &["--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            None,
+        )
+        .expect("write bare manifest");
+        assert_eq!(
+            resolve_launch_dump_pair(&AdapterRef::Manifest(bare.path().to_path_buf())),
+            Ok(None)
+        );
+
+        // A nonexistent manifest dir: the resolve error is NAMED.
+        let err = resolve_launch_dump_pair(&AdapterRef::Manifest(PathBuf::from(
+            "/nonexistent/does-not-exist",
+        )))
+        .unwrap_err();
+        assert!(err.contains("resolve the adapter's declaration"), "{err}");
     }
 
     /// The dump poll helpers report a hit, a miss, and a timeout as three
@@ -2867,7 +3540,7 @@ source = "self-reported"
 
         // Unknown instance: the read itself fails (a distinct reason from a
         // timeout).
-        let err = wait_for_state_for(
+        let err = wait_for_state(
             &facade,
             "no-such-instance",
             LifecycleState::Running,
@@ -2896,7 +3569,7 @@ source = "self-reported"
         facade
             .register_with_adapter("tck-wait", &AdapterRef::Manifest(dir.path().to_path_buf()))
             .expect("register wait probe");
-        let err = wait_for_state_for(
+        let err = wait_for_state(
             &facade,
             "tck-wait",
             LifecycleState::Running,
@@ -2906,63 +3579,149 @@ source = "self-reported"
         assert!(err.contains("timed out waiting for state"), "{err}");
     }
 
-    /// The usage-row helpers tolerate a missing database and a database
-    /// without the schema (both read 0, never panic), and the row-wait
-    /// helper times out into its reason.
+    /// The row-count helpers are error-honest (spec 15-3's INVERTED pin —
+    /// the pre-15-3 test tolerated a missing/schemaless DB as `0`): an
+    /// unopenable or corrupt state.db is `Err` with the error NAMED, and the
+    /// wait helper propagates the FIRST read error IMMEDIATELY — never a 30s
+    /// "have 0" timeout. Over a HEALTHY engine root the same helpers read
+    /// `Ok(0)` and the wait helper times out into its honest reason.
     #[test]
-    fn usage_row_helpers_tolerate_missing_and_schemaless_databases() {
+    fn usage_row_helpers_name_db_errors_and_propagate_them_immediately() {
         let dir = tempfile::Builder::new()
             .prefix("ktesio-tck-rows-")
             .tempdir()
             .expect("tempdir");
 
-        // No state.db at all.
-        assert_eq!(usage_row_count(dir.path(), "x"), 0);
-        assert_eq!(observed_row_count(dir.path(), "x"), 0);
+        // An UNOPENABLE state.db (the path is a directory): the OPEN itself
+        // fails, named with the path.
+        let dir_root = dir.path().join("root-unopenable");
+        std::fs::create_dir(&dir_root).expect("mkdir");
+        std::fs::create_dir(dir_root.join("state.db")).expect("state.db as a dir");
+        let err = usage_row_count(&dir_root, "x").unwrap_err();
+        assert!(err.contains("open") && err.contains("state.db"), "{err}");
+        assert!(observed_row_count(&dir_root, "x").is_err());
 
-        // A database without the usage schema: the query errors → 0.
-        let conn = rusqlite::Connection::open(dir.path().join("state.db")).expect("open");
-        drop(conn);
-        assert_eq!(usage_row_count(dir.path(), "x"), 0);
-        assert_eq!(observed_row_count(dir.path(), "x"), 0);
+        // A corrupt (non-SQLite) state.db: the QUERY fails, named.
+        let corrupt_root = dir.path().join("root-corrupt");
+        std::fs::create_dir(&corrupt_root).expect("mkdir");
+        std::fs::write(corrupt_root.join("state.db"), "not a sqlite file at all")
+            .expect("write corrupt db");
+        let err = usage_row_count(&corrupt_root, "x").unwrap_err();
+        assert!(err.contains("count usage rows"), "{err}");
+        let err = observed_row_count(&corrupt_root, "x").unwrap_err();
+        assert!(err.contains("count engine-observed rows"), "{err}");
 
-        // The wait helper reports the timeout (with the count it saw).
-        let err =
-            wait_for_usage_rows_for(dir.path(), "x", 1, Duration::from_millis(200)).unwrap_err();
+        // IMMEDIATE propagation: with the FULL 30s budget the wait helper
+        // returns the open/query error in well under a second — the inverted
+        // pin (a "have 0" timeout here would take the whole budget).
+        let started = std::time::Instant::now();
+        let err = wait_for_usage_rows_for(&corrupt_root, "x", 1, SECTION_TIMEOUT).unwrap_err();
+        assert!(err.contains("count usage rows"), "{err}");
         assert!(
-            err.contains("timed out waiting for 1 committed usage rows"),
+            started.elapsed() < Duration::from_secs(10),
+            "a DB error must propagate immediately, took {:?}",
+            started.elapsed()
+        );
+        let err = wait_for_observed_rows_for(&corrupt_root, "x", 1, SECTION_TIMEOUT).unwrap_err();
+        assert!(err.contains("count engine-observed rows"), "{err}");
+
+        // Over a HEALTHY engine root (schema present, zero rows): the honest
+        // timeout reason carries the count it saw — the REAL-behavior
+        // timeout arm, distinct from every error arm above.
+        let (engine_root, _facade) = helper_engine();
+        assert_eq!(usage_row_count(engine_root.path(), "x"), Ok(0));
+        assert_eq!(observed_row_count(engine_root.path(), "x"), Ok(0));
+        let err = wait_for_usage_rows_for(engine_root.path(), "x", 1, Duration::from_millis(150))
+            .unwrap_err();
+        assert!(
+            err.contains("timed out waiting for 1 committed usage rows (have 0)"),
+            "{err}"
+        );
+        let err =
+            wait_for_observed_rows_for(engine_root.path(), "x", 1, Duration::from_millis(150))
+                .unwrap_err();
+        assert!(
+            err.contains("timed out waiting for 1 engine-observed rows (have 0)"),
             "{err}"
         );
     }
 
-    /// The log poller reports a hit on a present line and a timeout naming
-    /// the missing line; the heartbeat counter counts only heartbeat lines.
+    /// The log helpers over the PUBLIC read seam (spec 15-3): a read of an
+    /// UNREGISTERED name is a named error; a real heartbeat probe's log
+    /// yields exact-line hits, whole-line-only matching, a timeout naming
+    /// the wanted line, and the heartbeat counter.
     #[test]
-    fn log_helpers_report_hits_timeouts_and_heartbeat_counts() {
-        let dir = tempfile::Builder::new()
-            .prefix("ktesio-tck-log-")
+    fn log_helpers_read_the_public_seam_and_report_each_outcome() {
+        let (_dir, facade) = helper_engine();
+
+        // An unregistered name: the public read itself fails (a distinct,
+        // named reason — never an empty log pretending nothing was said).
+        let err = read_log_texts(&facade, "no-such-instance").unwrap_err();
+        assert!(
+            err.contains("read_agent_log('no-such-instance') failed"),
+            "{err}"
+        );
+        assert!(heartbeat_count(&facade, "no-such-instance").is_err());
+
+        // A real probe with a live heartbeat: the echo-style exact-line wait
+        // hits, substrings do NOT count as whole lines, a never-arriving
+        // line times out naming it, and the counter counts heartbeat lines.
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-logseam-")
             .tempdir()
             .expect("tempdir");
-        let log = dir.path().join("agent.log");
+        write_probe_manifest(
+            scratch.path(),
+            "tck-logseam",
+            &["--heartbeat-ms", "40", "--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            None,
+        )
+        .expect("write logseam manifest");
+        facade
+            .register_with_adapter(
+                "tck-logseam",
+                &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            )
+            .expect("register logseam");
+        facade.start("tck-logseam").expect("start logseam");
 
-        // Timeout on an absent artifact names the wanted line.
-        let err = wait_for_log_line_for(&log, "stdin: hi", Duration::from_millis(150)).unwrap_err();
+        wait_for_log_line(&facade, "tck-logseam", "heartbeat 0", SECTION_TIMEOUT)
+            .expect("the heartbeat line arrives");
+        // A whole line, not a substring: "heartbeat" alone never matches.
+        assert!(wait_for_log_line(
+            &facade,
+            "tck-logseam",
+            "heartbeat",
+            Duration::from_millis(90)
+        )
+        .is_err());
+        // A never-arriving line times out naming it (and the probe).
+        let err = wait_for_log_line(
+            &facade,
+            "tck-logseam",
+            "stdin: hi",
+            Duration::from_millis(120),
+        )
+        .unwrap_err();
         assert!(
             err.contains("never observed") && err.contains("stdin: hi"),
             "{err}"
         );
+        assert!(
+            err.contains("tck-logseam"),
+            "the reason names the instance: {err}"
+        );
+        // The counter grows with the live heartbeat.
+        let first = heartbeat_count(&facade, "tck-logseam").expect("count");
+        std::thread::sleep(Duration::from_millis(150));
+        let second = heartbeat_count(&facade, "tck-logseam").expect("count again");
+        assert!(second > first, "heartbeat lines grow: {first} → {second}");
 
-        // Hit: the line lands (a full line, not a substring).
-        std::fs::write(&log, "heartbeat 0\nstdin: hi\nheartbeat 1\n").unwrap();
-        wait_for_log_line_for(&log, "stdin: hi", SECTION_TIMEOUT).expect("line present");
-        assert!(wait_for_log_line_for(&log, "stdin: bye", Duration::from_millis(90)).is_err());
-        // Substrings do not count as whole-line hits.
-        assert!(wait_for_log_line_for(&log, "stdin", Duration::from_millis(90)).is_err());
-
-        // Heartbeat counting: only lines starting with `heartbeat `.
-        assert_eq!(heartbeat_lines(&log), 2);
-        let missing = dir.path().join("nope.log");
-        assert_eq!(heartbeat_lines(&missing), 0);
+        let _ = facade.stop("tck-logseam", Some(Duration::from_secs(5)));
     }
 
     /// The byte-sequence helper finds a present needle and reports None for
@@ -3010,7 +3769,12 @@ source = "self-reported"
             .expect("tempdir");
 
         // Config: a NATIVE subject has no `--dump` seam to observe.
-        match run_config_mapping(&facade, scratch.path(), None) {
+        match run_config_mapping(
+            &facade,
+            scratch.path(),
+            &TckAdapter::Native("mock".to_string()),
+            SECTION_TIMEOUT,
+        ) {
             SectionResult::NotApplicable { reason } => {
                 assert!(
                     reason.contains("native") && reason.contains("--dump"),
@@ -3021,13 +3785,27 @@ source = "self-reported"
         }
 
         // Memory: no launchable agent / no declared `memory.dir` mapping.
-        match run_memory(&facade, scratch.path(), false, true) {
+        match run_memory(
+            &facade,
+            scratch.path(),
+            &TckAdapter::Native("mock".to_string()),
+            false,
+            true,
+            SECTION_TIMEOUT,
+        ) {
             SectionResult::NotApplicable { reason } => {
                 assert!(reason.contains("no launchable agent"), "{reason}");
             }
             other => panic!("expected NotApplicable for a launch-less memory probe, got {other:?}"),
         }
-        match run_memory(&facade, scratch.path(), true, false) {
+        match run_memory(
+            &facade,
+            scratch.path(),
+            &TckAdapter::Native("mock".to_string()),
+            true,
+            false,
+            SECTION_TIMEOUT,
+        ) {
             SectionResult::NotApplicable { reason } => {
                 assert!(reason.contains("memory.dir"), "{reason}");
             }
@@ -3041,7 +3819,7 @@ source = "self-reported"
             (true, None, "no pause capability"),
             (true, Some(SupportLevel::Unsupported), "unsupported"),
         ] {
-            match run_pause_section(&facade, scratch.path(), "tck-fast", launchable, level) {
+            match run_pause_section(&facade, "tck-fast", launchable, level, SECTION_TIMEOUT) {
                 SectionResult::NotApplicable { reason } => {
                     assert!(reason.contains(needle), "needle {needle:?} in {reason}");
                 }
@@ -3057,9 +3835,9 @@ source = "self-reported"
     /// (the declared behavior was demonstrated).
     #[test]
     fn unsupported_interaction_fails_fast_and_passes_the_section() {
-        let (dir, facade) = helper_engine();
+        let (_dir, facade) = helper_engine();
         assert_eq!(
-            run_interaction(&facade, dir.path(), SupportLevel::Unsupported),
+            run_interaction(&facade, SupportLevel::Unsupported, SECTION_TIMEOUT),
             SectionResult::Pass
         );
     }
@@ -3069,7 +3847,7 @@ source = "self-reported"
     /// a harness hang.
     #[test]
     fn heartbeat_freeze_reports_a_probe_that_never_heartbeats() {
-        let (dir, facade) = helper_engine();
+        let (_dir, facade) = helper_engine();
         let scratch = tempfile::Builder::new()
             .prefix("ktesio-tck-slowbeat-")
             .tempdir()
@@ -3092,13 +3870,8 @@ source = "self-reported"
             )
             .expect("register slowbeat");
         facade.start("tck-slowbeat").expect("start slowbeat");
-        let reason = prove_heartbeat_freeze(
-            &facade,
-            dir.path(),
-            "tck-slowbeat",
-            Duration::from_millis(400),
-        )
-        .expect("a never-beating probe must be reported");
+        let reason = prove_heartbeat_freeze(&facade, "tck-slowbeat", Duration::from_millis(400))
+            .expect("a never-beating probe must be reported");
         assert!(reason.contains("heartbeat never started"), "{reason}");
         let _ = facade.stop("tck-slowbeat", Some(Duration::from_secs(5)));
     }
@@ -3222,8 +3995,14 @@ env = "MODEL"
             Ok(ConfigScope::Env(rules)) => rules,
             other => panic!("expected env rules, got {other:?}"),
         };
-        let err = config_mapping_inner(&facade, dir.path(), rules, Duration::from_millis(400))
-            .expect_err("the dump can never arrive");
+        let err = config_mapping_inner(
+            &facade,
+            dir.path(),
+            &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            rules,
+            Duration::from_millis(400),
+        )
+        .expect_err("the dump can never arrive");
         assert!(err.contains("never reached"), "{err}");
         let _ = facade.stop("tck-subject", Some(Duration::from_secs(5)));
     }
@@ -3286,8 +4065,14 @@ env = "MODEL"
         // land on a loaded runner (unlike the never-arrives twin, this test
         // REQUIRES the model line to be found) while still bounding the
         // pass-through miss wait — 3s covers both.
-        let err = config_mapping_inner(&facade, dir.path(), rules, Duration::from_secs(3))
-            .expect_err("the pass-through can never arrive");
+        let err = config_mapping_inner(
+            &facade,
+            dir.path(),
+            &AdapterRef::Manifest(scratch.path().to_path_buf()),
+            rules,
+            Duration::from_secs(3),
+        )
+        .expect_err("the pass-through can never arrive");
         assert!(
             err.contains("pass-through key was not delivered verbatim"),
             "{err}"
@@ -3318,14 +4103,449 @@ env = "MODEL"
             .expect("tempdir");
         let blocked = scratch.path().join("blocked.txt");
         std::fs::write(&blocked, "a file, not a directory").expect("write blocker");
-        let err = memory_inner(&facade, &blocked, Duration::from_millis(400))
-            .expect_err("the dump can never arrive");
+        let err = memory_inner(
+            &facade,
+            &blocked,
+            &TckAdapter::Manifest(scratch.path().to_path_buf()),
+            Duration::from_millis(400),
+        )
+        .expect_err("the dump can never arrive");
         assert!(
             err.contains("never received the managed memory path"),
             "{err}"
         );
         // The failure path cleaned up after itself.
         assert!(facade.memory_status("tck-memory-probe").unwrap().is_none());
+    }
+
+    /// The `TckConfig` semantics (spec 15-3): the Default is exactly today's
+    /// behavior; `TckSection::id` maps to the stable report ids; selection is
+    /// a filter over the FIXED pipeline order (never the caller's order);
+    /// an empty `Only` selects nothing (documented vacuity).
+    #[test]
+    fn tck_config_defaults_and_selection_semantics() {
+        assert_eq!(TckConfig::default().section_timeout, SECTION_TIMEOUT);
+        assert_eq!(TckConfig::default().state_root, None);
+        assert_eq!(
+            TckConfig::default().sections,
+            SectionSelection::All,
+            "the default selects every section (today's behavior)"
+        );
+
+        // The typed section maps onto the stable ids, and ALL carries the
+        // fixed pipeline order.
+        let all_ids: Vec<&str> = TckSection::ALL.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            all_ids,
+            vec![
+                section_ids::CAPABILITY_EDGES,
+                section_ids::LIFECYCLE,
+                section_ids::PAUSE,
+                section_ids::CONFIG_MAPPING,
+                section_ids::METERING_SELF_REPORTED,
+                section_ids::METERING_ENGINE_OBSERVED,
+                section_ids::MEMORY,
+                section_ids::INTERACTION,
+            ]
+        );
+
+        // Selection FILTERS in the fixed order — a caller listing sections
+        // backwards still gets the report in pipeline order.
+        let backwards = SectionSelection::Only(vec![
+            TckSection::Memory,
+            TckSection::CapabilityEdges,
+            TckSection::Pause,
+        ]);
+        assert_eq!(
+            backwards.selected_ids(),
+            vec![
+                section_ids::CAPABILITY_EDGES,
+                section_ids::PAUSE,
+                section_ids::MEMORY
+            ]
+        );
+        // Duplicates collapse; an empty Only selects nothing (vacuous).
+        let dupes = SectionSelection::Only(vec![TckSection::Pause, TckSection::Pause]);
+        assert_eq!(dupes.selected_ids(), vec![section_ids::PAUSE]);
+        assert_eq!(
+            SectionSelection::Only(vec![]).selected_ids(),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A CONFIGURED run (spec 15-3's configured-invocation row): a subset
+    /// over a CALLER-OWNED state root runs exactly the selected sections
+    /// (fewer entries, fixed order — the report stays complete FOR THE
+    /// SELECTED SET), the engine's state lands under the caller's root, and
+    /// the configured section timeout is actually threaded (a ZERO budget
+    /// fails the lifecycle state poll immediately instead of waiting 30s).
+    #[test]
+    fn configured_run_selects_sections_uses_the_caller_root_and_timeout() {
+        let manifest_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-cfg-man-")
+            .tempdir()
+            .expect("manifest tempdir");
+        write_all_pass_manifest(manifest_dir.path());
+        let caller_root = tempfile::Builder::new()
+            .prefix("ktesio-tck-cfg-root-")
+            .tempdir()
+            .expect("caller root");
+
+        // Subset [capability_edges, lifecycle] with a ZERO section timeout:
+        // capability_edges passes (no poll); lifecycle's own waits complete
+        // inside start()/stop() calls, and the crash leg's bounded
+        // wait-for-failed — the section's one explicit poll — expires
+        // immediately (a 30s default would instead spin waiting for the
+        // twin's ~450ms crash to be reaped... and still fail fast; the
+        // elapsed bound below is what proves the ZERO budget was used).
+        let config = TckConfig {
+            section_timeout: Duration::ZERO,
+            state_root: Some(caller_root.path().to_path_buf()),
+            sections: SectionSelection::Only(vec![
+                TckSection::Lifecycle,
+                TckSection::CapabilityEdges,
+            ]),
+        };
+        let started = std::time::Instant::now();
+        let report = run_conformance_with(
+            &TckAdapter::Manifest(manifest_dir.path().to_path_buf()),
+            &config,
+        );
+        // Fewer entries, fixed pipeline order (capability_edges before
+        // lifecycle regardless of the listing order above).
+        let got: Vec<&str> = report.sections.iter().map(|s| s.section.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![section_ids::CAPABILITY_EDGES, section_ids::LIFECYCLE]
+        );
+        assert_eq!(
+            report.section(section_ids::CAPABILITY_EDGES),
+            Some(&SectionResult::Pass)
+        );
+        match report.section(section_ids::LIFECYCLE) {
+            Some(SectionResult::Fail { reason }) => {
+                assert!(
+                    reason.contains("timed out waiting for state"),
+                    "the zero timeout must bound the section's polls: {reason}"
+                );
+            }
+            other => panic!("lifecycle must fail under a zero budget, got {other:?}"),
+        }
+        // The caller's timeout was USED: the whole run finished in seconds,
+        // not the 30s default.
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "a zero section timeout must not wait the 30s default, took {:?}",
+            started.elapsed()
+        );
+        // The caller-owned root was used AS-IS: the engine's state landed
+        // there (and only there — the harness created no temp root of its
+        // own for this run).
+        assert!(
+            EnginePaths::new(Some(caller_root.path().to_path_buf()))
+                .expect("layout")
+                .state_db()
+                .is_file(),
+            "the engine's state.db must live under the caller's root"
+        );
+    }
+
+    /// The memory section's manifest-subject `--dump` leg (spec 15-3,
+    /// Fibery 174): a manifest subject that declares `memory.dir` AND
+    /// carries the `--dump` convention gets its OWN delivery proven — and a
+    /// subject that SWALLOWS the delivered var (`fake_agent --drop-env`)
+    /// fails the section naming the subject leg (the negative control that
+    /// proves the leg actually runs; a silent skip would pass).
+    #[test]
+    fn memory_subject_dump_leg_proves_and_fails_the_subjects_own_delivery() {
+        let (dir, facade) = helper_engine();
+
+        // The positive shape: the subject's dump echoes the managed dir.
+        let honest_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-ok-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            honest_dir.path(),
+            "tck-submem-ok",
+            &["--dump", "config-dump.txt", "--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nenv = \"TCK_SUBJECT_MEMORY\"\n"),
+        )
+        .expect("write honest subject manifest");
+        facade
+            .register_with_adapter(
+                "tck-subject",
+                &AdapterRef::Manifest(honest_dir.path().to_path_buf()),
+            )
+            .expect("register honest subject");
+        memory_inner(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(honest_dir.path().to_path_buf()),
+            SECTION_TIMEOUT,
+        )
+        .expect("both memory legs pass for an honest subject");
+        // The subject leg cleaned up: no attachment, terminal state.
+        assert!(facade.memory_status("tck-subject").unwrap().is_none());
+
+        // The negative control: same declaration, but the subject DROPS the
+        // delivered env var — the subject leg must FAIL naming it. (A fresh
+        // engine: `tck-subject` is a fleet-unique name.)
+        let (dir, facade) = helper_engine();
+        let lying_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-drop-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            lying_dir.path(),
+            "tck-submem-drop",
+            &[
+                "--dump",
+                "config-dump.txt",
+                "--drop-env",
+                "TCK_SUBJECT_MEMORY",
+                "--linger-ms",
+                "600000",
+            ],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nenv = \"TCK_SUBJECT_MEMORY\"\n"),
+        )
+        .expect("write lying subject manifest");
+        facade
+            .register_with_adapter(
+                "tck-subject",
+                &AdapterRef::Manifest(lying_dir.path().to_path_buf()),
+            )
+            .expect("register lying subject");
+        let err = memory_inner(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(lying_dir.path().to_path_buf()),
+            Duration::from_millis(400),
+        )
+        .expect_err("a subject that swallows the delivered dir must fail the section");
+        assert!(
+            err.contains("the manifest subject never received the managed memory dir")
+                && err.contains("TCK_SUBJECT_MEMORY"),
+            "{err}"
+        );
+        // No leaked attachment on the failure path either.
+        assert!(facade.memory_status("tck-subject").unwrap().is_none());
+    }
+
+    /// The subject leg skips honestly where it cannot run: a NATIVE subject
+    /// (code-declared launch) and a manifest subject whose launch declares
+    /// no `--dump` pair both return `Ok(())` from the leg itself (the probe
+    /// leg remains their delivery proof), while attaching to a
+    /// STILL-RUNNING subject fails the leg NAMING the attach — never a
+    /// silent no-op.
+    #[test]
+    fn memory_subject_leg_skips_or_fails_naming_the_cause() {
+        let (dir, facade) = helper_engine();
+
+        // Native subject: the leg is a documented skip.
+        assert!(subject_memory_delivery(
+            &facade,
+            dir.path(),
+            &TckAdapter::Native("mock".to_string()),
+            SECTION_TIMEOUT
+        )
+        .is_ok());
+
+        // A manifest subject whose launch carries no --dump pair: skip.
+        let bare_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-bare-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            bare_dir.path(),
+            "tck-submem-bare",
+            &["--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nenv = \"TCK_SUBJECT_MEMORY\"\n"),
+        )
+        .expect("write bare subject manifest");
+        assert!(subject_memory_delivery(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(bare_dir.path().to_path_buf()),
+            SECTION_TIMEOUT
+        )
+        .is_ok());
+
+        // A STILL-RUNNING subject with a dump-carrying declaration: attach
+        // is refused by design (the hot-swap guard) and the leg fails
+        // NAMING the attach.
+        let dump_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-run-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            dump_dir.path(),
+            "tck-submem-run",
+            &["--dump", "config-dump.txt", "--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nenv = \"TCK_SUBJECT_MEMORY\"\n"),
+        )
+        .expect("write running-subject manifest");
+        facade
+            .register_with_adapter(
+                "tck-subject",
+                &AdapterRef::Manifest(dump_dir.path().to_path_buf()),
+            )
+            .expect("register subject");
+        facade.start("tck-subject").expect("start subject");
+        let err = subject_memory_delivery(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(dump_dir.path().to_path_buf()),
+            Duration::from_millis(400),
+        )
+        .expect_err("attach onto a running subject must fail the leg");
+        assert!(
+            err.contains("subject attach_memory failed"),
+            "the leg names the refused attach: {err}"
+        );
+        let _ = facade.stop("tck-subject", Some(Duration::from_secs(5)));
+    }
+
+    /// `TckAdapter::memory_dir_env_target`: the manifest subject's own
+    /// declared env var, the native builtin table's, and the named error
+    /// for a declaration that cannot be re-read.
+    #[test]
+    fn memory_dir_env_target_reads_both_kinds_and_names_errors() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-envtarget-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            dir.path(),
+            "tck-envtarget",
+            &["--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nenv = \"SUBJECT_MEMORY\"\n"),
+        )
+        .expect("write manifest");
+        assert_eq!(
+            TckAdapter::Manifest(dir.path().to_path_buf()).memory_dir_env_target(),
+            Ok(Some("SUBJECT_MEMORY".to_string()))
+        );
+        // The mock builtin declares the reserved key → its env var.
+        assert_eq!(
+            TckAdapter::Native("mock".to_string()).memory_dir_env_target(),
+            Ok(Some("KTESIO_MEMORY_DIR".to_string()))
+        );
+        // A manifest that cannot be re-read: named error, never a collapsed
+        // None (the same honesty rule as `declares_memory_dir`).
+        let err = TckAdapter::Manifest(PathBuf::from("/nonexistent/does-not-exist"))
+            .memory_dir_env_target()
+            .unwrap_err();
+        assert!(err.contains("could not re-read"), "{err}");
+    }
+
+    /// The subject leg's two remaining honest-error arms: a declaration that
+    /// maps `memory.dir` to a NON-env target has no provable dump channel
+    /// (named, never a fabricated skip), and a start that cannot spawn (the
+    /// snapshot's exec binary vanished after attach) fails the leg naming
+    /// the start.
+    #[test]
+    fn memory_subject_leg_names_unprovable_channels_and_failed_starts() {
+        let (dir, facade) = helper_engine();
+
+        // `memory.dir` mapped to a FLAG target: delivery is declared but the
+        // dump echo has no env var to observe — the leg fails NAMING the
+        // unprovable channel (the section-level gate only proved A mapping
+        // exists, not an env one).
+        let flag_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-flag-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            flag_dir.path(),
+            "tck-submem-flag",
+            &["--dump", "config-dump.txt", "--linger-ms", "600000"],
+            None,
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            Some("\n[config.\"memory.dir\"]\nflag = \"--memory-dir\"\n"),
+        )
+        .expect("write flag-target manifest");
+        let err = subject_memory_delivery(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(flag_dir.path().to_path_buf()),
+            Duration::from_millis(400),
+        )
+        .expect_err("a non-env memory.dir target has no provable dump channel");
+        assert!(err.contains("maps 'memory.dir' to no ENV target"), "{err}");
+
+        // A start that cannot spawn: the registered launch's exec binary is
+        // gone by start time — the leg fails naming the subject start.
+        let gone_dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-submem-gone-")
+            .tempdir()
+            .expect("tempdir");
+        let bin = gone_dir.path().join("vanishing-agent");
+        std::fs::copy(crate::fake_agent_bin(), &bin).expect("copy agent");
+        let manifest = format!(
+            r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "tck-submem-gone"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--dump", "config-dump.txt", "--linger-ms", "600000"]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config."memory.dir"]
+env = "TCK_SUBJECT_MEMORY"
+"#,
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(gone_dir.path().join("adapter.toml"), manifest).expect("write manifest");
+        facade
+            .register_with_adapter(
+                "tck-subject",
+                &AdapterRef::Manifest(gone_dir.path().to_path_buf()),
+            )
+            .expect("register subject");
+        std::fs::remove_file(&bin).expect("remove the exec binary");
+        let err = subject_memory_delivery(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(gone_dir.path().to_path_buf()),
+            Duration::from_millis(400),
+        )
+        .expect_err("a spawnable-never start must fail the leg");
+        assert!(err.contains("subject start failed"), "{err}");
+        // The failed leg still detached (no leaked attachment).
+        assert!(facade.memory_status("tck-subject").unwrap().is_none());
     }
 
     // -----------------------------------------------------------------
@@ -3612,9 +4832,13 @@ env = "MODEL"
     #[test]
     fn self_reported_metering_fails_when_the_subject_lies_about_its_tokens() {
         let (dir, facade) = helper_engine();
-        let err =
-            self_reported_metering_inner_with(&facade, dir.path(), &["--usage-input-tokens", "11"])
-                .expect_err("a lying subject must fail the fleet-equality check");
+        let err = self_reported_metering_inner_with(
+            &facade,
+            dir.path(),
+            SECTION_TIMEOUT,
+            &["--usage-input-tokens", "11"],
+        )
+        .expect_err("a lying subject must fail the fleet-equality check");
         assert!(
             err.contains("fleet totals must equal the ledger exactly"),
             "{err}"
@@ -3740,7 +4964,12 @@ env = "MODEL"
         let undeclared = write(
             "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n",
         );
-        match run_config_mapping(&facade, dir.path(), Some(&undeclared)) {
+        match run_config_mapping(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(undeclared.parent().unwrap().to_path_buf()),
+            SECTION_TIMEOUT,
+        ) {
             SectionResult::NotApplicable { reason } => {
                 assert!(reason.contains("no [config] rules"), "{reason}");
             }
@@ -3750,7 +4979,12 @@ env = "MODEL"
         let no_env = write(
             "contract_version = \"1.0.0\"\n\n[adapter]\nkind = \"k\"\n\n[lifecycle.start]\nexec = \"x\"\nargs = []\n\n[metering]\nsource = \"self-reported\"\n\n[config.temperature]\nflag = \"--temp\"\n",
         );
-        match run_config_mapping(&facade, dir.path(), Some(&no_env)) {
+        match run_config_mapping(
+            &facade,
+            dir.path(),
+            &TckAdapter::Manifest(no_env.parent().unwrap().to_path_buf()),
+            SECTION_TIMEOUT,
+        ) {
             SectionResult::NotApplicable { reason } => {
                 assert!(reason.contains("ENV delivery"), "{reason}");
             }
@@ -3763,7 +4997,7 @@ env = "MODEL"
     /// the echo check cannot be deleted silently).
     #[test]
     fn interaction_delivery_fails_when_the_probe_never_echoes() {
-        let (dir, facade) = helper_engine();
+        let (_dir, facade) = helper_engine();
         let scratch = tempfile::Builder::new()
             .prefix("ktesio-tck-noecho-")
             .tempdir()
@@ -3789,13 +5023,9 @@ env = "MODEL"
             .expect("register no-echo probe");
         facade.start("tck-interaction-probe").expect("start probe");
 
-        let err = interaction_delivery(
-            &facade,
-            dir.path(),
-            "tck-interaction-probe",
-            Duration::from_millis(400),
-        )
-        .expect_err("a probe that never echoes must fail the delivery proof");
+        let err =
+            interaction_delivery(&facade, "tck-interaction-probe", Duration::from_millis(400))
+                .expect_err("a probe that never echoes must fail the delivery proof");
         assert!(err.contains("never observed"), "{err}");
     }
 
@@ -3853,7 +5083,7 @@ env = "MODEL"
         // landed `failed` — either way the state is (or becomes) terminal.
         let _ = facade.start("tck-terminal");
 
-        let err = wait_for_state_for(
+        let err = wait_for_state(
             &facade,
             "tck-terminal",
             LifecycleState::Running,
@@ -3875,7 +5105,9 @@ env = "MODEL"
             .tempdir()
             .expect("tempdir");
         let adapter = TckAdapter::Manifest(dir.path().to_path_buf());
-        let report = catch_report(&adapter, || panic!("deliberate tck panic"));
+        let report = catch_report(&adapter, &TckConfig::default(), || {
+            panic!("deliberate tck panic")
+        });
         assert!(!report.is_conformant());
         assert_eq!(report.sections.len(), 8);
         for entry in report.sections.iter() {
