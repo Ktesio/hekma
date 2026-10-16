@@ -4,6 +4,14 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — ACP verified against real OpenCode + Hermes agents.**
+> Announced ahead of the release that ships it:
+>
+> - **opencode is now a run-verified `acp`-kind agent** — opencode v2 ships a native ACP server (`opencode acp`); register it with `--kind acp`, `acp.command = opencode`, `acp.args = acp`. Verified end-to-end against `v2.0.28` (2026-10-16): handshake (its rich `initialize`/`session/new` shapes tolerated), a full prompt turn with the reply retained in the instance log, context-grain `usage_update` surfacing, clean stop. The pre-v2 manifest characterization remains documented for HTTP-native agents without an ACP mode.
+> - **Hermes via `hermes-acp` is run-verified at `v0.21.7+500.g8f81791`** — register → start → full turn → clean stop plus context-grain surfacing; the migration path from the deprecated `hermes` kind now carries a real-run pin, not just the contract-twin proof.
+> - **New opt-in turn-COMPLETION smokes** (`HEKMA_TEST_REAL_AGENT_TURNS=1`): drive a full prompt turn against the real `opencode`/`hermes-acp` binaries and assert the reply text lands in the retained log (reconstructed from the chunk stream — real agents split even a one-token reply across several updates). Default off with a visible skip note; binary presence alone never arms a possibly-costly model call. The existing register/start/send/stop smokes keep their skip-unless-present posture, and the real opencode dialect extras are pinned against the contract twin (`opencode-dialect` fake-agent mode) so tolerance is proven without the binary.
+> - No engine behavior changed: the `acp` kind already tolerated everything the real agents sent; this change adds the PROOF and the docs (validation pins moved forward with fresh evidence in `docs/agents.md`).
+
 > **Unreleased — port-level memory-backing kind invariant (hardening batch).**
 > Announced ahead of the release that ships it:
 >

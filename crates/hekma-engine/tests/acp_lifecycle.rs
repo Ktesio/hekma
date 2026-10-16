@@ -126,8 +126,9 @@ fn register_acp(engine: &Engine, base: &Path, name: &str) -> PathBuf {
     hekma_conformance::fake_acp_agent_bin()
 }
 
-/// Set the launch config keys and start the instance, returning the started
-/// instance (state `running`).
+/// Set the launch config keys for the fake agent (`acp.command` pointing at
+/// the helper binary, `acp.args` carrying `--mode <mode>` plus any extra
+/// args). Configuring only — the CALLER starts the instance.
 fn configure_and_start(engine: &Engine, name: &str, mode: &str, extra_args: &[&str]) {
     let bin = hekma_conformance::fake_acp_agent_bin();
     engine
@@ -1164,6 +1165,338 @@ fn real_gemini_acp_smoke_register_start_send_stop_when_present() {
         .blocking()
         .send_input(name, "smoke prompt")
         .expect("send to the real agent");
+    let stopped = engine.blocking().stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
+
+// ---------------------------------------------------------------------------
+// Story 15-1 — real-agent verification: opencode under the acp kind, and
+// turn COMPLETION (not just turn acceptance) for both real agents.
+// ---------------------------------------------------------------------------
+
+/// The parse for the turn-completion OPT-IN (kept pure so the default-off
+/// posture is unit-pinnable without env mutation races): the smokes run only
+/// when `HEKMA_TEST_REAL_AGENT_TURNS` is set to an affirmative value. A
+/// real model call can cost money or hang on a logged-out agent — the
+/// gemini -32000 lesson generalized — so presence of the binary alone must
+/// not arm them.
+fn parse_turn_env(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(v.trim(), "1" | "true" | "TRUE" | "True"),
+        None => false,
+    }
+}
+
+/// Whether the turn-completion smokes are armed on this machine (visible
+/// opt-out posture: a skip prints a stderr note, surfaced not silent).
+fn turn_smokes_enabled() -> bool {
+    let enabled = parse_turn_env(std::env::var("HEKMA_TEST_REAL_AGENT_TURNS").ok().as_deref());
+    if !enabled {
+        eprintln!(
+            "note: real-agent TURN smokes skipped: HEKMA_TEST_REAL_AGENT_TURNS is not set \
+             (set it to 1 to drive full prompt turns against real agent CLIs)"
+        );
+    }
+    enabled
+}
+
+#[test]
+fn turn_env_parser_is_default_off_and_affirmative_only() {
+    // Default-off: unset, empty, and everything non-affirmative stays off —
+    // a present binary never arms a possibly-costly model call by itself.
+    assert!(!parse_turn_env(None));
+    assert!(!parse_turn_env(Some("")));
+    assert!(!parse_turn_env(Some("0")));
+    assert!(!parse_turn_env(Some("false")));
+    assert!(!parse_turn_env(Some("yes please")));
+    // The affirmative spellings (mirroring the opt-OUT vocabulary).
+    assert!(parse_turn_env(Some("1")));
+    assert!(parse_turn_env(Some("true")));
+    assert!(parse_turn_env(Some(" TRUE ")));
+}
+
+/// Story 15-1, the REAL-AGENT smoke for opencode: opencode v2 ships a native
+/// ACP server (`opencode acp`) — registered under the `acp` kind as
+/// `acp.command = opencode` + `acp.args = acp`. SKIPPED HONESTLY when no
+/// `opencode` is on this machine's PATH (the same skip-unless-present
+/// posture as the hermes/gemini smokes; CI's network-free sandbox never
+/// sees the binary).
+#[test]
+fn real_opencode_acp_smoke_register_start_send_stop_when_present() {
+    if real_smokes_opted_out() {
+        eprintln!(
+            "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
+             (this machine opted out of driving real agent CLIs)"
+        );
+        return;
+    }
+    if !probe_binary_present("opencode") {
+        return; // the honest skip: no real agent on this machine.
+    }
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    let name = "opencode-acp-smoke";
+    register_acp(&engine, base.path(), name);
+    engine
+        .blocking()
+        .set_config(name, "acp.command", "opencode")
+        .expect("set the real agent's launch command");
+    engine
+        .blocking()
+        .set_config(name, "acp.args", "acp")
+        .expect("set the real agent's ACP subcommand argument");
+
+    let started = engine
+        .blocking()
+        .start(name)
+        .expect("real opencode acp start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // One prompt accepted (constant-time; the turn streams asynchronously
+    // and is not waited out here — the turn-COMPLETION smokes below do).
+    engine
+        .blocking()
+        .send_input(name, "smoke prompt")
+        .expect("send to the real agent");
+    let stopped = engine.blocking().stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
+
+/// The agent's visible reply text RECONSTRUCTED from the retained raw
+/// protocol lines: every `agent_message_chunk` (and the legacy
+/// `agent_text_message_chunk` spelling) contributes its `content.text`, in
+/// stream order. Real agents chunk mid-token — opencode v2 sent
+/// "hek" + "ma-acp" + "-turn-ok-…" as three updates — so a raw-line
+/// substring match can never see a whole reply; this is the operator-grade
+/// reconstruction (what the chunks add up to), built only from the honest
+/// record.
+fn agent_reply_text(engine: &Engine, name: &str) -> String {
+    let mut out = String::new();
+    for line in log_texts(engine, name) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(update) = value.pointer("/params/update").and_then(|u| u.as_object()) else {
+            continue;
+        };
+        let kind = update.get("sessionUpdate").and_then(|k| k.as_str());
+        if !matches!(
+            kind,
+            Some("agent_message_chunk") | Some("agent_text_message_chunk")
+        ) {
+            continue;
+        }
+        if let Some(text) = update
+            .get("content")
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// The shared body of a turn-COMPLETION smoke: start the real agent, send a
+/// prompt demanding a unique sentinel reply, poll the RETAINED log (the
+/// engine's own read seam — the operator's eye level) until the sentinel
+/// text lands, then stop clean. "ACP works 100%" means the turn actually
+/// completes through the engine, not merely that a prompt was accepted.
+fn real_turn_completion(binary: &str, acp_args: &str, name: &str) {
+    if !turn_smokes_enabled() {
+        return;
+    }
+    if real_smokes_opted_out() {
+        eprintln!(
+            "note: real-agent TURN smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
+             (this machine opted out of driving real agent CLIs)"
+        );
+        return;
+    }
+    if !probe_binary_present(binary) {
+        eprintln!("note: real-agent TURN smoke skipped: no `{binary}` on this machine's PATH");
+        return;
+    }
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    register_acp(&engine, base.path(), name);
+    engine
+        .blocking()
+        .set_config(name, "acp.command", binary)
+        .expect("set the real agent's launch command");
+    engine
+        .blocking()
+        .set_config(name, "acp.args", acp_args)
+        .expect("set the real agent's ACP arguments");
+
+    let started = engine.blocking().start(name).unwrap_or_else(|err| {
+        panic!(
+            "real agent `{binary}` start failed: {err:?}\n\
+                 note: a JSON-RPC error code answering the handshake is how a PRESENT but \
+                 logged-out/unconfigured agent refuses (log the agent in), and a launch \
+                 failure names the executable; set HEKMA_TEST_REAL_AGENT_TURNS=0 to disarm \
+                 the turn smokes on a machine that only hosts the binary."
+        )
+    });
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // The sentinel is unique per run so a stale line from any earlier turn
+    // can never satisfy the poll.
+    let sentinel = format!("hekma-acp-turn-ok-{}", std::process::id());
+    engine
+        .blocking()
+        .send_input(
+            name,
+            &format!("Reply with exactly this token and nothing else: {sentinel}"),
+        )
+        .expect("send the turn prompt");
+
+    // A REAL model's latency is unbounded; the budget is generous but
+    // finite. TURN COMPLETION means BOTH the sentinel landing in the
+    // reconstructed reply AND the turn's own end (the stopReason-bearing
+    // prompt result, retained in the raw log) — a sentinel seen mid-stream
+    // with the turn still open is NOT completion. The reply is polled
+    // RECONSTRUCTED from the chunk payloads (real agents split even a short
+    // reply across several updates).
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut reply_seen = false;
+    let mut turn_ended = false;
+    loop {
+        if !reply_seen && agent_reply_text(&engine, name).contains(&sentinel) {
+            reply_seen = true;
+        }
+        if !turn_ended && log_texts(&engine, name).concat().contains("stopReason") {
+            turn_ended = true;
+        }
+        if reply_seen && turn_ended {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let reply = agent_reply_text(&engine, name);
+            panic!(
+                "the real turn did not COMPLETE within 180s (sentinel seen: {reply_seen}, \
+                 turn end seen: {turn_ended}). Reconstructed reply so far: {reply:?}\n\
+                 - sentinel missing but reply non-empty → the model paraphrased a healthy \
+                 turn (engine fine; try re-running)\n\
+                 - reply empty and no turn end → the agent may need auth (log it in) or the \
+                 model is too slow\n\
+                 set HEKMA_TEST_REAL_AGENT_TURNS=0 to disarm turn smokes."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // The context-grain usage claim is ASSERTED, not assumed: both verified
+    // agents emit at least one `usage_update`, which the engine surfaces as
+    // the `acp_context_usage` fleet field (never billed). A bounded poll —
+    // the figure lands with the turn's own end-of-turn update.
+    let usage_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let surfaced = engine
+            .blocking()
+            .fleet_entry(name)
+            .ok()
+            .and_then(|entry| entry.acp_context_usage)
+            .is_some();
+        if surfaced || Instant::now() >= usage_deadline {
+            assert!(
+                surfaced,
+                "the turn completed but no acp_context_usage surfaced — the \
+                 context-grain claim in docs/agents.md rests on this assertion"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let stopped = engine.blocking().stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}
+
+/// Story 15-1, turn COMPLETION against the real opencode ACP server
+/// (OPT-IN via `HEKMA_TEST_REAL_AGENT_TURNS=1`: the free default model
+/// still makes a real network call).
+#[test]
+fn real_opencode_acp_turn_completes_when_opted_in() {
+    real_turn_completion("opencode", "acp", "opencode-acp-turn");
+}
+
+/// Story 15-1, turn COMPLETION against the real hermes-acp entry point
+/// (OPT-IN via `HEKMA_TEST_REAL_AGENT_TURNS=1`: a real provider call).
+#[test]
+fn real_hermes_acp_turn_completes_when_opted_in() {
+    real_turn_completion("hermes-acp", "", "hermes-acp-turn");
+}
+
+/// Story 15-1, the DIALECT pin (contract-twin, always runs): the
+/// `opencode-dialect` fake-agent mode proves the engine tolerates the real
+/// opencode v2 handshake and turn shapes — `authMethods` + rich
+/// `agentCapabilities` in `initialize`, `configOptions` in `session/new`,
+/// and an `available_commands_update` + cost-bearing `usage_update` riding
+/// the turn — without a single opencode-named branch in the engine.
+#[test]
+fn opencode_dialect_handshake_and_turn_are_tolerated() {
+    let base = TempDir::new().unwrap();
+    let shared = Arc::new(Mutex::new(Vec::new()));
+    let engine = open(&base, Some(&shared));
+    let name = "opencode-dialect-pin";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "opencode-dialect", &[]);
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(
+        started.state,
+        LifecycleState::Running,
+        "the rich initialize/session-new shapes must not fail the handshake"
+    );
+
+    engine
+        .blocking()
+        .send_input(name, "dialect pin turn")
+        .expect("send");
+    poll_until(
+        "the dialect turn's reply chunks land in the retained log",
+        || log_texts(&engine, name).concat().contains("chunk-1"),
+    );
+
+    // The two known update kinds classify cleanly: the CONTEXT-grain usage
+    // diagnostic surfaces (with its cost block), and NO `unhandled session
+    // update` notice fires for either `available_commands_update` or
+    // `usage_update` (the noisy-unknowns behavior belongs to that mode).
+    poll_until("the CONTEXT-grain usage diagnostic surfaces", || {
+        sink_text(&shared).contains("context tokens reported")
+    });
+    let sink = sink_text(&shared);
+    assert!(
+        !sink.contains("unhandled session update 'available_commands_update'"),
+        "available_commands_update is a KNOWN update kind: {sink}"
+    );
+    assert!(
+        !sink.contains("unhandled session update 'usage_update'"),
+        "usage_update is a KNOWN update kind: {sink}"
+    );
+    // The turn completes (the fake agent's chunks + end_turn response both
+    // reached the honest record).
+    let texts = log_texts(&engine, name).concat();
+    assert!(texts.contains("available_commands_update"), "{texts}");
+    assert!(texts.contains("configOptions"), "{texts}");
+    assert!(texts.contains("authMethods"), "{texts}");
+
+    // The reply RECONSTRUCTION (the deterministic half of the turn smokes'
+    // proof — pinned here so it can never regress unverified): the three
+    // message chunks concatenate ACROSS chunk boundaries with the legacy
+    // spelling included, while the thought chunk's token is EXCLUDED
+    // (thoughts are not the agent's message).
+    let reply = agent_reply_text(&engine, name);
+    assert_eq!(reply, "chunk-1chunk-2chunk-3-legacy", "texts: {texts}");
+    assert!(!reply.contains("thought-never-in-the-reply"));
+
+    // The legacy `agent_text_message_chunk` spelling is NOT in the engine's
+    // v1 vocabulary: the classifier surfaces it as a tolerated-unhandled
+    // update (counted, stream continues) — pinned as the honest behavior.
+    poll_until("the legacy-spelling unhandled notice surfaces", || {
+        sink_text(&shared).contains("unhandled session update 'agent_text_message_chunk'")
+    });
+
     let stopped = engine.blocking().stop(name, None).expect("stop");
     assert_eq!(stopped.state, LifecycleState::Stopped);
 }
