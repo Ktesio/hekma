@@ -74,7 +74,15 @@ use crate::ports::{
 /// is a pipe pair that dies with the engine that held it, so the resume rides
 /// the next handshake, not the adopted process). NULL = a pre-v8 record, or no
 /// session established yet. Not part of any key; no column renamed/removed.
-const SCHEMA_VERSION: i64 = 8;
+/// v9 (story 15-2): the spawn record's NULLABLE `run_id` — the Run identity
+/// (spine AD-7) the start path minted for this spawn, committed WITH the
+/// write-ahead record so ADOPTION can RESUME the Run instead of minting a
+/// fresh one per command (per-run budgets/usage and the breach latch then
+/// survive across the N commands of a detached instance's life). NULL = a
+/// pre-v9 record (adoption mints + writes back + one-time note), or a
+/// policy/settle pid-0 seed row (no current Run). Not part of any key; no
+/// column renamed/removed.
+const SCHEMA_VERSION: i64 = 9;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -247,6 +255,29 @@ ALTER TABLE usage_events ADD COLUMN cached_micros_per_1m INTEGER;
 ///   row (old rows read as NULL = no session on record).
 const SCHEMA_V8: &str = "\
 ALTER TABLE agent_runtime ADD COLUMN acp_session_id TEXT;
+";
+
+/// Schema v9 DDL (story 15-2): the spawn record's Run id — the durable Run
+/// identity (spine AD-7).
+///
+/// ADDITIVE over the frozen `agent_runtime` columns, following the v8
+/// (single NULLABLE TEXT column on the same table) pattern exactly: ONE
+/// NULLABLE TEXT column.
+///
+/// * `run_id TEXT` (NULLABLE) — the Run id the start/restart path minted for
+///   this spawn, committed WITH the write-ahead record (before the process is
+///   treated as supervised, AD-5's ordering). ADOPTION resumes it instead of
+///   minting, which is what makes a detached instance ONE Run across the N
+///   commands of its life: per-run token/dollar totals keep accumulating
+///   under the same id, and an already-recorded breach for that Run is spent
+///   (the latch seeds from breaches.log, which keys events by run_id). NULL =
+///   a pre-v9 record (adoption mints + writes back + one-time note), or a
+///   pid-0 policy/settle seed row (a stopped or never-started instance has no
+///   current Run; the next `start` mints fresh and RESETS the latch — the
+///   genuine-restart semantics are unchanged). NOT part of any UNIQUE key; no
+///   column is renamed/removed, so v1..v8 → v9 preserves every row.
+const SCHEMA_V9: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN run_id TEXT;
 ";
 
 /// A SQLite-backed state store over a single connection.
@@ -464,6 +495,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 8 {
         migrate_step(conn, 8, SCHEMA_V8)?;
+    }
+    if version < 9 {
+        migrate_step(conn, 9, SCHEMA_V9)?;
     }
 
     Ok(())
@@ -972,15 +1006,16 @@ impl StateStore for SqliteStore {
             .execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
-                  detached, acp_session_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                  detached, acp_session_id, run_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
                  restart_count = excluded.restart_count, \
                  last_known_cause = excluded.last_known_cause, \
                  detached = excluded.detached, \
-                 acp_session_id = excluded.acp_session_id",
+                 acp_session_id = excluded.acp_session_id, \
+                 run_id = excluded.run_id",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -990,6 +1025,7 @@ impl StateStore for SqliteStore {
                     record.last_known_cause,
                     record.detach as i64,
                     record.acp_session_id,
+                    record.run_id.as_ref().map(|run| run.as_str()),
                 ],
             )
             .map_err(backend)?;
@@ -1016,6 +1052,34 @@ impl StateStore for SqliteStore {
             .execute(
                 "UPDATE agent_runtime SET acp_session_id = ?1 WHERE instance_id = ?2",
                 rusqlite::params![session_id, id],
+            )
+            .map_err(backend)?;
+        if rows == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn set_spawn_run_id(&self, name: &InstanceName, run_id: &RunId) -> Result<(), StoreError> {
+        // Story 15-2: the durable Run identity's focused UPDATE — written by
+        // the start path (via the full record upsert, which carries the id) is
+        // NOT this method's caller; this is the ADOPTION path's back-compat
+        // write for a pre-v9 record (whose column reads NULL), so the mint +
+        // its one-time note are genuinely one-time. A missing record row is
+        // NotFound — the caller surfaces it (surfaced-not-silent, AI-18): a
+        // dropped Run identity must never vanish silently.
+        let id = self
+            .instance_id(name)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })?;
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE agent_runtime SET run_id = ?1 WHERE instance_id = ?2",
+                rusqlite::params![run_id.as_str(), id],
             )
             .map_err(backend)?;
         if rows == 0 {
@@ -1091,7 +1155,7 @@ impl StateStore for SqliteStore {
         self.conn
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
-                 detached, acp_session_id \
+                 detached, acp_session_id, run_id \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -1107,7 +1171,7 @@ impl StateStore for SqliteStore {
             .conn
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
-                 r.last_known_cause, r.detached, r.acp_session_id \
+                 r.last_known_cause, r.detached, r.acp_session_id, r.run_id \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1262,9 +1326,9 @@ impl StateStore for SqliteStore {
 }
 
 /// Build a [`SpawnRecord`] from a result row (the `pid, start_time,
-/// restart_policy, restart_count, last_known_cause, detached, acp_session_id`
-/// columns), decoding the policy wire form and clamping the integer columns
-/// into domain types.
+/// restart_policy, restart_count, last_known_cause, detached, acp_session_id,
+/// run_id` columns), decoding the policy wire form and clamping the integer
+/// columns into domain types.
 fn row_to_spawn_record(
     name: InstanceName,
     row: &rusqlite::Row<'_>,
@@ -1276,6 +1340,11 @@ fn row_to_spawn_record(
     let last_known_cause: Option<String> = row.get("last_known_cause").map_err(backend)?;
     let detached: i64 = row.get("detached").map_err(backend)?;
     let acp_session_id: Option<String> = row.get("acp_session_id").map_err(backend)?;
+    // Story 15-2: NULL = a pre-v9 record or a pid-0 seed row (no current Run);
+    // any other string is the persisted Run id verbatim (RunId::from_wire is
+    // infallible for a non-empty string — the id is opaque, never re-derived).
+    let run_id_raw: Option<String> = row.get("run_id").map_err(backend)?;
+    let run_id = run_id_raw.map(RunId::from_wire);
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1289,6 +1358,7 @@ fn row_to_spawn_record(
         last_known_cause,
         detach: detached != 0,
         acp_session_id,
+        run_id,
     })
 }
 
@@ -1640,6 +1710,7 @@ mod tests {
             last_known_cause: None,
             detach: false,
             acp_session_id: None,
+            run_id: None,
         }
     }
 
@@ -1852,6 +1923,153 @@ mod tests {
         // Exactly one row (replaced, not duplicated).
         let all = store.list_spawn_records().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // ---- Story 15-2: the spawn record's run_id (schema v9) ----
+
+    #[test]
+    fn run_id_round_trips_and_resets_with_the_record() {
+        // The v9 column rides the record both ways: Some on write, Some on
+        // read (get AND list — the reconcile input), and a FRESH upsert (the
+        // next genuine start/restart) replaces it with the new Run's id —
+        // the Run resets exactly when a new process is spawned.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("away", "mock", "/x/agents/away"))
+            .unwrap();
+        let mut rec = record("away", 111, 222, 0);
+        let first = crate::domain::RunId::mint();
+        rec.run_id = Some(first.clone());
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("away")).unwrap().unwrap();
+        assert_eq!(
+            back.run_id.as_ref(),
+            Some(&first),
+            "the id must ride the record"
+        );
+        let listed = store.list_spawn_records().unwrap();
+        assert_eq!(listed[0].run_id.as_ref(), Some(&first));
+
+        // A genuine restart rewrites the record with a FRESH id.
+        let second = crate::domain::RunId::mint();
+        let mut restarted = record("away", 112, 223, 1);
+        restarted.run_id = Some(second.clone());
+        store.upsert_spawn_record(&restarted).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("away"))
+                .unwrap()
+                .unwrap()
+                .run_id,
+            Some(second),
+            "the fresh upsert replaces the Run id (the Run resets on respawn)"
+        );
+
+        // set_spawn_run_id is the adoption back-compat write: a minted id
+        // lands on the row (pre-v9 records read None; the engine writes the
+        // mint back so the note is one-time).
+        let minted = crate::domain::RunId::mint();
+        store.set_spawn_run_id(&name("away"), &minted).unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("away"))
+                .unwrap()
+                .unwrap()
+                .run_id,
+            Some(minted)
+        );
+
+        // The settle drops the Run identity with the live record: the
+        // retained pid-0 seed carries NO run id (a stopped instance has no
+        // current Run).
+        let mut settling = record("away", 113, 224, 1);
+        settling.acp_session_id = Some("sess".to_string());
+        settling.run_id = Some(crate::domain::RunId::mint());
+        store.upsert_spawn_record(&settling).unwrap();
+        assert!(store.settle_spawn_record(&name("away")).unwrap());
+        let seed = store.get_spawn_record(&name("away")).unwrap().unwrap();
+        assert_eq!(seed.fingerprint.pid, 0);
+        assert_eq!(seed.run_id, None, "the settle seed carries no Run identity");
+    }
+
+    #[test]
+    fn set_spawn_run_id_for_a_missing_record_is_not_found() {
+        // The adoption path's back-compat write surfaces a missing row (a
+        // silently dropped Run identity would re-break per-command Runs
+        // with no trace — AI-18).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("ghost", "mock", "/x/agents/ghost"))
+            .unwrap();
+        let err = store
+            .set_spawn_run_id(&name("ghost"), &crate::domain::RunId::mint())
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn pre_v9_spawn_record_migrates_to_a_none_run_id() {
+        // Back-compat (the I/O matrix's pre-v9 row): a v8 DB whose
+        // agent_runtime rows predate the run_id column migrates additively —
+        // every existing row reads run_id = None (adoption mints + writes
+        // back), and user_version lands at 9.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            // Hand-build a v8-shaped DB: v1..v8 DDL + a spawn-record row with
+            // the v8 column set, stamped at user_version 8.
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE agent_instances (
+                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                     kind TEXT NOT NULL, state TEXT NOT NULL,
+                     agent_home TEXT NOT NULL, created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL);
+                 CREATE TABLE usage_events (
+                     id INTEGER PRIMARY KEY,
+                     instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,
+                     run_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
+                     output_tokens INTEGER NOT NULL, metering_source TEXT NOT NULL,
+                     occurred_at TEXT NOT NULL);
+                 CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);
+                 CREATE TABLE agent_runtime (
+                     id INTEGER PRIMARY KEY,
+                     instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,
+                     pid INTEGER NOT NULL, start_time INTEGER NOT NULL,
+                     restart_policy TEXT NOT NULL, restart_count INTEGER NOT NULL DEFAULT 0,
+                     last_known_cause TEXT, detached INTEGER NOT NULL DEFAULT 0,
+                     acp_session_id TEXT);
+                 PRAGMA user_version = 8;
+                 COMMIT;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances \
+                 (name, kind, state, agent_home, created_at, updated_at) \
+                 VALUES ('legacy', 'mock', 'running', '/x', '2026-10-16T00:00:00Z', '2026-10-16T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, detached, acp_session_id) \
+                 VALUES (1, 4242, 77, 'on-failure', 0, NULL, 1, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopen: the v9 ALTER adds the column (NULL for the legacy row).
+        let store = SqliteStore::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
+        assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
+        assert!(rec.detach, "the legacy detached flag survives");
+        assert_eq!(rec.run_id, None, "a pre-v9 record reads run_id = None");
     }
 
     #[test]

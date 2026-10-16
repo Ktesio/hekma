@@ -135,8 +135,23 @@ pub enum TransitionCause {
     /// (story 1-5, AC2): `paused → running` on a best-effort OS/adapter. Wire tag
     /// `resume-best-effort`.
     ResumeBestEffort {
-        /// The best-effort detail (names the OS + declared level) recorded in the
-        /// instance log (AC2).
+        /// The best-effort detail (names the OS + declared level) recorded in
+        /// the instance log (AC2).
+        detail: String,
+    },
+    /// A DETACHED paused child resumed at ENGINE RELEASE (story 15-2, Fibery
+    /// 178): the `paused → running` edge the engine's close pass drives when
+    /// it is about to drop the handle of a DETACHED instance whose row reads
+    /// `paused`. Between commands nothing supervises a detached child, so a
+    /// paused one would stay SIGSTOPped and unwatched forever; releasing it
+    /// resumed (BEFORE the handle drops) is the never-stranded-frozen
+    /// guarantee. Wire tag `detached-resumed` — DISTINCT from
+    /// [`TransitionCause::Command`] (`"resume"`) so the lifecycle log never
+    /// claims an operator resume that never happened. Carries a detail (the
+    /// release note; names a signal failure when the SIGCONT could not be
+    /// delivered).
+    DetachedResumed {
+        /// The release detail recorded in the instance log.
         detail: String,
     },
     /// The supervised process CRASHED — exited without a requested stop (story
@@ -269,6 +284,15 @@ impl TransitionCause {
     /// A best-effort RESUME cause recording `detail` (the OS + declared level).
     pub fn resume_best_effort(detail: impl Into<String>) -> Self {
         TransitionCause::ResumeBestEffort {
+            detail: detail.into(),
+        }
+    }
+
+    /// A DETACHED-release RESUME cause recording `detail` (story 15-2) — the
+    /// `paused → running` edge the engine's close pass drives before dropping
+    /// a detached paused handle.
+    pub fn detached_resumed(detail: impl Into<String>) -> Self {
+        TransitionCause::DetachedResumed {
             detail: detail.into(),
         }
     }
@@ -669,6 +693,7 @@ mod tests {
                 TransitionCause::resume_best_effort("x"),
                 "resume-best-effort",
             ),
+            (TransitionCause::detached_resumed("x"), "detached-resumed"),
             (TransitionCause::crashed("x"), "crashed"),
             (TransitionCause::restarted(1, 1000), "restarted"),
             (

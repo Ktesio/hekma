@@ -723,4 +723,101 @@ impl Supervisor {
             source,
         })
     }
+
+    /// Story 15-2 (Fibery 178): release DETACHED paused handles at engine
+    /// close — the never-stranded-frozen guarantee.
+    ///
+    /// A detached child paused by an operator (or by a budget breach) is
+    /// frozen for exactly as long as SOME engine holds its handle. When the
+    /// holding command's engine exits, the handle drops DISARMED (story 12-1)
+    /// — nothing kills the child, but equally nothing ever SIGCONTs it: it
+    /// stayed SIGSTOPped and unsupervised between commands, forever, unless
+    /// the operator happened to run `resume`. This pass closes that: for every
+    /// held handle whose spawn record is DETACHED and whose row reads
+    /// `paused`, RESUME the child BEFORE the handle is released (the caller
+    /// runs this at engine close, while `self.running` still holds the
+    /// handles) and record the honest `paused → running` edge with the
+    /// [`TransitionCause::DetachedResumed`] cause — never a plain `resume`
+    /// command, which would claim an operator action that never happened.
+    ///
+    /// Semantics contract (deliberate, documented in `docs/commands.md`): a
+    /// `pause` of a detached instance holds only while an engine session holds
+    /// the instance; at that session's exit the child is resumed and the row
+    /// moves to `running`, both surfaced through the note below. A
+    /// NON-detached paused handle is untouched here — its drop already kills
+    /// the group (the story 1-6 no-survivor guarantee), so there is nothing to
+    /// strand. Best-effort per instance: a resume-signal failure is SURFACED
+    /// (the note names it) and the child is still released — the pass never
+    /// blocks engine teardown on one instance.
+    pub(crate) fn release_detached_paused(&mut self, registry: &Registry) {
+        // Pass 1 (immutable): collect the candidates. The spawn record is the
+        // durable detach truth (the same source adoption and the Fleet
+        // indicator read); the row's `paused` state is the pause truth. Both
+        // reads degrade to "not a candidate" (an unreadable record/state never
+        // blocks teardown — the handle then simply drops as before).
+        let candidates: Vec<InstanceName> = self
+            .running
+            .keys()
+            .filter(|name| {
+                let detached = registry
+                    .spawn_record(name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.detach);
+                let paused = registry
+                    .lookup(name)
+                    .map(|inst| inst.state)
+                    .is_ok_and(|state| state == LifecycleState::Paused);
+                detached && paused
+            })
+            .cloned()
+            .collect();
+        // Pass 2: resume + record + note, one instance at a time.
+        for name in candidates {
+            let Some(supervised) = self.running.get_mut(&name) else {
+                continue;
+            };
+            match self.backend.resume(&mut supervised.handle) {
+                Ok(()) => {
+                    let detail = "resumed at engine release: a detached child is never \
+                                  left SIGSTOPped and unsupervised between commands";
+                    let cause = TransitionCause::detached_resumed(detail);
+                    if let Err(err) = self.transition(
+                        registry,
+                        &name,
+                        LifecycleState::Paused,
+                        LifecycleState::Running,
+                        cause,
+                    ) {
+                        // The child IS resumed but the row still says paused —
+                        // surfaced, never silent (AI-18); teardown continues.
+                        self.emit_diagnostic(&format!(
+                            "{}: the detached paused child was resumed at engine release, \
+                             but recording the paused→running transition failed ({err}) — \
+                             the row may read 'paused' until the next command adopts it",
+                            name.as_str(),
+                        ));
+                    }
+                    self.emit_diagnostic(&format!(
+                        "{}: paused detached child resumed at engine release (SIGCONT before \
+                         the handle was released) — a detached instance is only paused while \
+                         an engine session holds it; the row is now 'running'",
+                        name.as_str(),
+                    ));
+                }
+                Err(err) => {
+                    // The matrix's error arm: the note names the failure; the
+                    // child is still released (the map drops the disarmed
+                    // handle below exactly as before — no kill, no hold).
+                    self.emit_diagnostic(&format!(
+                        "{}: the paused detached child could NOT be resumed at engine \
+                         release ({err}) — it stays suspended after this command exits; \
+                         `hekma agent resume {}` from a later command is the recovery",
+                        name.as_str(),
+                        name.as_str(),
+                    ));
+                }
+            }
+        }
+    }
 }

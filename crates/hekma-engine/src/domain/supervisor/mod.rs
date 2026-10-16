@@ -1331,6 +1331,7 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::StopForced { detail } => format!(" (forced: {detail})"),
         TransitionCause::PauseBestEffort { detail } => format!(" (best-effort: {detail})"),
         TransitionCause::ResumeBestEffort { detail } => format!(" (best-effort: {detail})"),
+        TransitionCause::DetachedResumed { detail } => format!(" (detached-resume: {detail})"),
         TransitionCause::Crashed { detail } => format!(" (crashed: {detail})"),
         TransitionCause::Restarted { count, waited_ms } => {
             format!(" (restart #{count}, waited {waited_ms}ms)")

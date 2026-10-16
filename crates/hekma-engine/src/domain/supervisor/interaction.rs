@@ -357,6 +357,109 @@ impl Supervisor {
         }
     }
 
+    /// The RAW `agent.log` FALLBACK read (story 15-2, Fibery 207) — honest
+    /// un-attributed passthrough for the between-commands window.
+    ///
+    /// A detached instance's stdout keeps appending to the crash-immune RAW
+    /// `agent.log` for as long as the process lives, but the ATTRIBUTED
+    /// capture (`logs/output.log`) only grows while a live engine's tailer
+    /// thread runs — which dies with the engine that spawned it. Between
+    /// commands (the whole point of `--detach`), `agent logs --follow` in a
+    /// NEW command therefore saw nothing new. This read closes that gap: it
+    /// tails the RAW file directly, byte-cursor shaped EXACTLY like
+    /// [`Supervisor::read_agent_log_since`] (a returned cursor below the one
+    /// passed in = the file shrank — `agent.log` is never rotated, so that is
+    /// a truncation, and the caller surfaces it the same way as a rotation).
+    ///
+    /// Honesty rules (the "un-attributed" label, AI-18):
+    /// * Each raw line is returned as a [`LogLine`] with `stream = agent-out`
+    ///   — TRUE (agent.log is the stdout-only capture) — and `at` = the time
+    ///   THIS READ observed it, the same semantic the attributed tailer's
+    ///   stamp has. What the raw line genuinely lacks is REAL-TIME
+    ///   attribution: the write may have happened long before the read. The
+    ///   CALLER surfaces that qualifier ONCE per session on stderr (never
+    ///   per-poll), which is why this returns plain [`LogLine`]s: `--json`
+    ///   stays pure NDJSON and the frozen [`crate::domain::LOG_SCHEMA_VERSION`]
+    ///   surface is untouched.
+    /// * GUARD — only an instance with NO live capture in THIS engine session
+    ///   falls back: a supervisor that holds a live tailer gets
+    ///   `(vec![], current_len)`, because the tailer is already attributing
+    ///   those same bytes (a fallback read here would DOUBLE-report them).
+    ///   Every CLI command's engine re-holds ADOPTED handles
+    ///   (`log_capture: None`), so the fallback is what a new command's
+    ///   `--follow` streams from; an embedding host that spawned the instance
+    ///   in-process keeps the attributed pipeline untouched.
+    /// * `cursor: None` PRIMES the loop: it returns `(vec![], current_len)`
+    ///   so the caller streams only lines written after it started (the
+    ///   pre-existing raw backlog is already visible through the attributed
+    ///   generations where the tailer ever ran; replaying all of `agent.log`
+    ///   would duplicate it).
+    /// * Absent file → an honest empty read (cursor 0) — "both absent →
+    ///   honest empty" in the story's matrix.
+    pub fn read_raw_output_since(
+        &self,
+        registry: &Registry,
+        name: &str,
+        cursor: Option<u64>,
+    ) -> Result<(Vec<LogLine>, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let path = registry.agent_output_log_path(&name);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        let len = bytes.len() as u64;
+        // PRIME (or the live-capture guard): no lines, cursor at the current
+        // end. The guard MUST advance the cursor too — otherwise the moment
+        // the tailer dies the next poll would dump the whole attributed
+        // backlog as raw lines.
+        let live_capture = self
+            .running
+            .get(&name)
+            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some());
+        let cursor = match cursor {
+            None => return Ok((Vec::new(), len)),
+            Some(_) if live_capture => return Ok((Vec::new(), len)),
+            Some(cursor) => cursor,
+        };
+        match plan_follow(&bytes, cursor) {
+            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), new_cursor)),
+            FollowPlan::Consume { range, new_cursor } => {
+                let mut lines = Vec::new();
+                if !range.is_empty() {
+                    for raw in String::from_utf8_lossy(&bytes[range]).lines() {
+                        if raw.trim().is_empty() {
+                            continue;
+                        }
+                        // The attributed view strips trailing newlines
+                        // (`LogLine::text`'s contract); match it so the two
+                        // streams render identically. The timestamp is the
+                        // READ time — the qualifier's one honest caveat.
+                        lines.push(LogLine::new(
+                            name.as_str(),
+                            LogStream::AgentOut,
+                            raw,
+                            now_rfc3339(),
+                        ));
+                    }
+                }
+                Ok((lines, new_cursor))
+            }
+        }
+    }
+
     /// Ensure the per-instance log directory exists (AD-12 seed).
     pub(super) fn ensure_log_dir(
         &self,

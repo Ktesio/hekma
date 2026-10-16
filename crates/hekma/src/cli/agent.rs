@@ -599,6 +599,20 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
             ui::TableCell::plain("Metering source"),
             ui::TableCell::plain(metering_value),
         ],
+        // Story 15-2 (Fibery 176): the supervision indicator — `detached`
+        // (survives engine exits; every later command re-adopts it and
+        // resumes its durable Run) or `session` (dies with the engine
+        // session), or the honest `—` when no live spawn record exists (a
+        // stopped/never-started instance never implies supervised).
+        vec![
+            ui::TableCell::plain("Supervision"),
+            ui::TableCell::plain(
+                entry
+                    .and_then(|e| e.supervision)
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|| FleetEntry::METERING_SEED_CELL.to_string()),
+            ),
+        ],
     ];
     // Story 14-3 (T1): the ACP context-usage row — rendered for an `acp`
     // instance only (the Fleet read carries the kind), holding the
@@ -1031,6 +1045,14 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         ui::TableColumn::new("Name", 12, 32),
         ui::TableColumn::new("Kind", 8, 24),
         ui::TableColumn::new("State", 10, 12),
+        // Story 15-2 (Fibery 176): the supervision indicator — `detached`
+        // (survives engine exits) vs `session` (dies with the engine
+        // session), or the honest `—` absence when no live spawn record
+        // exists (a stopped/never-started instance never implies
+        // supervised). Compact marker per the AI-43 width discipline:
+        // min_width = the header's own length, so the header survives any
+        // shrink that still renders it.
+        ui::TableColumn::new("Supervision", 11, 11),
         ui::TableColumn::new("Restarts", 8, 10),
         ui::TableColumn::new(BUDGET_LIST_HEADER, 15, 34),
         // min_width = the header's own length: the qualifier survives any
@@ -1053,10 +1075,18 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ui::TableCell::muted(budget_text)
             };
+            // Story 15-2: the supervision marker — a live record renders its
+            // compact `detached`/`session` label; NO record is the honest
+            // muted `—` (never an implied supervised).
+            let supervision_cell = match entry.supervision {
+                Some(supervision) => ui::TableCell::plain(supervision.as_str().to_string()),
+                None => ui::TableCell::muted(FleetEntry::METERING_SEED_CELL.to_string()),
+            };
             vec![
                 ui::TableCell::skill(entry.name.as_str()),
                 ui::TableCell::plain(entry.kind.clone()),
                 ui::TableCell::status(entry.state.as_str()),
+                supervision_cell,
                 ui::TableCell::plain(entry.restart_count.to_string()),
                 budget_cell,
                 // Usage is REAL now (story 3-1): the cumulative token totals —
@@ -1432,6 +1462,16 @@ const FOLLOW_FINAL_DRAIN_BOUND: Duration = Duration::from_secs(2);
 /// How often the final-drain retry (above) re-polls while waiting.
 const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// The once-per-session qualifier for the RAW `agent.log` fallback lines
+/// (story 15-2, AI-18): between commands a detached instance's stdout lands
+/// only in the raw, un-attributed capture, so `logs --follow` in a new
+/// command streams those lines as an honest passthrough. The label rides
+/// stderr (AD-12) and is printed ONCE per session — the first time a raw
+/// line appears, never per poll.
+const RAW_FALLBACK_QUALIFIER: &str = "lines that follow may be un-attributed raw \
+     passthrough from agent.log: they were captured without a live engine tailer, so their \
+     timestamps are when this command read them, not when the agent wrote them";
+
 /// `hekma agent logs <name> [--follow]` — read retained logs, optionally
 /// following live output (story 4-2, FR-25, spine AD-12).
 ///
@@ -1461,6 +1501,13 @@ const FOLLOW_FINAL_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Output discipline holds in BOTH modes (DC-3): stdout stays pure NDJSON while
 /// the rotation notice and the follow-exit note ride on stderr (AD-12).
 ///
+/// Story 15-2 — the RAW fallback: while following, lines a live engine tailer
+/// never attributed (a detached instance's between-commands output) stream
+/// from the raw `agent.log` as real [`LogLine`]s (`agent-out` stream, the
+/// read-time timestamp), with the once-per-session un-attributed qualifier on
+/// stderr ([`RAW_FALLBACK_QUALIFIER`]) — stdout stays pure NDJSON in both
+/// modes.
+///
 /// A downstream consumer that STOPS READING (`hekma agent logs --json | head -5`)
 /// ends the command CLEANLY with exit `0` in every mode — one-shot, `--follow`,
 /// human, or JSON (fix pass, M1: see [`emit_log_lines`]). It is not an error; the
@@ -1483,6 +1530,17 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
     if emit_log_lines(&lines, json)? == EmitOutcome::PipeClosed || !follow {
         return Ok(());
     }
+    // Story 15-2: prime the RAW `agent.log` fallback cursor for the
+    // between-commands window — a detached instance's output keeps landing in
+    // the raw capture while no live engine tailer exists to attribute it, and
+    // `None` primes at the current end so only lines written AFTER this
+    // command started stream through the loop below.
+    let (_, mut raw_cursor) = facade
+        .read_raw_output_since(name, None)
+        .map_err(map_engine_error)?;
+    // The un-attributed qualifier is surfaced ONCE PER SESSION (never per
+    // poll) — the first time a raw fallback line actually appears.
+    let mut raw_qualifier_shown = false;
 
     loop {
         std::thread::sleep(LOGS_FOLLOW_POLL_INTERVAL);
@@ -1494,6 +1552,22 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
             return Ok(());
         }
         cursor = next_cursor;
+        // Story 15-2: the raw fallback poll — attributed lines first (above),
+        // then any raw lines that arrived in the same window. The engine's
+        // live-capture guard makes this a no-op while a real tailer is
+        // attributing the same bytes.
+        let (raw_lines, next_raw_cursor) = facade
+            .read_raw_output_since(name, Some(raw_cursor))
+            .map_err(map_engine_error)?;
+        note_if_rotated(next_raw_cursor, raw_cursor, name);
+        if !raw_lines.is_empty() && !raw_qualifier_shown {
+            raw_qualifier_shown = true;
+            ui::note(RAW_FALLBACK_QUALIFIER);
+        }
+        if emit_log_lines(&raw_lines, json)? == EmitOutcome::PipeClosed {
+            return Ok(());
+        }
+        raw_cursor = next_raw_cursor;
 
         let status = facade.instance_status(name).map_err(map_engine_error)?;
         if status.instance.state != LifecycleState::Running {
@@ -1515,7 +1589,19 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                     return Ok(());
                 }
                 cursor = next_cursor;
-                if !more.is_empty() || Instant::now() >= final_deadline {
+                let (raw_more, next_raw_cursor) = facade
+                    .read_raw_output_since(name, Some(raw_cursor))
+                    .map_err(map_engine_error)?;
+                note_if_rotated(next_raw_cursor, raw_cursor, name);
+                if !raw_more.is_empty() && !raw_qualifier_shown {
+                    raw_qualifier_shown = true;
+                    ui::note(RAW_FALLBACK_QUALIFIER);
+                }
+                if emit_log_lines(&raw_more, json)? == EmitOutcome::PipeClosed {
+                    return Ok(());
+                }
+                raw_cursor = next_raw_cursor;
+                if (more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
                     break;
                 }
                 std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
@@ -3268,6 +3354,9 @@ mod tests {
             metering_source: "self-reported".to_string(),
             acp_context_usage: None,
             usage_gap: None,
+            // Story 15-2: the honest absence — a registered instance has no
+            // live spawn record, so it is not supervised.
+            supervision: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }

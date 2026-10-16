@@ -477,8 +477,52 @@ pub struct FleetEntry {
     /// and every other kind omit the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_gap: Option<UsageGapNotice>,
+    /// The supervision indicator (story 15-2, Fibery 176) — whether this
+    /// instance's live process is DETACHED (survives engine exits; the spawn
+    /// record's durable `detach` flag) or SESSION-bound (dies with the engine
+    /// session that spawned it). Composed from the ALREADY-LOADED spawn
+    /// record: `Some(...)` exactly when a LIVE-process record exists (a
+    /// pid-0 policy/settle seed is not supervision), `None` (field omitted)
+    /// when the record is cleared — a stopped or never-started instance never
+    /// implies supervised (an honest absence the human cells render as `—`).
+    /// ADDITIVE + absent-when-none (`skip_serializing_if`), the
+    /// `acp_context_usage` pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision: Option<Supervision>,
     /// Absolute Agent Home path (engine-computed; the path authority).
     pub agent_home: String,
+}
+
+/// How an instance's live process is supervised (story 15-2, Fibery 176) —
+/// the Fleet-facing answer to "what happens to this agent when the command
+/// exits?". Kebab-case on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Supervision {
+    /// Spawned with `--detach` (story 12-1): the process survives engine
+    /// exits; every later command re-adopts it disarmed and RESUMES its
+    /// durable Run (story 15-2).
+    Detached,
+    /// Bound to an engine session (the default): the process — spawned or
+    /// adopted — is killed at the engine's clean exit (the story 1-6
+    /// no-survivor guarantee).
+    Session,
+}
+
+impl Supervision {
+    /// The stable wire/label form (`"detached"` / `"session"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Supervision::Detached => "detached",
+            Supervision::Session => "session",
+        }
+    }
+}
+
+impl std::fmt::Display for Supervision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl FleetEntry {
@@ -731,6 +775,9 @@ mod tests {
             metering_source: "self-reported".to_string(),
             acp_context_usage: None,
             usage_gap: None,
+            // Story 15-2: no spawn record in this fixture — the honest absence
+            // (a registered instance is not supervised).
+            supervision: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }

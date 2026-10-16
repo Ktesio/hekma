@@ -67,6 +67,17 @@ pub struct SpawnRecord {
     /// resume rides the next handshake. `settle_spawn_record` retains the id
     /// across a stop/crash settle on a pid-0 seed row.
     pub acp_session_id: Option<String>,
+    /// Story 15-2: the Run id (spine AD-7) this spawn opened, minted by the
+    /// start/restart path and committed WITH the write-ahead record — the
+    /// durable Run identity. `None` for a pre-v9 record (adoption mints and
+    /// writes one back, surfacing a one-time note) and for the pid-0 policy /
+    /// settle-retained seed rows (a stopped or never-started instance has no
+    /// current Run; the next `start` mints fresh). ADOPTION resumes the
+    /// persisted id instead of minting, so per-run budgets/usage and the
+    /// breach latch survive across the N commands of a detached instance's
+    /// life; a genuine restart (stop→start, or the reaper's restart path)
+    /// rewrites the record with a freshly minted id and the Run resets.
+    pub run_id: Option<RunId>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.
@@ -193,6 +204,16 @@ pub trait StateStore {
         name: &InstanceName,
         session_id: Option<&str>,
     ) -> Result<(), StoreError>;
+
+    /// Persist the current [`RunId`] onto the instance's spawn record (story
+    /// 15-2) — the durable Run identity's single WRITE beside the start path's
+    /// record commit. The ADOPTION path is the other caller: for a pre-v9
+    /// record (whose `run_id` reads `None`) it mints one and writes it back so
+    /// the back-compat mint + its one-time note are genuinely one-time (the
+    /// NEXT command resumes the id instead of minting again). Fails with
+    /// [`StoreError::NotFound`] when no record row exists (a dropped Run
+    /// identity must never vanish silently, AI-18).
+    fn set_spawn_run_id(&self, name: &InstanceName, run_id: &RunId) -> Result<(), StoreError>;
 
     /// Settle the write-ahead spawn record (story 14-2): clear the live
     /// record — a clean stop, a crash reconcile, a terminal settle — while
