@@ -655,25 +655,38 @@ impl Supervisor {
                     let run_id = match record.run_id.clone() {
                         Some(persisted) => persisted,
                         None => {
+                            // Review round 1: the mint note comes AFTER the
+                            // successful write-back (the Err arm carries the
+                            // failure) — a note printed before the write
+                            // could claim "persisted" of an id that never
+                            // landed.
                             let minted = RunId::mint();
-                            self.emit_diagnostic(&format!(
-                                "{}: the spawn record predates durable Run ids — a fresh \
-                                 Run id was minted for it and persisted; per-run totals and \
-                                 breach state continue under it from the next command on",
-                                name.as_str(),
-                            ));
-                            if let Err(err) = registry.set_spawn_run_id(&name, &minted) {
+                            match registry.set_spawn_run_id(&name, &minted, &record.fingerprint) {
+                                Ok(()) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the spawn record predates durable Run ids — a fresh \
+                                         Run id was minted for it and persisted; per-run totals and \
+                                         breach state continue under it from the next command on",
+                                        name.as_str(),
+                                    ));
+                                }
                                 // Surfaced-not-silent (AI-18): without the
                                 // write-back every later command mints AGAIN
                                 // (the pre-v9 behavior) — the operator must
                                 // hear that, not infer it from resetting
-                                // per-run totals.
-                                self.emit_diagnostic(&format!(
-                                    "{}: could not persist the minted Run id onto the \
-                                     spawn record ({err}) — each later command mints a \
-                                     fresh Run until a write succeeds",
-                                    name.as_str(),
-                                ));
+                                // per-run totals. (The CAS names the rarer
+                                // concurrent stop→start loss itself, where
+                                // the winner's fresh Run id — not a fresh
+                                // mint — is what the next command resumes.)
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: could not persist the minted Run id onto the \
+                                         spawn record ({err}) — each later command mints a \
+                                         fresh Run until a write succeeds (or, if a concurrent \
+                                         stop→start replaced the record, resumes ITS fresh Run)",
+                                        name.as_str(),
+                                    ));
+                                }
                             }
                             minted
                         }
@@ -690,17 +703,57 @@ impl Supervisor {
                     // (Fibery 205), while a genuinely un-recorded crossing
                     // still fires exactly once (AI-44, now durable: the
                     // crash-between-record-and-action window self-heals on
-                    // the FIRST adoption, not the next usage event). A
-                    // corrupt/unreadable breach log degrades to an EMPTY
-                    // latch — fail-open toward one extra enforcement pass,
-                    // never toward silently skipping enforcement.
-                    let breached_scopes =
-                        super::read_breach_events_from(&registry.instance_breach_log_path(&name))
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|event| event.run_id == run_id.as_str())
-                            .map(|event| (event.dimension, event.scope))
-                            .collect::<std::collections::HashSet<_>>();
+                    // the FIRST adoption, not the next usage event).
+                    //
+                    // Review round 1, ACTION FILTER: only events whose ACTION
+                    // equals the CURRENTLY-CONFIGURED action for their
+                    // dimension seed the latch — a reconfigured action
+                    // (e.g. `warn` → `pause`) must fire ONCE under the
+                    // resumed Run, not stay suppressed forever by the idempotence
+                    // latch keyed only on (dimension, scope). A config read
+                    // that fails degrades to an EMPTY latch (fail-open toward
+                    // one extra enforcement pass — the same direction as the
+                    // corrupt-log arm below; the enforcement call itself
+                    // returns early on a failed config read, so the seed is
+                    // moot in exactly that case).
+                    let (token_action, cost_action) = registry
+                        .effective_config(&name, ConfigLayer::empty())
+                        .map(|effective| {
+                            let (_budget, token_action) = config::resolve_token_budget(&effective);
+                            let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+                            (token_action, cost_action)
+                        })
+                        .unwrap_or((BreachAction::Pause, BreachAction::Pause));
+                    let breach_log_events =
+                        super::read_breach_events_from(&registry.instance_breach_log_path(&name));
+                    let breach_log_events = match breach_log_events {
+                        Ok(events) => events,
+                        Err(detail) => {
+                            // Review round 1 (AI-18): the corrupt log's
+                            // fail-open is SURFACED, never silent — the
+                            // operator hears that the durable spent-check
+                            // was unreadable and the latch degrades to
+                            // empty (one extra enforcement pass may re-fire,
+                            // a duplicate breaches.log line may land).
+                            self.emit_diagnostic(&format!(
+                                "{}: the instance's breach log could not be read \
+                                 ({detail}) — the breach latch degrades to empty, so an \
+                                 already-recorded breach may fire (and re-record) ONCE \
+                                 more under the resumed Run",
+                                name.as_str(),
+                            ));
+                            Vec::new()
+                        }
+                    };
+                    let breached_scopes = breach_log_events
+                        .into_iter()
+                        .filter(|event| event.run_id == run_id.as_str())
+                        .filter(|event| match event.dimension {
+                            BreachDimension::Tokens => event.action == token_action,
+                            BreachDimension::Dollars => event.action == cost_action,
+                        })
+                        .map(|event| (event.dimension, event.scope))
+                        .collect::<std::collections::HashSet<_>>();
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
                     // anchors the same way (at the CURRENT end of the captured
@@ -890,21 +943,35 @@ impl Supervisor {
                     // unsaid: a paused row whose previous engine died mid-pause
                     // looks exactly like a healthy operator pause on every
                     // surface. Name it, and name the way out. For a DETACHED
-                    // row the note also states the release semantics: when
-                    // THIS engine exits without resuming, the paused-detached
-                    // release pass SIGCONTs the child and records
-                    // paused→running, so it is never stranded frozen and
-                    // unsupervised (the Fibery 178 fix).
+                    // row the note also states the release semantics — which
+                    // REVIEW ROUND 1 now splits by pause kind (the release
+                    // pass's classifier, shared here): an OPERATOR pause is
+                    // healed at the releasing session's exit, while a
+                    // BUDGET-BREACH pause deliberately holds into the
+                    // enforcement-free between-commands window (resuming it
+                    // would run the agent unsupervised while the seeded latch
+                    // suppresses re-enforcement — un-doing AI-44's
+                    // spend-stop).
                     if registry
                         .lookup(&name)
                         .map(|inst| inst.state)
                         .is_ok_and(|state| state == LifecycleState::Paused)
                     {
                         let resume_hint = if record.detach {
-                            "it stays paused only while THIS engine session holds \
-                             it; on this session's exit the child is resumed \
-                             (SIGCONT) and the row moves to running — never left \
-                             frozen and unsupervised"
+                            if super::lifecycle::classify_pause_kind(registry, &name)
+                                == super::lifecycle::PauseKind::Breach
+                            {
+                                "it was paused by a BUDGET BREACH, so the freeze holds \
+                                 between commands too — this engine's exit does NOT resume it \
+                                 (the between-commands window is enforcement-free; resuming it \
+                                 there would run it unsupervised past its ceiling); it stays \
+                                 suspended until a later command resumes or stops it"
+                            } else {
+                                "it stays paused only while THIS engine session holds \
+                                 it; on this session's exit the child is resumed \
+                                 (SIGCONT) and the row moves to running — never left \
+                                 frozen and unsupervised"
+                            }
                         } else {
                             "it stays paused until an engine session resumes or \
                              stops it"

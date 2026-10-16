@@ -5503,9 +5503,13 @@ fn logs_on_an_unregistered_name_is_not_found() {
 // value for the same reason.
 
 /// The FROZEN `FleetEntry` key-set — the per-instance object shared by
-/// `list --json` (rows) and `show --json` (`instance`). `failed_cause` is
-/// `skip_serializing_if` and absent for a healthy instance, so it is not in
-/// the always-present set asserted here.
+/// `list --json` (rows) and `show --json` (`instance`). Two fields are
+/// `skip_serializing_if` and therefore absent when their condition does not
+/// hold, so they are not in the always-present set asserted here:
+/// `failed_cause` (absent for a healthy instance) and `supervision` (story
+/// 15-2's CONDITIONAL-FIELD example: present exactly when a live spawn
+/// record exists — `detached`/`session` — and omitted for a stopped or
+/// never-started instance, which must never imply supervised).
 const FLEET_ENTRY_KEYS: &[&str] = &[
     "agent_home",
     "budget",
@@ -8051,10 +8055,24 @@ fn list_and_show_surface_the_supervision_indicator() {
     );
     let shown = run_hekma_agent(&["agent", "show", "detachy"], &ctx.project_dir, state_dir);
     assert!(shown.success, "stderr={}", shown.stderr);
-    assert!(
-        shown.stdout.contains("Supervision") && shown.stdout.contains('—'),
-        "the registered row's Supervision cell is the honest absence: {}",
-        shown.stdout
+    // Pin the ABSENCE CELL EXACTLY (review round 1): the loose `contains('—')`
+    // was satisfied by the budget row alone — parse the Supervision ROW's own
+    // cell and assert it is exactly the honest `—` token.
+    let supervision_row = shown
+        .stdout
+        .lines()
+        .find(|line| line.contains("Supervision"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the show table carries the Supervision row: {}",
+                shown.stdout
+            )
+        });
+    let cells: Vec<&str> = supervision_row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        vec!["Supervision", "—"],
+        "the registered row's Supervision cell is EXACTLY the honest absence: {supervision_row}"
     );
     let doc: serde_json::Value = serde_json::from_str(
         &run_hekma_agent(
@@ -8069,6 +8087,102 @@ fn list_and_show_surface_the_supervision_indicator() {
         doc["instance"].get("supervision").is_none(),
         "a never-started instance omits the field (never implies supervised): {doc}"
     );
+
+    // THE SESSION LEG (review round 1): a live NON-DETACHED start must read
+    // `session` on ALL THREE surfaces. A session-bound child dies at the
+    // FIRST adopting command's engine drop (the story 1-6 kill-on-drop
+    // guarantee), so each surface gets its own freshly-started instance via
+    // the surviving-engine harness (the helper engine "crashes" without
+    // dropping, leaving a live adoptable process whose record reads
+    // detach=false).
+    let session_instance = |tag: &str| -> String {
+        let name = format!("sessy-{tag}");
+        let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+        let reg = run_hekma_agent_bounded(
+            &[
+                "agent",
+                "register",
+                &name,
+                "--manifest",
+                m.to_str().unwrap(),
+            ],
+            &ctx.project_dir,
+            state_dir,
+            REGISTER_BOUND,
+        );
+        assert!(!reg.timed_out, "register leg hung");
+        assert!(reg.run.success, "stderr={}", reg.run.stderr);
+        start_via_surviving_engine(state_dir, &name);
+        wait_for_agent_pid(state_dir, &name);
+        name
+    };
+
+    // (a) `list`: the compact `session` marker in the Supervision column.
+    session_instance("list");
+    let listed = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(
+        listed.success,
+        "list should exit 0; stderr={}",
+        listed.stderr
+    );
+    assert!(
+        listed.stdout.contains("session"),
+        "the live session-bound record renders the session marker: {}",
+        listed.stdout
+    );
+    assert!(
+        !listed.stdout.contains("detached"),
+        "the session leg must not render the detached marker: {}",
+        listed.stdout
+    );
+    // (b) `show`: the Supervision row names `session` EXACTLY.
+    let name = session_instance("show");
+    let shown = run_hekma_agent(&["agent", "show", &name], &ctx.project_dir, state_dir);
+    assert!(shown.success, "stderr={}", shown.stderr);
+    let supervision_row = shown
+        .stdout
+        .lines()
+        .find(|line| line.contains("Supervision"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the show table carries the Supervision row: {}",
+                shown.stdout
+            )
+        });
+    let cells: Vec<&str> = supervision_row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        vec!["Supervision", "session"],
+        "the live session-bound row's Supervision cell is exactly 'session': {supervision_row}"
+    );
+    // (c) `show --json`: the additive field carries the wire value.
+    let name = session_instance("json");
+    let json = run_hekma_agent(
+        &["agent", "show", &name, "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("pure JSON");
+    assert_eq!(
+        doc["instance"]["supervision"],
+        serde_json::json!("session"),
+        "the session-bound record carries the session wire value: {doc}"
+    );
+    // Each session-bound child was killed by its one adopting command's
+    // engine drop (kill-on-drop); settle the rows with a best-effort stop so
+    // later legs start from a clean table.
+    for tag in ["list", "show", "json"] {
+        let _ = run_hekma_agent(
+            &["agent", "stop", &format!("sessy-{tag}")],
+            &ctx.project_dir,
+            state_dir,
+        );
+    }
 
     // A DETACHED start: every later command re-adopts the live record — the
     // indicator reads `detached` on all three surfaces.

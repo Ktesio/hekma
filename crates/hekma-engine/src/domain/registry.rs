@@ -889,13 +889,16 @@ impl Registry {
 
     /// Persist the current [`RunId`] onto the instance's spawn record (story
     /// 15-2) — the adoption path's back-compat write for a pre-v9 record.
-    /// Fails when no record row exists (the caller surfaces it).
+    /// The write is a compare-and-set on the `fingerprint` the caller read
+    /// the record under (a concurrent stop→start's fresh Run id is never
+    /// stomped). Fails when no record row exists (the caller surfaces it).
     pub(crate) fn set_spawn_run_id(
         &self,
         name: &InstanceName,
         run_id: &crate::domain::RunId,
+        fingerprint: &crate::ports::ProcessFingerprint,
     ) -> Result<(), RegistryError> {
-        self.store.set_spawn_run_id(name, run_id)?;
+        self.store.set_spawn_run_id(name, run_id, fingerprint)?;
         Ok(())
     }
 

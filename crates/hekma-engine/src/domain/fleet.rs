@@ -478,13 +478,17 @@ pub struct FleetEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_gap: Option<UsageGapNotice>,
     /// The supervision indicator (story 15-2, Fibery 176) — whether this
-    /// instance's live process is DETACHED (survives engine exits; the spawn
-    /// record's durable `detach` flag) or SESSION-bound (dies with the engine
-    /// session that spawned it). Composed from the ALREADY-LOADED spawn
-    /// record: `Some(...)` exactly when a LIVE-process record exists (a
-    /// pid-0 policy/settle seed is not supervision), `None` (field omitted)
-    /// when the record is cleared — a stopped or never-started instance never
-    /// implies supervised (an honest absence the human cells render as `—`).
+    /// instance's spawn RECORD says the process is DETACHED (survives engine
+    /// exits; the record's durable `detach` flag) or SESSION-bound (dies
+    /// with the engine session that spawned it). RECORD truth, not a live
+    /// process probe (review round 1): composed from the ALREADY-LOADED
+    /// spawn record — the same source adoption reads — and a record whose
+    /// process is gone is reconciled away at `Engine::open`, so a stale
+    /// record never outlives the read that surfaces it. `Some(...)`
+    /// exactly when a live-process record exists (a pid-0 policy/settle
+    /// seed is not supervision), `None` (field omitted) when the record is
+    /// cleared — a stopped or never-started instance never implies
+    /// supervised (an honest absence the human cells render as `—`).
     /// ADDITIVE + absent-when-none (`skip_serializing_if`), the
     /// `acp_context_usage` pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -528,9 +532,11 @@ impl std::fmt::Display for Supervision {
 impl FleetEntry {
     /// The human-readable ABSENCE token rendered in a Fleet cell that has no value
     /// (story 1-7). A single `—` — used for the `budget` cell of an UN-budgeted
-    /// instance (no budget configured — story 3-2 keeps this honest absence) and
-    /// wherever else a truthful "nothing here" is shown. Kept here so `list` and
-    /// `show` render the SAME token.
+    /// instance (no budget configured — story 3-2 keeps this honest absence) and,
+    /// since story 15-2, for the SUPERVISION cell of an instance with no live
+    /// spawn record (a stopped/never-started instance never implies supervised —
+    /// the same honest-nothing token, so `list` and `show` render the SAME mark
+    /// for both absences). Kept here so `list` and `show` render the SAME token.
     pub const METERING_SEED_CELL: &'static str = "—";
 }
 

@@ -1559,7 +1559,7 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
         let (raw_lines, next_raw_cursor) = facade
             .read_raw_output_since(name, Some(raw_cursor))
             .map_err(map_engine_error)?;
-        note_if_rotated(next_raw_cursor, raw_cursor, name);
+        note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
         if !raw_lines.is_empty() && !raw_qualifier_shown {
             raw_qualifier_shown = true;
             ui::note(RAW_FALLBACK_QUALIFIER);
@@ -1592,7 +1592,7 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                 let (raw_more, next_raw_cursor) = facade
                     .read_raw_output_since(name, Some(raw_cursor))
                     .map_err(map_engine_error)?;
-                note_if_rotated(next_raw_cursor, raw_cursor, name);
+                note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
                 if !raw_more.is_empty() && !raw_qualifier_shown {
                     raw_qualifier_shown = true;
                     ui::note(RAW_FALLBACK_QUALIFIER);
@@ -1709,6 +1709,25 @@ fn note_if_rotated(next_cursor: u64, prior_cursor: u64, name: &str) {
         ui::note(format!(
             "output rotated; a small window may be missing from the live tail — `hekma agent logs {name}` \
              (without --follow) re-reads everything currently retained"
+        ));
+    }
+}
+
+/// The RAW-fallback twin of [`note_if_rotated`] (story 15-2, review round 1):
+/// a raw cursor snapping below its prior value means the RAW `agent.log`
+/// SHRANK — and since that file is NEVER rotated, this is a truncation (or a
+/// recreate), not a rotation. It therefore gets its OWN honest notice: the
+/// attributed-rotation remediation above would lie here ("one-shot `logs`
+/// re-reads everything currently retained") — the one-shot command reads the
+/// ATTRIBUTED capture only, never the raw file, so whatever the truncation
+/// ate from the raw capture is gone from every surface. Name exactly that.
+fn note_if_raw_shrunk(next_cursor: u64, prior_cursor: u64, name: &str) {
+    if next_cursor < prior_cursor {
+        ui::note(format!(
+            "the raw agent.log for '{name}' shrank (truncated or recreated); raw lines \
+             between the truncation and this poll may be missing from the live tail — \
+             the raw capture is never rotated, and the one-shot `hekma agent logs {name}` \
+             does not re-read it"
         ));
     }
 }

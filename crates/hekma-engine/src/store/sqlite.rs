@@ -1062,7 +1062,12 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
-    fn set_spawn_run_id(&self, name: &InstanceName, run_id: &RunId) -> Result<(), StoreError> {
+    fn set_spawn_run_id(
+        &self,
+        name: &InstanceName,
+        run_id: &RunId,
+        fingerprint: &ProcessFingerprint,
+    ) -> Result<(), StoreError> {
         // Story 15-2: the durable Run identity's focused UPDATE — written by
         // the start path (via the full record upsert, which carries the id) is
         // NOT this method's caller; this is the ADOPTION path's back-compat
@@ -1070,6 +1075,15 @@ impl StateStore for SqliteStore {
         // its one-time note are genuinely one-time. A missing record row is
         // NotFound — the caller surfaces it (surfaced-not-silent, AI-18): a
         // dropped Run identity must never vanish silently.
+        //
+        // Story 15-2 review round 1 — the CAS: the UPDATE matches the
+        // FINGERPRINT the caller read the record under, so a concurrent
+        // stop→start's FRESH record (new pid + start-time, carrying its own
+        // minted Run id) can never be stomped by this stale adoption mint.
+        // A zero-row outcome is then disambiguated: row gone → NotFound; row
+        // present under a DIFFERENT fingerprint → the concurrent start won,
+        // surfaced as a Backend error naming the race (never a silent Ok —
+        // the caller's "persisted" note must not lie, AI-18).
         let id = self
             .instance_id(name)?
             .ok_or_else(|| StoreError::NotFound {
@@ -1078,11 +1092,36 @@ impl StateStore for SqliteStore {
         let rows = self
             .conn
             .execute(
-                "UPDATE agent_runtime SET run_id = ?1 WHERE instance_id = ?2",
-                rusqlite::params![run_id.as_str(), id],
+                "UPDATE agent_runtime SET run_id = ?1 \
+                 WHERE instance_id = ?2 AND pid = ?3 AND start_time = ?4",
+                rusqlite::params![
+                    run_id.as_str(),
+                    id,
+                    fingerprint.pid as i64,
+                    fingerprint.start_time as i64
+                ],
             )
             .map_err(backend)?;
         if rows == 0 {
+            // Disambiguate the miss: a vanished row is the honest NotFound;
+            // a row that MOVED (a fresh fingerprint) means a concurrent
+            // stop→start won the race — its fresh Run id stands.
+            let moved = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_runtime WHERE instance_id = ?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(backend)?;
+            if moved > 0 {
+                return Err(StoreError::Backend(format!(
+                    "the spawn record for '{}' changed while its Run id was being \
+                     persisted (a concurrent stop→start won the race) — the fresh \
+                     record's own Run id stands; the stale mint was not written",
+                    name.as_str()
+                )));
+            }
             return Err(StoreError::NotFound {
                 name: name.as_str().to_string(),
             });
@@ -1343,8 +1382,13 @@ fn row_to_spawn_record(
     // Story 15-2: NULL = a pre-v9 record or a pid-0 seed row (no current Run);
     // any other string is the persisted Run id verbatim (RunId::from_wire is
     // infallible for a non-empty string — the id is opaque, never re-derived).
+    // Review round 1: an EMPTY-STRING raw value reads as None — a zero-length
+    // id is never a Run (a hand-edited or damaged row degrades to the honest
+    // "no Run" instead of minting a nonsense id that survives round-trips).
     let run_id_raw: Option<String> = row.get("run_id").map_err(backend)?;
-    let run_id = run_id_raw.map(RunId::from_wire);
+    let run_id = run_id_raw
+        .filter(|raw| !raw.is_empty())
+        .map(RunId::from_wire);
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1579,7 +1623,12 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        // PINNED LITERAL (AI-66 #5, review round 1): assert the actual
+        // version — comparing to SCHEMA_VERSION would pass even if the
+        // stamp and the constant drifted together. (The v9 step, story
+        // 15-2, is the current last step; bump this literal when the next
+        // additive step lands.)
+        assert_eq!(version, 9);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -1967,9 +2016,12 @@ mod tests {
 
         // set_spawn_run_id is the adoption back-compat write: a minted id
         // lands on the row (pre-v9 records read None; the engine writes the
-        // mint back so the note is one-time).
+        // mint back so the note is one-time). The CAS matches the record's
+        // OWN fingerprint — the read the adoption path performed.
         let minted = crate::domain::RunId::mint();
-        store.set_spawn_run_id(&name("away"), &minted).unwrap();
+        store
+            .set_spawn_run_id(&name("away"), &minted, &restarted.fingerprint)
+            .unwrap();
         assert_eq!(
             store
                 .get_spawn_record(&name("away"))
@@ -2002,9 +2054,100 @@ mod tests {
             .create_instance(&sample("ghost", "mock", "/x/agents/ghost"))
             .unwrap();
         let err = store
-            .set_spawn_run_id(&name("ghost"), &crate::domain::RunId::mint())
+            .set_spawn_run_id(
+                &name("ghost"),
+                &crate::domain::RunId::mint(),
+                &ProcessFingerprint::new(9, 99),
+            )
             .unwrap_err();
         assert!(matches!(err, StoreError::NotFound { name } if name == "ghost"));
+    }
+
+    #[test]
+    fn set_spawn_run_id_never_stomps_a_concurrent_fresh_record() {
+        // Review round 1 — the CAS: the adoption path read the record under
+        // fingerprint A, but a CONCURRENT stop→start replaced the row with a
+        // fresh fingerprint B carrying its OWN Run id before the adoption
+        // mint was written. The stale mint must NOT land (the fresh record's
+        // id stands) and the loss must SURFACE as a Backend error naming the
+        // race — never a silent Ok (the "minted and persisted" note must not
+        // lie, AI-18).
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("racy", "mock", "/x/agents/racy"))
+            .unwrap();
+        // The record the adoption path read (fingerprint A, pre-v9 NULL id).
+        store
+            .upsert_spawn_record(&record("racy", 111, 222, 0))
+            .unwrap();
+        let stale_read = record("racy", 111, 222, 0).fingerprint;
+        // The concurrent stop→start's FRESH record (fingerprint B + its own
+        // minted Run id) — written between the adoption's read and its mint.
+        let fresh_run = RunId::mint();
+        let mut fresh = record("racy", 333, 444, 0);
+        fresh.run_id = Some(fresh_run.clone());
+        store.upsert_spawn_record(&fresh).unwrap();
+
+        let err = store
+            .set_spawn_run_id(&name("racy"), &RunId::mint(), &stale_read)
+            .unwrap_err();
+        match err {
+            StoreError::Backend(detail) => {
+                assert!(
+                    detail.contains("concurrent stop→start won the race"),
+                    "the losing write must NAME the race: {detail}"
+                );
+            }
+            other => panic!("the CAS loss must surface as Backend, got {other:?}"),
+        }
+        // The fresh record's own Run id SURVIVED untouched.
+        assert_eq!(
+            store
+                .get_spawn_record(&name("racy"))
+                .unwrap()
+                .unwrap()
+                .run_id,
+            Some(fresh_run),
+            "a stale adoption mint must never stomp a concurrent fresh Run"
+        );
+    }
+
+    #[test]
+    fn an_empty_string_run_id_column_reads_as_none() {
+        // Review round 1 — the row builder's honest degrade: a zero-length
+        // raw value is never a Run id (a hand-edited or damaged row), so both
+        // the single read and the reconcile list read None — adoption then
+        // mints once through the normal pre-v9 back-compat path instead of
+        // round-tripping a nonsense empty id.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("empty", "mock", "/x/agents/empty"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("empty", 111, 222, 0))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agent_runtime SET run_id = '' \
+                 WHERE instance_id = (SELECT id FROM agent_instances WHERE name = 'empty')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_spawn_record(&name("empty"))
+                .unwrap()
+                .unwrap()
+                .run_id,
+            None,
+            "an empty raw value reads as None on the single get"
+        );
+        let listed = store.list_spawn_records().unwrap();
+        assert_eq!(
+            listed[0].run_id, None,
+            "an empty raw value reads as None on the reconcile list too"
+        );
     }
 
     #[test]
@@ -2065,7 +2208,9 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
+        // 9 (the v9 step, story 15-2, is the current last step).
+        assert_eq!(version, 9);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");

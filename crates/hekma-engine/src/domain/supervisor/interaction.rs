@@ -396,6 +396,12 @@ impl Supervisor {
     ///   would duplicate it).
     /// * Absent file → an honest empty read (cursor 0) — "both absent →
     ///   honest empty" in the story's matrix.
+    /// * INCREMENTAL (review round 1): the poll reads only the TAIL from the
+    ///   byte cursor (metadata length + seek + read), never the whole file —
+    ///   `--follow` polls every 300ms for an unbounded session, and a
+    ///   whole-file re-read per poll made that O(file×polls). The shrink
+    ///   check (cursor > current length) reads the same metadata, so the
+    ///   truncation detection the caller relies on is unchanged.
     pub fn read_raw_output_since(
         &self,
         registry: &Registry,
@@ -409,9 +415,11 @@ impl Supervisor {
         registry.lookup(&name).map_err(registry_to_engine)?;
 
         let path = registry.agent_output_log_path(&name);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        // The length probe (cheap metadata read — never file content): an
+        // absent file is an honest length 0.
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => {
                 return Err(EngineError::Log {
                     name: name.as_str().to_string(),
@@ -420,7 +428,6 @@ impl Supervisor {
                 })
             }
         };
-        let len = bytes.len() as u64;
         // PRIME (or the live-capture guard): no lines, cursor at the current
         // end. The guard MUST advance the cursor too — otherwise the moment
         // the tailer dies the next poll would dump the whole attributed
@@ -434,12 +441,53 @@ impl Supervisor {
             Some(_) if live_capture => return Ok((Vec::new(), len)),
             Some(cursor) => cursor,
         };
-        match plan_follow(&bytes, cursor) {
-            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), new_cursor)),
+        // SHRINK: agent.log is never rotated, so a length below the cursor is
+        // a truncation — snap to the new end, deliver nothing (the caller's
+        // dedicated raw-shrink notice names it; read_events_from's "missing
+        // file → empty" precedent keeps the absent-file case honest too).
+        if cursor > len {
+            return Ok((Vec::new(), len));
+        }
+        // THE TAIL-ONLY READ: seek to the cursor and read forward — never a
+        // whole-file read per poll. A file that vanished between the probe
+        // and the open degrades to an honest empty read at the probed length.
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), len));
+            }
+            Err(e) => {
+                return Err(EngineError::Log {
+                    name: name.as_str().to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    detail: e.to_string(),
+                })
+            }
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        // The capacity hint covers the expected tail (the probed delta);
+        // `read_to_end` grows past it if the file grew between probe and
+        // read — the read is bounded by the FILE, never a fixed cap.
+        let mut tail = Vec::with_capacity(usize::try_from(len - cursor).unwrap_or(usize::MAX));
+        if let Err(e) = file
+            .seek(SeekFrom::Start(cursor))
+            .and_then(|_| file.read_to_end(&mut tail))
+        {
+            return Err(EngineError::Log {
+                name: name.as_str().to_string(),
+                path: path.to_string_lossy().into_owned(),
+                detail: e.to_string(),
+            });
+        }
+        // The SAME complete-line plan the attributed follow uses, relative to
+        // the tail (cursor 0): a trailing partial line stays unconsumed, and
+        // the returned cursor advances by exactly the consumed bytes.
+        match plan_follow(&tail, 0) {
+            FollowPlan::Shrunk { new_cursor } => Ok((Vec::new(), cursor + new_cursor)),
             FollowPlan::Consume { range, new_cursor } => {
                 let mut lines = Vec::new();
                 if !range.is_empty() {
-                    for raw in String::from_utf8_lossy(&bytes[range]).lines() {
+                    for raw in String::from_utf8_lossy(&tail[range]).lines() {
                         if raw.trim().is_empty() {
                             continue;
                         }
@@ -455,7 +503,7 @@ impl Supervisor {
                         ));
                     }
                 }
-                Ok((lines, new_cursor))
+                Ok((lines, cursor + new_cursor))
             }
         }
     }

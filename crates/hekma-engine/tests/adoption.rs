@@ -498,9 +498,11 @@ fn adoption_helper_subprocess() {
         // Story 15-2: start `awaybud` DETACHED under a cumulative ceiling the
         // emitted usage crosses, wait until the breach pause lands, then let
         // the helper return NORMALLY — the engine's CLEAN drop runs the
-        // paused-detached RELEASE pass (SIGCONT + paused→running) exactly like
-        // a real first command's exit. The parent then proves the Run was
-        // CONTINUED (not re-minted) by later engines.
+        // paused-detached RELEASE pass. Review round 1: a BREACH pause (the
+        // only pause this helper fabricates) is NOT resumed at release — the
+        // enforcement freeze holds into the enforcement-free between-commands
+        // window, surfaced by the releasing engine's note, and the row keeps
+        // reading `paused` for the parent's adoption assertions.
         "detached_budgeted_survivor" => {
             facade
                 .register_with_adapter("awaybud", &AdapterRef::Manifest(manifest.clone()))
@@ -525,8 +527,9 @@ fn adoption_helper_subprocess() {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // CLEAN exit: the match arm ends, `engine` drops, the release
-            // pass SIGCONTs the paused detached child and records
-            // paused→running — no exit_helper_subprocess here.
+            // pass classifies the breach pause and LEAVES the child
+            // SIGSTOPped (the surfaced freeze note) — no
+            // exit_helper_subprocess here.
         }
         // Story 15-2: start `away` DETACHED with ONE usage event and NO
         // budget, then exit cleanly. The parent arms the budget AFTERWARD —
@@ -2081,13 +2084,15 @@ fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
     // process) starts `awaybud` detached under a cumulative ceiling its first
     // usage event crosses: the breach fires ONCE (recorded under the Run id
     // committed with the spawn record) and the breach action pauses it; the
-    // helper's CLEAN exit then runs the paused-detached release pass (SIGCONT +
-    // paused→running). Engine 2 adopts, RESUMES the same Run, and its seeded
-    // latch makes the recorded breach SPENT — no duplicate breach, no re-fired
-    // action. A THIRD engine proves the once-per-RUN (not per-command) shape
-    // again. The control leg then stops + starts the instance: a FRESH Run
-    // mints, the latch resets, and the still-over-ceiling cumulative enforces
-    // again under the new Run id (the unchanged genuine-restart semantics).
+    // helper's CLEAN exit then runs the paused-detached release pass, which
+    // review round 1 REFINED: a BREACH pause is NOT resumed (the freeze holds
+    // into the enforcement-free between-commands window) — engine 2 adopts a
+    // PAUSED child and RESUMES the same Run, and its seeded latch makes the
+    // recorded breach SPENT — no duplicate breach, no re-fired action. A THIRD
+    // engine proves the once-per-RUN (not per-command) shape again. The
+    // control leg then stops + starts the instance: a FRESH Run mints, the
+    // latch resets, and the still-over-ceiling cumulative enforces again
+    // under the new Run id (the unchanged genuine-restart semantics).
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
         return;
     }
@@ -2110,28 +2115,61 @@ fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
     );
     let first_run = record_run_id(state.path(), "awaybud").expect("the record carries the Run id");
 
-    // Engine 2: adopt + resume the Run. The row reads `running` — engine 1's
-    // release pass resumed the breach-paused child at ITS exit (proof below).
-    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    // Engine 2: adopt + resume the Run. The row reads `paused` — engine 1's
+    // release pass FROZE the breach-paused child at ITS exit (the review
+    // round 1 refinement: resuming it would run it unsupervised in the
+    // enforcement-free between-commands window while the seeded latch
+    // suppresses re-enforcement).
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
     let facade = engine.blocking();
     let status = facade.instance_status("awaybud").unwrap();
     assert_eq!(
         status.instance.state,
-        LifecycleState::Running,
-        "engine 1's release pass must have resumed the breach-paused detached \
-         child at its exit (never stranded frozen)"
+        LifecycleState::Paused,
+        "engine 1's release pass must have left the breach-paused detached \
+         child SIGSTOPped (the enforcement freeze holds between commands)"
     );
-    // The release edge is DURABLE: a paused→running transition whose cause is
-    // the dedicated `detached-resumed` kind (never a plain `resume` command).
-    let events = facade.transition_events("awaybud").unwrap();
-    let release = events
-        .iter()
-        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
-        .expect("the paused→running release edge must be recorded");
-    let cause = serde_json::to_string(&release.cause).unwrap();
+    // The Linux probe corroborates the freeze physically.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
+        assert!(
+            proc_pid_is_stopped(pid),
+            "the breach-paused child must still read SIGSTOP-suspended after release"
+        );
+    }
+    // And adoption SAYS so (AI-18): the stranded-paused note names the
+    // BREACH-freeze semantics for a detached row (the next command's
+    // visibility — the releasing engine's own note went to ITS stderr).
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
     assert!(
-        cause.contains("detached-resumed"),
-        "the release edge's cause must be the dedicated detached-resumed kind: {cause}"
+        sink.contains("awaybud: adopted a PAUSED instance"),
+        "the stranded-paused adoption note must surface: {sink}"
+    );
+    assert!(
+        sink.contains("paused by a BUDGET BREACH"),
+        "the adoption note must name the breach-freeze semantics: {sink}"
+    );
+    // NO release edge was ever recorded: the only paused edge is the breach
+    // itself (the BudgetExceeded cause the classifier reads).
+    let events = facade.transition_events("awaybud").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "the breach freeze records no paused→running edge: {events:?}"
+    );
+    let last_pause = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("the breach pause edge exists");
+    let cause = serde_json::to_string(&last_pause.cause).unwrap();
+    assert!(
+        cause.contains("budget-exceeded"),
+        "the paused edge carries the budget cause the classifier reads: {cause}"
     );
     // The breach fired EXACTLY ONCE — under the RESUMED Run — and the seeded
     // latch made the adoption-time re-evaluation a no-op (Fibery 205).
@@ -2162,7 +2200,9 @@ fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
         Some(first_run.as_str())
     );
 
-    // Engine 3: a second intervening command changes nothing (once per RUN).
+    // Engine 3: a second intervening command changes nothing (once per RUN)
+    // — including at ITS release: the breach freeze holds again (the row
+    // still reads paused; still no release edge).
     drop(engine);
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
@@ -2171,6 +2211,11 @@ fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
         breaches.len(),
         1,
         "a third command must not re-fire the spent breach: {breaches:?}"
+    );
+    assert_eq!(
+        facade.instance_status("awaybud").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the breach freeze holds across every intervening command"
     );
     assert_eq!(
         record_run_id(state.path(), "awaybud").as_deref(),
@@ -2212,7 +2257,8 @@ fn a_detached_run_is_continued_across_engines_and_its_breach_fires_once() {
     }
     let breaches = facade.budget_breach_events("awaybud").unwrap();
     assert_eq!(breaches[1].run_id, second_run);
-    // Teardown: stop the (breach-paused → release-resumed at drop) instance.
+    // Teardown: stop the instance (breach-paused under the fresh Run; the
+    // stop ladder reaches the suspended child).
     facade
         .stop("awaybud", Some(Duration::from_secs(5)))
         .unwrap();
@@ -2286,24 +2332,34 @@ fn adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption() {
             "the breach-paused child must read SIGSTOP-suspended"
         );
     }
-    // Dropping engine 3 runs the release pass: detached + paused → SIGCONT +
-    // paused→running (never stranded frozen), surfaced in the transition log.
+    // Dropping engine 3 runs the release pass: detached + BREACH-paused →
+    // review round 1's FREEZE (the enforcement hold continues into the
+    // between-commands window; no SIGCONT, no paused→running edge) — surfaced
+    // by the next adoption's stranded-paused note.
     drop(engine);
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
     assert_eq!(
         facade.instance_status("away").unwrap().instance.state,
-        LifecycleState::Running,
-        "the release pass must resume the breach-paused detached child"
+        LifecycleState::Paused,
+        "the release pass must leave the breach-paused detached child frozen"
     );
     if hekma_engine::OsId::current() == hekma_engine::OsId::Linux {
         assert!(
-            !proc_pid_is_stopped(pid),
-            "the released child must no longer read suspended"
+            proc_pid_is_stopped(pid),
+            "the breach-paused child must stay SIGSTOP-suspended after release"
         );
     }
+    let events = facade.transition_events("away").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "the breach freeze records no paused→running edge: {events:?}"
+    );
     facade.stop("away", Some(Duration::from_secs(5))).unwrap();
-    wait_until_gone(pid, "stop must terminate the released detached agent");
+    wait_until_gone(pid, "stop must terminate the frozen detached agent");
 }
 
 #[test]
@@ -2367,6 +2423,12 @@ fn adopting_a_stranded_paused_detached_row_keeps_it_paused_and_names_it() {
     assert!(
         sink.contains("resumed (SIGCONT) and the row moves to running"),
         "the detached variant must name the release-at-exit semantics: {sink}"
+    );
+    // The OPERATOR variant must NOT read as the breach freeze (review round
+    // 1's distinction, pinned both ways across the e2e pair).
+    assert!(
+        !sink.contains("paused by a BUDGET BREACH"),
+        "an operator pause must never read as the breach freeze: {sink}"
     );
 
     // Releasing THIS engine heals the strand: SIGCONT + paused→running.
