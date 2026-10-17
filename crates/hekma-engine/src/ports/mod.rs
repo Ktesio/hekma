@@ -36,7 +36,7 @@ pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,
     FileSecretResolver, SecretError, SecretResolver,
 };
-pub use state_store::{SpawnRecord, StateStore};
+pub use state_store::{MemoryBackingTxn, SpawnRecord, StateStore};
 pub use usage_source::{
     assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line,
     ObservedUsageSource, ParsedUsage, SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
@@ -104,6 +104,85 @@ pub enum StoreError {
         attached: String,
         /// The kind the caller attempted to write.
         requested: String,
+    },
+
+    /// A memory-backing mutation's terminal-state guard refused INSIDE the
+    /// transactional attach/detach (story 15-6): another process (a second CLI
+    /// Engine on the same state root) moved the instance to a non-terminal
+    /// Lifecycle State between the registry's pre-check read and the
+    /// `BEGIN IMMEDIATE` commit. The transaction rolled back, so the row is
+    /// byte-unchanged; the message mirrors the registry's
+    /// `RegistryError::MemoryBackingHotSwap` refusal (this store variant —
+    /// one of story 15-6's new surfaces — names the SHIPPED `hekma` binary;
+    /// the registry string above it is the untouched story-5-1 legacy).
+    #[error(
+        "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped — \
+         attach/detach need a terminal state (registered, stopped, or failed). Bring it to \
+         a terminal state first: hekma agent stop {name} from running or paused"
+    )]
+    MemoryBackingHotSwap {
+        /// The instance whose backing was being changed.
+        name: String,
+        /// The non-terminal state the transactional guard found (wire form).
+        state: String,
+    },
+
+    /// Story 15-6: start's AUTHORITATIVE backing read (the transition
+    /// transaction's snapshot) disagrees with the start path's early
+    /// pre-check read — a second process attached or detached the backing
+    /// inside start's read→transition window. The conditional transition
+    /// ROLLED BACK (the instance keeps its prior terminal state and no
+    /// process was launched; the inert pre-transition artifacts — the
+    /// effective-config snapshot and the log directories — remain,
+    /// harmlessly rewritten by the next start); the caller retries the whole
+    /// start. Names both sides.
+    #[error(
+        "the memory backing for '{name}' changed under start: the pre-check read {precheck}, \
+         but the store transaction read {snapshot}; no agent was launched and the instance \
+         state is unchanged (only the inert pre-start config snapshot and log directories \
+         remain — the next start rewrites them) — retry the start (it now sees the new backing)"
+    )]
+    MemoryBackingChangedUnderStart {
+        /// The instance being started.
+        name: String,
+        /// The pre-check's view: `"none"` or `kind '<k>' attached at <ts>`.
+        precheck: String,
+        /// The transaction snapshot's view: same format as `precheck`.
+        snapshot: String,
+    },
+
+    /// Story 15-6: a CONDITIONAL lifecycle transition found the instance in a
+    /// state other than the one the caller read — another process transitioned
+    /// it first (e.g. a second `start` on the same instance). The transaction
+    /// rolled back; nothing was persisted.
+    #[error(
+        "Agent Instance '{name}' is '{found}', not the expected '{expected}'; another \
+         command transitioned it first, so the conditional transition was refused"
+    )]
+    StateConflict {
+        /// The instance whose state was transitioned.
+        name: String,
+        /// The state the caller's read observed (wire form).
+        expected: String,
+        /// The state actually present inside the transaction (wire form).
+        found: String,
+    },
+
+    /// Story 15-6 (the AD-17 busy bound): a writer could not take the write
+    /// lock within the `busy_timeout` bounded-wait window (another hekma
+    /// command holds a write transaction). Typed, never a raw
+    /// `SQLITE_BUSY`/`database is locked` string — the bounded-wait window
+    /// and the retry remediation are part of the message. Review round 1:
+    /// the wording names the WINDOW, never a fully-elapsed duration — the
+    /// carried value is the configured bound, not a measured elapsed time.
+    #[error(
+        "the state store remained busy within the bounded {waited_ms}ms window (another hekma \
+         command holds the write transaction); retry the command"
+    )]
+    Busy {
+        /// The bounded-wait window that was in force, in milliseconds (the
+        /// configured `busy_timeout` — not a measured elapsed time).
+        waited_ms: u64,
     },
 
     /// Any other backend failure (open, migrate, I/O, SQL execution).
