@@ -1019,6 +1019,7 @@ impl StdioInheritDisarm {
 
     /// Whether the given handle currently carries `HANDLE_FLAG_INHERIT`
     /// (test seam; `None` when the flags cannot be read).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn is_inheritable(handle: HANDLE) -> Option<bool> {
         let mut flags: u32 = 0;
         // SAFETY: read-only query on a live handle.
@@ -1325,12 +1326,14 @@ mod tests {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the captured child");
-        let mut stderr = child.stderr.take().expect("stderr pipe");
         // Drain BOTH pipes on bounded threads while the child runs: each
         // returns true iff the pipe reached REAL EOF (read == 0) inside the
         // bound. Before the fix, the lingering detached agent held the
         // write-ends and neither read ever EOF'd — the deadline arm fires.
-        let drain = |mut pipe: impl std::io::Read + Send + 'static| {
+        // A local generic fn, not a closure: `impl Trait` is not allowed in
+        // closure parameters (E0562), and the stderr leg below previously
+        // hand-inlined a duplicate of this body.
+        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<bool> {
             std::thread::spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(60);
                 let mut sink = [0u8; 512];
@@ -1343,22 +1346,9 @@ mod tests {
                     }
                 }
             })
-        };
+        }
         let stdout_eof = drain(child.stdout.take().expect("stdout pipe"));
-        let stderr_drain = {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            std::thread::spawn(move || {
-                let mut sink = [0u8; 512];
-                loop {
-                    match stderr.read(&mut sink) {
-                        Ok(0) => return true,
-                        Ok(_) if Instant::now() > deadline => return false,
-                        Ok(_) => {}
-                        Err(_) => return true,
-                    }
-                }
-            })
-        };
+        let stderr_drain = drain(child.stderr.take().expect("stderr pipe"));
         let status = child.wait().expect("child status");
         assert!(status.success(), "the child arm must succeed: {status:?}");
         assert!(
