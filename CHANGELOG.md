@@ -95,6 +95,110 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 > **For `kt` users (deliberate, no compatibility window):** old `kt` binaries cannot self-update to 0.8.0 — release archives carry only the `hekma-*` family. Re-run the installer (`curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh`), or `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`. **Your data is untouched** — the same state directory is read, nothing is moved or reset; `KTESIO_*` environment settings keep working (with new `HEKMA_*` aliases); JSON output, exit codes, the `KTESIO_USAGE` sentinel, `HERMES_HOME`, and the adapter contract are unchanged. Full details: the [migration guide](docs/migration.md).
 
 
+## v0.11.0
+
+Comparison: [v0.9.0...v0.11.0](https://github.com/Ktesio/hekma/compare/v0.9.0...v0.11.0)
+
+| Platform | Target | Archive | Checksum |
+|----------|--------|---------|----------|
+| macOS Intel | `x86_64-apple-darwin` | [hekma-v0.11.0-x86_64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-apple-darwin.tar.gz.sha256) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | [hekma-v0.11.0-aarch64-apple-darwin.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-aarch64-apple-darwin.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-aarch64-apple-darwin.tar.gz.sha256) |
+| Windows x64 | `x86_64-pc-windows-msvc` | [hekma-v0.11.0-x86_64-pc-windows-msvc.zip](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-pc-windows-msvc.zip) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-pc-windows-msvc.zip.sha256) |
+| Linux x64 | `x86_64-unknown-linux-gnu` | [hekma-v0.11.0-x86_64-unknown-linux-gnu.tar.gz](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-unknown-linux-gnu.tar.gz) | [sha256](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-x86_64-unknown-linux-gnu.tar.gz.sha256) |
+| All | checksums | [hekma-v0.11.0-checksums.txt](https://github.com/Ktesio/hekma/releases/download/v0.11.0/hekma-v0.11.0-checksums.txt) | - |
+
+### Features
+
+- perf-budgets baseline trend tracking — ratchet, committed baseline, documented updates (#285) ([186da69](https://github.com/Ktesio/hekma/commit/186da69))
+- TCK hardening — public seams, error honesty, stage-differentiated failures, configurability, --dump convention (#282) ([65e7b45](https://github.com/Ktesio/hekma/commit/65e7b45))
+- detached continuation — one Run across commands, breach-once, honest logs, supervision indicator (#281) ([9a2ceaa](https://github.com/Ktesio/hekma/commit/9a2ceaa))
+- memory-backing invariant + adoption park-loss note + detached reaper (hardening batch 2) (#232) ([a5a763a](https://github.com/Ktesio/hekma/commit/a5a763a))
+- ACP backend support — epic opened, spec stage complete, story 14-1 (the transport core) (#193) ([1e71389](https://github.com/Ktesio/hekma/commit/1e71389))
+
+### Fixes
+
+- memory attach/detach × start atomicity — durable-store transactions close the cross-process windows (#286) ([7c73d60](https://github.com/Ktesio/hekma/commit/7c73d60))
+- Windows detached stdio write-end leak (root-caused) + x86-scoped CI skip (#283) ([800934c](https://github.com/Ktesio/hekma/commit/800934c))
+- keep the previous-tag lower bound in pre-tag release-docs rehearsals (#278) ([9583b4a](https://github.com/Ktesio/hekma/commit/9583b4a))
+- drop the direct postcss dev-dependency that conflicts with its override (#273) ([4bc791e](https://github.com/Ktesio/hekma/commit/4bc791e))
+- record session/cancel delivery on the engine-attributed log (#266) ([4766352](https://github.com/Ktesio/hekma/commit/4766352))
+- override transitive katex to >=0.18.2 (prototype-pollution gadget, GHSA-238p-pmpm-9mq7) (#256) ([ba3017a](https://github.com/Ktesio/hekma/commit/ba3017a))
+- repin the conformance-kit git example — the pinned rev predates the crate rename (#252) ([68c1f42](https://github.com/Ktesio/hekma/commit/68c1f42))
+- canonical /docs/ migration URL in generated release bodies (#251) ([597033a](https://github.com/Ktesio/hekma/commit/597033a))
+- Apache-2.0 wording and the source-install path (#243) ([016c137](https://github.com/Ktesio/hekma/commit/016c137))
+- docs probe follows the /docs/ mount — flat-URL reds, latent pipefail false-red (#249) ([7ab76f9](https://github.com/Ktesio/hekma/commit/7ab76f9))
+- follow the narrowed OS-cfg allowlist in the in-repo CI-string pin (#235) ([5057851](https://github.com/Ktesio/hekma/commit/5057851))
+- semver job script — close the both-graph case my shim insertion broke; add bash -n gate for every embedded workflow script ([0a02c2f](https://github.com/Ktesio/hekma/commit/0a02c2f))
+
+### Documentation
+
+- epic-15 closeout — retrospective, tracker repair, spec closeouts (#287) ([ea1a9f0](https://github.com/Ktesio/hekma/commit/ea1a9f0))
+- refresh TRADEMARK, SPONSORS, SUPPORT to the post-rename identity (#276) ([a186a7a](https://github.com/Ktesio/hekma/commit/a186a7a))
+- fix the source-install clone dir and state-path examples (#261) ([cae38b0](https://github.com/Ktesio/hekma/commit/cae38b0))
+- update release notes for v0.9.0 (#191) ([6b55c81](https://github.com/Ktesio/hekma/commit/6b55c81))
+- Ktesio attribution on the docs home page ([15fcafd](https://github.com/Ktesio/hekma/commit/15fcafd))
+- clarify the ktesio.dev attribution line ([d78f3b5](https://github.com/Ktesio/hekma/commit/d78f3b5))
+
+### Tests
+
+- make the supervision-indicator and raw-follow tests Windows-honest (#284) ([3191699](https://github.com/Ktesio/hekma/commit/3191699))
+- verify the acp kind against real opencode + hermes-acp agents (#280) ([e839265](https://github.com/Ktesio/hekma/commit/e839265))
+- pin the non-UTF-8 stdout read-failure death (#277) ([9f58225](https://github.com/Ktesio/hekma/commit/9f58225))
+- pin the resume result line + gap/context/malformed-layer absence arms (#274) ([c11840d](https://github.com/Ktesio/hekma/commit/c11840d))
+- drop secret-tainted steering values from assert panics (#272) ([192f3b0](https://github.com/Ktesio/hekma/commit/192f3b0))
+- pin the open-fault mapping, spawn-record pass-through, and steering degradation arms (#271) ([548844c](https://github.com/Ktesio/hekma/commit/548844c))
+- pin the failed-stop breach breadcrumb + config-fault disarm (#267) ([1d71bdb](https://github.com/Ktesio/hekma/commit/1d71bdb))
+- pin the resume divergence ladder + stuck-poll error map (#265) ([1205b2f](https://github.com/Ktesio/hekma/commit/1205b2f))
+- pin the crash-cause vocabulary + row-gone + sibling-corroboration arms (#263) ([cf168cf](https://github.com/Ktesio/hekma/commit/cf168cf))
+- serialize the state-dir env tests behind a shared lock (#260) ([1d743cd](https://github.com/Ktesio/hekma/commit/1d743cd))
+- pin the not-draining send timeout and poisoned-channel refusal (#259) ([74fd289](https://github.com/Ktesio/hekma/commit/74fd289))
+- pin the reader's tolerance + stream-death arms (#258) ([04b61ab](https://github.com/Ktesio/hekma/commit/04b61ab))
+- pin the adapter-snapshot write-failure rollback arm (#257) ([4d4dd23](https://github.com/Ktesio/hekma/commit/4d4dd23))
+- pin the --follow rotation notice (stderr-only, no NDJSON leak) (#255) ([8f30db1](https://github.com/Ktesio/hekma/commit/8f30db1))
+- pin the TCK config section's swallowed pass-through failure arm (#253) ([8c51228](https://github.com/Ktesio/hekma/commit/8c51228))
+- pin the self-reported metering fleet-equality failure arm (#254) ([f2a8632](https://github.com/Ktesio/hekma/commit/f2a8632))
+- scrub inherited HERMES_HOME in the hermes e2e; visible opt-out for the real-agent smokes (#250) ([f219920](https://github.com/Ktesio/hekma/commit/f219920))
+- full restoration — 95% gate (guard fix + 40-min budget + all restoration tests) (#238) ([763b632](https://github.com/Ktesio/hekma/commit/763b632))
+- restoration batch 2 — start-time memory-dir guard arms + the AI-12 environmental-cap test ([c470764](https://github.com/Ktesio/hekma/commit/c470764))
+- seven duplicate manifest-writer copies → the shared fixture builder (#233) ([d9a9b22](https://github.com/Ktesio/hekma/commit/d9a9b22))
+
+### CI
+
+- fix the duplicate env: key that startup-failed the workflow (#239) ([c22928f](https://github.com/Ktesio/hekma/commit/c22928f))
+- raise the test-job budget 25 -> 40 minutes (the suite outgrew the wall) (#237) ([0b62590](https://github.com/Ktesio/hekma/commit/0b62590))
+
+### Maintenance
+
+- re-anchor the canonical baseline from the CI leg's own run (#289) ([3471f0e](https://github.com/Ktesio/hekma/commit/3471f0e))
+- bump hekma to 0.11.0 — the backlog clear-out + engine 0.7.0 minor (#288) ([a074810](https://github.com/Ktesio/hekma/commit/a074810))
+- bump hekma to 0.10.0 — the ACP + engine-hardening minor (#279) ([7a757c5](https://github.com/Ktesio/hekma/commit/7a757c5))
+- bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349 (#275) ([c1bbef1](https://github.com/Ktesio/hekma/commit/c1bbef1))
+- bump the cargo-dependencies group with 4 updates (#268) ([2a98c21](https://github.com/Ktesio/hekma/commit/2a98c21))
+- bump the docs-dependencies group in /docs with 6 updates (#270) ([825e757](https://github.com/Ktesio/hekma/commit/825e757))
+- bump the github-actions group with 2 updates (#269) ([b37459d](https://github.com/Ktesio/hekma/commit/b37459d))
+- raise engines floor to match katex 0.18 toolchain (#262) ([10bf3c1](https://github.com/Ktesio/hekma/commit/10bf3c1))
+- bump sharp from 0.35.4 to 0.35.5 in /docs (#247) ([04d6aeb](https://github.com/Ktesio/hekma/commit/04d6aeb))
+- bump lodash-es from 4.17.23 to 4.18.1 in /docs (#246) ([74bb929](https://github.com/Ktesio/hekma/commit/74bb929))
+- bump source-map-js from 1.2.1 to 1.2.2 in /docs (#245) ([22ec402](https://github.com/Ktesio/hekma/commit/22ec402))
+- bump the docs-dependencies group across 1 directory with 8 updates (#244) ([1a087ed](https://github.com/Ktesio/hekma/commit/1a087ed))
+- bump dompurify from 3.4.15 to 3.4.16 in /docs (#241) ([ecdfa96](https://github.com/Ktesio/hekma/commit/ecdfa96))
+- bump sharp from 0.35.3 to 0.35.4 in /docs (#178) ([b0897aa](https://github.com/Ktesio/hekma/commit/b0897aa))
+- bump baseline-browser-mapping from 2.10.33 to 2.11.25 in /docs (#226) ([263eeb1](https://github.com/Ktesio/hekma/commit/263eeb1))
+- bump the docs-dependencies group across 1 directory with 11 updates (#183) ([362220c](https://github.com/Ktesio/hekma/commit/362220c))
+- bump the github-actions group across 1 directory with 2 updates (#134) ([fae5ef2](https://github.com/Ktesio/hekma/commit/fae5ef2))
+- bump the cargo-dependencies group across 1 directory with 14 updates (#240) ([321270e](https://github.com/Ktesio/hekma/commit/321270e))
+- record the Windows CI flake family (epic-12 item 95 extension) (#236) ([6489018](https://github.com/Ktesio/hekma/commit/6489018))
+- CI + docs + test-hygiene batch (hardening backlog, part 1) (#231) ([d28c94e](https://github.com/Ktesio/hekma/commit/d28c94e))
+- apply the confirmed action-item status batch (Islam, 2026-09-22) ([37482d7](https://github.com/Ktesio/hekma/commit/37482d7))
+- move the semver baselines to the epic-14 squash (1e71389) — PR #193 merge checklist (#229) ([2014dea](https://github.com/Ktesio/hekma/commit/2014dea))
+- retire the GitHub-issue mirror — project tracking migrated to Fibery (#228) ([efc4b8b](https://github.com/Ktesio/hekma/commit/efc4b8b))
+- sprint-record closeout + epic-13 (supervisor split A+B implemented) (#192) ([7f4454e](https://github.com/Ktesio/hekma/commit/7f4454e))
+
+### Other Changes
+
+- the five product calls, drafted for ratification (PC-1..PC-5) (#234) ([b10eaeb](https://github.com/Ktesio/hekma/commit/b10eaeb))
+- the owed retros — epics 10, 13, 14 (accepted-with-open-items) (#230) ([bf0c575](https://github.com/Ktesio/hekma/commit/bf0c575))
+
 ## v0.9.0
 
 Comparison: [v0.8.1...v0.9.0](https://github.com/Ktesio/hekma/compare/v0.8.1...v0.9.0)
