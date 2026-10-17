@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hekma-banner.png" alt="Hekma banner: run AI agents like services — supervise, meter, and budget them" width="100%">
+  <img src="https://raw.githubusercontent.com/Ktesio/hekma/main/docs/assets/hekma-banner.png" alt="Hekma banner: run AI agents like services — supervise, meter, and budget them" width="100%">
 </p>
 
 # Hekma
