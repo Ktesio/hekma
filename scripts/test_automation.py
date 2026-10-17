@@ -170,6 +170,25 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
         self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
+        # Wedge forensics (2026-10-17, #292): the coverage job is pinned to
+        # ubuntu-26.04 — the same class-2 runner-freeze mitigation as the
+        # test matrix's linux leg. Both
+        # coverage runs of bc561ee on the 24.04 image died ~52 min into
+        # Enforce coverage with "the hosted runner lost communication with the
+        # server" (the wedge starving the runner itself), while the PR's own
+        # ubuntu-26.04 test legs were green twice. Scope the assertion to the
+        # coverage JOB so it cannot be satisfied by another job's runner label,
+        # and so a regression back to the drifting ubuntu-latest label — or a
+        # reordering that moves the string out of this job — fails loudly.
+        job_start = ci.index("  coverage:")
+        import re as _re
+
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        # The coverage job may be LAST in the file — slice to end-of-file then.
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        coverage_job = ci[job_start:job_end]
+        self.assertIn("name: coverage", coverage_job)
+        self.assertIn("runs-on: ubuntu-26.04", coverage_job)
         # Stable jobs are explicit about their toolchain: the root
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job
@@ -407,7 +426,7 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
+        self.assertIn("os: [ubuntu-26.04, macos-latest, windows-latest]", ci)
         self.assertIn("runs-on: ${{ matrix.os }}", ci)
         self.assertIn("fail-fast: false", ci)
         # Only the `test` job matrixes; the other jobs stay ubuntu-only. The
@@ -440,19 +459,50 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
         self.assertIn("cargo +stable test --workspace --doc", ci)
         # Wedge forensics (2026-10-17): the ubuntu leg's RUN is wall-clock
-        # capped — the x86-ubuntu wedge family dies at the 40m JOB timeout,
-        # whose CANCEL discards the whole job-log blob, so the wedge was
-        # invisible by construction. The cap (matrix `include` DATA, not an
-        # in-step OS comparison) turns a wedge into a FAILED STEP with
-        # surviving logs while the job still has budget, and the always-on
-        # post-mortem snapshot step captures the still-live process table
-        # (stat/wchan names a D-state leftover's kernel wait channel) plus a
-        # PSI readout, uploaded as a per-OS artifact. Pin the deliberate
-        # shape so a future edit cannot silently drop the observability.
+        # capped AND session-quarantined. The cap alone was NOT enough: the
+        # x86-ubuntu wedge family ignores even SIGKILL, and `timeout(1)`
+        # WAITS for its child after signalling, so it could not enforce the
+        # cap either (run 39044536797: the 30m step cap fired, the step was
+        # still in_progress at +38m, the 40m JOB timeout fired, and the
+        # service force-cancelled at exactly +45m — discarding the whole
+        # job-log blob and leaving the post-mortem step pending). The shipped
+        # shape instead runs the suite double-forked into its OWN session
+        # (`( setsid ... & )` re-parents it to init, outside the step shell's
+        # process group AND descendant chain) while the step shell SUPERVISES
+        # by polling an exit-code file. FALSIFIED FOR CLASS 2 (2026-10-17,
+        # runs 39048612882/39048623940, jobs 117442316042/117442346937):
+        # with the quarantine live the run step was STILL in_progress at the
+        # exact +45:00 service force-cancels — the 30m supervisor cap never
+        # fired and both log blobs came back BlobNotFound, so the active
+        # wedge FREEZES THE RUNNER ITSELF (a proven-correct bash poll loop
+        # never reached its deadline; the mechanism was dev-box-smoked). The
+        # quarantine still bounds class 1 (D-state suite on a live runner):
+        # a healthy end replays the suite's exit code; a cap
+        # expiry fails the step (124) with the captured suite output + a
+        # live process snapshot in the step log, and the always-on
+        # post-mortem snapshot step then captures the still-live quarantined
+        # tree (stat/wchan names a D-state leftover's kernel wait channel)
+        # plus a PSI readout, uploaded as a per-OS artifact. Class 2 is
+        # bounded by the ENVIRONMENT instead: the linux leg pins
+        # ubuntu-26.04 and its JOB timeout tightens to 15m via the same
+        # matrix data (a freeze recurrence costs the 15+5m service window,
+        # not 45m). The cap rides
+        # the matrix `include` as DATA (not an in-step OS comparison). Pin
+        # the deliberate shape so a future edit cannot silently drop the
+        # observability, loosen the fast-fail timeout, or resurrect the
+        # un-enforceable timeout(1) form.
         self.assertIn("nextest_wallclock_cap: 30m", ci)
-        self.assertIn("timeout --signal=TERM --kill-after=90s", ci)
+        self.assertIn("setsid bash -c", ci)
+        self.assertIn('echo $? > "$exitf"', ci)
+        self.assertIn("[supervisor] WALL-CLOCK CAP HIT", ci)
+        self.assertNotIn("--kill-after=", ci)
         self.assertIn("- name: Wedge post-mortem snapshot", ci)
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
+        self.assertIn("- os: ubuntu-26.04", ci)
+        self.assertIn("test_job_timeout_minutes: 15", ci)
+        self.assertIn(
+            "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 40 }}", ci
+        )
         self.assertIn('status-level = "leak"', nextest)
         # The SOURCE fix: a max-threads=1 test-group over exactly the engine
         # integration binaries, with the existing retries + slow-timeout untouched.
