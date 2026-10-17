@@ -85,15 +85,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux leg PINNED to ubuntu-26.04 (class-2 runner-freeze mitigation,
+        # tracking #292): the wedging image is 24.04 (kernel 6.17.0-1022-azure);
+        # 26.04 is GA and is where ubuntu-latest migrates anyway Oct 19–Nov 19
+        # 2026 (actions/runner-images#14748). Unify back post-migration.
+        os: [ubuntu-26.04, macos-latest, windows-latest]
         # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
-        # capped and session-quarantined — see the "Run tests (nextest)" step
-        # below for the why. Carried as matrix DATA (not an in-step OS
-        # comparison) so the run step stays one uniform invocation for all
-        # three OSes.
+        # capped and session-quarantined, and its JOB timeout tightened to 15m —
+        # see the "Run tests (nextest)" step below for the full why (two wedge
+        # classes; the freeze class is environment-bounded via the 26.04 pin).
+        # Carried as matrix DATA (not an in-step OS comparison) so the run step
+        # stays one uniform invocation for all three OSes.
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
+            test_job_timeout_minutes: 15
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
@@ -109,8 +115,12 @@ jobs:
     # .config/nextest.toml) remains the cross-OS per-test hang guard; the
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
-    # under epic-12 retro item 95 (see #236).
-    timeout-minutes: 40
+    # under epic-12 retro item 95 (see #236). The matrix `include` tightens
+    # the PINNED ubuntu-26.04 leg to 15m (tracking #292): the healthy lane is
+    # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
+    # 15+5m service window instead of 45m and surfaces as a fast visible
+    # cancel rather than a silent three-quarter-hour burn.
+    timeout-minutes: ${{ matrix.test_job_timeout_minutes || 40 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,23 +243,48 @@ jobs:
         # force-cancelled at exactly +45m — the post-mortem step below
         # never ran and the job-log blob was destroyed (BlobNotFound),
         # exactly the blindness this instrumentation exists to remove. So
-        # the capped leg now runs the suite DOUBLE-FORKED into its own
-        # session — `( setsid … & )` re-parents the runner to init, outside
-        # this shell's process group AND descendant chain — while the step
-        # shell SUPERVISES by polling an exit-code file instead of ever
-        # waiting on the suite. The step therefore ALWAYS terminates on
-        # schedule: a healthy end replays the suite's exit code (and cats
-        # the captured output); a cap expiry fails THIS step (exit 124) with
-        # the captured suite output + a live process snapshot in the step
-        # log — which survives, because a failed-but-completed step is not a
-        # cancel — and the still-live quarantined wedged tree stays around
-        # for the post-mortem step below to snapshot (its wchan names the
-        # stuck kernel path) before the ephemeral runner reclaims it. The
-        # cap rides the matrix `include` as data; the other legs render an
-        # empty cap and run the plain uncapped invocation. (Context:
-        # ubuntu-latest flips to the Ubuntu 26 image on 2026-10-19 —
-        # actions/runner-images#14748 — an extra reason to keep this lane
-        # observable through the migration window.)
+        # the capped leg runs the suite DOUBLE-FORKED into its own session
+        # — `( setsid … & )` re-parents the runner to init, outside this
+        # shell's process group AND descendant chain — while the step shell
+        # SUPERVISES by polling an exit-code file instead of ever waiting
+        # on the suite. That bounds the CLASS-1 wedge (a D-state suite on a
+        # LIVE runner, the #106 `adoption` shape): a healthy end replays the
+        # suite's exit code (and cats the captured output); a cap expiry
+        # fails THIS step (exit 124) with the captured suite output + a
+        # live process snapshot in the step log — which survives, because
+        # a failed-but-completed step is not a cancel — and the still-live
+        # quarantined wedged tree stays around for the post-mortem step
+        # below to snapshot (its wchan names the stuck kernel path).
+        #
+        # FALSIFIED FOR CLASS 2 — a full runner freeze (2026-10-17): with
+        # this quarantine live, both first runs of the quarantine branch
+        # (39048612882 push / 39048623940 pull_request, jobs 117442316042 /
+        # 117442346937) still had this step in_progress at the exact
+        # +45:00 service force-cancels — the 30m supervisor cap never
+        # fired, the post-mortem steps never ran, and both job-log blobs
+        # came back BlobNotFound. The supervisor mechanism itself is
+        # proven (dev-box smoke: a 2s cap against a 60s suite exits 124
+        # with the markers; the healthy path replays exit 0), so when
+        # THIS wedge hits the runner has stopped executing the step shell
+        # itself — a machine-level freeze below any in-job containment;
+        # only the service-side clock terminates it, and it destroys the
+        # logs on the way out. For class 2 the only lever left is the
+        # ENVIRONMENT, so this matrix's linux leg is pinned to
+        # ubuntu-26.04 (kernel 7.0.0-1012-azure vs the wedging 24.04
+        # image's 6.17.0-1022-azure; GA for production) — which is where
+        # ubuntu-latest is migrating anyway (actions/runner-images#14748,
+        # rollout Oct 19–Nov 19 2026), so the pin carries no migration
+        # debt; unify back to ubuntu-latest once that migration
+        # completes. Corroboration that this is a tree×24.04-kernel
+        # interaction, not a fleet incident: bite-mcp's ubuntu-latest CI
+        # stayed green through the same window, and hekma main run
+        # 39016343545 ran the SAME ubuntu suite green in 4m36s at 08:10Z
+        # the same day — the trigger is nondeterministic. The pinned
+        # leg's JOB timeout drops to 15m (matrix data below): a class-2
+        # recurrence on 26.04 costs the 15+5m service window, not 45m,
+        # and surfaces as a fast visible cancel. The cap rides the
+        # matrix `include` as data; the other legs render an empty cap
+        # and run the plain uncapped invocation. Tracking issue: #292.
         shell: bash
         run: |
           CAP="${{ matrix.nextest_wallclock_cap }}"
