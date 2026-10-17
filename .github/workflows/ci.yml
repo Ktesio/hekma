@@ -85,14 +85,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux leg PINNED to ubuntu-26.04 (class-2 runner-freeze mitigation,
+        # tracking #292): the wedging image is 24.04 (kernel 6.17.0-1022-azure);
+        # 26.04 is GA and is where ubuntu-latest migrates anyway Oct 19–Nov 19
+        # 2026 (actions/runner-images#14748). Unify back post-migration.
+        os: [ubuntu-26.04, macos-latest, windows-latest]
         # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
-        # capped — see the "Run tests (nextest)" step below for the why. Carried
-        # as matrix DATA (not an in-step OS comparison) so the run step stays one
-        # uniform invocation for all three OSes.
+        # capped and session-quarantined, and its JOB timeout tightened to 15m —
+        # see the "Run tests (nextest)" step below for the full why (two wedge
+        # classes; the freeze class is environment-bounded via the 26.04 pin).
+        # Carried as matrix DATA (not an in-step OS comparison) so the run step
+        # stays one uniform invocation for all three OSes.
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
+            test_job_timeout_minutes: 15
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
@@ -108,8 +115,12 @@ jobs:
     # .config/nextest.toml) remains the cross-OS per-test hang guard; the
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
-    # under epic-12 retro item 95 (see #236).
-    timeout-minutes: 40
+    # under epic-12 retro item 95 (see #236). The matrix `include` tightens
+    # the PINNED ubuntu-26.04 leg to 15m (tracking #292): the healthy lane is
+    # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
+    # 15+5m service window instead of 45m and surfaces as a fast visible
+    # cancel rather than a silent three-quarter-hour burn.
+    timeout-minutes: ${{ matrix.test_job_timeout_minutes || 40 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -214,34 +225,129 @@ jobs:
         # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable per
         # OS; the root pin governs only local bare cargo. MSRV floor: the `msrv` job.
         #
-        # WALL-CLOCK CAP on the ubuntu leg (2026-10-17 wedge forensics): every
-        # ubuntu-latest test run on a #281-carrying tree since Oct 16 23:42Z has
-        # died at the 40m JOB timeout with NO test ever named — 8+ verified
-        # exact-45m cancels (main and PR trees alike) while the healthy lane is
-        # ~4.5 minutes end-to-end and macOS/Windows stayed green throughout.
-        # One identical tree produced a green-270s run and a wedged-2700s run
-        # seconds apart, so the wedge is nondeterministic — and three
-        # serialization probes (the #106 group, then the CLI integration binary,
-        # then the engine lib unit tests; #284) did NOT cure it. nextest's
-        # slow-timeout kill cannot name what never dies: the wedge sits BELOW
-        # the harness (an unkilling D-state process), and a job-timeout CANCEL
-        # discards the whole job-log blob (BlobNotFound) — so the wedge has
-        # been invisible by construction. Capping the RUN (not the job) means
-        # a wedge fails this STEP while the job still has budget: a FAILED
-        # step's log survives, and the post-mortem snapshot step below captures
-        # the still-live process table (a leftover's stat/wchan names the stuck
-        # kernel wait channel). The cap rides the matrix `include` as data; the
-        # other legs render an empty cap and run uncapped. (Context:
-        # ubuntu-latest flips to the Ubuntu 26 image on 2026-10-19 —
-        # actions/runner-images#14748 — an extra reason to keep this lane
-        # observable through the migration window.)
+        # WALL-CLOCK CAP + SESSION QUARANTINE on the ubuntu leg (2026-10-17
+        # wedge forensics): every ubuntu-latest test run on a #281-carrying
+        # tree since Oct 16 23:42Z has died at the 40m JOB timeout with NO
+        # test ever named — 8+ verified exact-45m cancels (main and PR trees
+        # alike) while the healthy lane is ~4.5 minutes end-to-end and
+        # macOS/Windows stayed green throughout. One identical tree produced
+        # a green-270s run and a wedged-2700s run seconds apart, so the wedge
+        # is nondeterministic — and three serialization probes (the #106
+        # group, then the CLI integration binary, then the engine lib unit
+        # tests; #284) did NOT cure it. nextest's slow-timeout kill cannot
+        # name what never dies: the wedge sits BELOW the harness, in a
+        # process that ignores even SIGKILL. A cap ALONE cannot fix that:
+        # `timeout(1)` WAITS for its child after signalling, so when the
+        # 30m cap fired (run 39044536797) the step was still in_progress at
+        # +38m, the 40m JOB timeout fired at +40m, and the service
+        # force-cancelled at exactly +45m — the post-mortem step below
+        # never ran and the job-log blob was destroyed (BlobNotFound),
+        # exactly the blindness this instrumentation exists to remove. So
+        # the capped leg runs the suite DOUBLE-FORKED into its own session
+        # — `( setsid … & )` re-parents the runner to init, outside this
+        # shell's process group AND descendant chain — while the step shell
+        # SUPERVISES by polling an exit-code file instead of ever waiting
+        # on the suite. That bounds the CLASS-1 wedge (a D-state suite on a
+        # LIVE runner, the #106 `adoption` shape): a healthy end replays the
+        # suite's exit code (and cats the captured output); a cap expiry
+        # fails THIS step (exit 124) with the captured suite output + a
+        # live process snapshot in the step log — which survives, because
+        # a failed-but-completed step is not a cancel — and the still-live
+        # quarantined wedged tree stays around for the post-mortem step
+        # below to snapshot (its wchan names the stuck kernel path).
+        #
+        # FALSIFIED FOR CLASS 2 — a full runner freeze (2026-10-17): with
+        # this quarantine live, both first runs of the quarantine branch
+        # (39048612882 push / 39048623940 pull_request, jobs 117442316042 /
+        # 117442346937) still had this step in_progress at the exact
+        # +45:00 service force-cancels — the 30m supervisor cap never
+        # fired, the post-mortem steps never ran, and both job-log blobs
+        # came back BlobNotFound. The supervisor mechanism itself is
+        # proven (dev-box smoke: a 2s cap against a 60s suite exits 124
+        # with the markers; the healthy path replays exit 0), so when
+        # THIS wedge hits the runner has stopped executing the step shell
+        # itself — a machine-level freeze below any in-job containment;
+        # only the service-side clock terminates it, and it destroys the
+        # logs on the way out. For class 2 the only lever left is the
+        # ENVIRONMENT, so this matrix's linux leg is pinned to
+        # ubuntu-26.04 (kernel 7.0.0-1012-azure vs the wedging 24.04
+        # image's 6.17.0-1022-azure; GA for production) — which is where
+        # ubuntu-latest is migrating anyway (actions/runner-images#14748,
+        # rollout Oct 19–Nov 19 2026), so the pin carries no migration
+        # debt; unify back to ubuntu-latest once that migration
+        # completes. Corroboration that this is a tree×24.04-kernel
+        # interaction, not a fleet incident: bite-mcp's ubuntu-latest CI
+        # stayed green through the same window, and hekma main run
+        # 39016343545 ran the SAME ubuntu suite green in 4m36s at 08:10Z
+        # the same day — the trigger is nondeterministic. The pinned
+        # leg's JOB timeout drops to 15m (matrix data below): a class-2
+        # recurrence on 26.04 costs the 15+5m service window, not 45m,
+        # and surfaces as a fast visible cancel. The cap rides the
+        # matrix `include` as data; the other legs render an empty cap
+        # and run the plain uncapped invocation. Tracking issue: #292.
         shell: bash
         run: |
-          if [ -n "${{ matrix.nextest_wallclock_cap }}" ]; then
-            timeout --signal=TERM --kill-after=90s ${{ matrix.nextest_wallclock_cap }} cargo +stable nextest run --workspace --all-targets
-          else
-            cargo +stable nextest run --workspace --all-targets
+          CAP="${{ matrix.nextest_wallclock_cap }}"
+          if [ -z "$CAP" ]; then
+            # Uncapped leg: plain foreground invocation, untouched semantics.
+            exec cargo +stable nextest run --workspace --all-targets
           fi
+          # Capped leg: double-fork the suite into its own session and
+          # supervise. `setsid` plus the backgrounding subshell re-parent the
+          # runner to init — nothing in THIS step's process tree waits on it,
+          # which is what lets the step terminate even when the suite wedges
+          # below SIGKILL. The inner script records its pid, runs the suite
+          # with stdin detached and output captured, then records the exit
+          # code; no `set -e` there BY DESIGN — the code must be recorded
+          # whatever happens.
+          LOG="$RUNNER_TEMP/nextest-run.log"
+          PIDF="$RUNNER_TEMP/nextest.pid"
+          EXITF="$RUNNER_TEMP/nextest.exit"
+          rm -f "$PIDF" "$EXITF"
+          # The cap is expressed in minutes (matrix data, e.g. 30m).
+          CAPS=$(( ${CAP%m} * 60 ))
+          (
+            setsid bash -c '
+                  pidf=$1; exitf=$2; shift 2
+                  echo $$ > "$pidf"
+                  "$@"
+                  echo $? > "$exitf"
+                ' quarantine "$PIDF" "$EXITF" \
+              cargo +stable nextest run --workspace --all-targets \
+              < /dev/null > "$LOG" 2>&1 &
+          )
+          START=$SECONDS
+          HEART=0
+          while true; do
+            if [ -f "$EXITF" ]; then
+              break
+            fi
+            NOW=$(( SECONDS - START ))
+            if [ "$NOW" -ge "$CAPS" ]; then
+              break
+            fi
+            if [ $(( NOW - HEART )) -ge 60 ]; then
+              HEART=$NOW
+              echo "[supervisor] suite running for ${NOW}s; recent output:"
+              tail -c 800 "$LOG" 2>/dev/null || true
+              echo
+            fi
+            sleep 5
+          done
+          if [ -f "$EXITF" ]; then
+            cat "$LOG"
+            CODE=$(cat "$EXITF")
+            echo "[supervisor] suite exited with code $CODE after $(( SECONDS - START ))s"
+            exit "$CODE"
+          fi
+          echo "[supervisor] WALL-CLOCK CAP HIT at +$(( SECONDS - START ))s — the suite did not finish"
+          echo "[supervisor] ===== full suite output so far ====="
+          cat "$LOG"
+          echo "[supervisor] ===== live process table (quarantined tree included; stat D = uninterruptible) ====="
+          ps -eo pid,ppid,pgid,sid,stat,wchan:32,etimes,comm,args --sort=etimes || true
+          echo "[supervisor] ===== suite-related survivors ====="
+          ps -eo pid,stat,args 2>/dev/null | grep -E "nextest|fake_agent|fake_acp_agent|hermes_shim|hekma" | grep -v grep || echo "(none)"
+          exit 124
       - name: Wedge post-mortem snapshot (process table + pressure)
         # Always runs — also when the capped run step above FAILED on its
         # wall-clock expiry, which is exactly when it matters: the wedged
@@ -1026,7 +1132,18 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    # 2026-10-17 (#292): pinned to ubuntu-26.04 like the test matrix's linux
+    # leg (the class-2 runner-freeze mitigation). Both coverage runs of
+    # bc561ee on the 24.04 image died ~52 min into
+    # Enforce coverage with "the hosted runner lost communication with the
+    # server" — the x86-ubuntu wedge family starving the runner process itself,
+    # not a test hang and not the AI-23 cold-compile shape (the instrumented
+    # build had long finished; tarpaulin was mid-suite). The same PR's
+    # test (ubuntu-26.04) legs were green twice, and the wedge-postmortem
+    # artifact shows 26.04 carrying the same fake_agent leftovers with no
+    # freeze — so the pin moves the last 24.04 consumer off the drifting
+    # ubuntu-latest label (migrating Oct 19–Nov 19 anyway).
+    runs-on: ubuntu-26.04
     needs: [fmt, clippy, test, build, docs, boundary, semver]
     # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
