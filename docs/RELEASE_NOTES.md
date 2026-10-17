@@ -9,6 +9,13 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
+> **Unreleased — conformance kit hardening (the TCK's third-party surface).**
+> Announced ahead of the release that ships it:
+>
+> - **`hekma-conformance` additive surface** (path-only crate, no crates.io bump): `run_conformance_with` + `TckConfig` (per-section timeout, a CALLER-OWNED state root, typed section selection) — the default `run_conformance` stays byte-identical; the report shape is unchanged (schema_version 1, subsets yield fewer entries). Caller roots must be FRESH (empty) and are exclusively one run's — a non-empty or uncreatable root is a named stage failure, which also kills the stale-artifact false-pass and fixed-name-collision classes.
+> - **Read routing + error honesty**: every read with an existing public seam routes through it (log polls via `read_agent_log`, metering source via `fleet_entry`, the `--dump` pair via `adapter::resolve` with documented resolve-from-source semantics); DB errors no longer masquerade as zero rows (named errors, propagated immediately); pre-section failures carry their own stage prefix (state root / engine open / registration / capabilities / snapshot read — no more blanket "registration failed").
+> - **The `--dump` subject-delivery proof convention** (Adapter Contract docs): a manifest adapter that declares config delivery SHOULD provide a `--dump` seam; the TCK's memory section now proves the SUBJECT received the delivered values through it (dump-carrying adapters mapping `memory.dir` to a non-env target skip the leg honestly — the probe twin remains the proof).
+
 > **Unreleased — ACP verified against real OpenCode + Hermes agents.** opencode v2's native ACP server (`opencode acp`) is a run-verified `acp`-kind backend (`acp.command = opencode`, `acp.args = acp`; verified at `v2.0.28` — full prompt turn, reply retained, clean stop), and Hermes via `hermes-acp` carries a real-run pin (`v0.21.7+500.g8f81791`). New opt-in turn-completion smokes (`HEKMA_TEST_REAL_AGENT_TURNS=1`) prove full turns against both; the real opencode dialect shapes are pinned against the contract twin. No engine behavior changed — validation and docs moved forward (`docs/agents.md`).
 
 

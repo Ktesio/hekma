@@ -215,10 +215,13 @@ fn run_engine1(mode: &str, state: &Path, manifest: &Path) {
 }
 
 /// Linux AND running under CI (GitHub sets `CI`). Used to skip the heavy
-/// process-spawning adoption tests that deadlock on the x86 ubuntu runner (#109),
-/// while still running them locally (Linux dev) and on macOS/Windows/arm64.
+/// process-spawning adoption tests that deadlock on the x86-64 ubuntu runner
+/// only (#109 — arm64 Linux was never affected), while still running them
+/// locally (Linux dev), on macOS/Windows, and on any arm64 Linux CI leg.
 fn is_linux_ci() -> bool {
-    hekma_engine::OsId::current() == hekma_engine::OsId::Linux && std::env::var_os("CI").is_some()
+    hekma_engine::OsId::current() == hekma_engine::OsId::Linux
+        && std::env::var_os("CI").is_some()
+        && std::env::consts::ARCH == "x86_64"
 }
 
 /// The re-exec entry for the "engine 1" work (see module docs). When
@@ -2524,4 +2527,47 @@ fn a_pre_v9_spawn_record_mints_a_run_once_persists_it_and_notes_it_once() {
     );
     facade.stop("away", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the detached agent");
+}
+
+/// Story 15-2 (M2 CI fix, OS-uniform half): the SESSION supervision
+/// composition — a live NON-DETACHED spawn under THIS engine reads
+/// `Some(Supervision::Session)`, and the record's clear at stop returns the
+/// field to its absent state. This in-process proof runs on EVERY OS (the
+/// child lives exactly as long as this engine session — no cross-command
+/// survival needed); the cross-command session surface (list/show/--json)
+/// is the CLI leg, Unix-only by the documented NFR-1 Windows semantics.
+#[test]
+fn a_live_session_bound_spawn_reads_session_supervision_in_process() {
+    let base = TempDir::new().unwrap();
+    let shared: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let engine = Engine::open_with_diagnostics(Some(base.path().to_path_buf()), make_sink(&shared))
+        .expect("engine open");
+    let name = "sessy-inprocess";
+    let manifest = TempDir::new().unwrap();
+    write_fake_manifest(manifest.path(), "fake", &["--linger-ms", "600000"]);
+    engine
+        .blocking()
+        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .expect("register the fake instance");
+    let started = engine.blocking().start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let entry = engine.blocking().fleet_entry(name).expect("fleet entry");
+    assert_eq!(
+        entry.supervision,
+        Some(Supervision::Session),
+        "a live session-bound spawn reads Session: {:?}",
+        entry.supervision
+    );
+
+    let stopped = engine
+        .blocking()
+        .stop(name, Some(Duration::from_secs(5)))
+        .expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    let entry = engine.blocking().fleet_entry(name).expect("fleet entry");
+    assert_eq!(
+        entry.supervision, None,
+        "the stopped record never implies supervised"
+    );
 }

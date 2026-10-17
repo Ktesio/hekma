@@ -483,13 +483,16 @@ class ReleaseDocsTests(unittest.TestCase):
         # 2026-09-22 hardening narrowed the engine-tests entry from the whole
         # tests/ directory to the TWO files that genuinely use OS-cfg
         # (atomic_config_writes.rs, memory.rs), each justified in the step
-        # comment — the pin follows the new line exactly.
+        # comment — the pin follows the new line exactly. Story 15-3 added
+        # the conformance tck.rs entry (the EngineOpen drive's unix-only
+        # unwritable-root shape, justified in the step comment).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
             r"|^crates/hekma/src/cli/self_update\.rs:"
             r"|^crates/hekma-engine/tests/atomic_config_writes\.rs:"
-            r"|^crates/hekma-engine/tests/memory\.rs:'",
+            r"|^crates/hekma-engine/tests/memory\.rs:"
+            r"|^crates/hekma-conformance/src/tck\.rs:'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
