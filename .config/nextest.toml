@@ -81,3 +81,23 @@ test-group = "engine-integration-serial"
 [[profile.default.overrides]]
 filter = "kind(test) & package(hekma)"
 test-group = "engine-integration-serial"
+
+# Serialize the engine crate's LIB unit tests too (the 2026-10-17 wedge,
+# probe 2). The two overrides above cover `kind(test)` — the integration
+# binaries — but #281 also grew process-spawning at kind(lib):
+# src/domain/supervisor/tests.rs's release-pass legs (resume/freeze/
+# reconcile of DETACHED children — SIGSTOP/SIGCONT on live fake_agents)
+# run as plain lib unit tests, fully parallel on the genuine 2-core x86
+# ubuntu runner. With both integration surfaces serialized but the lib
+# spawns parallel, the lane still wedged into the #106 D-state family:
+# every ubuntu-latest test run since 2026-10-16T23:42Z on a #281-carrying
+# tree died at its 40m job timeout (7 verified by the timeout annotation
+# or an exact-45m cancel, the agent_cli serialization active for the
+# last; macOS/Windows green throughout; every serialized binary passes
+# under nextest on a dev box in seconds). Joining the lib tests to the
+# same group closes the last unsynchronized process-spawning surface —
+# all engine/CLI spawners now mutually exclude. HIDES/SKIPS nothing;
+# only parallelism changes. The lib suite is unit-level and fast.
+[[profile.default.overrides]]
+filter = "kind(lib) & package(hekma-engine)"
+test-group = "engine-integration-serial"
