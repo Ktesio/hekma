@@ -170,6 +170,25 @@ class ReleaseDocsTests(unittest.TestCase):
         )
 
         self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
+        # Wedge forensics (2026-10-17, #292): the coverage job is pinned to
+        # ubuntu-26.04 — the same class-2 runner-freeze mitigation as the
+        # test matrix's linux leg. Both
+        # coverage runs of bc561ee on the 24.04 image died ~52 min into
+        # Enforce coverage with "the hosted runner lost communication with the
+        # server" (the wedge starving the runner itself), while the PR's own
+        # ubuntu-26.04 test legs were green twice. Scope the assertion to the
+        # coverage JOB so it cannot be satisfied by another job's runner label,
+        # and so a regression back to the drifting ubuntu-latest label — or a
+        # reordering that moves the string out of this job — fails loudly.
+        job_start = ci.index("  coverage:")
+        import re as _re
+
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        # The coverage job may be LAST in the file — slice to end-of-file then.
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        coverage_job = ci[job_start:job_end]
+        self.assertIn("name: coverage", coverage_job)
+        self.assertIn("runs-on: ubuntu-26.04", coverage_job)
         # Stable jobs are explicit about their toolchain: the root
         # rust-toolchain.toml pins bare cargo to the MSRV (1.96.1), so these jobs
         # select +stable to keep exercising latest stable (AI-17). The `msrv` job

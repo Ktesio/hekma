@@ -1132,7 +1132,18 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    # 2026-10-17 (#292): pinned to ubuntu-26.04 like the test matrix's linux
+    # leg (the class-2 runner-freeze mitigation). Both coverage runs of
+    # bc561ee on the 24.04 image died ~52 min into
+    # Enforce coverage with "the hosted runner lost communication with the
+    # server" — the x86-ubuntu wedge family starving the runner process itself,
+    # not a test hang and not the AI-23 cold-compile shape (the instrumented
+    # build had long finished; tarpaulin was mid-suite). The same PR's
+    # test (ubuntu-26.04) legs were green twice, and the wedge-postmortem
+    # artifact shows 26.04 carrying the same fake_agent leftovers with no
+    # freeze — so the pin moves the last 24.04 consumer off the drifting
+    # ubuntu-latest label (migrating Oct 19–Nov 19 anyway).
+    runs-on: ubuntu-26.04
     needs: [fmt, clippy, test, build, docs, boundary, semver]
     # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
