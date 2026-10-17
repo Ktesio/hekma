@@ -8096,15 +8096,15 @@ fn list_and_show_surface_the_supervision_indicator() {
     // guarantee), so each surface gets its own freshly-started instance via
     // the surviving-engine harness (the helper engine "crashes" without
     // dropping, leaving a live adoptable process whose record reads
-    // detach=false) — a survival shape that exists on UNIX ONLY: on Windows
-    // the starting engine's Job-Object kill-on-close takes the child at the
-    // helper's exit (the documented NFR-1 semantics), so the cross-command
-    // leg gates here (the file's data-driven `_unix` convention, per the
-    // boundary rule); the OS-uniform half of the proof — the in-process
-    // session composition — is pinned engine-side in tests/adoption.rs.
-    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
-        return; // the documented Windows limitation (data-driven OsId, not cfg).
-    }
+    // detach=false). On Windows that cross-lifetime liveness genuinely
+    // cannot be simulated — the helper's job object kills the child at
+    // helper exit (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; the same constraint
+    // `pause_after_windows_engine_death_reconciles_and_fails_honestly_windows`
+    // builds on) — so the Windows arm waits out the asynchronous job-close
+    // kill and asserts the honest Windows-real outcome instead: the row
+    // reconciles to `failed` and the indicator reads the frozen absence on
+    // every surface (a dead process is never supervised).
+    let windows = hekma_engine::OsId::current() == hekma_engine::OsId::Windows;
     let session_instance = |tag: &str| -> String {
         let name = format!("sessy-{tag}");
         let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
@@ -8123,11 +8123,26 @@ fn list_and_show_surface_the_supervision_indicator() {
         assert!(!reg.timed_out, "register leg hung");
         assert!(reg.run.success, "stderr={}", reg.run.stderr);
         start_via_surviving_engine(state_dir, &name);
-        wait_for_agent_pid(state_dir, &name);
+        let pid = wait_for_agent_pid(state_dir, &name);
+        if windows {
+            // The kill is asynchronous relative to the helper's exit — wait
+            // it out (the pause family's `wait_until_gone` discipline) so
+            // the adopting command below reconciles deterministically
+            // instead of racing a still-dying pid.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while pid_alive(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the engine-death job-close kill never completed for pid {pid}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
         name
     };
 
-    // (a) `list`: the compact `session` marker in the Supervision column.
+    // (a) `list`: the compact `session` marker in the Supervision column
+    // (Windows: the reconciled `failed` row renders the absence instead).
     session_instance("list");
     let listed = run_hekma_agent_with_env(
         &["agent", "list"],
@@ -8140,17 +8155,31 @@ fn list_and_show_surface_the_supervision_indicator() {
         "list should exit 0; stderr={}",
         listed.stderr
     );
-    assert!(
-        listed.stdout.contains("session"),
-        "the live session-bound record renders the session marker: {}",
-        listed.stdout
-    );
+    if windows {
+        assert!(
+            listed.stdout.contains("failed"),
+            "the engine-death row reconciles to failed: {}",
+            listed.stdout
+        );
+        assert!(
+            !listed.stdout.contains("session"),
+            "a reconciled engine-death row never renders the session marker: {}",
+            listed.stdout
+        );
+    } else {
+        assert!(
+            listed.stdout.contains("session"),
+            "the live session-bound record renders the session marker: {}",
+            listed.stdout
+        );
+    }
     assert!(
         !listed.stdout.contains("detached"),
         "the session leg must not render the detached marker: {}",
         listed.stdout
     );
-    // (b) `show`: the Supervision row names `session` EXACTLY.
+    // (b) `show`: the Supervision row names `session` EXACTLY (Windows: the
+    // honest `—` absence on the reconciled row).
     let name = session_instance("show");
     let shown = run_hekma_agent(&["agent", "show", &name], &ctx.project_dir, state_dir);
     assert!(shown.success, "stderr={}", shown.stderr);
@@ -8165,12 +8194,14 @@ fn list_and_show_surface_the_supervision_indicator() {
             )
         });
     let cells: Vec<&str> = supervision_row.split_whitespace().collect();
+    let session_cell = if windows { "—" } else { "session" };
     assert_eq!(
         cells,
-        vec!["Supervision", "session"],
-        "the live session-bound row's Supervision cell is exactly 'session': {supervision_row}"
+        vec!["Supervision", session_cell],
+        "the session-bound row's Supervision cell is exactly '{session_cell}': {supervision_row}"
     );
-    // (c) `show --json`: the additive field carries the wire value.
+    // (c) `show --json`: the additive field carries the wire value (Windows:
+    // the reconciled row omits the field — failed never implies supervised).
     let name = session_instance("json");
     let json = run_hekma_agent(
         &["agent", "show", &name, "--json"],
@@ -8178,11 +8209,18 @@ fn list_and_show_surface_the_supervision_indicator() {
         state_dir,
     );
     let doc: serde_json::Value = serde_json::from_str(&json.stdout).expect("pure JSON");
-    assert_eq!(
-        doc["instance"]["supervision"],
-        serde_json::json!("session"),
-        "the session-bound record carries the session wire value: {doc}"
-    );
+    if windows {
+        assert!(
+            doc["instance"].get("supervision").is_none(),
+            "the reconciled engine-death row omits the supervision field: {doc}"
+        );
+    } else {
+        assert_eq!(
+            doc["instance"]["supervision"],
+            serde_json::json!("session"),
+            "the session-bound record carries the session wire value: {doc}"
+        );
+    }
     // Each session-bound child was killed by its one adopting command's
     // engine drop (kill-on-drop); settle the rows with a best-effort stop so
     // later legs start from a clean table.
@@ -8285,36 +8323,109 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
     // instance) APPEARS in a later command's `logs --follow` — human mode
     // renders it like any line, `--json` emits it as a real NDJSON LogLine
     // (stdout stays pure NDJSON), and the un-attributed qualifier rides
-    // STDERR exactly once per session. The instance is REGISTERED (never
-    // started), so the follow loop exits on its own after the final drain.
-    let (ctx, state) = registered_mock("rawcat");
+    // STDERR exactly once per session. The instances are LIVE and DETACHED
+    // (the exact between-commands window the story describes), and the stop
+    // that ends each follow doubles as the drain trigger.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
-    // The backlog exists BEFORE the command starts: priming must SKIP it
-    // (it is not re-emitted), which the thread-appended line below then
-    // proves by being the ONLY raw line on stdout.
-    let raw_log = agent_log_path(state_dir, "rawcat");
-    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
-    std::fs::write(&raw_log, "pre-existing backlog line\n").unwrap();
 
     for (mode, json) in [("human", false), ("json", true)] {
-        // A line written WHILE the follow command runs (after its raw cursor
-        // prime, before its first poll).
+        // Each mode gets its OWN live detached instance: a registered
+        // (never-started) row's follow loop exits on its first status poll,
+        // which raced the appender on slow-starting platforms — the Windows
+        // runner's process spawn can outlast a fixed appender delay, landing
+        // the write before the command's raw-cursor prime (primed as
+        // backlog, never streamed; stdout empty). A detached instance keeps
+        // the loop following while the appender writes, and the stop that
+        // ends the follow drains the line before the exit note on every
+        // platform, deterministically.
+        let name = format!("rawcat-{mode}");
+        let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+        let reg = run_hekma_agent_bounded(
+            &[
+                "agent",
+                "register",
+                &name,
+                "--manifest",
+                m.to_str().unwrap(),
+            ],
+            &ctx.project_dir,
+            state_dir,
+            REGISTER_BOUND,
+        );
+        assert!(!reg.timed_out, "register leg hung");
+        assert!(reg.run.success, "stderr={}", reg.run.stderr);
+        let mut orphan_guard = StopOrphanOnDrop {
+            name: &name,
+            working_dir: ctx.project_dir.as_path(),
+            state_dir,
+            timeout_arg: "5".to_string(),
+            armed: true,
+        };
+        let started = run_hekma_agent_bounded(
+            &["agent", "start", &name, "--detach"],
+            &ctx.project_dir,
+            state_dir,
+            LEG_BOUND,
+        );
+        assert!(!started.timed_out, "the detached start leg hung");
+        assert!(started.run.success, "stderr={}", started.run.stderr);
+        wait_for_agent_pid(state_dir, &name);
+
+        // The backlog exists BEFORE the follow command starts: priming must
+        // SKIP it (it is not re-emitted), which the thread-appended line
+        // below then proves by being the ONLY raw line on stdout. Appended,
+        // not truncated over — the agent's own ready line ahead of it is
+        // equally backlog, and priming skips both.
+        let raw_log = agent_log_path(state_dir, &name);
+        std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&raw_log)
+                .expect("open the raw log");
+            writeln!(file, "pre-existing backlog line").expect("append the backlog");
+        }
+
+        // A line written WHILE the follow command runs (safely past its raw
+        // cursor prime — the instance is live, so the loop keeps polling),
+        // then the stop that lets the loop drain and exit cleanly.
         let append_log = raw_log.clone();
+        let stop_name = name.clone();
+        let working_dir = ctx.project_dir.clone();
+        let state_dir_owned = state.project_dir.clone();
         let appender = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            std::thread::sleep(std::time::Duration::from_millis(1200));
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&append_log)
                 .expect("open the raw log");
             writeln!(file, "raw fallback line for {mode}").expect("append");
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let stopped = run_hekma_agent_bounded(
+                &["agent", "stop", &stop_name],
+                &working_dir,
+                &state_dir_owned,
+                LEG_BOUND,
+            );
+            assert!(!stopped.timed_out, "the stop leg hung");
+            assert!(stopped.run.success, "stderr={}", stopped.run.stderr);
         });
-        let mut args = vec!["agent", "logs", "rawcat", "--follow"];
+        let mut args = vec!["agent", "logs", name.as_str(), "--follow"];
         if json {
             args.push("--json");
         }
-        let run = run_hekma_agent(&args, &ctx.project_dir, state_dir);
+        let bounded = run_hekma_agent_bounded(&args, &ctx.project_dir, state_dir, LEG_BOUND);
+        assert!(
+            !bounded.timed_out,
+            "the follow command never exited after the stop"
+        );
         appender.join().expect("the appender thread");
+        orphan_guard.disarm();
+        let run = bounded.run;
         assert!(run.success, "[{mode}] stderr={}", run.stderr);
         // The NEW raw line appears; the pre-existing backlog does NOT.
         assert!(
