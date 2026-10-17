@@ -252,6 +252,16 @@ impl Supervisor {
         // so a failure rejects the start with no spurious transition. This is the
         // defensive SELF-HEAL — attach already created it; a manual delete must
         // not wedge future starts.
+        //
+        // STORY 15-6: this early read is the PRE-CHECK, no longer the
+        // authoritative read. Its refusal inputs (the UTF-8 + symlink refusals
+        // and the self-heal below) must run BEFORE any state transition, so it
+        // stays; the AUTHORITATIVE read is the snapshot inside the `→ starting`
+        // transition transaction (step (3) below), which refuses typed +
+        // retryably when a second process attached/detached between here and
+        // there. A matching snapshot confirms everything this pre-check
+        // derived (the injected memory dir, the mapping application); a
+        // mismatching one rejects the start with nothing launched.
         let memory_backing = registry.memory_backing(&name).map_err(registry_to_engine)?;
         let memory_dir = memory_backing
             .as_ref()
@@ -356,9 +366,16 @@ impl Supervisor {
         // the operator took an explicit attach action and is owed the truth
         // about its effect). Pure decision fn (unit-tested); this is the only
         // emission site, routed through `emit_diagnostic` (story 10-2).
-        if let Some(notice) = memory_delivery_notice(memory_dir.as_deref(), &mapping, &name) {
-            self.emit_diagnostic(&notice);
-        }
+        //
+        // STORY 15-6: the emission moved BELOW the `→ starting` transition
+        // transaction and now derives from the TRANSACTIONAL SNAPSHOT (the
+        // authoritative read), not this pre-check — a start whose snapshot
+        // disagrees with the pre-check rejects and emits NOTHING (a notice
+        // for a launch that never happened would be a lie). When the
+        // snapshot matches (the only way the start proceeds), the
+        // snapshot-derived notice is byte-identical to this pre-check
+        // derivation. The `mapping` needed by the notice is already resolved
+        // (above) and unchanged by the transition.
 
         // (2b-secret) Resolve every `secret:NAME` leaf into a SecretString BEFORE
         // the mapping application (story 2-4, spine AD-10, AC-A/AC9). This is where
@@ -483,14 +500,39 @@ impl Supervisor {
         let usage_cursor = self.agent_log_len(registry, &name);
         let stderr_usage_cursor = self.agent_stderr_log_len(registry, &name);
 
-        // (3) registered/stopped/failed → starting.
-        self.transition(
+        // (3) registered/stopped/failed → starting — TRANSACTIONALLY (story
+        // 15-6). The state persist and the AUTHORITATIVE backing read share
+        // ONE `BEGIN IMMEDIATE` transaction, conditional on the state and
+        // backing this start's pre-check reads observed. A second process's
+        // attach/detach (or lifecycle transition) landing anywhere inside
+        // start's read→transition window refuses here, typed and retryable,
+        // with the transaction rolled back — no `starting` row, no launch
+        // against a stale view. On success the returned snapshot is the
+        // authoritative backing this launch reflects.
+        let backing_snapshot = self.transition_with_backing_snapshot(
             registry,
             &name,
             instance.state,
             starting,
             TransitionCause::command(LifecycleCommand::Start.as_str()),
+            memory_backing,
         )?;
+
+        // (3b) The DC-10 delivery notice, derived from the TRANSACTIONAL
+        // SNAPSHOT (story 15-6 — see the (2b-memory-delivery) block above):
+        // reaching this line proves snapshot == pre-check, so the derived
+        // dir is byte-identical to the pre-check's; deriving it from the
+        // snapshot keeps the notice's semantics tied to what the launch
+        // actually delivers, surviving the reorder.
+        let snapshot_memory_dir = backing_snapshot
+            .as_ref()
+            .filter(|backing| backing.kind == MemoryBackingKind::Filesystem)
+            .map(|_| registry.agent_memory_dir(&name));
+        if let Some(notice) =
+            memory_delivery_notice(snapshot_memory_dir.as_deref(), &mapping, &name)
+        {
+            self.emit_diagnostic(&notice);
+        }
 
         let spec = SpawnSpec {
             exec: launch.exec.clone(),
