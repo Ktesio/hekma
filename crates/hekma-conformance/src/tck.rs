@@ -3519,10 +3519,14 @@ mod tests {
     /// design: the fresh-root contract refuses any pre-existing entry at
     /// the StateRoot stage FIRST, which is the stronger guarantee; the
     /// unwritable-empty-root shape drives the same stage arm.) Unix-only
-    /// (directory write permissions); skipped with a note when the runner
+    /// (directory write permissions — the one shape that passes the
+    /// fresh-root check yet fails the engine open; boundary-allowlisted in
+    /// ci.yml with this justification); skipped with a note when the runner
     /// ignores permissions (e.g. root).
     #[test]
-    #[cfg(unix)]
+    #[cfg(unix)] // boundary-allowlisted with justification in ci.yml: the
+                 // EngineOpen drive needs an EMPTY-but-UNWRITABLE root — unix permission
+                 // model only (the fresh-root contract refuses non-empty roots at StateRoot).
     fn unwritable_caller_state_root_fails_the_engine_open_stage_for_the_selected_set() {
         use std::os::unix::fs::PermissionsExt;
         let scratch = tempfile::Builder::new()

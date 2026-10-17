@@ -7891,7 +7891,7 @@ fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
     // (`kind_dispatch_and_the_adoption_note_are_stable`) and the
     // cross-OS e2e above.
     if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
-        return; // the documented Windows limitation; the `_unix` suffix says so.
+        return; // the documented Windows limitation (data-driven OsId, not cfg).
     }
     let ctx = TestContext::new();
     let state = TestContext::new();
@@ -8094,7 +8094,15 @@ fn list_and_show_surface_the_supervision_indicator() {
     // guarantee), so each surface gets its own freshly-started instance via
     // the surviving-engine harness (the helper engine "crashes" without
     // dropping, leaving a live adoptable process whose record reads
-    // detach=false).
+    // detach=false) — a survival shape that exists on UNIX ONLY: on Windows
+    // the starting engine's Job-Object kill-on-close takes the child at the
+    // helper's exit (the documented NFR-1 semantics), so the cross-command
+    // leg gates here (the file's data-driven `_unix` convention, per the
+    // boundary rule); the OS-uniform half of the proof — the in-process
+    // session composition — is pinned engine-side in tests/adoption.rs.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return; // the documented Windows limitation (data-driven OsId, not cfg).
+    }
     let session_instance = |tag: &str| -> String {
         let name = format!("sessy-{tag}");
         let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
