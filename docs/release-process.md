@@ -235,6 +235,16 @@ widen a gate or an allowlist to make a baseline pass.
 
 ### Decision log
 
+- **Release go (v0.11.0 + engine 0.7.0):** GRANTED 2026-10-17 — Islam's explicit go, given
+  in direct response to the orchestrator's protocol question (the tree decision + the go,
+  answered "1.b - 2. go" in the release-prep session that posed exactly those two items
+  per this section's requirements; the session transcript is the recorded artifact).
+  Decision (b) ratified: v0.11.0 ships CURRENT MAIN — the 2026-10-16/17 backlog
+  clear-out (six merged story PRs through ea1a9f0) + the hekma-engine 0.7.0 additive surface — in one honest
+  minor, superseding the v0.10.0 bump's audited-tree scope (#279). adapter-api 0.2.0 and
+  adapters-hermes 0.2.0 are already on crates.io (their publish steps self-skip); the
+  ktesio-* deprecation shims were completed at the v0.8.0 cutover and do not repeat.
+
 - **Publish go:** GRANTED 2026-09-09 — Islam's explicit go recorded on the release-tracking issue
   [#176](https://github.com/Ktesio/hekma/issues/176) ("GO — execute steps 0–7 now", libs 0.1.0 +
   kt/tag v0.7.0, #168 dispositions ratified in the same decision round). Steps 0–7 executed by the
