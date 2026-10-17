@@ -329,7 +329,23 @@ impl SqliteStore {
     /// only genuine pragma gap): a concurrent writer degrades to the
     /// [`BUSY_TIMEOUT_MS`] bounded wait and then the TYPED
     /// [`StoreError::Busy`], never an instant raw `SQLITE_BUSY`.
+    ///
+    /// ORDER (review round 1): the `busy_timeout` installs FIRST, before the
+    /// `journal_mode=WAL` pragma. Entering WAL can itself need the write lock
+    /// (it writes the DB header), so on a FIRST open that races another
+    /// process's write transaction the WAL pragma would return an instant
+    /// `SQLITE_BUSY` with no busy handler installed — bypassing the typed
+    /// bounded-wait contract at exactly the moment it exists for. With the
+    /// handler installed first, that race degrades to the bounded wait and
+    /// the typed error like every other writer collision.
     fn configure(conn: &Connection) -> Result<(), StoreError> {
+        // Story 15-6: the AD-17 bounded-wait bound. rusqlite installs the
+        // busy handler directly; every subsequent blocked write (including a
+        // `BEGIN IMMEDIATE` that loses the race for the write lock, and the
+        // WAL pragma below) waits this long before surfacing
+        // [`StoreError::Busy`].
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
+            .map_err(backend)?;
         // WAL returns the resulting mode as a row; query_row consumes it.
         let mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
@@ -346,12 +362,6 @@ impl SqliteStore {
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(backend)?;
         conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(backend)?;
-        // Story 15-6: the AD-17 bounded-wait bound. rusqlite installs the
-        // busy handler directly; every subsequent blocked write (including a
-        // `BEGIN IMMEDIATE` that loses the race for the write lock) waits
-        // this long before surfacing [`StoreError::Busy`].
-        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
             .map_err(backend)?;
         Ok(())
     }
@@ -1403,17 +1413,9 @@ impl StateStore for SqliteStore {
         kind: MemoryBackingKind,
         terminal_states: &[LifecycleState],
     ) -> Result<MemoryBackingTxn, StoreError> {
-        begin_immediate(&self.conn)?;
-        match self.attach_in_txn(name, kind, terminal_states) {
-            Ok(outcome) => {
-                commit(&self.conn)?;
-                Ok(outcome)
-            }
-            Err(err) => {
-                rollback(&self.conn);
-                Err(err)
-            }
-        }
+        in_immediate_txn(&self.conn, || {
+            self.attach_in_txn(name, kind, terminal_states)
+        })
     }
 
     fn detach_memory_backing_txn(
@@ -1421,14 +1423,7 @@ impl StateStore for SqliteStore {
         name: &InstanceName,
         terminal_states: &[LifecycleState],
     ) -> Result<(), StoreError> {
-        begin_immediate(&self.conn)?;
-        match self.detach_in_txn(name, terminal_states) {
-            Ok(()) => commit(&self.conn),
-            Err(err) => {
-                rollback(&self.conn);
-                Err(err)
-            }
-        }
+        in_immediate_txn(&self.conn, || self.detach_in_txn(name, terminal_states))
     }
 
     fn set_state_snapshotting_memory_backing(
@@ -1438,23 +1433,16 @@ impl StateStore for SqliteStore {
         new_state: LifecycleState,
         expected_backing: Option<MemoryBacking>,
     ) -> Result<Option<MemoryBacking>, StoreError> {
-        begin_immediate(&self.conn)?;
-        match self.transition_snapshot_in_txn(name, expected_prior, new_state, expected_backing) {
-            Ok(snapshot) => {
-                commit(&self.conn)?;
-                Ok(snapshot)
-            }
-            Err(err) => {
-                rollback(&self.conn);
-                Err(err)
-            }
-        }
+        in_immediate_txn(&self.conn, || {
+            self.transition_snapshot_in_txn(name, expected_prior, new_state, expected_backing)
+        })
     }
 }
 
 /// The story-15-6 transactional seams' statement-level internals: each txn is
-/// `begin_immediate` → one `_in_txn` body (guard + checks + writes) →
-/// `commit`, or `rollback` + the typed refusal.
+/// `in_immediate_txn` — `begin_immediate` → one `_in_txn` body (guard +
+/// checks + writes) → `commit`, with a `rollback` on EVERY failure path
+/// (body refusals AND commit failures — see `in_immediate_txn`).
 impl SqliteStore {
     /// The attach's guard + conflict/idempotence check + row write, all under
     /// the write lock `begin_immediate` already took. Any refusal returns
@@ -1629,12 +1617,46 @@ fn commit(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("COMMIT").map_err(backend)
 }
 
-/// Best-effort rollback on a refusal path: the transaction is being
-/// abandoned with an error anyway, so the rollback's own failure (it cannot
+/// Best-effort rollback on an abandonment path: the transaction is being
+/// dropped with an error anyway, so the rollback's own failure (it cannot
 /// meaningfully fail here — the connection is healthy enough to have run the
-/// statements) must not MASK the real refusal.
+/// statements) must not MASK the real error.
 fn rollback(conn: &Connection) {
     let _ = conn.execute_batch("ROLLBACK");
+}
+
+/// Run `body` inside ONE `BEGIN IMMEDIATE` write transaction (the story-15-6
+/// seams' shared spine): `begin_immediate` → body → `commit`, with a
+/// `rollback` on EVERY failure path.
+///
+/// Review round 1 (the bricking bug): a failed COMMIT must ROLL BACK before
+/// the error returns. This connection is the LONG-LIVED engine handle, and a
+/// SQLite commit CAN fail after the transaction stays open (a deferred
+/// foreign-key violation surfacing at commit time is the portable example) —
+/// returning the error with the transaction still open would brick every
+/// later store call on the connection ("cannot start a transaction within a
+/// transaction"), taking down the whole engine session, not just the one
+/// refused operation. Both failure shapes therefore roll back: a body
+/// refusal (the typed, row-unchanged contract) and a commit failure (the
+/// write never landed; the connection stays usable).
+fn in_immediate_txn<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    begin_immediate(conn)?;
+    match body() {
+        Ok(value) => match commit(conn) {
+            Ok(()) => Ok(value),
+            Err(err) => {
+                rollback(conn);
+                Err(err)
+            }
+        },
+        Err(err) => {
+            rollback(conn);
+            Err(err)
+        }
+    }
 }
 
 /// Format a backing view for [`StoreError::MemoryBackingChangedUnderStart`]
@@ -4378,5 +4400,132 @@ mod tests {
             "the operator surface never shows a raw SQLITE_BUSY: {err}"
         );
         drop(holder);
+    }
+
+    /// Review round 1 (the bricking bug): a COMMIT failure must ROLL BACK
+    /// before the error returns — the engine's store is ONE long-lived
+    /// connection, and a transaction left open by a failed commit would
+    /// brick every later store call ("cannot start a transaction within a
+    /// transaction").
+    ///
+    /// Fault injection (portable, no mock store): a `DEFERRABLE INITIALLY
+    /// DEFERRED` foreign key violated only by rows the txn body itself
+    /// writes. The violating INSERT succeeds at statement time (the check is
+    /// deferred) and SQLite surfaces `SQLITE_CONSTRAINT_FOREIGNKEY` at COMMIT
+    /// — after which the transaction is STILL OPEN, exactly the poisoned
+    /// shape. A trigger routes each seam's own write into the violation, so
+    /// all three wrappers exercise the same commit-failure path.
+    #[test]
+    fn a_commit_failure_rolls_back_and_leaves_the_connection_usable() {
+        // Poison kit: any insert into `poison_child` violates the deferred FK
+        // (no parent 424242 exists) and only fails at COMMIT.
+        const POISON: &str = "CREATE TABLE poison_parent (id INTEGER PRIMARY KEY); \
+             CREATE TABLE poison_child (parent INTEGER NOT NULL \
+             REFERENCES poison_parent(id) DEFERRABLE INITIALLY DEFERRED);";
+
+        // --- The attach seam: the row INSERT trips the trigger -> poison. ---
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+        store
+            .conn
+            .execute_batch(&format!(
+                "{POISON} CREATE TRIGGER poison_attach AFTER INSERT ON agent_memory_backing \
+                 BEGIN INSERT INTO poison_child (parent) VALUES (424242); END;"
+            ))
+            .unwrap();
+        let err = store
+            .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Filesystem, TERMINAL)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(detail) if detail.contains("FOREIGN KEY")),
+            "the injected deferred-FK violation must surface, got {err:?}"
+        );
+        // The connection is USABLE: a later read and a later WRITE TXN both
+        // work (this is the assertion the bricking bug failed — an open
+        // transaction would fail both with \"cannot start a transaction
+        // within a transaction\").
+        assert_eq!(
+            store.get_memory_backing(&name("demo")).unwrap(),
+            None,
+            "the failed commit left no row"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER poison_attach")
+            .unwrap();
+        assert_eq!(
+            store
+                .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Filesystem, TERMINAL)
+                .unwrap(),
+            MemoryBackingTxn::Attached,
+            "the connection must still take (and commit) a later write txn"
+        );
+
+        // --- The detach seam: the row DELETE trips the poison trigger. ---
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+        store
+            .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Native, TERMINAL)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(&format!(
+                "{POISON} CREATE TRIGGER poison_detach AFTER DELETE ON agent_memory_backing \
+                 BEGIN INSERT INTO poison_child (parent) VALUES (424242); END;"
+            ))
+            .unwrap();
+        let err = store
+            .detach_memory_backing_txn(&name("demo"), TERMINAL)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(detail) if detail.contains("FOREIGN KEY")),
+            "got {err:?}"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER poison_detach")
+            .unwrap();
+        store
+            .detach_memory_backing_txn(&name("demo"), TERMINAL)
+            .expect("the connection must still take (and commit) a later write txn");
+
+        // --- The transition seam: the state UPDATE trips the poison
+        // trigger; the row must keep its prior state. ---
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+        let before = lifecycle_row(&store, "demo");
+        store
+            .conn
+            .execute_batch(&format!(
+                "{POISON} CREATE TRIGGER poison_transition AFTER UPDATE ON agent_instances \
+                 BEGIN INSERT INTO poison_child (parent) VALUES (424242); END;"
+            ))
+            .unwrap();
+        let err = store
+            .set_state_snapshotting_memory_backing(
+                &name("demo"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(detail) if detail.contains("FOREIGN KEY")),
+            "got {err:?}"
+        );
+        assert_eq!(
+            lifecycle_row(&store, "demo"),
+            before,
+            "the failed commit rolled back — state + updated_at unchanged"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER poison_transition")
+            .unwrap();
+        store
+            .set_state_snapshotting_memory_backing(
+                &name("demo"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                None,
+            )
+            .expect("the connection must still take (and commit) a later write txn");
     }
 }

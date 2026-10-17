@@ -2521,6 +2521,30 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 15-6 review round 1: the memory attach/detach commands hit a
+        // busy store — the retry-class arm (never the catch-all's "database
+        // may be inaccessible" misdiagnosis; contention is transient).
+        RegistryError::Store(hekma_engine::ports::StoreError::Busy { waited_ms }) => AgentStore {
+            message: format!(
+                "The state store remained busy within the bounded {waited_ms}ms window — another \
+                 hekma command holds the write transaction. Retry the command once the other one \
+                 finishes."
+            ),
+        }
+        .into(),
+        // Story 15-6 review round 1: the attachment row COMMITTED but the
+        // managed directory could not be ensured — a post-commit partial
+        // failure that must name the committed state (the attachment stands)
+        // and the self-heal, never read as "the attach failed".
+        RegistryError::MemoryBackingRowCommittedDirFailed { name, path, detail } => AgentIo {
+            message: format!(
+                "The Memory Backing for '{name}' was committed to the state store, but its \
+                 managed directory at '{path}' could not be ensured: {detail}. The attachment \
+                 stands; the next start re-creates the directory (the start-path self-heal) \
+                 once the path problem is fixed — no detach is needed."
+            ),
+        }
+        .into(),
         RegistryError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -2743,6 +2767,44 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 15-6 review round 1: the typed RETRY-class store refusals get
+        // dedicated arms — a busy store or a raced conditional transition is
+        // TRANSIENT, and the catch-all's "database may be inaccessible" text
+        // would misdiagnose exactly the contention the busy_timeout exists
+        // to bound (AI-18: the remediation must match the failure).
+        EngineError::Store(hekma_engine::ports::StoreError::Busy { waited_ms }) => AgentStore {
+            message: format!(
+                "The state store remained busy within the bounded {waited_ms}ms window — another \
+                 hekma command holds the write transaction. Retry the command once the other one \
+                 finishes."
+            ),
+        }
+        .into(),
+        // A conditional transition lost the race: another command transitioned
+        // the instance first (e.g. a concurrent `start`). Invalid-state class
+        // (4) like the transition gate — the state at command time was not
+        // what this command read — with the retry remediation.
+        EngineError::Store(hekma_engine::ports::StoreError::StateConflict {
+            name,
+            expected,
+            found,
+        }) => AgentInvalidTransition {
+            message: format!(
+                "Agent Instance '{name}' is '{found}', not the expected '{expected}'; another \
+                 command transitioned it first, so the conditional transition was refused. Retry \
+                 the command — it re-reads the current state. List the Fleet with: hekma agent list"
+            ),
+        }
+        .into(),
+        // NotFound-in-txn keeps the not-found class (3): an instance deleted
+        // between this command's read and its store transaction is the
+        // ordinary not-found outcome, not a store failure.
+        EngineError::Store(hekma_engine::ports::StoreError::NotFound { name }) => AgentNotFound {
+            message: format!(
+                "No Agent Instance named '{name}' is registered. List the Fleet with: hekma agent list"
+            ),
+        }
+        .into(),
         EngineError::Store(inner) => AgentStore {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
@@ -2750,8 +2812,9 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // Story 15-6: the memory backing changed between the start's pre-check
         // read and the `→ starting` transition transaction (a concurrent
         // `hekma agent memory attach`/`detach` in another terminal raced the
-        // start). Nothing was launched and the instance state is unchanged —
-        // the retry remediation is the message. Same invalid-state class as
+        // start). No agent was launched and the instance state is unchanged —
+        // only the inert pre-start artifacts remain — and the retry
+        // remediation is the message. Same invalid-state class as
         // the transition gate (exit code 4).
         EngineError::MemoryBackingChangedUnderStart {
             name,
@@ -2761,8 +2824,10 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!(
                 "The memory backing for '{name}' changed under start (pre-check saw \
                  {precheck}; the store transaction read {snapshot}): an attach/detach raced \
-                 this start from another ktesio command. Nothing was launched and the \
-                 instance state is unchanged — retry: hekma agent start {name}"
+                 this start from another hekma command. No agent was launched and the \
+                 instance state is unchanged — only the inert pre-start config snapshot and \
+                 log directories remain, and the next start rewrites them. Retry: \
+                 hekma agent start {name}"
             ),
         }
         .into(),
@@ -3161,6 +3226,53 @@ mod tests {
                 },
                 ExitCode::General,
             ),
+            (
+                // Story 15-6: the raced-start refusal stays in the
+                // invalid-state class (4) — the frozen table's "invalid state
+                // at command time" row — WITH the retry remediation. Pinned
+                // here (review round 1) because this is exactly the arm an
+                // adversarial retarget could demote to the Store catch-all
+                // (1) while every other test stays green.
+                "MemoryBackingChangedUnderStart",
+                EngineError::MemoryBackingChangedUnderStart {
+                    name: "svc".to_string(),
+                    precheck: "none".to_string(),
+                    snapshot: "kind 'filesystem' attached at 2026-10-17T00:00:00Z".to_string(),
+                },
+                ExitCode::InvalidState,
+            ),
+            (
+                // Story 15-6 review round 1: the busy store keeps the
+                // general store class (1) — a transient contention, not a
+                // state problem — but its arm is DEDICATED (retry
+                // remediation, never "database may be inaccessible").
+                "Store(Busy)",
+                EngineError::Store(hekma_engine::ports::StoreError::Busy { waited_ms: 5000 }),
+                ExitCode::General,
+            ),
+            (
+                // Story 15-6 review round 1: the raced conditional transition
+                // joins the invalid-state class (4) — the state at command
+                // time was not what this command read.
+                "Store(StateConflict)",
+                EngineError::Store(hekma_engine::ports::StoreError::StateConflict {
+                    name: "svc".to_string(),
+                    expected: "registered".to_string(),
+                    found: "starting".to_string(),
+                }),
+                ExitCode::InvalidState,
+            ),
+            (
+                // Story 15-6 review round 1: NotFound-in-txn KEEPS the
+                // not-found class (3) — an instance deleted between a
+                // command's read and its store transaction is the ordinary
+                // not-found outcome, never a store failure.
+                "Store(NotFound)",
+                EngineError::Store(hekma_engine::ports::StoreError::NotFound {
+                    name: "ghost".to_string(),
+                }),
+                ExitCode::NotFound,
+            ),
         ];
 
         for (what, engine_error, expected) in cases {
@@ -3230,6 +3342,27 @@ mod tests {
                     requested: "native".to_string(),
                 },
                 ExitCode::InvalidState,
+            ),
+            (
+                // Story 15-6 review round 1: a busy store through the memory
+                // commands keeps the general store class (1), from its
+                // DEDICATED retry arm.
+                "Store(Busy)",
+                RegistryError::Store(hekma_engine::ports::StoreError::Busy { waited_ms: 5000 }),
+                ExitCode::General,
+            ),
+            (
+                // Story 15-6 review round 1: the post-commit directory-ensure
+                // partial failure surfaces as the general I/O class (1),
+                // naming the committed attachment (never "the attach
+                // failed").
+                "MemoryBackingRowCommittedDirFailed",
+                RegistryError::MemoryBackingRowCommittedDirFailed {
+                    name: "svc".to_string(),
+                    path: "/x/agents/svc/memory".to_string(),
+                    detail: "the managed memory directory path is a symlink".to_string(),
+                },
+                ExitCode::General,
             ),
         ];
 

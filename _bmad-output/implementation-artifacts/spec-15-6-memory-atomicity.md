@@ -73,6 +73,9 @@ Investigated 2026-10-16 (anchors verified):
 
 ## Spec Change Log
 
+- (Review round 1, 2026-10-17) 31 findings triaged (blind 18, edge 10, vg 3), all patches except one DEFER (record_transition failure after the transition commit — a PRE-EXISTING window the old autocommit path shared; the extraction made it visible; deferred entry, not a regression of this story). The bricking bug leads: commit-failure in the three txn wrappers now ROLLS BACK (an open txn on the long-lived connection could kill every later store call). CLI honesty: Busy/StateConflict gain dedicated retry-class arms (never the "database may be inaccessible" text); NotFound-in-txn keeps its class; the raced-start arm stays exit-code 4 (frozen table; the class fits "invalid state at command time") WITH the mapper-test case pinning it (the adversarial-retarget hole the suite exists for) and the retry remediation; the three new surfaces' binary naming aligns to ONE name (hekma); backend()'s busy wording stops asserting a full 5s elapsed ("remained busy within the bounded 5000ms window"). busy_timeout installs BEFORE the WAL pragma (first-open races can't bypass the typed error). The post-commit symlink/ensure failure reports the COMMITTED state honestly (attach succeeded at the store; the dir problem named; the self-heal path named) — no fake side-effect-freeness; the attach doc's numbered ordering prose matches the code; rejected-start messages stop overclaiming ("nothing was launched" → names the inert config-snapshot residue). Tests: the dead second Engine removed + docs wording scoped (deterministic windows pin the store seam; the unsynchronized race drives two Engines); the vacuous probe assertion replaced; the two-concurrent-starts engine-level pin + the dichotomy test's attach-loses arm (E7) + the scheduler-stall Busy tolerance (E8) added; the no-notice-on-rejection sink-emptiness pin (vg). Records: CHANGELOG gains the 15-6 surface in the unreleased 0.7.0 block (new StoreError variants are exhaustive arms for external implementors); "zero existing tests modified" corrected (the BareStore mock gained the three trait impls; no existing ASSERTIONS moved); the architecture sentence scoped to the → starting seam; upsert/clear carry the bypass-warning doc; MemoryBackingTxn's retention documented; testing.md gains the memory_atomicity suite (incl. the deliberate 2×5s busy-wait note — a test-fidelity choice, no env lever); the sprint row gains the Fibery URL.
+- (Closeout, pending)
+
 - 2026-10-17 (implementation, loop 0): landed as specified — store txns
   (`attach_memory_backing_txn`/`detach_memory_backing_txn`/`set_state_snapshotting_memory_backing`),
   the registry pre-check + in-txn authority split, the start-path reorder
@@ -89,8 +92,12 @@ Investigated 2026-10-16 (anchors verified):
   the pre-check cannot see). The row now commits BEFORE the managed-dir
   creation (the guard must precede any side effect and the guard lives in
   the txn); both failure residues remain the documented inert, self-healing
-  class (no rollback ever deletes operator-shaped data). Pin inventory: zero
-  existing tests modified; all green. New: tests/memory_atomicity.rs
+  class (no rollback ever deletes operator-shaped data). Pin inventory
+  (review round 1 correction): no existing test ASSERTIONS were modified —
+  the one touched existing test artifact is the `BareStore` test-support
+  mock in `ports/state_store.rs`, which gained the three new trait-method
+  impls (`unimplemented!` bodies, compile-necessary for the exhaustive
+  impl); all green. New: tests/memory_atomicity.rs
   (two-Engine same-root harness, all three windows, the busy bound) + 9
   store-level pins.
 

@@ -89,6 +89,32 @@ pub enum RegistryError {
         requested: String,
     },
 
+    /// Story 15-6 review round 1 (honest post-commit failure): the memory
+    /// attachment ROW committed inside the store transaction, but the
+    /// post-commit managed-directory ensure failed — a symlink planted at
+    /// the managed path mid-flight, or a filesystem error. The attachment
+    /// IS attached (the durable truth committed); pretending the whole
+    /// operation side-effect-freely failed would be the lie this variant
+    /// exists to prevent (AI-18). Names the instance, the directory, the
+    /// underlying failure, and the self-heal: the start path re-ensures the
+    /// directory, so the remediation is to fix the named path problem and
+    /// start — no detach/repair of the row is needed.
+    #[error(
+        "the Memory Backing for Agent Instance '{name}' was committed to the state store, but \
+         its managed directory at {path} could not be ensured: {detail}. The attachment stands; \
+         the next start re-creates the directory (the start-path self-heal) once the path \
+         problem is fixed — no detach is needed"
+    )]
+    MemoryBackingRowCommittedDirFailed {
+        /// The instance whose attachment row committed.
+        name: String,
+        /// The managed directory that could not be ensured.
+        path: String,
+        /// Why the ensure failed (the underlying I/O or symlink-refusal
+        /// detail).
+        detail: String,
+    },
+
     /// A filesystem operation on the Agent Home failed.
     ///
     /// Carries the offending path so the diagnostic can name it (NFR-1). Used
@@ -549,15 +575,19 @@ pub enum EngineError {
     /// authoritative snapshot — another process (a second CLI Engine on the
     /// same state root) attached or detached inside start's read→transition
     /// window. The CONDITIONAL transition ROLLED BACK: the instance keeps its
-    /// prior terminal state and NOTHING was launched (a launched agent
-    /// contradicting the row is exactly the forbidden outcome). RETRYABLE by
-    /// design: re-running `start` re-reads the backing and proceeds against
-    /// the new truth. Names both sides (the pre-check's view + the snapshot's
-    /// view).
+    /// prior terminal state and no agent was launched (a launched agent
+    /// contradicting the row is exactly the forbidden outcome); the only
+    /// residue is the INERT pre-transition artifacts — the effective-config
+    /// snapshot and the log directories — which the next start rewrites
+    /// harmlessly. RETRYABLE by design: re-running `start` re-reads the
+    /// backing and proceeds against the new truth. Names both sides (the
+    /// pre-check's view + the snapshot's view).
     #[error(
         "the memory backing for '{name}' changed under start (pre-check saw {precheck}; the \
-         store transaction read {snapshot}): an attach/detach raced this start. Nothing was \
-         launched and the instance state is unchanged — retry: kt agent start {name}"
+         store transaction read {snapshot}): an attach/detach raced this start. No agent was \
+         launched and the instance state is unchanged — only the inert pre-start config \
+         snapshot and log directories remain, and the next start rewrites them. Retry: \
+         hekma agent start {name}"
     )]
     MemoryBackingChangedUnderStart {
         /// The instance whose start raced a backing mutation.

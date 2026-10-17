@@ -111,13 +111,14 @@ pub enum StoreError {
     /// Engine on the same state root) moved the instance to a non-terminal
     /// Lifecycle State between the registry's pre-check read and the
     /// `BEGIN IMMEDIATE` commit. The transaction rolled back, so the row is
-    /// byte-unchanged; the message matches the registry's
-    /// `RegistryError::MemoryBackingHotSwap` wording so both layers refuse
-    /// identically.
+    /// byte-unchanged; the message mirrors the registry's
+    /// `RegistryError::MemoryBackingHotSwap` refusal (this store variant —
+    /// one of story 15-6's new surfaces — names the SHIPPED `hekma` binary;
+    /// the registry string above it is the untouched story-5-1 legacy).
     #[error(
         "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped — \
          attach/detach need a terminal state (registered, stopped, or failed). Bring it to \
-         a terminal state first: kt agent stop {name} from running or paused"
+         a terminal state first: hekma agent stop {name} from running or paused"
     )]
     MemoryBackingHotSwap {
         /// The instance whose backing was being changed.
@@ -130,12 +131,16 @@ pub enum StoreError {
     /// transaction's snapshot) disagrees with the start path's early
     /// pre-check read — a second process attached or detached the backing
     /// inside start's read→transition window. The conditional transition
-    /// ROLLED BACK (the instance keeps its prior terminal state, nothing was
-    /// launched); the caller retries the whole start. Names both sides.
+    /// ROLLED BACK (the instance keeps its prior terminal state and no
+    /// process was launched; the inert pre-transition artifacts — the
+    /// effective-config snapshot and the log directories — remain,
+    /// harmlessly rewritten by the next start); the caller retries the whole
+    /// start. Names both sides.
     #[error(
         "the memory backing for '{name}' changed under start: the pre-check read {precheck}, \
-         but the store transaction read {snapshot}; nothing was launched and the instance \
-         state is unchanged — retry the start (it now sees the new backing)"
+         but the store transaction read {snapshot}; no agent was launched and the instance \
+         state is unchanged (only the inert pre-start config snapshot and log directories \
+         remain — the next start rewrites them) — retry the start (it now sees the new backing)"
     )]
     MemoryBackingChangedUnderStart {
         /// The instance being started.
@@ -163,17 +168,20 @@ pub enum StoreError {
         found: String,
     },
 
-    /// Story 15-6 (the AD-17 busy bound): a writer waited the FULL
-    /// `busy_timeout` (5000ms) for another process's write transaction and
-    /// still could not take the write lock. Typed, never a raw
-    /// `SQLITE_BUSY`/`database is locked` string — the bounded wait + the
-    /// retry remediation are part of the message.
+    /// Story 15-6 (the AD-17 busy bound): a writer could not take the write
+    /// lock within the `busy_timeout` bounded-wait window (another hekma
+    /// command holds a write transaction). Typed, never a raw
+    /// `SQLITE_BUSY`/`database is locked` string — the bounded-wait window
+    /// and the retry remediation are part of the message. Review round 1:
+    /// the wording names the WINDOW, never a fully-elapsed duration — the
+    /// carried value is the configured bound, not a measured elapsed time.
     #[error(
-        "the state store stayed busy for the full {waited_ms}ms bounded wait (another ktesio \
+        "the state store remained busy within the bounded {waited_ms}ms window (another hekma \
          command holds the write transaction); retry the command"
     )]
     Busy {
-        /// The bounded wait that expired, in milliseconds.
+        /// The bounded-wait window that was in force, in milliseconds (the
+        /// configured `busy_timeout` — not a measured elapsed time).
         waited_ms: u64,
     },
 

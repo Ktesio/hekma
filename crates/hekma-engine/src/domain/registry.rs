@@ -614,11 +614,13 @@ impl Registry {
     /// (`registered`/`stopped`/`failed`); every non-terminal state is refused
     /// ([`RegistryError::MemoryBackingHotSwap`] — no `--force`, AD-11).
     ///
-    /// Side effects, in order, AFTER every fallible check passes:
-    /// 1. for [`MemoryBackingKind::Filesystem`] — create the managed directory
-    ///    (`<Agent Home>/memory`, one idempotent `create_dir_all`, no recursion);
-    /// 2. (story 15-6) the ATTACHMENT ROW, committed by the transactional
-    ///    store call below.
+    /// Side effects, in order, AFTER every fallible pre-check passes:
+    /// 1. (story 15-6) the ATTACHMENT ROW, committed by the transactional
+    ///    store call below (guard + conflict/idempotence check + write in
+    ///    ONE transaction);
+    /// 2. for [`MemoryBackingKind::Filesystem`] — create the managed
+    ///    directory (`<Agent Home>/memory`, one idempotent `create_dir_all`,
+    ///    no recursion).
     ///
     /// Story 15-6 (cross-process atomicity): the AUTHORITATIVE terminal-state
     /// guard, the kind-conflict/idempotence check, and the row write run
@@ -628,19 +630,17 @@ impl Registry {
     /// guard→write gap (the forbidden hot-swap window). The in-process mutex
     /// discipline is unchanged (registry-lock-only, AD-17).
     ///
-    /// Ordering note: the row now commits BEFORE the directory is created
-    /// (the guard must precede ANY side effect, and the guard lives in the
-    /// txn). Both orderings leave only inert, self-healing residue when one
-    /// side fails: a committed row whose directory creation failed is
-    /// repaired by start's defensive self-heal; the pre-existing rule (a
-    /// created directory left in place when the row write fails) is
-    /// unchanged in spirit — no rollback ever deletes operator-shaped data.
-    /// The symlink REFUSAL (pure read, no side effect) still fires BEFORE the
-    /// txn, so a symlinked managed path refuses with NO row written.
-    ///
-    /// If the row write fails after the directory exists, the directory is
-    /// LEFT in place — it is inert and idempotent, and inventing a rollback that
-    /// deletes operator-shaped data is exactly what a supervisor must not do.
+    /// Ordering note (review round 1): the row commits BEFORE the directory
+    /// is created (the guard must precede ANY side effect, and the
+    /// authoritative guard lives in the txn). Both failure residues are
+    /// inert and self-healing, and neither is ever silently erased: a
+    /// committed row whose directory creation failed surfaces
+    /// [`RegistryError::MemoryBackingRowCommittedDirFailed`] — naming the
+    /// committed state, the directory problem, and the start-path self-heal —
+    /// and the start path re-ensures the directory on every start (no
+    /// rollback ever deletes operator-shaped data). The symlink REFUSAL
+    /// (pure read, no side effect) still fires BEFORE the txn, so a
+    /// symlinked managed path refuses with NO row written.
     ///
     /// Idempotence (A-6): re-attaching the SAME kind is an idempotent success
     /// (the row's original timestamp stands; the directory is self-healed if a
@@ -690,9 +690,19 @@ impl Registry {
 
         // (5) The managed directory, created only after the row commits
         // (idempotent + self-healing; the symlink refusal re-fires here for
-        // anything planted mid-flight).
+        // anything planted mid-flight). A failure HERE is a post-commit
+        // partial failure, surfaced honestly (review round 1): the row IS
+        // committed, so the error names that state, the directory problem,
+        // and the start-path self-heal instead of letting a bare I/O error
+        // read as "the attach failed".
         if kind == MemoryBackingKind::Filesystem {
-            ensure_managed_memory_dir(&dir, name.as_str())?;
+            ensure_managed_memory_dir(&dir, name.as_str()).map_err(|err| {
+                RegistryError::MemoryBackingRowCommittedDirFailed {
+                    name: name.as_str().to_string(),
+                    path: dir.to_string_lossy().into_owned(),
+                    detail: err.to_string(),
+                }
+            })?;
         }
         Ok(dir)
     }

@@ -292,12 +292,32 @@ pub trait StateStore {
     /// instance FK, so a re-attach REPLACES the row (kind + timestamp). Typed
     /// columns, never a JSON blob (DC-2). Fails with [`StoreError::NotFound`] if
     /// the instance row is gone.
+    ///
+    /// **Store-level seam — bypasses the registry guard (story 15-6 doc
+    /// warning):** this method writes the attachment row with NO terminal-state
+    /// guard, NO managed-directory handling, and NO cross-process atomicity
+    /// against a concurrent lifecycle transition. The sanctioned writer is
+    /// [`Registry::attach_memory`](crate::domain::Registry::attach_memory)
+    /// (which routes through
+    /// [`StateStore::attach_memory_backing_txn`]); this raw seam exists for
+    /// MIGRATIONS and TESTS only. A caller that drives it directly can land a
+    /// backing row on a running instance — exactly the forbidden hot-swap the
+    /// transactional seam refuses.
     fn upsert_memory_backing(&self, backing: &MemoryBacking) -> Result<(), StoreError>;
 
     /// Clear the Memory Backing attachment for an instance (a detach).
     /// IDEMPOTENT: clearing when nothing is attached (or the instance is gone)
     /// is success — the desired end state already holds. METADATA ONLY: this
     /// never touches any directory on disk (A-4 — operator data stays).
+    ///
+    /// **Store-level seam — bypasses the registry guard (story 15-6 doc
+    /// warning):** like [`StateStore::upsert_memory_backing`], this clears the
+    /// row with NO terminal-state guard and NO cross-process atomicity — a
+    /// caller that drives it directly can clear a backing from under a
+    /// mid-start instance. The sanctioned writer is
+    /// [`Registry::detach_memory`](crate::domain::Registry::detach_memory)
+    /// (via [`StateStore::detach_memory_backing_txn`]); migrations and tests
+    /// only.
     fn clear_memory_backing(&self, name: &InstanceName) -> Result<(), StoreError>;
 
     /// Read the attached [`MemoryBacking`] for an instance, or `None` if nothing
@@ -377,6 +397,16 @@ pub trait StateStore {
 }
 
 /// What [`StateStore::attach_memory_backing_txn`] decided (story 15-6).
+///
+/// RETENTION (why the outcome is a returned, public type rather than the
+/// bare `Ok(())` a plain write would return): the fresh-vs-idempotent
+/// distinction is observable state a caller may need — HOSTS embedding the
+/// engine and TESTS pinning A-6's original-timestamp idempotence read the
+/// outcome off the seam instead of re-reading (and racing) the row's
+/// `attached_at`. The engine's own registry path does not branch on it
+/// (both outcomes are successes; the row is already the truth it would
+/// consult), which is exactly why the fact is handed to the caller rather
+/// than dropped — a return type is the only surface where it survives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryBackingTxn {
     /// A fresh attachment row was committed (kind + `attached_at`).
