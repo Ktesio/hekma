@@ -59,8 +59,8 @@ pub mod test_support;
 pub mod uj3;
 
 pub use tck::{
-    run_conformance, run_mock_conformance, section_ids, ConformanceReport, SectionReport,
-    SectionResult, TckAdapter,
+    run_conformance, run_conformance_with, run_mock_conformance, section_ids, ConformanceReport,
+    SectionReport, SectionResult, SectionSelection, TckAdapter, TckConfig, TckSection,
 };
 
 // The `fake_agent` locator lives in `test_support` (the shared test-support

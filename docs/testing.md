@@ -131,12 +131,17 @@ A third-party adapter crate adds `hekma-conformance` as a **dev-dependency** —
 # Pin a full commit SHA: until the crates publish a bare `git =`
 # dependency floats on this repo's default-branch HEAD, and a breaking
 # report-shape change would break your build without you moving. Update the
-# pin deliberately.
+# pin deliberately. NOTE: the pinned rev below predates the configured-run
+# surface — `TckConfig`/`run_conformance_with` (and the fresh-root contract
+# on caller-owned state roots) require a revision at or after the change
+# that introduced them (the 15-3 TCK hardening); this pin is bumped to that
+# revision in the same change that lands it, so third parties following the
+# pin forward get the configured-run surface with the bump.
 [dev-dependencies]
 hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "14fbf772710e9151f7a90be8d504a4f67bd95531" }
 ```
 
-Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) — the `tests/third_party_manifest.rs` file in `hekma-conformance` is the exact third-party shape.
+Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) — the `tests/third_party_manifest.rs` file in `hekma-conformance` is the exact third-party shape. Configured runs (spec 15-3) use `run_conformance_with(&adapter, &TckConfig { .. })`: a custom per-poll section timeout (default 30s), a caller-owned state root under the fresh-root contract (empty or not-yet-existing, exclusively one run's; default: the harness's fresh hermetic tempdir), and a typed section subset (`SectionSelection::Only(..)`, default all eight) — a subset yields fewer entries in the same fixed order and the same JSON shape, and a pre-section failure carries its own stage prefix (`engine open failed:` vs `registration failed:`) on every selected section. Reads route through public engine seams where they exist (`read_agent_log`, `fleet_entry`, `adapter::resolve`, the engine's public path layout); the two frozen-v1 residual reads (usage-event row counts, the registered-snapshot launch boolean) are documented in `docs/adapter-contract.md` and on the helpers.
 
 #### The eight sections
 
@@ -146,7 +151,7 @@ Then author the `adapter.toml` and invoke the harness from the crate's own `#[te
 - `config_mapping` — the subject's own declared `[config]` rules are set before start and proven delivered through its `--dump <path>` artifact, with the `agent.*` pass-through delivered verbatim; a native subject's code-declared launch offers no such seam, so it reads `not_applicable`.
 - `metering_self_reported` — a probe emits three sentinel batches; the ledger gains exactly three rows, a replayed sequence does not double-count, and Fleet totals equal the ledger exactly.
 - `metering_engine_observed` — for EngineObserved declarations only: a loopback upstream stub, the operator sets the real upstream, forwarded calls commit exactly — a SelfReported adapter reads `not_applicable` naming its declaration, so no section ever demands EngineObserved of a SelfReported adapter.
-- `memory` — attach → status reports the attachment and the declared delivery fact → a probe receives the managed dir through its declared env var → detach clears it; `not_applicable` when the declaration maps no `memory.dir` key — delivery is offered, not imposed. A manifest declaration that cannot be re-read to decide applicability **fails** the section naming the cause — it never collapses to a fabricated "maps nothing".
+- `memory` — attach → status reports the attachment and the declared delivery fact → a probe receives the managed dir through its declared env var → detach clears it; `not_applicable` when the declaration maps no `memory.dir` key — delivery is offered, not imposed. A manifest declaration that cannot be re-read to decide applicability **fails** the section naming the cause — it never collapses to a fabricated "maps nothing". For a manifest subject whose launch carries the `--dump <path>` convention, the section ALSO proves the SUBJECT's own declared delivery (its dump must echo the managed dir under its own env var — spec 15-3, the `--dump` subject-delivery convention in `docs/adapter-contract.md`); subjects without a dump seam keep the probe-twin proof.
 - `interaction` — Guaranteed/BestEffort: `send_input` reaches a running agent and the echo lands in its captured log; Unsupported fails fast naming the declaration on a probe.
 
 #### Who is under test (subject vs probe twins)
