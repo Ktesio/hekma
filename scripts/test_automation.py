@@ -445,6 +445,17 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("max-threads = 1", nextest)
         self.assertIn('filter = "kind(test) & package(hekma-engine)"', nextest)
         self.assertIn('test-group = "engine-integration-serial"', nextest)
+        # The 2026-10-17 extension: the CLI integration binary (agent_cli) joins
+        # the same serialized group after PR trees carrying #281's supervision
+        # legs + the raw-follow rewrite wedged the 2-core ubuntu runner into the
+        # #106 D-state family (3/3 job-timeout cancels; macOS/Windows green).
+        self.assertIn('filter = "kind(test) & package(hekma)"', nextest)
+        # Probe 2 of the same wedge: with both integration surfaces serialized
+        # the lane STILL wedged (8/8 overnight, main trees included) — #281 also
+        # grew process-spawning at kind(lib) (supervisor/tests.rs release-pass
+        # legs SIGSTOP/SIGCONT-ing live detached fake_agents), which the
+        # kind(test) filters never covered. The lib unit tests join the group.
+        self.assertIn('filter = "kind(lib) & package(hekma-engine)"', nextest)
         self.assertIn("retries = 2", nextest)
         self.assertIn("slow-timeout = ", nextest)
         # The temporary bisect scaffold and the watchdog/off-pipe machinery are GONE
