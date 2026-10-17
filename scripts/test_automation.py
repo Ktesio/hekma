@@ -440,17 +440,31 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
         self.assertIn("cargo +stable test --workspace --doc", ci)
         # Wedge forensics (2026-10-17): the ubuntu leg's RUN is wall-clock
-        # capped — the x86-ubuntu wedge family dies at the 40m JOB timeout,
-        # whose CANCEL discards the whole job-log blob, so the wedge was
-        # invisible by construction. The cap (matrix `include` DATA, not an
-        # in-step OS comparison) turns a wedge into a FAILED STEP with
-        # surviving logs while the job still has budget, and the always-on
-        # post-mortem snapshot step captures the still-live process table
-        # (stat/wchan names a D-state leftover's kernel wait channel) plus a
-        # PSI readout, uploaded as a per-OS artifact. Pin the deliberate
-        # shape so a future edit cannot silently drop the observability.
+        # capped AND session-quarantined. The cap alone was NOT enough: the
+        # x86-ubuntu wedge family ignores even SIGKILL, and `timeout(1)`
+        # WAITS for its child after signalling, so it could not enforce the
+        # cap either (run 39044536797: the 30m step cap fired, the step was
+        # still in_progress at +38m, the 40m JOB timeout fired, and the
+        # service force-cancelled at exactly +45m — discarding the whole
+        # job-log blob and leaving the post-mortem step pending). The shipped
+        # shape instead runs the suite double-forked into its OWN session
+        # (`( setsid ... & )` re-parents it to init, outside the step shell's
+        # process group AND descendant chain) while the step shell SUPERVISES
+        # by polling an exit-code file: the step therefore ALWAYS terminates
+        # on schedule — a healthy end replays the suite's exit code; a cap
+        # expiry fails the step (124) with the captured suite output + a
+        # live process snapshot in the step log, and the always-on
+        # post-mortem snapshot step then captures the still-live quarantined
+        # tree (stat/wchan names a D-state leftover's kernel wait channel)
+        # plus a PSI readout, uploaded as a per-OS artifact. The cap rides
+        # the matrix `include` as DATA (not an in-step OS comparison). Pin
+        # the deliberate shape so a future edit cannot silently drop the
+        # observability or resurrect the un-enforceable timeout(1) form.
         self.assertIn("nextest_wallclock_cap: 30m", ci)
-        self.assertIn("timeout --signal=TERM --kill-after=90s", ci)
+        self.assertIn("setsid bash -c", ci)
+        self.assertIn('echo $? > "$exitf"', ci)
+        self.assertIn("[supervisor] WALL-CLOCK CAP HIT", ci)
+        self.assertNotIn("--kill-after=", ci)
         self.assertIn("- name: Wedge post-mortem snapshot", ci)
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
         self.assertIn('status-level = "leak"', nextest)
