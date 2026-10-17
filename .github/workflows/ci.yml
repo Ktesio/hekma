@@ -709,7 +709,7 @@ jobs:
           # TWO baselines, two honest freeze points:
           # * hekma-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
           #   contract surface has been frozen since story 6-6.
-          # * hekma-engine @ 49da96b — the epic-12 merge (2026-09-15, PR
+          # * hekma-engine @ 1e71389 — the epic-14 merge (2026-09-22, PR
           #   #184): the latest deliberate post-freeze surface extension
           #   (`EngineError::DetachRefused` + `SpawnSpec.detach` — announced
           #   in the PR) defines the new freeze point. The prior extension

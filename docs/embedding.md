@@ -18,16 +18,7 @@ Depend on the released version:
 
 ```toml
 [dependencies]
-hekma-engine = "0.6"
-```
-
-Prefer to track `main` between releases? Pin the repository to a
-**full-length commit SHA**, never a branch: a pinned `rev` makes your build
-reproducible and upgrades deliberate.
-
-```toml
-[dependencies]
-hekma-engine = { git = "https://github.com/Ktesio/hekma", rev = "<full commit SHA>" }
+hekma-engine = "0.7"
 ```
 
 Prefer to track `main` between releases? Pin the repository to a
@@ -36,7 +27,12 @@ reproducible and upgrades deliberate (the engine's public surface is
 CI-guarded against breaking changes between freezes, but a moving target is
 still a moving target).
 
-**Which SHA to pin:** the engine's current surface freeze is the 2026-09-14
+```toml
+[dependencies]
+hekma-engine = { git = "https://github.com/Ktesio/hekma", rev = "<full commit SHA>" }
+```
+
+**Which SHA to pin:** the engine's current surface freeze is the 2026-09-22
 merge commit — the CI semver gate guards the public surface
 against that exact baseline. Pin **any commit at or after it**; the newest
 `main` commit you are comfortable with is the right default. To fetch a
