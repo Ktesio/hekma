@@ -2,7 +2,7 @@
 title: 'Windows detached stdio leak fix + Linux-CI detach-e2e skip scoped to x86-64'
 type: 'bugfix'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'done'
 baseline_commit: '9a2ceaa09c01fde7312a27bc55f29e0a7bdcd1fa'
 review_loop_iteration: 0
 context: []
@@ -55,12 +55,12 @@ Investigated 2026-10-16 (anchors verified):
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hekma-engine/src/backends/windows/mod.rs` -- the detached-spawn inheritable-stdio guard: a RAII guard clearing `HANDLE_FLAG_INHERIT` on the spawner's three stdio handles around `command.spawn()` when `spec.detach`, restoring on drop (panic-safe); a hosted unit arm proving clear-then-restore.
-- [ ] `crates/hekma-engine/src/backends/windows/mod.rs` -- the Windows-hosted regression test: spawn the test binary with piped stdout/stderr → inside, spawn a detached instance (fake agent, linger) → exit the inner process → assert both pipes EOF within a bound.
-- [ ] `crates/hekma/tests/agent_cli.rs` -- correct the false std-inheritance comment at :853; tighten the `mem::forget` leak workaround ONLY if the Windows leg proves the fix (otherwise leave + note).
-- [ ] `crates/hekma-engine/tests/adoption.rs` -- `is_linux_ci()` gains `std::env::consts::ARCH == "x86_64"`; a comment naming #109 as the reason and arm64 as never-affected.
-- [ ] Docs — `docs/testing.md` (the skip family now x86-64-scoped, the Windows leak root cause + residual-risk note); `deferred-work.md` 12-1 entry gains the resolved root-cause note (fix ref at merge).
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-4 row.
+- [x] `crates/hekma-engine/src/backends/windows/mod.rs` -- the detached-spawn inheritable-stdio guard: a RAII guard clearing `HANDLE_FLAG_INHERIT` on the spawner's three stdio handles around `command.spawn()` when `spec.detach`, restoring on drop (panic-safe); a hosted unit arm proving clear-then-restore.
+- [x] `crates/hekma-engine/src/backends/windows/mod.rs` -- the Windows-hosted regression test: spawn the test binary with piped stdout/stderr → inside, spawn a detached instance (fake agent, linger) → exit the inner process → assert both pipes EOF within a bound.
+- [x] `crates/hekma/tests/agent_cli.rs` -- correct the false std-inheritance comment at :853; tighten the `mem::forget` leak workaround ONLY if the Windows leg proves the fix (otherwise leave + note).
+- [x] `crates/hekma-engine/tests/adoption.rs` -- `is_linux_ci()` gains `std::env::consts::ARCH == "x86_64"`; a comment naming #109 as the reason and arm64 as never-affected.
+- [x] Docs — `docs/testing.md` (the skip family now x86-64-scoped, the Windows leak root cause + residual-risk note); `deferred-work.md` 12-1 entry gains the resolved root-cause note (fix ref at merge).
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-4 row.
 
 **Acceptance Criteria:**
 - Given a Windows host with a piped parent, when a detached start's command exits, then the parent's pipes EOF within the bound (the regression test's assertion) — and the non-detached paths are byte-unchanged.
