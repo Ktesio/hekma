@@ -200,6 +200,15 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: On Windows, a DETACHED agent ends up holding its spawning `kt` command's stdio pipe write-ends — any script that CAPTURES `kt agent start --detach` output (pipes) blocks until the agent exits; interactive terminals are unaffected (no pipes).
   evidence: the CLI detach test's forensic harness (agent_cli.rs `run_kt_agent_bounded`, 56ee766) proved kt EXITS (~1s, try_wait Ok(Some)) while its stdout/stderr pipes never EOF; std's spawn is documented to restrict inheritance to the child's own three stdio handles (attribute list), so the leak mechanism is unexpected — investigate (suspects: the Stdio::from(file) inheritable-dup path interacting with the job assignment, or a std behavior change) before fixing (candidates: explicit handle pinning at the Windows detached spawn, or DETACHED_PROCESS when the capture files already carry the output).
   routed: engine Windows detached-spawn handle handling — next Windows-touching story.
+  resolved-note: ROOT CAUSE found 2026-10-17 (story 15-4 investigation): std's default
+  Windows spawn passes NO PROC_THREAD_ATTRIBUTE_HANDLE_LIST while bInheritHandles stays
+  TRUE, and every stdio std provides (Stdio::from(File)/null()/piped()) is created or
+  duplicated INHERITABLE — the detached child inherits the WHOLE inheritable-handle table,
+  including the spawner's own pipe write-ends. The in-repo belief that std restricts
+  inheritance to the child's three stdio handles was FALSE. Fix: the engine clears
+  HANDLE_FLAG_INHERIT on its own three stdio handles around a detached spawn (panic-safe
+  guard). DETACHED_PROCESS alone would NOT fix it (console flags do not touch handle
+  inheritance).
 
 ## Deferred from: three-layer review of spec-15-1 (2026-10-16)
 
