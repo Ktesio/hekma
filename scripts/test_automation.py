@@ -431,14 +431,29 @@ class ReleaseDocsTests(unittest.TestCase):
         nextest = (release_docs.ROOT / ".config" / "nextest.toml").read_text(
             encoding="utf-8"
         )
-        # Clean shape: build test binaries once (--no-run), ONE unified run for all
-        # OSes, doctests separate.
+        # Clean shape: build test binaries once (--no-run), ONE unified run for
+        # all OSes, doctests separate.
         self.assertIn(
             "cargo +stable nextest run --workspace --all-targets --no-run", ci
         )
         self.assertIn("- name: Run tests (nextest)", ci)
         self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
         self.assertIn("cargo +stable test --workspace --doc", ci)
+        # Wedge forensics (2026-10-17): the ubuntu leg's RUN is wall-clock
+        # capped — the x86-ubuntu wedge family dies at the 40m JOB timeout,
+        # whose CANCEL discards the whole job-log blob, so the wedge was
+        # invisible by construction. The cap (matrix `include` DATA, not an
+        # in-step OS comparison) turns a wedge into a FAILED STEP with
+        # surviving logs while the job still has budget, and the always-on
+        # post-mortem snapshot step captures the still-live process table
+        # (stat/wchan names a D-state leftover's kernel wait channel) plus a
+        # PSI readout, uploaded as a per-OS artifact. Pin the deliberate
+        # shape so a future edit cannot silently drop the observability.
+        self.assertIn("nextest_wallclock_cap: 30m", ci)
+        self.assertIn("timeout --signal=TERM --kill-after=90s", ci)
+        self.assertIn("- name: Wedge post-mortem snapshot", ci)
+        self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
+        self.assertIn('status-level = "leak"', nextest)
         # The SOURCE fix: a max-threads=1 test-group over exactly the engine
         # integration binaries, with the existing retries + slow-timeout untouched.
         self.assertIn("[test-groups.engine-integration-serial]", nextest)
