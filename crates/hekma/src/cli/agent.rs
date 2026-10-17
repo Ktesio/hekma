@@ -2747,6 +2747,25 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
         .into(),
+        // Story 15-6: the memory backing changed between the start's pre-check
+        // read and the `→ starting` transition transaction (a concurrent
+        // `hekma agent memory attach`/`detach` in another terminal raced the
+        // start). Nothing was launched and the instance state is unchanged —
+        // the retry remediation is the message. Same invalid-state class as
+        // the transition gate (exit code 4).
+        EngineError::MemoryBackingChangedUnderStart {
+            name,
+            precheck,
+            snapshot,
+        } => AgentInvalidTransition {
+            message: format!(
+                "The memory backing for '{name}' changed under start (pre-check saw \
+                 {precheck}; the store transaction read {snapshot}): an attach/detach raced \
+                 this start from another ktesio command. Nothing was launched and the \
+                 instance state is unchanged — retry: hekma agent start {name}"
+            ),
+        }
+        .into(),
     }
 }
 

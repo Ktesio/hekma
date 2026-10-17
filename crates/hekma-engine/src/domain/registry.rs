@@ -617,10 +617,29 @@ impl Registry {
     /// Side effects, in order, AFTER every fallible check passes:
     /// 1. for [`MemoryBackingKind::Filesystem`] — create the managed directory
     ///    (`<Agent Home>/memory`, one idempotent `create_dir_all`, no recursion);
-    /// 2. persist the attachment row.
+    /// 2. (story 15-6) the ATTACHMENT ROW, committed by the transactional
+    ///    store call below.
     ///
-    /// If the row write fails after the directory exists, the directory is LEFT
-    /// in place — it is inert and idempotent, and inventing a rollback that
+    /// Story 15-6 (cross-process atomicity): the AUTHORITATIVE terminal-state
+    /// guard, the kind-conflict/idempotence check, and the row write run
+    /// inside ONE `BEGIN IMMEDIATE` transaction on the shared SQLite store
+    /// (`StateStore::attach_memory_backing_txn`) — a second CLI Engine on the
+    /// same state root can no longer land a lifecycle transition inside the
+    /// guard→write gap (the forbidden hot-swap window). The in-process mutex
+    /// discipline is unchanged (registry-lock-only, AD-17).
+    ///
+    /// Ordering note: the row now commits BEFORE the directory is created
+    /// (the guard must precede ANY side effect, and the guard lives in the
+    /// txn). Both orderings leave only inert, self-healing residue when one
+    /// side fails: a committed row whose directory creation failed is
+    /// repaired by start's defensive self-heal; the pre-existing rule (a
+    /// created directory left in place when the row write fails) is
+    /// unchanged in spirit — no rollback ever deletes operator-shaped data.
+    /// The symlink REFUSAL (pure read, no side effect) still fires BEFORE the
+    /// txn, so a symlinked managed path refuses with NO row written.
+    ///
+    /// If the row write fails after the directory exists, the directory is
+    /// LEFT in place — it is inert and idempotent, and inventing a rollback that
     /// deletes operator-shaped data is exactly what a supervisor must not do.
     ///
     /// Idempotence (A-6): re-attaching the SAME kind is an idempotent success
@@ -646,41 +665,35 @@ impl Registry {
         // (2) Look up the instance (→ NotFound when unregistered).
         let instance = self.lookup(&name)?;
 
-        // (3) State guard: terminal states only (pure persisted-state check).
+        // (3) State guard PRE-CHECK (pure persisted-state read): refuses the
+        // common non-terminal case with NO side effect at all. The
+        // AUTHORITATIVE guard re-runs INSIDE the transaction below, so this
+        // read cannot be raced past (story 15-6).
         ensure_terminal_for_memory_backing(&name, &instance.state)?;
 
         let dir = self.paths.agent_memory_dir(&name);
 
-        // (4) Conflict / idempotence check against the EXISTING attachment —
-        // still before any side effect.
-        if let Some(existing) = self.store.get_memory_backing(&name)? {
-            if existing.kind != kind {
-                return Err(RegistryError::MemoryBackingKindConflict {
-                    name: name.as_str().to_string(),
-                    attached: existing.kind.as_str().to_string(),
-                    requested: kind.as_str().to_string(),
-                });
-            }
-            // Same kind again: idempotent success. Still self-heal the managed
-            // directory (a manual delete must not wedge future starts), but do
-            // NOT rewrite the row — the original attached_at stands.
-            if kind == MemoryBackingKind::Filesystem {
-                ensure_managed_memory_dir(&dir, name.as_str())?;
-            }
-            return Ok(dir);
+        // (3b) Symlink refusal — a pure read, still BEFORE any write, so a
+        // planted symlink refuses with NO row committed (mirrors the
+        // start-path refusal; a symlink appearing between here and the txn is
+        // re-refused by the post-commit ensure below).
+        if kind == MemoryBackingKind::Filesystem {
+            refuse_symlinked_memory_dir(&dir, name.as_str())?;
         }
 
-        // (5) Side effects, in order. If step 6 fails, step 5's directory stays
-        // (inert + idempotent; see this method's docs — no data-deleting rollback).
+        // (4) THE TRANSACTION: guard + conflict/idempotence + row write in
+        // one BEGIN IMMEDIATE (story 15-6). Every refusal inside rolls back
+        // with the row byte-unchanged.
+        self.store
+            .attach_memory_backing_txn(&name, kind, TERMINAL_MEMORY_BACKING_STATES)
+            .map_err(memory_store_error)?;
+
+        // (5) The managed directory, created only after the row commits
+        // (idempotent + self-healing; the symlink refusal re-fires here for
+        // anything planted mid-flight).
         if kind == MemoryBackingKind::Filesystem {
             ensure_managed_memory_dir(&dir, name.as_str())?;
         }
-        let backing = MemoryBacking {
-            name: name.clone(),
-            kind,
-            attached_at: now_rfc3339(),
-        };
-        self.store.upsert_memory_backing(&backing)?;
         Ok(dir)
     }
 
@@ -694,8 +707,14 @@ impl Registry {
     /// engine locks (AD-17); (c) it matches `kt agent remove`'s shipped default
     /// where retention is the default and deletion is opt-in. A future
     /// `detach --delete` is a deliberate deferral, not an oversight. Re-attaching
-    /// later simply re-adopts the existing contents. Detaching when nothing is
+    /// later re-adopts the existing contents. Detaching when nothing is
     /// attached is a successful no-op.
+    ///
+    /// Story 15-6: the terminal-state guard and the row clear run inside ONE
+    /// `BEGIN IMMEDIATE` transaction
+    /// ([`StateStore::detach_memory_backing_txn`]) — same cross-process
+    /// closure as [`Registry::attach_memory`]; the registry-side guard above
+    /// it stays as the no-side-effect pre-check.
     pub fn detach_memory(&self, name: &str) -> Result<(), RegistryError> {
         let name = InstanceName::new(name).map_err(|reason| RegistryError::InvalidName {
             name: name.to_string(),
@@ -703,8 +722,31 @@ impl Registry {
         })?;
         let instance = self.lookup(&name)?;
         ensure_terminal_for_memory_backing(&name, &instance.state)?;
-        self.store.clear_memory_backing(&name)?;
+        self.store
+            .detach_memory_backing_txn(&name, TERMINAL_MEMORY_BACKING_STATES)
+            .map_err(memory_store_error)?;
         Ok(())
+    }
+
+    /// Persist a lifecycle transition and snapshot the memory backing in ONE
+    /// store transaction (story 15-6) — the supervisor's `→ starting`
+    /// transition's new shape. The store refuses (typed, transaction rolled
+    /// back) when another process moved the instance's state or its backing
+    /// row between this start's pre-check reads and the transition; see
+    /// [`StateStore::set_state_snapshotting_memory_backing`].
+    pub(crate) fn set_state_snapshotting_memory_backing(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+        expected_backing: Option<MemoryBacking>,
+    ) -> Result<Option<MemoryBacking>, RegistryError> {
+        Ok(self.store.set_state_snapshotting_memory_backing(
+            name,
+            expected_prior,
+            new_state,
+            expected_backing,
+        )?)
     }
 
     /// Read the instance's Memory Backing through the public API (story 5-1,
@@ -1488,7 +1530,11 @@ fn ensure_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
 /// with the state dir and Agent Home roots, which an operator may legitimately
 /// place on another volume via a symlink), this path is engine-owned, so the
 /// refusal costs nothing legitimate.
-fn ensure_managed_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
+/// Refuse a SYMLINK planted at the managed memory directory path (story 5-1
+/// review) — a PURE READ (no side effect), so callers can run it before any
+/// write and still leave nothing behind (story 15-6: attach runs it before
+/// the transactional row write). Rejected with the documented message.
+fn refuse_symlinked_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
     if let Ok(meta) = std::fs::symlink_metadata(dir) {
         if meta.is_symlink() {
             return Err(RegistryError::Io {
@@ -1502,6 +1548,13 @@ fn ensure_managed_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError
             });
         }
     }
+    Ok(())
+}
+
+/// Ensure the managed memory directory exists for a `filesystem` backing:
+/// the symlink refusal (above) plus ONE idempotent `create_dir_all`.
+fn ensure_managed_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
+    refuse_symlinked_memory_dir(dir, name)?;
     ensure_dir(dir, name)
 }
 
@@ -1511,16 +1564,52 @@ fn ensure_managed_memory_dir(dir: &Path, name: &str) -> Result<(), RegistryError
 /// `stopping`, `paused`). Pure state-machine validation from the persisted row —
 /// no live process is consulted (DC-3), so it is deterministically testable via
 /// seeded rows exactly like `remove`'s running-guard.
+///
+/// The permitted set lives in [`TERMINAL_MEMORY_BACKING_STATES`], shared with
+/// the transactional store guard (story 15-6) so the pre-check and the
+/// authoritative in-txn guard can never drift.
 fn ensure_terminal_for_memory_backing(
     name: &InstanceName,
     state: &LifecycleState,
 ) -> Result<(), RegistryError> {
-    match state {
-        LifecycleState::Registered | LifecycleState::Stopped | LifecycleState::Failed => Ok(()),
-        other => Err(RegistryError::MemoryBackingHotSwap {
-            name: name.as_str().to_string(),
-            state: other.as_str().to_string(),
-        }),
+    if TERMINAL_MEMORY_BACKING_STATES.contains(state) {
+        return Ok(());
+    }
+    Err(RegistryError::MemoryBackingHotSwap {
+        name: name.as_str().to_string(),
+        state: state.as_str().to_string(),
+    })
+}
+
+/// The terminal Lifecycle States a memory attach/detach is permitted from
+/// (story 5-1, A-5). Consumed by BOTH the registry's pre-check guard (above)
+/// and the transactional store guard (story 15-6 — the store re-evaluates it
+/// under the write lock), so the two layers enforce the SAME set.
+const TERMINAL_MEMORY_BACKING_STATES: &[LifecycleState] = &[
+    LifecycleState::Registered,
+    LifecycleState::Stopped,
+    LifecycleState::Failed,
+];
+
+/// Map the transactional memory-seam store errors onto their registry-shaped
+/// variants (story 15-6). The refusal surfaces stay byte-identical to the
+/// pre-txn refusals; only the store's catch-all `Backend` falls through as
+/// [`RegistryError::Store`].
+fn memory_store_error(err: StoreError) -> RegistryError {
+    match err {
+        StoreError::MemoryBackingHotSwap { name, state } => {
+            RegistryError::MemoryBackingHotSwap { name, state }
+        }
+        StoreError::MemoryBackingKindConflict {
+            name,
+            attached,
+            requested,
+        } => RegistryError::MemoryBackingKindConflict {
+            name,
+            attached,
+            requested,
+        },
+        other => RegistryError::Store(other),
     }
 }
 

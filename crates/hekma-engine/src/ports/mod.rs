@@ -36,7 +36,7 @@ pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,
     FileSecretResolver, SecretError, SecretResolver,
 };
-pub use state_store::{SpawnRecord, StateStore};
+pub use state_store::{MemoryBackingTxn, SpawnRecord, StateStore};
 pub use usage_source::{
     assemble_usage_event, format_usage_line, parse_usage_block, parse_usage_line,
     ObservedUsageSource, ParsedUsage, SelfReportedUsageSource, UsageSource, USAGE_SENTINEL_PREFIX,
@@ -104,6 +104,77 @@ pub enum StoreError {
         attached: String,
         /// The kind the caller attempted to write.
         requested: String,
+    },
+
+    /// A memory-backing mutation's terminal-state guard refused INSIDE the
+    /// transactional attach/detach (story 15-6): another process (a second CLI
+    /// Engine on the same state root) moved the instance to a non-terminal
+    /// Lifecycle State between the registry's pre-check read and the
+    /// `BEGIN IMMEDIATE` commit. The transaction rolled back, so the row is
+    /// byte-unchanged; the message matches the registry's
+    /// `RegistryError::MemoryBackingHotSwap` wording so both layers refuse
+    /// identically.
+    #[error(
+        "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped — \
+         attach/detach need a terminal state (registered, stopped, or failed). Bring it to \
+         a terminal state first: kt agent stop {name} from running or paused"
+    )]
+    MemoryBackingHotSwap {
+        /// The instance whose backing was being changed.
+        name: String,
+        /// The non-terminal state the transactional guard found (wire form).
+        state: String,
+    },
+
+    /// Story 15-6: start's AUTHORITATIVE backing read (the transition
+    /// transaction's snapshot) disagrees with the start path's early
+    /// pre-check read — a second process attached or detached the backing
+    /// inside start's read→transition window. The conditional transition
+    /// ROLLED BACK (the instance keeps its prior terminal state, nothing was
+    /// launched); the caller retries the whole start. Names both sides.
+    #[error(
+        "the memory backing for '{name}' changed under start: the pre-check read {precheck}, \
+         but the store transaction read {snapshot}; nothing was launched and the instance \
+         state is unchanged — retry the start (it now sees the new backing)"
+    )]
+    MemoryBackingChangedUnderStart {
+        /// The instance being started.
+        name: String,
+        /// The pre-check's view: `"none"` or `kind '<k>' attached at <ts>`.
+        precheck: String,
+        /// The transaction snapshot's view: same format as `precheck`.
+        snapshot: String,
+    },
+
+    /// Story 15-6: a CONDITIONAL lifecycle transition found the instance in a
+    /// state other than the one the caller read — another process transitioned
+    /// it first (e.g. a second `start` on the same instance). The transaction
+    /// rolled back; nothing was persisted.
+    #[error(
+        "Agent Instance '{name}' is '{found}', not the expected '{expected}'; another \
+         command transitioned it first, so the conditional transition was refused"
+    )]
+    StateConflict {
+        /// The instance whose state was transitioned.
+        name: String,
+        /// The state the caller's read observed (wire form).
+        expected: String,
+        /// The state actually present inside the transaction (wire form).
+        found: String,
+    },
+
+    /// Story 15-6 (the AD-17 busy bound): a writer waited the FULL
+    /// `busy_timeout` (5000ms) for another process's write transaction and
+    /// still could not take the write lock. Typed, never a raw
+    /// `SQLITE_BUSY`/`database is locked` string — the bounded wait + the
+    /// retry remediation are part of the message.
+    #[error(
+        "the state store stayed busy for the full {waited_ms}ms bounded wait (another ktesio \
+         command holds the write transaction); retry the command"
+    )]
+    Busy {
+        /// The bounded wait that expired, in milliseconds.
+        waited_ms: u64,
     },
 
     /// Any other backend failure (open, migrate, I/O, SQL execution).

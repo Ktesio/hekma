@@ -2,7 +2,7 @@
 title: 'Memory attach/detach × start atomicity: durable-store transactions closing the cross-process windows'
 type: 'bugfix'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'implemented'
 baseline_commit: '800934c0eced9e60e4d253a61b63d836650f689a'
 review_loop_iteration: 0
 context:
@@ -56,12 +56,12 @@ Investigated 2026-10-16 (anchors verified):
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hekma-engine/src/store/sqlite.rs` (+ `ports/state_store.rs`) -- transactional seams: a `BEGIN IMMEDIATE` wrapper for the attach/detach guard+write, and a conditional `transition_with_backing_snapshot` persisting `→ starting` + reading the authoritative backing row in ONE txn; `busy_timeout` pragma at connection open (bounded, named in the docs).
-- [ ] `crates/hekma-engine/src/domain/registry.rs` -- attach_memory/detach_memory move guard+conflict-check+write into the txn; rejection arms stay side-effect-free.
-- [ ] `crates/hekma-engine/src/domain/supervisor/spawn.rs` -- the authoritative read becomes the txn snapshot; the early read demoted to pre-check (self-heal/symlink/UTF-8/notice inputs); a snapshot-vs-precheck mismatch rejects typed+retryable; the delivery notice derives from the snapshot.
-- [ ] New integration test -- a two-`Engine` same-root race harness pinning all three windows closed (attach-during-start, detach-during-start, transition-inside-guard-gap) using the hermetic two-engine shape; plus the busy-timeout typed error under a held write txn.
-- [ ] `docs/architecture.md` -- the locking paragraph gains the transactional boundary statement (what the store txns close, what mutexes still cover, the considered-and-rejected PC-5a/flock options, the busy_timeout bound).
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-6 row; `deferred-work.md` 5-1 entry resolved-marker at merge.
+- [x] `crates/hekma-engine/src/store/sqlite.rs` (+ `ports/state_store.rs`) -- transactional seams: a `BEGIN IMMEDIATE` wrapper for the attach/detach guard+write, and a conditional `transition_with_backing_snapshot` persisting `→ starting` + reading the authoritative backing row in ONE txn; `busy_timeout` pragma at connection open (bounded, named in the docs).
+- [x] `crates/hekma-engine/src/domain/registry.rs` -- attach_memory/detach_memory move guard+conflict-check+write into the txn; rejection arms stay side-effect-free.
+- [x] `crates/hekma-engine/src/domain/supervisor/spawn.rs` -- the authoritative read becomes the txn snapshot; the early read demoted to pre-check (self-heal/symlink/UTF-8/notice inputs); a snapshot-vs-precheck mismatch rejects typed+retryable; the delivery notice derives from the snapshot.
+- [x] New integration test -- a two-`Engine` same-root race harness pinning all three windows closed (attach-during-start, detach-during-start, transition-inside-guard-gap) using the hermetic two-engine shape; plus the busy-timeout typed error under a held write txn.
+- [x] `docs/architecture.md` -- the locking paragraph gains the transactional boundary statement (what the store txns close, what mutexes still cover, the considered-and-rejected PC-5a/flock options, the busy_timeout bound).
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-6 row; `deferred-work.md` 5-1 entry resolved-marker at merge.
 
 **Acceptance Criteria:**
 - Given two Engines on one root with attach interleaved anywhere in start's read→transition window, then EITHER start launches with the attached dir (attach committed before the snapshot) OR start rejects typed+retryable — never a launched agent contradicting the row; and an attach committing after the transition refuses side-effect-free.
@@ -72,6 +72,27 @@ Investigated 2026-10-16 (anchors verified):
 - Gates: fmt/clippy/workspace tests/check_docs green.
 
 ## Spec Change Log
+
+- 2026-10-17 (implementation, loop 0): landed as specified — store txns
+  (`attach_memory_backing_txn`/`detach_memory_backing_txn`/`set_state_snapshotting_memory_backing`),
+  the registry pre-check + in-txn authority split, the start-path reorder
+  (early read → pre-check; txn snapshot authoritative; delivery notice moved
+  post-transition deriving from the snapshot), `busy_timeout` 5000ms at open
+  with the typed `StoreError::Busy` classification, typed
+  `EngineError::MemoryBackingChangedUnderStart` (retryable, names both
+  sides). Two deliberate orderings worth naming for review: (1) the attach's
+  symlink refusal stays a PURE PRE-TXN READ so a symlinked managed path
+  still refuses with no row committed (the pinned re-attach refusal keeps
+  its exact semantics); (2) the registry keeps a side-effect-free pre-check
+  guard ahead of the txn so the no-side-effect rejection trio stays green
+  UNMODIFIED — the authoritative guard re-runs inside the txn (the race case
+  the pre-check cannot see). The row now commits BEFORE the managed-dir
+  creation (the guard must precede any side effect and the guard lives in
+  the txn); both failure residues remain the documented inert, self-healing
+  class (no rollback ever deletes operator-shaped data). Pin inventory: zero
+  existing tests modified; all green. New: tests/memory_atomicity.rs
+  (two-Engine same-root harness, all three windows, the busy bound) + 9
+  store-level pins.
 
 ## Design Notes
 

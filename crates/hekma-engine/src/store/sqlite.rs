@@ -45,7 +45,8 @@ use crate::domain::{
     RecordOutcome, RestartPolicy, RunId, UsageEvent, UsageTotals,
 };
 use crate::ports::{
-    MemoryBacking, MemoryBackingKind, ProcessFingerprint, SpawnRecord, StateStore, StoreError,
+    MemoryBacking, MemoryBackingKind, MemoryBackingTxn, ProcessFingerprint, SpawnRecord,
+    StateStore, StoreError,
 };
 
 /// Current schema version applied by this build.
@@ -280,6 +281,15 @@ const SCHEMA_V9: &str = "\
 ALTER TABLE agent_runtime ADD COLUMN run_id TEXT;
 ";
 
+/// The AD-17 bounded-wait bound (story 15-6): how long a writer waits for
+/// another process's write transaction before surfacing the typed
+/// [`StoreError::Busy`]. 5000ms — the stop ladder's bounded-wait precedent
+/// (`kt agent stop`'s default graceful window): long enough for a realistic
+/// attach-vs-start collision to resolve, short enough to never feel hung.
+/// Set as the connection's `busy_timeout` at open; named in
+/// `docs/architecture.md`'s concurrency section.
+pub(crate) const BUSY_TIMEOUT_MS: u64 = 5_000;
+
 /// A SQLite-backed state store over a single connection.
 ///
 /// One handle owns one connection. This story is single-threaded per handle
@@ -314,7 +324,11 @@ impl SqliteStore {
     ///
     /// `foreign_keys` is OFF by default in SQLite and must be enabled on every
     /// connection. `journal_mode=WAL` is a persistent DB property but is set
-    /// here so a freshly created file adopts it immediately.
+    /// here so a freshly created file adopts it immediately. Story 15-6 adds
+    /// the `busy_timeout` (absent repo-wide before it — the AI-63a sweep's
+    /// only genuine pragma gap): a concurrent writer degrades to the
+    /// [`BUSY_TIMEOUT_MS`] bounded wait and then the TYPED
+    /// [`StoreError::Busy`], never an instant raw `SQLITE_BUSY`.
     fn configure(conn: &Connection) -> Result<(), StoreError> {
         // WAL returns the resulting mode as a row; query_row consumes it.
         let mode: String = conn
@@ -332,6 +346,12 @@ impl SqliteStore {
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(backend)?;
         conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(backend)?;
+        // Story 15-6: the AD-17 bounded-wait bound. rusqlite installs the
+        // busy handler directly; every subsequent blocked write (including a
+        // `BEGIN IMMEDIATE` that loses the race for the write lock) waits
+        // this long before surfacing [`StoreError::Busy`].
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
             .map_err(backend)?;
         Ok(())
     }
@@ -519,7 +539,19 @@ fn migrate_step(conn: &Connection, to_version: i64, ddl: &str) -> Result<(), Sto
 }
 
 /// Map an arbitrary `rusqlite::Error` into a backend [`StoreError`].
+///
+/// Story 15-6: `SQLITE_BUSY` is classified into the typed
+/// [`StoreError::Busy`] (the AD-17 bounded-wait contract — the operator never
+/// sees a raw `SQLITE_BUSY`/`database is locked` string), everything else
+/// stays a [`StoreError::Backend`].
 fn backend(err: rusqlite::Error) -> StoreError {
+    if let rusqlite::Error::SqliteFailure(e, _) = &err {
+        if e.code == rusqlite::ErrorCode::DatabaseBusy {
+            return StoreError::Busy {
+                waited_ms: BUSY_TIMEOUT_MS,
+            };
+        }
+    }
     StoreError::Backend(err.to_string())
 }
 
@@ -1361,6 +1393,260 @@ impl StateStore for SqliteStore {
             .optional()
             .map_err(backend)?
             .transpose()
+    }
+
+    // ---- Transactional memory/lifecycle seams (story 15-6) ----
+
+    fn attach_memory_backing_txn(
+        &self,
+        name: &InstanceName,
+        kind: MemoryBackingKind,
+        terminal_states: &[LifecycleState],
+    ) -> Result<MemoryBackingTxn, StoreError> {
+        begin_immediate(&self.conn)?;
+        match self.attach_in_txn(name, kind, terminal_states) {
+            Ok(outcome) => {
+                commit(&self.conn)?;
+                Ok(outcome)
+            }
+            Err(err) => {
+                rollback(&self.conn);
+                Err(err)
+            }
+        }
+    }
+
+    fn detach_memory_backing_txn(
+        &self,
+        name: &InstanceName,
+        terminal_states: &[LifecycleState],
+    ) -> Result<(), StoreError> {
+        begin_immediate(&self.conn)?;
+        match self.detach_in_txn(name, terminal_states) {
+            Ok(()) => commit(&self.conn),
+            Err(err) => {
+                rollback(&self.conn);
+                Err(err)
+            }
+        }
+    }
+
+    fn set_state_snapshotting_memory_backing(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+        expected_backing: Option<MemoryBacking>,
+    ) -> Result<Option<MemoryBacking>, StoreError> {
+        begin_immediate(&self.conn)?;
+        match self.transition_snapshot_in_txn(name, expected_prior, new_state, expected_backing) {
+            Ok(snapshot) => {
+                commit(&self.conn)?;
+                Ok(snapshot)
+            }
+            Err(err) => {
+                rollback(&self.conn);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// The story-15-6 transactional seams' statement-level internals: each txn is
+/// `begin_immediate` → one `_in_txn` body (guard + checks + writes) →
+/// `commit`, or `rollback` + the typed refusal.
+impl SqliteStore {
+    /// The attach's guard + conflict/idempotence check + row write, all under
+    /// the write lock `begin_immediate` already took. Any refusal returns
+    /// `Err` so the caller rolls back — the row is byte-unchanged.
+    fn attach_in_txn(
+        &self,
+        name: &InstanceName,
+        kind: MemoryBackingKind,
+        terminal_states: &[LifecycleState],
+    ) -> Result<MemoryBackingTxn, StoreError> {
+        // The guard re-evaluates UNDER THE WRITE LOCK (the whole point of the
+        // txn — a lifecycle transition committed by another process between
+        // the registry's pre-check and here is SEEN, never raced past).
+        let state = self.state_in_txn(name)?;
+        if !terminal_states.iter().any(|s| s.as_str() == state) {
+            return Err(StoreError::MemoryBackingHotSwap {
+                name: name.as_str().to_string(),
+                state,
+            });
+        }
+        // Conflict / idempotence against the EXISTING row, read under the
+        // same lock (port-level A-6: a kind-CHANGE is refused below the
+        // registry too).
+        let id = self.instance_id(name)?.expect("guarded above: row exists");
+        let existing_kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM agent_memory_backing WHERE instance_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        if let Some(attached) = existing_kind {
+            if attached != kind.as_str() {
+                return Err(StoreError::MemoryBackingKindConflict {
+                    name: name.as_str().to_string(),
+                    attached,
+                    requested: kind.as_str().to_string(),
+                });
+            }
+            // Same kind again: idempotent success — NO rewrite (the original
+            // attached_at stands, A-6).
+            return Ok(MemoryBackingTxn::Idempotent);
+        }
+        self.conn
+            .execute(
+                "INSERT INTO agent_memory_backing (instance_id, kind, attached_at) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![id, kind.as_str(), crate::time::now_rfc3339()],
+            )
+            .map_err(backend)?;
+        Ok(MemoryBackingTxn::Attached)
+    }
+
+    /// The detach's guard + clear under the write lock (see
+    /// [`SqliteStore::attach_in_txn`]).
+    fn detach_in_txn(
+        &self,
+        name: &InstanceName,
+        terminal_states: &[LifecycleState],
+    ) -> Result<(), StoreError> {
+        let state = self.state_in_txn(name)?;
+        if !terminal_states.iter().any(|s| s.as_str() == state) {
+            return Err(StoreError::MemoryBackingHotSwap {
+                name: name.as_str().to_string(),
+                state,
+            });
+        }
+        // Idempotent clear (A-4 metadata-only): nothing attached → success.
+        let id = self.instance_id(name)?.expect("guarded above: row exists");
+        self.conn
+            .execute(
+                "DELETE FROM agent_memory_backing WHERE instance_id = ?1",
+                [id],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    /// The CONDITIONAL `→ starting` transition + the authoritative backing
+    /// snapshot under the write lock. The transition commits only when the
+    /// persisted state still equals `expected_prior` AND the backing row
+    /// still equals the caller's pre-check view — either drift refuses with
+    /// the typed error and everything rolls back.
+    fn transition_snapshot_in_txn(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+        expected_backing: Option<MemoryBacking>,
+    ) -> Result<Option<MemoryBacking>, StoreError> {
+        let found = self.state_in_txn(name)?;
+        if found != expected_prior.as_str() {
+            return Err(StoreError::StateConflict {
+                name: name.as_str().to_string(),
+                expected: expected_prior.as_str().to_string(),
+                found,
+            });
+        }
+        // The AUTHORITATIVE backing read — the same transaction that will
+        // persist the transition, so no attach/detach can land between this
+        // read and the state write.
+        let snapshot = self.backing_in_txn(name)?;
+        if snapshot != expected_backing {
+            return Err(StoreError::MemoryBackingChangedUnderStart {
+                name: name.as_str().to_string(),
+                precheck: describe_backing(expected_backing.as_ref()),
+                snapshot: describe_backing(snapshot.as_ref()),
+            });
+        }
+        // Mirrors `set_state`'s persisted shape (state + updated_at bump).
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE agent_instances SET state = ?1, updated_at = ?2 WHERE name = ?3",
+                rusqlite::params![
+                    new_state.as_str(),
+                    crate::time::now_rfc3339(),
+                    name.as_str(),
+                ],
+            )
+            .map_err(backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(snapshot)
+    }
+
+    /// The persisted Lifecycle State (wire form) of `name` inside the open
+    /// transaction. Absent instance → [`StoreError::NotFound`].
+    fn state_in_txn(&self, name: &InstanceName) -> Result<String, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT state FROM agent_instances WHERE name = ?1",
+                [name.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: name.as_str().to_string(),
+            })
+    }
+
+    /// The backing row read inside the open transaction (or `None`).
+    fn backing_in_txn(&self, name: &InstanceName) -> Result<Option<MemoryBacking>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT kind, attached_at FROM agent_memory_backing WHERE instance_id = \
+                 (SELECT id FROM agent_instances WHERE name = ?1)",
+                [name.as_str()],
+                |row| Ok(row_to_memory_backing(name.clone(), row)),
+            )
+            .optional()
+            .map_err(backend)?
+            .transpose()
+    }
+}
+
+/// One `BEGIN IMMEDIATE` step of the story-15-6 transactional seams — the
+/// `migrate_step` pattern (story 11-3, B3) applied to a guard+write pair:
+/// the statements that must be atomic with each other run inside ONE write
+/// transaction and commit together or not at all.
+fn begin_immediate(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)
+}
+
+fn commit(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("COMMIT").map_err(backend)
+}
+
+/// Best-effort rollback on a refusal path: the transaction is being
+/// abandoned with an error anyway, so the rollback's own failure (it cannot
+/// meaningfully fail here — the connection is healthy enough to have run the
+/// statements) must not MASK the real refusal.
+fn rollback(conn: &Connection) {
+    let _ = conn.execute_batch("ROLLBACK");
+}
+
+/// Format a backing view for [`StoreError::MemoryBackingChangedUnderStart`]
+/// — the two "sides" the typed mismatch names (AI-18: surfaced, not silent).
+fn describe_backing(backing: Option<&MemoryBacking>) -> String {
+    match backing {
+        None => "none".to_string(),
+        Some(backing) => format!(
+            "kind '{}' attached at {}",
+            backing.kind.as_str(),
+            backing.attached_at
+        ),
     }
 }
 
@@ -3716,5 +4002,381 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 0, "attachment row must cascade-delete");
+    }
+
+    // ---- Story 15-6: the transactional memory/lifecycle seams ----
+
+    /// Seed an instance in an arbitrary persisted state (the txn guard's
+    /// input) and return the store.
+    fn seeded_in_state(n: &str, state: LifecycleState) -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample(n, "mock", "/x/agents/x"))
+            .unwrap();
+        if state != LifecycleState::Registered {
+            store.set_state(&name(n), state).unwrap();
+        }
+        store
+    }
+
+    /// The lifecycle row's (state, updated_at) — the byte-unchanged contract
+    /// every rolled-back txn must preserve.
+    fn lifecycle_row(store: &SqliteStore, n: &str) -> (String, String) {
+        store
+            .conn
+            .query_row(
+                "SELECT state, updated_at FROM agent_instances WHERE name = ?1",
+                [n],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn backing_row_count(store: &SqliteStore, n: &str) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_memory_backing WHERE instance_id = \
+                 (SELECT id FROM agent_instances WHERE name = ?1)",
+                [n],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    const TERMINAL: &[LifecycleState] = &[
+        LifecycleState::Registered,
+        LifecycleState::Stopped,
+        LifecycleState::Failed,
+    ];
+
+    #[test]
+    fn attach_txn_attaches_idempotent_and_conflicts_atomically() {
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+
+        // Fresh attach: commits (the guard passed, the row landed).
+        assert_eq!(
+            store
+                .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Filesystem, TERMINAL)
+                .unwrap(),
+            MemoryBackingTxn::Attached
+        );
+        assert_eq!(
+            store.get_memory_backing(&name("demo")).unwrap(),
+            Some(backing("demo", MemoryBackingKind::Filesystem, "x")).map(|b| MemoryBacking {
+                attached_at: store
+                    .get_memory_backing(&name("demo"))
+                    .unwrap()
+                    .unwrap()
+                    .attached_at,
+                ..b
+            })
+        );
+
+        // Same kind again: IDEMPOTENT — no rewrite (the original attached_at
+        // stands, A-6).
+        let before = store.get_memory_backing(&name("demo")).unwrap().unwrap();
+        assert_eq!(
+            store
+                .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Filesystem, TERMINAL)
+                .unwrap(),
+            MemoryBackingTxn::Idempotent
+        );
+        assert_eq!(
+            store.get_memory_backing(&name("demo")).unwrap().unwrap(),
+            before
+        );
+
+        // Different kind: the typed conflict, row byte-unchanged.
+        let err = store
+            .attach_memory_backing_txn(&name("demo"), MemoryBackingKind::Native, TERMINAL)
+            .unwrap_err();
+        match err {
+            StoreError::MemoryBackingKindConflict {
+                ref attached,
+                ref requested,
+                ..
+            } => {
+                assert_eq!(attached, "filesystem");
+                assert_eq!(requested, "native");
+            }
+            other => panic!("expected MemoryBackingKindConflict, got {other:?}"),
+        }
+        assert_eq!(
+            store.get_memory_backing(&name("demo")).unwrap().unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn attach_txn_guard_refuses_a_non_terminal_state_and_rolls_back() {
+        // THE 15-6 window: another process transitioned the instance between
+        // the registry's pre-check and the txn. The in-txn guard refuses with
+        // the typed hot-swap error and the row stays absent; the lifecycle
+        // row is byte-unchanged (nothing the txn touched committed).
+        for state in [
+            LifecycleState::Running,
+            LifecycleState::Starting,
+            LifecycleState::Stopping,
+            LifecycleState::Paused,
+        ] {
+            let store = seeded_in_state("live", state);
+            let before = lifecycle_row(&store, "live");
+            let err = store
+                .attach_memory_backing_txn(&name("live"), MemoryBackingKind::Filesystem, TERMINAL)
+                .unwrap_err();
+            match &err {
+                StoreError::MemoryBackingHotSwap {
+                    name,
+                    state: reported,
+                } => {
+                    assert_eq!(name, "live");
+                    assert_eq!(reported, state.as_str());
+                }
+                other => panic!("expected MemoryBackingHotSwap for {state:?}, got {other:?}"),
+            }
+            assert_eq!(backing_row_count(&store, "live"), 0, "{state:?}: no row");
+            assert_eq!(
+                lifecycle_row(&store, "live"),
+                before,
+                "{state:?}: unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn attach_txn_refuses_an_absent_instance_with_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let err = store
+            .attach_memory_backing_txn(&name("ghost"), MemoryBackingKind::Native, TERMINAL)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound { ref name } if name == "ghost"));
+    }
+
+    #[test]
+    fn detach_txn_guard_clears_and_stays_idempotent() {
+        // Guard refusal on a non-terminal state: typed, row unchanged.
+        let store = seeded_in_state("live", LifecycleState::Running);
+        store
+            .upsert_memory_backing(&backing(
+                "live",
+                MemoryBackingKind::Filesystem,
+                "2026-10-16T00:00:00Z",
+            ))
+            .unwrap();
+        let err = store
+            .detach_memory_backing_txn(&name("live"), TERMINAL)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::MemoryBackingHotSwap { name, state }
+                if name == "live" && state == "running"),
+            "detach must refuse running inside the txn, got {err:?}"
+        );
+        assert!(store.get_memory_backing(&name("live")).unwrap().is_some());
+
+        // Terminal: clears. Idempotent: clearing again is success.
+        store
+            .set_state(&name("live"), LifecycleState::Stopped)
+            .unwrap();
+        store
+            .detach_memory_backing_txn(&name("live"), TERMINAL)
+            .unwrap();
+        assert!(store.get_memory_backing(&name("live")).unwrap().is_none());
+        store
+            .detach_memory_backing_txn(&name("live"), TERMINAL)
+            .unwrap();
+    }
+
+    #[test]
+    fn transition_snapshot_commits_state_and_returns_the_authoritative_backing() {
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+
+        // No backing: commits starting, snapshot None.
+        let snapshot = store
+            .set_state_snapshotting_memory_backing(
+                &name("demo"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                None,
+            )
+            .unwrap();
+        assert_eq!(snapshot, None);
+        assert_eq!(lifecycle_row(&store, "demo").0, "starting");
+
+        // With a backing row: the snapshot returns it (the authoritative read
+        // inside the same txn that persisted the transition).
+        let store = seeded_in_state("svc", LifecycleState::Stopped);
+        store
+            .upsert_memory_backing(&backing(
+                "svc",
+                MemoryBackingKind::Native,
+                "2026-10-16T00:00:00Z",
+            ))
+            .unwrap();
+        let snapshot = store
+            .set_state_snapshotting_memory_backing(
+                &name("svc"),
+                LifecycleState::Stopped,
+                LifecycleState::Starting,
+                Some(backing(
+                    "svc",
+                    MemoryBackingKind::Native,
+                    "2026-10-16T00:00:00Z",
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot,
+            Some(backing(
+                "svc",
+                MemoryBackingKind::Native,
+                "2026-10-16T00:00:00Z"
+            ))
+        );
+        assert_eq!(lifecycle_row(&store, "svc").0, "starting");
+    }
+
+    #[test]
+    fn transition_snapshot_mismatch_rolls_the_transition_back_byte_identically() {
+        // THE start-window pin at the store seam: the pre-check read None,
+        // but by txn time another process's attach row is visible. The
+        // CONDITIONAL transition refuses typed (naming BOTH sides) and rolls
+        // back — no `starting` row, lifecycle row byte-unchanged.
+        let store = seeded_in_state("svc", LifecycleState::Registered);
+        let before = lifecycle_row(&store, "svc");
+        // The racing attach lands (any channel — here the sanctioned upsert)
+        // BEFORE the transition txn runs.
+        store
+            .upsert_memory_backing(&backing(
+                "svc",
+                MemoryBackingKind::Filesystem,
+                "2026-10-16T12:00:00Z",
+            ))
+            .unwrap();
+
+        let err = store
+            .set_state_snapshotting_memory_backing(
+                &name("svc"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                None, // the pre-check's stale view
+            )
+            .unwrap_err();
+        match err {
+            StoreError::MemoryBackingChangedUnderStart {
+                ref precheck,
+                ref snapshot,
+                ..
+            } => {
+                assert_eq!(precheck, "none");
+                assert_eq!(
+                    snapshot,
+                    "kind 'filesystem' attached at 2026-10-16T12:00:00Z"
+                );
+            }
+            other => panic!("expected MemoryBackingChangedUnderStart, got {other:?}"),
+        }
+        assert_eq!(
+            lifecycle_row(&store, "svc"),
+            before,
+            "the mismatch must roll the transition back — state + updated_at unchanged"
+        );
+
+        // And the symmetric detach race: pre-check saw a backing, the txn
+        // finds none.
+        store.clear_memory_backing(&name("svc")).unwrap();
+        let err = store
+            .set_state_snapshotting_memory_backing(
+                &name("svc"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                Some(backing(
+                    "svc",
+                    MemoryBackingKind::Filesystem,
+                    "2026-10-16T12:00:00Z",
+                )),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::MemoryBackingChangedUnderStart { precheck, snapshot, .. }
+                if precheck.starts_with("kind 'filesystem'") && snapshot == "none"),
+            "the detach race must refuse naming both sides, got {err:?}"
+        );
+        assert_eq!(lifecycle_row(&store, "svc"), before);
+    }
+
+    #[test]
+    fn transition_snapshot_state_conflict_rolls_back() {
+        // Another process transitioned the instance first: the conditional
+        // transition refuses with the typed StateConflict, nothing persisted.
+        let store = seeded_in_state("demo", LifecycleState::Registered);
+        store
+            .set_state(&name("demo"), LifecycleState::Running)
+            .unwrap();
+        let before = lifecycle_row(&store, "demo");
+        let err = store
+            .set_state_snapshotting_memory_backing(
+                &name("demo"),
+                LifecycleState::Registered,
+                LifecycleState::Starting,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::StateConflict { expected, found, .. }
+                if expected == "registered" && found == "running"),
+            "expected StateConflict, got {err:?}"
+        );
+        assert_eq!(lifecycle_row(&store, "demo"), before);
+    }
+
+    #[test]
+    fn the_busy_timeout_pragma_is_set_on_every_open() {
+        // Story 15-6: the AD-17 bounded-wait bound is a CONNECTION property —
+        // pinned at the persisted value (5000ms, the stop-ladder precedent).
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("state.db")).unwrap();
+        let timeout: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(timeout, BUSY_TIMEOUT_MS as i64);
+    }
+
+    #[test]
+    fn a_held_write_txn_surfaces_the_typed_busy_error_after_the_bounded_wait() {
+        // The concurrent-writers row of the 15-6 I/O matrix: a second writer
+        // waits the FULL busy_timeout and then gets the TYPED Busy error —
+        // never a raw SQLITE_BUSY string (AI-18). Costs one bounded wait
+        // (~5s) by design: that IS the contract.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        let store = SqliteStore::open(&db).unwrap();
+        store
+            .create_instance(&sample("busy", "mock", "/x/agents/busy"))
+            .unwrap();
+        // A second raw connection (the "other process") holds the write txn.
+        let holder = Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        let err = store
+            .attach_memory_backing_txn(&name("busy"), MemoryBackingKind::Native, TERMINAL)
+            .unwrap_err();
+        let waited = started.elapsed();
+
+        match err {
+            StoreError::Busy { waited_ms } => assert_eq!(waited_ms, BUSY_TIMEOUT_MS),
+            other => panic!("expected the typed Busy error, got {other:?}"),
+        }
+        assert!(
+            waited >= std::time::Duration::from_millis(BUSY_TIMEOUT_MS),
+            "the bounded wait must actually elapse before the typed error: {waited:?}"
+        );
+        assert!(
+            !err.to_string().contains("SQLITE_BUSY"),
+            "the operator surface never shows a raw SQLITE_BUSY: {err}"
+        );
+        drop(holder);
     }
 }

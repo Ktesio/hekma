@@ -18,6 +18,7 @@ use crate::domain::{
 };
 
 use super::memory_backing::MemoryBacking;
+use super::memory_backing::MemoryBackingKind;
 use super::{ProcessFingerprint, StoreError};
 
 /// A write-ahead spawn record (spine AD-5) — the durable supervision state for
@@ -302,6 +303,88 @@ pub trait StateStore {
     /// Read the attached [`MemoryBacking`] for an instance, or `None` if nothing
     /// is attached.
     fn get_memory_backing(&self, name: &InstanceName) -> Result<Option<MemoryBacking>, StoreError>;
+
+    // ---- Transactional memory/lifecycle seams (story 15-6, spine AD-17/AD-18) ----
+    //
+    // The registry's mutex serializes memory ops only WITHIN one Engine
+    // process. The real CLI shape is one Engine per command sharing a state
+    // dir, so `start` in one terminal races `memory attach` in another across
+    // the ONLY state both share: this SQLite file. These three methods move
+    // the guard + conflict-check + write (attach/detach) and the `→ starting`
+    // transition + authoritative backing read (start) into ONE
+    // `BEGIN IMMEDIATE` transaction each — the crash-atomic `migrate_step`
+    // pattern — so the cross-process windows close at the durable store
+    // without touching the two-mutex model (AD-17/AD-18 stand).
+
+    /// Attach a [`MemoryBacking`] atomically (story 15-6): the terminal-state
+    /// guard (the instance's PERSISTED state must be one of
+    /// `terminal_states`), the kind-conflict/idempotence check, and the row
+    /// write all run inside ONE `BEGIN IMMEDIATE` transaction — a concurrent
+    /// process cannot land a lifecycle transition inside the guard→write gap.
+    ///
+    /// Returns [`MemoryBackingTxn::Attached`] when a fresh row committed, or
+    /// [`MemoryBackingTxn::Idempotent`] when the SAME kind was already
+    /// attached (A-6: no rewrite — the row's original `attached_at` stands).
+    /// A DIFFERENT kind refuses with
+    /// [`StoreError::MemoryBackingKindConflict`]; a non-terminal state
+    /// refuses with [`StoreError::MemoryBackingHotSwap`]. Every refusal rolls
+    /// the transaction back: the row is byte-unchanged.
+    ///
+    /// METADATA ONLY like [`StateStore::upsert_memory_backing`]: the managed
+    /// directory on disk is the CALLER's concern (the registry creates it
+    /// after this commits — inert + idempotent either way).
+    fn attach_memory_backing_txn(
+        &self,
+        name: &InstanceName,
+        kind: MemoryBackingKind,
+        terminal_states: &[LifecycleState],
+    ) -> Result<MemoryBackingTxn, StoreError>;
+
+    /// Detach the named instance's Memory Backing atomically (story 15-6):
+    /// the terminal-state guard and the row clear run inside ONE
+    /// `BEGIN IMMEDIATE` transaction, refusing with
+    /// [`StoreError::MemoryBackingHotSwap`] (row byte-unchanged) when the
+    /// instance sits outside `terminal_states` at COMMIT time. Idempotent
+    /// like [`StateStore::clear_memory_backing`]: detaching with nothing
+    /// attached is success.
+    fn detach_memory_backing_txn(
+        &self,
+        name: &InstanceName,
+        terminal_states: &[LifecycleState],
+    ) -> Result<(), StoreError>;
+
+    /// Persist a lifecycle transition AND snapshot the memory backing in ONE
+    /// transaction (story 15-6) — start's AUTHORITATIVE backing read. The
+    /// transition is CONDITIONAL: it commits only when the persisted state is
+    /// still `expected_prior` (another command's transition first refuses
+    /// with [`StoreError::StateConflict`]), and it commits only when the
+    /// backing row still equals `expected_backing` (the start path's
+    /// pre-check read; a mid-start attach/detach by another process refuses
+    /// with [`StoreError::MemoryBackingChangedUnderStart`]). Every refusal
+    /// rolls the transaction back — the instance keeps its prior state, no
+    /// `starting` row ever lands, nothing launches against a stale view.
+    ///
+    /// On success returns the snapshot READ INSIDE the same transaction (the
+    /// authoritative view the caller's launch then reflects — equal to
+    /// `expected_backing` by construction).
+    fn set_state_snapshotting_memory_backing(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+        expected_backing: Option<MemoryBacking>,
+    ) -> Result<Option<MemoryBacking>, StoreError>;
+}
+
+/// What [`StateStore::attach_memory_backing_txn`] decided (story 15-6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryBackingTxn {
+    /// A fresh attachment row was committed (kind + `attached_at`).
+    Attached,
+    /// The SAME kind was already attached: NO row rewrite (A-6 idempotence —
+    /// the row's original `attached_at` stands); the caller still self-heals
+    /// the managed directory.
+    Idempotent,
 }
 
 #[cfg(test)]
@@ -417,6 +500,30 @@ mod tests {
         fn get_memory_backing(
             &self,
             _name: &InstanceName,
+        ) -> Result<Option<MemoryBacking>, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn attach_memory_backing_txn(
+            &self,
+            _name: &InstanceName,
+            _kind: MemoryBackingKind,
+            _terminal_states: &[LifecycleState],
+        ) -> Result<MemoryBackingTxn, StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn detach_memory_backing_txn(
+            &self,
+            _name: &InstanceName,
+            _terminal_states: &[LifecycleState],
+        ) -> Result<(), StoreError> {
+            unimplemented!("not the seam under test")
+        }
+        fn set_state_snapshotting_memory_backing(
+            &self,
+            _name: &InstanceName,
+            _expected_prior: LifecycleState,
+            _new_state: LifecycleState,
+            _expected_backing: Option<MemoryBacking>,
         ) -> Result<Option<MemoryBacking>, StoreError> {
             unimplemented!("not the seam under test")
         }

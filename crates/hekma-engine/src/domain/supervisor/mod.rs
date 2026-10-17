@@ -1117,6 +1117,58 @@ impl Supervisor {
         log_capture: Option<LogCapture>,
     ) -> Result<TransitionEvent, EngineError> {
         registry.set_state(name, new).map_err(registry_to_engine)?;
+        self.record_transition(registry, name, prior, new, cause, log_capture)
+    }
+
+    /// Story 15-6: the `→ starting` transition's TRANSACTIONAL shape — the
+    /// state persist and the AUTHORITATIVE memory-backing read happen in ONE
+    /// `BEGIN IMMEDIATE` store transaction
+    /// ([`StateStore::set_state_snapshotting_memory_backing`]), conditional on
+    /// `expected_prior` (the state the start path read) and
+    /// `expected_backing` (the backing the start path's pre-check read). A
+    /// second CLI Engine on the same state root can no longer attach/detach
+    /// the backing — or transition the instance — inside the window between
+    /// the start path's reads and the persisted transition: the transaction
+    /// refuses typed and ROLLS BACK (no `starting` row lands, nothing
+    /// launches against a stale view).
+    ///
+    /// On success returns the backing snapshot read inside the same
+    /// transaction — the authoritative view the launch then reflects (and the
+    /// input the delivery notice derives from, so the DC-10 notice survives
+    /// the reorder byte-identically).
+    fn transition_with_backing_snapshot(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        expected_backing: Option<crate::ports::MemoryBacking>,
+    ) -> Result<Option<crate::ports::MemoryBacking>, EngineError> {
+        let snapshot = registry
+            .set_state_snapshotting_memory_backing(name, prior, new, expected_backing)
+            .map_err(transition_snapshot_to_engine)?;
+        // The capture lookup mirrors `transition`'s (the instance has no
+        // `self.running` entry yet — the spawn comes after this transition).
+        let log_capture = self.log_capture_for(name);
+        self.record_transition(registry, name, prior, new, cause, log_capture)?;
+        Ok(snapshot)
+    }
+
+    /// Everything a transition records AFTER the state persist: the durable
+    /// `instance.log` append, the bus publish, and the attributed-capture
+    /// engine line. Shared by [`Supervisor::transition_with_log_capture`] and
+    /// [`Supervisor::transition_with_backing_snapshot`] so both transitions
+    /// record byte-identically once the state is persisted.
+    fn record_transition(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        log_capture: Option<LogCapture>,
+    ) -> Result<TransitionEvent, EngineError> {
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
         append_event(&registry.instance_log_path(name), &event).map_err(|detail| {
             EngineError::Log {
@@ -1474,6 +1526,28 @@ pub(crate) fn registry_to_engine(err: super::error::RegistryError) -> EngineErro
             name: "<unknown>".to_string(),
             detail: other.to_string(),
         },
+    }
+}
+
+/// Map the TRANSACTIONAL `→ starting` transition's errors (story 15-6) into
+/// the lifecycle [`EngineError`]. The typed mid-start backing mismatch gets
+/// its OWN retryable variant (naming both sides, the instance state provably
+/// unchanged — the store rolled the transaction back); every other registry
+/// error falls back to the shared mapper.
+fn transition_snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
+    match err {
+        super::error::RegistryError::Store(
+            crate::ports::StoreError::MemoryBackingChangedUnderStart {
+                name,
+                precheck,
+                snapshot,
+            },
+        ) => EngineError::MemoryBackingChangedUnderStart {
+            name,
+            precheck,
+            snapshot,
+        },
+        other => registry_to_engine(other),
     }
 }
 

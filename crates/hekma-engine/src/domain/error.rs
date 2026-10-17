@@ -544,6 +544,30 @@ pub enum EngineError {
         timeout_secs: u64,
     },
 
+    /// Story 15-6: the memory backing changed BETWEEN the start path's early
+    /// pre-check read and the `→ starting` transition transaction's
+    /// authoritative snapshot — another process (a second CLI Engine on the
+    /// same state root) attached or detached inside start's read→transition
+    /// window. The CONDITIONAL transition ROLLED BACK: the instance keeps its
+    /// prior terminal state and NOTHING was launched (a launched agent
+    /// contradicting the row is exactly the forbidden outcome). RETRYABLE by
+    /// design: re-running `start` re-reads the backing and proceeds against
+    /// the new truth. Names both sides (the pre-check's view + the snapshot's
+    /// view).
+    #[error(
+        "the memory backing for '{name}' changed under start (pre-check saw {precheck}; the \
+         store transaction read {snapshot}): an attach/detach raced this start. Nothing was \
+         launched and the instance state is unchanged — retry: kt agent start {name}"
+    )]
+    MemoryBackingChangedUnderStart {
+        /// The instance whose start raced a backing mutation.
+        name: String,
+        /// The pre-check's view: `"none"` or `kind '<k>' attached at <ts>`.
+        precheck: String,
+        /// The transaction snapshot's view: same format as `precheck`.
+        snapshot: String,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),
