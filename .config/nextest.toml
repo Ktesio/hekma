@@ -59,3 +59,25 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = "kind(test) & package(hekma-engine)"
 test-group = "engine-integration-serial"
+
+# Serialize the CLI crate's integration binary too (the 2026-10-17 x86-ubuntu
+# wedge). The #106 group above covers the engine binaries, but the CLI
+# integration binary (crates/hekma/tests/agent_cli.rs) grew its own
+# process-spawning population outside it: #281's surviving-engine supervision
+# legs and the raw-follow rewrite hold LIVE detached fake_agent children
+# (--linger-ms 600000) plus follow/stop engine processes DURING the test, on a
+# lane that also runs the serialized engine group — the same concurrent
+# heavy-re-exec + long-lived-orphan population that wedged the 2-core runner
+# into an uninterruptible D-state hang in #106. Symptom here: the ubuntu-latest
+# test job cancelled by its own 40m job timeout three-for-three on PR trees
+# carrying those tests (PR #284, 2026-10-17) while macOS/Windows stayed green
+# and the same tests passed on a quiet many-core box in seconds — a
+# runner-contention wedge, not a test-logic hang (nextest's slow-timeout kill
+# would have named a stuck test long before 40m). Same remedy as #106, same
+# group so the engine and CLI process-spawners never overlap: the whole
+# agent_cli binary runs max-threads=1. Cost is negligible — the binary is 129
+# tests, 25s fully single-threaded on a dev box. This HIDES/SKIPS nothing;
+# it only limits parallelism.
+[[profile.default.overrides]]
+filter = "kind(test) & package(hekma)"
+test-group = "engine-integration-serial"
