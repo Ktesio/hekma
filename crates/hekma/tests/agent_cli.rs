@@ -850,12 +850,14 @@ fn run_hekma_agent_bounded(
     // see EOF, then PROCEED WITHOUT THEM. On windows-latest this harness
     // proved the pipes never EOF after a detached start even though hekma is
     // DEAD: the surviving detached agent ends up holding hekma's stdio pipe
-    // write-ends, so a plain join deadlocks. (`std` spawns with a handle
-    // list restricted to the child's own three stdio handles, so this leak
-    // is unexpected and is recorded as a story 12-1 production follow-up —
-    // a script that captures `hekma agent start --detach` output would hang
-    // until the agent exits.) The leaked readers die with the test process;
-    // the incremental buffers already hold hekma's full transcript.
+    // write-ends, so a plain join deadlocks. (Root cause, story 15-4: `std`'s
+    // default Windows spawn passes NO handle list while bInheritHandles is
+    // TRUE and every std-provided stdio handle is inheritable — the child
+    // inherits the WHOLE table, including these write-ends. The engine now
+    // clears the flag on its own three stdio handles around a detached
+    // spawn; until that fix is proven on the Windows leg, the leaked
+    // readers die with the test process and the incremental buffers already
+    // hold hekma's full transcript.)
     let grace = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !(t_out.is_finished() && t_err.is_finished()) && std::time::Instant::now() < grace {
         std::thread::sleep(std::time::Duration::from_millis(10));
