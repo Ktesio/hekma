@@ -131,12 +131,17 @@ A third-party adapter crate adds `hekma-conformance` as a **dev-dependency** —
 # Pin a full commit SHA: until the crates publish a bare `git =`
 # dependency floats on this repo's default-branch HEAD, and a breaking
 # report-shape change would break your build without you moving. Update the
-# pin deliberately.
+# pin deliberately. NOTE: the pinned rev below predates the configured-run
+# surface — `TckConfig`/`run_conformance_with` (and the fresh-root contract
+# on caller-owned state roots) require a revision at or after the change
+# that introduced them (the 15-3 TCK hardening); this pin is bumped to that
+# revision in the same change that lands it, so third parties following the
+# pin forward get the configured-run surface with the bump.
 [dev-dependencies]
 hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "14fbf772710e9151f7a90be8d504a4f67bd95531" }
 ```
 
-Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) — the `tests/third_party_manifest.rs` file in `hekma-conformance` is the exact third-party shape. Configured runs (spec 15-3) use `run_conformance_with(&adapter, &TckConfig { .. })`: a custom per-poll section timeout (default 30s), a caller-owned state root used as-is (default: the harness's fresh hermetic tempdir), and a typed section subset (`SectionSelection::Only(..)`, default all eight) — a subset yields fewer entries in the same fixed order and the same JSON shape, and a pre-section failure carries its own stage prefix (`engine open failed:` vs `registration failed:`) on every selected section. Reads route through public engine seams where they exist (`read_agent_log`, `fleet_entry`, `adapter::resolve`, the engine's public path layout); the two frozen-v1 residual reads (usage-event row counts, the registered-snapshot launch boolean) are documented in `docs/adapter-contract.md` and on the helpers.
+Then author the `adapter.toml` and invoke the harness from the crate's own `#[test]`: `run_mock_conformance(&manifest_dir)` (the manifest shape) or `run_conformance(&TckAdapter::Native(kind.into()))` (a native builtin registered by kind). The caller asserts on the report (`is_conformant()`, `section(id)`, `failures()`) — the `tests/third_party_manifest.rs` file in `hekma-conformance` is the exact third-party shape. Configured runs (spec 15-3) use `run_conformance_with(&adapter, &TckConfig { .. })`: a custom per-poll section timeout (default 30s), a caller-owned state root under the fresh-root contract (empty or not-yet-existing, exclusively one run's; default: the harness's fresh hermetic tempdir), and a typed section subset (`SectionSelection::Only(..)`, default all eight) — a subset yields fewer entries in the same fixed order and the same JSON shape, and a pre-section failure carries its own stage prefix (`engine open failed:` vs `registration failed:`) on every selected section. Reads route through public engine seams where they exist (`read_agent_log`, `fleet_entry`, `adapter::resolve`, the engine's public path layout); the two frozen-v1 residual reads (usage-event row counts, the registered-snapshot launch boolean) are documented in `docs/adapter-contract.md` and on the helpers.
 
 #### The eight sections
 

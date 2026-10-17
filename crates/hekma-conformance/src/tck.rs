@@ -44,17 +44,21 @@
 //! ## Configured runs (spec 15-3)
 //!
 //! [`run_conformance_with`] takes a [`TckConfig`]: a per-poll section
-//! timeout (default 30s), a caller-owned state root used as-is (default: a
-//! fresh hermetic tempdir), and a section subset (default: all eight —
+//! timeout (default 30s), a caller-owned state root (default: a fresh
+//! hermetic tempdir), and a section subset (default: all eight —
 //! [`run_conformance`] delegates to the default config byte-for-byte). A
 //! subset yields FEWER report entries in the same fixed order and the same
-//! shape; completeness is "complete for the selected set". Reads route
-//! through public engine seams where they exist ([`Blocking::read_agent_log`]
-//! for log polls, `fleet_entry` for the registered metering source,
-//! `adapter::resolve` for the `--dump` pair, the engine's public path layout
-//! for every state-root-relative path); the two frozen-v1 residual reads
-//! (usage-event row counts; the registered-snapshot launch boolean) are
-//! documented on their helpers.
+//! shape; completeness is "complete for the selected set". A caller-owned
+//! root is bound by the FRESH-ROOT CONTRACT: it must be empty (or not yet
+//! exist) and is exclusively one run's — a non-empty or uncreatable root
+//! fails the run's state-root stage with a named reason (stale dumps,
+//! fixed-name collisions, and residual state are all refused rather than
+//! inherited). Reads route through public engine seams where they exist
+//! ([`Blocking::read_agent_log`] for log polls, `fleet_entry` for the
+//! registered metering source, `adapter::resolve` for the `--dump` pair,
+//! the engine's public path layout for every state-root-relative path); the
+//! two frozen-v1 residual reads (usage-event row counts; the
+//! registered-snapshot launch boolean) are documented on their helpers.
 //!
 //! ## Sections
 //!
@@ -89,14 +93,18 @@
 //!   usage body), the operator sets the real upstream, and 3 forwarded calls
 //!   commit exactly.
 //! * `memory` — attach → status reports the attachment AND the declared
-//!   delivery fact → a probe with the same declaration receives the managed
-//!   dir through its declared env var → detach clears it. Adapters that
-//!   declare no `memory.dir` mapping read `not_applicable` (delivery is
+//!   delivery fact → a probe with the same declaration receives the
+//!   managed dir through its declared env var → detach clears it. Adapters
+//!   that declare no `memory.dir` mapping read `not_applicable` (delivery is
 //!   offered, not imposed); a declaration that cannot be re-read FAILS the
 //!   section naming the cause (never a fabricated "maps nothing"). The
 //!   SUBJECT's own declared delivery is proven for the shipping hermes
 //!   builtin by the hermes pass (`hermes_tck.rs`: the subject's process
-//!   receives the managed dir as `HERMES_HOME`).
+//!   receives the managed dir as `HERMES_HOME`) and for manifest subjects by
+//!   the `--dump` subject leg, whose applicability rules are stated on
+//!   [`run_memory`] (dump-less → probe leg, not penalized; dump + env target
+//!   → proven on the subject; dump + non-env target → surfaced skip naming
+//!   the probe twin as the proof).
 //! * `interaction` — Guaranteed/BestEffort: send_input reaches a running
 //!   agent (echo proof in its log); Unsupported: fails fast
 //!   `CapabilityUnsupported` on a probe.
@@ -241,11 +249,17 @@ impl ConformanceReport {
     }
 
     /// `true` when every section is pass or not_applicable — the "conformant"
-    /// verdict a third-party `#[test]` asserts.
+    /// verdict a third-party `#[test]` asserts. An EMPTY report is NOT
+    /// conformant (the 15-3 review): "every section passed" over zero
+    /// sections would be a vacuous pass — the harness never emits one (an
+    /// empty selection is a named failure at the run level), and a
+    /// hand-built empty report must not read conformant either.
     pub fn is_conformant(&self) -> bool {
-        self.sections
-            .iter()
-            .all(|s| !matches!(s.result, SectionResult::Fail { .. }))
+        !self.sections.is_empty()
+            && self
+                .sections
+                .iter()
+                .all(|s| !matches!(s.result, SectionResult::Fail { .. }))
     }
 
     /// The named failures (section id + reason) — the human-readable triage
@@ -302,12 +316,22 @@ impl TckAdapter {
         }
     }
 
-    /// The env var the subject's declaration maps the reserved `memory.dir`
-    /// key to, when it maps one (the memory section's manifest-subject `--dump`
-    /// leg delivers through it — spec 15-3, Fibery 174). Same source and same
-    /// error honesty as [`TckAdapter::declares_memory_dir`]: a manifest
-    /// re-read/parse failure is `Err` (never a collapsed `None`).
-    fn memory_dir_env_target(&self) -> Result<Option<String>, String> {
+    /// The declaration's mapping target for the reserved `memory.dir` key —
+    /// the ONE parsed declaration read that serves every memory-section
+    /// question (the 15-3 review's TOCTOU fix: `declares_memory_dir` and
+    /// [`TckAdapter::memory_dir_env_target`] formerly re-read and re-parsed
+    /// the manifest independently, so the section's applicability gate and
+    /// its subject leg could disagree if the file changed between reads; the
+    /// pipeline now calls this ONCE and threads the answer down). For a
+    /// MANIFEST adapter this re-reads the caller-supplied `adapter.toml`
+    /// (that file IS the declaration the engine registered — the engine has
+    /// no separate persisted copy of the mapping); a re-read/parse failure is
+    /// `Err` (retro #163, finding B11) — never a collapsed `None`, which
+    /// would lie "maps nothing" about a declaration the harness could not
+    /// read. The NATIVE arm routes through the same helper shape (no dead
+    /// arm): the engine's compiled-in builtin table IS the native
+    /// declaration (no I/O — cannot fail).
+    fn memory_dir_target(&self) -> Result<Option<::hekma_adapter_api::ConfigTarget>, String> {
         match self {
             TckAdapter::Manifest(dir) => {
                 let path = dir.join("adapter.toml");
@@ -318,54 +342,27 @@ impl TckAdapter {
                 Ok(manifest
                     .config_mapping()
                     .target(::hekma_engine::domain::MEMORY_DIR_KEY)
-                    .and_then(|target| match target {
-                        ::hekma_adapter_api::ConfigTarget::Env { env } => Some(env.clone()),
-                        _ => None,
-                    }))
+                    .cloned())
             }
             TckAdapter::Native(kind) => Ok(::hekma_engine::adapter::native_config_mapping(kind)
                 .and_then(|mapping| {
                     mapping
                         .target(::hekma_engine::domain::MEMORY_DIR_KEY)
-                        .and_then(|target| match target {
-                            ::hekma_adapter_api::ConfigTarget::Env { env } => Some(env.clone()),
-                            _ => None,
-                        })
+                        .cloned()
                 })),
         }
     }
 
-    /// Whether the adapter's declaration maps the reserved `memory.dir` key.
-    /// For a MANIFEST adapter this re-reads the `adapter.toml` file the caller
-    /// supplied (that file IS the declaration the engine registered — the
-    /// engine has no separate persisted copy of the mapping), so the source is
-    /// caller-controlled by nature. For a NATIVE adapter the declaration is
-    /// the engine's compiled-in builtin table (no I/O — cannot fail).
-    ///
-    /// A manifest re-read/parse FAILURE is `Err` (retro #163, finding B11):
-    /// it must FAIL the memory section, never collapse to `false` — a
-    /// collapsed `false` would report `not_applicable` ("maps no reserved
-    /// key"), a lie about a declaration the harness could not read.
-    fn declares_memory_dir(&self) -> Result<bool, String> {
-        match self {
-            TckAdapter::Manifest(dir) => {
-                let path = dir.join("adapter.toml");
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("could not re-read {}: {e}", path.display()))?;
-                let manifest = ::hekma_adapter_api::Manifest::from_toml_str(&text)
-                    .map_err(|e| format!("could not re-parse {}: {e}", path.display()))?;
-                Ok(manifest
-                    .config_mapping()
-                    .target(::hekma_engine::domain::MEMORY_DIR_KEY)
-                    .is_some())
-            }
-            TckAdapter::Native(kind) => Ok(::hekma_engine::adapter::native_config_mapping(kind)
-                .is_some_and(|mapping| {
-                    mapping
-                        .target(::hekma_engine::domain::MEMORY_DIR_KEY)
-                        .is_some()
-                })),
-        }
+    /// The env var the subject's declaration maps the reserved `memory.dir`
+    /// key to, when it maps an ENV target — a thin view over the ONE parsed
+    /// read ([`TckAdapter::memory_dir_target`]); same error honesty (a
+    /// manifest re-read/parse failure is `Err`, never a collapsed `None`).
+    /// Public for third-party kit consumers that surface their subject's
+    /// declared delivery channel next to the report.
+    pub fn memory_dir_env_target(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .memory_dir_target()?
+            .and_then(|target| target.env_var().map(str::to_string)))
     }
 }
 
@@ -387,6 +384,12 @@ pub mod section_ids {
     pub const MEMORY: &str = "memory";
     /// send_input delivery / unsupported fail-fast.
     pub const INTERACTION: &str = "interaction";
+    /// The pseudo-section id a malformed selection reports under (the 15-3
+    /// review): an empty [`SectionSelection::Only`] list fails the RUN with
+    /// ONE named entry under this id instead of a vacuously-conformant empty
+    /// report. Not a real section — it never appears for any valid
+    /// selection, and the report's JSON shape is unchanged.
+    pub const SELECTION: &str = "selection";
 }
 
 /// One selectable TCK section — the typed form of a [`section_ids`] stable
@@ -451,11 +454,11 @@ pub enum SectionSelection {
     /// Every section — today's behavior (the [`Default`]).
     #[default]
     All,
-    /// Only the listed sections. An EMPTY list selects nothing: the report
-    /// carries zero entries and `is_conformant()` reads vacuously `true` —
-    /// callers almost always want [`SectionSelection::All`] or a non-empty
-    /// list, and this arm is pinned by test rather than rejected at runtime
-    /// (the harness's contract is a report, never a panic).
+    /// Only the listed sections. An EMPTY list is a named misconfiguration
+    /// failure, never a vacuous pass: the run returns a one-entry report
+    /// under [`section_ids::SELECTION`] carrying the reason (a zero-section
+    /// report would otherwise read `is_conformant() == true` vacuously — a
+    /// lie). The harness's contract is a report, never a panic.
     Only(Vec<TckSection>),
 }
 
@@ -478,7 +481,7 @@ impl SectionSelection {
 /// (Fibery 173). Additive surface — [`run_conformance`] and
 /// [`run_mock_conformance`] delegate to a `Default` config and are
 /// byte-for-byte unchanged.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TckConfig {
     /// The per-poll budget every section's bounded wait uses (state polls,
     /// dump/log/row polls). The default (30s) covers a loaded CI runner;
@@ -487,9 +490,19 @@ pub struct TckConfig {
     /// A caller-owned state root used AS-IS instead of the harness's fresh
     /// hermetic tempdir: `None` (the default) creates the tempdir, `Some(p)`
     /// hands `p` to the engine verbatim (no swap, no cleanup — the caller
-    /// owns the root and whatever the run leaves in it). A root that exists
-    /// but is not a directory fails the run's state-root stage with a named
-    /// reason.
+    /// owns the root and whatever the run leaves in it). THE FRESH-ROOT
+    /// CONTRACT (the 15-3 review): a configured root must be an EMPTY
+    /// directory (or not yet exist — the harness's creatability probe
+    /// creates it); a root that exists but is not a directory, a root that
+    /// cannot be created (missing parent, unwritable), and a root holding
+    /// ANY pre-existing entry each fail the run's state-root stage with a
+    /// named reason. The root is EXCLUSIVELY this run's: the harness
+    /// registers fixed instance names (`tck-subject`, probe twins) and
+    /// writes dump artifacts at fixed paths, so a reused root would
+    /// collide with prior names and let a STALE artifact (a previous
+    /// run's dump or rows) false-pass this run's proofs — the fresh check
+    /// closes the stale-dump false-pass, the fixed-name collisions, and
+    /// the residual-state class in one rule.
     pub state_root: Option<PathBuf>,
     /// Which sections execute (the default runs all eight).
     pub sections: SectionSelection,
@@ -536,6 +549,28 @@ pub fn run_conformance(adapter: &TckAdapter) -> ConformanceReport {
 /// prefix naming where the pipeline stopped (never a blanket "registration
 /// failed").
 pub fn run_conformance_with(adapter: &TckAdapter, config: &TckConfig) -> ConformanceReport {
+    // An EMPTY Only-list selects nothing: a zero-entry report would read
+    // `is_conformant() == true` VACUOUSLY — a lie about a run that proved
+    // nothing. The misconfiguration gets a NAMED, complete failure instead
+    // (the 15-3 review): exactly one entry, under the `selection`
+    // pseudo-id, carrying the remedy.
+    if let SectionSelection::Only(list) = &config.sections {
+        if list.is_empty() {
+            return ConformanceReport {
+                schema_version: REPORT_SCHEMA_VERSION,
+                contract_version: ::hekma_adapter_api::CONTRACT_VERSION.to_string(),
+                adapter_kind: adapter.kind_label(),
+                sections: vec![SectionReport {
+                    section: section_ids::SELECTION.to_string(),
+                    result: SectionResult::fail(
+                        "the section selection is empty: SectionSelection::Only([]) selects \
+                         nothing, so no conformance claim can be made — pass \
+                         SectionSelection::All or a non-empty list",
+                    ),
+                }],
+            };
+        }
+    }
     catch_report(adapter, config, || {
         // A stage failure IS a complete all-`fail` report for the selected
         // set, not a separate error surface: the rendered stage reason just
@@ -587,6 +622,27 @@ impl Stage {
     fn render(self, detail: &str) -> String {
         format!("{}: {detail}", self.prefix())
     }
+
+    /// The detail half of a stage raise, with any redundant leading
+    /// restatement of THIS stage's own rendered prefix stripped — no
+    /// `"stage: stage: detail"` double-stacking when a helper error already
+    /// carries the stage's prefix (the 15-3 review). Helper prefixes that
+    /// NAME their helper (e.g. `register: …`, the byte-parity infix) add
+    /// information and stay.
+    fn strip_own_prefix(self, raw: String) -> String {
+        let prefix = format!("{}: ", self.prefix());
+        match raw.strip_prefix(&prefix) {
+            Some(rest) => rest.to_string(),
+            None => raw,
+        }
+    }
+}
+
+/// Raise a pipeline stage with `detail`, applying [`Stage::strip_own_prefix`]
+/// (the single choke point every stage raise flows through — a helper whose
+/// error already restates the stage cannot double-stack it).
+fn stage_err(stage: Stage, detail: String) -> (Stage, String) {
+    (stage, stage.strip_own_prefix(detail))
 }
 
 /// The never-panic boundary: run `op` and, if it panics, return the complete
@@ -639,10 +695,20 @@ impl StateRoot {
 
 /// Prepare the run's state root per `config` (the [`Stage::StateRoot`]
 /// pipeline step): the default hermetic tempdir, or the caller's root
-/// validated to be usable AS-IS. A configured root that exists but is not a
-/// directory fails HERE — with the root named — instead of deep inside the
-/// engine's tree creation, so the StateRoot stage's failure reason is the
-/// operator-actionable one.
+/// validated against the FRESH-ROOT CONTRACT (the 15-3 review) —
+///
+/// * a root that exists but is not a directory fails HERE, with the root
+///   named;
+/// * a root holding ANY pre-existing entry fails HERE (the root is
+///   exclusively this run's: the harness registers fixed instance names and
+///   writes dump artifacts at fixed paths, so residual state would collide
+///   with prior names and could let a STALE artifact false-pass this run's
+///   proofs);
+/// * a root that does not exist is probed for CREATABILITY with
+///   `create_dir_all` (which also creates it), so a missing parent or an
+///   unwritable location fails HERE at the state-root stage — named with
+///   the root — instead of deep inside the engine's open, where the reason
+///   would mislead.
 fn prepare_state_root(config: &TckConfig) -> Result<StateRoot, String> {
     match &config.state_root {
         None => tempfile::Builder::new()
@@ -657,6 +723,37 @@ fn prepare_state_root(config: &TckConfig) -> Result<StateRoot, String> {
                     root.display()
                 ));
             }
+            if root.is_dir() {
+                // FRESH: any entry — a prior run's dump, state.db, or agent
+                // tree — is residual state this exclusive-single-run harness
+                // must not inherit (named class: stale-dump false-pass,
+                // fixed-instance-name collisions, residual state).
+                let nonempty = root
+                    .read_dir()
+                    .map_err(|e| format!("read the configured state root {}: {e}", root.display()))?
+                    .next()
+                    .is_some();
+                if nonempty {
+                    return Err(format!(
+                        "the configured state root {} is not empty: a configured root is \
+                         exclusively one run's state (fixed instance names and dump paths \
+                         would collide with prior content, and a stale artifact could \
+                         false-pass this run's proofs) — pass an empty (or not-yet-existing) \
+                         directory",
+                        root.display()
+                    ));
+                }
+            } else {
+                // Not yet existing: probe creatability HERE so a missing
+                // parent or an unwritable location fails at the state-root
+                // stage, never as a mysterious engine-open failure.
+                std::fs::create_dir_all(root).map_err(|e| {
+                    format!(
+                        "the configured state root {} cannot be created: {e}",
+                        root.display()
+                    )
+                })?;
+            }
             Ok(StateRoot::Caller(root.clone()))
         }
     }
@@ -669,33 +766,36 @@ fn conformance_inner(
     adapter: &TckAdapter,
     config: &TckConfig,
 ) -> Result<ConformanceReport, (Stage, String)> {
-    let state = prepare_state_root(config).map_err(|e| (Stage::StateRoot, e))?;
+    let state = prepare_state_root(config).map_err(|e| stage_err(Stage::StateRoot, e))?;
     let engine = Engine::open(Some(state.path().to_path_buf()))
-        .map_err(|e| (Stage::EngineOpen, e.to_string()))?;
+        .map_err(|e| stage_err(Stage::EngineOpen, e.to_string()))?;
     let facade = engine.blocking();
     let timeout = config.section_timeout;
 
+    // The `register: ` infix is byte-parity with the pre-15-3 default-path
+    // reason ("registration failed: register: …" — the one compatibility
+    // point beyond the pinned stage prefix; the 15-3 review).
     let registered = facade
         .register_with_adapter("tck-subject", &adapter.adapter_ref())
-        .map_err(|e| (Stage::Registration, e.to_string()))?;
+        .map_err(|e| stage_err(Stage::Registration, format!("register: {e}")))?;
 
     // The declaration under test, read from the engine's own projection (the
     // adapter as REGISTERED — the source of every applicability decision).
     let capabilities = facade
         .effective_capabilities("tck-subject")
-        .map_err(|e| (Stage::CapabilitiesRead, e.to_string()))?;
+        .map_err(|e| stage_err(Stage::CapabilitiesRead, e.to_string()))?;
 
-    // The subject's declared `memory.dir` delivery fact (the memory section's
-    // applicability input): manifest subjects read their own adapter.toml;
-    // native subjects consult the engine's builtin table — both are the
-    // REGISTERED declaration, never a caller-supplied copy. A re-read failure
-    // is carried as `Err` and FAILS the memory section (retro #163, finding
-    // B11) — it must never collapse to "declares nothing".
-    let declares_memory_dir = adapter.declares_memory_dir();
+    // The subject's declared `memory.dir` mapping target — the memory
+    // section's applicability input, read ONCE here (the single parsed
+    // declaration read; a re-read failure is carried as `Err` and FAILS the
+    // memory section, retro #163 finding B11 — never a collapsed "declares
+    // nothing") and THREADED down to the subject leg, so the section's gate
+    // and its proof can never disagree between reads (the 15-3 TOCTOU fix).
+    let memory_dir = adapter.memory_dir_target();
 
     // The registered adapter facts (the launchability + metering truth).
     let snapshot = read_registered_facts(&facade, state.path(), "tck-subject")
-        .map_err(|e| (Stage::SnapshotRead, e))?;
+        .map_err(|e| stage_err(Stage::SnapshotRead, e))?;
 
     // Launchable ⇔ the registration snapshotted a resolved `launch` (present
     // AND non-null): a manifest adapter that declares `[lifecycle.start]`. A
@@ -827,7 +927,7 @@ fn conformance_inner(
     if selected(section_ids::MEMORY) {
         sections.push(SectionReport {
             section: section_ids::MEMORY.to_string(),
-            result: match &declares_memory_dir {
+            result: match &memory_dir {
                 // A declaration we cannot re-read is a FAIL naming the cause —
                 // never a `not_applicable` derived from a fabricated "maps
                 // nothing" (retro #163, finding B11).
@@ -835,12 +935,12 @@ fn conformance_inner(
                     "the declaration could not be re-read to decide the memory section's \
                      applicability: {detail}"
                 )),
-                Ok(declares) => run_memory(
+                Ok(memory_dir) => run_memory(
                     &facade,
                     state.path(),
                     adapter,
                     launchable,
-                    *declares,
+                    memory_dir.as_ref(),
                     timeout,
                 ),
             },
@@ -1065,20 +1165,31 @@ fn dump_contains_env_for(dump: &Path, var: &str, value: &str, budget: Duration) 
 // to `0` and never timed out as a misleading "have 0".
 
 /// Open a read-only-purpose connection to the state DB through the engine's
-/// public path layout.
-fn open_state_db(state_root: &Path) -> Result<rusqlite::Connection, String> {
+/// public path layout. `busy_budget` bounds the connection's sqlite
+/// `busy_timeout` (the 15-3 review): the engine's writer can hold the state
+/// DB lock for a moment mid-commit, and a transient `SQLITE_BUSY` on a poll
+/// must WAIT within the caller's budget — never fail the poll immediately
+/// with a spurious "database is locked" section failure. The budget is the
+/// run's configured section timeout (or the remaining poll budget), so the
+/// wait is bounded by the same overall bound that bounds the poll itself.
+fn open_state_db(state_root: &Path, busy_budget: Duration) -> Result<rusqlite::Connection, String> {
     let db = EnginePaths::new(Some(state_root.to_path_buf()))
         .map_err(|e| format!("resolve the engine path layout: {e}"))?
         .state_db();
-    rusqlite::Connection::open(&db).map_err(|e| format!("open {}: {e}", db.display()))
+    let connection =
+        rusqlite::Connection::open(&db).map_err(|e| format!("open {}: {e}", db.display()))?;
+    connection
+        .busy_timeout(busy_budget)
+        .map_err(|e| format!("set busy_timeout on {}: {e}", db.display()))?;
+    Ok(connection)
 }
 
 /// Count committed usage rows for `name` via a direct read-only connection to
 /// the same state DB the engine commits to (committed STATE, never a guess).
 /// A DB that fails to open or query is `Err` with the error named (spec
 /// 15-3's error honesty: never conflated with "zero rows").
-fn usage_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
-    open_state_db(state_root)?
+fn usage_row_count(state_root: &Path, name: &str, busy_budget: Duration) -> Result<u64, String> {
+    open_state_db(state_root, busy_budget)?
         .query_row(
             "SELECT COUNT(*) FROM usage_events e \
              JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1",
@@ -1090,9 +1201,10 @@ fn usage_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
 }
 
 /// Count committed ENGINE-OBSERVED usage rows for `name` (same residual
-/// coupling as [`usage_row_count`]; same error honesty).
-fn observed_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
-    open_state_db(state_root)?
+/// coupling as [`usage_row_count`]; same error honesty; same bounded
+/// busy-wait).
+fn observed_row_count(state_root: &Path, name: &str, busy_budget: Duration) -> Result<u64, String> {
+    open_state_db(state_root, busy_budget)?
         .query_row(
             "SELECT COUNT(*) FROM usage_events e \
              JOIN agent_instances i ON i.id = e.instance_id \
@@ -1109,17 +1221,20 @@ fn observed_row_count(state_root: &Path, name: &str) -> Result<u64, String> {
 /// reason — spec 15-3's error honesty: a DB error is never hidden behind a
 /// 30s "have 0" timeout. This is the shared poll both metering sections use
 /// (the engine-observed section's former inline loop was deduped into it).
+/// A transient BUSY lock is not an error at all: the connection's
+/// `busy_timeout` (bounded by this poll's budget) waits it out inside the
+/// single count call.
 fn wait_for_rows_for(
     state_root: &Path,
     name: &str,
     expected: u64,
     budget: Duration,
     what: &str,
-    count: fn(&Path, &str) -> Result<u64, String>,
+    count: fn(&Path, &str, Duration) -> Result<u64, String>,
 ) -> Result<(), String> {
     let deadline = std::time::Instant::now() + budget;
     loop {
-        let have = count(state_root, name)?;
+        let have = count(state_root, name, budget)?;
         if have >= expected {
             return Ok(());
         }
@@ -1188,7 +1303,21 @@ fn read_log_texts(
     facade: &::hekma_engine::Blocking<'_>,
     name: &str,
 ) -> Result<Vec<String>, String> {
-    let (lines, _) = facade
+    // DISCARDED CURSOR, deliberately (the 15-3 review's naming rule): the
+    // seam returns `(lines, cursor)` and we drop the cursor. The cursor
+    // exists for `read_agent_log_since` follow-loops that want to avoid
+    // rescanning; this kit's polls are bounded WHOLE-VIEW checks (a whole
+    // line appears; a `heartbeat ` prefix count) over a log the harness
+    // itself bounds — one section's lifetime, one subject — and
+    // `read_agent_log` returns the FULL retained view (the current
+    // generation PLUS any rotated predecessors, in on-disk append order),
+    // so a rotation mid-poll can never hide a line these checks wait for.
+    // A since-cursor continuation would be current-generation-only and
+    // would need rotation-shrink handling to be no LESS safe than this
+    // full-view rescan; for the counting checks (freeze-proof baselines) a
+    // cursor window would be actively wrong. Dropping the cursor here is
+    // the safe choice, named.
+    let (lines, _cursor) = facade
         .read_agent_log(name)
         .map_err(|e| format!("read_agent_log('{name}') failed: {e}"))?;
     Ok(lines.into_iter().map(|line| line.text).collect())
@@ -2067,6 +2196,11 @@ fn config_mapping_inner(
     } else {
         home.join(&dump_token)
     };
+    // Only THIS run's dump can satisfy the proof (the 15-3 review): remove
+    // any artifact an earlier run left at the path BEFORE start, so a dump
+    // that never regenerates this run cannot false-pass the delivery checks
+    // on stale bytes.
+    let _ = std::fs::remove_file(&dump);
 
     // Set the unified keys BEFORE start (the invocation override the start
     // seam resolves into the native mechanism): every DECLARED env-mapped key
@@ -2088,12 +2222,16 @@ fn config_mapping_inner(
     wait_for_state(facade, name, LifecycleState::Running, poll_budget)?;
 
     // Every DECLARED env rule must receive the set value under its OWN env
-    // var; a miss names the dump lines that DID land (triage without a rerun).
+    // var; a miss names the dump lines that DID land (triage without a rerun)
+    // plus the resolve-from-source remedy (the dump pair is re-resolved from
+    // the manifest while the start uses the registration-time snapshot, so a
+    // manifest edited after registration diverges exactly here).
     for (key, env) in &declared {
         if !dump_contains_env_for(&dump, env, probe_value, poll_budget) {
             return Err(format!(
                 "the mapped value for '{key}' never reached the agent's environment \
-                 as env={env}={probe_value} (dump at {} showed: {})",
+                 as env={env}={probe_value} (dump at {} showed: {}) — manifest edited \
+                 after registration? re-register the adapter",
                 dump.display(),
                 dump_env_lines(&dump)
             ));
@@ -2107,7 +2245,8 @@ fn config_mapping_inner(
     ) {
         return Err(format!(
             "the agent.* pass-through key was not delivered verbatim (no \
-             env=TCK_PROBE=verbatim-1 line; dump at {} showed: {})",
+             env=TCK_PROBE=verbatim-1 line; dump at {} showed: {}) — manifest edited \
+             after registration? re-register the adapter",
             dump.display(),
             dump_env_lines(&dump)
         ));
@@ -2281,7 +2420,7 @@ fn self_reported_metering_inner_with(
     // immediately as this section's named fail reason (spec 15-3).
     wait_for_usage_rows_for(state_root, probe_kind, EXPECTED_SELF_REPORTED_ROWS, timeout)?;
     std::thread::sleep(Duration::from_millis(800));
-    let rows = usage_row_count(state_root, probe_kind)?;
+    let rows = usage_row_count(state_root, probe_kind, timeout)?;
     replay_row_defect(rows)?;
 
     // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out), and the
@@ -2393,22 +2532,32 @@ fn engine_observed_metering_inner(
 /// delivery fact → a probe twin with the same declaration RECEIVES the
 /// managed dir through ITS declared env var → detach clears it. NotApplicable
 /// when the adapter declares no `memory.dir` mapping (delivery is offered,
-/// not imposed — the honesty rule) or registers nothing launchable.
+/// not imposed) or registers nothing launchable.
 ///
 /// Spec 15-3 (Fibery 174) adds the manifest-subject `--dump` leg: a MANIFEST
 /// subject whose launch carries the `--dump <path>` convention ALSO gets its
 /// own delivery proven on the subject itself (the subject's dump must echo
 /// the managed dir through the subject's OWN declared env var) — closing the
 /// gap where only the hermes builtin's subject delivery had a proof leg.
-/// Subjects WITHOUT a dump seam (native builtins, dump-less manifests) keep
-/// the env-var probe leg as the delivery proof, with the same honest reasons
-/// as before.
+/// The leg's applicability rules, stated together (the 15-3 review):
+///
+/// * dump-LESS manifest (or a native builtin) → the leg is a documented,
+///   surfaced SKIP; the probe twin's env leg is the delivery proof (not
+///   penalized — no dump seam is not a conformance failure);
+/// * dump-carrying + `memory.dir` mapped to an ENV target → the leg RUNS and
+///   the subject's own delivery is proven (a swallowed var fails the
+///   section);
+/// * dump-carrying + `memory.dir` mapped to a NON-env target → the leg
+///   SKIPS with the named reason (the dump echo has no env var to observe;
+///   the probe twin remains the proof) — a SKIP, never a FAIL: pre-15-3
+///   this shape passed, and the spec's Never clause keeps WHAT the section
+///   verifies unchanged.
 fn run_memory(
     facade: &::hekma_engine::Blocking<'_>,
     state_root: &Path,
     adapter: &TckAdapter,
     launchable: bool,
-    declares_memory_dir: bool,
+    memory_dir: Option<&::hekma_adapter_api::ConfigTarget>,
     timeout: Duration,
 ) -> SectionResult {
     if !launchable {
@@ -2419,14 +2568,31 @@ fn run_memory(
     // The declaration is the input: an adapter that maps no `memory.dir` key
     // declares NO Memory Backing delivery, so there is nothing to demonstrate
     // (the engine must not impose delivery on it — DC-10 / the honesty rule).
-    if !declares_memory_dir {
+    if memory_dir.is_none() {
         return SectionResult::NotApplicable {
             reason: "the declaration maps no reserved 'memory.dir' key, so Memory Backing \
                      delivery is not declared (delivery is offered, not imposed)"
                 .to_string(),
         };
     }
-    into_section_result(memory_inner(facade, state_root, adapter, timeout))
+    into_section_result(memory_inner(
+        facade, state_root, adapter, memory_dir, timeout,
+    ))
+}
+
+/// The subject memory leg's outcome: proven on the subject itself, or
+/// skipped with the surfaced reason (the probe twin remains the delivery
+/// proof — a skip is honest, a silent no-op is not, and a skip is never a
+/// failure: none of the skip shapes is a conformance defect).
+#[derive(Debug, PartialEq, Eq)]
+enum SubjectLegOutcome {
+    /// The subject's own dump echoed the managed dir through its declared
+    /// env var.
+    Proven,
+    /// The leg did not apply, with the honest reason (surfaced as a stderr
+    /// note by the caller — the report's JSON shape has no note channel on
+    /// `pass`).
+    Skipped { reason: String },
 }
 
 /// [`run_memory`]'s pipeline (the declaration gates already passed).
@@ -2437,6 +2603,7 @@ fn memory_inner(
     facade: &::hekma_engine::Blocking<'_>,
     state_root: &Path,
     adapter: &TckAdapter,
+    memory_dir: Option<&::hekma_adapter_api::ConfigTarget>,
     poll_budget: Duration,
 ) -> Result<(), String> {
     // Attach BEFORE any start (hot-swap is rejected by design). The SECTION's
@@ -2535,59 +2702,127 @@ fn memory_inner(
     // The manifest-subject `--dump` leg (spec 15-3, Fibery 174): the probe
     // twin above proves the ENGINE seam; this proves the SUBJECT's own
     // declared delivery when the subject carries the `--dump <path>`
-    // convention. Adapters without a dump seam keep the probe leg as their
-    // delivery proof — surfaced by the leg's absence being a documented,
-    // tested skip, never a fabricated one.
-    subject_memory_delivery(facade, state_root, adapter, poll_budget)
+    // convention. The skip shapes are surfaced, never silent.
+    match subject_memory_delivery(facade, state_root, adapter, memory_dir, poll_budget)? {
+        SubjectLegOutcome::Proven => {}
+        SubjectLegOutcome::Skipped { reason } => {
+            // Surfaced, not silent: the report's JSON shape is frozen (no
+            // note channel on `pass`), so the skip note goes to stderr —
+            // the surface a `#[test]` operator actually watches. The
+            // section still passes: the probe leg proved the engine seam,
+            // and none of the skip shapes is a conformance defect.
+            eprintln!("note: tck memory subject leg skipped: {reason}");
+        }
+    }
+    Ok(())
+}
+
+/// Poll the committed lifecycle state until `name` is terminal for attach
+/// purposes — anything but a LIVE state (Starting/Running/Paused/Stopping):
+/// Registered (never started), Stopped, and Failed all allow an attach. The
+/// subject memory leg terminalizes the subject BEFORE attaching (the 15-3
+/// review): an orphaned RUNNING subject left by an earlier section's `?` path
+/// must not misattribute the engine's by-design hot-swap refusal to the
+/// memory section.
+fn wait_for_terminal(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    budget: Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let state = facade
+            .instance_status(name)
+            .map_err(|e| format!("instance_status read failed: {e}"))?
+            .instance
+            .state;
+        if !matches!(
+            state,
+            LifecycleState::Starting
+                | LifecycleState::Running
+                | LifecycleState::Paused
+                | LifecycleState::Stopping
+        ) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the subject never reached a terminal state before the memory attach \
+                 (stuck in {state:?})"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The SUBJECT's own declared `memory.dir` delivery, proven through the
 /// `--dump <path>` seam the adapter's launch declares (the convention
-/// `docs/adapter-contract.md` documents for manifest adapters): attach a
-/// filesystem backing to the subject, start it, and require the subject's
-/// dump to echo the managed dir under the subject's OWN declared env var —
-/// then detach. Only runs for a MANIFEST subject whose resolved launch
-/// carries `--dump <path>`; everything else (native builtins, dump-less
-/// manifests) returns `Ok(())` after the probe leg has already proven the
-/// engine seam on a twin.
+/// `docs/adapter-contract.md` documents for manifest adapters): terminalize
+/// the subject, attach a filesystem backing, start it, and require the
+/// subject's dump to echo the managed dir under the subject's OWN declared
+/// env var — then stop and detach. The leg's skip shapes (native subject,
+/// dump-less launch, non-env `memory.dir` target) return
+/// [`SubjectLegOutcome::Skipped`] with the named reason — the probe twin
+/// already proved the engine seam, and a skip is never a failure.
 fn subject_memory_delivery(
     facade: &::hekma_engine::Blocking<'_>,
     state_root: &Path,
     adapter: &TckAdapter,
+    memory_dir: Option<&::hekma_adapter_api::ConfigTarget>,
     poll_budget: Duration,
-) -> Result<(), String> {
+) -> Result<SubjectLegOutcome, String> {
     let name = "tck-subject";
     let TckAdapter::Manifest(_) = adapter else {
         // A NATIVE subject's launch is code-declared contract (no harness-
         // authorable `--dump` pair); the shipping builtin's own subject
         // delivery is proven by the engine's hermes pass over its shim seam.
-        return Ok(());
+        return Ok(SubjectLegOutcome::Skipped {
+            reason: "the subject is a native builtin whose code-declared launch offers no \
+                     --dump seam; the engine-side hermes pass proves the shipping \
+                     builtin's own subject delivery"
+                .to_string(),
+        });
     };
     // Resolve-from-source, the same seam + semantics the config section uses
     // (a post-registration manifest edit diverges; re-register).
     let Some(dump_token) = resolve_launch_dump_pair(&adapter.adapter_ref())? else {
         // No dump seam declared: the probe leg above already proved delivery
         // on a twin with the same declaration shape.
-        return Ok(());
+        return Ok(SubjectLegOutcome::Skipped {
+            reason: "the subject's launch declares no --dump pair, so its own delivery \
+                     has no dump-observable channel; the probe twin's env leg remains \
+                     the delivery proof"
+                .to_string(),
+        });
     };
-    // The subject's own declared env target for the reserved key (the
-    // declaration gate already proved a mapping exists; a re-read failure is
-    // a named error, consistent with `declares_memory_dir`).
-    let env_var = adapter.memory_dir_env_target()?.ok_or(
-        "the subject's declaration maps 'memory.dir' to no ENV target, so the dump \
-                echo has no provable channel",
-    )?;
+    // The subject's own declared env target for the reserved key — taken
+    // from the SAME single parsed read that gated the section (no re-read,
+    // no TOCTOU between the gate and the proof).
+    let Some(env_var) = memory_dir.and_then(|target| target.env_var()) else {
+        // Dump-carrying + NON-env `memory.dir` target: the dump echo has no
+        // env var to observe. A SKIP with the named reason, never a FAIL —
+        // pre-15-3 this shape passed, and WHAT the section verifies does not
+        // change (the spec's Never clause; the 15-3 review).
+        return Ok(SubjectLegOutcome::Skipped {
+            reason: "the subject's declaration maps 'memory.dir' to a non-env target, so \
+                     its own delivery has no dump-observable channel; the probe twin's \
+                     env leg remains the delivery proof"
+                .to_string(),
+        });
+    };
 
+    // Terminalize BEFORE attach (stop is idempotent): an orphaned RUNNING
+    // subject must not surface as a memory-section attach failure.
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    wait_for_terminal(facade, name, poll_budget)?;
     let managed = facade
         .attach_memory(name, MemoryBackingKind::Filesystem)
-        .map_err(|e| {
-            format!("subject attach_memory failed (is the subject still running?): {e}")
-        })?;
+        .map_err(|e| format!("subject attach_memory failed: {e}"))?;
     let outcome = subject_memory_dump_echo(
         facade,
         state_root,
         name,
-        &env_var,
+        env_var,
         &managed,
         &dump_token,
         poll_budget,
@@ -2598,7 +2833,13 @@ fn subject_memory_delivery(
     let detach = facade
         .detach_memory(name)
         .map_err(|e| format!("subject detach_memory failed: {e}"));
-    outcome.and(detach)
+    // Either failure propagates; BOTH errors surface when both fail — the
+    // detach error is never dropped (the 15-3 review).
+    match (outcome, detach) {
+        (Ok(()), Ok(())) => Ok(SubjectLegOutcome::Proven),
+        (Err(proof), Err(detach)) => Err(format!("{proof}; additionally, {detach}")),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    }
 }
 
 /// Start the subject and prove its dump echoes `env=<env_var>=<managed>`
@@ -2613,6 +2854,17 @@ fn subject_memory_dump_echo(
     dump_token: &str,
     poll_budget: Duration,
 ) -> Result<(), String> {
+    // The dump path is resolved (and any STALE artifact from an earlier run
+    // removed) BEFORE start: only THIS run's dump can satisfy the proof (the
+    // 15-3 review) — a subject that never re-writes its dump cannot
+    // false-pass on stale bytes.
+    let home = engine_home(state_root, name)?;
+    let dump = if std::path::Path::new(dump_token).is_absolute() {
+        std::path::PathBuf::from(dump_token)
+    } else {
+        home.join(dump_token)
+    };
+    let _ = std::fs::remove_file(&dump);
     facade
         .start(name)
         .map_err(|e| format!("subject start failed: {e}"))?;
@@ -2620,18 +2872,12 @@ fn subject_memory_dump_echo(
     // EVERY exit path (the caller detaches after the terminal state).
     let outcome = (|| {
         wait_for_state(facade, name, LifecycleState::Running, poll_budget)?;
-        let home = engine_home(state_root, name)?;
-        let dump = if std::path::Path::new(dump_token).is_absolute() {
-            std::path::PathBuf::from(dump_token)
-        } else {
-            home.join(dump_token)
-        };
         let managed_str = managed.to_string_lossy().into_owned();
         if !dump_contains_env_for(&dump, env_var, &managed_str, poll_budget) {
             return Err(format!(
                 "the manifest subject never received the managed memory dir through its own \
                  declared env var {env_var} (expected env={env_var}={managed_str}; dump at {} \
-                 showed: {})",
+                 showed: {}) — manifest edited after registration? re-register the adapter",
                 dump.display(),
                 dump_env_lines(&dump)
             ));
@@ -3039,7 +3285,9 @@ mod tests {
 
     /// The registration-failure report is complete and honest: 8 fail entries
     /// carrying the REGISTRATION stage's rendered prefix (the pre-15-3 string,
-    /// kept verbatim for consumers that pinned it), and the kind label is
+    /// kept verbatim for consumers that pinned it) INCLUDING the `register: `
+    /// detail infix — the default-path failure renders byte-identical to
+    /// pre-15-3 beyond the pinned stage prefix — and the kind label is
     /// derived without resolving anything.
     #[test]
     fn registration_failure_report_is_complete() {
@@ -3054,8 +3302,9 @@ mod tests {
             match &entry.result {
                 SectionResult::Fail { reason } => {
                     assert!(
-                        reason.starts_with("registration failed: "),
-                        "reason must name the registration stage: {reason}"
+                        reason.starts_with("registration failed: register: "),
+                        "reason must be byte-identical to the pre-15-3 default-path render \
+                         (stage prefix + register infix): {reason}"
                     );
                 }
                 other => panic!("expected Fail, got {other:?}"),
@@ -3137,6 +3386,261 @@ mod tests {
                 other => panic!("expected Fail, got {other:?}"),
             }
         }
+    }
+
+    /// The FRESH-ROOT CONTRACT (the 15-3 review): a caller-supplied state
+    /// root holding ANY pre-existing entry — a prior run's leftover file OR
+    /// a stale garbage `state.db` — is a named StateRoot-stage failure for
+    /// every selected section. The garbage-state.db shape is the residual
+    /// state class named by the review: it is refused HERE, before the
+    /// engine ever opens, so no prior-run artifact can false-pass this
+    /// run's proofs.
+    #[test]
+    fn nonempty_caller_state_root_fails_the_state_root_stage_naming_the_fresh_contract() {
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-staleroot-")
+            .tempdir()
+            .expect("tempdir");
+
+        for (label, populate) in [
+            (
+                "a leftover file",
+                Box::new(|root: &Path| {
+                    std::fs::write(root.join("stale-dump.txt"), "a previous run's dump")
+                        .expect("write leftover");
+                }) as Box<dyn Fn(&Path)>,
+            ),
+            (
+                "a stale non-sqlite state.db",
+                Box::new(|root: &Path| {
+                    std::fs::write(root.join("state.db"), "not a sqlite file at all")
+                        .expect("write stale db");
+                }),
+            ),
+        ] {
+            let root = scratch.path().join(format!("root-{label}"));
+            std::fs::create_dir(&root).expect("mkdir");
+            populate(&root);
+            let config = TckConfig {
+                state_root: Some(root.clone()),
+                sections: SectionSelection::Only(vec![TckSection::Pause]),
+                ..TckConfig::default()
+            };
+            let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+            assert!(!report.is_conformant(), "{label}");
+            assert_eq!(report.sections.len(), 1, "{label}");
+            match &report.sections[0].result {
+                SectionResult::Fail { reason } => {
+                    assert!(
+                        reason.starts_with("state root preparation failed: "),
+                        "{label}: {reason}"
+                    );
+                    assert!(
+                        reason.contains("not empty"),
+                        "{label}: the reason names the fresh-root contract: {reason}"
+                    );
+                    assert!(
+                        reason.contains("exclusively"),
+                        "{label}: the reason names the exclusive-single-run contract: {reason}"
+                    );
+                }
+                other => panic!("{label}: expected Fail, got {other:?}"),
+            }
+        }
+    }
+
+    /// The CREATABILITY probe (the 15-3 review): a caller root that cannot
+    /// be created (its parent does not exist) fails at the STATE-ROOT stage
+    /// with the root named — never as a mysterious engine-open failure. A
+    /// root that does not yet exist but IS creatable is created and used.
+    #[test]
+    fn uncreatable_caller_state_root_fails_at_the_state_root_stage() {
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-noparent-")
+            .tempdir()
+            .expect("tempdir");
+        // The root's PARENT is an existing FILE: the creatability probe
+        // (create_dir_all) cannot succeed through it, on every OS.
+        let blocker = scratch.path().join("blocked.txt");
+        std::fs::write(&blocker, "a file, not a directory").expect("write blocker");
+        let impossible = blocker.join("root");
+        let config = TckConfig {
+            state_root: Some(impossible.clone()),
+            sections: SectionSelection::Only(vec![TckSection::CapabilityEdges]),
+            ..TckConfig::default()
+        };
+        let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+        assert!(!report.is_conformant());
+        assert_eq!(report.sections.len(), 1);
+        match &report.sections[0].result {
+            SectionResult::Fail { reason } => {
+                assert!(
+                    reason.starts_with("state root preparation failed: "),
+                    "the failure belongs to the StateRoot stage, not EngineOpen: {reason}"
+                );
+                assert!(
+                    reason.contains("cannot be created"),
+                    "the reason names the creatability probe: {reason}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+
+        // The healthy counterpart: a NOT-YET-EXISTING root is created and
+        // used (the engine's state lands there).
+        let fresh = scratch.path().join("created-by-the-probe");
+        let config = TckConfig {
+            state_root: Some(fresh.clone()),
+            sections: SectionSelection::Only(vec![TckSection::CapabilityEdges]),
+            ..TckConfig::default()
+        };
+        let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+        assert_eq!(
+            report.section(section_ids::CAPABILITY_EDGES),
+            Some(&SectionResult::Pass),
+            "a creatable fresh root runs: {:?}",
+            report.failures()
+        );
+        assert!(
+            EnginePaths::new(Some(fresh))
+                .expect("layout")
+                .state_db()
+                .is_file(),
+            "the probe created the root and the engine used it"
+        );
+    }
+
+    /// The EngineOpen stage gets a REAL pipeline drive (the 15-3 review):
+    /// a caller root that is EMPTY and creatable but NOT WRITABLE passes
+    /// every state-root check, and the engine's own open then fails
+    /// creating its state DB — every selected section's reason starts with
+    /// `engine open failed: `. (The review's original suggestion — a
+    /// garbage non-SQLite `state.db` in the root — is unreachable here by
+    /// design: the fresh-root contract refuses any pre-existing entry at
+    /// the StateRoot stage FIRST, which is the stronger guarantee; the
+    /// unwritable-empty-root shape drives the same stage arm.) Unix-only
+    /// (directory write permissions); skipped with a note when the runner
+    /// ignores permissions (e.g. root).
+    #[test]
+    #[cfg(unix)]
+    fn unwritable_caller_state_root_fails_the_engine_open_stage_for_the_selected_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::Builder::new()
+            .prefix("ktesio-tck-readonly-")
+            .tempdir()
+            .expect("tempdir");
+        let root = scratch.path().join("root");
+        std::fs::create_dir(&root).expect("mkdir");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only perms");
+        // Honesty guard: if the runner ignores directory permissions (root),
+        // the engine would open fine and this drive would prove nothing —
+        // skip with a visible note instead of false-passing.
+        if std::fs::write(root.join("canary"), b"x").is_ok() {
+            eprintln!("note: skipping unwritable-root engine-open drive (runner is root)");
+            return;
+        }
+        let config = TckConfig {
+            state_root: Some(root.clone()),
+            sections: SectionSelection::Only(vec![TckSection::Pause, TckSection::Memory]),
+            ..TckConfig::default()
+        };
+        let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+        assert!(!report.is_conformant());
+        assert_eq!(
+            report.sections.len(),
+            2,
+            "the failure report covers exactly the selected set"
+        );
+        for entry in report.sections.iter() {
+            match &entry.result {
+                SectionResult::Fail { reason } => {
+                    assert!(
+                        reason.starts_with("engine open failed: "),
+                        "reason must name the engine-open stage: {reason}"
+                    );
+                }
+                other => panic!("expected Fail, got {other:?}"),
+            }
+        }
+        // Restore writability so the TempDir teardown can clean up.
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+    }
+
+    /// An EMPTY `SectionSelection::Only` list is a named, complete failure —
+    /// never a vacuously-conformant zero-entry report (the 15-3 review).
+    #[test]
+    fn empty_selection_is_a_named_complete_failure_never_a_vacuous_pass() {
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![]),
+            ..TckConfig::default()
+        };
+        let report = run_conformance_with(&TckAdapter::Native("mock".to_string()), &config);
+        assert!(
+            !report.is_conformant(),
+            "a run that selected nothing must not read conformant"
+        );
+        assert_eq!(report.sections.len(), 1, "exactly the one named entry");
+        assert_eq!(report.sections[0].section, section_ids::SELECTION);
+        match &report.sections[0].result {
+            SectionResult::Fail { reason } => {
+                assert!(reason.contains("selection is empty"), "{reason}");
+                assert!(
+                    reason.contains("All"),
+                    "the reason names the remedy: {reason}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+        // The defense-in-depth half: a hand-built EMPTY report also reads
+        // non-conformant (`is_conformant` refuses the vacuous truth).
+        let empty = ConformanceReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            contract_version: String::new(),
+            adapter_kind: "hand-built".to_string(),
+            sections: vec![],
+        };
+        assert!(!empty.is_conformant());
+    }
+
+    /// Stage raises strip a redundant leading restatement of the stage's OWN
+    /// prefix (no "stage: stage: detail" double-stacking), while informative
+    /// helper prefixes — the byte-parity `register: ` infix — survive (the
+    /// 15-3 review).
+    #[test]
+    fn stage_raises_strip_own_prefix_but_keep_informative_infixes() {
+        // A helper error that already restates the stage: the raise strips
+        // the duplicate.
+        assert_eq!(
+            stage_err(
+                Stage::EngineOpen,
+                "engine open failed: the engine could not open".to_string()
+            ),
+            (Stage::EngineOpen, "the engine could not open".to_string())
+        );
+        // Every other stage's restatement is stripped by ITS raise only.
+        assert_eq!(
+            stage_err(
+                Stage::StateRoot,
+                "state root preparation failed: stale content".to_string()
+            ),
+            (Stage::StateRoot, "stale content".to_string())
+        );
+        // Informative prefixes are NOT the stage prefix and survive.
+        assert_eq!(
+            stage_err(
+                Stage::Registration,
+                "register: no such manifest".to_string()
+            ),
+            (
+                Stage::Registration,
+                "register: no such manifest".to_string()
+            )
+        );
+        assert_eq!(
+            stage_err(Stage::EngineOpen, "plain detail".to_string()),
+            (Stage::EngineOpen, "plain detail".to_string())
+        );
     }
 
     /// A real launchable manifest that declares UNSUPPORTED pause reads
@@ -3584,36 +4088,41 @@ source = "self-reported"
     /// unopenable or corrupt state.db is `Err` with the error NAMED, and the
     /// wait helper propagates the FIRST read error IMMEDIATELY — never a 30s
     /// "have 0" timeout. Over a HEALTHY engine root the same helpers read
-    /// `Ok(0)` and the wait helper times out into its honest reason.
+    /// `Ok(0)` and the wait helper times out into its honest reason. The
+    /// busy-timeout knob (bounded by the section budget) rides along on
+    /// every connection and changes none of these outcomes.
     #[test]
     fn usage_row_helpers_name_db_errors_and_propagate_them_immediately() {
         let dir = tempfile::Builder::new()
             .prefix("ktesio-tck-rows-")
             .tempdir()
             .expect("tempdir");
+        let busy = Duration::from_millis(250);
 
         // An UNOPENABLE state.db (the path is a directory): the OPEN itself
         // fails, named with the path.
         let dir_root = dir.path().join("root-unopenable");
         std::fs::create_dir(&dir_root).expect("mkdir");
         std::fs::create_dir(dir_root.join("state.db")).expect("state.db as a dir");
-        let err = usage_row_count(&dir_root, "x").unwrap_err();
+        let err = usage_row_count(&dir_root, "x", busy).unwrap_err();
         assert!(err.contains("open") && err.contains("state.db"), "{err}");
-        assert!(observed_row_count(&dir_root, "x").is_err());
+        assert!(observed_row_count(&dir_root, "x", busy).is_err());
 
         // A corrupt (non-SQLite) state.db: the QUERY fails, named.
         let corrupt_root = dir.path().join("root-corrupt");
         std::fs::create_dir(&corrupt_root).expect("mkdir");
         std::fs::write(corrupt_root.join("state.db"), "not a sqlite file at all")
             .expect("write corrupt db");
-        let err = usage_row_count(&corrupt_root, "x").unwrap_err();
+        let err = usage_row_count(&corrupt_root, "x", busy).unwrap_err();
         assert!(err.contains("count usage rows"), "{err}");
-        let err = observed_row_count(&corrupt_root, "x").unwrap_err();
+        let err = observed_row_count(&corrupt_root, "x", busy).unwrap_err();
         assert!(err.contains("count engine-observed rows"), "{err}");
 
         // IMMEDIATE propagation: with the FULL 30s budget the wait helper
         // returns the open/query error in well under a second — the inverted
-        // pin (a "have 0" timeout here would take the whole budget).
+        // pin (a "have 0" timeout here would take the whole budget; the
+        // busy-timeout wait is bounded by the same budget and does not
+        // rescue a genuinely corrupt DB).
         let started = std::time::Instant::now();
         let err = wait_for_usage_rows_for(&corrupt_root, "x", 1, SECTION_TIMEOUT).unwrap_err();
         assert!(err.contains("count usage rows"), "{err}");
@@ -3629,8 +4138,8 @@ source = "self-reported"
         // timeout reason carries the count it saw — the REAL-behavior
         // timeout arm, distinct from every error arm above.
         let (engine_root, _facade) = helper_engine();
-        assert_eq!(usage_row_count(engine_root.path(), "x"), Ok(0));
-        assert_eq!(observed_row_count(engine_root.path(), "x"), Ok(0));
+        assert_eq!(usage_row_count(engine_root.path(), "x", busy), Ok(0));
+        assert_eq!(observed_row_count(engine_root.path(), "x", busy), Ok(0));
         let err = wait_for_usage_rows_for(engine_root.path(), "x", 1, Duration::from_millis(150))
             .unwrap_err();
         assert!(
@@ -3785,12 +4294,13 @@ source = "self-reported"
         }
 
         // Memory: no launchable agent / no declared `memory.dir` mapping.
+        // The gate under test is the THREADED target: `None` = undeclared.
         match run_memory(
             &facade,
             scratch.path(),
             &TckAdapter::Native("mock".to_string()),
             false,
-            true,
+            None,
             SECTION_TIMEOUT,
         ) {
             SectionResult::NotApplicable { reason } => {
@@ -3803,7 +4313,7 @@ source = "self-reported"
             scratch.path(),
             &TckAdapter::Native("mock".to_string()),
             true,
-            false,
+            None,
             SECTION_TIMEOUT,
         ) {
             SectionResult::NotApplicable { reason } => {
@@ -4103,10 +4613,18 @@ env = "MODEL"
             .expect("tempdir");
         let blocked = scratch.path().join("blocked.txt");
         std::fs::write(&blocked, "a file, not a directory").expect("write blocker");
+        // The subject manifest dir deliberately holds NO adapter.toml: the
+        // probe leg fails (the dump can never arrive) BEFORE the subject leg
+        // could ever read a declaration, so a synthetic env target is
+        // threaded — exactly what the pipeline's single read would supply.
+        let target = ::hekma_adapter_api::ConfigTarget::Env {
+            env: "TCK_SUBJECT_MEMORY".to_string(),
+        };
         let err = memory_inner(
             &facade,
             &blocked,
             &TckAdapter::Manifest(scratch.path().to_path_buf()),
+            Some(&target),
             Duration::from_millis(400),
         )
         .expect_err("the dump can never arrive");
@@ -4174,36 +4692,76 @@ env = "MODEL"
     }
 
     /// A CONFIGURED run (spec 15-3's configured-invocation row): a subset
-    /// over a CALLER-OWNED state root runs exactly the selected sections
-    /// (fewer entries, fixed order — the report stays complete FOR THE
-    /// SELECTED SET), the engine's state lands under the caller's root, and
-    /// the configured section timeout is actually threaded (a ZERO budget
-    /// fails the lifecycle state poll immediately instead of waiting 30s).
+    /// over a CALLER-OWNED fresh state root runs exactly the selected
+    /// sections (fewer entries, fixed order — the report stays complete FOR
+    /// THE SELECTED SET), the engine's state lands under the caller's root,
+    /// and the configured section timeout is UNIQUELY identified: the
+    /// budget is a small nonzero 2s, the subject's dump can never appear
+    /// (its parent path is an existing file), so the config section's dump
+    /// poll burns exactly the configured budget and fails — the elapsed
+    /// bound (`>= 2s`, `< one default budget`) can ONLY hold if the 2s
+    /// config was actually threaded (a run ignoring the config would burn
+    /// the 30s default in the same poll). The lifecycle verdict is asserted
+    /// alongside: the same subject is perfectly startable, so lifecycle
+    /// PASSES under the configured budget.
     #[test]
     fn configured_run_selects_sections_uses_the_caller_root_and_timeout() {
         let manifest_dir = tempfile::Builder::new()
             .prefix("ktesio-tck-cfg-man-")
             .tempdir()
             .expect("manifest tempdir");
-        write_all_pass_manifest(manifest_dir.path());
+        // A launchable subject whose `--dump` parent is an existing FILE:
+        // lifecycle start/stop/crash all work, but the config section's dump
+        // artifact can NEVER appear — the one poll that consumes the whole
+        // configured budget.
+        let bin = crate::fake_agent_bin();
+        let blocked = manifest_dir.path().join("blocked.txt");
+        std::fs::write(&blocked, "a file, not a directory").expect("write blocker");
+        let dump = blocked.join("config-dump.txt");
+        let manifest = format!(
+            r#"
+contract_version = "1.0.0"
+
+[adapter]
+kind = "tck-cfg-adapter"
+
+[lifecycle.start]
+exec = {exec:?}
+args = ["--dump", {dump:?}, "--linger-ms", "600000"]
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"
+"#,
+            exec = bin.to_string_lossy(),
+            dump = dump.to_string_lossy(),
+        );
+        std::fs::write(manifest_dir.path().join("adapter.toml"), manifest).expect("write manifest");
         let caller_root = tempfile::Builder::new()
             .prefix("ktesio-tck-cfg-root-")
             .tempdir()
             .expect("caller root");
-
-        // Subset [capability_edges, lifecycle] with a ZERO section timeout:
-        // capability_edges passes (no poll); lifecycle's own waits complete
-        // inside start()/stop() calls, and the crash leg's bounded
-        // wait-for-failed — the section's one explicit poll — expires
-        // immediately (a 30s default would instead spin waiting for the
-        // twin's ~450ms crash to be reaped... and still fail fast; the
-        // elapsed bound below is what proves the ZERO budget was used).
+        // The fresh-root contract: an EMPTY existing dir is a valid caller
+        // root (this test doubles as its positive proof).
         let config = TckConfig {
-            section_timeout: Duration::ZERO,
+            section_timeout: Duration::from_secs(2),
             state_root: Some(caller_root.path().to_path_buf()),
             sections: SectionSelection::Only(vec![
                 TckSection::Lifecycle,
                 TckSection::CapabilityEdges,
+                TckSection::ConfigMapping,
             ]),
         };
         let started = std::time::Instant::now();
@@ -4211,32 +4769,52 @@ env = "MODEL"
             &TckAdapter::Manifest(manifest_dir.path().to_path_buf()),
             &config,
         );
+        let elapsed = started.elapsed();
         // Fewer entries, fixed pipeline order (capability_edges before
         // lifecycle regardless of the listing order above).
         let got: Vec<&str> = report.sections.iter().map(|s| s.section.as_str()).collect();
         assert_eq!(
             got,
-            vec![section_ids::CAPABILITY_EDGES, section_ids::LIFECYCLE]
+            vec![
+                section_ids::CAPABILITY_EDGES,
+                section_ids::LIFECYCLE,
+                section_ids::CONFIG_MAPPING,
+            ]
         );
         assert_eq!(
             report.section(section_ids::CAPABILITY_EDGES),
             Some(&SectionResult::Pass)
         );
-        match report.section(section_ids::LIFECYCLE) {
+        // The lifecycle verdict: a healthy subject PASSES under the 2s
+        // budget (start/stop/crash each complete well inside it).
+        assert_eq!(
+            report.section(section_ids::LIFECYCLE),
+            Some(&SectionResult::Pass),
+            "lifecycle passes under the configured budget: {:?}",
+            report.section(section_ids::LIFECYCLE)
+        );
+        // The config section fails at the never-arriving dump, having spent
+        // the whole configured budget polling for it.
+        match report.section(section_ids::CONFIG_MAPPING) {
             Some(SectionResult::Fail { reason }) => {
                 assert!(
-                    reason.contains("timed out waiting for state"),
-                    "the zero timeout must bound the section's polls: {reason}"
+                    reason.contains("never reached") || reason.contains("not delivered verbatim"),
+                    "the blocked dump fails the config section: {reason}"
                 );
             }
-            other => panic!("lifecycle must fail under a zero budget, got {other:?}"),
+            other => panic!("config_mapping must fail for a blocked dump, got {other:?}"),
         }
-        // The caller's timeout was USED: the whole run finished in seconds,
-        // not the 30s default.
+        // The elapsed bound UNIQUELY identifies the configured 2s: the poll
+        // burned at least the whole budget, and the total stayed WELL UNDER
+        // one default budget (30s) — a run that ignored the config would
+        // burn ~30s in the same dump poll alone.
         assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "a zero section timeout must not wait the 30s default, took {:?}",
-            started.elapsed()
+            elapsed >= Duration::from_secs(2),
+            "the dump poll must consume the configured 2s budget, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < SECTION_TIMEOUT,
+            "a 2s section timeout must not wait the 30s default, took {elapsed:?}"
         );
         // The caller-owned root was used AS-IS: the engine's state landed
         // there (and only there — the harness created no temp root of its
@@ -4282,10 +4860,14 @@ env = "MODEL"
                 &AdapterRef::Manifest(honest_dir.path().to_path_buf()),
             )
             .expect("register honest subject");
+        let honest_target = TckAdapter::Manifest(honest_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
         memory_inner(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(honest_dir.path().to_path_buf()),
+            honest_target.as_ref(),
             SECTION_TIMEOUT,
         )
         .expect("both memory legs pass for an honest subject");
@@ -4324,10 +4906,14 @@ env = "MODEL"
                 &AdapterRef::Manifest(lying_dir.path().to_path_buf()),
             )
             .expect("register lying subject");
+        let lying_target = TckAdapter::Manifest(lying_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
         let err = memory_inner(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(lying_dir.path().to_path_buf()),
+            lying_target.as_ref(),
             Duration::from_millis(400),
         )
         .expect_err("a subject that swallows the delivered dir must fail the section");
@@ -4336,30 +4922,47 @@ env = "MODEL"
                 && err.contains("TCK_SUBJECT_MEMORY"),
             "{err}"
         );
+        // The failure reason carries the resolve-from-source remedy hint
+        // (the 15-3 review): a manifest edited after registration diverges
+        // from the registration-time snapshot exactly here.
+        assert!(
+            err.contains("re-register the adapter"),
+            "the timeout reason names the remedy: {err}"
+        );
         // No leaked attachment on the failure path either.
         assert!(facade.memory_status("tck-subject").unwrap().is_none());
     }
 
-    /// The subject leg skips honestly where it cannot run: a NATIVE subject
-    /// (code-declared launch) and a manifest subject whose launch declares
-    /// no `--dump` pair both return `Ok(())` from the leg itself (the probe
-    /// leg remains their delivery proof), while attaching to a
-    /// STILL-RUNNING subject fails the leg NAMING the attach — never a
-    /// silent no-op.
+    /// The subject leg's skip shapes are HONEST skips (the probe twin
+    /// remains the delivery proof — never a failure, never silent), and the
+    /// orphaned-RUNNING-subject case is TERMINALIZED before attach (the
+    /// 15-3 review: an orphan left by an earlier section's `?` path must not
+    /// misattribute the engine's by-design hot-swap refusal to the memory
+    /// section) — the leg then proves the subject's delivery and detaches.
     #[test]
-    fn memory_subject_leg_skips_or_fails_naming_the_cause() {
+    fn memory_subject_leg_skips_honestly_and_terminalizes_an_orphaned_subject() {
         let (dir, facade) = helper_engine();
 
-        // Native subject: the leg is a documented skip.
-        assert!(subject_memory_delivery(
+        // Native subject: a documented, surfaced skip (the reason names the
+        // engine-side hermes pass as the subject-delivery proof).
+        match subject_memory_delivery(
             &facade,
             dir.path(),
             &TckAdapter::Native("mock".to_string()),
-            SECTION_TIMEOUT
+            None,
+            SECTION_TIMEOUT,
         )
-        .is_ok());
+        .expect("the native leg skips, never fails")
+        {
+            SubjectLegOutcome::Skipped { reason } => {
+                assert!(reason.contains("native"), "{reason}");
+                assert!(reason.contains("--dump"), "{reason}");
+            }
+            other => panic!("expected Skipped for a native subject, got {other:?}"),
+        }
 
-        // A manifest subject whose launch carries no --dump pair: skip.
+        // A manifest subject whose launch carries no --dump pair: skip, with
+        // the probe twin named as the delivery proof.
         let bare_dir = tempfile::Builder::new()
             .prefix("ktesio-tck-submem-bare-")
             .tempdir()
@@ -4375,17 +4978,30 @@ env = "MODEL"
             Some("\n[config.\"memory.dir\"]\nenv = \"TCK_SUBJECT_MEMORY\"\n"),
         )
         .expect("write bare subject manifest");
-        assert!(subject_memory_delivery(
+        let bare_target = TckAdapter::Manifest(bare_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
+        match subject_memory_delivery(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(bare_dir.path().to_path_buf()),
-            SECTION_TIMEOUT
+            bare_target.as_ref(),
+            SECTION_TIMEOUT,
         )
-        .is_ok());
+        .expect("the dump-less leg skips, never fails")
+        {
+            SubjectLegOutcome::Skipped { reason } => {
+                assert!(reason.contains("no --dump pair"), "{reason}");
+                assert!(reason.contains("probe twin"), "{reason}");
+            }
+            other => panic!("expected Skipped for a dump-less subject, got {other:?}"),
+        }
 
-        // A STILL-RUNNING subject with a dump-carrying declaration: attach
-        // is refused by design (the hot-swap guard) and the leg fails
-        // NAMING the attach.
+        // The ORPHANED-RUNNING subject (dump-carrying, env target): the leg
+        // idempotently stops it, waits for the terminal state, attaches,
+        // proves the subject's own delivery, and detaches — where the
+        // pre-review code FAILED the leg with a misattributed hot-swap
+        // refusal ("subject attach_memory failed").
         let dump_dir = tempfile::Builder::new()
             .prefix("ktesio-tck-submem-run-")
             .tempdir()
@@ -4408,18 +5024,32 @@ env = "MODEL"
             )
             .expect("register subject");
         facade.start("tck-subject").expect("start subject");
-        let err = subject_memory_delivery(
+        let dump_target = TckAdapter::Manifest(dump_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
+        let outcome = subject_memory_delivery(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(dump_dir.path().to_path_buf()),
-            Duration::from_millis(400),
+            dump_target.as_ref(),
+            SECTION_TIMEOUT,
         )
-        .expect_err("attach onto a running subject must fail the leg");
-        assert!(
-            err.contains("subject attach_memory failed"),
-            "the leg names the refused attach: {err}"
+        .expect("an orphaned running subject is terminalized, not failed");
+        assert_eq!(
+            outcome,
+            SubjectLegOutcome::Proven,
+            "the leg proves the subject's own delivery after terminalizing it"
         );
-        let _ = facade.stop("tck-subject", Some(Duration::from_secs(5)));
+        // No leaked attachment; the subject is terminal again.
+        assert!(facade.memory_status("tck-subject").unwrap().is_none());
+        assert!(matches!(
+            facade
+                .instance_status("tck-subject")
+                .unwrap()
+                .instance
+                .state,
+            LifecycleState::Stopped | LifecycleState::Failed
+        ));
     }
 
     /// `TckAdapter::memory_dir_env_target`: the manifest subject's own
@@ -4452,26 +5082,28 @@ env = "MODEL"
             Ok(Some("KTESIO_MEMORY_DIR".to_string()))
         );
         // A manifest that cannot be re-read: named error, never a collapsed
-        // None (the same honesty rule as `declares_memory_dir`).
+        // None (the same honesty rule as the single parsed read).
         let err = TckAdapter::Manifest(PathBuf::from("/nonexistent/does-not-exist"))
             .memory_dir_env_target()
             .unwrap_err();
         assert!(err.contains("could not re-read"), "{err}");
     }
 
-    /// The subject leg's two remaining honest-error arms: a declaration that
-    /// maps `memory.dir` to a NON-env target has no provable dump channel
-    /// (named, never a fabricated skip), and a start that cannot spawn (the
-    /// snapshot's exec binary vanished after attach) fails the leg naming
-    /// the start.
+    /// The subject leg's two remaining arms: a declaration that maps
+    /// `memory.dir` to a NON-env target while carrying `--dump` SKIPS the
+    /// leg with the named reason (a surfaced skip, never a fabricated
+    /// failure — pre-15-3 this shape passed, and WHAT the section verifies
+    /// is unchanged; the probe twin remains the proof), and a start that
+    /// cannot spawn (the snapshot's exec binary vanished after attach)
+    /// still fails the leg naming the start.
     #[test]
     fn memory_subject_leg_names_unprovable_channels_and_failed_starts() {
         let (dir, facade) = helper_engine();
 
         // `memory.dir` mapped to a FLAG target: delivery is declared but the
-        // dump echo has no env var to observe — the leg fails NAMING the
-        // unprovable channel (the section-level gate only proved A mapping
-        // exists, not an env one).
+        // dump echo has no env var to observe — the leg SKIPS naming the
+        // unprovable channel and the probe twin as the proof (the
+        // section-level gate only proved A mapping exists, not an env one).
         let flag_dir = tempfile::Builder::new()
             .prefix("ktesio-tck-submem-flag-")
             .tempdir()
@@ -4487,14 +5119,32 @@ env = "MODEL"
             Some("\n[config.\"memory.dir\"]\nflag = \"--memory-dir\"\n"),
         )
         .expect("write flag-target manifest");
-        let err = subject_memory_delivery(
+        let flag_target = TckAdapter::Manifest(flag_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
+        assert!(
+            flag_target
+                .as_ref()
+                .is_some_and(|target| target.env_var().is_none()),
+            "the fixture maps memory.dir to a non-env target"
+        );
+        match subject_memory_delivery(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(flag_dir.path().to_path_buf()),
+            flag_target.as_ref(),
             Duration::from_millis(400),
         )
-        .expect_err("a non-env memory.dir target has no provable dump channel");
-        assert!(err.contains("maps 'memory.dir' to no ENV target"), "{err}");
+        .expect("a non-env memory.dir target is a skip, never a failure")
+        {
+            SubjectLegOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("non-env target") && reason.contains("probe twin"),
+                    "the skip names the unprovable channel and the remaining proof: {reason}"
+                );
+            }
+            other => panic!("expected Skipped for a non-env memory.dir target, got {other:?}"),
+        }
 
         // A start that cannot spawn: the registered launch's exec binary is
         // gone by start time — the leg fails naming the subject start.
@@ -4536,10 +5186,14 @@ env = "TCK_SUBJECT_MEMORY"
             )
             .expect("register subject");
         std::fs::remove_file(&bin).expect("remove the exec binary");
+        let gone_target = TckAdapter::Manifest(gone_dir.path().to_path_buf())
+            .memory_dir_target()
+            .expect("the single declaration read");
         let err = subject_memory_delivery(
             &facade,
             dir.path(),
             &TckAdapter::Manifest(gone_dir.path().to_path_buf()),
+            gone_target.as_ref(),
             Duration::from_millis(400),
         )
         .expect_err("a spawnable-never start must fail the leg");

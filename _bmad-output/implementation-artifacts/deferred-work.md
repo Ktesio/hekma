@@ -94,7 +94,8 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   resolved: story 15-3 (2026-10-17) — every read with an existing public seam now routes through it
   (read_agent_log for log polls incl. the heartbeat-freeze proof, O(1) fleet_entry for the
   registered metering source, adapter::resolve for the --dump pair, EnginePaths for every
-  state-root-relative path); the two reads with NO seam (usage row counts, the registered-snapshot
+  state-root-relative path; scoped to tck.rs — uj3.rs keeps its own path joins BY DESIGN as
+  the recorded test-infra module, not the kit surface); the two reads with NO seam (usage row counts, the registered-snapshot
   launch boolean) stay direct with the frozen-v1 residual coupling documented on the helpers and in
   docs/adapter-contract.md — no silent breakage remains.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-4-prove-any-adapter-with-the-conformance-test-kit.md`
