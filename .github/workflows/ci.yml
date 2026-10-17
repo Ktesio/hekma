@@ -86,6 +86,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
+        # capped — see the "Run tests (nextest)" step below for the why. Carried
+        # as matrix DATA (not an in-step OS comparison) so the run step stays one
+        # uniform invocation for all three OSes.
+        include:
+          - os: ubuntu-latest
+            nextest_wallclock_cap: 30m
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
@@ -206,7 +213,75 @@ jobs:
         # absorb the windows-latest timing flake and time-box a genuinely stuck test.
         # Explicit +stable (see fmt job): the 3-OS matrix exercises latest stable per
         # OS; the root pin governs only local bare cargo. MSRV floor: the `msrv` job.
-        run: cargo +stable nextest run --workspace --all-targets
+        #
+        # WALL-CLOCK CAP on the ubuntu leg (2026-10-17 wedge forensics): every
+        # ubuntu-latest test run on a #281-carrying tree since Oct 16 23:42Z has
+        # died at the 40m JOB timeout with NO test ever named — 8+ verified
+        # exact-45m cancels (main and PR trees alike) while the healthy lane is
+        # ~4.5 minutes end-to-end and macOS/Windows stayed green throughout.
+        # One identical tree produced a green-270s run and a wedged-2700s run
+        # seconds apart, so the wedge is nondeterministic — and three
+        # serialization probes (the #106 group, then the CLI integration binary,
+        # then the engine lib unit tests; #284) did NOT cure it. nextest's
+        # slow-timeout kill cannot name what never dies: the wedge sits BELOW
+        # the harness (an unkilling D-state process), and a job-timeout CANCEL
+        # discards the whole job-log blob (BlobNotFound) — so the wedge has
+        # been invisible by construction. Capping the RUN (not the job) means
+        # a wedge fails this STEP while the job still has budget: a FAILED
+        # step's log survives, and the post-mortem snapshot step below captures
+        # the still-live process table (a leftover's stat/wchan names the stuck
+        # kernel wait channel). The cap rides the matrix `include` as data; the
+        # other legs render an empty cap and run uncapped. (Context:
+        # ubuntu-latest flips to the Ubuntu 26 image on 2026-10-19 —
+        # actions/runner-images#14748 — an extra reason to keep this lane
+        # observable through the migration window.)
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.nextest_wallclock_cap }}" ]; then
+            timeout --signal=TERM --kill-after=90s ${{ matrix.nextest_wallclock_cap }} cargo +stable nextest run --workspace --all-targets
+          else
+            cargo +stable nextest run --workspace --all-targets
+          fi
+      - name: Wedge post-mortem snapshot (process table + pressure)
+        # Always runs — also when the capped run step above FAILED on its
+        # wall-clock expiry, which is exactly when it matters: the wedged
+        # processes are still alive at this point, so the full process table
+        # with stat + wchan (an uninterruptible D-state leftover shows its
+        # kernel wait channel), PSI pressure, and the leftover helper binaries
+        # land in the step log AND in an artifact (a cancelled job loses its
+        # whole log blob; a failed-step job does not — and the artifact rides
+        # along either way). ~2s on a healthy run. Linux gets the deep set
+        # (wchan/PSI are procfs); the other OSes echo their plain tables.
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "== wedge post-mortem: $(date -u) =="
+            uname -a || true
+            echo "nproc=$(nproc 2>/dev/null || echo '?')"
+            uptime 2>/dev/null || true
+            free -m 2>/dev/null || true
+            if [ "$(uname -s)" = "Linux" ]; then
+              echo "== PSI (cpu/io/memory) =="
+              for f in /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory; do
+                echo "-- $f"; cat "$f" 2>/dev/null || true
+              done
+              echo "== process table (oldest first; stat D = uninterruptible) =="
+              ps -eo pid,ppid,pgid,stat,wchan:32,etimes,comm,args --sort=etimes || true
+            else
+              echo "== process table =="
+              ps -ef 2>/dev/null || true
+            fi
+            echo "== suite-related leftovers =="
+            ps -eo pid,stat,args 2>/dev/null | grep -E "nextest|fake_agent|fake_acp_agent|hermes_shim|hekma" | grep -v grep || echo "(none)"
+          } | tee "$RUNNER_TEMP/wedge-postmortem.txt"
+      - name: Upload wedge post-mortem artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wedge-postmortem-${{ matrix.os }}
+          path: ${{ runner.temp }}/wedge-postmortem.txt
+          if-no-files-found: ignore
       - name: Run doctests
         # nextest does not run doctests, so run them separately to keep the doc
         # examples gated (`--doc` and `--all-targets` cannot combine in one cargo

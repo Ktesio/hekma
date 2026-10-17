@@ -36,7 +36,14 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 # Show output for failed (and retried) tests so a flake or a timeout kill lands
 # in the CI log with its captured stdout/stderr, not a bare status line.
 failure-output = "immediate-final"
-status-level = "retry"
+# Level "leak" (⊇ slow ⊇ retry ⊇ fail): SLOW markers print live at each
+# slow-timeout period and LEAKED notices print for output-fd-holding
+# survivors (2026-10-17 wedge forensics): during the x86-ubuntu wedge family
+# NO test was ever named before the 40m job cancel — with slow markers
+# streaming live, the surviving log's tail names the tests that were in
+# flight when the lane wedged, and leak notices make fd-holding leftovers
+# explicit instead of silent. Display-only; no kill/retry semantics change.
+status-level = "leak"
 
 # Serialize the HEAVY hekma-engine integration tests (#106). The `adoption` binary
 # (and its siblings) RE-EXEC the test binary as subprocesses that spawn real
