@@ -127,7 +127,7 @@ jobs:
           for lib in hekma-adapter-api hekma-adapters-hermes hekma-engine; do
             lib_status="$(curl --silent --show-error --user-agent "$user_agent" --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${lib}")" || lib_status=000
             if [ "$lib_status" != "200" ]; then
-              echo "::error::${lib} is not on crates.io yet (HTTP ${lib_status}). The v0.8.0 runbook publishes the hekma-* libraries BEFORE the tag; execute those steps first (docs/release-process.md)."
+              echo "::error::${lib} is not on crates.io yet (HTTP ${lib_status}). The release runbook publishes the hekma-* libraries BEFORE the tag; execute those steps first (docs/release-process.md)."
               exit 1
             fi
           done
