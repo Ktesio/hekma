@@ -746,10 +746,13 @@ class ReleaseDocsTests(unittest.TestCase):
             perf_job,
         )
         # Blocking, pinned structurally beyond substrings: the RUN step's
-        # block must END on the bare binary invocation (optional leading
-        # whitespace; the story-15-5 --baseline flag rides the same line) —
-        # a tee/pipe/&& suffix could swallow the harness's nonzero exit —
-        # and must contain no failure-swallowing idiom.
+        # block must END on the bare binary invocation followed ONLY by
+        # flag/value tokens — a flags-only suffix (review round 1
+        # re-tightening: the old `(?:\s.*)?` accepted ANY trailing text, so
+        # a `| tee`, `&&`, or redirect suffix could swallow the harness's
+        # nonzero exit again) — and must contain no failure-swallowing
+        # idiom. The `set -euo pipefail` line carries the step's real
+        # protection and is pinned in its own right.
         run_step = perf_job.index("- name: Run the perf harness")
         run_text = perf_job[perf_job.index("run: |", run_step) :]
         next_step = _re.search(r"\n      - name:", run_text[1:])
@@ -760,8 +763,11 @@ class ReleaseDocsTests(unittest.TestCase):
             line for line in reversed(run_block.splitlines()) if line.strip()
         )
         self.assertRegex(
-            last_line, r"^\s*target/release/examples/perf-budgets(?:\s.*)?$"
+            last_line,
+            r"^\s*target/release/examples/perf-budgets"
+            r"(?:\s(?:--\S+|[^\s|;&><`$()]+))*$",
         )
+        self.assertIn("set -euo pipefail", run_block)
         # The ratchet invocation itself is pinned, not merely permitted: the
         # run gates against the committed canonical baseline (story 15-5).
         self.assertIn(
