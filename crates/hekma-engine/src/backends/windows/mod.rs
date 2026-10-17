@@ -85,7 +85,13 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetHandleInformation, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
+    WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -411,10 +417,20 @@ impl ProcessBackend for WindowsBackend {
         // module docs on the sub-millisecond assign-after-spawn window).
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 
+        // Story 15-4 (the detached stdio leak): std's default Windows spawn
+        // passes NO PROC_THREAD_ATTRIBUTE_HANDLE_LIST while bInheritHandles
+        // stays TRUE, and EVERY stdio std provides (Stdio::from(File), null(),
+        // piped()) is created/duplicated INHERITABLE — so a detached child
+        // would inherit EVERY inheritable handle in this process's table,
+        // INCLUDING our own stdout/stderr pipe write-ends when a script
+        // captures US. Disarm exactly those three for the spawn window (the
+        // capture files still inherit through std's own deliberate dups).
+        let _stdio_disarm = spec.detach.then(StdioInheritDisarm::disarm_spawner_stdio);
         let mut child = command.spawn().map_err(|e| BackendError::Spawn {
             exec: spec.exec.clone(),
             detail: e.to_string(),
         })?;
+        drop(_stdio_disarm); // restore immediately: inheritance happens at spawn
         let pid = child.id();
 
         // Assign the child to the job immediately (before it does meaningful
@@ -930,6 +946,105 @@ fn last_error() -> u32 {
     unsafe { windows_sys::Win32::Foundation::GetLastError() }
 }
 
+// ---------------------------------------------------------------------------
+// Story 15-4 — the detached-spawn stdio-inherit disarm (the Windows pipe
+// write-end leak fix).
+// ---------------------------------------------------------------------------
+
+/// One stdio handle whose `HANDLE_FLAG_INHERIT` was cleared, remembering the
+/// ORIGINAL flags so [`Drop`] restores exactly what was there (a handle that
+/// never carried the flag is restored without it — the disarm never leaves
+/// the spawner's stdio MORE inheritable than it found it).
+struct DisarmedStdio {
+    handle: HANDLE,
+    original_flags: u32,
+}
+
+/// The spawn-window guard clearing `HANDLE_FLAG_INHERIT` on the SPAWNING
+/// process's own three stdio handles around a DETACHED spawn (story 15-4).
+///
+/// Why this exists: std's default Windows `Command::spawn` passes no
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` while `bInheritHandles` is always
+/// TRUE, and every stdio value std provides (`Stdio::from(File)`, `null()`,
+/// `piped()`) is created or duplicated INHERITABLE. A detached child would
+/// therefore inherit EVERY inheritable handle in the parent's table —
+/// including the parent's own stdout/stderr pipe WRITE-ENDS when a script
+/// captures the `hekma` command. Clearing the flag on exactly those three
+/// for the spawn window removes them from the inheritance sweep while the
+/// INTENDED inheritance (the capture-file handles std dups for the child's
+/// own stdio) is untouched. Best-effort per handle: a stdio slot with no
+/// retrievable handle (already closed, or a console pseudo-handle the flag
+/// does not apply to) is skipped — the RESIDUAL risk is any OTHER
+/// inheritable handle in the process (none known) still leaking.
+///
+/// Panic-safe by construction: [`Drop`] restores even when the spawn between
+/// disarm and restore fails or panics.
+struct StdioInheritDisarm {
+    disarmed: Vec<DisarmedStdio>,
+}
+
+impl StdioInheritDisarm {
+    /// Clear `HANDLE_FLAG_INHERIT` on the spawner's stdin/stdout/stderr,
+    /// returning the guard that restores them. Handles whose flags cannot be
+    /// read or cleared are skipped (best-effort, see the type docs).
+    fn disarm_spawner_stdio() -> Self {
+        let mut disarmed = Vec::new();
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle has no preconditions; a null return means
+            // the slot has no handle (skipped, not an error).
+            let handle = unsafe { GetStdHandle(which) };
+            if handle.is_null() {
+                continue;
+            }
+            let mut flags: u32 = 0;
+            // SAFETY: the handle comes straight from GetStdHandle; the out-
+            // pointer is a valid u32. Failure (e.g. a handle the information
+            // does not apply to) skips the slot.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+                continue;
+            }
+            // SAFETY: same handle; clearing only the INHERIT bit. Failure is
+            // best-effort-skipped (the leak persists for that one handle —
+            // the documented residual).
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                continue;
+            }
+            disarmed.push(DisarmedStdio {
+                handle,
+                original_flags: flags,
+            });
+        }
+        Self { disarmed }
+    }
+
+    /// Whether the given handle currently carries `HANDLE_FLAG_INHERIT`
+    /// (test seam; `None` when the flags cannot be read).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn is_inheritable(handle: HANDLE) -> Option<bool> {
+        let mut flags: u32 = 0;
+        // SAFETY: read-only query on a live handle.
+        (unsafe { GetHandleInformation(handle, &mut flags) } != 0)
+            .then(|| flags & HANDLE_FLAG_INHERIT != 0)
+    }
+}
+
+impl Drop for StdioInheritDisarm {
+    fn drop(&mut self) {
+        for disarmed in &self.disarmed {
+            // SAFETY: the handle was captured from GetStdHandle in this
+            // process and the flags value was read from the OS at disarm
+            // time; restoring applies the same single bit.
+            unsafe {
+                SetHandleInformation(
+                    disarmed.handle,
+                    HANDLE_FLAG_INHERIT,
+                    disarmed.original_flags & HANDLE_FLAG_INHERIT,
+                );
+            }
+        }
+    }
+}
+
 /// Poll `handle` (via the NON-BLOCKING [`WindowsProcess::reap_if_exited`])
 /// until it reports exited, or `timeout` elapses — the bounded
 /// death-confirmation primitive [`WindowsBackend::stop`]'s escalation phase
@@ -1030,6 +1145,7 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+    use std::io::Read;
 
     /// A `SpawnSpec` for a real child, mirroring the Unix backend test
     /// module's helper (the capture trio `None` = the narrow don't-care
@@ -1146,5 +1262,102 @@ mod tests {
             "a lingering agent needs the forced escalation"
         );
         assert!(adopter.poll(&mut adopted).unwrap().is_exited());
+    }
+
+    /// Story 15-4: the disarm's clear/restore ROUNDTRIP on the live stdout
+    /// handle — whatever the original inheritability, the guard clears it
+    /// for the window and Drop restores EXACTLY it (never more, never less).
+    #[test]
+    fn stdio_disarm_roundtrip_clears_and_restores_the_live_handle() {
+        let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        assert!(!stdout_handle.is_null(), "test stdout handle present");
+        let before = StdioInheritDisarm::is_inheritable(stdout_handle);
+        let guard = StdioInheritDisarm::disarm_spawner_stdio();
+        assert_eq!(
+            StdioInheritDisarm::is_inheritable(stdout_handle),
+            Some(false),
+            "mid-window the spawner's stdout must NOT be inheritable"
+        );
+        drop(guard);
+        assert_eq!(
+            StdioInheritDisarm::is_inheritable(stdout_handle),
+            before,
+            "Drop restores the ORIGINAL inheritability exactly"
+        );
+    }
+
+    /// Story 15-4's regression proof, in the INVERTED forensic shape: a child
+    /// process (this test binary, re-exec'd with piped stdout/stderr) performs
+    /// a DETACHED spawn and exits; the parent asserts BOTH pipes reach EOF
+    /// within a bounded window. Before the fix, the lingering detached agent
+    /// inherited the child's pipe write-ends and the reads never EOF'd.
+    #[test]
+    fn a_captured_detached_spawn_does_not_hold_the_spawners_pipe_write_ends() {
+        const ARM: &str = "HEKMA_TEST_DETACHED_STDIO_ARM";
+        if std::env::var_os(ARM).is_some() {
+            // The child arm: spawn a detached lingering agent, release the
+            // handle (the command-exit shape), clean up via adopt+stop, and
+            // exit — nothing in THIS process may keep the parent's pipes.
+            let backend = WindowsBackend::new();
+            let agent = hekma_conformance::fake_agent_bin();
+            let mut detached_spec = spec(&agent.to_string_lossy(), &["--linger-ms", "600000"]);
+            detached_spec.detach = true;
+            let handle = backend.spawn(&detached_spec).expect("detached spawn (arm)");
+            let fp = backend.fingerprint(&handle);
+            drop(handle); // the releasing command's exit shape
+            let adopter = WindowsBackend::new();
+            let mut adopted = adopter
+                .adopt(&fp, true)
+                .expect("adopt ok")
+                .expect("the surviving child must be adoptable (arm)");
+            let _ = adopter
+                .stop(&mut adopted, Duration::from_secs(10))
+                .expect("stop the agent (arm — no lingering processes on the runner)");
+            std::process::exit(0);
+        }
+
+        let exe = std::env::current_exe().expect("test exe");
+        let mut child = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("a_captured_detached_spawn_does_not_hold_the_spawners_pipe_write_ends")
+            .arg("--nocapture")
+            .env(ARM, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the captured child");
+        // Drain BOTH pipes on bounded threads while the child runs: each
+        // returns true iff the pipe reached REAL EOF (read == 0) inside the
+        // bound. Before the fix, the lingering detached agent held the
+        // write-ends and neither read ever EOF'd — the deadline arm fires.
+        // A local generic fn, not a closure: `impl Trait` is not allowed in
+        // closure parameters (E0562), and the stderr leg below previously
+        // hand-inlined a duplicate of this body.
+        fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<bool> {
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let mut sink = [0u8; 512];
+                loop {
+                    match pipe.read(&mut sink) {
+                        Ok(0) => return true,
+                        Ok(_) if Instant::now() > deadline => return false,
+                        Ok(_) => {}
+                        Err(_) => return true, // broken pipe also implies no live writer
+                    }
+                }
+            })
+        }
+        let stdout_eof = drain(child.stdout.take().expect("stdout pipe"));
+        let stderr_drain = drain(child.stderr.take().expect("stderr pipe"));
+        let status = child.wait().expect("child status");
+        assert!(status.success(), "the child arm must succeed: {status:?}");
+        assert!(
+            stdout_eof.join().expect("stdout drain"),
+            "stdout never reached EOF within the bound — the write-end leak is back"
+        );
+        assert!(
+            stderr_drain.join().expect("stderr drain"),
+            "stderr never reached EOF within the bound — the write-end leak is back"
+        );
     }
 }

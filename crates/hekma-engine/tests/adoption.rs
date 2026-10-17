@@ -215,10 +215,13 @@ fn run_engine1(mode: &str, state: &Path, manifest: &Path) {
 }
 
 /// Linux AND running under CI (GitHub sets `CI`). Used to skip the heavy
-/// process-spawning adoption tests that deadlock on the x86 ubuntu runner (#109),
-/// while still running them locally (Linux dev) and on macOS/Windows/arm64.
+/// process-spawning adoption tests that deadlock on the x86-64 ubuntu runner
+/// only (#109 — arm64 Linux was never affected), while still running them
+/// locally (Linux dev), on macOS/Windows, and on any arm64 Linux CI leg.
 fn is_linux_ci() -> bool {
-    hekma_engine::OsId::current() == hekma_engine::OsId::Linux && std::env::var_os("CI").is_some()
+    hekma_engine::OsId::current() == hekma_engine::OsId::Linux
+        && std::env::var_os("CI").is_some()
+        && std::env::consts::ARCH == "x86_64"
 }
 
 /// The re-exec entry for the "engine 1" work (see module docs). When
