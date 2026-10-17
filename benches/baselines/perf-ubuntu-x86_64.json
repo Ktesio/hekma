@@ -21,9 +21,9 @@
   },
   "environment": {
     "ci": true,
-    "cpu_model": "Intel(R) Core(TM) i7-7820HQ CPU @ 2.90GHz",
-    "git_sha": "eab5503",
-    "logical_cores": 8,
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "git_sha": "75f8812",
+    "logical_cores": 4,
     "os": "linux",
     "tolerance_factor": 1.5
   },
@@ -41,10 +41,10 @@
       "budget": 1000.0,
       "effective_budget": 1000.0,
       "hard": true,
-      "measured": 2.986486,
+      "measured": 1.649045,
       "name": "read_p99_lt_1s",
       "status": "pass",
-      "strict_margin": 997.013514,
+      "strict_margin": 998.350955,
       "tolerance": 1.0
     },
     {
@@ -52,10 +52,10 @@
       "budget": 50.0,
       "effective_budget": 50.0,
       "hard": true,
-      "measured": 0.852734375,
+      "measured": 0.81796875,
       "name": "rss_per_instance_le_50mib",
       "status": "pass",
-      "strict_margin": 49.147265625,
+      "strict_margin": 49.18203125,
       "tolerance": 1.0
     },
     {
@@ -63,10 +63,10 @@
       "budget": 100.0,
       "effective_budget": 100.0,
       "hard": true,
-      "measured": 0.852734375,
+      "measured": 0.81796875,
       "name": "rss_max_spike_le_2x_budget",
       "status": "pass",
-      "strict_margin": 99.147265625,
+      "strict_margin": 99.18203125,
       "tolerance": 1.0
     },
     {
@@ -74,10 +74,10 @@
       "budget": 2.0,
       "effective_budget": 3.0,
       "hard": true,
-      "measured": 0.1536760221828114,
+      "measured": 0.2666720173575662,
       "name": "cpu_per_instance_le_2pct",
       "status": "pass",
-      "strict_margin": 1.8463239778171885,
+      "strict_margin": 1.7333279826424337,
       "tolerance": 1.5
     },
     {
@@ -85,10 +85,10 @@
       "budget": 0.25,
       "effective_budget": 0.375,
       "hard": true,
-      "measured": 0.017799869450655842,
+      "measured": 0.018134407563642985,
       "name": "subscriber_cpu_delta_le_budget",
       "status": "pass",
-      "strict_margin": 0.23220013054934416,
+      "strict_margin": 0.23186559243635702,
       "tolerance": 1.5
     },
     {
@@ -96,10 +96,10 @@
       "budget": 2.0,
       "effective_budget": 3.0,
       "hard": true,
-      "measured": 0.008203124999999978,
+      "measured": 0.008593749999999956,
       "name": "subscriber_rss_delta_le_budget",
       "status": "pass",
-      "strict_margin": 1.991796875,
+      "strict_margin": 1.99140625,
       "tolerance": 1.5
     },
     {
@@ -107,10 +107,10 @@
       "budget": 100.0,
       "effective_budget": 150.0,
       "hard": true,
-      "measured": -0.6437470000000003,
+      "measured": 0.15685799999999994,
       "name": "subscriber_read_p99_delta_le_budget",
       "status": "pass",
-      "strict_margin": 100.643747,
+      "strict_margin": 99.843142,
       "tolerance": 1.5
     }
   ],
@@ -147,10 +147,10 @@
     "subscriber overhead is measured separately (the subscriber_overhead block, ONE active subscriber, after the gated phases) and its DELTAS gate at the story-10-3 ratified budgets (strict locally; shared-runner tolerance on CI) — a negative delta passes trivially: the budget ceilings the overhead, never the measurement's sign"
   ],
   "provenance": {
-    "generated_on": "local-ci-mode",
-    "git_sha": "eab5503955227563ca7ab3da0a3dea4c637dbfe7",
-    "note": "seed: true marks a local stand-in (this harness never sees 'is this the committed file' — it sees where it ran); the canonical refresh procedure (docs/testing.md) writes seed: false, generated_on \"ci-leg\"",
-    "seed": true
+    "generated_on": "ci-leg",
+    "git_sha": "a0748101d706a8335bc9ead1d912e8f9a24075c4",
+    "note": "Re-anchored from the CI leg run (PR 288 perf job) per the documented update procedure — the local seed CPU/instance figure sat below shared-runner variance, tripping the ratchet with every absolute gate passing (CPU 0.267% vs the 3.0% CI-tolerant budget). All figures are this leg median-of-3 measurement.",
+    "seed": false
   },
   "read_gate_retry": {
     "attempts": 1,
@@ -159,75 +159,76 @@
   },
   "read_latency_ms": {
     "effective_config": {
-      "max_ms": 0.168724,
-      "p50_ms": 0.11809299999999999,
-      "p95_ms": 0.135163,
-      "p99_ms": 0.164959,
+      "max_ms": 0.103555,
+      "p50_ms": 0.072015,
+      "p95_ms": 0.09014899999999999,
+      "p99_ms": 0.095971,
       "samples": 200
     },
     "fleet": {
-      "max_ms": 3.6895640000000003,
-      "p50_ms": 1.6303649999999998,
-      "p95_ms": 2.064896,
-      "p99_ms": 2.986486,
+      "max_ms": 2.144274,
+      "p50_ms": 1.4096549999999999,
+      "p95_ms": 1.5902939999999999,
+      "p99_ms": 1.649045,
       "samples": 200
     },
     "instance_status": {
-      "max_ms": 0.191072,
-      "p50_ms": 0.12633499999999998,
-      "p95_ms": 0.165518,
-      "p99_ms": 0.189457,
+      "max_ms": 0.178214,
+      "p50_ms": 0.07804699999999999,
+      "p95_ms": 0.09577999999999999,
+      "p99_ms": 0.10329400000000001,
       "samples": 200
     },
     "usage_via_fleet": {
-      "max_ms": 3.339964,
-      "p50_ms": 1.6417510000000002,
-      "p95_ms": 2.105723,
-      "p99_ms": 2.291409,
+      "max_ms": 1.797012,
+      "p50_ms": 1.4000670000000002,
+      "p95_ms": 1.578332,
+      "p99_ms": 1.6103319999999999,
       "samples": 200
     }
   },
-  "read_p99_overall_ms": 2.986486,
+  "read_p99_overall_ms": 1.649045,
   "schema_version": 1,
-  "status": "pass",
+  "status": "fail",
   "steady_state": {
-    "cpu_percent_aggregate_median": 1.536760221828114,
-    "cpu_percent_per_instance": 0.1536760221828114,
-    "rss_mib_aggregate_median": 8.52734375,
-    "rss_mib_per_instance_max": 0.852734375,
-    "rss_mib_per_instance_mean": 0.852734375,
+    "cpu_percent_aggregate_median": 2.6667201735756616,
+    "cpu_percent_per_instance": 0.2666720173575662,
+    "rss_mib_aggregate_median": 8.1796875,
+    "rss_mib_per_instance_max": 0.81796875,
+    "rss_mib_per_instance_mean": 0.81796875,
     "windows": [
       {
-        "cpu_percent_aggregate_mean": 1.536760221828114,
-        "rss_mib_max": 8.52734375,
-        "rss_mib_mean": 8.517045454545455,
+        "cpu_percent_aggregate_mean": 1.8353966149416836,
+        "rss_mib_max": 8.1796875,
+        "rss_mib_mean": 8.1796875,
         "samples": 11
       },
       {
-        "cpu_percent_aggregate_mean": 1.5346360802650452,
-        "rss_mib_max": 8.52734375,
-        "rss_mib_mean": 8.52734375,
+        "cpu_percent_aggregate_mean": 2.762042934244329,
+        "rss_mib_max": 8.1796875,
+        "rss_mib_mean": 8.1796875,
         "samples": 11
       },
       {
-        "cpu_percent_aggregate_mean": 1.7147563804279675,
-        "rss_mib_max": 8.52734375,
-        "rss_mib_mean": 8.52734375,
+        "cpu_percent_aggregate_mean": 2.6667201735756616,
+        "rss_mib_max": 8.1796875,
+        "rss_mib_mean": 8.1796875,
         "samples": 11
       }
     ]
   },
   "story": "7-5",
   "subscriber_overhead": {
-    "cpu_delta_vs_unsubscribed_pct_points": 0.017799869450655842,
-    "cpu_percent_per_instance": 0.17147589163346724,
+    "cpu_delta_vs_unsubscribed_pct_points": 0.018134407563642985,
+    "cpu_percent_per_instance": 0.28480642492120917,
     "policy": "GATED at the story-10-3 ratified subscriber-active delta budgets (strict locally; the shared-runner tolerance on CI, one window even on CI — the deltas gate, the absolutes are context); the gated zero-subscriber figures above were measured BEFORE the subscriber attached, by design",
-    "read_p99_delta_vs_unsubscribed_ms": -0.6437470000000003,
-    "read_p99_overall_ms": 2.342739,
-    "rss_delta_vs_unsubscribed_mib": 0.008203124999999978,
-    "rss_mib_per_instance_mean": 0.8609375,
+    "read_p99_delta_vs_unsubscribed_ms": 0.15685799999999994,
+    "read_p99_overall_ms": 1.805903,
+    "rss_delta_vs_unsubscribed_mib": 0.008593749999999956,
+    "rss_mib_per_instance_mean": 0.8265625,
     "subscriber_count": 1,
     "window_count": 1,
     "window_note": "one steady-state window even in CI mode — the ratified delta budgets are sized for single-window noise (docs/testing.md)"
   }
 }
+
