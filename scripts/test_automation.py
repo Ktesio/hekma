@@ -697,14 +697,19 @@ class ReleaseDocsTests(unittest.TestCase):
         # harness on every PR and GATES the measured budgets — reads p99 and
         # RSS/instance gate hard; CPU/instance carries the harness's
         # documented shared-runner tolerance over a median-of-3 window in CI.
+        # Story 15-5: the run also carries --baseline against the COMMITTED
+        # canonical baseline (benches/baselines/perf-ubuntu-x86_64.json), so
+        # the leg ratchet-gates (no gated metric worse than baseline x 1.15,
+        # additive to the absolute budgets); the committed baseline file
+        # itself must exist.
         # Guard the whole shape so the gate cannot silently drop out: the job
         # exists, builds the release example, carries the stale-helper rm +
         # rebuild guard (the harness SPAWNS fake_agent, so the test/coverage
         # -job rule "any job that spawns agents carries it" applies), runs
         # the binary BLOCKING (the run block's last line IS the bare binary
-        # invocation, and the block contains no failure-swallowing idiom),
-        # uploads the JSON report artifact, and the harness example file
-        # itself exists.
+        # invocation + its flags, and the block contains no
+        # failure-swallowing idiom), uploads the JSON report artifact, and
+        # the harness example file itself exists.
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
@@ -714,6 +719,9 @@ class ReleaseDocsTests(unittest.TestCase):
             / "hekma-engine"
             / "examples"
             / "perf-budgets.rs"
+        )
+        baseline = (
+            release_docs.ROOT / "benches" / "baselines" / "perf-ubuntu-x86_64.json"
         )
         job_start = ci.index("  perf-budgets:")
         import re as _re
@@ -739,8 +747,9 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         # Blocking, pinned structurally beyond substrings: the RUN step's
         # block must END on the bare binary invocation (optional leading
-        # whitespace) — a tee/pipe/&& suffix could swallow the harness's
-        # nonzero exit — and must contain no failure-swallowing idiom.
+        # whitespace; the story-15-5 --baseline flag rides the same line) —
+        # a tee/pipe/&& suffix could swallow the harness's nonzero exit —
+        # and must contain no failure-swallowing idiom.
         run_step = perf_job.index("- name: Run the perf harness")
         run_text = perf_job[perf_job.index("run: |", run_step) :]
         next_step = _re.search(r"\n      - name:", run_text[1:])
@@ -751,7 +760,12 @@ class ReleaseDocsTests(unittest.TestCase):
             line for line in reversed(run_block.splitlines()) if line.strip()
         )
         self.assertRegex(
-            last_line, r"^\s*target/release/examples/perf-budgets\s*$"
+            last_line, r"^\s*target/release/examples/perf-budgets(?:\s.*)?$"
+        )
+        # The ratchet invocation itself is pinned, not merely permitted: the
+        # run gates against the committed canonical baseline (story 15-5).
+        self.assertIn(
+            "--baseline benches/baselines/perf-ubuntu-x86_64.json", run_block
         )
         self.assertNotIn("|| true", run_block)
         self.assertNotIn("exit 0", run_block)
@@ -765,6 +779,11 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@", upload)
         self.assertIn("perf-budgets-report.json", upload)
         self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
+        self.assertTrue(
+            baseline.is_file(),
+            "the committed canonical perf baseline must exist (the CI run "
+            "gates its ratchet against it)",
+        )
 
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):

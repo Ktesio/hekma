@@ -1,0 +1,227 @@
+{
+  "budget_source": "NFR-4",
+  "budgets": {
+    "cpu_per_instance_pct": 2.0,
+    "read_p99_ms": 1000.0,
+    "rss_per_instance_mib": 50.0,
+    "rss_spike_factor": 2.0,
+    "subscriber_budget_source": "story 10-3 ratification over the observed 2026-09-10 runs (docs/testing.md)",
+    "subscriber_cpu_delta_pct_points": 0.25,
+    "subscriber_read_p99_delta_ms": 100.0,
+    "subscriber_rss_delta_mib": 2.0
+  },
+  "ci_mode": true,
+  "ci_tolerance": {
+    "applied": true,
+    "applies_to": "cpu_per_instance gate AND the story-10-3 subscriber-active delta gates, CI mode only",
+    "effective_cpu_budget_pct": 3.0,
+    "factor": 1.5,
+    "name": "shared_runner_tolerance",
+    "policy": "reads and RSS gate at budget on every gate platform (ubuntu CI; strict local macOS — Windows is measured-and-reported, never a gate platform); CPU gates strict (x1.0) locally and at the named shared-runner tolerance (x1.5) on CI — over the median of three windows — where co-tenant noise is uncontrollable; the subscriber delta gates use the same factor shape but stay single-window (the factor is their noise absorber, and their budgets are sized for it)"
+  },
+  "environment": {
+    "ci": true,
+    "cpu_model": "Intel(R) Core(TM) i7-7820HQ CPU @ 2.90GHz",
+    "git_sha": "71f7f2b",
+    "logical_cores": 8,
+    "os": "linux",
+    "tolerance_factor": 1.5
+  },
+  "fixture": {
+    "fleet_size": 25,
+    "idle_behavior": "fake_agent --heartbeat-ms 1000 (heartbeat only; no usage emission)",
+    "orphan_bound_ms": 60000,
+    "running_instances": 10,
+    "running_instances_sampled_at_measurement": true,
+    "state_root": "hermetic temp dir (removed at teardown)"
+  },
+  "gates": [
+    {
+      "bound": "<",
+      "budget": 1000.0,
+      "effective_budget": 1000.0,
+      "hard": true,
+      "measured": 2.523262,
+      "name": "read_p99_lt_1s",
+      "status": "pass",
+      "strict_margin": 997.476738,
+      "tolerance": 1.0
+    },
+    {
+      "bound": "<=",
+      "budget": 50.0,
+      "effective_budget": 50.0,
+      "hard": true,
+      "measured": 0.847265625,
+      "name": "rss_per_instance_le_50mib",
+      "status": "pass",
+      "strict_margin": 49.152734375,
+      "tolerance": 1.0
+    },
+    {
+      "bound": "<=",
+      "budget": 100.0,
+      "effective_budget": 100.0,
+      "hard": true,
+      "measured": 0.847265625,
+      "name": "rss_max_spike_le_2x_budget",
+      "status": "pass",
+      "strict_margin": 99.152734375,
+      "tolerance": 1.0
+    },
+    {
+      "bound": "<=",
+      "budget": 2.0,
+      "effective_budget": 3.0,
+      "hard": true,
+      "measured": 0.17147597616369076,
+      "name": "cpu_per_instance_le_2pct",
+      "status": "pass",
+      "strict_margin": 1.8285240238363092,
+      "tolerance": 1.5
+    },
+    {
+      "bound": "<=",
+      "budget": 0.25,
+      "effective_budget": 0.375,
+      "hard": true,
+      "measured": 0.0089669108390808,
+      "name": "subscriber_cpu_delta_le_budget",
+      "status": "pass",
+      "strict_margin": 0.2410330891609192,
+      "tolerance": 1.5
+    },
+    {
+      "bound": "<=",
+      "budget": 2.0,
+      "effective_budget": 3.0,
+      "hard": true,
+      "measured": 0.008984374999999933,
+      "name": "subscriber_rss_delta_le_budget",
+      "status": "pass",
+      "strict_margin": 1.9910156250000002,
+      "tolerance": 1.5
+    },
+    {
+      "bound": "<=",
+      "budget": 100.0,
+      "effective_budget": 150.0,
+      "hard": true,
+      "measured": -0.31169899999999995,
+      "name": "subscriber_read_p99_delta_le_budget",
+      "status": "pass",
+      "strict_margin": 100.311699,
+      "tolerance": 1.5
+    }
+  ],
+  "methodology": {
+    "contamination_notes": [
+      "reads-before-window would inflate the CPU samples with read-phase activity — the fixed order (steady first) avoids that direction",
+      "the window's background leaves the runtime warm for the reads — a short re-settle (1 s) absorbs the other direction"
+    ],
+    "cpu_scope": "ENGINE process aggregate (per-core sum) — the harness process that owns the Engine runtime",
+    "first_sample_skipped": true,
+    "order": "setup -> settle -> steady-state window(s) -> re-settle -> read latency -> subscriber-overhead addendum (one window + reads, reported only)",
+    "process_metrics_source": "sysinfo (dev-dep), two-refresh CPU delta, one-second samples",
+    "read_iterations": 200,
+    "read_kinds": [
+      "fleet",
+      "instance_status",
+      "effective_config",
+      "usage_via_fleet"
+    ],
+    "read_spread": "per-instance reads round-robin across the fleet (iteration i -> instance i % 25)",
+    "rss_scope": "ENGINE process resident set only; the supervised agents' own memory is their own, NOT supervision overhead; the allocator may retain pages from earlier phases (registration/start/sampling) in this figure",
+    "sample_interval_secs": 1.0,
+    "settle_secs": 2.0,
+    "steady_state_selection": "median window (CI stability mechanism)",
+    "steady_state_window_secs": 12.0,
+    "steady_state_windows": 3,
+    "usage_kind_note": "usage_via_fleet mirrors kt agent usage <name>'s exact facade shape (fleet() + find) and therefore INCLUDES the fleet listing's cost — it is not an independent read kind",
+    "window_coverage": "the window validates heartbeat-frequency supervision work (reaper cadence + per-second log captures); longer-period supervision tasks (sweeps, retention) are NOT captured — lengthen locally via PERF_BUDGETS_WINDOW_MS (clamped to [10s, 1h])"
+  },
+  "notes": [
+    "units: the gate is 50 MiB/instance (derived from raw bytes); this reconciles with NFR-4's '50MB' prose intent — documented in docs/testing.md",
+    "platform scope: gates are enforced on ubuntu CI; strict local gating on macOS; Windows figures are measured-and-reported (sysinfo's memory() is the working-set-size analog there), never a gate platform",
+    "the per-instance budgets mean MARGINAL supervision overhead: the fixed engine cost amortizes over the running count (see the consts' budget-assumption docs)",
+    "subscriber overhead is measured separately (the subscriber_overhead block, ONE active subscriber, after the gated phases) and its DELTAS gate at the story-10-3 ratified budgets (strict locally; shared-runner tolerance on CI) — a negative delta passes trivially: the budget ceilings the overhead, never the measurement's sign"
+  ],
+  "read_gate_retry": {
+    "attempts": 1,
+    "policy": "CI mode retries ONCE after a 30 s cool-down and gates on the second run (house pattern: a co-tenant stall must not red an ordinary PR); local runs are single-shot",
+    "retry_applied": false
+  },
+  "read_latency_ms": {
+    "effective_config": {
+      "max_ms": 0.226494,
+      "p50_ms": 0.096407,
+      "p95_ms": 0.136222,
+      "p99_ms": 0.17016399999999998,
+      "samples": 200
+    },
+    "fleet": {
+      "max_ms": 2.557111,
+      "p50_ms": 1.6206580000000002,
+      "p95_ms": 2.142199,
+      "p99_ms": 2.523262,
+      "samples": 200
+    },
+    "instance_status": {
+      "max_ms": 0.204532,
+      "p50_ms": 0.10512200000000001,
+      "p95_ms": 0.138603,
+      "p99_ms": 0.197209,
+      "samples": 200
+    },
+    "usage_via_fleet": {
+      "max_ms": 2.698636,
+      "p50_ms": 1.62076,
+      "p95_ms": 2.0906480000000003,
+      "p99_ms": 2.250363,
+      "samples": 200
+    }
+  },
+  "read_p99_overall_ms": 2.523262,
+  "schema_version": 1,
+  "status": "pass",
+  "steady_state": {
+    "cpu_percent_aggregate_median": 1.7147597616369075,
+    "cpu_percent_per_instance": 0.17147597616369076,
+    "rss_mib_aggregate_median": 8.47265625,
+    "rss_mib_per_instance_max": 0.847265625,
+    "rss_mib_per_instance_mean": 0.847265625,
+    "windows": [
+      {
+        "cpu_percent_aggregate_mean": 1.5350777398456226,
+        "rss_mib_max": 8.46875,
+        "rss_mib_mean": 8.459161931818182,
+        "samples": 11
+      },
+      {
+        "cpu_percent_aggregate_mean": 1.7147597616369075,
+        "rss_mib_max": 8.47265625,
+        "rss_mib_mean": 8.47265625,
+        "samples": 11
+      },
+      {
+        "cpu_percent_aggregate_mean": 1.715537965297699,
+        "rss_mib_max": 8.47265625,
+        "rss_mib_mean": 8.47265625,
+        "samples": 11
+      }
+    ]
+  },
+  "story": "7-5",
+  "subscriber_overhead": {
+    "cpu_delta_vs_unsubscribed_pct_points": 0.0089669108390808,
+    "cpu_percent_per_instance": 0.18044288700277156,
+    "policy": "GATED at the story-10-3 ratified subscriber-active delta budgets (strict locally; the shared-runner tolerance on CI, one window even on CI — the deltas gate, the absolutes are context); the gated zero-subscriber figures above were measured BEFORE the subscriber attached, by design",
+    "read_p99_delta_vs_unsubscribed_ms": -0.31169899999999995,
+    "read_p99_overall_ms": 2.211563,
+    "rss_delta_vs_unsubscribed_mib": 0.008984374999999933,
+    "rss_mib_per_instance_mean": 0.85625,
+    "subscriber_count": 1,
+    "window_count": 1,
+    "window_note": "one steady-state window even in CI mode — the ratified delta budgets are sized for single-window noise (docs/testing.md)"
+  }
+}

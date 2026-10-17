@@ -2,7 +2,7 @@
 title: 'Perf-budgets baseline trend tracking (committed baseline, ratchet deltas, documented updates)'
 type: 'feature'
 created: '2026-10-16'
-status: 'in-progress'
+status: 'implemented'
 baseline_commit: '800934c0eced9e60e4d253a61b63d836650f689a'
 review_loop_iteration: 0
 context:
@@ -55,11 +55,11 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hekma-engine/examples/perf-budgets.rs` -- `--baseline`/`--write-baseline` flag parsing (stderr diagnostics), the `trend` block (per gated metric: baseline, current, delta, verdict), the ratchet evaluation (×1.15, gate-platform only), report additivity per the schema policy.
-- [ ] `crates/hekma-engine/examples/perf-budgets.rs` -- pure unit tests for the ratchet math (improve / within tolerance / beyond) + the baseline load error arms (missing file, corrupt JSON, schema mismatch).
-- [ ] `benches/baselines/perf-ubuntu-x86_64.json` -- the committed canonical baseline (from the CI leg's run; values recorded in the PR body).
-- [ ] `.github/workflows/ci.yml` -- the perf job runs with `--baseline`; failures surface the trend block in the log.
-- [ ] `docs/testing.md` -- baseline mechanics + the PR-ride update procedure; `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-5 row; `deferred-work.md` 7-5 entry resolved-marker at merge.
+- [x] `crates/hekma-engine/examples/perf-budgets.rs` -- `--baseline`/`--write-baseline` flag parsing (stderr diagnostics), the `trend` block (per gated metric: baseline, current, delta, verdict), the ratchet evaluation (×1.15, gate-platform only), report additivity per the schema policy.
+- [x] `crates/hekma-engine/examples/perf-budgets.rs` -- pure unit tests for the ratchet math (improve / within tolerance / beyond) + the baseline load error arms (missing file, corrupt JSON, schema mismatch).
+- [x] `benches/baselines/perf-ubuntu-x86_64.json` -- the committed canonical baseline (from the CI leg's run; values recorded in the PR body).
+- [x] `.github/workflows/ci.yml` -- the perf job runs with `--baseline`; failures surface the trend block in the log.
+- [x] `docs/testing.md` -- baseline mechanics + the PR-ride update procedure; `_bmad-output/implementation-artifacts/sprint-status.yaml` -- story 15-5 row; `deferred-work.md` 7-5 entry resolved-marker at merge.
 
 **Acceptance Criteria:**
 - Given a baseline and a current report where every gated metric is within 1.15×, then the ratchet passes and the trend block names each delta.
@@ -70,6 +70,8 @@ context:
 - Gates: fmt/clippy/workspace tests/check_docs green; the in-file ratchet unit tests green.
 
 ## Spec Change Log
+
+- (Closeout, 2026-10-17) Implemented as specified, with three surface decisions recorded: (1) **the ratchet's gate platform is CI MODE** (`config.ci` — the ubuntu `perf-budgets` job), not "any gate platform": the canonical baseline records the CI leg's own run, so that leg is the only apples-to-apples comparison; macOS-local strict gating of the ABSOLUTE budgets is untouched, and local/other-platform `--baseline` runs are report-only (the spec matrix's "local macOS → NO ratchet gate" row generalized to every non-CI run). (2) **A non-positive baseline never ratchets** — verdict `no-ratchet`, reason surfaced in the report + stderr, absolute budget still gating: ×1.15 on a negative figure TIGHTENS the bound (a tolerance must absorb noise, never add strictness), and the committed baseline's subscriber read-p99 delta is negative (−0.31 ms), so this arm is exercised by the very first canonical file. Exactly-at-limit counts as within (the rule is "no WORSE than ×1.15"). (3) **The initial committed baseline was generated from a REAL local linux-x86_64 release run with CI mode forced** (median-of-3 windows — the CI leg's measurement shape; 8 logical cores, recorded in the file's `environment` block), because the CI leg did not yet exist at implementation time; the canonical refresh procedure (CI-leg artifact → strip `trend` → PR, docs/testing.md) re-anchors it on the first post-merge run if the runner's figures drift past the local seed. `--write-baseline` output strips the `trend` block (a baseline is a self-contained measurement; a stale nested `trend` key is tolerated on load but never written). `scripts/test_automation.py`'s CI pins updated in the same change (run-line regex accepts flags; the `--baseline` invocation + the baseline file's existence are pinned). Verified end-to-end with the spec's round-trip command: two real CI-mode runs, the second gated against the first's committed baseline — ratchet PASS, exit 0, all seven trend rows present.
 
 ## Design Notes
 

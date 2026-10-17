@@ -293,6 +293,11 @@ jobs:
     # Gated separately from the standard test matrix (a dedicated ubuntu job,
     # not a matrix leg) so the measurement is comparable run-to-run and
     # perf-noise flakiness can never spill into the ordinary test gates.
+    # Story 15-5: this leg is also the RATCHET gate platform — it runs with
+    # --baseline against the committed canonical baseline
+    # (benches/baselines/perf-ubuntu-x86_64.json) and fails when any gated
+    # metric is worse than baseline x 1.15 (additive to the absolute
+    # budgets; see docs/testing.md's update procedure for refreshes).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -338,8 +343,18 @@ jobs:
         # tolerance, and the reads gate's one 30s-cool-down retry). The env
         # var also makes the harness write the JSON report to a file, which
         # the step below uploads as the job's artifact — the run line itself
-        # stays the bare binary invocation so the step cannot silently
-        # swallow a nonzero exit.
+        # stays the bare binary invocation (+ its flags) so the step cannot
+        # silently swallow a nonzero exit.
+        # Story 15-5: the run carries --baseline against the COMMITTED
+        # canonical baseline (benches/baselines/perf-ubuntu-x86_64.json), so
+        # this leg ALSO ratchet-gates: any gated metric worse than
+        # baseline x 1.15 fails the run (additive to the absolute budgets).
+        # On a failure the trend block is already IN this job's log — the
+        # harness prints every ratchet verdict (baseline/current/delta/
+        # tolerance) to stderr and the full trend JSON to stdout, with no
+        # redirection here — and the artifact step below preserves the
+        # numbers (if: always()). A missing/corrupt baseline exits 2 loudly
+        # (never a silent no-trend run), which reds this job the same way.
         timeout-minutes: 10
         env:
           PERF_BUDGETS_REPORT_PATH: perf-budgets-report.json
@@ -350,7 +365,11 @@ jobs:
             echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
             exit 1
           }
-          target/release/examples/perf-budgets
+          test -f benches/baselines/perf-ubuntu-x86_64.json || {
+            echo "::error::committed perf baseline not found at benches/baselines/perf-ubuntu-x86_64.json — the ratchet has nothing to compare against (docs/testing.md carries the update procedure)."
+            exit 1
+          }
+          target/release/examples/perf-budgets --baseline benches/baselines/perf-ubuntu-x86_64.json
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`

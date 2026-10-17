@@ -72,6 +72,7 @@
 //! | subscriber RSS Δ / instance       | hard       | ≤ 2 × tolerance (CI)            |
 //! | subscriber read-p99 Δ             | hard       | ≤ 100 ms strict (local)         |
 //! | subscriber read-p99 Δ             | hard       | ≤ 100 × tolerance (CI)          |
+//! | ratchet vs committed baseline     | additive   | ≤ baseline × 1.15 (CI leg only) |
 //!
 //! ## The CI tolerance policy (named, not hidden)
 //!
@@ -93,6 +94,38 @@
 //! addendum measures ONE window even on CI (the deltas are differences taken
 //! seconds apart in one process), so the tolerance is the sole noise
 //! absorber there and the budgets are sized for it (docs/testing.md).
+//!
+//! ## Baseline trend tracking — the ratchet (story 15-5)
+//!
+//! The absolute budgets above catch a regression only when it crosses them;
+//! they cannot see a slow multi-week DRIFT (reads creeping from 6 ms toward
+//! 100 ms is green every week and worse every month). The ratchet closes
+//! that gap ADDITIVELY — a gate-platform run must pass BOTH the absolute
+//! budgets and the ratchet:
+//!
+//! * `--baseline <file>` loads a prior report JSON, the report gains a
+//!   `trend` block (per gated metric: baseline, current, delta, verdict),
+//!   and on the gate platform a gated metric worse than
+//!   baseline × [`RATCHET_TOLERANCE`] (1.15) fails the run. Improvements
+//!   are accepted freely; exactly-at-limit is within (the rule is "no
+//!   WORSE than ×1.15"); a NON-POSITIVE baseline never ratchets (×1.15 on
+//!   a negative figure tightens the bound instead of tolerating noise —
+//!   that verdict is `no-ratchet`, surfaced with its reason, and the
+//!   metric's absolute budget still gates it).
+//! * The ratchet gates CI MODE only — the canonical baseline records the
+//!   CI ubuntu-x86_64 leg's own run, so that leg is the only place the
+//!   comparison is apples-to-apples. Local and other-platform runs may
+//!   pass `--baseline` for a REPORTING-ONLY trend block; they never
+//!   ratchet-gate (the same platform discipline as the absolute gates).
+//! * `--write-baseline <file>` writes the fresh report (trend stripped) as
+//!   the next baseline; the stdout report is unchanged.
+//! * The canonical committed baseline is `benches/baselines/perf-ubuntu-x86_64.json`
+//!   — ONE file, no per-platform zoo. It is updated by PR: the visible
+//!   diff IS the ratification (docs/testing.md carries the procedure; CI
+//!   never auto-writes a baseline).
+//! * A missing, corrupt, or schema-mismatched baseline is a LOUD named
+//!   error and a non-zero exit — never a silent no-trend run. The default
+//!   invocation (no flags) is byte-equivalent to the pre-15-5 report.
 //!
 //! ## Why an example (explicit gating, not `#[ignore]` sprawl)
 //!
@@ -252,6 +285,16 @@ const BUDGET_SUBSCRIBER_READ_P99_DELTA_MS: f64 = 100.0;
 /// The DOCUMENTED shared-runner tolerance factor for the CPU gate in CI only
 /// (see the module docs). Named here and in every report — never hidden.
 const CI_CPU_TOLERANCE_FACTOR: f64 = 1.5;
+
+/// The RATCHET tolerance (story 15-5): a gated metric may not be WORSE than
+/// baseline × this factor. 1.15 (15%) absorbs CI-run-to-CI-run noise on the
+/// SAME leg (where machine variance is small) while catching the slow
+/// multi-week drift class the absolute budgets cannot see — reads creeping
+/// from 6 ms toward 100 ms is green every week against a 1 s budget. If CI
+/// proves noisier than 15% absorbs, this is a one-line change WITH a
+/// baseline refresh in the same PR (the documented remedy, never a silent
+/// tolerance tweak).
+const RATCHET_TOLERANCE: f64 = 1.15;
 
 /// The read-gate retry (CI mode only): one cool-down + re-measure, gated on
 /// the second run — the house pattern so a co-tenant stall cannot red an
@@ -688,11 +731,471 @@ fn gate(
 }
 
 // ---------------------------------------------------------------------------
+// Baseline trend tracking + the ratchet (story 15-5) — ADDITIVE to the
+// absolute gates (a gate-platform run must pass both). Pure math + parsing
+// here, pinned by the #[cfg(test)] battery like the gate math above.
+// ---------------------------------------------------------------------------
+
+/// The harness's command-line surface: `--baseline <file>` and
+/// `--write-baseline <file>` (each also accepted as `--flag=<file>`), parsed
+/// in the example's plain std style — no dependencies, no clap. Invalid
+/// usage is a LOUD stderr error + exit 2 in `main`, never a silent ignore;
+/// diagnostics go to stderr (CLI-first).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CliArgs {
+    baseline: Option<String>,
+    write_baseline: Option<String>,
+}
+
+/// Pure argv parse (pinned by tests): unknown flags, missing values, empty
+/// values, and duplicates are named errors.
+fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
+    let mut parsed = CliArgs::default();
+    let mut index = 0;
+    while index < argv.len() {
+        let raw = argv[index].as_str();
+        let (flag, inline_value) = match raw.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_string())),
+            None => (raw, None),
+        };
+        if flag != "--baseline" && flag != "--write-baseline" {
+            return Err(format!(
+                "unknown argument {raw:?} \
+                 (supported: --baseline <file>, --write-baseline <file>)"
+            ));
+        }
+        let value = match inline_value {
+            Some(value) => value,
+            None => {
+                index += 1;
+                argv.get(index)
+                    .cloned()
+                    .ok_or_else(|| format!("{flag} requires a file path (usage: {flag} <file>)"))?
+            }
+        };
+        if value.is_empty() {
+            return Err(format!("{flag} requires a non-empty file path"));
+        }
+        let slot = if flag == "--baseline" {
+            &mut parsed.baseline
+        } else {
+            &mut parsed.write_baseline
+        };
+        if slot.is_some() {
+            return Err(format!("{flag} given more than once"));
+        }
+        *slot = Some(value);
+        index += 1;
+    }
+    Ok(parsed)
+}
+
+/// A prior report loaded as the ratchet's basis: the gate-name → measured
+/// map (every figure the ratchet compares) plus the provenance the trend
+/// block cites back (git SHA, OS).
+#[derive(Clone, Debug, PartialEq)]
+struct BaselineFigures {
+    schema_version: u64,
+    git_sha: Option<String>,
+    os: Option<String>,
+    measured_by_gate: Vec<(String, f64)>,
+}
+
+impl BaselineFigures {
+    fn lookup(&self, gate: &str) -> Option<f64> {
+        self.measured_by_gate
+            .iter()
+            .find(|(name, _)| name == gate)
+            .map(|(_, measured)| *measured)
+    }
+}
+
+/// Read + parse a baseline report file. Every error NAMES the file: a
+/// missing or unreadable baseline must fail loudly (exit 2 in `main`) —
+/// never a silent no-trend run.
+fn load_baseline(path: &std::path::Path) -> Result<BaselineFigures, String> {
+    let file = path.display().to_string();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the baseline file {file}: {e}"))?;
+    parse_baseline(&text, &file)
+}
+
+/// Pure baseline parse + validation: valid JSON object whose
+/// `schema_version` matches this harness (a future breaking shape bumps
+/// [`REPORT_SCHEMA_VERSION`] and stale baselines must be refused BY NAME,
+/// never mis-read), and a non-empty `gates` array whose entries each carry
+/// a string `name` and a numeric `measured` (duplicates refused). Unknown
+/// keys — including a stale nested `trend` block from a baseline committed
+/// before the strip rule — are ignored: only the gated figures are
+/// load-bearing. The `environment` block is best-effort provenance.
+fn parse_baseline(text: &str, file: &str) -> Result<BaselineFigures, String> {
+    let corrupt = |reason: String| format!("baseline {file} is corrupt: {reason}");
+    let root: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("baseline {file} is not valid JSON: {e}"))?;
+    let object = root
+        .as_object()
+        .ok_or_else(|| corrupt("the root is not a JSON object".to_string()))?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            corrupt(format!(
+                "schema_version is missing or not a non-negative integer \
+                 (this harness reads {REPORT_SCHEMA_VERSION})"
+            ))
+        })?;
+    if schema_version != REPORT_SCHEMA_VERSION {
+        return Err(format!(
+            "baseline {file} schema mismatch: carries schema_version \
+             {schema_version}, this harness reads {REPORT_SCHEMA_VERSION} — regenerate \
+             the baseline with --write-baseline per docs/testing.md"
+        ));
+    }
+    let environment = object
+        .get("environment")
+        .and_then(|value| value.as_object());
+    let string_field = |key: &str| {
+        environment
+            .and_then(|env| env.get(key))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    let gates = object
+        .get("gates")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| corrupt("the gates array is missing or not an array".to_string()))?;
+    if gates.is_empty() {
+        return Err(corrupt("the gates array is empty".to_string()));
+    }
+    let mut measured_by_gate = Vec::with_capacity(gates.len());
+    for gate in gates {
+        let gate_object = gate
+            .as_object()
+            .ok_or_else(|| corrupt("a gates entry is not an object".to_string()))?;
+        let name = gate_object
+            .get("name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| corrupt("a gates entry lacks a string name".to_string()))?
+            .to_string();
+        let measured = gate_object
+            .get("measured")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| corrupt(format!("gate {name:?} lacks a numeric measured value")))?;
+        if measured_by_gate.iter().any(|(known, _)| *known == name) {
+            return Err(corrupt(format!("gate {name:?} appears twice")));
+        }
+        measured_by_gate.push((name, measured));
+    }
+    Ok(BaselineFigures {
+        schema_version,
+        git_sha: string_field("git_sha"),
+        os: string_field("os"),
+        measured_by_gate,
+    })
+}
+
+/// One gated metric's ratchet verdict. [`RatchetVerdict::NoRatchet`] is the
+/// surfaced guard for a non-positive baseline: ×1.15 on a NEGATIVE figure
+/// tightens the bound below the baseline (a tolerance must absorb noise,
+/// never add strictness) and ×1.15 on zero bounds everything above zero —
+/// both are noise arithmetic, so the trend reports the delta and the reason
+/// while the metric's ABSOLUTE budget keeps gating it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RatchetVerdict {
+    Improved,
+    Within,
+    Beyond,
+    NoRatchet,
+}
+
+impl RatchetVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            RatchetVerdict::Improved => "improved",
+            RatchetVerdict::Within => "within",
+            RatchetVerdict::Beyond => "beyond",
+            RatchetVerdict::NoRatchet => "no-ratchet",
+        }
+    }
+}
+
+/// One trend row — everything the spec demands a ratchet verdict name:
+/// baseline value, current value, delta, and the tolerance (via `limit`).
+#[derive(Clone, Debug, PartialEq)]
+struct TrendEntry {
+    name: String,
+    baseline: f64,
+    current: f64,
+    delta: f64,
+    /// (delta / baseline) × 100 — `None` exactly when the verdict is
+    /// `no-ratchet` (a non-positive baseline has no meaningful ratio).
+    delta_pct: Option<f64>,
+    /// baseline × [`RATCHET_TOLERANCE`] — the worst current this metric
+    /// tolerates; `None` for `no-ratchet`.
+    limit: Option<f64>,
+    verdict: RatchetVerdict,
+}
+
+/// Pure ratchet math for one metric: improvements pass freely; a current
+/// beyond baseline × 1.15 fails; exactly-at-limit is WITHIN (the rule is
+/// "no WORSE than ×1.15"); a non-positive baseline never ratchets.
+fn ratchet_entry(name: &str, baseline: f64, current: f64) -> TrendEntry {
+    let delta = current - baseline;
+    if baseline <= 0.0 {
+        return TrendEntry {
+            name: name.to_string(),
+            baseline,
+            current,
+            delta,
+            delta_pct: None,
+            limit: None,
+            verdict: RatchetVerdict::NoRatchet,
+        };
+    }
+    let limit = baseline * RATCHET_TOLERANCE;
+    let verdict = if current < baseline {
+        RatchetVerdict::Improved
+    } else if current > limit {
+        RatchetVerdict::Beyond
+    } else {
+        RatchetVerdict::Within
+    };
+    TrendEntry {
+        name: name.to_string(),
+        baseline,
+        current,
+        delta,
+        delta_pct: Some(delta / baseline * 100.0),
+        limit: Some(limit),
+        verdict,
+    }
+}
+
+/// The whole trend evaluation for one run. `gated` is true only on the
+/// ratchet's gate platform — CI mode, whose canonical baseline this is
+/// (local and other platforms pass `--baseline` for a reporting-only
+/// block, the same platform discipline as the absolute gates). `passed`
+/// is the pure math verdict (no metric Beyond); whether it FAILS the run
+/// is `gated && !passed`.
+#[derive(Clone, Debug, PartialEq)]
+struct TrendBlock {
+    baseline_path: String,
+    baseline_git_sha: Option<String>,
+    baseline_os: Option<String>,
+    gated: bool,
+    passed: bool,
+    entries: Vec<TrendEntry>,
+}
+
+impl TrendBlock {
+    /// The wire verdict: a non-gated run never claims pass/fail authority.
+    fn verdict_str(&self) -> &'static str {
+        if !self.gated {
+            "report-only"
+        } else if self.passed {
+            "pass"
+        } else {
+            "fail"
+        }
+    }
+
+    /// Whether this trend fails the RUN (the additive gate).
+    fn fails_run(&self) -> bool {
+        self.gated && !self.passed
+    }
+}
+
+/// Evaluate the ratchet over EVERY gated metric: the current run's gate
+/// verdicts carry the current measured values, the baseline supplies the
+/// priors, matched by gate name. A current gate the baseline lacks is a
+/// schema mismatch — a LOUD named error, never a silently skipped row.
+fn evaluate_trend(
+    gates: &GateReport,
+    baseline: &BaselineFigures,
+    baseline_path: &str,
+    gated: bool,
+) -> Result<TrendBlock, String> {
+    let mut entries = Vec::with_capacity(gates.verdicts.len());
+    for verdict in &gates.verdicts {
+        let prior = baseline.lookup(verdict.name).ok_or_else(|| {
+            format!(
+                "baseline {baseline_path} schema mismatch: it lacks the gated \
+                 metric {:?} — regenerate the baseline with --write-baseline",
+                verdict.name
+            )
+        })?;
+        entries.push(ratchet_entry(verdict.name, prior, verdict.measured));
+    }
+    let passed = !entries
+        .iter()
+        .any(|entry| entry.verdict == RatchetVerdict::Beyond);
+    Ok(TrendBlock {
+        baseline_path: baseline_path.to_string(),
+        baseline_git_sha: baseline.git_sha.clone(),
+        baseline_os: baseline.os.clone(),
+        gated,
+        passed,
+        entries,
+    })
+}
+
+/// The `trend` report block. ADDITIVE — the report schema stays 1 per the
+/// bump policy on [`REPORT_SCHEMA_VERSION`].
+fn trend_json(trend: &TrendBlock) -> serde_json::Value {
+    let metrics: Vec<serde_json::Value> = trend
+        .entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": entry.name,
+                "baseline": entry.baseline,
+                "current": entry.current,
+                "delta": entry.delta,
+                "delta_pct": entry.delta_pct,
+                "ratchet_limit": entry.limit,
+                "verdict": entry.verdict.as_str(),
+                "note": match entry.verdict {
+                    RatchetVerdict::NoRatchet => Some(
+                        "baseline <= 0: the x1.15 ratchet is meaningless on a non-positive \
+                         figure (it would tighten, not tolerate); the absolute budget \
+                         still gates this metric",
+                    ),
+                    _ => None,
+                },
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "policy": "ADDITIVE to the absolute gates (a gate-platform run must pass both): no \
+                   gated metric worse than baseline x RATCHET_TOLERANCE; improvements \
+                   accepted freely; a non-positive baseline never ratchets (surfaced as \
+                   no-ratchet, absolute budget still applies); the ratchet gates CI mode \
+                   only — the canonical baseline's own leg — every other run reports \
+                   without gating",
+        "baseline_path": trend.baseline_path,
+        "baseline_git_sha": trend.baseline_git_sha,
+        "baseline_os": trend.baseline_os,
+        "tolerance": RATCHET_TOLERANCE,
+        "gated": trend.gated,
+        "verdict": trend.verdict_str(),
+        "metrics": metrics,
+    })
+}
+
+/// Every ratchet verdict to STDERR, naming the four figures the spec
+/// demands (baseline, current, delta, tolerance/limit), plus the block
+/// summary — a report-only Beyond is called out as would-fail-there, never
+/// swallowed (surfaced, not silent).
+fn emit_trend_notes(trend: &TrendBlock) {
+    for entry in &trend.entries {
+        match entry.verdict {
+            RatchetVerdict::NoRatchet => note(&format!(
+                "ratchet {:<34} baseline {:>10.4} -> current {:>10.4}  delta {:+.4}  \
+                 [baseline <= 0: no ratchet — the absolute budget still gates this metric]",
+                entry.name, entry.baseline, entry.current, entry.delta
+            )),
+            RatchetVerdict::Improved | RatchetVerdict::Within | RatchetVerdict::Beyond => {
+                note(&format!(
+                    "ratchet {:<34} baseline {:>10.4} -> current {:>10.4}  delta {:+.4} \
+                 ({:+.1}% vs baseline)  tolerance x{RATCHET_TOLERANCE} (limit {:.4}) — {}",
+                    entry.name,
+                    entry.baseline,
+                    entry.current,
+                    entry.delta,
+                    // Non-no-ratchet verdicts always carry the ratio + limit.
+                    entry.delta_pct.unwrap_or_default(),
+                    entry.limit.unwrap_or_default(),
+                    entry.verdict.as_str(),
+                ))
+            }
+        }
+    }
+    let beyond = trend
+        .entries
+        .iter()
+        .filter(|entry| entry.verdict == RatchetVerdict::Beyond)
+        .count();
+    if trend.gated {
+        if trend.passed {
+            note(&format!(
+                "ratchet: PASS vs baseline {} (tolerance x{RATCHET_TOLERANCE})",
+                trend.baseline_path
+            ));
+        } else {
+            note(&format!(
+                "ratchet: FAIL — {beyond} metric(s) beyond baseline x {RATCHET_TOLERANCE} \
+                 vs {} (baseline/current/delta/limit per metric above; the report's trend \
+                 block carries the same figures) — exiting 1",
+                trend.baseline_path
+            ));
+        }
+    } else {
+        note(&format!(
+            "ratchet: REPORT-ONLY on this platform (the ratchet gates CI mode — the \
+             canonical baseline's own leg) vs {} — {beyond} metric(s) beyond tolerance \
+             would fail there",
+            trend.baseline_path
+        ));
+    }
+}
+
+/// The report written as the NEXT baseline: the fresh report with any
+/// `trend` block STRIPPED (a baseline is a self-contained measurement —
+/// nesting the comparison it was produced under would grow stale data every
+/// refresh; `parse_baseline` tolerates a stale one, but never writes one).
+fn baseline_report_json(report: &serde_json::Value) -> serde_json::Value {
+    let mut clean = report.clone();
+    if let Some(object) = clean.as_object_mut() {
+        object.remove("trend");
+    }
+    clean
+}
+
+// ---------------------------------------------------------------------------
 // The harness
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Story 15-5: the flag surface (--baseline / --write-baseline). Parsed
+    // FIRST so a usage error cannot waste a minute of measurement; invalid
+    // usage exits 2 (the env-override convention).
+    let cli = match parse_cli_args(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(cli) => cli,
+        Err(reason) => {
+            note(&format!("{reason} — exiting 2"));
+            std::process::exit(2);
+        }
+    };
     let config = HarnessConfig::from_env();
+    // The baseline loads (and validates) BEFORE anything is spawned, for the
+    // same fail-fast reason — a missing/corrupt/schema-mismatched baseline
+    // is a loud named error + exit 2, never a silent no-trend run. The
+    // ratchet GATES only in CI mode (the canonical baseline's own leg);
+    // everywhere else the trend is report-only.
+    let baseline = match &cli.baseline {
+        Some(path) => match load_baseline(std::path::Path::new(path)) {
+            Ok(figures) => {
+                note(&format!(
+                    "baseline loaded: {path} (git_sha {}, os {}) — trend will be \
+                     reported{}",
+                    figures.git_sha.as_deref().unwrap_or("unknown"),
+                    figures.os.as_deref().unwrap_or("unknown"),
+                    if config.ci {
+                        " and the ratchet GATES this run (CI mode)"
+                    } else {
+                        " (report-only: the ratchet gates CI mode, the canonical \
+                         baseline's own leg)"
+                    }
+                ));
+                Some((path.clone(), figures))
+            }
+            Err(reason) => {
+                note(&format!("{reason} — exiting 2"));
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
     // The liveness gate BEFORE anything is spawned: the orphan bound must
     // cover the gated windows PLUS the subscriber-overhead addendum window
     // (the same heartbeat idlers are measured in both).
@@ -851,7 +1354,7 @@ fn main() {
         1.0
     };
     let gates = evaluate_gates(p99, &figures, &subscriber_overhead, tolerance);
-    let report = build_report(
+    let mut report = build_report(
         &config,
         &reads,
         p99,
@@ -863,7 +1366,59 @@ fn main() {
         &gates,
         &subscriber_overhead,
     );
+    // ---- The trend block + ratchet (story 15-5), ADDITIVE to the gates:
+    // inserted only when --baseline was given, so the default report stays
+    // byte-equivalent. The ratchet fails the run (exit 1 below) only on its
+    // gate platform — CI mode; every other run reports without gating. ----
+    let mut ratchet_failed = false;
+    if let Some((path, figures)) = &baseline {
+        match evaluate_trend(&gates, figures, path, config.ci) {
+            Ok(trend) => {
+                emit_trend_notes(&trend);
+                ratchet_failed = trend.fails_run();
+                if let Some(object) = report.as_object_mut() {
+                    object.insert("trend".to_string(), trend_json(&trend));
+                    if ratchet_failed {
+                        // The additive gate failed: the run's overall status
+                        // must say fail even with every absolute gate green.
+                        object.insert(
+                            "status".to_string(),
+                            serde_json::Value::String("fail".to_string()),
+                        );
+                    }
+                }
+            }
+            Err(reason) => {
+                note(&format!("{reason} — exiting 2"));
+                std::process::exit(2);
+            }
+        }
+    }
     print_report(&report, &gates);
+    // ---- --write-baseline: the fresh report (trend stripped) as the next
+    // baseline. The operator asked for the FILE, so a write failure is a
+    // loud error that fails the run (exit 2 below) — unlike the optional
+    // PERF_BUDGETS_REPORT_PATH artifact below, whose failure is only noted
+    // (stdout — the measured record — is unaffected there). ----
+    let mut baseline_write_failed = false;
+    if let Some(path) = &cli.write_baseline {
+        let fresh = baseline_report_json(&report);
+        let written = serde_json::to_string_pretty(&fresh)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => note(&format!(
+                "baseline written to {path} (the next baseline; commit it via the \
+                 documented PR procedure — the visible diff IS the ratification)"
+            )),
+            Err(e) => {
+                baseline_write_failed = true;
+                note(&format!(
+                    "could not write the baseline to {path} ({e}) — exiting 2"
+                ));
+            }
+        }
+    }
     if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
         match serde_json::to_string_pretty(&report)
             .map_err(|e| e.to_string())
@@ -896,10 +1451,14 @@ fn main() {
     drop(manifest_tmp);
     note("teardown complete: running instances stopped, hermetic roots removed");
 
-    if !gates.passed {
+    if !gates.passed || ratchet_failed {
         // The measured record is already on stdout; exit nonzero so the CI
-        // perf-budgets job (and any local gate runner) fails on the regression.
+        // perf-budgets job (and any local gate runner) fails on the
+        // regression — an absolute-budget failure OR a ratchet failure.
         std::process::exit(1);
+    }
+    if baseline_write_failed {
+        std::process::exit(2);
     }
 }
 
@@ -1373,7 +1932,34 @@ fn print_report(report: &serde_json::Value, gates: &GateReport) {
             if verdict.passed { "PASS" } else { "FAIL" },
         );
     }
-    let status = if gates.passed { "pass" } else { "fail" };
+    // The trend table (present only when --baseline was given — the default
+    // invocation prints nothing here, byte-equivalent to the pre-15-5 form).
+    if let Some(trend) = report["trend"].as_object() {
+        let gated = trend["gated"].as_bool().unwrap_or(false);
+        println!(
+            "PERF BUDGETS — trend vs baseline {} (ratchet x{}, {}):",
+            trend["baseline_path"],
+            trend["tolerance"],
+            if gated { "GATED" } else { "report-only" },
+        );
+        if let Some(metrics) = trend["metrics"].as_array() {
+            for metric in metrics {
+                println!(
+                    "  trend {:<34} baseline={:>10.4}  current={:>10.4}  delta={:>9.4}  limit={:>10}  {}",
+                    metric["name"],
+                    metric["baseline"],
+                    metric["current"],
+                    metric["delta"],
+                    metric["ratchet_limit"],
+                    metric["verdict"],
+                );
+            }
+        }
+    }
+    // The overall status comes from the REPORT (a ratchet failure flips it
+    // even with every absolute gate green — the gates table above stays the
+    // absolute gates' own record).
+    let status = report["status"].as_str().unwrap_or("fail");
     println!("PERF BUDGETS: {status}");
     println!("\n----- perf-budgets report (JSON, schema v{REPORT_SCHEMA_VERSION}) -----");
     println!(
@@ -1806,5 +2392,392 @@ mod tests {
         // and RSS keep gating at strict budget.
         assert!((ci.verdicts[0].effective_budget - BUDGET_READ_P99_MS).abs() < 1e-9);
         assert!((ci.verdicts[1].effective_budget - BUDGET_RSS_PER_INSTANCE_MIB).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 15-5: the ratchet + the baseline load error arms
+    // -----------------------------------------------------------------------
+
+    /// A syntactically valid baseline covering the seven gated metrics with
+    /// the given measured values, zipped onto the canonical gate order (the
+    /// order `evaluate_gates` emits — pinned by the tests above).
+    fn baseline_json_with(measured: &[f64]) -> String {
+        let reference = evaluate_gates(5.0, &healthy_steady(), &quiet_subscriber(), 1.0);
+        let gates: Vec<serde_json::Value> = reference
+            .verdicts
+            .iter()
+            .zip(measured)
+            .map(|(verdict, value)| serde_json::json!({ "name": verdict.name, "measured": value }))
+            .collect();
+        serde_json::json!({
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "environment": { "git_sha": "deadbee", "os": "linux" },
+            "gates": gates,
+        })
+        .to_string()
+    }
+
+    /// Parse a baseline and evaluate the trend against a report whose gated
+    /// measured values are `current` (same trick: zipped onto the canonical
+    /// gate order via `evaluate_gates` inputs chosen to produce them).
+    fn trend_for(baseline_text: &str, current: &[f64], gated: bool) -> Result<TrendBlock, String> {
+        let figures = parse_baseline(baseline_text, "test-baseline.json")?;
+        // Rebuild a GateReport whose measured values ARE `current` by
+        // evaluating the reference gates and overwriting each measured
+        // figure (the ratchet reads only name + measured).
+        let mut gates = evaluate_gates(5.0, &healthy_steady(), &quiet_subscriber(), 1.0);
+        for (verdict, value) in gates.verdicts.iter_mut().zip(current) {
+            verdict.measured = *value;
+        }
+        evaluate_trend(&gates, &figures, "test-baseline.json", gated)
+    }
+
+    /// The seven reference figures: read p99, RSS mean, RSS max, CPU, then
+    /// the three subscriber deltas — all meaningfully positive so every
+    /// metric exercises the real ×1.15 arithmetic.
+    const SEVEN: [f64; 7] = [5.0, 10.0, 20.0, 1.0, 0.1, 0.5, 10.0];
+
+    #[test]
+    fn cli_args_parse_both_flags_in_both_value_forms() {
+        let argv: Vec<String> = ["--baseline", "b.json", "--write-baseline", "w.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_cli_args(&argv).unwrap(),
+            CliArgs {
+                baseline: Some("b.json".into()),
+                write_baseline: Some("w.json".into()),
+            }
+        );
+        let argv: Vec<String> = ["--write-baseline=w.json", "--baseline=b.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_cli_args(&argv).unwrap(),
+            CliArgs {
+                baseline: Some("b.json".into()),
+                write_baseline: Some("w.json".into()),
+            }
+        );
+        assert_eq!(parse_cli_args(&[]).unwrap(), CliArgs::default());
+        // Each flag alone.
+        let argv: Vec<String> = ["--baseline", "only.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_cli_args(&argv).unwrap(),
+            CliArgs {
+                baseline: Some("only.json".into()),
+                write_baseline: None
+            }
+        );
+    }
+
+    #[test]
+    fn cli_args_reject_unknown_missing_duplicate_and_empty_values() {
+        let bad = |argv: &[&str]| {
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            parse_cli_args(&owned).expect_err("must be rejected")
+        };
+        let err = bad(&["--nonsense"]);
+        assert!(err.contains("unknown argument"), "{err}");
+        let err = bad(&["--baseline"]);
+        assert!(err.contains("--baseline requires a file path"), "{err}");
+        let err = bad(&["--baseline=", "--write-baseline", "w.json"]);
+        assert!(err.contains("non-empty file path"), "{err}");
+        let err = bad(&["--baseline", "a.json", "--baseline", "b.json"]);
+        assert!(err.contains("more than once"), "{err}");
+        let err = bad(&["b.json"]);
+        assert!(err.contains("unknown argument"), "{err}");
+    }
+
+    #[test]
+    fn missing_baseline_file_is_a_loud_named_error() {
+        // A path that cannot exist (never created); the error must NAME it.
+        let missing = std::env::temp_dir().join("perf-budgets-15-5-absent-baseline.json");
+        let err = load_baseline(&missing).expect_err("a missing baseline must fail loudly");
+        assert!(
+            err.contains(&missing.display().to_string()),
+            "the error must name the file: {err}"
+        );
+        assert!(err.contains("cannot read the baseline file"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_and_schema_mismatched_baselines_are_named_errors() {
+        let err = parse_baseline("{ not json", "corrupt.json").expect_err("must fail");
+        assert!(
+            err.contains("corrupt.json") && err.contains("not valid JSON"),
+            "{err}"
+        );
+        let err = parse_baseline("[1,2]", "corrupt.json").expect_err("must fail");
+        assert!(err.contains("corrupt"), "{err}");
+        // Schema mismatch (a future breaking shape bumps the version and old
+        // baselines must be refused BY NAME, never mis-read).
+        let future = baseline_json_with(&SEVEN).replace(
+            &format!("\"schema_version\":{REPORT_SCHEMA_VERSION}"),
+            "\"schema_version\":2",
+        );
+        let err = parse_baseline(&future, "future.json").expect_err("must fail");
+        assert!(
+            err.contains("schema mismatch") && err.contains("future.json"),
+            "{err}"
+        );
+        // Missing schema_version, missing gates, empty gates, gate without a
+        // numeric measured, duplicate gate — every arm named.
+        let err = parse_baseline("{}", "empty.json").expect_err("must fail");
+        assert!(err.contains("schema_version"), "{err}");
+        let no_gates = serde_json::json!({ "schema_version": REPORT_SCHEMA_VERSION }).to_string();
+        let err = parse_baseline(&no_gates, "no-gates.json").expect_err("must fail");
+        assert!(err.contains("gates array is missing"), "{err}");
+        let empty_gates = serde_json::json!({
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "gates": [],
+        })
+        .to_string();
+        let err = parse_baseline(&empty_gates, "empty-gates.json").expect_err("must fail");
+        assert!(err.contains("gates array is empty"), "{err}");
+        let unmeasured = serde_json::json!({
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "gates": [{ "name": "read_p99_lt_1s" }],
+        })
+        .to_string();
+        let err = parse_baseline(&unmeasured, "unmeasured.json").expect_err("must fail");
+        assert!(err.contains("lacks a numeric measured value"), "{err}");
+        let duplicated = serde_json::json!({
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "gates": [
+                { "name": "read_p99_lt_1s", "measured": 5.0 },
+                { "name": "read_p99_lt_1s", "measured": 6.0 },
+            ],
+        })
+        .to_string();
+        let err = parse_baseline(&duplicated, "dup.json").expect_err("must fail");
+        assert!(err.contains("appears twice"), "{err}");
+        // A stale nested trend key is IGNORED (only the gated figures are
+        // load-bearing) — a refresh committed before the strip rule loads.
+        let mut stale = serde_json::from_str::<serde_json::Value>(&baseline_json_with(&SEVEN))
+            .expect("valid json");
+        stale["trend"] = serde_json::json!({ "stale": true });
+        assert!(parse_baseline(&stale.to_string(), "stale.json").is_ok());
+    }
+
+    #[test]
+    fn baseline_parse_extracts_figures_and_provenance() {
+        let figures = parse_baseline(&baseline_json_with(&SEVEN), "ok.json").expect("must parse");
+        assert_eq!(figures.schema_version, REPORT_SCHEMA_VERSION);
+        assert_eq!(figures.git_sha.as_deref(), Some("deadbee"));
+        assert_eq!(figures.os.as_deref(), Some("linux"));
+        assert_eq!(figures.lookup("read_p99_lt_1s"), Some(5.0));
+        assert_eq!(figures.lookup("cpu_per_instance_le_2pct"), Some(1.0));
+        assert_eq!(
+            figures.lookup("subscriber_read_p99_delta_le_budget"),
+            Some(10.0)
+        );
+        assert_eq!(figures.lookup("no_such_gate"), None);
+        assert_eq!(figures.measured_by_gate.len(), 7);
+    }
+
+    #[test]
+    fn ratchet_improvements_pass_freely() {
+        let improved: [f64; 7] = [4.0, 9.0, 18.0, 0.5, 0.05, 0.4, 9.0];
+        let trend = trend_for(&baseline_json_with(&SEVEN), &improved, true).unwrap();
+        assert!(trend.passed && trend.gated && !trend.fails_run());
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Improved));
+        let entry = &trend.entries[0];
+        assert!((entry.delta - (-1.0)).abs() < 1e-9);
+        assert!((entry.delta_pct.unwrap() - (-20.0)).abs() < 1e-9);
+        assert!((entry.limit.unwrap() - 5.0 * RATCHET_TOLERANCE).abs() < 1e-9);
+        assert_eq!(trend.verdict_str(), "pass");
+    }
+
+    #[test]
+    fn ratchet_within_tolerance_passes_and_the_boundary_is_inclusive() {
+        // +10% on every metric — inside 1.15.
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.10);
+        let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, true).unwrap();
+        assert!(trend.passed && !trend.fails_run(), "{trend:?}");
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Within));
+        // EXACTLY at baseline × 1.15 is still within: the rule is "no WORSE
+        // than ×1.15" (the ratchet's own bound discipline — the read gate's
+        // strict < does not apply here).
+        let at_limit: [f64; 7] = SEVEN.map(|value| value * RATCHET_TOLERANCE);
+        let trend = trend_for(&baseline_json_with(&SEVEN), &at_limit, true).unwrap();
+        assert!(trend.passed, "exactly-at-limit must be within: {trend:?}");
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Within));
+    }
+
+    #[test]
+    fn ratchet_beyond_tolerance_fails_naming_all_four_figures() {
+        // +20% on every metric — beyond 1.15: the gated run fails, and each
+        // entry carries the baseline, the current, the delta, and the
+        // tolerance's limit (the four figures every verdict must name).
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.20);
+        let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, true).unwrap();
+        assert!(!trend.passed && trend.fails_run(), "{trend:?}");
+        assert_eq!(trend.verdict_str(), "fail");
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Beyond));
+        let entry = &trend.entries[0];
+        assert!((entry.baseline - 5.0).abs() < 1e-9);
+        assert!((entry.current - 6.0).abs() < 1e-9);
+        assert!((entry.delta - 1.0).abs() < 1e-9);
+        assert!(
+            (entry.limit.unwrap() - 5.75).abs() < 1e-9,
+            "limit = baseline x 1.15"
+        );
+        assert!((entry.delta_pct.unwrap() - 20.0).abs() < 1e-9);
+        // One drifted metric alone fails the whole ratchet (the additive
+        // gate is per-metric, like the absolute gates).
+        let mut one = SEVEN;
+        one[3] *= 1.20;
+        let trend = trend_for(&baseline_json_with(&SEVEN), &one, true).unwrap();
+        assert!(!trend.passed, "{trend:?}");
+        assert_eq!(trend.entries[3].verdict, RatchetVerdict::Beyond);
+        assert_eq!(trend.entries[0].verdict, RatchetVerdict::Within);
+    }
+
+    #[test]
+    fn non_positive_baselines_never_ratchet() {
+        // ×1.15 on a negative figure TIGHTENS the bound below the baseline
+        // (a tolerance must absorb noise, never add strictness), and ×1.15
+        // on zero bounds everything above zero — both noise arithmetic. The
+        // verdict is the surfaced no-ratchet; the absolute budget still
+        // gates the metric (the report's note says exactly that).
+        for baseline_value in [0.0, -0.015] {
+            let entry = ratchet_entry("subscriber_cpu_delta_le_budget", baseline_value, 0.25);
+            assert_eq!(entry.verdict, RatchetVerdict::NoRatchet, "{entry:?}");
+            assert_eq!(entry.limit, None);
+            assert_eq!(entry.delta_pct, None);
+            assert!((entry.delta - (0.25 - baseline_value)).abs() < 1e-9);
+        }
+        // In the block: a zero-baseline metric whose current is far above it
+        // does NOT fail even the GATED ratchet — the other six stay within.
+        let mut baseline = SEVEN;
+        baseline[4] = 0.0; // subscriber CPU Δ measured exactly zero
+        let trend = trend_for(&baseline_json_with(&baseline), &SEVEN, true).unwrap();
+        assert!(trend.passed && !trend.fails_run(), "{trend:?}");
+        assert_eq!(trend.entries[4].verdict, RatchetVerdict::NoRatchet);
+        // The JSON arm surfaces the reason (surfaced, not silent).
+        let json = trend_json(&trend);
+        let note = json["metrics"][4]["note"].as_str().unwrap_or_default();
+        assert!(
+            note.contains("no-ratchet is meaningless") || note.contains("baseline <= 0"),
+            "{note}"
+        );
+        assert_eq!(json["metrics"][4]["ratchet_limit"].as_null(), Some(()));
+    }
+
+    #[test]
+    fn non_gate_platforms_report_without_gating() {
+        // The same +20% drift on a NON-gate platform (local/other-OS run):
+        // the trend names every Beyond verdict, but the run does not gate —
+        // verdict_str is report-only and fails_run is false.
+        let drifted: [f64; 7] = SEVEN.map(|value| value * 1.20);
+        let trend = trend_for(&baseline_json_with(&SEVEN), &drifted, false).unwrap();
+        assert!(!trend.passed, "the math verdict still names the drift");
+        assert!(
+            !trend.fails_run(),
+            "a non-gate platform never ratchet-gates"
+        );
+        assert_eq!(trend.verdict_str(), "report-only");
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Beyond));
+    }
+
+    #[test]
+    fn round_trip_against_a_baseline_of_itself_is_all_within() {
+        // The spec's own verification shape: a report compared against a
+        // baseline carrying its own figures — every delta zero, every
+        // verdict within, the gated ratchet passes.
+        let trend = trend_for(&baseline_json_with(&SEVEN), &SEVEN, true).unwrap();
+        assert!(trend.passed && !trend.fails_run(), "{trend:?}");
+        assert_eq!(trend.entries.len(), 7);
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| e.verdict == RatchetVerdict::Within));
+        assert!(trend.entries.iter().all(|e| (e.delta).abs() < 1e-9));
+        assert!(trend
+            .entries
+            .iter()
+            .all(|e| (e.delta_pct.unwrap()).abs() < 1e-9));
+    }
+
+    #[test]
+    fn a_baseline_missing_a_gated_metric_is_a_schema_mismatch() {
+        // Six of the seven gates present: the missing one is a LOUD named
+        // schema error — never a silently skipped trend row.
+        let short: Vec<f64> = SEVEN[..6].to_vec();
+        let err = trend_for(&baseline_json_with(&short), &SEVEN, true).expect_err("must fail");
+        assert!(err.contains("lacks the gated metric"), "{err}");
+        assert!(err.contains("subscriber_read_p99_delta_le_budget"), "{err}");
+        assert!(err.contains("test-baseline.json"), "names the file: {err}");
+    }
+
+    #[test]
+    fn written_baselines_strip_the_trend_block() {
+        let mut report = serde_json::json!({ "status": "pass", "gates": [] });
+        report["trend"] = serde_json::json!({ "verdict": "pass" });
+        let clean = baseline_report_json(&report);
+        assert!(
+            clean.get("trend").is_none(),
+            "the written baseline must not nest a trend"
+        );
+        assert!(clean.get("status").is_some());
+        // A report without a trend passes through byte-identically.
+        let plain = serde_json::json!({ "status": "pass" });
+        assert_eq!(baseline_report_json(&plain), plain);
+    }
+
+    #[test]
+    fn trend_json_carries_the_spec_fields() {
+        let trend = trend_for(&baseline_json_with(&SEVEN), &SEVEN, true).unwrap();
+        let json = trend_json(&trend);
+        assert_eq!(json["tolerance"].as_f64(), Some(RATCHET_TOLERANCE));
+        assert_eq!(json["gated"].as_bool(), Some(true));
+        assert_eq!(json["verdict"].as_str(), Some("pass"));
+        assert_eq!(json["baseline_git_sha"].as_str(), Some("deadbee"));
+        assert_eq!(json["baseline_os"].as_str(), Some("linux"));
+        assert_eq!(json["metrics"].as_array().map(Vec::len), Some(7));
+        for field in [
+            "name",
+            "baseline",
+            "current",
+            "delta",
+            "delta_pct",
+            "ratchet_limit",
+            "verdict",
+        ] {
+            assert!(
+                json["metrics"][0].get(field).is_some(),
+                "every trend row must carry {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ratchet_tolerance_is_pinned_at_1_15() {
+        // The spec-15.5 ratification: 15% absorbs same-leg CI noise while
+        // catching the multi-week drift class. Changing this number is a
+        // re-ratification that must edit this pin AND refresh the committed
+        // baseline in the same PR (docs/testing.md's update procedure).
+        assert_eq!(RATCHET_TOLERANCE, 1.15);
     }
 }
