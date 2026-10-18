@@ -2027,7 +2027,7 @@ fn plan_follow_at_end_of_log_consumes_nothing() {
 
 // ---- The bounded raw-BACKLOG window (follow prime; the between-commands gap) ----
 
-use super::interaction::{prime_backlog_lines, prime_backlog_window};
+use super::interaction::{prime_backlog_lines, prime_backlog_lines_chunked, prime_backlog_window};
 
 #[test]
 fn prime_backlog_window_with_n_below_total_starts_at_the_nth_from_last_line() {
@@ -2097,6 +2097,96 @@ fn prime_backlog_lines_on_an_absent_file_is_an_honest_empty_prime() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("never-written.log");
     assert_eq!(prime_backlog_lines(&path, 200).unwrap(), (0, 0));
+}
+
+#[test]
+fn prime_backlog_streaming_matches_the_pure_window_across_chunk_boundaries() {
+    // The streaming two-pass reader must agree with the pure ORACLE on every
+    // input shape. Chunk sizes 1..64 force newlines and window boundaries
+    // onto every position of the chunk arithmetic (1 = every byte is a
+    // boundary; a line spanning an edge is the interesting case), and the
+    // window sizes sweep below/at/above the total plus the defensive 0.
+    let mut shapes: Vec<Vec<u8>> = vec![
+        b"".to_vec(),
+        b"no newline at all".to_vec(),
+        b"\n".to_vec(),
+        b"\n\n\n".to_vec(),
+        b"l1\nl2\nl3\n".to_vec(),
+        b"l1\nl2\nl3".to_vec(), // trailing partial line: never primed
+        b"\ntrailing partial".to_vec(),
+        b"crlf line\r\nsecond\r\n".to_vec(), // '\r' is payload, '\n' terminates
+        vec![0xff, b'\n', 0x80, 0x81, b'\n', 0xfe], // non-UTF-8 raw payload
+    ];
+    // A deterministic larger shape with varied line lengths (a seeded
+    // sprinkle, so boundaries do not all sit at uniform offsets).
+    let mut lcg = 0x2545F4914F6CDD1Du64;
+    let mut varied = Vec::new();
+    for i in 0..500u32 {
+        let pad = (lcg % 17) as usize;
+        lcg = lcg
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        varied.extend_from_slice(format!("line {i} ").as_bytes());
+        varied.extend(std::iter::repeat_n(b'x', pad));
+        varied.push(b'\n');
+    }
+    shapes.push(varied);
+
+    for bytes in &shapes {
+        for n in [0u64, 1, 2, 3, 5, 200] {
+            let expected = prime_backlog_window(bytes, n);
+            for chunk in [1usize, 2, 3, 7, 64] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("agent.log");
+                std::fs::write(&path, bytes).unwrap();
+                assert_eq!(
+                    prime_backlog_lines_chunked(&path, n, chunk).unwrap(),
+                    expected,
+                    "streaming != oracle: n={n} chunk={chunk} bytes={:?}",
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(48)]),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prime_backlog_lines_primes_a_multi_chunk_file_at_the_real_chunk_size() {
+    // ~240 KB of varied lines spans several REAL 64 KiB chunks: the cursor
+    // the shipped path returns is a true line boundary and the bytes from it
+    // are exactly the last N complete lines (same integration shape as the
+    // small real-file pin above, at scale).
+    let lines_total = 20_000usize;
+    let n = 50usize;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.log");
+    let mut content = Vec::new();
+    let mut line_offsets = Vec::new();
+    for i in 0..lines_total {
+        let line = format!("agent output line {i}\n");
+        line_offsets.push(content.len() as u64);
+        content.extend_from_slice(line.as_bytes());
+    }
+    assert!(
+        content.len() > 3 * 64 * 1024,
+        "fixture must span several chunks, got {} bytes",
+        content.len()
+    );
+    std::fs::write(&path, &content).unwrap();
+
+    let expected_tail: Vec<u8> = (lines_total - n..lines_total)
+        .map(|i| format!("agent output line {i}\n").into_bytes())
+        .collect::<Vec<_>>()
+        .concat();
+    let (cursor, skipped) = prime_backlog_lines(&path, n as u64).unwrap();
+    assert_eq!(cursor, line_offsets[lines_total - n]);
+    assert_eq!(skipped, (lines_total - n) as u64);
+    assert_eq!(&content[cursor as usize..], expected_tail.as_slice());
+    // And the shipped path's answer agrees with the pure oracle.
+    assert_eq!(
+        prime_backlog_lines(&path, n as u64).unwrap(),
+        prime_backlog_window(&content, n as u64)
+    );
 }
 
 // ---- Story 4-2: engine-attributed line rendering (Task 4) ----
