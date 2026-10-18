@@ -761,6 +761,14 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     signal_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 16-3 — cfg(test) FAULT-INJECTION SEAM at the compensating store
+    /// write: an instance name listed here makes [`Supervisor::
+    /// compensate_transition`]'s registry write fail with an injected error,
+    /// driving the append-fails-AND-compensation-fails arm deterministically.
+    /// Same placement rationale as `signal_fault_names` above. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    compensation_fault_names: std::collections::HashSet<InstanceName>,
 }
 
 impl Supervisor {
@@ -787,6 +795,8 @@ impl Supervisor {
             poll_fault_pids: std::collections::HashSet::new(),
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            compensation_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -812,6 +822,8 @@ impl Supervisor {
             poll_fault_pids: std::collections::HashSet::new(),
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            compensation_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -837,6 +849,8 @@ impl Supervisor {
             poll_fault_pids: std::collections::HashSet::new(),
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            compensation_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -1170,16 +1184,19 @@ impl Supervisor {
         log_capture: Option<LogCapture>,
     ) -> Result<TransitionEvent, EngineError> {
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
-        append_event(&registry.instance_log_path(name), &event).map_err(|detail| {
-            EngineError::Log {
-                name: name.as_str().to_string(),
-                path: registry
-                    .instance_log_path(name)
-                    .to_string_lossy()
-                    .into_owned(),
-                detail,
-            }
-        })?;
+        if let Err(detail) = append_event(&registry.instance_log_path(name), &event) {
+            // Story 16-3: the state COMMITTED but the event never landed — the
+            // row and the audit log disagree. COMPENSATE the row back to
+            // `prior` (the state the last durably-landed event supports) so the
+            // observable end-state is `prior + an error`, never `new + silence`
+            // (surfaced, not silent, AI-18). Never fabricates a synthetic
+            // event: that would trust the medium that just failed.
+            let path = registry
+                .instance_log_path(name)
+                .to_string_lossy()
+                .into_owned();
+            return Err(self.compensate_transition(registry, name, prior, new, path, detail));
+        }
         // Story 7-2: the append COMMITTED — publish onto the event bus. After
         // the durable append (never before: a subscriber never sees an
         // uncommitted event), before the best-effort text mirror below, so the
@@ -1199,7 +1216,62 @@ impl Supervisor {
         Ok(event)
     }
 
-    /// The output-capture handle this engine session currently holds for
+    /// Story 16-3: settle the registry row back to `prior` after a committed
+    /// transition's durable event append FAILED. Best-effort but LOUD: on
+    /// success the surfaced error names the compensation; on compensation
+    /// failure the error names BOTH failures and the row stays at `new` (the
+    /// honestly-stuck state — a compensating retry loop is out of scope by
+    /// the spec's Never list). Runs under the supervisor lock
+    /// (`record_transition`'s caller discipline) — no new locking.
+    fn compensate_transition(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        path: String,
+        append_detail: String,
+    ) -> EngineError {
+        let compensated = {
+            // cfg(test) FAULT-INJECTION SEAM (AI-9/AI-12 precedent): when the
+            // instance is armed, the compensating store write fails with an
+            // injected error, driving the double-failure arm deterministically
+            // in the lib's own tests without staging a real store outage.
+            // State lives on the supervisor (per-supervisor, test-isolated by
+            // construction); never compiled outside test builds.
+            #[cfg(test)]
+            if self.compensation_fault_names.contains(name) {
+                Err(super::error::RegistryError::Io {
+                    name: name.as_str().to_string(),
+                    path: path.clone(),
+                    source: std::io::Error::other("injected compensation fault (test seam)"),
+                })
+            } else {
+                registry.set_state(name, prior)
+            }
+            #[cfg(not(test))]
+            registry.set_state(name, prior)
+        };
+        match compensated {
+            Ok(()) => EngineError::Log {
+                name: name.as_str().to_string(),
+                path,
+                detail: format!(
+                    "{append_detail}; the committed '{new}' state was \
+                     compensated back to '{prior}' — the row reflects the last \
+                     event that durably landed"
+                ),
+            },
+            Err(comp) => EngineError::Log {
+                name: name.as_str().to_string(),
+                path,
+                detail: format!(
+                    "{append_detail}; COMPENSATION ALSO FAILED: the row is \
+                     stuck at '{new}'; compensating write error: {comp}"
+                ),
+            },
+        }
+    }
     /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
     /// `self.running` entry (not started this session, already torn down, or
     /// adopted with no recoverable capture pipeline).
