@@ -93,11 +93,15 @@ fn write_real_stderr(bytes: &[u8]) {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::FromRawHandle;
-        // SAFETY: the Windows equivalent of the Unix arm — handle 2 is the
-        // process's standard error, and the `ManuallyDrop` wrapper writes
-        // through it without ever closing a handle the process owns.
-        let mut stderr = ManuallyDrop::new(unsafe { File::from_raw_handle(2) });
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        // SAFETY: the Windows equivalent of the Unix arm. The real stderr
+        // HANDLE is taken from `std::io::stderr()` (NOT the integer 2 — on
+        // Windows that is the CRT fd number, not a `HANDLE`; constructing one
+        // from it would yield an invalid handle whose writes fail silently).
+        // `ManuallyDrop` guarantees the wrapper never closes the handle —
+        // the process owns it.
+        let raw = std::io::stderr().as_raw_handle();
+        let mut stderr = ManuallyDrop::new(unsafe { File::from_raw_handle(raw) });
         let _ = stderr.write_all(bytes);
     }
     #[cfg(not(any(unix, windows)))]
@@ -157,6 +161,12 @@ mod tests {
             .args([full_test_name(test).as_str(), "--exact"])
             .env(child_env, "1")
             .env("LLVM_PROFILE_FILE", crate::helper_profile_env())
+            // The child must run CAPTURED for the differential to hold: if
+            // the parent was started with RUST_TEST_NOCAPTURE set (or any
+            // --nocapture equivalent leaked into the env), the control
+            // token would reach the pipe too and the round-trip pin would
+            // fail spuriously. The pin tests capture behavior — force it.
+            .env_remove("RUST_TEST_NOCAPTURE")
             .stdout(Stdio::null())
             .stderr(stderr)
             .spawn()
