@@ -55,6 +55,7 @@ use hekma_adapter_api::{
 };
 
 pub mod tck;
+pub mod test_notes;
 pub mod test_support;
 pub mod uj3;
 
@@ -69,6 +70,9 @@ pub use tck::{
 pub use test_support::{
     exit_helper_subprocess, fake_acp_agent_bin, fake_agent_bin, helper_profile_env,
 };
+// The uncaptured skip-note helper (story 16-1) gets the same crate-root
+// stability: the smokes' call sites read `hekma_conformance::note_uncaptured`.
+pub use test_notes::note_uncaptured;
 
 /// The kind string the mock adapter registers under.
 pub const MOCK_KIND: &str = "mock";

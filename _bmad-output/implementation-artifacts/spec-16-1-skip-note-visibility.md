@@ -2,7 +2,7 @@
 title: 'Skip-note visibility: uncaptured stderr notes for the real-agent smokes (fd-2 direct write)'
 type: 'bugfix'
 created: '2026-10-18'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: '31519f74bad018a151d48870a4b8e33a1a01641a'
 context: []
@@ -50,10 +50,10 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `hekma-conformance` — `note_uncaptured(msg: &str)` writing to fd 2 via `std::fs::File::from_raw_fd(2)` (Unix) / the Windows equivalent (`std::os::windows::io` raw handle), best-effort, never panicking; unit pins for both the round-trip and the closed-pipe arm.
-- [ ] `acp_lifecycle.rs` — the 6 skip-note sites switch to the helper; the silent binary-absent returns in the three register/start/send/stop smokes gain the same noted skip.
-- [ ] `docs/testing.md` — the visibility sentence updated.
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` — story 16-1 row; `deferred-work.md` — the 15-1 entry's resolved marker at merge.
+- [x] `hekma-conformance` — `note_uncaptured(msg: &str)` writing to fd 2 via `std::fs::File::from_raw_fd(2)` (Unix) / the Windows equivalent (`std::os::windows::io` raw handle), best-effort, never panicking; unit pins for both the round-trip and the closed-pipe arm.
+- [x] `acp_lifecycle.rs` — the 6 skip-note sites switch to the helper; the silent binary-absent returns in the three register/start/send/stop smokes gain the same noted skip.
+- [x] `docs/testing.md` — the visibility sentence updated.
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` — story 16-1 row; `deferred-work.md` — the 15-1 entry's resolved marker at merge.
 
 **Acceptance Criteria:**
 - Given a plain `cargo test -p hekma-engine --test acp_lifecycle real_` with a real binary present but the turn env unset, when the run completes, then the turn-skip note is VISIBLE on the terminal while the test reports `ok`.
@@ -62,6 +62,20 @@ context: []
 - Gates: fmt / clippy / workspace tests / check_docs green; no test outcome changes anywhere.
 
 ## Spec Change Log
+
+- 2026-10-18 (implementation closeout): landed as specced — helper in a new
+  `test_notes` module beside `test_support` (re-exported at the crate root),
+  the 6 note sites switched, the 3 silent binary-absent skips gained notes,
+  testing.md flipped. Real-run evidence on this machine (opencode/hermes-acp/
+  gemini all present, turn env unset): plain `cargo test -p hekma-engine
+  --test acp_lifecycle real_` shows both TURN-unset notes while the turn
+  tests report `ok` (the acceptance grep counts 2 with NO `--nocapture`);
+  the `SMOKES=0` run shows all 5 notes under plain and `--nocapture` runs
+  BYTE-IDENTICAL (sorted-line diff empty). One environment note, NOT a
+  regression: `real_gemini_acp_smoke_register_start_send_stop_when_present`
+  fails identically on the baseline tree (this machine's Gemini CLI is
+  logged out — the documented -32000 session/new refusal; the I/O matrix's
+  failing-test diagnostics arm, unchanged by this story).
 
 ## Design Notes
 
