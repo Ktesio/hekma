@@ -1472,6 +1472,69 @@ const RAW_FALLBACK_QUALIFIER: &str = "lines that follow may be un-attributed raw
      passthrough from agent.log: they were captured without a live engine tailer, so their \
      timestamps are when this command read them, not when the agent wrote them";
 
+/// The bounded backlog window for `logs --follow`'s raw prime: at most this
+/// many COMPLETE lines of the between-commands gap stream at follow start
+/// (the lines a live tailer never attributed, written before the follow
+/// command began). Tunable via [`LOGS_BACKLOG_LINES_ENV`] — deliberately an
+/// env and not a flag, so the shipped CLI surface stays unchanged while
+/// pathological cases (a huge gap, a tiny terminal) stay tunable.
+const LOGS_BACKLOG_LINES_DEFAULT: u64 = 200;
+
+/// The env var overriding [`LOGS_BACKLOG_LINES_DEFAULT`]. A value that is
+/// absent falls back silently; a value that is present but not a positive
+/// integer falls back to the default WITH a stderr note naming the bad
+/// value — never a crash, never a silent 0.
+const LOGS_BACKLOG_LINES_ENV: &str = "HEKMA_LOGS_BACKLOG_LINES";
+
+/// Resolve the effective backlog window from the raw env value (pure — the
+/// env read and the stderr note live in [`backlog_lines_from_env`], so this
+/// is unit-testable): `None` (unset) → the default, silently; a positive
+/// integer → itself; anything else (non-numeric, zero, negative, empty) →
+/// the default PLUS the note to surface, quoting the offending value.
+fn resolve_backlog_lines(raw: Option<&str>) -> (u64, Option<String>) {
+    match raw {
+        None => (LOGS_BACKLOG_LINES_DEFAULT, None),
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => (n, None),
+            _ => (
+                LOGS_BACKLOG_LINES_DEFAULT,
+                Some(format!(
+                    "invalid {LOGS_BACKLOG_LINES_ENV} value {raw:?} (expected a positive \
+                     integer); using the default of {LOGS_BACKLOG_LINES_DEFAULT}"
+                )),
+            ),
+        },
+    }
+}
+
+/// Read [`LOGS_BACKLOG_LINES_ENV`] and resolve the window, surfacing the
+/// fallback note (stderr, AD-12) when the value is garbage. Follow-path
+/// only: the one-shot `logs` never reads or notes this env.
+fn backlog_lines_from_env() -> u64 {
+    let (lines, note) =
+        resolve_backlog_lines(std::env::var(LOGS_BACKLOG_LINES_ENV).ok().as_deref());
+    if let Some(note) = note {
+        ui::note(note);
+    }
+    lines
+}
+
+/// The once-per-session raw-fallback qualifier, extended with the bounded
+/// window's skipped-beyond honesty: when the between-commands gap exceeded
+/// the window, the qualifier NAMES how many earlier complete lines the
+/// bound skipped (never a silent truncation). `skipped_beyond == 0` → the
+/// base qualifier byte-identical to its pre-window shape.
+fn raw_fallback_qualifier(skipped_beyond: u64) -> String {
+    if skipped_beyond == 0 {
+        RAW_FALLBACK_QUALIFIER.to_string()
+    } else {
+        format!(
+            "{RAW_FALLBACK_QUALIFIER}; the bounded backlog window skipped {skipped_beyond} \
+             earlier complete line(s) (tunable via {LOGS_BACKLOG_LINES_ENV})"
+        )
+    }
+}
+
 /// `hekma agent logs <name> [--follow]` — read retained logs, optionally
 /// following live output (story 4-2, FR-25, spine AD-12).
 ///
@@ -1508,6 +1571,18 @@ const RAW_FALLBACK_QUALIFIER: &str = "lines that follow may be un-attributed raw
 /// stderr ([`RAW_FALLBACK_QUALIFIER`]) — stdout stays pure NDJSON in both
 /// modes.
 ///
+/// The bounded BACKLOG prime (the between-commands gap): the raw cursor no
+/// longer starts at the file's current end — it starts at the last
+/// [`LOGS_BACKLOG_LINES_DEFAULT`] COMPLETE lines (tunable via
+/// [`LOGS_BACKLOG_LINES_ENV`]), so gap lines the agent wrote while NO engine
+/// session existed stream at follow start under the same qualifier. A gap
+/// larger than the window streams only its LAST N lines, and the qualifier
+/// names the skipped-beyond count (never a silent truncation); a fresh
+/// attributed capture (a live tailer in this session) primes nothing, so
+/// that path is byte-identical to the un-primed behavior; a garbage env
+/// value falls back to the default with a stderr note naming it. The
+/// one-shot `logs` and the attributed read path are untouched.
+///
 /// A downstream consumer that STOPS READING (`hekma agent logs --json | head -5`)
 /// ends the command CLEANLY with exit `0` in every mode — one-shot, `--follow`,
 /// human, or JSON (fix pass, M1: see [`emit_log_lines`]). It is not an error; the
@@ -1530,14 +1605,22 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
     if emit_log_lines(&lines, json)? == EmitOutcome::PipeClosed || !follow {
         return Ok(());
     }
-    // Story 15-2: prime the RAW `agent.log` fallback cursor for the
-    // between-commands window — a detached instance's output keeps landing in
-    // the raw capture while no live engine tailer exists to attribute it, and
-    // `None` primes at the current end so only lines written AFTER this
-    // command started stream through the loop below.
-    let (_, mut raw_cursor) = facade
-        .read_raw_output_since(name, None)
-        .map_err(map_engine_error)?;
+    // The bounded BACKLOG prime (the between-commands gap): instead of
+    // priming the raw cursor at the file's current end, resolve the window
+    // (env-tunable, garbage → default + note) and start the raw cursor at
+    // the last N COMPLETE lines — gap lines written while no engine session
+    // existed then stream on the loop's first poll, under the SAME un-
+    // attributed qualifier (extended with the skipped-beyond count when the
+    // gap exceeded the window). A live tailer in THIS session makes the
+    // prime a no-op at the current end, so a fresh attributed capture stays
+    // byte-identical to the un-primed behavior.
+    let (mut raw_cursor, skipped_beyond) = {
+        let backlog_lines = backlog_lines_from_env();
+        facade
+            .prime_raw_backlog(name, backlog_lines)
+            .map_err(map_engine_error)?
+    };
+    let raw_qualifier = raw_fallback_qualifier(skipped_beyond);
     // The un-attributed qualifier is surfaced ONCE PER SESSION (never per
     // poll) — the first time a raw fallback line actually appears.
     let mut raw_qualifier_shown = false;
@@ -1552,8 +1635,9 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
             return Ok(());
         }
         cursor = next_cursor;
-        // Story 15-2: the raw fallback poll — attributed lines first (above),
-        // then any raw lines that arrived in the same window. The engine's
+        // The raw fallback poll — attributed lines first (above), then any
+        // raw lines that arrived in the same window (the backlog prime's
+        // window content included, on this first pass). The engine's
         // live-capture guard makes this a no-op while a real tailer is
         // attributing the same bytes.
         let (raw_lines, next_raw_cursor) = facade
@@ -1562,7 +1646,7 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
         note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
         if !raw_lines.is_empty() && !raw_qualifier_shown {
             raw_qualifier_shown = true;
-            ui::note(RAW_FALLBACK_QUALIFIER);
+            ui::note(&raw_qualifier);
         }
         if emit_log_lines(&raw_lines, json)? == EmitOutcome::PipeClosed {
             return Ok(());
@@ -1595,7 +1679,7 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                 note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
                 if !raw_more.is_empty() && !raw_qualifier_shown {
                     raw_qualifier_shown = true;
-                    ui::note(RAW_FALLBACK_QUALIFIER);
+                    ui::note(&raw_qualifier);
                 }
                 if emit_log_lines(&raw_more, json)? == EmitOutcome::PipeClosed {
                     return Ok(());
@@ -2858,6 +2942,74 @@ mod tests {
         assert_eq!(
             DispositionArg::from_flags(false, false),
             DispositionArg::Unspecified
+        );
+    }
+
+    // ---- The bounded backlog window's env resolution (logs --follow prime) ----
+
+    #[test]
+    fn backlog_lines_env_unset_resolves_to_the_default_silently() {
+        // The common case: no env at all → the default window, and NEVER a
+        // note (an unset variable is not a misconfiguration).
+        assert_eq!(resolve_backlog_lines(None), (200, None));
+    }
+
+    #[test]
+    fn backlog_lines_env_positive_integer_is_honored() {
+        assert_eq!(resolve_backlog_lines(Some("1")), (1, None));
+        assert_eq!(resolve_backlog_lines(Some("200")), (200, None));
+        assert_eq!(resolve_backlog_lines(Some("5000")), (5000, None));
+    }
+
+    #[test]
+    fn backlog_lines_env_garbage_falls_back_to_the_default_with_a_note() {
+        // Non-numeric, zero, negative, empty, and u64 overflow ALL fall
+        // back to the default — never a crash, never a silent 0 — and each
+        // carries a stderr note that NAMES the offending value and the env
+        // var (surfaced, not silent).
+        for bad in ["abc", "0", "-5", "", "3.5", "99999999999999999999999"] {
+            let (lines, note) = resolve_backlog_lines(Some(bad));
+            assert_eq!(lines, 200, "[{bad}] the default window applies");
+            let note = note.unwrap_or_else(|| panic!("[{bad}] the fallback must carry a note"));
+            assert!(
+                note.contains(&format!("HEKMA_LOGS_BACKLOG_LINES value {bad:?}")),
+                "[{bad}] the note names the env var and the bad value: {note}"
+            );
+            assert!(
+                note.contains("200"),
+                "[{bad}] the note names the default it fell back to: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn backlog_lines_env_surrounding_whitespace_is_tolerated() {
+        // A shell-exported value often trails a newline; trim before the
+        // strict integer parse.
+        assert_eq!(resolve_backlog_lines(Some(" 42\n")), (42, None));
+    }
+
+    #[test]
+    fn raw_fallback_qualifier_is_byte_identical_when_nothing_was_skipped() {
+        // skipped_beyond == 0 → EXACTLY the base qualifier (the fresh-
+        // capture and gap-fits-the-window shapes are unchanged).
+        assert_eq!(raw_fallback_qualifier(0), RAW_FALLBACK_QUALIFIER);
+    }
+
+    #[test]
+    fn raw_fallback_qualifier_names_the_skipped_count_when_the_gap_exceeds_the_window() {
+        let note = raw_fallback_qualifier(3);
+        assert!(
+            note.starts_with(RAW_FALLBACK_QUALIFIER),
+            "the base qualifier stays the prefix: {note}"
+        );
+        assert!(
+            note.contains("skipped 3 earlier complete line(s)"),
+            "the skipped-beyond count is named: {note}"
+        );
+        assert!(
+            note.contains("HEKMA_LOGS_BACKLOG_LINES"),
+            "the tuning env is named so the operator can widen the window: {note}"
         );
     }
 

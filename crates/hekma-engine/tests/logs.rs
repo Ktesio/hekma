@@ -1549,3 +1549,94 @@ fn attributed_follow_surfaces_a_corrupt_output_log_line() {
         other => panic!("expected the typed Log failure from the corrupt line, got {other:?}"),
     }
 }
+
+#[test]
+fn raw_backlog_prime_resolves_the_bounded_window_when_the_fallback_is_active() {
+    // The bounded backlog prime (the between-commands gap) with NO live
+    // tailer (a registered, never-started instance — the same
+    // `log_capture: None` shape every adopted handle has): the prime
+    // resolves the START of the last N complete lines plus the skipped-
+    // beyond count, and feeding that cursor to the EXISTING fallback poll
+    // streams exactly the window's lines — the prime rides the 15-2 seam,
+    // no second read path.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("rawprime", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "rawprime");
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    std::fs::write(&raw_log, "gap one\ngap two\ngap three\n").unwrap();
+
+    // Window 2 of 3 complete lines: cursor at the second line's start (a
+    // line boundary), ONE earlier line skipped — the count the CLI's
+    // qualifier must name.
+    let (cursor, skipped) = facade.prime_raw_backlog("rawprime", 2).unwrap();
+    assert_eq!((cursor, skipped), ("gap one\n".len() as u64, 1));
+    let (lines, next) = facade
+        .read_raw_output_since("rawprime", Some(cursor))
+        .unwrap();
+    assert_eq!(
+        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+        vec!["gap two", "gap three"],
+        "the window's lines stream through the existing poll"
+    );
+    assert_eq!(next, "gap one\ngap two\ngap three\n".len() as u64);
+
+    // A window at/above the total primes everything from zero, and an
+    // absent raw file is an honest empty prime.
+    assert_eq!(facade.prime_raw_backlog("rawprime", 3).unwrap(), (0, 0));
+    assert_eq!(facade.prime_raw_backlog("rawprime", 100).unwrap(), (0, 0));
+    std::fs::remove_file(&raw_log).unwrap();
+    assert_eq!(facade.prime_raw_backlog("rawprime", 200).unwrap(), (0, 0));
+}
+
+#[test]
+fn raw_backlog_prime_is_a_noop_at_the_current_end_while_a_live_tailer_runs() {
+    // The live-capture guard on the prime: with a fresh attributed capture
+    // in THIS engine session, the prime returns the CURRENT end with
+    // nothing skipped — the exact shape of the un-primed cursor — so a
+    // fresh-capture follow stays byte-identical (no backlog lines, no
+    // skipped count to name in the qualifier).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // No heartbeat: the startup line lands once and the raw file's length
+    // goes still, so the "current end" assertion below is exact.
+    write_logs_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        "guaranteed",
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    facade.start("svc").unwrap();
+    let raw_log = agent_log_path(state.path(), "svc");
+    // Wait for the raw file to have content AND go still (two equal probes
+    // 150ms apart), so the length below is the settled current end.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let len = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no raw output ever appeared"
+        );
+        let probe = std::fs::metadata(&raw_log).map(|m| m.len()).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(150));
+        if probe > 0 && probe == std::fs::metadata(&raw_log).map(|m| m.len()).unwrap_or(0) {
+            break probe;
+        }
+    };
+
+    let (cursor, skipped) = facade.prime_raw_backlog("svc", 200).unwrap();
+    assert_eq!(skipped, 0, "a fresh capture skips nothing");
+    assert_eq!(
+        cursor, len,
+        "the prime lands at the current end — the un-primed shape"
+    );
+
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}

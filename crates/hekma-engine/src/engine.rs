@@ -1439,6 +1439,27 @@ impl Engine {
         .await
     }
 
+    /// The bounded raw-BACKLOG prime (the between-commands gap) —
+    /// `logs --follow` resolves its raw fallback cursor's START through this
+    /// before polling, so the last `backlog_lines` complete raw lines stream
+    /// at follow start. See
+    /// [`Supervisor::prime_raw_backlog`]'s docs for the
+    /// `(cursor, skipped_beyond)` contract and the live-capture guard.
+    pub async fn prime_raw_backlog(
+        &self,
+        name: &str,
+        backlog_lines: u64,
+    ) -> Result<(u64, u64), EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.prime_raw_backlog(&registry, &name, backlog_lines)
+        })
+        .await
+    }
+
     /// Run a blocking closure on tokio's blocking pool and await its result.
     ///
     /// Centralizes the `spawn_blocking` bridge so every async wrapper follows the
@@ -1632,6 +1653,18 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.read_raw_output_since(name, cursor))
+    }
+
+    /// Blocking [`Engine::prime_raw_backlog`] — the bounded raw-backlog
+    /// prime the follow loop resolves its starting cursor through.
+    pub fn prime_raw_backlog(
+        &self,
+        name: &str,
+        backlog_lines: u64,
+    ) -> Result<(u64, u64), EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.prime_raw_backlog(name, backlog_lines))
     }
 
     /// Blocking [`Engine::instance_status`] (story 1-6, AC9).
