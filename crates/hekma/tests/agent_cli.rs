@@ -755,19 +755,36 @@ fn run_hekma_agent_bounded(
     state_dir: &Path,
     bound: std::time::Duration,
 ) -> BoundedKt {
+    run_hekma_agent_bounded_with_env(args, working_dir, state_dir, bound, &[])
+}
+
+/// [`run_hekma_agent_bounded`] PLUS extra env pairs for the child (the
+/// bounded-window follow leg tunes `HEKMA_LOGS_BACKLOG_LINES` per-command —
+/// never the test process's env, which the shared-thread test runner would
+/// race). Existing env (KTESIO_*) is preserved; the pairs are appended.
+fn run_hekma_agent_bounded_with_env(
+    args: &[&str],
+    working_dir: &Path,
+    state_dir: &Path,
+    bound: std::time::Duration,
+    extra_env: &[(&str, &str)],
+) -> BoundedKt {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
     println!("harness: entered, args={:?}", args);
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"));
+    command
         .args(args)
         .current_dir(working_dir)
         .env("KTESIO_NO_UPDATE_CHECK", "1")
         .env("KTESIO_STATE_DIR", state_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn hekma");
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("spawn hekma");
     // Reader threads accumulate each stream INCREMENTALLY (per-chunk append
     // under the lock) so the partial transcript is readable at any moment —
     // the timeout path must NEVER depend on pipe EOF (a grandchild inheriting
@@ -8373,11 +8390,12 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
         assert!(started.run.success, "stderr={}", started.run.stderr);
         wait_for_agent_pid(state_dir, &name);
 
-        // The backlog exists BEFORE the follow command starts: priming must
-        // SKIP it (it is not re-emitted), which the thread-appended line
-        // below then proves by being the ONLY raw line on stdout. Appended,
-        // not truncated over — the agent's own ready line ahead of it is
-        // equally backlog, and priming skips both.
+        // The backlog exists BEFORE the follow command starts: the bounded
+        // window (default 200) covers this small gap, so it STREAMS at
+        // follow start — alongside the thread-appended line below, which
+        // proves live streaming still continues past the prime. Appended,
+        // not truncated over: the agent's own ready line ahead of it is
+        // equally backlog, and the window primes both.
         let raw_log = agent_log_path(state_dir, &name);
         std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
         {
@@ -8427,7 +8445,8 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
         orphan_guard.disarm();
         let run = bounded.run;
         assert!(run.success, "[{mode}] stderr={}", run.stderr);
-        // The NEW raw line appears; the pre-existing backlog does NOT.
+        // The NEW raw line appears, AND the pre-existing backlog streams
+        // with it (the bounded window covers this small gap by default).
         assert!(
             run.stdout
                 .contains(&format!("raw fallback line for {mode}")),
@@ -8435,8 +8454,8 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
             run.stdout
         );
         assert!(
-            !run.stdout.contains("pre-existing backlog line"),
-            "[{mode}] priming must not replay the raw backlog: stdout={}",
+            run.stdout.contains("pre-existing backlog line"),
+            "[{mode}] the pre-follow backlog must stream at follow start: stdout={}",
             run.stdout
         );
         // The un-attributed qualifier rides STDERR, exactly once.
@@ -8475,4 +8494,151 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
             );
         }
     }
+}
+
+#[test]
+fn logs_follow_primes_only_the_bounded_backlog_window_and_names_the_skipped_count() {
+    // The between-commands gap LARGER than the window: gap lines written to
+    // the raw agent.log while no engine session existed (before the follow
+    // command started) stream only as their LAST N complete lines when the
+    // window is env-tuned small, the OLDER gap lines stay skipped, and the
+    // once-per-session qualifier NAMES the skipped-beyond count — never a
+    // silent truncation. A live detached instance keeps the loop following
+    // while a fresh post-start line appends, and the stop that ends the
+    // follow doubles as the drain trigger (the raw-fallback e2e shape).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let name = "rawprime";
+
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+    let reg = run_hekma_agent_bounded(
+        &["agent", "register", name, "--manifest", m.to_str().unwrap()],
+        &ctx.project_dir,
+        state_dir,
+        REGISTER_BOUND,
+    );
+    assert!(!reg.timed_out, "register leg hung");
+    assert!(reg.run.success, "stderr={}", reg.run.stderr);
+    let mut orphan_guard = StopOrphanOnDrop {
+        name,
+        working_dir: ctx.project_dir.as_path(),
+        state_dir,
+        timeout_arg: "5".to_string(),
+        armed: true,
+    };
+    let started = run_hekma_agent_bounded(
+        &["agent", "start", name, "--detach"],
+        &ctx.project_dir,
+        state_dir,
+        LEG_BOUND,
+    );
+    assert!(!started.timed_out, "the detached start leg hung");
+    assert!(started.run.success, "stderr={}", started.run.stderr);
+    wait_for_agent_pid(state_dir, name);
+
+    // The PRE-FOLLOW GAP: four complete lines appended while NO engine
+    // session holds the instance (the detached agent only idles) — a gap
+    // the one-shot `logs` never shows and, with a window of 2, one the
+    // follow can only stream the tail of.
+    let raw_log = agent_log_path(state_dir, name);
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&raw_log)
+            .expect("open the raw log");
+        for gap in 1..=4 {
+            writeln!(file, "gap line {gap} of four").expect("append the gap line");
+        }
+    }
+    // The window the follow command will see (env-tuned to 2): the skipped
+    // count is every COMPLETE line ahead of the last two — the agent's own
+    // ready line plus the first two gap lines. Computed from the file right
+    // before the follow starts (the agent writes nothing further).
+    let total_complete = std::fs::read(&raw_log)
+        .expect("read the raw log")
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count() as u64;
+    let window: u64 = 2;
+    let expected_skipped = total_complete - window;
+
+    // A fresh line written WHILE the follow runs (after its prime), then
+    // the stop that lets the loop drain and exit cleanly.
+    let append_log = raw_log.clone();
+    let working_dir = ctx.project_dir.clone();
+    let state_dir_owned = state.project_dir.clone();
+    let appender = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&append_log)
+            .expect("open the raw log");
+        writeln!(file, "fresh line after the follow started").expect("append");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let stopped = run_hekma_agent_bounded(
+            &["agent", "stop", name],
+            &working_dir,
+            &state_dir_owned,
+            LEG_BOUND,
+        );
+        assert!(!stopped.timed_out, "the stop leg hung");
+        assert!(stopped.run.success, "stderr={}", stopped.run.stderr);
+    });
+    let bounded = run_hekma_agent_bounded_with_env(
+        &["agent", "logs", name, "--follow"],
+        &ctx.project_dir,
+        state_dir,
+        LEG_BOUND,
+        &[("HEKMA_LOGS_BACKLOG_LINES", "2")],
+    );
+    assert!(
+        !bounded.timed_out,
+        "the follow command never exited after the stop"
+    );
+    appender.join().expect("the appender thread");
+    orphan_guard.disarm();
+    let run = bounded.run;
+    assert!(run.success, "stderr={}", run.stderr);
+
+    // Exactly the LAST N gap lines stream...
+    assert!(
+        run.stdout.contains("gap line 3 of four") && run.stdout.contains("gap line 4 of four"),
+        "the window's tail of the gap must stream: stdout={}",
+        run.stdout
+    );
+    // ...the older gap lines do NOT...
+    assert!(
+        !run.stdout.contains("gap line 1 of four") && !run.stdout.contains("gap line 2 of four"),
+        "the lines beyond the window stay skipped: stdout={}",
+        run.stdout
+    );
+    // ...the live-streaming line still arrives...
+    assert!(
+        run.stdout.contains("fresh line after the follow started"),
+        "streaming continues past the prime: stdout={}",
+        run.stdout
+    );
+    // ...and the qualifier carries the skipped-beyond count, exactly once.
+    assert!(
+        run.stderr.contains("un-attributed raw passthrough"),
+        "the qualifier must surface on stderr: {}",
+        run.stderr
+    );
+    assert_eq!(
+        run.stderr.matches("un-attributed raw passthrough").count(),
+        1,
+        "the qualifier is once-per-session, not per-poll: {}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains(&format!(
+            "skipped {expected_skipped} earlier complete line(s)"
+        )),
+        "the qualifier must name the skipped-beyond count ({expected_skipped}): {}",
+        run.stderr
+    );
 }

@@ -279,6 +279,8 @@ Lines are emitted in on-disk append order (never re-sorted by `at`, whose whole-
 
 While following, `--follow` also watches the **raw `agent.log`**: a detached instance keeps writing to that crash-immune raw capture between commands, where no live engine tailer exists to attribute it into the rotated capture. New raw lines stream as ordinary lines — human and NDJSON alike — with one honest qualifier printed to **stderr the first time** such a line appears in the session (never per poll): these are *un-attributed passthrough* lines, whose timestamps are when this command read them, not when the agent wrote them. The one-shot `logs` (no `--follow`) reads the attributed capture only; while an engine tailer is live in the session, the raw fallback is suppressed (the tailer is attributing those same bytes).
 
+That raw fallback is **primed with a bounded backlog**: at follow start, the last `N` complete raw lines (default **200**, tunable via the `HEKMA_LOGS_BACKLOG_LINES` environment variable) stream too — so output the agent wrote between commands, before the follow began, is not silently invisible. If the gap exceeds the window, only its last `N` lines stream and the qualifier names how many earlier complete lines were skipped; a partial trailing line is never primed (it streams once it completes); a value that is not a positive integer falls back to the default with a stderr note naming the bad value; and when an engine tailer is live, nothing extra streams and nothing extra is noted. The one-shot `logs` remains attributed-capture-only.
+
 ## `hekma agent remove <name> [--delete | --retain] [--force]`
 
 Remove an Agent Instance from the Fleet.
