@@ -32,7 +32,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hekma_engine::{
-    AdapterRef, Capability, Engine, LifecycleState, LogLine, LogStream, OsId, SupportLevel,
+    AdapterRef, Capability, Engine, EngineError, LifecycleState, LogLine, LogStream, OsId,
+    SupportLevel,
 };
 use tempfile::TempDir;
 
@@ -1396,4 +1397,155 @@ fn raw_fallback_is_suppressed_while_a_live_tailer_attributes_the_same_bytes() {
     );
 
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
+
+#[test]
+fn raw_fallback_fails_closed_on_an_invalid_name() {
+    // The name gate runs BEFORE any filesystem probing: a malformed name
+    // surfaces the typed InvalidName refusal, never an accidental path
+    // read (the same `Bad Name` convention resync_events pins).
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("raw", "mock").unwrap();
+
+    match facade.read_raw_output_since("Bad Name", Some(0)) {
+        Err(EngineError::InvalidName { name, .. }) => assert_eq!(name, "Bad Name"),
+        other => panic!("expected the typed InvalidName refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn raw_fallback_skips_blank_lines_in_the_raw_tail() {
+    // The raw tail's line loop skips lines that are empty or whitespace-only
+    // (the same tolerance parse_log_lines gives the ATTRIBUTED view), so a
+    // noisy agent.log never surfaces blank LogLines to the follower.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("blank", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "blank");
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    let body = "alpha\n\n   \nbeta\n\n";
+    std::fs::write(&raw_log, body).unwrap();
+
+    let (lines, cursor) = facade.read_raw_output_since("blank", Some(0)).unwrap();
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.stream, l.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (LogStream::AgentOut, "alpha"),
+            (LogStream::AgentOut, "beta")
+        ],
+        "blank and whitespace-only lines are skipped, content kept: {lines:?}"
+    );
+    assert_eq!(
+        cursor,
+        body.len() as u64,
+        "the cursor still consumes the whole tail (blank bytes included)"
+    );
+}
+
+#[test]
+fn raw_fallback_surfaces_permission_denied_on_the_length_probe_and_the_open() {
+    // The two non-NotFound I/O fail-closed arms of the raw read, driven by
+    // permission sabotage: a search-denied logs DIRECTORY trips the length
+    // probe (metadata), a read-denied agent.log FILE trips the open (the
+    // probe still stats it — mode bits do not affect stat). Both must
+    // surface the typed Log error naming the path and the OS detail, never
+    // a silent empty read that would look like "no output".
+    // Permission-shaped sabotage is Unix-only honesty (Windows ACLs make a
+    // same-user mode change meaningless) — data-driven skip, the sanctioned
+    // shape for test files under the boundary gate.
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("rawperm", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "rawperm");
+    let logs_dir = raw_log.parent().unwrap();
+    std::fs::create_dir_all(logs_dir).unwrap();
+    std::fs::write(&raw_log, "content the probe will see\n").unwrap();
+
+    let chmod = |mode: &str, path: &std::path::Path| {
+        let status = Command::new("chmod")
+            .args([mode, &path.to_string_lossy()])
+            .status()
+            .expect("spawn chmod");
+        assert!(
+            status.success(),
+            "chmod {mode} on {} failed",
+            path.display()
+        );
+    };
+
+    // Arm 1 — the LENGTH PROBE: no search permission on the logs directory
+    // makes metadata(agent.log) fail with EACCES (not NotFound).
+    chmod("000", logs_dir);
+    match facade.read_raw_output_since("rawperm", Some(0)) {
+        Err(EngineError::Log { name, detail, .. }) => {
+            assert_eq!(name, "rawperm");
+            assert!(
+                detail.contains("Permission denied"),
+                "the OS detail must name the failure: {detail}"
+            );
+        }
+        other => panic!("expected the typed Log failure from the length probe, got {other:?}"),
+    }
+    chmod("755", logs_dir);
+
+    // Arm 2 — the OPEN: the file itself is read-denied while stat still
+    // succeeds (the probe's len is real), so the failure moves to the open.
+    chmod("000", &raw_log);
+    match facade.read_raw_output_since("rawperm", Some(0)) {
+        Err(EngineError::Log { name, detail, .. }) => {
+            assert_eq!(name, "rawperm");
+            assert!(
+                detail.contains("Permission denied"),
+                "the OS detail must name the failure: {detail}"
+            );
+        }
+        other => panic!("expected the typed Log failure from the open, got {other:?}"),
+    }
+    // Restore so the TempDir teardown can walk the tree unhindered.
+    chmod("644", &raw_log);
+}
+
+#[test]
+fn attributed_follow_surfaces_a_corrupt_output_log_line() {
+    // The attributed follow's parse arm: a torn write or on-disk corruption
+    // in the CURRENT generation must fail CLOSED with the typed Log error
+    // naming the corrupt line's 1-based index — the follower surfaces the
+    // degradation instead of silently dropping the line (the same torn-write
+    // shape the rotation work documented as reachable in production).
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("attr", "mock").unwrap();
+
+    let output_log = state
+        .path()
+        .join("agents")
+        .join("attr")
+        .join("logs")
+        .join("output.log");
+    std::fs::create_dir_all(output_log.parent().unwrap()).unwrap();
+    std::fs::write(&output_log, "this line is not json\n").unwrap();
+
+    match facade.read_agent_log_since("attr", 0) {
+        Err(EngineError::Log { name, detail, .. }) => {
+            assert_eq!(name, "attr");
+            assert!(
+                detail.contains("corrupt output-log line 1"),
+                "the failure must name the corrupt line index: {detail}"
+            );
+        }
+        other => panic!("expected the typed Log failure from the corrupt line, got {other:?}"),
+    }
 }
