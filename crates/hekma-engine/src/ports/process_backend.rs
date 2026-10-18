@@ -1784,6 +1784,46 @@ mod tests {
     }
 
     #[test]
+    fn tail_new_lines_skips_silently_when_the_raw_path_cannot_be_read() {
+        // A read-time I/O failure is a SILENT skip — never a panic, never a
+        // partial attribution — mirroring the best-effort capture contract
+        // documented on `tail_new_lines`. Driven with the raw "file" as a
+        // DIRECTORY (the house sabotage shape the events suite uses for
+        // append errors): on Unix the open, metadata, and seek all succeed
+        // and only the read fails (EISDIR), pinning the read-failure arm
+        // specifically; on Windows the open itself fails. Whichever arm
+        // fires, the observable contract is identical on every OS — cursor
+        // untouched, nothing attributed — so no OsId gate is needed.
+        let dir = tempfile::tempdir().unwrap();
+        // Force the directory's REPORTED size above zero first: on btrfs a
+        // fresh directory stats as 0 bytes, which would take the
+        // nothing-new arm instead of the read-failure arm; a few entries
+        // grow the reported size on every mainstream filesystem (ext4
+        // 4096, tmpfs 40, APFS ~64 — a fresh dir is already nonzero there,
+        // so the loop exits on its first probe).
+        for i in 0..64 {
+            std::fs::write(dir.path().join(format!("e{i}")), b"x").unwrap();
+            if std::fs::metadata(dir.path()).unwrap().len() > 0 {
+                break;
+            }
+        }
+        let attributed = dir.path().join("output.log");
+        let mut cursor = 0u64;
+        tail_new_lines(
+            dir.path(),
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+        );
+        assert_eq!(cursor, 0, "a failed pass must not advance the cursor");
+        assert!(
+            !attributed.exists(),
+            "a failed pass must not create or write the attributed capture"
+        );
+    }
+
+    #[test]
     fn tail_new_lines_stays_fast_against_a_huge_backlog_of_tiny_lines() {
         // Regression guard (fix pass, review of #80): a fast, bursty writer
         // with ZERO backpressure (a real OS process writing directly to its
