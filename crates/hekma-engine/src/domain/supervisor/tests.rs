@@ -1798,6 +1798,35 @@ fn read_usage_tail_incremental_across_multiple_drains_matches_whole_file() {
     );
 }
 
+/// (2b) A read that fails MID-PASS (not NotFound, not a shrink) maps to
+/// `Unavailable` — skip this poll, retry the next — never `Tail` bytes and
+/// never `Shrunk`. Driven with the log "file" as a DIRECTORY (the house
+/// sabotage shape the events suite uses): on Unix the open, metadata, and
+/// seek all succeed and only `read_exact` fails (EISDIR), pinning the
+/// read-failure arm specifically; on Windows the open fails outright with
+/// the same observable `Unavailable` contract — honest on every OS without
+/// an OsId gate.
+#[test]
+fn read_usage_tail_maps_a_read_failure_to_unavailable_never_bytes_or_shrunk() {
+    let dir = tempfile::tempdir().unwrap();
+    // Force the directory's REPORTED size above zero first (btrfs stats a
+    // fresh directory as 0 bytes, which would take the empty-tail arm
+    // instead of the read-failure one; entries grow the reported size on
+    // every mainstream filesystem — on ext4/tmpfs/APFS the first probe
+    // already passes and the loop exits immediately).
+    for i in 0..64 {
+        std::fs::write(dir.path().join(format!("e{i}")), b"x").unwrap();
+        if std::fs::metadata(dir.path()).unwrap().len() > 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        read_usage_tail(dir.path(), 0),
+        UsageTail::Unavailable,
+        "a mid-pass read failure must skip the poll, never misreport bytes or a shrink"
+    );
+}
+
 /// (3) Terminal newline-less tail (the H1 fix): the process is dead, so a final
 /// usage line flushed WITHOUT a trailing newline is consumed to end-of-log via
 /// the incremental read too — never stranded.
@@ -4529,6 +4558,31 @@ fn read_breach_events_surfaces_an_unreadable_breach_log_as_a_typed_log_error() {
         }
         other => panic!("expected EngineError::Log, got {other:?}"),
     }
+}
+
+/// Blank/whitespace-only lines in a breach log are SKIPPED, not corrupt-line
+/// errors — a padded log (trailing newline pairs, a whitespace run between
+/// appends) reads back only its events. The corrupt-after-blank leg proves
+/// the scan CONTINUES past blanks and still surfaces real corruption with
+/// the PHYSICAL line number, which the blanks must not shift.
+#[test]
+fn read_breach_events_skips_blank_lines_without_erroring() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("breach.log");
+
+    std::fs::write(&path, "\n   \n\t\n").unwrap();
+    assert_eq!(
+        read_breach_events_from(&path),
+        Ok(Vec::new()),
+        "blank/whitespace-only lines must be skipped, not a read error"
+    );
+
+    std::fs::write(&path, "\nnot a breach event\n").unwrap();
+    let err = read_breach_events_from(&path).unwrap_err();
+    assert!(
+        err.contains("corrupt breach-log line 2"),
+        "the scan must continue past blanks and name the corrupt line's physical number: {err}"
+    );
 }
 
 #[test]
