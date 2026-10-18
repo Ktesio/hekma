@@ -217,6 +217,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-15-1-acp-real-agent-verification-opencode-hermes`
   summary: The real-agent smokes' visible skip NOTES (both the HEKMA_TEST_REAL_AGENT_SMOKES=0 opt-out and the HEKMA_TEST_REAL_AGENT_TURNS unset skip) are eprintln'd but INVISIBLE under a plain `cargo test` run — libtest captures stderr of passing tests, so the surfaced-not-silent posture only shows under the documented `--nocapture` commands; testing.md now says so.
   evidence: Verification-gap reviewer (review round 1): `turn_smokes_enabled`/`real_smokes_opted_out` notes emit via eprintln; a plain harness run shows `... ok` with no note. Pre-existing family behavior (the 14-4 gemini opt-out note has the same shape); a harness-level fix (e.g. a --format jitter or a note-via-test-name) is a test-infra decision beyond this story.
+  resolved: story 16-1 (spec-16-1-skip-note-visibility, 2026-10-18) — the notes now write straight to the process's real stderr (`hekma_conformance::note_uncaptured`, fd 2 via `File::from_raw_fd` + `ManuallyDrop`, best-effort never-panic), so every real-agent smoke skip note is visible under a plain `cargo test`; the 3 silent binary-absent skips gained the same noted skip, and testing.md's limitation sentence flipped. Shipped in PR #296.
 
 ## Deferred from: three-layer review of spec-15-2 (2026-10-16)
 
