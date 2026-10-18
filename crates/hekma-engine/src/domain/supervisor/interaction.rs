@@ -508,6 +508,76 @@ impl Supervisor {
         }
     }
 
+    /// The bounded BACKLOG prime for the raw fallback's follow cursor
+    /// (the between-commands gap): resolves WHERE `logs --follow` should
+    /// start its raw `agent.log` polling so the last `backlog_lines`
+    /// COMPLETE lines — output the agent wrote while NO engine session
+    /// existed, before the follow command started — stream at follow start.
+    /// Returns `(cursor, skipped_beyond)`:
+    ///
+    /// * `cursor` — the byte offset to prime the poll loop with: the start
+    ///   of the Nth-from-last complete line (always a line boundary, never
+    ///   mid-line; `0` when every complete line fits the window). The
+    ///   caller simply passes it to [`Supervisor::read_raw_output_since`]
+    ///   as `Some(cursor)` — the existing poll machinery does the rest, so
+    ///   the backlog rides the SAME raw-read seam story 15-2 shipped (no
+    ///   second read path).
+    /// * `skipped_beyond` — how many COMPLETE lines precede the window
+    ///   (always `0` unless the gap exceeds `backlog_lines`); the CALLER
+    ///   names this count in its once-per-session qualifier when non-zero
+    ///   — a bounded window that silently ate lines would be exactly the
+    ///   "surfaced, not silent" violation the house rules forbid.
+    ///
+    /// The SAME staleness condition as [`Supervisor::read_raw_output_since`]'s
+    /// live-capture guard applies: when THIS engine session already holds a
+    /// live tailer for the instance, the attributed capture is fresh — no
+    /// backlog is primed (`(current_len, 0)`), so a fresh-capture follow is
+    /// byte-identical to the un-primed behavior (no backlog lines, no extra
+    /// qualifier content). The prime reads the raw file ONCE, at follow
+    /// start only — the per-poll tail-only discipline of
+    /// `read_raw_output_since` is untouched.
+    pub fn prime_raw_backlog(
+        &self,
+        registry: &Registry,
+        name: &str,
+        backlog_lines: u64,
+    ) -> Result<(u64, u64), EngineError> {
+        let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
+            name: name.to_string(),
+            reason,
+        })?;
+        registry.lookup(&name).map_err(registry_to_engine)?;
+
+        let path = registry.agent_output_log_path(&name);
+        // The live-capture guard, verbatim in spirit from
+        // `read_raw_output_since`: a tailer already attributing these bytes
+        // makes a backlog prime a DOUBLE-report. Prime at the current end
+        // with nothing skipped — the exact shape of the un-primed cursor.
+        let live_capture = self
+            .running
+            .get(&name)
+            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some());
+        if live_capture {
+            let len = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(e) => {
+                    return Err(EngineError::Log {
+                        name: name.as_str().to_string(),
+                        path: path.to_string_lossy().into_owned(),
+                        detail: e.to_string(),
+                    })
+                }
+            };
+            return Ok((len, 0));
+        }
+        prime_backlog_lines(&path, backlog_lines).map_err(|detail| EngineError::Log {
+            name: name.as_str().to_string(),
+            path: path.to_string_lossy().into_owned(),
+            detail,
+        })
+    }
+
     /// Ensure the per-instance log directory exists (AD-12 seed).
     pub(super) fn ensure_log_dir(
         &self,
@@ -543,4 +613,63 @@ impl Supervisor {
             .map(|m| m.len())
             .unwrap_or(0)
     }
+}
+
+/// Read the raw `agent.log` and resolve the bounded BACKLOG window for
+/// [`Supervisor::prime_raw_backlog`] (the between-commands gap): returns
+/// `(cursor, skipped_beyond)` where `cursor` is the byte offset the follow
+/// loop should start polling from (the start of the Nth-from-last COMPLETE
+/// line) and `skipped_beyond` counts the COMPLETE lines the window leaves
+/// BEFORE it (the count the caller's qualifier must name when non-zero).
+///
+/// Semantics pinned by the sibling unit tests (the `prime_backlog` family in
+/// `supervisor/tests.rs`):
+/// * COMPLETE lines only — each `\n` terminates one line; a trailing partial
+///   line (no newline yet) is neither counted nor primed (the follow's
+///   `plan_follow` consumes it the moment it completes, unchanged).
+/// * every complete line fits the window (`total ≤ N`) → `(0, 0)` — prime
+///   from the file start so ALL of them stream.
+/// * the gap exceeds the window → the cursor lands after the
+///   `(total − N)`-th newline, so exactly the LAST N complete lines stream,
+///   and `skipped_beyond = total − N`.
+/// * absent file → `(0, 0)` (an honest empty read, the story 15-2 precedent).
+///
+/// The whole file is scanned ONCE per follow start (never per poll — the
+/// 15-2 poll stays tail-only). `N = 0` degrades to "prime nothing" (the
+/// cursor lands at the end of the complete region): defensive only, since
+/// the CLI never sends a non-positive window.
+pub(super) fn prime_backlog_lines(path: &std::path::Path, n: u64) -> Result<(u64, u64), String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(prime_backlog_window(&bytes, n))
+}
+
+/// The pure offset math behind [`prime_backlog_lines`] — no I/O, fully
+/// unit-testable: given the raw file's bytes and the window size `n`,
+/// return `(cursor, skipped_beyond)`.
+pub(super) fn prime_backlog_window(bytes: &[u8], n: u64) -> (u64, u64) {
+    // Every `\n` terminates exactly one complete line; a trailing partial
+    // line contributes none.
+    let total = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    let skipped = total.saturating_sub(n);
+    if skipped == 0 {
+        return (0, 0);
+    }
+    // Walk to the byte just after the `skipped`-th newline — the start of
+    // the (skipped+1)-th line, the window's first line. `total > 0` is
+    // guaranteed here (skipped > 0 requires it), so the walk always finds
+    // the boundary; the fallback below is unreachable defense.
+    let mut seen = 0u64;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            seen += 1;
+            if seen == skipped {
+                return (i as u64 + 1, skipped);
+            }
+        }
+    }
+    (bytes.len() as u64, skipped)
 }

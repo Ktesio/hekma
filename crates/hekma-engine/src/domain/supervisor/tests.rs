@@ -1996,6 +1996,80 @@ fn plan_follow_at_end_of_log_consumes_nothing() {
     );
 }
 
+// ---- The bounded raw-BACKLOG window (follow prime; the between-commands gap) ----
+
+use super::interaction::{prime_backlog_lines, prime_backlog_window};
+
+#[test]
+fn prime_backlog_window_with_n_below_total_starts_at_the_nth_from_last_line() {
+    // 3 complete lines, window 2 → the cursor lands after the 1st newline
+    // (the start of line 2, a line boundary) and 1 line is skipped.
+    let bytes = b"l1\nl2\nl3\n";
+    assert_eq!(prime_backlog_window(bytes, 2), (3, 1));
+    // Window 1 → after the 2nd newline; 2 skipped.
+    assert_eq!(prime_backlog_window(bytes, 1), (6, 2));
+}
+
+#[test]
+fn prime_backlog_window_with_n_at_or_above_total_primes_everything_from_zero() {
+    let bytes = b"l1\nl2\nl3\n";
+    // Exactly N and more than N both mean "nothing is skipped": the cursor
+    // starts at 0 so every complete line streams.
+    assert_eq!(prime_backlog_window(bytes, 3), (0, 0));
+    assert_eq!(prime_backlog_window(bytes, 100), (0, 0));
+}
+
+#[test]
+fn prime_backlog_window_never_primes_a_partial_trailing_line() {
+    // The trailing "half-written" has no newline: it is neither counted as
+    // a line nor included in the window (the follow's plan_follow consumes
+    // it only once it completes, unchanged).
+    let bytes = b"l1\nl2\nhalf-written";
+    // A window larger than everything complete → cursor 0, nothing skipped
+    // (the partial is simply not part of the primed region).
+    assert_eq!(prime_backlog_window(bytes, 10), (0, 0));
+    // A window smaller than the complete total still ends at a boundary —
+    // never mid-"half-written".
+    assert_eq!(prime_backlog_window(bytes, 1), (3, 1));
+    // A partial-ONLY file primes nothing at all.
+    assert_eq!(prime_backlog_window(b"half-written", 5), (0, 0));
+}
+
+#[test]
+fn prime_backlog_window_on_an_empty_file_primes_nothing() {
+    assert_eq!(prime_backlog_window(b"", 200), (0, 0));
+}
+
+#[test]
+fn prime_backlog_window_zero_degrades_to_priming_nothing() {
+    // Defensive only (the CLI never sends a non-positive window): the
+    // cursor lands at the end of the complete region — i.e. today's
+    // end-prime shape.
+    let bytes = b"l1\nl2\n";
+    assert_eq!(prime_backlog_window(bytes, 0), (6, 2));
+}
+
+#[test]
+fn prime_backlog_lines_reads_the_window_from_a_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("agent.log");
+    std::fs::write(&path, b"l1\nl2\nl3\n").unwrap();
+    // The path wrapper agrees with the pure math...
+    assert_eq!(prime_backlog_lines(&path, 2).unwrap(), (3, 1));
+    // ...and the cursor it returns is a real line boundary: the bytes from
+    // the cursor are exactly the LAST N complete lines.
+    let bytes = std::fs::read(&path).unwrap();
+    let (cursor, _) = prime_backlog_lines(&path, 2).unwrap();
+    assert_eq!(&bytes[cursor as usize..], b"l2\nl3\n");
+}
+
+#[test]
+fn prime_backlog_lines_on_an_absent_file_is_an_honest_empty_prime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("never-written.log");
+    assert_eq!(prime_backlog_lines(&path, 200).unwrap(), (0, 0));
+}
+
 // ---- Story 4-2: engine-attributed line rendering (Task 4) ----
 
 #[test]

@@ -52,10 +52,10 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `interaction.rs` — `prime_backlog_lines` helper + unit pins (boundary math, partial line, under/over N, empty).
-- [ ] `cli/agent.rs` — env parse (`HEKMA_LOGS_BACKLOG_LINES`, default 200, garbage→default+note), the prime wiring, the skipped-beyond count in the qualifier.
-- [ ] CLI e2e — the pre-follow gap-write scenario (gap streams; >N names the skip).
-- [ ] `docs/commands.md` — the backlog paragraph; sprint-status 16-2 row; `deferred-work.md` — the 15-2 entry's resolved marker at merge.
+- [x] `interaction.rs` — `prime_backlog_lines` helper + unit pins (boundary math, partial line, under/over N, empty).
+- [x] `cli/agent.rs` — env parse (`HEKMA_LOGS_BACKLOG_LINES`, default 200, garbage→default+note), the prime wiring, the skipped-beyond count in the qualifier.
+- [x] CLI e2e — the pre-follow gap-write scenario (gap streams; >N names the skip).
+- [x] `docs/commands.md` — the backlog paragraph; sprint-status 16-2 row; `deferred-work.md` — the 15-2 entry's resolved marker lands at merge (this branch is unmerged, so the marker is deliberately not added yet).
 
 **Acceptance Criteria:**
 - Given raw lines written with no engine session, when a later `logs --follow` starts, then those lines (up to N) stream immediately with the qualifier.
