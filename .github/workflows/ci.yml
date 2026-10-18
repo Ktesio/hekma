@@ -697,6 +697,12 @@ jobs:
           #     honestly unix-gated suite under the AI-35 disclosure
           #     convention ("the test does not exist on Windows" rather than
           #     passing vacuously).
+          #   * conformance test_notes.rs — the uncaptured-note helper's
+          #     write arms ARE the OS API boundary: std::os::unix::io /
+          #     std::os::windows::io exist per-OS, so importing the raw
+          #     fd/handle constructors cannot be made data-driven (OsId
+          #     cannot import a platform-only trait). The arms are the
+          #     boundary gate's own sanctioned class.
           #   * conformance tck.rs — story 15-3's EngineOpen stage drive
           #     needs an EMPTY-but-UNWRITABLE state root (the fresh-root
           #     contract refuses any non-empty root at StateRoot first), and
@@ -705,7 +711,7 @@ jobs:
           #     with a root-runner honesty skip.
           # adoption/interaction suites deliberately use NO cfg (data-driven
           # OS ids); no production code may use cfg outside backends/.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:'
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
