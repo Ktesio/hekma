@@ -1601,7 +1601,12 @@ fn raw_backlog_prime_is_a_noop_at_the_current_end_while_a_live_tailer_runs() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     // No heartbeat: the startup line lands once and the raw file's length
-    // goes still, so the "current end" assertion below is exact.
+    // goes still — still enough to prove real output exists. The cursor
+    // assertion below pins AT-OR-PAST that settled length rather than exact
+    // equality: a slow-starting writer could append bytes between the
+    // still-probe and the prime's own metadata read, and the guard's
+    // contract is "the current end at prime time", not "the probed length"
+    // (#297, item 3).
     write_logs_manifest(
         manifest.path(),
         "svc",
@@ -1617,7 +1622,8 @@ fn raw_backlog_prime_is_a_noop_at_the_current_end_while_a_live_tailer_runs() {
     facade.start("svc").unwrap();
     let raw_log = agent_log_path(state.path(), "svc");
     // Wait for the raw file to have content AND go still (two equal probes
-    // 150ms apart), so the length below is the settled current end.
+    // 150ms apart) — the settled length is a FLOOR for the prime's cursor,
+    // not an exact target.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let len = loop {
         assert!(
@@ -1633,9 +1639,14 @@ fn raw_backlog_prime_is_a_noop_at_the_current_end_while_a_live_tailer_runs() {
 
     let (cursor, skipped) = facade.prime_raw_backlog("svc", 200).unwrap();
     assert_eq!(skipped, 0, "a fresh capture skips nothing");
-    assert_eq!(
-        cursor, len,
-        "the prime lands at the current end — the un-primed shape"
+    // At-or-past, not equality: the guard primes at the CURRENT end, which
+    // may have grown past the probe. The pin still discriminates the real
+    // regression — a fall-through to the backlog prime would return cursor
+    // 0 (every complete line fits the 200-line window), and 0 < len fails.
+    assert!(
+        cursor >= len,
+        "the prime lands at the current end — at or past the settled probe \
+         (cursor {cursor}, settled {len})"
     );
 
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
