@@ -1030,7 +1030,9 @@ fn probe_binary_present(bin: &str) -> bool {
 /// a machine the smoke is testing the LOGIN state, not the engine, and
 /// fails red on every local battery. Set `HEKMA_TEST_REAL_AGENT_SMOKES=0`
 /// (or `=false`) to skip both smokes VISIBLY — the skip prints a stderr
-/// note (surfaced, not silent; AI-18) — while CI runners (no binaries
+/// note (surfaced, not silent; AI-18), written UNCAPTURED to the process's
+/// real stderr (story 16-1: visible under a plain `cargo test`, no
+/// `--nocapture` needed) — while CI runners (no binaries
 /// present) keep the ordinary skip-unless-present posture untouched.
 fn real_smokes_opted_out() -> bool {
     std::env::var("HEKMA_TEST_REAL_AGENT_SMOKES")
@@ -1051,9 +1053,12 @@ fn real_smokes_opted_out() -> bool {
 #[test]
 fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
     if real_smokes_opted_out() {
-        eprintln!(
+        // 16-1: the note rides the process's REAL stderr (uncaptured), so a
+        // plain `cargo test` shows it — libtest captures eprintln!'d notes of
+        // PASSING tests.
+        hekma_conformance::note_uncaptured(
             "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
-             (this machine opted out of driving real agent CLIs)"
+             (this machine opted out of driving real agent CLIs)",
         );
         return;
     }
@@ -1061,7 +1066,12 @@ fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
     // CLI and does NOT speak ACP on stdio by default, so it is not a valid
     // acp-kind launch and is deliberately not probed as a fallback.
     if !probe_binary_present("hermes-acp") {
-        return; // the honest skip: no real agent on this machine.
+        // The honest skip, NOTED (16-1: uncaptured, so a plain `cargo test`
+        // shows it — parity with the turn smoke's binary-absent note).
+        hekma_conformance::note_uncaptured(
+            "note: real-agent smoke skipped: no `hermes-acp` on this machine's PATH",
+        );
+        return;
     }
     let base = TempDir::new().unwrap();
     let engine = open(&base, None);
@@ -1107,14 +1117,22 @@ fn real_hermes_acp_smoke_register_start_send_stop_when_present() {
 #[test]
 fn real_gemini_acp_smoke_register_start_send_stop_when_present() {
     if real_smokes_opted_out() {
-        eprintln!(
+        // 16-1: the note rides the process's REAL stderr (uncaptured), so a
+        // plain `cargo test` shows it — libtest captures eprintln!'d notes of
+        // PASSING tests.
+        hekma_conformance::note_uncaptured(
             "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
-             (this machine opted out of driving real agent CLIs)"
+             (this machine opted out of driving real agent CLIs)",
         );
         return;
     }
     if !probe_binary_present("gemini") {
-        return; // the honest skip: no real agent on this machine.
+        // The honest skip, NOTED (16-1: uncaptured, so a plain `cargo test`
+        // shows it — parity with the turn smoke's binary-absent note).
+        hekma_conformance::note_uncaptured(
+            "note: real-agent smoke skipped: no `gemini` on this machine's PATH",
+        );
+        return;
     }
     let base = TempDir::new().unwrap();
     let engine = open(&base, None);
@@ -1188,13 +1206,16 @@ fn parse_turn_env(value: Option<&str>) -> bool {
 }
 
 /// Whether the turn-completion smokes are armed on this machine (visible
-/// opt-out posture: a skip prints a stderr note, surfaced not silent).
+/// opt-out posture: a skip prints a stderr note, surfaced not silent —
+/// UNCAPTURED since story 16-1, so a plain `cargo test` shows it).
 fn turn_smokes_enabled() -> bool {
     let enabled = parse_turn_env(std::env::var("HEKMA_TEST_REAL_AGENT_TURNS").ok().as_deref());
     if !enabled {
-        eprintln!(
+        // 16-1: uncaptured (see `note_uncaptured`) — visible under a plain
+        // `cargo test`, not only under `--nocapture`.
+        hekma_conformance::note_uncaptured(
             "note: real-agent TURN smokes skipped: HEKMA_TEST_REAL_AGENT_TURNS is not set \
-             (set it to 1 to drive full prompt turns against real agent CLIs)"
+             (set it to 1 to drive full prompt turns against real agent CLIs)",
         );
     }
     enabled
@@ -1224,14 +1245,22 @@ fn turn_env_parser_is_default_off_and_affirmative_only() {
 #[test]
 fn real_opencode_acp_smoke_register_start_send_stop_when_present() {
     if real_smokes_opted_out() {
-        eprintln!(
+        // 16-1: the note rides the process's REAL stderr (uncaptured), so a
+        // plain `cargo test` shows it — libtest captures eprintln!'d notes of
+        // PASSING tests.
+        hekma_conformance::note_uncaptured(
             "note: real-agent smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
-             (this machine opted out of driving real agent CLIs)"
+             (this machine opted out of driving real agent CLIs)",
         );
         return;
     }
     if !probe_binary_present("opencode") {
-        return; // the honest skip: no real agent on this machine.
+        // The honest skip, NOTED (16-1: uncaptured, so a plain `cargo test`
+        // shows it — parity with the turn smoke's binary-absent note).
+        hekma_conformance::note_uncaptured(
+            "note: real-agent smoke skipped: no `opencode` on this machine's PATH",
+        );
+        return;
     }
     let base = TempDir::new().unwrap();
     let engine = open(&base, None);
@@ -1307,14 +1336,18 @@ fn real_turn_completion(binary: &str, acp_args: &str, name: &str) {
         return;
     }
     if real_smokes_opted_out() {
-        eprintln!(
+        // 16-1: uncaptured (see `note_uncaptured`) — visible under a plain
+        // `cargo test`, not only under `--nocapture`.
+        hekma_conformance::note_uncaptured(
             "note: real-agent TURN smoke skipped: HEKMA_TEST_REAL_AGENT_SMOKES=0 is set \
-             (this machine opted out of driving real agent CLIs)"
+             (this machine opted out of driving real agent CLIs)",
         );
         return;
     }
     if !probe_binary_present(binary) {
-        eprintln!("note: real-agent TURN smoke skipped: no `{binary}` on this machine's PATH");
+        hekma_conformance::note_uncaptured(&format!(
+            "note: real-agent TURN smoke skipped: no `{binary}` on this machine's PATH"
+        ));
         return;
     }
     let base = TempDir::new().unwrap();
