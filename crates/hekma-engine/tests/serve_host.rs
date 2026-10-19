@@ -461,6 +461,23 @@ fn an_adopted_observed_instance_is_rebound_live_on_the_fixed_port() {
     );
     assert!(text.contains("env=OPENAI_BASE_URL="));
     let pid = wait_for_agent_pid(&agent_log_path(state.path(), "observed"));
+    // The NFR-1 crash-survival vehicle is Unix-only: on Windows the engine's
+    // Job-Object kill-on-close takes the observed child the moment engine1's
+    // process exits (the documented no-orphan guarantee — adoption.rs's
+    // Windows-gated NFR-1 proofs and its Windows-positive mirror), so the
+    // live-orphan window this test drives cannot exist there. Pin the
+    // documented Windows outcome (no leaked child) and stop; the OS-uniform
+    // half of the fixed-port re-bind proof is pinned in-process by the
+    // restart sibling (`a_host_restart_rebinds_the_same_fixed_port`), and
+    // this crash-shaped adoption leg runs where an orphan can survive.
+    // Runtime branch per the boundary gate's data-driven OS rule.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        wait_until_gone(
+            pid,
+            "NFR-1: the crashed engine1 must not leak the observed child on Windows",
+        );
+        return;
+    }
     assert!(pid_alive(pid), "the orphan survived the crash");
     assert!(
         !port_answer(port),
