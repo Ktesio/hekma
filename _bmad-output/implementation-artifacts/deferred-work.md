@@ -45,6 +45,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Semantic split between store and registry — `StateStore::upsert_memory_backing` documents REPLACE-on-re-attach (kind + timestamp overwritten) while `Registry::attach_memory` promises idempotent re-attach keeps the original timestamp and never changes kind; any future caller bypassing the registry guard can violate the A-6 invariant through sanctioned store behavior.
   evidence: Both behaviors are individually documented and tested; the invariant currently holds only because every caller goes through the registry. Hardening option: make the store reject kind-changes on an existing row (UNIQUE conflict → typed error) so the invariant lives below the registry too.
+  resolved: 2026-09-22 hardening batch (PR #232 / a5a763a) — port-level A-6 now lives below the registry: `StateStore::upsert_memory_backing` REJECTS a kind-change on an existing row (`StoreError::MemoryBackingKindConflict` naming attached + requested, row byte-unchanged), pinned by `upsert_memory_backing_rejects_a_kind_change_and_keeps_the_row` (store/sqlite.rs); a same-kind upsert keeps the documented REPLACE shape (the registry passes the ORIGINAL timestamp, so idempotence holds end to end), and story 15-6's `attach_memory_backing_txn` re-runs the same conflict check under the BEGIN IMMEDIATE write lock.
 
 - source_spec: `5-1-attach-a-managed-filesystem-memory-backing`
   summary: Integration test helpers (fake-manifest writer, dump polling, tree snapshotting in tests/memory.rs) duplicate shapes already living in sibling integration files rather than a shared test-support utility.
@@ -68,15 +69,19 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: PATH save/restore in the hermes e2e test is not panic-safe — an assert between the shim install and teardown skips the restore.
   evidence: `crates/ktesio-engine/tests/hermes.rs` installs the PATH shim mid-test and restores it only as trailing teardown code; a RAII/Drop guard (like the existing `_shim` guard) would make the restore unconditional. The shim-install site predates this diff (blind-3 asked only for save/restore).
+  resolved: 2026-09-22 hardening batch (PR #231 / d28c94e) — the restore now runs through the `PathGuard`'s `Drop`, so it fires even when an assert between shim install and test end panics (the suite's module doc states the panic-safe guarantee).
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: hermes.rs module doc claims later tests start from a pristine PATH — true only on the happy path while the restore is not panic-safe.
   evidence: `crates/ktesio-engine/tests/hermes.rs:21-28` "restored at teardown so any test added to this binary later starts from a pristine environment" holds only if no test panics between install and restore; wording should soften or follow the RAII fix above.
+  resolved: 2026-09-22 hardening batch (PR #231 / d28c94e) — with the `PathGuard` Drop restore the claim is now unconditional; the doc names the guard and its panic-safety explicitly.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: The engine-tests OS-cfg allowlist covers the whole `crates/ktesio-engine/tests/` directory while only `memory.rs:605` uses cfg — narrow the allowlist to the single file.
   evidence: `.github/workflows/ci.yml` allowlist entry whitelists the directory; the corrected comment (vg-o2) names memory.rs:605 as the sole user. Narrowing is a CI behavior change, out of the comment-only scope of vg-o2.
+  resolved: 2026-09-22 hardening batch (PR #231 / d28c94e) — the boundary gate's OS-cfg allowlist now ENUMERATES the engine test files (atomic_config_writes.rs, memory.rs) instead of whitelisting the whole tests/ directory; a new cfg use in any other test file must go data-driven (`OsId::current`) or join the enumerated list with a justification comment in the same change.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: No test pins that a manifest declaring kind `hermes` WITHOUT a `[lifecycle.start]` table yields NoStartTemplate with no builtin-table fallback.
   evidence: The new precedence test (blind-19) covers only manifest-with-start beating the builtin table; the no-start-table complement relies on pre-existing engine semantics in `resolve_start_launch` (`crates/ktesio-engine/src/adapter/mod.rs:275`).
+  resolved: 2026-09-22 hardening batch (PR #231 / d28c94e) — `resolve_start_launch_of_a_hermes_manifest_without_start_yields_no_start_template` (adapter/mod.rs, its comment names this deferral) pins the complement: kind `hermes` without `[lifecycle.start]` yields `NoStartTemplate`; the builtin gateway launch is never a fallback for a manifest re-read.
 - source_spec: `_bmad-output/implementation-artifacts/spec-6-2-round1-triage-fixes.md`
   summary: No user-facing doc that `model` is a silent no-op for the hermes kind (Decision 6) — discoverable only in code comments/tests.
   evidence: `docs/commands.md` hermes paragraph documents HERMES_HOME mapping but not the deliberately unmapped `model` key; pre-existing gap unrelated to the 13 triaged findings.
@@ -177,12 +182,14 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: Fleet surfaces (`list`/`show`/`--json`) carry no detached/supervision-mode indicator, so an operator cannot see which running instances survive command exit or sit in the enforcement window.
   evidence: epic-12 step-04 blind-hunter (round 2, 2026-09-15) — the honesty lives only in the one-time start stderr note; a visible cell/field (the honest `—` cell pattern) is a product-surface decision.
+  resolved: story 15-2 (PR #281 / 9a2ceaa, 2026-10-17) — the fleet surfaces carry the supervision indicator: `list`/`show` render the `detached` cell and `--json` the matching field, so instances surviving command exit (or sitting in the enforcement window) are visible in the fleet view (cli/agent.rs, "Story 15-2 (Fibery 176): the supervision indicator").
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: The engine-level cross-lifetime detach e2e (`detached_start_survives_a_clean_engine_exit_and_the_next_engine_adopts`) still runtime-skips on the linux-x86 CI leg (pre-existing #109 mitigation); the CLI-level e2e covers the behavior there, but the facade-level harness runs only on macOS/Windows legs.
   evidence: epic-12 step-04 verification-gap reviewer (rounds 1+2, 2026-09-15) — compensation verified (unskipped `kt`-binary e2e on Linux); fold into the #109 re-exec-deadlock follow-up.
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: pause × detach cross-lifetime edge — a detached handle paused (SIGSTOP) in-process and then dropped at command exit strands the child frozen and unsupervised until a later command resumes/stops it.
   evidence: epic-12 step-04 edge-case-hunter (round 1, 2026-09-15) — needs a product call (resume-before-release vs kill vs document-only; documented-only in commands.md today); the backend handle does not track pause state, so it is not a trivial patch.
+  resolved: story 15-2 (PR #281 / 9a2ceaa, 2026-10-17) — ratified and implemented: `release_detached_paused` (supervisor/lifecycle.rs, "Story 15-2 (Fibery 178)") SIGCONT-resumes a detached paused child at the releasing engine's exit with a surfaced note — EXCEPT a budget-breach pause, which stays stopped (resuming it would run unsupervised in the enforcement-free window); a child that exited first and the breach-shaped stay-stopped arm each carry their own surfaced note.
 - source_spec: `spec-epic-12-durable-detach-observed-channel.md`
   summary: A detached child that exits long after its handle dropped is reaped only once at drop — a long-lived embedding host can accumulate zombie entries until the host exits (kt CLI processes exit immediately, so CLI usage is unaffected).
   evidence: epic-12 step-04 edge-case-hunter (round 1, 2026-09-15) — a lazy-reaper arm in the backend (poll detached children this process spawned) is a small design task for an embedding-focused story.
@@ -202,7 +209,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: On Windows, a DETACHED agent ends up holding its spawning `kt` command's stdio pipe write-ends — any script that CAPTURES `kt agent start --detach` output (pipes) blocks until the agent exits; interactive terminals are unaffected (no pipes).
   evidence: the CLI detach test's forensic harness (agent_cli.rs `run_kt_agent_bounded`, 56ee766) proved kt EXITS (~1s, try_wait Ok(Some)) while its stdout/stderr pipes never EOF; std's spawn is documented to restrict inheritance to the child's own three stdio handles (attribute list), so the leak mechanism is unexpected — investigate (suspects: the Stdio::from(file) inheritable-dup path interacting with the job assignment, or a std behavior change) before fixing (candidates: explicit handle pinning at the Windows detached spawn, or DETACHED_PROCESS when the capture files already carry the output).
   routed: engine Windows detached-spawn handle handling — next Windows-touching story.
-  resolved-note: ROOT CAUSE found 2026-10-17 (story 15-4 investigation): std's default
+  resolved: story 15-4 (PR #283 / 800934c, 2026-10-17) — root cause found and fixed: std's default
   Windows spawn passes NO PROC_THREAD_ATTRIBUTE_HANDLE_LIST while bInheritHandles stays
   TRUE, and every stdio std provides (Stdio::from(File)/null()/piped()) is created or
   duplicated INHERITABLE — the detached child inherits the WHOLE inheritable-handle table,
