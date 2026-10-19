@@ -466,9 +466,8 @@ async fn forward(
     queue: ObservedQueue,
 ) -> Response<Full<Bytes>> {
     // Build the upstream URI: <upstream authority> + the request's path-and-query,
-    // preserving the exact path the agent called (e.g. /v1/chat/completions). A
-    // build failure → an honest 502 (no traffic echoed).
-    let Some(uri) = build_upstream_uri(&upstream, &req) else {
+    // A build failure → an honest 502 (no traffic echoed).
+    let Some(uri) = build_upstream_uri(&upstream, req.uri()) else {
         return bad_gateway();
     };
 
@@ -699,13 +698,22 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// Build the upstream URI from the configured `upstream` authority + the inbound
 /// request's path-and-query (preserving the exact path the agent called). Returns
 /// `None` on a malformed combination (→ an honest 502; no traffic echoed).
-fn build_upstream_uri(upstream: &str, req: &Request<Incoming>) -> Option<hyper::Uri> {
+///
+/// An asterisk-form request target (`OPTIONS *`) is REFUSED here. It has no path
+/// to join onto the upstream base, and the join it used to produce —
+/// `http://host:port*` — is ACCEPTED by the http crate's lenient authority
+/// grammar with the port silently dropped (`port_u16() == None`), so the relay
+/// dialed the upstream host on the DEFAULT port: whatever service happens to
+/// listen there received the agent's request (observed answering a relayed
+/// `OPTIONS` with 200 on a Windows CI runner's IIS). Refusing keeps the
+/// destination the configured upstream on every path: an honest 502, never a
+/// silent misroute to an unrelated listener.
+fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
     let base = upstream.trim().trim_end_matches('/');
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    if path_and_query == "*" {
+        return None;
+    }
     format!("{base}{path_and_query}").parse::<hyper::Uri>().ok()
 }
 
@@ -1754,11 +1762,15 @@ mod tests {
     #[test]
     fn an_asterisk_form_target_never_fabricates_success_or_meters() {
         // The asterisk-form request target (`OPTIONS * HTTP/1.1`) is legal on
-        // the wire and reaches the service. The join with the upstream base
-        // yields a Uri whose AUTHORITY carries the `*` (the http crate's
-        // authority grammar tolerates it), so the forward fails at transport
-        // — and the agent still sees the honest 502 with the static no-leak
-        // body: never a panic, never a fabricated success. The upstream here
+        // the wire and reaches the service — and has no path to join onto the
+        // upstream base. Historically the raw join produced `http://host:port*`,
+        // which the http crate ACCEPTS with the port silently dropped, so the
+        // relay dialed the DEFAULT port of the upstream host — on the Windows
+        // CI runner IIS answers there with 200 and the relay faithfully relayed
+        // a response from a service the agent never configured. build_upstream_uri
+        // now refuses the asterisk-form up front, so the agent always sees the
+        // honest 502 with the static no-leak body on EVERY platform: never a
+        // panic, never a fabricated success, never a misroute. The upstream here
         // is LIVE: had the forward somehow succeeded, the stub's 200 would be
         // relayed and this test would go red.
         let (upstream_url, upstream_join) = spawn_oneshot_upstream(
@@ -1799,6 +1811,29 @@ mod tests {
             !upstream_join.is_finished(),
             "no request may reach the upstream from an unrelayable target"
         );
+    }
+
+    #[test]
+    fn build_upstream_uri_refuses_the_asterisk_form() {
+        // `OPTIONS *` has no path to join onto the upstream base. The join it
+        // used to produce — `http://host:port*` — PARSES in the http crate with
+        // the port silently dropped, which would send the relay to the DEFAULT
+        // port of the upstream host instead of the configured one (a Windows CI
+        // runner's IIS answered the misrouted OPTIONS with 200). The refusal is
+        // the deterministic contract: None → an honest 502 on every platform.
+        let asterisk: hyper::Uri = "*".parse().unwrap();
+        assert_eq!(asterisk.path_and_query().map(|pq| pq.as_str()), Some("*"));
+        assert!(
+            build_upstream_uri("http://127.0.0.1:12345", &asterisk).is_none(),
+            "the asterisk-form target must be refused, never joined"
+        );
+        // Control: an origin-form target still joins onto the upstream base and
+        // keeps the configured port.
+        let origin: hyper::Uri = "/v1/chat/completions?stream=false".parse().unwrap();
+        let joined = build_upstream_uri("http://127.0.0.1:12345", &origin).unwrap();
+        assert_eq!(joined.port_u16(), Some(12345));
+        assert_eq!(joined.path(), "/v1/chat/completions");
+        assert_eq!(joined.query(), Some("stream=false"));
     }
 
     #[test]
