@@ -246,7 +246,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   evidence: the proposal §4.6 item 3
 - source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (declarative fleet file)
   summary: A declarative fleet file reconciled at Service Host boot is DEFERRED; trigger: a Host runs more than one agent per Service Host (the first Host runs one per container).
-  evidence: the proposal §4.6 item 4; Story 15.2 scope
+  evidence: the proposal §4.6 item 4; Story 17.2 scope (renumbered from 15.2)
 - source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (incremental SSE relay + multi-route upstreams)
   summary: The store-and-forward relay (whole-body buffering, up to 64 MiB) and the single upstream per instance stay; incremental SSE relay and multi-route upstreams are DEFERRED; trigger: a Host whose model path streams to the agent, or reaches more than one upstream.
   evidence: crates/hekma-engine/src/metering/listener.rs:147-162, 372-393

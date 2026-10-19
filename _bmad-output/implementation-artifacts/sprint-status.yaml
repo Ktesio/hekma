@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-19-2026 06:33"
+last_updated: "10-19-2026 12:00"  # bumped by the 15-17 → 17-19 renumber (epic numbers 15/16 consumed on main by the autonomous Fibery-backlog tranches)
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -168,32 +168,36 @@ development_status:
   13-2-renegotiate-the-contract-on-the-legacy-start-fallback: done  # RESOLVED-PRE-EXISTING 2026-09-19: closed by 7b1a70c2 (PR #172, 2026-09-07, retro item #2) — fallback re-parse negotiates (adapter/mod.rs:338-352 → LaunchResolveError::ContractIncompatible), bypass tests at mod.rs:1348/:1390, docs corrected in the same PR; verified at HEAD, zero code change in epic-13. Retro item epic-6-retro-item-2 reconciled closed.
   13-3-supervisor-module-boundary-split-study: done  # spec stage (supervisor-split-study-2026-09-19.md, options A/B/C) ratified A+B by Islam 2026-09-19; implemented in two compile-gated commits: commit 1 = tests -> supervisor/tests.rs (9101 -> 4775-line supervisor.rs) + embed_clean walker recognizes tests.rs/tests/ test regions; commit 2 = production directory split mod.rs(core+transitions)/spawn/lifecycle/reaper/usage/interaction (pure impl-block moves, 11 cross-family fns widened pub(super), audit path pins updated to the family files). Lock model untouched per AD-18.
   epic-13-retrospective: done  # 2026-09-22 — epic-13-retro-2026-09-22.md (accepted-with-open-items; the 10/13/14 catch-up batch — the key was never created at epic close, added by the retro run).
-  # Epics 15-17 (hosted-platform readiness) — opened 2026-09-30 via correct-course
+  # Epics 17-19 (hosted-platform readiness) — opened 2026-09-30 via correct-course
   # (sprint-change-proposal-2026-09-30-hosted-platform-readiness.md, APPROVED by Islam with D1-D5 +
   # the Q6/Q8 answers): the first production Host (generic; unnamed per the naming ruling) needs a
-  # Service Host + Control API (15), service-grade lifecycle via Adapter Contract v1.1.0 (16), and
-  # wire governance incl. portable Governance Vectors (17). 17-1 runs FIRST. Batch-epic shape.
-  epic-15: backlog  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 15-1)
-  15-1-host-mode-spec-the-shim-crate-and-the-lock-model: backlog
-  15-2-hekma-serve-the-long-running-host: backlog
-  15-3-control-api-v0: backlog
-  15-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: backlog
-  15-5-static-linux-release-and-the-container-recipe: backlog
-  epic-15-retrospective: optional
-  epic-16: backlog  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0)
-  16-1-readiness-probes: backlog
-  16-2-liveness-and-the-unresponsive-failure: backlog
-  16-3-exit-code-classes-and-the-stable-window-reset: backlog
-  16-4-cooperative-pause-commands-and-the-drain-verb: backlog
-  16-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
-  epic-16-retrospective: optional
-  epic-17: backlog  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass)
-  17-1-governance-conformance-vectors: backlog  # FOUNDATION — runs first; an external Host consumer waits on it
-  17-2-the-wire-fence-block-breach-action: backlog
-  17-3-task-scope-host-units-of-work: backlog
-  17-4-per-call-records-for-hosts: backlog
-  17-5-reconciliation-ingestion: backlog
+  # Service Host + Control API (17), service-grade lifecycle via Adapter Contract v1.1.0 (18), and
+  # wire governance incl. portable Governance Vectors (19). 19-1 runs FIRST. Batch-epic shape.
+  # RENUMBERED 2026-10-19 from Epics 15-17: remote main's autonomous Fibery-backlog tranches
+  # (epic-15 done 2026-10-17, epic-16 done 2026-10-19) had consumed the numbers 15/16 while this
+  # approved 2026-09-30 correct-course output sat uncommitted locally. Stories shift with their
+  # epics: Service Host 15.x→17.x, Service-Grade Lifecycle 16.x→18.x, Wire Governance 17.x→19.x.
+  epic-17: backlog  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber)
+  17-1-host-mode-spec-the-shim-crate-and-the-lock-model: backlog
+  17-2-hekma-serve-the-long-running-host: backlog
+  17-3-control-api-v0: backlog
+  17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: backlog
+  17-5-static-linux-release-and-the-container-recipe: backlog
   epic-17-retrospective: optional
+  epic-18: backlog  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber)
+  18-1-readiness-probes: backlog
+  18-2-liveness-and-the-unresponsive-failure: backlog
+  18-3-exit-code-classes-and-the-stable-window-reset: backlog
+  18-4-cooperative-pause-commands-and-the-drain-verb: backlog
+  18-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
+  epic-18-retrospective: optional
+  epic-19: backlog  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber)
+  19-1-governance-conformance-vectors: backlog  # FOUNDATION — runs first; an external Host consumer waits on it
+  19-2-the-wire-fence-block-breach-action: backlog
+  19-3-task-scope-host-units-of-work: backlog
+  19-4-per-call-records-for-hosts: backlog
+  19-5-reconciliation-ingestion: backlog
+  epic-19-retrospective: optional
   epic-9: done  # squash-merged to main 2026-07-14 as 39f0a57 (PR #114). kt --help now matches the shipped agent-runner README/GitHub positioning; v0.6.0. All 3 stories + AD-16/Epic-8 re-scope done. Issues #110/#111/#112/#113 closed. Follow-up #109 (adoption x86 CI deadlock root-cause) remains open/tracked separately, not a blocker.
   9-1-remove-the-legacy-skill-manager-command-surface-modules-and: done  # committed 42896b7 on feat/epic-9-retire-legacy-cli; TWO-pass review APPROVED (primary + adversarial: byte-identical agent/self-update help vs baseline, no over/under-deletion, AgentManifest* boundary intact, all 9 gates green / 767 tests). 2 LOW deferred: dangling [workspace.dependencies] (→9-2), stale check_docs KT_COMMANDS allowlist (→9-3).
   9-2-reposition-the-top-level-kt-identity-to-the-agent-runner: done  # (was tracked as 9-2-rebrand-kt-identity-and-make-agent-list-show-canonical) committed 45d203e on feat/epic-9-retire-legacy-cli (on top of 9-1); CI green cross-OS incl. coverage on PR #114. Review APPROVED-WITH-NITS (rebrand text verified verbatim-consistent with the live README/GitHub description; canonical-surface guard proven non-vacuous via live smoke; 0.6.0 bump isolated to workspace.package; dangling deps confirmed gone). 1 LOW cosmetic nit (story-file wording, reconciled) — no functional follow-up.

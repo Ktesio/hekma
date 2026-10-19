@@ -330,6 +330,6 @@ graph LR
 - **Richer Memory Backings** (vector stores, tiered) — behind `MemoryBacking` (AD-11).
 - **Sandboxing** — explicit v1 non-goal (PRD §8, NFR-6); revisit only as a versioned initiative.
 - **opencode adapter as shipped code** — v1.x per Islam's ruling; the paper conformance mapping (FR-29) lands during contract-freeze work.
-- *(Scheduled 2026-09-30 and removed from this list: the Service/IPC transport → AD-20 / Epic 15; reconciliation ingestion → Story 17.5.)*
+- *(Scheduled 2026-09-30 and removed from this list: the Service/IPC transport → AD-20 / Epic 17; reconciliation ingestion → Story 19.5. Epic/story numbers renumbered 2026-10-19 from 15/17.5 — epic numbers 15/16 were consumed on main by the autonomous Fibery-backlog tranches.)*
 - **Privilege separation and attested egress** — would make an in-container fence non-bypassable; waits for a Host topology with no external choke point.
 - **Windowed (daily/monthly) and runtime-hour budgets**, **pre-start/pre-stop lifecycle hooks**, **a declarative fleet file**, **static `aarch64` Linux**, **incremental SSE relay**, **multi-route upstreams**, **approval routing** (ACP `request_permission` to the Host), **a `hekma conformance` CLI**, and **a WASM build of the governance core** — each waits for its trigger in `deferred-work.md`.

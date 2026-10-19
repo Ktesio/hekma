@@ -1,9 +1,18 @@
 # Sprint Change Proposal — Hosted-Platform Readiness (the first production Host)
 
+> **RENUMBERED 2026-10-19 (before landing):** approved 2026-09-30 as Epics 15–17, but while this
+> approved output sat uncommitted on a local branch, remote main's autonomous Fibery-backlog
+> tranches consumed the epic numbers 15 (done 2026-10-17) and 16 (done 2026-10-19). The hosted-
+> platform epics land RENUMBERED: Service Host 15→**17**, Service-Grade Lifecycle 16→**18**,
+> Wire Governance 17→**19**; stories shift with their epics (15.x→17.x, 16.x→18.x, 17.x→19.x).
+> The body below retains the original 2026-09-30 numbering as the historical record of what was
+> ratified; the live tracker (`sprint-status.yaml`), `epics.md`, the PRD FR map, and the
+> architecture spine carry the renumbered numbers.
+
 **Date:** 2026-09-30 · **Trigger owner:** Islam (product directive) · **Mode:** Batch
-**Route:** Correct Course → new Epics 15, 16 and 17 · **Scope classification:** Moderate (new epics +
+**Route:** Correct Course → new Epics 15, 16 and 17 (renumbered to 17, 18, 19 at landing) · **Scope classification:** Moderate (new epics +
 PRD/spine additions; no replan of shipped work)
-**Status:** APPROVED 2026-09-30 (Islam, Batch mode) — applied the same day
+**Status:** APPROVED 2026-09-30 (Islam, Batch mode) — applied the same day; landed 2026-10-19
 
 > **Naming.** This proposal describes its first production Host generically — a hosted container
 > platform (the PRD's UJ-3 "Lena" archetype). Whether to name it publicly is Islam's decision after

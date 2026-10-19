@@ -146,11 +146,11 @@ FR-37: Epic 9 — Legacy surface removed at the pivot release (amended from "dep
 FR-38: Epic 9 — Removal announced via release notes at a stated version (amended from "notice-window lifecycle")
 FR-39: Epic 9 (preserved: kt name / crates.io / Homebrew / self-update kept) + Epic 8 Story 8-5 (per-channel upgrade verification in release checks)
 FR-40: Epic 14 — ACP backend support
-FR-41: Epic 15 — Service host mode
-FR-42: Epic 16 — Service-grade lifecycle
-FR-43: Epic 17 (17.2–17.4) — Governance at the wire and per unit of work
-FR-44: Epic 17 (17.1) — Portable governance semantics
-FR-45: Epic 17 (17.5) — Reconciliation with confirmed actuals
+FR-41: Epic 17 — Service host mode
+FR-42: Epic 18 — Service-grade lifecycle
+FR-43: Epic 19 (19.2–19.4) — Governance at the wire and per unit of work
+FR-44: Epic 19 (19.1) — Portable governance semantics
+FR-45: Epic 19 (19.5) — Reconciliation with confirmed actuals
 
 NFR mapping (cross-cutting unless noted): NFR-1 → Epic 1 (resilience core) + all DoDs; NFR-2 → Epic 1 (per-OS backends) + every OS-touching story; NFR-3 → every story's DoD (coverage gate); NFR-4 → Epic 7 (benchmark story); NFR-5 → Epic 4; NFR-6 → Epic 2 (secrets) + docs; NFR-7 → every story's DoD + Epic 8 (migration docs); NFR-8 → Epic 1 (tokio/rusqlite adoption stories).
 
@@ -184,17 +184,17 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
 
-### Epic 17: Wire Governance for Hosts *(opened 2026-09-30 via correct-course)*
+### Epic 19: Wire Governance for Hosts *(opened 2026-09-30 via correct-course)*
 A Host shares the Engine's decision rules as portable vectors, scopes budgets to its own units of
 work, fences further model calls when a ceiling is reached, reads per-call facts, and feeds back
 confirmed actuals. **FRs covered:** FR-43, FR-44, FR-45.
 
-### Epic 16: Service-Grade Lifecycle *(opened 2026-09-30 via correct-course)*
+### Epic 18: Service-Grade Lifecycle *(opened 2026-09-30 via correct-course)*
 Readiness and liveness probes, exit-code classes with a stable-window reset, cooperative pause
 commands and a drain verb — an additive Adapter Contract minor (v1.1.0) under which a gateway-style
 service agent is a plain manifest adapter. **FRs covered:** FR-42 (+ FR-9 amendment).
 
-### Epic 15: Service Host *(opened 2026-09-30 via correct-course)*
+### Epic 17: Service Host *(opened 2026-09-30 via correct-course)*
 A long-running host that owns supervision continuously and serves a local, versioned Control API;
 state export for ephemeral disks; static Linux releases and a container recipe. **FRs covered:**
 FR-41.
@@ -1104,7 +1104,7 @@ commands.md (the `acp` kind), supported-agents page, architecture AD-19 (spine; 
 in the proposal), adapter-contract scope sentence (builtins don't negotiate — B3), metering
 honesty note. Release-surface announcement per AI-55 (new kind, additive schema, no break).
 
-## Epic 15: Service Host
+## Epic 17: Service Host
 
 > **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
 > The first production Host — a hosted container platform, the UJ-3 archetype — needs supervision
@@ -1112,7 +1112,7 @@ honesty note. Release-surface announcement per AI-55 (new kind, additive schema,
 > future epic when embedder demand … materializes"; PRD §13 Q6 asked for its delivery path. Realizes
 > FR-41. Batch-epic shape (the 10–14 precedent): full ACs are derived at the spec stage.
 
-### Story 15.1: Host-mode spec — the shim crate and the lock model (D1, D2; spec stage, AI-58)
+### Story 17.1: Host-mode spec — the shim crate and the lock model (D1, D2; spec stage, AI-58)
 Settle the two decisions this proposal leaves to measurement:
 1. **The host crate.** Its name, its HTTP stack under an NFR-8 review, and its AD-2 boundary entry.
    The CLI stays synchronous and the engine transport-agnostic.
@@ -1122,7 +1122,7 @@ Settle the two decisions this proposal leaves to measurement:
 
 Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 
-### Story 15.2: `hekma serve` — the long-running host
+### Story 17.2: `hekma serve` — the long-running host
 - A foreground host that owns one Engine for its whole life, with a state-directory lock so exactly
   one owner exists.
 - A fixed `metering.listen` port option, which also closes the adoption strand.
@@ -1132,7 +1132,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
   agent on its own exit before that window ends.
 - Operator-visible notices through the diagnostic sink.
 
-### Story 15.3: Control API v0 (D3)
+### Story 17.3: Control API v0 (D3)
 - An HTTP/JSON projection of the public facade — lifecycle, config and budgets, fleet and status,
   usage, events — plus `drain` and the Task verbs once Epics 16 and 17 land.
 - Explicit bind; a bearer resolved through `SecretResolver`; no secret reveal and no raw agent output
@@ -1141,7 +1141,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 - Versioned and marked unstable (`0.x`) until a second Host validates it.
 - A conformance-style suite drives the whole API against the fake agents.
 
-### Story 15.4: Export for ephemeral hosts — the outbox and log capture modes
+### Story 17.4: Export for ephemeral hosts — the outbox and log capture modes
 - A global sequence across the transition, breach and usage families, pulled by cursor and
   acknowledged by the Host (AD-14 amendment); the per-family `resync_events` stays.
 - The state directory can be placed on a volume the Host chooses.
@@ -1149,7 +1149,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
   rotation bounded like `output.log` (AD-12 amendment). A Host whose agent output may carry user
   content can keep it off disk.
 
-### Story 15.5: Static Linux release and the container recipe
+### Story 17.5: Static Linux release and the container recipe
 - Static musl `x86_64` release artifacts, checksummed, in the release matrix; `aarch64` is deferred.
 - A docs page, "running Hekma as a container supervisor", covering:
   - the host as the container command or as an init-supervised service;
@@ -1157,7 +1157,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
   - state-directory placement;
   - the cooperative-meter caveat (NFR-6).
 
-## Epic 16: Service-Grade Lifecycle
+## Epic 18: Service-Grade Lifecycle
 
 > **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
 > A service agent is ready later than its process exists, can hang while alive, asks its supervisor to
@@ -1166,31 +1166,31 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 > older engine still rejects a newer same-major manifest that uses a new section — this is stated on
 > the release surface (AI-55).
 
-### Story 16.1: Readiness probes
+### Story 18.1: Readiness probes
 - Declared probes: an HTTP GET with an expected status, a file's age, or a log-line match — each with a
   timeout.
 - `starting → running` waits for the probe; a timeout lands the instance in `failed` with the probe
   named (AD-15 amendment).
 - Honest per-OS semantics where a probe kind needs them.
 
-### Story 16.2: Liveness and the unresponsive failure
+### Story 18.2: Liveness and the unresponsive failure
 - Declared liveness: a heartbeat file's maximum age, or an HTTP check.
 - A failure moves `running → failed` with cause `unresponsive`, and the Restart Policy applies.
 - Liveness never probes a paused instance.
 
-### Story 16.3: Exit-code classes and the stable-window reset
+### Story 18.3: Exit-code classes and the stable-window reset
 - Declared restart-requested codes (e.g. 75) relaunch without charging the crash loop.
 - Declared clean codes are not crashes.
 - The consecutive-failure counter resets after a stable running window.
 - FR-9's `always` is recorded as subsumed.
 
-### Story 16.4: Cooperative pause commands and the drain verb
+### Story 18.4: Cooperative pause commands and the drain verb
 - A declared pause/resume command pair (e.g. a sentinel-writing CLI verb) drives pause and resume.
   It is still surfaced as best-effort when it only stops new work.
 - `drain` = stop new work (the pause command, if declared) → wait for idle, bounded → stop. The
   outcome records completed versus timed out, and no new lifecycle state is added.
 
-### Story 16.5: A service-mode gateway as a manifest adapter
+### Story 18.5: A service-mode gateway as a manifest adapter
 - A reference manifest for a gateway-style service agent: an API server, readiness on its models
   endpoint, heartbeat liveness, exit-75 restart, and a cooperative pause.
 - A conformance-kit fake that behaves like one, with TCK sections for readiness, liveness, exit
@@ -1198,7 +1198,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 - The `hermes`-kind deprecation (14-5) gains its service-mode successor here: removal waits for this
   story (AD-19 amendment).
 
-## Epic 17: Wire Governance for Hosts
+## Epic 19: Wire Governance for Hosts
 
 > **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
 > The Host enforces money at its own external choke point and wants Hekma's rules there, provably. It
@@ -1206,7 +1206,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 > reconcile against the Host's figures. Realizes FR-43, FR-44 and FR-45. This is money code: every
 > story gets the AI-55 two-pass review.
 
-### Story 17.1: Governance conformance vectors — FOUNDATION, runs first (D5, FR-44)
+### Story 19.1: Governance conformance vectors — FOUNDATION, runs first (D5, FR-44)
 - Versioned, checksummed JSON vectors — ledger state and ceilings in, decisions out — covering:
   - the `≥` threshold;
   - per-scope latches and re-arm;
@@ -1219,27 +1219,27 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
   can pin them.
 - Small, and first: the Host's guard waits on them.
 
-### Story 17.2: The wire fence — a `block` Breach Action (D4, AD-7 amendment)
+### Story 19.2: The wire fence — a `block` Breach Action (D4, AD-7 amendment)
 - On breach, the pipeline flips a lock-free per-instance flag.
 - `forward()` refuses further model calls with a typed, non-retryable response (not 429), until the
   ceiling is raised or reset.
 - The breach event and log record the fence like any action.
 - Docs state its cooperative scope (NFR-6).
 
-### Story 17.3: Task scope — Host units of work (AD-7 amendment)
+### Story 19.3: Task scope — Host units of work (AD-7 amendment)
 - Begin and end a Task on a running instance through the facade and the Control API.
 - Ledger rows and events carry the Task.
 - Per-Task budgets and latches sit beside per-Run and cumulative ones.
 - Raising a ceiling re-arms its latch within the Run.
 - Usage outside any Task is recorded as untasked.
 
-### Story 17.4: Per-call records for Hosts
+### Story 19.4: Per-call records for Hosts
 - For each observed completion: status class, latency, model when present, tokens, Task, sub-second
   timestamp.
 - Never request or response content — the sentinel no-leak matrix is extended.
 - Readable through the facade and the Control API.
 
-### Story 17.5: Reconciliation ingestion — the `reconciled` label's first producer (FR-45, AD-8)
+### Story 19.5: Reconciliation ingestion — the `reconciled` label's first producer (FR-45, AD-8)
 - A Host submits confirmed usage for a Run or Task.
 - Reconciled figures sit beside estimated rows and never overwrite them.
 - Drift is reported, and every surface labels which figure it shows.

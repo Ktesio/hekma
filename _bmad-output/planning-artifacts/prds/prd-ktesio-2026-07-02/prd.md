@@ -499,7 +499,7 @@ Carried from the brief (confirmed direction, list awaiting Islam's re-confirmati
 
 ### 9.3 v1.x additions
 
-FR-40 (shipped in Epic 14) and FR-41..FR-45 (Epics 15–17, added 2026-09-30) are v1.x additions, not the v1 MVP.
+FR-40 (shipped in Epic 14) and FR-41..FR-45 (Epics 17–19, added 2026-09-30; renumbered from 15–17 on 2026-10-19 — main's autonomous Fibery-backlog tranches had consumed epic numbers 15/16 while the correct-course output sat uncommitted) are v1.x additions, not the v1 MVP.
 
 ## 10. Why Now
 
