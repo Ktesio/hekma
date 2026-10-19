@@ -2,7 +2,7 @@
 title: 'record_transition-after-commit: compensate the starting state on event-append failure'
 type: 'bugfix'
 created: '2026-10-18'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'f6dbc02d62ba1ef3e15dbd451796b04d439a5ee8'
 context: []
@@ -50,9 +50,9 @@ context: []
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] The compensation helper + the error arm in `record_transition`; the additive variant if needed (with caller audit).
-- [ ] The two deterministic test arms via the 15-6 fault-injection harness.
-- [ ] CHANGELOG/RELEASE_NOTES Unreleased; sprint-status 16-3 row; `deferred-work.md` — the 15-6 entry's resolved marker at merge.
+- [x] The compensation helper + the error arm in `record_transition`; the additive variant if needed (with caller audit).
+- [x] The two deterministic test arms via the 15-6 fault-injection harness.
+- [x] CHANGELOG/RELEASE_NOTES Unreleased; sprint-status 16-3 row; `deferred-work.md` — the 15-6 entry's resolved marker (the row and the marker land in this PR's bookkeeping).
 
 **Acceptance Criteria:**
 - Given a committed transition whose event append fails, then the registry row reads `prior` and the surfaced error is the Log failure.

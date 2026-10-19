@@ -2,7 +2,7 @@
 title: 'Between-commands raw-log backlog: bounded follow prime (ratified surface)'
 type: 'feature'
 created: '2026-10-18'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'f6dbc02d62ba1ef3e15dbd451796b04d439a5ee8'
 context: []
