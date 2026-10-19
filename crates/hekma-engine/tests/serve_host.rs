@@ -633,12 +633,38 @@ fn serve_mode_children_inherit_only_their_declared_environment() {
     // prefix).
     let text = poll_dump_for(&dump, "env=OPENAI_BASE_URL=http://127.0.0.1:");
     // The FLOOR arrived: the child can resolve programs and find its home.
-    // (Both are set in every dev/CI shell this unix leg runs in.)
-    for floor in ["env=PATH=", "env=HOME="] {
-        assert!(
-            text.contains(floor),
-            "the floor must keep {floor} for the child (review finding 7); full dump:\n{text}"
-        );
+    // The floor is the OS-documented baseline (docs/commands.md): Unix keeps
+    // PATH+HOME (both set in every dev/CI shell this leg runs in); Windows
+    // keeps the CRT plumbing set (SystemRoot/SystemDrive/ComSpec/TEMP/TMP/
+    // PATH), where env NAMES are case-insensitive and arrive in the ambient
+    // spelling — so the keys are matched case-insensitively against the
+    // dump's env lines rather than by exact substring.
+    if std::env::consts::OS == "windows" {
+        let dumped_keys: Vec<String> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("env="))
+            .map(|rest| rest.split('=').next().unwrap_or("").to_ascii_uppercase())
+            .collect();
+        for floor in [
+            "SYSTEMROOT",
+            "SYSTEMDRIVE",
+            "COMSPEC",
+            "TEMP",
+            "TMP",
+            "PATH",
+        ] {
+            assert!(
+                dumped_keys.iter().any(|k| k == floor),
+                "the Windows floor must keep {floor} for the child (review finding 7); full dump:\n{text}"
+            );
+        }
+    } else {
+        for floor in ["env=PATH=", "env=HOME="] {
+            assert!(
+                text.contains(floor),
+                "the floor must keep {floor} for the child (review finding 7); full dump:\n{text}"
+            );
+        }
     }
     // And NOTHING ELSE ambient did: no common CI/shell variables.
     for ambient in ["env=CI=", "env=CARGO=", "env=RUSTUP_HOME="] {
@@ -758,8 +784,18 @@ fn both_backend_sources_carry_the_env_clear_guard() {
     // finding 7) between the clear and the apply; a pure source scan — no
     // OS-cfg, no Windows build needed in this suite.
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let floors: [(&str, &[&str]); 2] = [
-        ("backends/unix/mod.rs", &["\"PATH\"", "\"HOME\""]),
+    // The floor-loop predicate differs per backend: Unix env names are
+    // case-SENSITIVE (exact `contains`), Windows names are case-INSENSITIVE
+    // and arrive in the ambient spelling (the CI runner may re-case the
+    // system variables), so that backend matches its floor keys with
+    // `eq_ignore_ascii_case` — observed live on windows-latest where an
+    // exact-match floor silently dropped SystemRoot/SystemDrive/ComSpec.
+    let floors: [(&str, &[&str], &str); 2] = [
+        (
+            "backends/unix/mod.rs",
+            &["\"PATH\"", "\"HOME\""],
+            "ENV_FLOOR.contains(&k)",
+        ),
         (
             "backends/windows/mod.rs",
             &[
@@ -770,9 +806,10 @@ fn both_backend_sources_carry_the_env_clear_guard() {
                 "\"TMP\"",
                 "\"PATH\"",
             ],
+            "ENV_FLOOR.iter().any(|f| k.eq_ignore_ascii_case(f))",
         ),
     ];
-    for (backend_rel, floor_keys) in floors {
+    for (backend_rel, floor_keys, floor_predicate) in floors {
         let backend = src.join(backend_rel);
         let source = std::fs::read_to_string(&backend)
             .unwrap_or_else(|err| panic!("read {}: {err}", backend.display()));
@@ -802,9 +839,7 @@ fn both_backend_sources_carry_the_env_clear_guard() {
         // (clear → floor → apply, never apply-then-clear which would drop
         // the declared mappings or lose the floor).
         let clear = source.find("command.env_clear();").expect("clear position");
-        let floor = source
-            .find("ENV_FLOOR.contains(&k)")
-            .expect("floor position");
+        let floor = source.find(floor_predicate).expect("floor position");
         let apply = source
             .find("for (key, value) in &spec.env {")
             .expect("apply position");

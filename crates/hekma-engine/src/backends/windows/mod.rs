@@ -348,10 +348,17 @@ impl ProcessBackend for WindowsBackend {
         if !spec.inherit_env {
             command.env_clear();
             for (key, value) in std::env::vars_os() {
+                // Env NAMES are case-insensitive on Windows (the CRT resolves
+                // them so), and the ambient block's spelling is not under our
+                // control — the CI runner rebuilds the step environment and
+                // may change the case of the system variables. Match the
+                // floor case-insensitively and pass the key through VERBATIM
+                // (its ambient case), so the documented plumbing always
+                // reaches the child instead of being dropped on a spelling.
                 let is_floor = key
                     .as_os_str()
                     .to_str()
-                    .is_some_and(|k| ENV_FLOOR.contains(&k));
+                    .is_some_and(|k| ENV_FLOOR.iter().any(|f| k.eq_ignore_ascii_case(f)));
                 if is_floor {
                     command.env(key, value);
                 }
