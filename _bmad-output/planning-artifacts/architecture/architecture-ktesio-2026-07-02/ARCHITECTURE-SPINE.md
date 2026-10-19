@@ -7,8 +7,8 @@ paradigm: 'hexagonal (ports & adapters) around a supervised-process core'
 scope: 'Repositioned Ktesio: embeddable personal-agent runtime engine + kt CLI (PRD prd-ktesio-2026-07-02, FR-1..39)'
 status: final
 created: '2026-07-02'
-updated: '2026-07-30'
-binds: [FR-1..FR-39, NFR-1..NFR-8]
+updated: '2026-09-30'
+binds: [FR-1..FR-45, NFR-1..NFR-8]
 sources:
   - ../../prds/prd-ktesio-2026-07-02/prd.md
   - ../../prds/prd-ktesio-2026-07-02/addendum.md
@@ -83,11 +83,13 @@ graph TD
 - **Binds:** FR-18..23, SM-2
 - **Prevents:** budget checks scattered across call sites, each with its own race against the ledger.
 - **Rule:** `MeteringSource` → UsageEvent → ledger transaction → `BudgetEvaluator` (inside the same commit path) → BreachDecision → supervisor executes the Breach Action (default `pause`) and emits the breach event. No other code path may mutate the Usage Ledger or trigger Breach Actions. A **Run** is the span from a `starting` transition to the next terminal state (`stopped`/`failed`) of that Agent Instance — "per-run" budget scope means exactly this span, and every UsageEvent carries at minimum {instance id, run id, input tokens, output tokens, metering source, timestamp}. v1 `engine-observed` source = loopback-only HTTP forward listener the adapter points the Agent's OpenAI-compatible `base_url` at, parsing standard usage fields. `[ASSUMPTION: OpenAI-compatible usage JSON covers v1 targets; other provider schemas are Deferred.]` (Run is absent from the PRD Glossary — flagged upstream as a PRD open item.)
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 
 ### AD-8 — Estimate honesty is type-enforced
 - **Binds:** FR-23, SM-C3
 - **Prevents:** an unlabeled dollar figure ever reaching a human or a Host.
 - **Rule:** exactly one rendering module owns currency formatting; its input type requires an `EstimateLabel` (`estimated` | `reconciled`). No other module formats currency (review + grep-lint enforced).
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 
 ### AD-9 — Layered TOML config with persisted provenance
 - **Binds:** FR-11..13
@@ -109,6 +111,7 @@ graph TD
 - **Binds:** FR-24..26, NFR-5
 - **Prevents:** per-adapter log formats and lost output while detached.
 - **Rule:** the adapter trait exposes an `InteractionChannel` (manifest kind default: stdin pipe in, stdout/stderr capture out; hermes maps to its native channel). The engine captures agent stdout/stderr into per-instance rotated files (10MB × 3), every line timestamped and attributed (`agent-out` | `agent-err` | `engine`). stdout of `kt` is command output; diagnostics go to stderr (ADOPTED).
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 
 ### AD-13 — Async-first engine on tokio; blocking facade for sync callers
 - **Binds:** all engine internals; FR-33, FR-34
@@ -119,11 +122,13 @@ graph TD
 - **Binds:** FR-8, FR-9, FR-21, FR-26, FR-33
 - **Prevents:** the CLI's `--json` and the Host event stream drifting into two dialects.
 - **Rule:** engine events (state transitions, crash/restart, usage updates, breaches) are versioned serde structs published over the subscription API; `kt --json` serializes the same structs. Schema changes follow the Embedding Interface semver rules (AD-2).
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 
 ### AD-15 — Lifecycle state machine is data
 - **Binds:** FR-5..9; PRD Glossary states (ratified: `registered starting running paused stopping stopped failed`)
 - **Prevents:** transition logic duplicating across commands and drifting per adapter.
 - **Rule:** one transition table (state × command → state | error) in engine core, exhaustively unit-tested; every transition emits the AD-14 event with prior state, new state, cause, timestamp. Restart Policy executor: exponential backoff 1s base, ×2, 60s cap; crash-loop stop after 5 consecutive failures — all per-instance configurable.
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 
 ```mermaid
 stateDiagram-v2
@@ -161,12 +166,61 @@ stateDiagram-v2
 - **Evidence (ratified by Islam, 2026-09-19):** (1) story 7-5 measured coarse-model contention at ~0.7% per instance against NFR-4's 2% budget (40–170× headroom) — the proposal's own reopening clause is measurement-gated ("that measurement, not an argument, reopens this decision") and the measurement passed; (2) AI-20's 2026-09-15 ratification declined the daemon/persistent-engine-session concurrency that made per-instance locking an Epic-7 fitness requirement; (3) epics 7–12 shipped with no lock-class incident.
 - **Accepted costs (bounded and disclosed, never silent):** AI-59's bounded 5s stdin-write stall — fleet-wide within one engine lifetime, and the CLI's one-engine-per-command shape isolates across commands; the ≤35s `KILL_CONFIRM_TIMEOUT` window; bounded-but-large filesystem work under the locks (Agent Home deletion). Agent latency never holds engine locks — an agent thinking/reasoning is its own process's work; the engine is not in the agent request path, so agent slowness blocks nothing under either model.
 - **Reopen triggers (any one reopens this decision; the archived plan reactivates as-written):** (1) ratification of a daemon / persistent-engine-session / concurrent embedded host (AI-20's successor); (2) a 7-5-style measurement over the NFR-4 budget under active contention; (3) a cross-instance invariant defect under the coarse model; (4) sustained fleet-scale growth moving the measured contention term. The archived proposal's Steps 0–4 are zero-interleaving-risk and may still be executed on their own merits without reopening this decision.
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
 - **Carried debt (model-independent — pays under either model, tracked in deferred-work):** the archived proposal's Step 0 free wins (hoist `EnginePaths` out of `Registry`; move the whole-file agent-log reads off the guard; bound the bare `child.wait()` in the unix Drop) and Step 7 companions (usage-total rollups bounding the `usage_events` scans; deduplicate `fleet_entry_for`'s double `effective_config` fold; `agent.log` rotation). AD-17's bounded-work rule and the AI-63(a) inventory remain **debt, not licence**.
 
 ### AD-19 — The engine speaks ACP as a client for the builtin `acp` kind
 - **Binds:** the `acp` builtin kind end to end; AD-4 (no per-OS cfg outside `backends/` — ndJSON/JSON-RPC framing is OS-uniform), AD-7 (metering), AD-8 (estimate honesty), AD-12 (engine-owned interaction/log capture), AD-13 (tokio tasks, bounded lock holds per AD-17/AD-18), AD-18; NFR-6 (no sandbox claims), NFR-8 (lean dependencies); resolves Epic 14 (Sprint Change Proposal 2026-09-19-acp, decisions D1–D8).
 - **Prevents:** per-agent bespoke integration cost for every ACP-speaking agent (the friction this AD exists to delete); the frozen adapter contract v1 being re-opened for a transport concern (builtins do not negotiate — epic-6 retro B3 precedent); billing-grain dishonesty via ACP (the protocol's `usage_update` is CONTEXT-grain — used/size — and must never be minted into the billing ledger); silent loss of cached tokens (the pipeline-wide gap: parse ignored `prompt_tokens_details`, `Rate` had no cached price, the ledger no column).
 - **Rule:** the engine runs an ACP **client** over the child's stdio — newline-delimited JSON-RPC 2.0 (UTF-8, one message per line, stdout purity), hand-rolled over `serde_json` (NO new crates; the official SDK rejected for v1 under NFR-8 — churn vs. the single-integer protocol version; revisit when the End-Turn Token Usage RFD lands). Client capabilities advertised = the protocol default (no fs/terminal/elicitation; D3); incoming `session/request_permission` is answered denied + one surfaced diagnostic. Version posture: negotiate at `initialize` (client offers its latest; tolerate the pinned set {1}; counter outside it → close with a surfaced, traffic-free error). Lifecycle mapping: `send` = one `session/prompt` (returns after the bounded write; the turn completes asynchronously — `send`'s latency contract stays constant-time; a second concurrent prompt is refused with a surfaced in-flight error); `session/cancel` precedes the normal stop ladder; pause/resume keeps process semantics; the ACP session id persists with the spawn record and re-adoption resumes via `session/load` when the agent advertises it, else `session/new` + honest note (composes with epic-12 detach). Metering is tiered, never fabricated: T1 `usage_update` → surfaced context metric (log + `show --json`), T2 the engine-observed base-URL channel, T3 the optional stderr sentinel — the billing ledger (input/output/**cached**) is fed only by T2/T3; the honest `—` cell survives only as the surfaced last resort naming the tiers attempted (AI-18, AD-8). Cached tokens are first-class across parse → ledger (additive nullable column) → rate (optional cached rate; unset prices at the input rate — documented conservative default) → budgets → surfaces, for every kind. The bespoke `hermes` kind deprecates by announcement once the acp kind reaches parity (14-5); its removal is a future MAJOR-release decision under the CLI-surface policy — never this epic's.
+- **Amended 2026-09-30:** see *Amendments (2026-09-30)* after AD-20.
+
+### AD-20 — The Service Host is a shim over the public engine API
+- **Binds:** FR-41; AD-2, AD-13, AD-14, AD-17/AD-18; PRD §8 (no hosted control plane), §6 Privacy, NFR-6, NFR-8.
+- **Prevents:** supervision gaps between commands for Hosts that cannot link Rust; a second
+  business-logic implementation growing inside a transport layer; a network surface that leaks
+  secrets or content.
+- **Rule:** a new host crate depends only on `hekma-engine`'s public API — one AD-2 boundary-gate
+  entry — and serves a local HTTP/JSON Control API. The `hekma` CLI stays synchronous; the engine
+  library stays transport-agnostic. Around that:
+  - **Ownership:** one Service Host owns a state directory, enforced by a lock.
+  - **Binding and auth:** the bind address is explicit, and auth is a bearer resolved through
+    `SecretResolver`.
+  - **What it never returns:** no secret reveal and no raw agent output unless explicitly enabled.
+  - **Events:** live over SSE, and by pull on a global cursor (AD-14 amendment).
+  - **Shutdown:** SIGTERM drains, then stops within a bound. The host may own process signals; the
+    engine library still may not (the embed-clean audit is unchanged).
+  - **Versioning:** the Control API carries its own version, unstable `0.x` until a second Host
+    validates it.
+  - **Settled at 15.1's spec stage:** the crate name, the HTTP stack (NFR-8 review) and AD-18's
+    outcome.
+
+### Amendments (2026-09-30) — ratified with sprint-change-proposal-2026-09-30-hosted-platform-readiness.md
+
+- **AD-7 (2026-09-30):**
+  - A `block` Breach Action fences further model calls: the pipeline flips a lock-free per-instance
+    flag that `forward()` checks, refusing with a typed non-retryable response. No lock is taken in
+    the request path, so AD-18's premise holds.
+  - A Host-defined **Task** is a budget scope beside per-Run and cumulative.
+  - Raising a ceiling re-arms its latch within the Run.
+  - Still true: no code path other than the pipeline triggers a Breach Action.
+- **AD-8 (2026-09-30):** reconciliation ingestion (FR-45) is the `reconciled` label's first producer.
+  Reconciled figures never overwrite estimated rows.
+- **AD-12 (2026-09-30):** capture modes `full` (the default, today's behaviour), `metadata` and `off`;
+  `agent.log` rotation joins `output.log`'s bound.
+- **AD-14 (2026-09-30):** an export view with one global sequence across the event families, pulled by
+  cursor. The per-family `resync_events` is unchanged.
+- **AD-15 (2026-09-30):**
+  - Declared readiness gates `starting → running`.
+  - Declared liveness failure is `running → failed` (cause `unresponsive`).
+  - Declared exit-code classes: restart-requested exits do not charge the crash loop; clean exits
+    are not crashes.
+  - A stable window resets the counter.
+  - `drain` is a composite (stop new work → bounded wait → stop). It adds no state.
+- **AD-18 (2026-09-30):** reopen trigger (1) fired with AD-20's ratification. The decision is
+  15.1's, on measurement.
+- **AD-19 (2026-09-30):** removal of the `hermes` kind waits for the service-mode successor (16.5);
+  ACP stdio does not run a gateway's API server, scheduler or messaging.
 
 ## Consistency Conventions
 
@@ -270,11 +324,12 @@ graph LR
 ## Deferred
 
 - **Adapter registry / remote adapter distribution** — v1 is bundled + path-loaded manifests; distribution design waits for real third-party demand (PRD §9.2).
-- **Service/IPC embedding transport** (PRD Q6) — the Embedding Interface stays transport-agnostic (plain async API + serde events) so a JSON-RPC/gRPC shim can wrap it at v1.x without reshaping the engine.
 - **Non-OpenAI-compatible metering schemas** — behind `MeteringSource` (AD-7 assumption).
 - **OS-keychain secrets backend** — behind `SecretResolver` (AD-10).
 - **Per-window budgets (daily/monthly)** — ledger schema already timestamped; evaluator extension only (PRD FR-18 note).
-- **Reconciliation with provider actuals** — `EstimateLabel` already carries `reconciled` (AD-8); the ingestion path is the deferred part.
 - **Richer Memory Backings** (vector stores, tiered) — behind `MemoryBacking` (AD-11).
 - **Sandboxing** — explicit v1 non-goal (PRD §8, NFR-6); revisit only as a versioned initiative.
 - **opencode adapter as shipped code** — v1.x per Islam's ruling; the paper conformance mapping (FR-29) lands during contract-freeze work.
+- *(Scheduled 2026-09-30 and removed from this list: the Service/IPC transport → AD-20 / Epic 17; reconciliation ingestion → Story 19.5. Epic/story numbers renumbered 2026-10-19 from 15/17.5 — epic numbers 15/16 were consumed on main by the autonomous Fibery-backlog tranches.)*
+- **Privilege separation and attested egress** — would make an in-container fence non-bypassable; waits for a Host topology with no external choke point.
+- **Windowed (daily/monthly) and runtime-hour budgets**, **pre-start/pre-stop lifecycle hooks**, **a declarative fleet file**, **static `aarch64` Linux**, **incremental SSE relay**, **multi-route upstreams**, **approval routing** (ACP `request_permission` to the Host), **a `hekma conformance` CLI**, and **a WASM build of the governance core** — each waits for its trigger in `deferred-work.md`.

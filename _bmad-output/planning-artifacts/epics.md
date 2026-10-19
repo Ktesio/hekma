@@ -5,6 +5,7 @@ inputDocuments:
   - _bmad-output/planning-artifacts/prds/prd-ktesio-2026-07-02/prd.md
   - _bmad-output/planning-artifacts/prds/prd-ktesio-2026-07-02/addendum.md
   - _bmad-output/planning-artifacts/architecture/architecture-ktesio-2026-07-02/ARCHITECTURE-SPINE.md
+  - _bmad-output/planning-artifacts/sprint-change-proposal-2026-09-30-hosted-platform-readiness.md
 executionNote: "Headless-conservative run inside the parent orchestrator (Islam's standing 'proceed inline, non-blocking' direction, 2026-07-02, during a flapping platform classifier). Step menus auto-continued with [C]; Party Mode offers skipped (requires subagent orchestration, gated) — validation gap covered by bmad-check-implementation-readiness next. Step-4 validation passed: 39/39 FRs covered (FR-27/FR-32 seeded early + completed later, annotated in the coverage map), no starter template (brownfield restructure = Story 1.1), entities introduced only when first needed (SQLite 1.2, tokio 1.4, usage_events 3.1), no forward dependencies, epics standalone on predecessors. 8 epics, 37 stories. No UX design contract exists (CLI/engine product — PRD review confirmed no UX phase needed). bmad-help invocation skipped (parent orchestrator owns routing; next = readiness check → sprint planning)."
 ---
 
@@ -57,6 +58,12 @@ FR-36: Skill Set lifecycle per instance (list, upgrade/re-lock, remove, integrit
 FR-37: The legacy skill-manager command surface is removed at the pivot release (0.6.0), with the removal explicitly stated in that release's CHANGELOG/RELEASE_NOTES and README — superseding the original "remain functional with a notice" requirement (amended 2026-07-14, ratified by Islam — Epic 9 correct-course, Story 9-3)
 FR-38: The removal is announced at the pivot release via CHANGELOG.md/RELEASE_NOTES.md/README, naming the retired commands and the version at which they were removed — a clean break at a major pivot boundary satisfies the announce-and-document intent without an in-tool notice-then-remove window (Option A; amended 2026-07-14, ratified by Islam — Epic 9 correct-course, Story 9-3; Story 9.4's notice-stub path (Option B) not pursued)
 FR-39: Continuity of `kt` name and channels (crates.io, Homebrew, install scripts) through the pivot
+FR-40: ACP backend support — any ACP v1 agent via the builtin `acp` kind; tiered usage acquisition, never fabricated (added 2026-09-19; landed in the PRD 2026-09-30)
+FR-41: Service host mode — a long-running host owning supervision continuously, driven by a local versioned Control API (added 2026-09-30)
+FR-42: Service-grade lifecycle — readiness and liveness probes, exit-code classes with a stable-window reset, cooperative pause, drain (Adapter Contract v1.1.0; added 2026-09-30)
+FR-43: Governance at the wire and per unit of work — Task-scoped budgets, the `block` fence, content-free per-call records (added 2026-09-30)
+FR-44: Portable governance semantics — versioned Governance Vectors verified against the evaluator (added 2026-09-30)
+FR-45: Reconciliation with confirmed actuals — the `reconciled` label's first producer (added 2026-09-30)
 
 ### NonFunctional Requirements
 
@@ -138,6 +145,12 @@ FR-36: Epic 8 — Skill Set lifecycle
 FR-37: Epic 9 — Legacy surface removed at the pivot release (amended from "deprecation notices")
 FR-38: Epic 9 — Removal announced via release notes at a stated version (amended from "notice-window lifecycle")
 FR-39: Epic 9 (preserved: kt name / crates.io / Homebrew / self-update kept) + Epic 8 Story 8-5 (per-channel upgrade verification in release checks)
+FR-40: Epic 14 — ACP backend support
+FR-41: Epic 17 — Service host mode
+FR-42: Epic 18 — Service-grade lifecycle
+FR-43: Epic 19 (19.2–19.4) — Governance at the wire and per unit of work
+FR-44: Epic 19 (19.1) — Portable governance semantics
+FR-45: Epic 19 (19.5) — Reconciliation with confirmed actuals
 
 NFR mapping (cross-cutting unless noted): NFR-1 → Epic 1 (resilience core) + all DoDs; NFR-2 → Epic 1 (per-OS backends) + every OS-touching story; NFR-3 → every story's DoD (coverage gate); NFR-4 → Epic 7 (benchmark story); NFR-5 → Epic 4; NFR-6 → Epic 2 (secrets) + docs; NFR-7 → every story's DoD + Epic 8 (migration docs); NFR-8 → Epic 1 (tokio/rusqlite adoption stories).
 
@@ -170,6 +183,21 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 ### Epic 7: Embed the Engine (Hosts)
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
+
+### Epic 19: Wire Governance for Hosts *(opened 2026-09-30 via correct-course)*
+A Host shares the Engine's decision rules as portable vectors, scopes budgets to its own units of
+work, fences further model calls when a ceiling is reached, reads per-call facts, and feeds back
+confirmed actuals. **FRs covered:** FR-43, FR-44, FR-45.
+
+### Epic 18: Service-Grade Lifecycle *(opened 2026-09-30 via correct-course)*
+Readiness and liveness probes, exit-code classes with a stable-window reset, cooperative pause
+commands and a drain verb — an additive Adapter Contract minor (v1.1.0) under which a gateway-style
+service agent is a plain manifest adapter. **FRs covered:** FR-42 (+ FR-9 amendment).
+
+### Epic 17: Service Host *(opened 2026-09-30 via correct-course)*
+A long-running host that owns supervision continuously and serves a local, versioned Control API;
+state export for ephemeral disks; static Linux releases and a container recipe. **FRs covered:**
+FR-41.
 
 ### Epic 14: ACP Backend Support *(opened 2026-09-19 via correct-course)*
 ### Epic 13: Engine Correctness & the Supervisor Module Boundary *(opened 2026-09-19)*
@@ -1075,3 +1103,143 @@ Real-agent smoke against `gemini --acp` when present (skip otherwise, surfaced).
 commands.md (the `acp` kind), supported-agents page, architecture AD-19 (spine; seed text
 in the proposal), adapter-contract scope sentence (builtins don't negotiate — B3), metering
 honesty note. Release-surface announcement per AI-55 (new kind, additive schema, no break).
+
+## Epic 17: Service Host
+
+> **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
+> The first production Host — a hosted container platform, the UJ-3 archetype — needs supervision
+> that outlives a command and a local surface to drive it. AI-20 deferred exactly this "as a deliberate
+> future epic when embedder demand … materializes"; PRD §13 Q6 asked for its delivery path. Realizes
+> FR-41. Batch-epic shape (the 10–14 precedent): full ACs are derived at the spec stage.
+
+### Story 17.1: Host-mode spec — the shim crate and the lock model (D1, D2; spec stage, AI-58)
+Settle the two decisions this proposal leaves to measurement:
+1. **The host crate.** Its name, its HTTP stack under an NFR-8 review, and its AD-2 boundary entry.
+   The CLI stays synchronous and the engine transport-agnostic.
+2. **The lock model.** AD-18's reopen trigger (1) fires here. Measure the serve shape against NFR-4 by
+   the 7-5 method, then either re-ratify the coarse two-mutex model with that evidence or activate the
+   archived per-instance plan.
+
+Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
+
+### Story 17.2: `hekma serve` — the long-running host
+- A foreground host that owns one Engine for its whole life, with a state-directory lock so exactly
+  one owner exists.
+- A fixed `metering.listen` port option, which also closes the adoption strand.
+- A child environment allowlist: agents inherit only what is declared, not the host's whole
+  environment.
+- SIGTERM drains then stops every instance within a bounded window, and the host never SIGKILLs an
+  agent on its own exit before that window ends.
+- Operator-visible notices through the diagnostic sink.
+
+### Story 17.3: Control API v0 (D3)
+- An HTTP/JSON projection of the public facade — lifecycle, config and budgets, fleet and status,
+  usage, events — plus `drain` and the Task verbs once Epics 16 and 17 land.
+- Explicit bind; a bearer resolved through `SecretResolver`; no secret reveal and no raw agent output
+  unless explicitly enabled.
+- Events over SSE, and pull by cursor.
+- Versioned and marked unstable (`0.x`) until a second Host validates it.
+- A conformance-style suite drives the whole API against the fake agents.
+
+### Story 17.4: Export for ephemeral hosts — the outbox and log capture modes
+- A global sequence across the transition, breach and usage families, pulled by cursor and
+  acknowledged by the Host (AD-14 amendment); the per-family `resync_events` stays.
+- The state directory can be placed on a volume the Host chooses.
+- Log capture modes `full` (today's behaviour, the default), `metadata` and `off`, with `agent.log`
+  rotation bounded like `output.log` (AD-12 amendment). A Host whose agent output may carry user
+  content can keep it off disk.
+
+### Story 17.5: Static Linux release and the container recipe
+- Static musl `x86_64` release artifacts, checksummed, in the release matrix; `aarch64` is deferred.
+- A docs page, "running Hekma as a container supervisor", covering:
+  - the host as the container command or as an init-supervised service;
+  - how drain meets the container's stop grace;
+  - state-directory placement;
+  - the cooperative-meter caveat (NFR-6).
+
+## Epic 18: Service-Grade Lifecycle
+
+> **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
+> A service agent is ready later than its process exists, can hang while alive, asks its supervisor to
+> restart it with an exit code, and must drain before a stop. None of that is expressible today.
+> Realizes FR-42 as an additive Adapter Contract minor (v1.1.0). Per the contract's own rule, an
+> older engine still rejects a newer same-major manifest that uses a new section — this is stated on
+> the release surface (AI-55).
+
+### Story 18.1: Readiness probes
+- Declared probes: an HTTP GET with an expected status, a file's age, or a log-line match — each with a
+  timeout.
+- `starting → running` waits for the probe; a timeout lands the instance in `failed` with the probe
+  named (AD-15 amendment).
+- Honest per-OS semantics where a probe kind needs them.
+
+### Story 18.2: Liveness and the unresponsive failure
+- Declared liveness: a heartbeat file's maximum age, or an HTTP check.
+- A failure moves `running → failed` with cause `unresponsive`, and the Restart Policy applies.
+- Liveness never probes a paused instance.
+
+### Story 18.3: Exit-code classes and the stable-window reset
+- Declared restart-requested codes (e.g. 75) relaunch without charging the crash loop.
+- Declared clean codes are not crashes.
+- The consecutive-failure counter resets after a stable running window.
+- FR-9's `always` is recorded as subsumed.
+
+### Story 18.4: Cooperative pause commands and the drain verb
+- A declared pause/resume command pair (e.g. a sentinel-writing CLI verb) drives pause and resume.
+  It is still surfaced as best-effort when it only stops new work.
+- `drain` = stop new work (the pause command, if declared) → wait for idle, bounded → stop. The
+  outcome records completed versus timed out, and no new lifecycle state is added.
+
+### Story 18.5: A service-mode gateway as a manifest adapter
+- A reference manifest for a gateway-style service agent: an API server, readiness on its models
+  endpoint, heartbeat liveness, exit-75 restart, and a cooperative pause.
+- A conformance-kit fake that behaves like one, with TCK sections for readiness, liveness, exit
+  classes and drain.
+- The `hermes`-kind deprecation (14-5) gains its service-mode successor here: removal waits for this
+  story (AD-19 amendment).
+
+## Epic 19: Wire Governance for Hosts
+
+> **(2026-09-30 — opened via correct-course: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md`.)**
+> The Host enforces money at its own external choke point and wants Hekma's rules there, provably. It
+> also wants Hekma's cooperative meter to fence, to attribute usage to its own units of work, and to
+> reconcile against the Host's figures. Realizes FR-43, FR-44 and FR-45. This is money code: every
+> story gets the AI-55 two-pass review.
+
+### Story 19.1: Governance conformance vectors — FOUNDATION, runs first (D5, FR-44)
+- Versioned, checksummed JSON vectors — ledger state and ceilings in, decisions out — covering:
+  - the `≥` threshold;
+  - per-scope latches and re-arm;
+  - token ceilings before dollar ceilings;
+  - integer micro-dollar arithmetic;
+  - round-half-up;
+  - saturation;
+  - no retroactive repricing.
+- They are generated from, and verified against, the evaluator in CI, and published so a non-Rust Host
+  can pin them.
+- Small, and first: the Host's guard waits on them.
+
+### Story 19.2: The wire fence — a `block` Breach Action (D4, AD-7 amendment)
+- On breach, the pipeline flips a lock-free per-instance flag.
+- `forward()` refuses further model calls with a typed, non-retryable response (not 429), until the
+  ceiling is raised or reset.
+- The breach event and log record the fence like any action.
+- Docs state its cooperative scope (NFR-6).
+
+### Story 19.3: Task scope — Host units of work (AD-7 amendment)
+- Begin and end a Task on a running instance through the facade and the Control API.
+- Ledger rows and events carry the Task.
+- Per-Task budgets and latches sit beside per-Run and cumulative ones.
+- Raising a ceiling re-arms its latch within the Run.
+- Usage outside any Task is recorded as untasked.
+
+### Story 19.4: Per-call records for Hosts
+- For each observed completion: status class, latency, model when present, tokens, Task, sub-second
+  timestamp.
+- Never request or response content — the sentinel no-leak matrix is extended.
+- Readable through the facade and the Control API.
+
+### Story 19.5: Reconciliation ingestion — the `reconciled` label's first producer (FR-45, AD-8)
+- A Host submits confirmed usage for a Run or Task.
+- Reconciled figures sit beside estimated rows and never overwrite them.
+- Drift is reported, and every surface labels which figure it shows.
