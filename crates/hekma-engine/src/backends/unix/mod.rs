@@ -159,6 +159,13 @@ impl UnixBackend {
     }
 }
 
+/// The OS-baseline environment FLOOR (review finding 7): the variables an
+/// `inherit_env: false` child keeps BEYOND its declared mappings — the
+/// minimal plumbing a Unix process needs to start and resolve programs.
+/// NOT host-environment leakage: the declared-env contract is unchanged for
+/// everything else (see the spawn guard + docs/commands.md).
+const ENV_FLOOR: &[&str] = &["PATH", "HOME"];
+
 impl ProcessBackend for UnixBackend {
     type Handle = UnixProcess;
 
@@ -166,7 +173,30 @@ impl ProcessBackend for UnixBackend {
         let mut command = Command::new(&spec.exec);
         command.args(&spec.args);
         command.current_dir(&spec.working_dir);
-        // Apply env overrides on top of the inherited environment.
+        // Story 17-2: `inherit_env: false` (the Host's `child_env_allowlist`)
+        // clears the inherited environment FIRST so the child sees ONLY the
+        // declared mappings below — plus the OS-baseline FLOOR (review
+        // finding 7): the minimal OS plumbing every child process needs to
+        // start and resolve programs. A strict clear with no floor breaks
+        // real children (no PATH → no program resolution, no shelling out;
+        // on Windows a stripped SystemRoot breaks process startup outright).
+        // The floor is NOT host-environment leakage: it is documented OS
+        // plumbing (see docs/commands.md), and everything ELSE ambient —
+        // credentials, shell exports, CI variables — still never passes.
+        // `true` (the default) is the pre-17-2 `envs`-on-top semantics.
+        if !spec.inherit_env {
+            command.env_clear();
+            for (key, value) in std::env::vars_os() {
+                let is_floor = key
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|k| ENV_FLOOR.contains(&k));
+                if is_floor {
+                    command.env(key, value);
+                }
+            }
+        }
+        // Apply env overrides on top of the (possibly cleared) environment.
         for (key, value) in &spec.env {
             command.env(key, value);
         }
@@ -1063,6 +1093,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         }
     }
 
@@ -1703,6 +1734,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         s.env.clear();
 
@@ -1868,6 +1900,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
             stderr_log_file: Some(dir.path().join("stderr.raw")),
@@ -1975,6 +2008,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
         let backend = UnixBackend::new();
@@ -2025,6 +2059,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         s.env.clear();
 
@@ -2146,6 +2181,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         let mut proc = backend
             .spawn(&s)
@@ -2206,6 +2242,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
 
@@ -2284,6 +2321,7 @@ mod tests {
             pipe_stdin: false,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
@@ -2372,6 +2410,7 @@ mod tests {
             pipe_stdin: false,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         let mut original = backend.spawn(&s).expect("spawn sleep with capture");
         assert!(backend.log_capture(&original).is_some());

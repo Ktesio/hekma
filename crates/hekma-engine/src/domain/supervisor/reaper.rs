@@ -811,6 +811,91 @@ impl Supervisor {
                     };
                     // Clone the Run context into `Supervised` — the AI-44
                     // enforcement call below borrows the same values afterwards.
+                    // Story 17-2 (the AI-46 closure, the `metering.listen`
+                    // seam): when THIS engine opened with a FIXED metering
+                    // port, an adopted engine-observed instance gets a LIVE
+                    // listener re-bound on that port before it is re-held —
+                    // the injected `base_url` of an instance whose spawner ran
+                    // the same fixed port is live again with NO stop→start.
+                    // Port 0 (every pre-17-2 open) keeps the story-11-3
+                    // strand diagnostic below unchanged (a re-bind cannot
+                    // guess the previous engine's ephemeral port). The
+                    // DECISION itself is the pure
+                    // [`adoption_rebind_decision`] seam (review finding 14:
+                    // unit-tested on every OS — the process legs skip on the
+                    // linux CI runner).
+                    let adopted_listener =
+                        match adoption_rebind_decision(&metering_source, self.metering_listen_port)
+                        {
+                            AdoptionRebind::Attempt => {
+                                match registry.effective_config(&name, ConfigLayer::empty()) {
+                                    Ok(effective) => {
+                                        match self.start_observed_listener(
+                                            &name,
+                                            &metering_source,
+                                            &effective,
+                                        ) {
+                                            // `start_observed_listener` returns Some only for
+                                            // an engine-observed instance — which this is.
+                                            Ok(Some(listener)) => {
+                                                self.emit_diagnostic(&format!(
+                                            "{}: re-bound the observed-metering listener on the \
+                                             fixed loopback port {} — an instance started under \
+                                             the SAME fixed port is live again (no stop/start \
+                                             needed); one inherited from an ephemeral-port engine \
+                                             still needs stop→start to re-inject its base_url",
+                                            name.as_str(),
+                                            listener.local_addr().port(),
+                                        ));
+                                                Some(listener)
+                                            }
+                                            Ok(None) => None,
+                                            Err(err) => {
+                                                // AI-18: a failed re-bind is SURFACED (the
+                                                // EngineError detail is traffic-free by
+                                                // construction — bind/upstream shape only),
+                                                // never a silent strand; the strand note
+                                                // below still applies and fires too.
+                                                self.emit_diagnostic(&format!(
+                                                    "{}: could not re-bind the observed-metering \
+                                             listener on the fixed port {} ({}) — the adopted \
+                                             instance keeps NO listener; free the port (or stop \
+                                             and start the instance) to restore its model \
+                                             traffic",
+                                                    name.as_str(),
+                                                    self.metering_listen_port,
+                                                    err,
+                                                ));
+                                                None
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        // A config-read failure degrades to the
+                                        // pre-17-2 strand posture (no listener),
+                                        // SURFACED — the strand note below fires too.
+                                        self.emit_diagnostic(&format!(
+                                            "{}: the adopted engine-observed instance's effective \
+                                     config could not be read ({err}); its metering listener \
+                                     could not be re-bound on the fixed port {} — stop and \
+                                     start the instance to restore its model traffic",
+                                            name.as_str(),
+                                            self.metering_listen_port,
+                                        ));
+                                        None
+                                    }
+                                }
+                            }
+                            AdoptionRebind::SkipNotObserved | AdoptionRebind::SkipNoFixedPort => {
+                                None
+                            }
+                        };
+                    let adopted_observed_source = adopted_listener
+                        .as_ref()
+                        .map(|_| ObservedUsageSource::new());
+                    // Read BEFORE the listener moves into `Supervised` (the
+                    // strand note below must know whether a live listener landed).
+                    let rebind_landed = adopted_listener.is_some();
                     self.clear_poll_error_streak(&name);
                     self.running.insert(
                         name.clone(),
@@ -859,8 +944,14 @@ impl Supervisor {
                             // port / the Epic-7 daemon owning the listener) is a tracked
                             // follow-up, not done here. A self-reported instance's
                             // log-tail drain is unaffected (it needs no listener).
-                            observed_listener: None,
-                            observed_source: None,
+                            // Story 17-2: an adopted engine-observed instance
+                            // whose spawner ran the SAME fixed metering port
+                            // is re-bound live above; `None` (port-0 opens,
+                            // failed re-binds) keeps the story-11-3 strand
+                            // posture, and the strand diagnostic below says
+                            // so honestly.
+                            observed_listener: adopted_listener,
+                            observed_source: adopted_observed_source,
                             // An adopted instance's stop attempt has not
                             // happened yet in THIS engine session.
                             stop_unconfirmed: false,
@@ -921,7 +1012,11 @@ impl Supervisor {
                     // Semantics are untouched: the instance stays marked
                     // un-observed exactly as below, and no process is
                     // relaunched (adoption keeps-them-running).
-                    if metering_source == "engine-observed" {
+                    // Story 17-2: SKIPPED when the fixed-port re-bind above
+                    // landed a live listener (`adopted_listener` is Some) —
+                    // the instance is NOT stranded, and a strand warning would
+                    // lie. Port-0 opens (and failed re-binds) still fire it.
+                    if metering_source == "engine-observed" && !rebind_landed {
                         let strand = format!(
                             "{}: adopted an engine-observed instance; its injected \
                              'metering.base_url' still points at the PREVIOUS engine's \

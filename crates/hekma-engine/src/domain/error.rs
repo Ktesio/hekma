@@ -14,6 +14,20 @@ use super::transition::LifecycleError;
 /// Errors from the registry service (`register` / `remove`).
 #[derive(Debug, Error)]
 pub enum RegistryError {
+    /// Review finding 16: the story-17-2 serve options were applied to a
+    /// supervisor whose lifecycle already began, or twice on the same
+    /// supervisor — the open-time-only guard's typed refusal. Never
+    /// reachable through the shipped open paths (`open`,
+    /// `open_with_diagnostics`, `open_with_options` all apply once, on a
+    /// fresh supervisor, before any lifecycle); the variant exists so a
+    /// future misuser gets a surfaced error, never a panic or a silent
+    /// re-pin.
+    #[error("serve options are open-time only: {detail}")]
+    ServeOptionsOpenTimeOnly {
+        /// The guard's surfaced refusal (why the application was refused).
+        detail: String,
+    },
+
     /// The requested name collides with an existing instance.
     ///
     /// Distinct from [`StoreError::DuplicateName`] so the service layer can

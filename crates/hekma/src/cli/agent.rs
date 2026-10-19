@@ -2633,6 +2633,22 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             message: format!("State store error: {inner}. The state database may be inaccessible."),
         }
         .into(),
+        // Story 17-2, review finding 16: the serve-options open-time-only
+        // guard — unreachable through the shipped CLI paths (every `open`
+        // applies the options once, on a fresh supervisor, before any
+        // lifecycle). Mapped into the code-1 config class (the serve options
+        // ARE open-time configuration, and the refusal is that
+        // configuration's invariant); the arm keeps the mapper exhaustive —
+        // if a future caller ever trips the guard, the diagnostic surfaces
+        // the refusal verbatim instead of falling to the catch-all
+        // unexplained.
+        RegistryError::ServeOptionsOpenTimeOnly { detail } => AgentConfig {
+            message: format!(
+                "{detail}. This is an internal invariant of the engine's open path — \
+                 please report it with the command you ran."
+            ),
+        }
+        .into(),
     }
 }
 

@@ -248,6 +248,23 @@ impl Drop for WindowsProcess {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsBackend;
 
+/// The OS-baseline environment FLOOR (review finding 7): the variables an
+/// `inherit_env: false` child keeps BEYOND its declared mappings — the
+/// plumbing the Windows CRT/process startup reads (`SystemRoot`,
+/// `SystemDrive`, `ComSpec`) plus temp dirs (`TEMP`, `TMP`) and program
+/// resolution (`PATH`). Stripping them breaks real children outright. NOT
+/// host-environment leakage: the declared-env contract is unchanged for
+/// everything else (see the spawn guard + docs/commands.md). Mirrors the
+/// Unix backend's identical floor shape.
+const ENV_FLOOR: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "PATH",
+];
+
 impl WindowsBackend {
     /// Construct the backend.
     pub fn new() -> Self {
@@ -318,6 +335,28 @@ impl ProcessBackend for WindowsBackend {
         let mut command = Command::new(&spec.exec);
         command.args(&spec.args);
         command.current_dir(&spec.working_dir);
+        // Story 17-2: `inherit_env: false` (the Host's `child_env_allowlist`)
+        // clears the inherited environment FIRST so the child sees ONLY the
+        // declared mappings below — plus the OS-baseline FLOOR (review
+        // finding 7): on Windows a child stripped of SystemRoot/SystemDrive/
+        // ComSpec/TEMP/TMP cannot reliably start a process at all (CRT
+        // initialization reads them). Mirrors the Unix backend's identical
+        // guard + floor shape. The floor is NOT host-environment leakage: it
+        // is documented OS plumbing (see docs/commands.md), and everything
+        // ELSE ambient still never passes. `true` (the default) is the
+        // pre-17-2 `envs`-on-top semantics.
+        if !spec.inherit_env {
+            command.env_clear();
+            for (key, value) in std::env::vars_os() {
+                let is_floor = key
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|k| ENV_FLOOR.contains(&k));
+                if is_floor {
+                    command.env(key, value);
+                }
+            }
+        }
         for (key, value) in &spec.env {
             command.env(key, value);
         }
@@ -1163,6 +1202,7 @@ mod tests {
             pipe_stdin: false,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         }
     }
 

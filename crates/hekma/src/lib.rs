@@ -25,6 +25,24 @@ Details:
 Example:
   hekma self-update";
 
+const SERVE_AFTER_HELP: &str = "\
+Details:
+  Runs the long-running Service Host over one state directory: adopts every
+  live agent at open, then waits. On SIGTERM (or Ctrl+C) every RUNNING agent
+  is stopped through the bounded graceful ladder (--stop-window <secs>,
+  default 30, bounded 1..=86400), each outcome surfaced, and only then does
+  the host exit. Hosted children inherit ONLY their manifest-declared
+  environment plus a minimal OS-baseline floor (process plumbing — Unix
+  PATH/HOME; Windows SystemRoot/SystemDrive/ComSpec/TEMP/TMP/PATH), never
+  the host shell's ambient variables. A second `hekma serve` on the same
+  state directory is refused naming the holder PID (exit 2); a crashed
+  host's stale lock file re-acquires.
+
+Examples:
+  hekma serve
+  hekma serve --stop-window 10
+  hekma serve --metering-listen 8400 --state-dir ~/agents-state";
+
 const AGENT_AFTER_HELP: &str = "\
 Details:
   An agent is a third-party program you run — a personal agent such as Hermes
@@ -105,6 +123,30 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Serve a state directory as a long-running host
+    #[command(
+        about = "Serve a state directory as a long-running host",
+        after_help = SERVE_AFTER_HELP
+    )]
+    Serve {
+        /// Graceful stop window in seconds for the shutdown drain (default 30)
+        #[arg(
+            long,
+            value_name = "SECS",
+            value_parser = clap::value_parser!(u64).range(1..=86_400)
+        )]
+        stop_window: Option<u64>,
+        /// Fixed loopback port for observed metering listeners (default 0 =
+        /// OS-ephemeral). A host restart re-binds the SAME port, so adopted
+        /// observed instances stay live; a port already in use refuses the
+        /// start (never a silent hop).
+        #[arg(long, value_name = "PORT", default_value_t = 0)]
+        metering_listen: u16,
+        /// Serve this state directory instead of the resolved default
+        /// (HEKMA_STATE_DIR / KTESIO_STATE_DIR / the platform data dir)
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<String>,
     },
 }
 
@@ -322,6 +364,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::SelfUpdate) => cli::self_update::run(),
+        Some(Commands::Serve {
+            stop_window,
+            metering_listen,
+            state_dir,
+        }) => cli::serve::run(stop_window, metering_listen, state_dir),
         Some(Commands::Agent { command }) => match command {
             AgentCommands::Register {
                 name,
@@ -377,7 +424,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn should_check_for_updates(command: &Option<Commands>) -> bool {
-    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate))
+    matches!(command, Some(command) if !matches!(command, Commands::SelfUpdate | Commands::Serve { .. }))
 }
 
 /// Classify a returned diagnostic into the documented, stable numeric exit
@@ -814,6 +861,17 @@ mod tests {
     #[test]
     fn test_self_update_skips_passive_update_check() {
         let cli = Cli::try_parse_from(["hekma", "self-update"]).expect("self-update should parse");
+
+        assert!(!should_check_for_updates(&cli.command));
+    }
+
+    #[test]
+    fn test_serve_skips_passive_update_check() {
+        // Review finding 11: `serve` is the OTHER passive surface — a
+        // long-running host is not a point-in-time command, and its stderr
+        // stream carries host diagnostics, not update notices. Pinned as the
+        // sibling of the self-update pin.
+        let cli = Cli::try_parse_from(["hekma", "serve"]).expect("serve should parse");
 
         assert!(!should_check_for_updates(&cli.command));
     }

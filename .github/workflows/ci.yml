@@ -663,15 +663,19 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::kt may depend only on hekma-engine (plus hekma-adapter-api types and the hekma-adapters-hermes builtin); forbidden internal crate edge found."
+            echo "::error::kt may depend only on hekma-engine (plus hekma-adapter-api types, the hekma-adapters-hermes builtin, and hekma-host for the serve subcommand); forbidden internal crate edge found."
             # WHY the adapters-hermes edge is allowed (review blind-22): it is
             # the builtin native-adapter table the engine's `native()` matcher
             # consults to resolve `--kind hermes` — code, not a plugin, so the
-            # shipping binary carries it. Any OTHER internal crate must stay
-            # out of kt's graph (mock/dev fixtures ride dev-dependencies only).
+            # shipping binary carries it. WHY the hekma-host edge is allowed
+            # (story 17-2, AD-2 amendment 2026-10-19): the `serve` subcommand's
+            # engine — the long-running Service Host drives the engine's
+            # public API; the CLI source stays synchronous (no tokio dep in
+            # kt itself). Any OTHER internal crate must stay out of kt's
+            # graph (mock/dev fixtures ride dev-dependencies only).
             exit 1
           fi
-          echo "Boundary gate green: internal edges are exactly the allowlisted hekma-engine / hekma-adapter-api / hekma-adapters-hermes."
+          echo "Boundary gate green: internal edges are exactly the allowlisted hekma-engine / hekma-adapter-api / hekma-adapters-hermes / hekma-host."
       - name: Enforce the one-rustls/ring TLS invariant (story 12-3, NFR-8)
         shell: bash
         run: |
@@ -745,7 +749,14 @@ jobs:
           #     with a root-runner honesty skip.
           # adoption/interaction suites deliberately use NO cfg (data-driven
           # OS ids); no production code may use cfg outside backends/.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:'
+          #   * hekma-host signals.rs — story 17-2: the host OWNS the
+          #     shutdown-signal wait (AD-20: process signals are the host's,
+          #     never the engine's), and tokio's signal API is inherently
+          #     per-OS (SIGTERM/SIGINT streams on Unix, ctrl_c on Windows —
+          #     there is no data-driven OsId form for a signal STREAM). The
+          #     file is the crate's ONLY cfg; the wait is thin and its
+          #     Windows half is the documented OS asymmetry.
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:|^crates/hekma-host/src/signals\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -763,10 +774,10 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, and the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs). A new cfg use in any other test file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs), and hekma-host's signals.rs (the host's shutdown-signal wait). A new cfg use in any other file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
             exit 1
           fi
-          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites."
+          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites / the host's signals.rs."
       - name: Enforce single currency-formatting module (story 3-3, AD-8)
         shell: bash
         run: |
@@ -1401,7 +1412,10 @@ jobs:
           rm -rf cov && mkdir -p cov
           # Crate list as positional params (portable, no word-split reliance):
           # lightest → heaviest, hekma-engine LAST (see the WHY comment above).
-          set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma hekma-engine
+          # hekma-host (story 17-2) rides before the engines: its lib is
+          # small (lock/drain/signals/serve), and its tests spawn REAL
+          # agents — coverage must include it (the ≥95% gate is aggregate).
+          set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma-host hekma hekma-engine
           # The conformance test-support BINS (fake_agent, fake_acp_agent,
           # hermes_shim) are excluded from instrumentation: their lines are
           # not part of any crate's gate. This exclusion is the REPORT-side
