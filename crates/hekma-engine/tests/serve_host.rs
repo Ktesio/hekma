@@ -543,6 +543,21 @@ fn an_ephemeral_open_adoption_keeps_the_strand_diagnostic() {
     let port = free_port();
     run_engine1_fixed_port(state.path(), manifest.path(), port);
     let pid = wait_for_agent_pid(&agent_log_path(state.path(), "observed"));
+    // The NFR-1 crash-survival vehicle is Unix-only: on Windows the engine's
+    // Job-Object kill-on-close takes the observed child the moment engine1's
+    // process exits (the documented no-orphan guarantee), so the live-orphan
+    // strand posture this test pins cannot exist there — the upstream 11-3
+    // proof (adoption.rs's ai46 strand test) is Windows-gated on the same
+    // survival harness. Pin the documented Windows outcome (no leaked child)
+    // and stop; the ephemeral-open posture is exercised where an orphan can
+    // survive. Runtime branch per the boundary gate's data-driven OS rule.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        wait_until_gone(
+            pid,
+            "NFR-1: the crashed engine1 must not leak the observed child on Windows",
+        );
+        return;
+    }
     let shared = Arc::new(Mutex::new(Vec::new()));
     // The DEFAULT open (port 0) — the pre-17-2 shape, byte-identical. Held
     // for the test's duration (the host-like shape: the engine stays open).
