@@ -260,3 +260,6 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (approval routing + `hekma conformance` CLI)
   summary: ACP `session/request_permission` stays auto-denied (D3) and the TCK stays a Rust library; routing approvals to the Host and a conformance CLI for non-Rust adapter authors are DEFERRED; triggers: the first Host that surfaces approvals to its users, and the first non-Rust adapter author.
   evidence: ARCHITECTURE-SPINE.md AD-19 (permission requests answered denied); hekma-conformance is publish=false and library-only
+- source_spec: `spec-17-1-host-mode-spec-the-shim-crate-and-the-lock-model.md`
+  summary: CI-runner serve-shape headroom watch — the run of record's tight budget (~1.03× CPU headroom at 1.94%/instance, effective 10) was measured on an 8-core local host; the blocking CI serve step runs on 2-4 vCPU shared runners where oversubscription shifts the process-wide aggregate math.
+  evidence: docs/testing.md serve-shape measured record (2026-10-19 run + provenance note: heavier development loads measured 6.55-7.61%/instance); .github/workflows/ci.yml perf-budgets serve step. Trigger: the first red CI serve run — a maintainer call on the ×1.5 tolerance vs reader count, not a silent re-baseline.

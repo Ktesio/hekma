@@ -192,8 +192,11 @@ stateDiagram-v2
     engine library still may not (the embed-clean audit is unchanged).
   - **Versioning:** the Control API carries its own version, unstable `0.x` until a second Host
     validates it.
-  - **Settled at 15.1's spec stage:** the crate name, the HTTP stack (NFR-8 review) and AD-18's
-    outcome.
+  - **Settled (2026-10-19, story 17-1):** crate name `hekma-host`; HTTP stack **axum 0.8**
+    (NFR-8: rides the hyper/http/tokio stack already in-tree; the actual `cargo tree` diff is
+    recorded in 17-2's PR, hyper-direct the honest fallback); AD-18 **re-ratified coarse** on
+    measurement. Provenance: `_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md`
+    (ratified by Islam, 2026-10-19). See *Amendments (2026-10-19)*.
 
 ### Amendments (2026-09-30) — ratified with sprint-change-proposal-2026-09-30-hosted-platform-readiness.md
 
@@ -218,9 +221,28 @@ stateDiagram-v2
   - A stable window resets the counter.
   - `drain` is a composite (stop new work → bounded wait → stop). It adds no state.
 - **AD-18 (2026-09-30):** reopen trigger (1) fired with AD-20's ratification. The decision is
-  15.1's, on measurement.
+  15.1's, on measurement. (Closed 2026-10-19: measured — re-ratified coarse; see
+  *Amendments (2026-10-19)*.)
 - **AD-19 (2026-09-30):** removal of the `hermes` kind waits for the service-mode successor (16.5);
   ACP stdio does not run a gateway's API server, scheduler or messaging.
+
+### Amendments (2026-10-19) — ratified from story 17-1's bounded-options proposal (`_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md`)
+
+- **AD-2 (2026-10-19):** the publishable-crate list gains `hekma-host` (bin + lib; the AD-20
+  Service Host — depends only on `hekma-engine`'s public API plus its own Control-API types). The
+  CI boundary-gate allowlist gains `|host` in the same change; the automation pin follows.
+- **AD-20 (2026-10-19):** the three deferred decisions are settled: name `hekma-host`, HTTP stack
+  **axum 0.8** (NFR-8 review — the marginal axum/tower crates ride the hyper/http/tokio stack
+  already in-tree; 17-2's PR records the actual `cargo tree` diff, hyper-direct the honest
+  fallback), and AD-18's outcome re-ratified coarse. Picked by Islam 2026-10-19, applied verbatim.
+- **AD-18 (2026-10-19):** reopen trigger (1) is measured and closed. 17-1's `--serve-shape` run of
+  record (linux x86_64, release, review-hardened; CI-blocking): read p99 **5.07 ms** vs < 1000 ms
+  (~197× headroom); CPU **1.94 %/instance** over the schedule-aware conservative effective count
+  of 10 vs ≤ 2 % (~1.03× — the tight budget; process-wide and load-model-sensitive, so any host
+  demand growth re-runs `--serve-shape` before a scaling claim); RSS **0.96 MiB**/instance vs
+  ≤ 50 MiB (~52×). The bounded stop stalls in-flight reads ~2.0 s (4 of 610 fleet samples) —
+  bounded, amortizing, no cascade. **The coarse two-mutex model is re-ratified;** the per-instance
+  plan (`ai-63b-lock-model-decision-2026-08-27.md`) stays archived behind the standing triggers.
 
 ## Consistency Conventions
 
