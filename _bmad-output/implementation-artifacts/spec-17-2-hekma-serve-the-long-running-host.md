@@ -119,6 +119,16 @@ context:
   event harness), and parallel stop ladders (the supervisor mutex serializes escalated
   stops — Σ(window) worst case; an AD-18 draft-then-ratify matter, the host-side
   issue-all/join seam is ready). Gates green; spec → done.
+- 2026-10-19 (Windows CI verdict on the holder record): the "refusal names the live
+  holder" AC is platform-conditional — `File::try_lock` maps to `LockFileEx` on Windows,
+  whose byte-range locks are PER-HANDLE, so the live holder's `pid=` record is unreadable
+  through a second handle while the lock is held and the refusal honestly carries
+  `holder: None` there (the module's documented best-effort-record case; the record
+  becomes readable again once the holder releases or dies). The safety property (the LOCK
+  refuses; the first holder is unaffected) is platform-uniform and pinned in-process on
+  both; the pid-naming leg asserts `Some(own pid)` on Unix and `None` on Windows — a
+  runtime branch, not `#[cfg]`, per the boundary gate's data-driven OS rule. No product
+  code changed: test expectation + doc comments only.
 
 ## Suggested Review Order
 
