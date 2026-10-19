@@ -254,3 +254,9 @@ amendment, AD-20 settled note → outcome, AD-18 trigger-(1) closure note, *Amen
 `scripts/test_automation.py` (the allowlist pin), `docs/testing.md` (the host crate named), and
 the sprint tracker (17-1's ratification-gated task ticked). The AD-18 per-instance plan stays
 archived; the standing reopen triggers remain the guard.
+
+*Erratum (2026-10-19, applied with story 17-2): the D2 text above says the axum `cargo tree`
+review happens "17.2's first step" — a cross-reference slip in the application wording: 17-2
+ships no axum (its tree stays hekma-engine + tokio). The tree-diff review records in **17-3's
+PR**, where axum actually enters. The decision itself (axum 0.8 + recorded tree diff +
+hyper-direct fallback) is unchanged.*

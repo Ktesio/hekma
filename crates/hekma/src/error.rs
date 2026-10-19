@@ -8,6 +8,46 @@ pub struct SelfUpdateFailed {
     pub message: String,
 }
 
+/// Story 17-2: another host already serves the state directory (the
+/// `host.lock` refusal). The message names the live holder PID + the lock
+/// path + the remediation (from `hekma_host::ServeError::StateDirLocked`'s
+/// Display — carried verbatim, never re-worded here). Classified as exit `2`
+/// (Usage — the invocation cannot proceed on this state root; no new
+/// exit-code number was minted, DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::serve::state_dir_busy))]
+pub struct ServeStateDirBusy {
+    pub message: String,
+}
+
+/// Story 17-2: a serve OPTION value is invalid — today a `--stop-window`
+/// outside the 1..=86400 whole-second bounds (review finding 9; the message
+/// is carried verbatim from `hekma_host::ServeError::InvalidOptions`). The
+/// CLI's own clap range refuses these at parse time; this diagnostic covers
+/// the programmatic/host path. Classified as exit `2` (Usage — the flag
+/// value, not the environment, is at fault).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::serve::options_invalid))]
+pub struct ServeOptionsInvalid {
+    pub message: String,
+}
+
+/// Story 17-2: the host could not start (state-dir resolution/creation,
+/// lock I/O, engine open, runtime build, signal registration). The message
+/// is the surfaced reason, carried verbatim from
+/// `hekma_host::ServeError::Startup`'s Display. Classified as exit `1`
+/// (review finding 8: an ENVIRONMENT/system failure — filesystem, OS
+/// resource — per the house exit table's code-1 class, NOT a usage error;
+/// the second-owner refusal and invalid options stay exit `2`).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::serve::startup_failed))]
+pub struct ServeStartupFailed {
+    pub message: String,
+}
+
 #[derive(Error, Diagnostic, Debug)]
 #[error("{}", message)]
 #[diagnostic(code(hekma::agent::duplicate_name))]

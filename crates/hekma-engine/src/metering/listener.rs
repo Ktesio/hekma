@@ -12,14 +12,25 @@
 //!
 //! ## Loopback-only bind (AC-B — the security invariant)
 //!
-//! The bind address is ENGINE-COMPUTED (`127.0.0.1:0`), NEVER adapter- or
-//! operator-supplied — the engine is the sole authority on the listen address
-//! (the AD-4/conventions discipline extended to the listener). The listener
-//! binds EXCLUSIVELY to the loopback interface; a resolved non-loopback address is
+//! The bind address is ENGINE-COMPUTED, NEVER adapter- or operator-supplied —
+//! the engine is the sole authority on the listen address (the
+//! AD-4/conventions discipline extended to the listener). The listener binds
+//! EXCLUSIVELY to the loopback interface; a resolved non-loopback address is
 //! a hard error ([`ListenerError::NonLoopbackBind`]), never a silent widening.
 //! NFR-6 honesty: this is defense against ACCIDENTAL external exposure of the
 //! agent's model traffic (which carries the resolved API key UPSTREAM), NOT a
 //! hardened sandbox. IPv4 `127.0.0.1` only for v1 (IPv6 `::1` deferred, recorded).
+//!
+//! The HOST part of the address is an engine OPTION (story 17-2, the
+//! `metering.listen` seam): `start`/`start_with_tls_config` keep the OS-ephemeral
+//! `127.0.0.1:0` bind; `start_on_port`/`start_with_tls_config_on_port` pin the
+//! PORT (never an address — the loopback-only invariant above stands) so a
+//! long-running Host can re-bind the SAME port across engine restarts and an
+//! adopted observed instance's injected `base_url` stays live (the AI-46 strand
+//! closure, option 2). Port `0` is the ephemeral default, byte-identical to
+//! every pre-17-2 release. A pinned port that is already taken fails the bind
+//! with the surfaced typed [`ListenerError::Bind`] at start (AI-18 — never a
+//! silent port hop).
 //!
 //! ## Secret / traffic no-leak (2-4 rigor)
 //!
@@ -107,7 +118,7 @@ type ForwardClient = Client<
 /// no-system-dependency philosophy; identical roots on all three OSes, and the
 /// same vendored-roots choice `kt`→`ureq` already ships). Named + injectable so
 /// the TLS test can substitute a config trusting a self-signed root (see
-/// [`ObservedListener::start_with_tls_config`]).
+/// the story-12-3 `start_with_tls_config` test seam).
 /// The vendored PRODUCTION root store (webpki-roots — the no-system-TLS
 /// philosophy, matching ureq's choice). Extracted from
 /// [`default_tls_config`] (review round 2) so a unit test can observe the
@@ -202,10 +213,16 @@ pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64, u64)>>>;
 /// no secret).
 #[derive(Debug, Error)]
 pub enum ListenerError {
-    /// The loopback TCP bind failed (`127.0.0.1:0` could not be acquired). Carries
-    /// the OS error string (a bind/permission failure) — no traffic, no secret.
-    #[error("could not bind the engine-observed loopback listener on 127.0.0.1: {detail}")]
+    /// The loopback TCP bind failed (`127.0.0.1:<port>` could not be
+    /// acquired). Carries the REQUESTED port (review finding 12: the typed
+    /// bind refusal NAMES the port — the operator reads exactly which pin
+    /// collided, and the "never a silent hop" contract is checkable) plus
+    /// the OS error string (a bind/permission failure) — no traffic, no
+    /// secret.
+    #[error("could not bind the engine-observed loopback listener on 127.0.0.1:{port}: {detail}")]
     Bind {
+        /// The requested (pinned or ephemeral-pick) port.
+        port: u16,
         /// The underlying bind error (OS-level; carries no traffic).
         detail: String,
     },
@@ -276,32 +293,74 @@ impl ObservedListener {
     /// The bind itself runs synchronously via `handle.block_on` (a fast, local
     /// loopback bind), so `start` stays a plain sync call the supervisor's sync
     /// start path can make.
+    ///
+    /// Test-only since story 17-2: production binds through
+    /// [`start_on_port`](Self::start_on_port) (the Host's `metering.listen`
+    /// seam) with the supervisor-owned port; `0` is the same ephemeral bind.
+    #[cfg(test)]
     pub fn start(handle: &Handle, upstream: String) -> Result<ObservedListener, ListenerError> {
-        Self::start_with_tls_config(handle, upstream, default_tls_config())
+        Self::start_on_port(handle, upstream, 0)
     }
 
-    /// [`ObservedListener::start`] with an EXPLICIT TLS client config (story
-    /// 12-3 test seam): the TLS test substitutes a config trusting its own
-    /// self-signed root, proving the https + streaming + metering composition.
-    /// Production uses [`start`](Self::start) (webpki-roots default).
+    /// [`ObservedListener::start_on_port`]'s readability form: START a loopback
+    /// forward listener with a FIXED loopback PORT (story 17-2, the
+    /// `metering.listen` seam): the same bind, verification, and accept-loop
+    /// spawn as the historical ephemeral `start`, but the HOST part of
+    /// `127.0.0.1:<port>` is the caller-pinned `port` instead of an
+    /// OS-ephemeral pick. The ADDRESS stays engine-computed loopback (AC-B — a
+    /// port, never an address); a `0` port is the ephemeral default. A port
+    /// that is already taken fails with the surfaced typed
+    /// [`ListenerError::Bind`] (naming the OS bind error, no traffic) — never
+    /// a silent hop to another port, so a Host's adopted instance either lands
+    /// on ITS port or fails loudly.
+    pub fn start_on_port(
+        handle: &Handle,
+        upstream: String,
+        port: u16,
+    ) -> Result<ObservedListener, ListenerError> {
+        Self::start_with_tls_config_on_port(handle, upstream, default_tls_config(), port)
+    }
+
+    /// The historical explicit-TLS entry (story 12-3 test seam): the TLS test
+    /// substitutes a config trusting its own self-signed root, proving the
+    /// https + streaming + metering composition. Test-only since story 17-2
+    /// (production goes through
+    /// [`start_with_tls_config_on_port`](Self::start_with_tls_config_on_port)).
+    #[cfg(test)]
     pub(crate) fn start_with_tls_config(
         handle: &Handle,
         upstream: String,
         tls: Arc<rustls::ClientConfig>,
     ) -> Result<ObservedListener, ListenerError> {
+        Self::start_with_tls_config_on_port(handle, upstream, tls, 0)
+    }
+
+    /// The full seam ([`start_on_port`](Self::start_on_port) + the story-12-3
+    /// TLS config): an explicit TLS client config AND an explicit loopback
+    /// port. Both public entries delegate here; `port == 0` is the ephemeral
+    /// default every pre-17-2 caller takes.
+    pub(crate) fn start_with_tls_config_on_port(
+        handle: &Handle,
+        upstream: String,
+        tls: Arc<rustls::ClientConfig>,
+        port: u16,
+    ) -> Result<ObservedListener, ListenerError> {
         // Validate the upstream is a usable http(s):// URL BEFORE binding
         // (fail fast, no listener leak).
         validate_upstream(&upstream)?;
 
-        // Bind 127.0.0.1:0 (loopback, OS-picked ephemeral port). The bind is a fast
+        // Bind 127.0.0.1:<port> (loopback; the OS picks an ephemeral port when
+        // `port` is 0 — the pre-17-2 default). The bind is a fast
         // local syscall; run it on the runtime so the returned listener is owned by
         // the runtime the accept loop runs on.
         let listener = handle
-            .block_on(async { TcpListener::bind(("127.0.0.1", 0)).await })
+            .block_on(async { TcpListener::bind(("127.0.0.1", port)).await })
             .map_err(|e| ListenerError::Bind {
+                port,
                 detail: e.to_string(),
             })?;
         let local_addr = listener.local_addr().map_err(|e| ListenerError::Bind {
+            port,
             detail: e.to_string(),
         })?;
 
@@ -785,6 +844,52 @@ mod tests {
             a.local_addr().port(),
             b.local_addr().port(),
             "each listener binds its own port"
+        );
+    }
+
+    #[test]
+    fn a_pinned_port_binds_exactly_that_port_and_a_collision_fails_the_bind() {
+        // Story 17-2 (`metering.listen` seam): `start_on_port` binds the
+        // caller-pinned PORT — the same loopback-only, engine-computed address —
+        // so a long-running Host can re-bind the SAME port across engine
+        // restarts. A port that is already held fails with the surfaced typed
+        // [`ListenerError::Bind`] (AI-18: never a silent hop to another port).
+        let rt = test_runtime();
+        // Hold a port, prove the collision surfaces FIRST (the holder is alive),
+        // then release it and prove the exact-port re-bind (the Host's restart
+        // shape). The port number is discovered, never a magic constant.
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let collision = match ObservedListener::start_on_port(
+            rt.handle(),
+            "http://127.0.0.1:9/".to_string(),
+            port,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a pinned port already in use must fail the bind, not hop"),
+        };
+        assert!(
+            matches!(collision, ListenerError::Bind { .. }),
+            "the collision must be the typed bind error, got {collision:?}"
+        );
+        drop(holder);
+        let pinned =
+            ObservedListener::start_on_port(rt.handle(), "http://127.0.0.1:9/".to_string(), port)
+                .unwrap();
+        let addr = pinned.local_addr();
+        assert_eq!(
+            addr.port(),
+            port,
+            "start_on_port binds EXACTLY the pinned port"
+        );
+        assert!(
+            addr.ip().is_loopback() && !addr.ip().is_unspecified(),
+            "a pinned PORT must not widen the loopback-only bind: {addr}"
+        );
+        assert!(
+            pinned.base_url().ends_with(&port.to_string()),
+            "the injected base_url carries the pinned port: {}",
+            pinned.base_url()
         );
     }
 

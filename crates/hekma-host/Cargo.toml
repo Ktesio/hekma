@@ -1,0 +1,45 @@
+[package]
+name = "hekma-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Hekma long-running Service Host; drives the engine as a supervised, signal-aware service"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# UNPUBLISHED by decision (17-2): publication (and any version alignment with
+# the workspace release train) is the container/release story's step (17-5 /
+# docs/release-process.md), never an autonomous flip.
+publish = false
+
+[dependencies]
+# The ONLY internal edge (AD-2 amendment 2026-10-19): the host drives the
+# engine's PUBLIC API (Engine / EngineOptions / DiagnosticSink / domain types
+# / the paths authority). Verify with `cargo tree -p hekma-host -e normal`.
+hekma-engine = { workspace = true }
+# The host owns ONE tokio Runtime of its own (the `Engine`'s
+# internal-runtime shape — the host lib stays a sync, blocking call surface):
+# the shutdown-signal wait and the engine's async drain calls run on it. The
+# workspace's shared feature set covers the runtime; the host-only additive
+# features are `signal` (the OS shutdown streams) and `sync` (the `watch`
+# channel that holds an early signal across the engine open — the review
+# finding 1 fix) + `time` (the arming-handshake timeout).
+tokio = { workspace = true, features = ["signal", "sync", "time"] }
+
+[dev-dependencies]
+# Hermetic per-test state roots.
+tempfile = { workspace = true }
+# The integration tests drive the async `drain_and_stop`/`serve_with_signal`
+# seam directly; tokio here is the SAME workspace pin (dev-only — the normal
+# tree is unchanged, `cargo tree -p hekma-host -e normal` stays engine+tokio).
+tokio = { workspace = true }
+# The `fake_agent` fixture (the same dev/test kit the engine's own
+# subprocess tests use — off every shipping graph).
+hekma-conformance = { path = "../hekma-conformance" }
+
+[[bin]]
+name = "hekma-host"
+path = "src/main.rs"
+
+[lints]
+workspace = true

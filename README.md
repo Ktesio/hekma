@@ -178,6 +178,9 @@ The agent runner lives under `hekma agent`. Every command supports `--help`.
 | `hekma agent remove` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
 | `hekma agent config set` / `get` | Write and read the layered config (validated; `--reveal` un-masks secrets) |
 | `hekma agent memory attach` / `detach` | Attach or detach a Memory Backing (`filesystem` or `native`) |
+| `hekma serve` | Run the long-running Service Host over one state directory: it adopts live agents, holds the single-writer lock, and on SIGTERM drains every running agent through the bounded graceful ladder |
+
+`hekma serve` is the hosting posture: instead of supervising agents command-scoped (supervision lives only inside each `hekma` invocation), one long-running process owns the state directory — every live agent is adopted at open, hosted children inherit only their adapter-declared environment (plus a minimal OS-plumbing floor), and a shutdown signal stops every running agent before the host exits. A second host on the same state directory is refused (naming the holder PID), and `--metering-listen <port>` pins the observed-metering proxy to a fixed port so adopted agents survive host restarts. See [the command reference](docs/commands.md#hekma-serve---stop-window-secs---metering-listen-port---state-dir-dir).
 
 See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.
 

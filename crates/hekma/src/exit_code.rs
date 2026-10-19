@@ -25,8 +25,8 @@
 //! | Code | Meaning | Mapped from (`crate::error` diagnostics) |
 //! |------|---------|------------------------------------------|
 //! | `0` | Success | `Ok(())` |
-//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, + any unmapped error |
-//! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName` |
+//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, `ServeStartupFailed` (story 17-2, review finding 8: a host that cannot START is an environment/system failure — state-dir creation, lock I/O, engine open, runtime build, signal registration), + any unmapped error |
+//! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName`, `ServeStateDirBusy` (story 17-2: the state root is already served — the invocation cannot proceed here), `ServeOptionsInvalid` (story 17-2, review finding 9: a serve option value outside its documented bounds) |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
 //! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict`, `AgentAcpTurnInFlight` (story 14-1: a second prompt while an acp turn is in flight) |
 //! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable`, `AgentDetachRefused` (story 12-1: a detached start of an engine-observed instance — the operation cannot be done for this instance) |
@@ -112,10 +112,16 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         ExitCode::NotFound
     // 2 — usage error (invalid invocation): a bad name, an unknown kind/config
     // key, or a duplicate name. (clap's parse/usage errors are already `2`.)
+    // Story 17-2: the serve refusals of the same class — the invocation
+    // cannot proceed (the state root is already served) or the option value
+    // is invalid. Review finding 8: the STARTUP failure class moved to `1`
+    // (an environment/system failure), only the true usage refusals stay.
     } else if err.is::<AgentInvalidName>()
         || err.is::<AgentUnknownKind>()
         || err.is::<AgentUnknownConfigKey>()
         || err.is::<AgentDuplicateName>()
+        || err.is::<crate::error::ServeStateDirBusy>()
+        || err.is::<crate::error::ServeOptionsInvalid>()
     {
         ExitCode::Usage
     // 4 — invalid state: the instance is not in a state that permits the op.
@@ -249,6 +255,16 @@ mod tests {
             boxed(AgentDuplicateName {
                 message: "dup".into(),
             }),
+            // Story 17-2: the serve refusals join the frozen `2` class —
+            // no new exit-code number was minted (DC-4). Review finding 8:
+            // ONLY the usage refusals stay — the held-lock refusal and an
+            // invalid option value; the startup failure moved to `1`.
+            boxed(crate::error::ServeStateDirBusy {
+                message: "already served".into(),
+            }),
+            boxed(crate::error::ServeOptionsInvalid {
+                message: "invalid stop window".into(),
+            }),
         ] {
             assert_eq!(
                 classify(err.as_ref()),
@@ -256,6 +272,22 @@ mod tests {
                 "{err} should be Usage (2)",
             );
         }
+    }
+
+    #[test]
+    fn serve_startup_failure_maps_to_one_not_two() {
+        // Review finding 8's pin: a host that cannot START is an
+        // environment/system failure (state-dir creation, lock I/O, engine
+        // open, runtime build, signal registration) — the house table's
+        // code-1 class, NOT usage.
+        let err = boxed(crate::error::ServeStartupFailed {
+            message: "could not create the state directory".into(),
+        });
+        assert_eq!(
+            classify(err.as_ref()),
+            ExitCode::General,
+            "ServeStartupFailed should be General (1)"
+        );
     }
 
     #[test]

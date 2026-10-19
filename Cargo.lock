@@ -588,6 +588,7 @@ dependencies = [
  "flate2",
  "hekma-conformance",
  "hekma-engine",
+ "hekma-host",
  "miette",
  "rusqlite",
  "semver",
@@ -657,6 +658,16 @@ dependencies = [
  "toml",
  "webpki-roots",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hekma-host"
+version = "0.1.0"
+dependencies = [
+ "hekma-conformance",
+ "hekma-engine",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -194,7 +194,8 @@ stateDiagram-v2
     validates it.
   - **Settled (2026-10-19, story 17-1):** crate name `hekma-host`; HTTP stack **axum 0.8**
     (NFR-8: rides the hyper/http/tokio stack already in-tree; the actual `cargo tree` diff is
-    recorded in 17-2's PR, hyper-direct the honest fallback); AD-18 **re-ratified coarse** on
+    recorded in 17-3's PR — where axum enters — per the 17-2 spec's erratum, hyper-direct the
+    honest fallback); AD-18 **re-ratified coarse** on
     measurement. Provenance: `_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md`
     (ratified by Islam, 2026-10-19). See *Amendments (2026-10-19)*.
 
@@ -233,7 +234,8 @@ stateDiagram-v2
   CI boundary-gate allowlist gains `|host` in the same change; the automation pin follows.
 - **AD-20 (2026-10-19):** the three deferred decisions are settled: name `hekma-host`, HTTP stack
   **axum 0.8** (NFR-8 review — the marginal axum/tower crates ride the hyper/http/tokio stack
-  already in-tree; 17-2's PR records the actual `cargo tree` diff, hyper-direct the honest
+  already in-tree; the `cargo tree` diff is recorded in 17-3's PR — where axum enters; erratum
+  2026-10-19, the original application said 17-2 —, hyper-direct the honest
   fallback), and AD-18's outcome re-ratified coarse. Picked by Islam 2026-10-19, applied verbatim.
 - **AD-18 (2026-10-19):** reopen trigger (1) is measured and closed. 17-1's `--serve-shape` run of
   record (linux x86_64, release, review-hardened; CI-blocking): read p99 **5.07 ms** vs < 1000 ms
