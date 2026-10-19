@@ -168,13 +168,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = lock_path(&dir);
         let first = HostLock::acquire(&path).expect("first acquire");
-        let pid_text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            pid_text.trim(),
-            format!("pid={}", std::process::id()),
-            "the holder record names the acquirer"
-        );
+        // The while-held record check reads through a SECOND handle: on
+        // Windows `File::try_lock` maps to `LockFileEx`, whose per-handle
+        // byte-range locks make that read fail with a lock violation even
+        // in-process (the module's documented case) — the record is
+        // unreadable while held there. Unix advisory locks never block
+        // reads, so the record names the acquirer. Runtime branch, not
+        // `#[cfg]` — the boundary gate's data-driven OS rule.
+        if std::env::consts::OS == "windows" {
+            assert!(
+                std::fs::read_to_string(&path).is_err(),
+                "on Windows the record is unreadable through a second handle while held"
+            );
+        } else {
+            let pid_text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                pid_text.trim(),
+                format!("pid={}", std::process::id()),
+                "the holder record names the acquirer"
+            );
+        }
         drop(first);
+        // Once RELEASED the record is readable again on every platform —
+        // the residue is intentionally left behind naming the released
+        // holder (the next acquire rewrites it).
+        let residue =
+            std::fs::read_to_string(&path).expect("the released holder's record is readable again");
+        assert_eq!(
+            residue.trim(),
+            format!("pid={}", std::process::id()),
+            "the residue record survives the release naming the released holder"
+        );
         let second = HostLock::acquire(&path).expect("re-acquire after release");
         drop(second);
     }

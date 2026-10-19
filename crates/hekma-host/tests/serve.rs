@@ -99,10 +99,22 @@ fn a_second_host_is_refused_naming_the_holder_without_opening_an_engine() {
         serve_with_signal(options, immediate_signal()).expect_err("a second host must be refused");
     match &err {
         ServeError::StateDirLocked { lock_path, holder } => {
+            // "Naming the holder" is platform-conditional in its EVIDENCE,
+            // not its refusal: on Windows the record is unreadable while
+            // the lock is held (per-handle `LockFileEx` — the lock module's
+            // documented case), so the refusal honestly carries
+            // `holder: None` there; the LOCK itself was proven by
+            // `WouldBlock`. Unix advisory locks never block reads, so the
+            // record names this test process's pid. Runtime branch, not
+            // `#[cfg]` — the boundary gate's data-driven OS rule.
+            let expected_holder = if std::env::consts::OS == "windows" {
+                None
+            } else {
+                Some(std::process::id())
+            };
             assert_eq!(
-                holder,
-                &Some(std::process::id()),
-                "the refusal names the live holder"
+                holder, &expected_holder,
+                "the refusal names the live holder's pid where the platform can read the record"
             );
             assert_eq!(
                 lock_path,
@@ -141,9 +153,18 @@ fn a_refusal_without_a_sink_surfaces_through_the_error_alone() {
     };
     let err = serve_with_signal(options, immediate_signal()).expect_err("refused");
     let text = err.to_string();
+    // On Windows the holder record is unreadable while the lock is held
+    // (per-handle `LockFileEx` — the lock module's documented case), so the
+    // error alone carries the honest unreadable-record wording instead of
+    // the pid. Runtime branch, not `#[cfg]` — the boundary gate's
+    // data-driven OS rule.
+    let holder_named = if std::env::consts::OS == "windows" {
+        text.contains("its pid record could not be read")
+    } else {
+        text.contains(&std::process::id().to_string())
+    };
     assert!(
-        text.contains("already served by another host")
-            && text.contains(&std::process::id().to_string()),
+        text.contains("already served by another host") && holder_named,
         "the error alone carries the holder + remediation: {text}"
     );
     // Review finding 10's pin: the remediation names the two REAL options —
