@@ -400,6 +400,15 @@ fn serve_state_dir_flag_serves_that_root() {
     // Review finding 15's CLI-level pin: `--state-dir <dir>` (the FLAG, not
     // the env var) serves THAT root — the lock and the state store land in
     // the flagged directory, and the notice names it.
+    if is_windows() {
+        return; // POSIX `kill`-based shutdown: the runner's `kill` cannot
+                // signal the native serve child ("No such process"). On
+                // Windows the state-root routing is exercised lib-level
+                // (`ServeOptions::state_base` through `serve_with_signal`)
+                // and the graceful-shutdown e2e shares the deferred
+                // console-event harness (see deferred-work.md, "real
+                // Windows Ctrl+C e2e needs a console-event harness").
+    }
     let ctx = TestContext::new();
     let flagged = ctx.project_dir.join("flagged-root");
     std::fs::create_dir_all(&flagged).unwrap();
