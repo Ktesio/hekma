@@ -759,4 +759,34 @@ mod tests {
         assert!(events.is_empty());
         assert!(!torn);
     }
+
+    #[test]
+    fn a_directory_at_the_breach_log_path_fails_the_read_with_the_typed_log_error() {
+        // A non-NotFound read failure on the breach log (here: a DIRECTORY at
+        // the path — read fails EISDIR on Unix, the open is refused on
+        // Windows; the same typed arm either way, so no OS gate is needed)
+        // surfaces as `EngineError::Log` naming the instance and the path.
+        // The heal must never silently treat a broken disk as "no breaches"
+        // — that would under-report budget breaches to a host mid-heal.
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = super::super::Registry::open(Some(dir.path().to_path_buf()))
+            .expect("open a registry over a hermetic root");
+        let name = super::super::InstanceName::new("probe").expect("a valid probe name");
+        // The sabotage: the breaches.log PATH ITSELF is a directory (its
+        // parent instance dir comes along for the ride).
+        let breach_path = registry.instance_breach_log_path(&name);
+        std::fs::create_dir_all(&breach_path).unwrap();
+        let breach_str = breach_path.to_string_lossy().into_owned();
+        let err = read_committed(&registry, &name, &ResyncCursor::START)
+            .expect_err("an unreadable breach log must fail the heal read");
+        assert!(
+            matches!(&err, EngineError::Log { name, path, .. }
+                if name == "probe" && *path == breach_str),
+            "the typed error names the instance and the breach-log path: {err:?}"
+        );
+        assert!(
+            !err.to_string().is_empty(),
+            "the underlying io failure is carried: {err}"
+        );
+    }
 }
