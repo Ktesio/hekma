@@ -1750,4 +1750,116 @@ mod tests {
             "a non-chat-completions streaming call must not enqueue usage"
         );
     }
+
+    #[test]
+    fn an_asterisk_form_target_never_fabricates_success_or_meters() {
+        // The asterisk-form request target (`OPTIONS * HTTP/1.1`) is legal on
+        // the wire and reaches the service. The join with the upstream base
+        // yields a Uri whose AUTHORITY carries the `*` (the http crate's
+        // authority grammar tolerates it), so the forward fails at transport
+        // — and the agent still sees the honest 502 with the static no-leak
+        // body: never a panic, never a fabricated success. The upstream here
+        // is LIVE: had the forward somehow succeeded, the stub's 200 would be
+        // relayed and this test would go red.
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let req = format!("OPTIONS * HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth_for_thread, &req))
+            .join()
+            .unwrap();
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 502"),
+            "an asterisk-form target must relay an honest 502: {resp_text}"
+        );
+        assert!(
+            resp_text.contains("ktesio engine-observed proxy: upstream request failed"),
+            "the static no-leak 502 body: {resp_text}"
+        );
+        // Nothing was metered: no traffic ever completed, so no usage can
+        // exist (the no-leak discipline holds on the fault path too).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a forward that never completed must not enqueue usage"
+        );
+        // The live upstream really was never contacted — the one-shot stub
+        // is still waiting.
+        assert!(
+            !upstream_join.is_finished(),
+            "no request may reach the upstream from an unrelayable target"
+        );
+    }
+
+    #[test]
+    fn a_truncated_request_body_yields_an_honest_502() {
+        // The agent's request body dies mid-transfer: a Content-Length larger
+        // than the bytes actually sent, then a write half-close. The relay's
+        // bounded collect() sees the transport error and answers the SAME
+        // honest 502 as any other forward failure — no partial/corrupt relay,
+        // no unbounded buffering — and no usage can be metered from a request
+        // that never completed. The upstream here is LIVE: if the collect
+        // failure were ever swallowed, the (empty-bodied) request would be
+        // forwarded and the stub's 200 relayed — this test would go red.
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        );
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let queue = listener.queue();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        // Head declares 32 body bytes; only 4 ever arrive, then FIN.
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{{\"a\":"
+        );
+        let auth_for_thread = authority.clone();
+        let resp = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let mut stream =
+                std::net::TcpStream::connect(&auth_for_thread).expect("connect listener");
+            stream.write_all(req.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            // Half-close: no further body bytes will ever arrive.
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut resp = Vec::new();
+            let _ = stream.read_to_end(&mut resp);
+            resp
+        })
+        .join()
+        .unwrap();
+        let resp_text = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 502"),
+            "a truncated request body must relay an honest 502: {resp_text}"
+        );
+        assert!(
+            resp_text.contains("ktesio engine-observed proxy: upstream request failed"),
+            "the static no-leak 502 body: {resp_text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "a request that never completed must not enqueue usage"
+        );
+        // The live upstream really was never contacted (the collect failed
+        // before the forward) — the one-shot stub is still waiting.
+        assert!(
+            !upstream_join.is_finished(),
+            "no request may reach the upstream when the body read fails"
+        );
+    }
 }
