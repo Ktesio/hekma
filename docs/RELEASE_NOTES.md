@@ -9,6 +9,8 @@ Release notes are generated when a version tag is published.
 
 The tag workflow updates the GitHub Release immediately and then opens a pull request that refreshes this file and the root `CHANGELOG.md`.
 
+> **Unreleased — hekma-engine 0.8.0: the host-mode service surface.** `SpawnSpec` gains `inherit_env` (exhaustive constructors need it; `false` = clear-then-apply-only-declared — the Host's minimal-child-environment seam, story 17-2) and `RegistryError` gains the `ServeOptionsOpenTimeOnly` arm (exhaustive matches need it; the typed open-time-only guard, unreachable through the shipped open paths). `hekma-engine` → **0.8.0** — v0.11.0 published 0.7.0, so the host-mode surface takes the next minor.
+
 > **Unreleased — transition-append compensation (durable-state honesty).** A transition whose durable event append fails after the store commit now compensates the row back to the prior state (the registry never disagrees with the last durably-landed event); the surfaced `Log` error names the compensation, or names both failures when the compensating write also fails (row honestly stuck at the new state — no retry loop, no fabricated event). Success path byte-identical; error detail text only, no API change.
 
 > **Unreleased — between-commands raw-log backlog: bounded follow prime.** `logs --follow`'s raw fallback cursor primes at the last N complete raw lines (default 200, `HEKMA_LOGS_BACKLOG_LINES`) instead of the file's end, so between-commands output streams at follow start under the same un-attributed qualifier; a gap beyond the window names its skipped count, a partial trailing line is never primed, and the live-capture guard keeps fresh attributed captures untouched (#298).

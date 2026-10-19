@@ -4,6 +4,13 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — hekma-engine 0.8.0: the host-mode service surface.**
+> Announced ahead of the release that ships it:
+>
+> - **`SpawnSpec.inherit_env`** — new public field on the exhaustively-constructed `SpawnSpec` (exhaustive constructors need it): `true` keeps today's `Command::envs` semantics (the child sees the engine's whole environment plus the mapped keys); `false` clears the environment first and applies ONLY the declared mappings — the long-running Host hard-sets `false` so every hosted child gets a minimal, manifest-declared environment (story 17-2's `child_env_allowlist` seam).
+> - **`RegistryError::ServeOptionsOpenTimeOnly`** — new variant on the exhaustive `RegistryError` enum (hosts matching exhaustively need the arm or `_`): the typed refusal for applying serve options to a supervisor whose lifecycle already began or twice on the same supervisor. Never reachable through the shipped open paths (`open`, `open_with_diagnostics`, `open_with_options` all apply once, on a fresh supervisor, before any lifecycle).
+> - `hekma-engine` → **0.8.0** — v0.11.0 published 0.7.0, so this additive surface takes the next minor (the version-slot move that keeps the release-to-release semver gate honest; the same pattern the 0.7.0 slot move took after v0.10.0).
+
 > **Unreleased — transition-append compensation (durable-state honesty).**
 > Announced ahead of the release that ships it:
 >
