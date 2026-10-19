@@ -6,11 +6,14 @@
 //! run the host without the `hekma` CLI present.
 //!
 //! Hand-rolled arg loop (no clap here — the crate's deps stay hekma-engine +
-//! tokio, the AD-2 tree discipline): `--help`/`-h`, `--version`/`-V`,
-//! `--state-dir <dir>` (the SAME flag name and semantics as `hekma serve`'s
-//! `--state-dir` — one surface to learn; review finding 19),
+//! tokio + the axum set, the AD-2 tree discipline): `--help`/`-h`,
+//! `--version`/`-V`, `--state-dir <dir>` (the SAME flag name and semantics as
+//! `hekma serve`'s `--state-dir` — one surface to learn; review finding 19),
 //! `--stop-window <secs>` (bounded 1..=86400 like every other surface,
-//! finding 9), `--metering-listen <port>`. Anything else is a usage error:
+//! finding 9), `--metering-listen <port>`, and — story 17-3 — `--listen
+//! <addr>` + `--bearer-secret <name>` (the Control API; BOTH or NEITHER — a
+//! half-configured API is a usage error, and an unparseable address is too).
+//! Anything else is a usage error:
 //! the message AND the usage text go to STDERR (help is the only stdout
 //! product; finding 19), exit 2. `ServeError` variants map onto the same
 //! exit classes as the CLI (finding 8): the lock refusal and an invalid
@@ -32,6 +35,8 @@ fn main() {
     let mut state_dir: Option<std::path::PathBuf> = None;
     let mut stop_window: Option<u64> = None;
     let mut metering_listen: u16 = 0;
+    let mut control_listen: Option<std::net::SocketAddr> = None;
+    let mut bearer_secret: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +74,36 @@ fn main() {
                     None => usage_error("--metering-listen needs a port number (0-65535)"),
                 }
             }
+            "--listen" => {
+                i += 1;
+                match args
+                    .get(i)
+                    .and_then(|v| v.parse::<std::net::SocketAddr>().ok())
+                {
+                    Some(addr) => control_listen = Some(addr),
+                    None => usage_error("--listen needs a socket address like 127.0.0.1:8477"),
+                }
+            }
+            "--bearer-secret" => {
+                i += 1;
+                match args.get(i) {
+                    // The NAME of the secret (env var or secrets-file key) —
+                    // never the secret value itself. A FLAG-looking value
+                    // (`--bearer-secret --listen ...`) is a swallowed
+                    // neighbor, not a name — refuse with a usage error
+                    // naming the expectation (review item 5) instead of
+                    // "resolving" a secret literally named `--listen`.
+                    Some(name) if !name.starts_with('-') => {
+                        bearer_secret = Some(name.clone());
+                    }
+                    Some(_) => usage_error(
+                        "--bearer-secret needs a secret NAME (the env var or secrets-file \
+                         key), not a flag-looking value; e.g. `--bearer-secret \
+                         CONTROL_BEARER`",
+                    ),
+                    None => usage_error("--bearer-secret needs a secret NAME"),
+                }
+            }
             other => usage_error(&format!("unknown argument {other:?}")),
         }
         i += 1;
@@ -77,6 +112,8 @@ fn main() {
         state_base: state_dir,
         stop_window,
         metering_listen_port: metering_listen,
+        control_listen,
+        bearer_secret,
         diagnostics: None,
     };
     match hekma_host::serve(options) {
@@ -119,6 +156,12 @@ fn usage_text() -> String {
                                   the engine's 30s)\n    \
          --metering-listen <port> Fixed loopback port for observed metering\n    \
                                   listeners (default: 0 = OS-ephemeral)\n    \
+         --listen <addr>          Expose the v0 Control API on this address\n    \
+                                  (e.g. 127.0.0.1:8477). Default: off\n    \
+         --bearer-secret <name>   The NAME of the bearer secret guarding the\n    \
+                                  Control API (an env var, or a key in the\n    \
+                                  state dir's secrets file). Required with\n    \
+                                  --listen; the API never serves unauthenticated\n    \
          -h, --help               Print this help\n    \
          -V, --version            Print the version\n\
      \n\

@@ -41,7 +41,13 @@ Details:
 Examples:
   hekma serve
   hekma serve --stop-window 10
-  hekma serve --metering-listen 8400 --state-dir ~/agents-state";
+  hekma serve --metering-listen 8400 --state-dir ~/agents-state
+  hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
+
+The Control API (--listen + --bearer-secret, both or neither) exposes the
+unstable v0 HTTP/JSON surface — fleet, per-instance lifecycle/config/status,
+and events (SSE + cursor pull) — guarded by the resolved bearer token; see
+docs/control-api.md.";
 
 const AGENT_AFTER_HELP: &str = "\
 Details:
@@ -147,6 +153,21 @@ enum Commands {
         /// (HEKMA_STATE_DIR / KTESIO_STATE_DIR / the platform data dir)
         #[arg(long, value_name = "DIR")]
         state_dir: Option<String>,
+        /// Expose the v0 Control API on this address (e.g. 127.0.0.1:8477).
+        /// Default: off. Requires --bearer-secret (the API never serves
+        /// unauthenticated).
+        #[arg(
+            long,
+            value_name = "ADDR",
+            value_parser = clap::value_parser!(std::net::SocketAddr),
+            requires = "bearer_secret"
+        )]
+        listen: Option<std::net::SocketAddr>,
+        /// The NAME of the bearer secret guarding the Control API — resolved
+        /// once at startup from the environment (the NAME as the env var),
+        /// then the state dir's secrets file. Requires --listen.
+        #[arg(long, value_name = "NAME", requires = "listen")]
+        bearer_secret: Option<String>,
     },
 }
 
@@ -368,7 +389,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             stop_window,
             metering_listen,
             state_dir,
-        }) => cli::serve::run(stop_window, metering_listen, state_dir),
+            listen,
+            bearer_secret,
+        }) => cli::serve::run(
+            stop_window,
+            metering_listen,
+            state_dir,
+            listen,
+            bearer_secret,
+        ),
         Some(Commands::Agent { command }) => match command {
             AgentCommands::Register {
                 name,
@@ -874,5 +903,55 @@ mod tests {
         let cli = Cli::try_parse_from(["hekma", "serve"]).expect("serve should parse");
 
         assert!(!should_check_for_updates(&cli.command));
+    }
+
+    #[test]
+    fn test_serve_control_api_flag_pair_lands_in_the_right_fields() {
+        // Review item 24(a): the Control-API flags are pinned at BOTH
+        // binary surfaces. This pin holds the clap parse — the pair's values
+        // land in the RIGHT fields, and each half ALONE is refused. The
+        // real-binary wiring leg (the secret resolved from the secrets file,
+        // the bearer answered over the wire) lives in
+        // `crates/hekma/tests/serve_cli.rs`.
+        let cli = Cli::try_parse_from([
+            "hekma",
+            "serve",
+            "--listen",
+            "127.0.0.1:8477",
+            "--bearer-secret",
+            "CONTROL_BEARER",
+        ])
+        .expect("the flag pair parses");
+        let Some(Commands::Serve {
+            listen,
+            bearer_secret,
+            ..
+        }) = &cli.command
+        else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(
+            *listen,
+            Some("127.0.0.1:8477".parse().unwrap()),
+            "the listen address lands in the listen field"
+        );
+        assert_eq!(
+            bearer_secret.as_deref(),
+            Some("CONTROL_BEARER"),
+            "the bearer NAME lands in the bearer_secret field"
+        );
+
+        // Each half ALONE is refused (clap's `requires` — the API never
+        // serves unauthenticated, and a bearer without a listener is inert).
+        match Cli::try_parse_from(["hekma", "serve", "--listen", "127.0.0.1:8477"]) {
+            Ok(_) => panic!("--listen without --bearer-secret must be refused"),
+            Err(err) => assert!(
+                err.use_stderr(),
+                "a half-pair is a usage error, not a silent default"
+            ),
+        }
+        if Cli::try_parse_from(["hekma", "serve", "--bearer-secret", "CONTROL_BEARER"]).is_ok() {
+            panic!("--bearer-secret without --listen must be refused");
+        }
     }
 }
