@@ -1651,3 +1651,210 @@ fn raw_backlog_prime_is_a_noop_at_the_current_end_while_a_live_tailer_runs() {
 
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
 }
+
+#[test]
+fn raw_fallback_fails_closed_when_the_tail_read_fails() {
+    // The tail read's fail-closed arm (probe ok, open ok, READ fails): a
+    // DIRECTORY at the raw log's path stats and opens fine on Unix but
+    // refuses to be read, so the seek+read fails and the typed Log error
+    // surfaces — never a silent empty read that would masquerade as "no
+    // output" (the same honesty rule the length-probe and open arms already
+    // pin). On Windows the same sabotage fails one step earlier, at the
+    // open — the same typed error either way.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("rawdir", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "rawdir");
+    std::fs::create_dir_all(&raw_log).unwrap(); // a DIRECTORY at the log path
+
+    match facade.read_raw_output_since("rawdir", Some(0)) {
+        Err(EngineError::Log { name, path, detail }) => {
+            assert_eq!(name, "rawdir");
+            assert!(
+                path.ends_with("agent.log"),
+                "the failure must name the raw log path: {path}"
+            );
+            assert!(!detail.is_empty());
+        }
+        other => panic!("expected the typed Log failure from the tail read, got {other:?}"),
+    }
+}
+
+#[test]
+fn raw_backlog_prime_fails_closed_on_an_invalid_name() {
+    // The prime's name gate, mirroring the fallback read's: a malformed
+    // name surfaces the typed InvalidName refusal BEFORE any filesystem
+    // probing — never an accidental path read (the `Bad Name` convention
+    // resync_events pins).
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("raw", "mock").unwrap();
+
+    match facade.prime_raw_backlog("Bad Name", 200) {
+        Err(EngineError::InvalidName { name, .. }) => assert_eq!(name, "Bad Name"),
+        other => panic!("expected the typed InvalidName refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn raw_backlog_prime_fails_closed_when_the_raw_scan_fails() {
+    // The prime's scan fail-closed mapping: with no live tailer, the bounded
+    // two-pass scan opens the raw log itself, and a path that cannot be
+    // scanned (here: a directory — readable metadata, openable on Unix,
+    // refusing the first buffered read) must surface the typed Log error
+    // naming the path, never an honest-looking (0, 0) that would silently
+    // skip the backlog window.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("rawscan", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "rawscan");
+    std::fs::create_dir_all(&raw_log).unwrap(); // a DIRECTORY at the log path
+
+    match facade.prime_raw_backlog("rawscan", 200) {
+        Err(EngineError::Log { name, path, detail }) => {
+            assert_eq!(name, "rawscan");
+            assert!(
+                path.ends_with("agent.log"),
+                "the failure must name the raw log path: {path}"
+            );
+            assert!(!detail.is_empty());
+        }
+        other => panic!("expected the typed Log failure from the backlog scan, got {other:?}"),
+    }
+}
+
+#[test]
+fn raw_backlog_prime_fails_closed_on_permission_denied_open() {
+    // The scan's non-NotFound OPEN arm on Unix: a read-denied raw log stats
+    // fine (mode bits do not affect stat) but refuses to open, so the
+    // failure moves past the absent-file honesty into the typed Log error —
+    // the same permission convention the fallback read's open arm pins.
+    // Permission-shaped sabotage is Unix-only honesty (Windows ACLs make a
+    // same-user mode change meaningless) — data-driven skip, the sanctioned
+    // shape for test files under the boundary gate.
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade.register("rawperm2", "mock").unwrap();
+
+    let raw_log = agent_log_path(state.path(), "rawperm2");
+    std::fs::create_dir_all(raw_log.parent().unwrap()).unwrap();
+    std::fs::write(&raw_log, "content the scan will not reach\n").unwrap();
+
+    let status = Command::new("chmod")
+        .args(["000", &raw_log.to_string_lossy()])
+        .status()
+        .expect("spawn chmod");
+    assert!(
+        status.success(),
+        "chmod 000 on {} failed",
+        raw_log.display()
+    );
+
+    match facade.prime_raw_backlog("rawperm2", 200) {
+        Err(EngineError::Log { name, detail, .. }) => {
+            assert_eq!(name, "rawperm2");
+            assert!(
+                detail.contains("Permission denied"),
+                "the OS detail must name the failure: {detail}"
+            );
+        }
+        other => panic!("expected the typed Log failure from the denied open, got {other:?}"),
+    }
+    // Restore so the TempDir teardown can remove the file.
+    let _ = Command::new("chmod")
+        .args(["644", &raw_log.to_string_lossy()])
+        .status();
+}
+
+#[test]
+fn raw_backlog_prime_live_capture_metadata_faults_fail_closed() {
+    // The live-capture guard's own length probe, fault-pinned: while a live
+    // tailer attributes the bytes, the prime still stats the raw path to
+    // return the current end — an ABSENT raw log is an honest (0, 0) (the
+    // tailer owns the bytes now), but a path that cannot be stat-ed at all
+    // (a self-referential symlink) fails closed with the typed Log error
+    // instead of guessing a cursor. Both sabotage shapes are Unix-only
+    // honesty (an open Windows handle blocks the remove; unprivileged
+    // symlink creation is unreliable there) — data-driven skip.
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // No heartbeat: the startup line lands once and the raw file's length
+    // goes still — the settled shape the guard's own test relies on.
+    write_logs_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        "guaranteed",
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    facade.start("svc").unwrap();
+    let raw_log = agent_log_path(state.path(), "svc");
+    // Wait for raw content AND stillness (two equal probes 150ms apart).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no raw output ever appeared"
+        );
+        let probe = std::fs::metadata(&raw_log).map(|m| m.len()).unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(150));
+        if probe > 0 && probe == std::fs::metadata(&raw_log).map(|m| m.len()).unwrap_or(0) {
+            break;
+        }
+    }
+
+    // Arm 1 — an absent raw log under a live capture: honest (0, 0). The
+    // child's output fd keeps writing the UNLINKED inode, so the path stays
+    // absent for every later probe.
+    std::fs::remove_file(&raw_log).unwrap();
+    assert_eq!(
+        facade.prime_raw_backlog("svc", 200).unwrap(),
+        (0, 0),
+        "an absent raw log under a live tailer primes nothing, honestly"
+    );
+
+    // Arm 2 — a path that cannot be stat-ed: typed Log failure naming the
+    // loop, never a guessed cursor.
+    let status = Command::new("ln")
+        .arg("-s")
+        .arg(&raw_log)
+        .arg(&raw_log)
+        .status()
+        .expect("spawn ln");
+    assert!(
+        status.success(),
+        "ln -s self-loop at {} failed",
+        raw_log.display()
+    );
+    match facade.prime_raw_backlog("svc", 200) {
+        Err(EngineError::Log { name, detail, .. }) => {
+            assert_eq!(name, "svc");
+            assert!(
+                detail.contains("Too many levels of symbolic links"),
+                "the OS detail must name the loop: {detail}"
+            );
+        }
+        other => panic!("expected the typed Log failure from the looped stat, got {other:?}"),
+    }
+
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+    // Remove the loop so the TempDir teardown walks the tree cleanly.
+    let _ = std::fs::remove_file(&raw_log);
+}
