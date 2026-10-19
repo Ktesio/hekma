@@ -855,6 +855,46 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         self.assertNotIn("|| true", run_block)
         self.assertNotIn("exit 0", run_block)
+        # Story 17-1: the serve-shape scenario is its OWN blocking run step
+        # (gated budgets CI never runs are not gates) with the SAME
+        # no-swallow contract — pinned structurally like the default step:
+        # flags-only last line (EXACTLY `--serve-shape`, no baseline — the
+        # canonical baseline carries no serve metrics and the serve gates
+        # bind only on serve runs), `set -euo pipefail`, no failure
+        #-swallowing idiom, and its own report-path env var.
+        self.assertIn("- name: Run the serve-shape scenario", perf_job)
+        serve_step = perf_job.index("- name: Run the serve-shape scenario")
+        serve_text = perf_job[perf_job.index("run: |", serve_step) :]
+        next_serve_step = _re.search(r"\n      - name:", serve_text[1:])
+        serve_block = (
+            serve_text[: 1 + next_serve_step.start()] if next_serve_step else serve_text
+        )
+        serve_last_line = next(
+            line for line in reversed(serve_block.splitlines()) if line.strip()
+        )
+        self.assertEqual(
+            serve_last_line.strip(),
+            "target/release/examples/perf-budgets --serve-shape",
+            "the serve run's last line is the bare binary + its flag — no "
+            "redirection, no chaining",
+        )
+        self.assertIn("set -euo pipefail", serve_block)
+        self.assertNotIn("|| true", serve_block)
+        self.assertNotIn("exit 0", serve_block)
+        self.assertNotIn(
+            "--baseline", serve_block, "the serve run does not ratchet"
+        )
+        # The serve step's OWN env slice (review round 3: scoped to the step,
+        # not the whole job — the default step's report path must not satisfy
+        # this assertion): the serve run writes its report file for the
+        # shared artifact.
+        serve_upload = perf_job.index("- name: Upload the measured report", serve_step)
+        serve_step_slice = perf_job[serve_step:serve_upload]
+        self.assertIn(
+            "PERF_BUDGETS_REPORT_PATH: perf-budgets-serve-report.json",
+            serve_step_slice,
+            "the serve step writes its own report file (perf-budgets-serve-report.json)",
+        )
         # The measured record is also uploaded as the job's artifact (even on
         # a red run): the harness writes it via the env var, the upload step
         # publishes it, and the upload is not skipped on failure.
@@ -864,6 +904,11 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("if: always()", upload)
         self.assertIn("actions/upload-artifact@", upload)
         self.assertIn("perf-budgets-report.json", upload)
+        self.assertIn(
+            "perf-budgets-serve-report.json",
+            upload,
+            "story 17-1: ONE artifact carries both report files (default + serve)",
+        )
         self.assertTrue(example.is_file(), "the perf-budgets harness example must exist")
         self.assertTrue(
             baseline.is_file(),

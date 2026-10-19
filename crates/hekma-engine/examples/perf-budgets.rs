@@ -152,6 +152,83 @@
 //!   default invocation (no flags) is byte-equivalent to the pre-15-5
 //!   report.
 //!
+//! ## The serve-shape scenario (story 17-1, `--serve-shape`)
+//!
+//! AD-18's reopen trigger (1) fired when AD-20 (the Service Host) was
+//! ratified: a long-lived host drives the engine's PUBLIC ASYNC facade under
+//! serve-shaped concurrency, and the coarse two-mutex lock model must be
+//! MEASURED against NFR-4 under that shape — never argued. The scenario
+//! extends this harness ADDITIVELY: the default no-flag invocation stays
+//! byte-equivalent (the `serve_shape` report block exists only on
+//! `--serve-shape` runs), the report `schema_version` stays 1, and the serve
+//! gates get their OWN names and bind only on serve runs.
+//!
+//! The scenario mimics an embedded host (docs/embedding.md's "call its async
+//! methods on your own runtime"): a small multi-thread tokio runtime OWNED BY
+//! THE DRIVER calls the engine's async methods concurrently — no HTTP
+//! transport (the lock question is engine-side; a transport would only add
+//! noise), no private reach-in. On the 25/10 heartbeat fleet PLUS one
+//! pathological instance it runs, concurrently, for one 12 s window:
+//!
+//! * `SERVE_READER_TASKS` reader tasks looping the SAME four read kinds the
+//!   default phase measures (`fleet()`, `instance_status()` round-robin,
+//!   `effective_config()`, the `usage_via_fleet` poll) — content-asserted
+//!   exactly like the default reads, PACED so each reader carries the
+//!   default phase's own read demand (`READ_ITERATIONS` per window, spread
+//!   across it — `serve_reader_pace`; a host serves at demand rate, and the
+//!   process-wide sampling cannot separate host handling cost from
+//!   supervision, so the load model is anchored to the harness's ratified
+//!   premise rather than chosen freely);
+//! * ONE `--follow`-style subscribed reader over the lock-free
+//!   `Engine::subscribe()` bus, counting committed events; a `Lagged`
+//!   (backlog) is COUNTED AND SURFACED in the report notes — never a crash,
+//!   never a silent drop (AI-18);
+//! * ONE pathological instance (registered + started AFTER the default
+//!   phases, whose read assertions count exactly 25 entries) stopped with a
+//!   BOUNDED window mid-load. The fixture is built so the stop is genuinely
+//!   slow: on Unix the agent IGNORES SIGTERM (the lifecycle suite's proven
+//!   `sh trap '' TERM` shape — the conformance `fake_agent` cannot install a
+//!   signal handler there, the OS-cfg gate forbids it), so the supervisor
+//!   mutex is held for the whole graceful window before the SIGKILL
+//!   escalation; on Windows the graceful step always elapses the window
+//!   before `TerminateJobObject`, so the lingering `fake_agent` shape gives
+//!   the same bounded-window stop. Both arms run through the SAME conformance
+//!   `ManifestFixture` machinery; both are bounded by the stop window plus
+//!   the kill confirmation.
+//!
+//! The serve gate set reuses the existing machinery (`GateBound`
+//! strict-vs-≤, per-instance normalization over the actually-Running count,
+//! the documented CI tolerance shape) at the RATIFIED NFR-4 budgets: read
+//! p99 STRICT `<` 1 s; CPU ≤ 2%/instance (× the shared-runner tolerance on
+//! CI); RSS ≤ 50 MiB/instance — three gates, their own names
+//! (`serve_read_p99_lt_1s`, `serve_cpu_per_instance_le_2pct`,
+//! `serve_rss_per_instance_le_50mib`), bound only on serve runs. The CPU/RSS
+//! window is sampled with the same sysinfo discipline (first sample
+//! discarded) while the load runs, so the figures cover the host's serve
+//! cost, not idle supervision.
+//!
+//! The DECISION RULE is fixed (spec 17-1): contention over ANY of the three
+//! NFR-4 budgets in this shape → the evidence recommends activating the
+//! archived per-instance plan (`ai-63b-lock-model-decision-2026-08-27.md`);
+//! all budgets hold → the evidence recommends re-ratifying the coarse model,
+//! citing the measured headroom. The proposal never argues past the numbers.
+//!
+//! Scenario-scoped baseline rule: the committed canonical baseline carries NO
+//! serve metrics, and the gated-metric coverage check is MODE-AWARE — a
+//! SERVE run's baseline must carry the serve metrics too (their absence is
+//! the same LOUD named exit-2 schema error, fired before anything spawns),
+//! while a default run's set is exactly the seven default gates (the serve
+//! names are not in it — pinned). A serve run trends the serve gates as
+//! well: against a serve-carrying baseline (seeded per docs/testing.md's
+//! procedure — a serve run's own `--write-baseline` merges the serve gates
+//! into the baseline's gates array), a serve-gate regression ratchets just
+//! like a default one. The CI perf job runs the serve invocation as a SECOND
+//! explicit step (gated budgets CI never runs are not gates) whose report
+//! file rides the SAME artifact as the default report (two files, one
+//! artifact). Platform scope (the standing gate-platform rule): the serve
+//! gates GATE on the ratified gate platform and are REPORT-ONLY elsewhere
+//! (Windows — sysinfo's `memory()` is the working-set-size analog there).
+
 //! ## Why an example (explicit gating, not `#[ignore]` sprawl)
 //!
 //! `cargo test --workspace --all-targets` COMPILES this file and RUNS its
@@ -208,10 +285,14 @@
 //!   on macOS; Windows is measured-and-reported (sysinfo's `memory()` is the
 //!   working-set-size analog there) — NEVER a gate platform.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hekma_conformance::test_support::{fake_agent_bin_in, BinDir, ManifestFixture};
-use hekma_engine::{AdapterRef, Blocking, ConfigLayer, Engine, FleetEntry, LifecycleState};
+use hekma_engine::{
+    broadcast, AdapterRef, Blocking, ConfigLayer, Engine, EngineEvent, FleetEntry, LifecycleState,
+};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 // ---------------------------------------------------------------------------
@@ -335,6 +416,87 @@ const CI_STEADY_WINDOWS: usize = 3;
 const REPORT_SCHEMA_VERSION: u64 = 1;
 
 // ---------------------------------------------------------------------------
+// Serve-shape scenario constants (story 17-1) — pinned by the test battery
+// like the NFR-4 fixture premise above
+// ---------------------------------------------------------------------------
+
+/// The serve-shape scenario's measurement window: a steady-window-shaped 12 s
+/// (same 1 s sample cadence, same first-sample-discard discipline), long
+/// enough to cover the mid-window bounded stop AND the reads that recover
+/// after it.
+const SERVE_WINDOW: Duration = Duration::from_secs(12);
+
+/// The pathological instance's BOUNDED stop window: a host's tight bound (the
+/// same bound the harness's own [`RunningGuard`] drop uses). The coarse model
+/// holds the supervisor mutex for this whole window when the agent ignores
+/// SIGTERM — exactly the contention term the serve shape exists to measure.
+/// Changing it changes what is measured; it is pinned by a test.
+const SERVE_STOP_WINDOW: Duration = Duration::from_secs(2);
+
+/// How far into the serve window the bounded stop fires: early enough that
+/// the stall lands while all readers are mid-storm, late enough that the
+/// post-stop recovery reads are inside the same window's p99.
+const SERVE_STOP_DELAY: Duration = Duration::from_secs(3);
+
+/// The orphan bound ON SERVE RUNS ONLY: the serve window + the stop bound
+/// extend the measurement schedule past [`AGENT_LINGER_MS`]'s 60 s, so the
+/// heartbeat fixture is BUILT with this linger on serve runs and
+/// [`check_liveness_schedule_serve`] asserts coverage against THIS bound.
+/// Default runs keep [`AGENT_LINGER_MS`] and stay byte-equivalent.
+const SERVE_AGENT_LINGER_MS: u64 = 120_000;
+
+/// Concurrent reader tasks in the serve driver (serve-shaped concurrency:
+/// several simultaneous read streams, not one).
+const SERVE_READER_TASKS: usize = 4;
+
+/// The serve readers' pace, DERIVED from the existing ratified fixture
+/// premise (not a free knob): EACH reader carries the default phase's own
+/// read demand — `READ_ITERATIONS` iterations per window — spread evenly
+/// across [`SERVE_WINDOW`] (12 s / 200 = 60 ms between a reader's
+/// iterations). Per reader that equals the default phase's demand; across
+/// the [`SERVE_READER_TASKS`] concurrent readers the aggregate is ~4× the
+/// default phase's (~800 iterations/window) — a serve shape, not a
+/// single-pass replay. The pace is sleep-only think-time: a reader stalled
+/// on the bounded stop delivers FEWER than its nominal iterations, and the
+/// report records the delivered count beside the nominal demand. A host
+/// serves at demand rate, and the process-wide sampling discipline cannot
+/// separate the host's own handling cost from supervision — so the load
+/// model IS part of the shape definition, and it is anchored to the
+/// harness's own ratified read-demand premise rather than chosen after
+/// seeing gate outcomes. Pure; pinned by tests.
+fn serve_reader_pace(window: Duration, read_iterations: usize) -> Duration {
+    window / (read_iterations.max(1) as u32)
+}
+
+/// Per-call retries for ONE serve read (review round 3): a transient read
+/// error must not panic a serve reader mid-window — the read is retried
+/// this many times with a short backoff, every retry is COUNTED (surfaced
+/// in the report as `reader_retries`), and the retried read's latency
+/// sample honestly includes the backoff it waited through.
+const SERVE_READ_RETRIES: usize = 2;
+
+/// The backoff between a serve read's retry attempts (a store-busy hiccup
+/// clears in far less; the value only has to outlast scheduler jitter).
+const SERVE_READ_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How many CONSECUTIVE failed iterations one serve reader tolerates before
+/// it aborts the scenario (review round 3): the abort is a NAMED error
+/// through the scenario's cleanup — never a silent short window, and never
+/// a first-transient panic.
+const SERVE_MAX_CONSECUTIVE_FAILURES: usize = 3;
+
+/// The driver runtime's worker threads — "a small multi-thread tokio
+/// runtime" (the host's own runtime; the engine's internals ride the engine's).
+const SERVE_DRIVER_WORKERS: usize = 4;
+
+/// The pathological instance's registered name (valid
+/// `[a-z0-9][a-z0-9_-]*`).
+const SERVE_PATHOLOGICAL_NAME: &str = "serve-pathological";
+
+/// The pathological fixture's manifest adapter kind (flow-local identity).
+const SERVE_PATHOLOGICAL_KIND: &str = "servepathological";
+
+// ---------------------------------------------------------------------------
 // Environment (tunables + CI detection) — invalid values are LOUD, never silent
 // ---------------------------------------------------------------------------
 
@@ -397,12 +559,40 @@ fn check_liveness_schedule(
 ) -> Result<(), String> {
     let gaps_ms = window_count.saturating_sub(1) as u128 * 1000; // 1 s between windows
     let schedule_ms = settle.as_millis() + window_count as u128 * window.as_millis() + gaps_ms;
+    check_liveness_schedule_ms(schedule_ms, AGENT_LINGER_MS)
+}
+
+/// The serve-shape extension (story 17-1): the same schedule PLUS the serve
+/// window and the pathological stop's bound, checked against the RAISED
+/// serve orphan bound ([`SERVE_AGENT_LINGER_MS`] — the heartbeat fixture is
+/// built with that linger on serve runs). Pinned by tests, like the default
+/// schedule above.
+fn check_liveness_schedule_serve(
+    settle: Duration,
+    window_count: usize,
+    window: Duration,
+    serve_window: Duration,
+    stop_bound: Duration,
+) -> Result<(), String> {
+    let gaps_ms = window_count.saturating_sub(1) as u128 * 1000; // 1 s between windows
+    let schedule_ms = settle.as_millis()
+        + window_count as u128 * window.as_millis()
+        + gaps_ms
+        + serve_window.as_millis()
+        + stop_bound.as_millis();
+    check_liveness_schedule_ms(schedule_ms, SERVE_AGENT_LINGER_MS)
+}
+
+/// The shared bound comparison (named once so the error text cannot drift
+/// between the default and serve arms): `linger_ms` must strictly exceed the
+/// schedule plus the margin.
+fn check_liveness_schedule_ms(schedule_ms: u128, linger_ms: u64) -> Result<(), String> {
     let required_ms = schedule_ms + LIVENESS_MARGIN.as_millis();
-    if u128::from(AGENT_LINGER_MS) > required_ms {
+    if u128::from(linger_ms) > required_ms {
         Ok(())
     } else {
         Err(format!(
-            "the orphan bound AGENT_LINGER_MS={AGENT_LINGER_MS} ms does not cover the \
+            "the orphan bound linger={linger_ms} ms does not cover the \
              measurement schedule ({schedule_ms} ms of settle + windows + gaps, plus a {} ms \
              margin) — the heartbeat idlers would self-exit mid-window and the figures \
              would measure nothing; shrink PERF_BUDGETS_SETTLE_MS / PERF_BUDGETS_WINDOW_MS \
@@ -416,6 +606,9 @@ fn check_liveness_schedule(
 /// loud (a stderr note) and bounded: settle ≥ 1 s, window ∈ [10 s, 1 h]
 /// (the spec's ≥ 10 s floor; the 1 h cap keeps a stray override from hanging
 /// the CI job).
+/// Clones/Copies so the serve scenario can derive a sampler-scoped config
+/// (the clamped window) without touching the caller's.
+#[derive(Clone, Copy)]
 struct HarnessConfig {
     read_iterations: usize,
     settle: Duration,
@@ -756,6 +949,892 @@ fn gate(
 }
 
 // ---------------------------------------------------------------------------
+// Serve-shape gates (story 17-1) — the SAME machinery (`GateBound`,
+// per-instance normalization, the CI tolerance shape) at the RATIFIED NFR-4
+// budgets, under the serve gates' OWN names. Bound only on serve runs; kept
+// OUT of the default trend evaluation (the scenario-scoped baseline rule).
+// ---------------------------------------------------------------------------
+
+/// Evaluate the three serve gates (pinned by tests): read p99 STRICT `<` 1 s
+/// (the budget's own prose, on every gate platform); CPU ≤ 2%/instance with
+/// the documented shared-runner tolerance shape (strict ×1.0 locally, ×1.5 on
+/// CI); RSS ≤ 50 MiB/instance at budget everywhere. A zero running count
+/// fails closed exactly like the default steady gates ([`per_instance`]'s
+/// +inf).
+fn evaluate_serve_gates(
+    overall_p99_ms: f64,
+    figures: &SteadyFigures,
+    tolerance: f64,
+) -> GateReport {
+    let verdicts = vec![
+        gate(
+            "serve_read_p99_lt_1s",
+            overall_p99_ms,
+            BUDGET_READ_P99_MS,
+            1.0,
+            GateBound::Lt,
+        ),
+        gate(
+            "serve_cpu_per_instance_le_2pct",
+            figures.cpu_per_instance_pct,
+            BUDGET_CPU_PER_INSTANCE_PCT,
+            tolerance,
+            GateBound::Le,
+        ),
+        gate(
+            "serve_rss_per_instance_le_50mib",
+            figures.rss_per_instance_mib,
+            BUDGET_RSS_PER_INSTANCE_MIB,
+            1.0,
+            GateBound::Le,
+        ),
+    ];
+    let passed = verdicts.iter().all(|v| v.passed);
+    GateReport { verdicts, passed }
+}
+
+/// Merge one read kind's per-reader sample vectors into ONE sample list for
+/// [`summarize_read`] (pure; pinned by tests). Order across readers is
+/// irrelevant to the sorted percentile math, but the concatenation is
+/// explicit so a lost vector is a length mismatch, not a silent short summary.
+fn merge_kind_samples(parts: &[Vec<f64>]) -> Vec<f64> {
+    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        all.extend_from_slice(part);
+    }
+    all
+}
+
+/// The serve scenario's CONTENTION PROOF (review round 3): the bounded stop
+/// must have overlapped in-flight reads — specifically, at least one read
+/// must have STARTED inside the stop's measured window. A serve window where
+/// no read started during the stop measured idle supervision, not the
+/// lock-contention term the shape exists to measure: its figures are vacuous
+/// evidence, and the fixed decision rule must not route on them. Pure;
+/// pinned. `main` maps `Err` to a NAMED exit-2 BEFORE any gate verdict is
+/// computed or printed (the scenario's own teardown has already run).
+fn serve_contention_exercised(reads_started_during_stop: u64) -> Result<(), String> {
+    if reads_started_during_stop == 0 {
+        Err(
+            "serve contention NOT exercised: the bounded stop never overlapped any \
+             in-flight read — the window's figures are idle-supervision numbers, not \
+             the serve shape's, so no gate verdict is computed; check the serve reader \
+             tasks (a dead reader is the usual cause) and re-run"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+/// The serve window's SAMPLER window (review round 3): the sampling window is
+/// CLAMPED to the serve load window. A raised `PERF_BUDGETS_WINDOW_MS` would
+/// otherwise sample past the 12 s load into idle tail, diluting the
+/// per-instance CPU/RSS figures toward passing; the clamp keeps the sampling
+/// window exactly as wide as the load it claims to measure. Pure; pinned.
+fn serve_sampling_window(configured: Duration) -> Duration {
+    configured.min(SERVE_WINDOW)
+}
+
+/// The schedule-aware Running count at `t` into the serve window (review
+/// round 3): the full sampled count until the bounded stop COMPLETES
+/// ([`SERVE_STOP_DELAY`] + [`SERVE_STOP_WINDOW`] — the pathological leaves
+/// the Running set when its stop lands), one fewer after. Pure in the
+/// constants; pinned by tests.
+fn serve_running_at(running_before_stop: usize, t: Duration) -> usize {
+    if t >= SERVE_STOP_DELAY + SERVE_STOP_WINDOW {
+        running_before_stop.saturating_sub(1)
+    } else {
+        running_before_stop
+    }
+}
+
+/// The per-instance normalization divisor for the serve window (review round
+/// 3): the MINIMUM Running count the schedule puts in effect across the
+/// window — the post-stop count. Dividing by the pre-window count would
+/// UNDERSTATE per-instance cost after the stop (the lenient direction —
+/// wrong for a gate); the conservative divisor can only overstate a
+/// per-instance figure, never understate one. Pure; pinned by tests.
+fn serve_effective_running_instances(running_before_stop: usize) -> usize {
+    serve_running_at(running_before_stop, SERVE_WINDOW)
+}
+
+/// The serve gates' PLATFORM SCOPE (review round 3), the standing rule the
+/// process-metric budgets carry (docs/testing.md, gate-platform scope):
+/// process figures are ratified on the gate platform (Linux CI; strict local
+/// macOS) and are measured-and-reported elsewhere — Windows is NOT a
+/// ratified gate platform (sysinfo's `memory()` is the working-set-size
+/// analog there). On a non-gate platform the serve verdicts are REPORT-ONLY:
+/// they carry `hard: false` in the report, never set the run's
+/// `serve_failed`, and a named stderr note says so. Pure; pinned by tests.
+fn serve_gates_bind(os: &str) -> bool {
+    matches!(os, "linux" | "macos")
+}
+
+// ---------------------------------------------------------------------------
+// Serve-shape scenario driver (story 17-1) — the engine's PUBLIC async facade
+// under serve-shaped concurrency, exactly as an embedded host drives it
+// (docs/embedding.md): the driver's OWN small multi-thread tokio runtime,
+// concurrent read streams, one subscribed follow-style reader, and one
+// pathological instance stopped with a BOUNDED window mid-load. No HTTP
+// transport (the lock-model question is engine-side; a transport would only
+// add noise), no private reach-in.
+// ---------------------------------------------------------------------------
+
+/// The pathological fixture whose BOUNDED stop the serve window measures.
+/// Returns the fixture plus the honest note (surfaced in the report's
+/// `serve_shape.fixture.note`) naming WHY the stop is genuinely slow on this
+/// OS — both arms go through the SAME conformance `ManifestFixture`
+/// machinery, and the OS branch is a RUNTIME branch (the conformance crate
+/// forbids `#[cfg]`).
+///
+/// * Unix: the lifecycle suite's proven shape — `sh -c 'trap "" TERM; sleep
+///   120'` IGNORES SIGTERM, so the supervisor's graceful step elapses the
+///   whole window before the SIGKILL escalation
+///   (`stop_escalates_to_forced_kill_and_records_it`). The self-exit sleep
+///   is DERIVED from [`SERVE_AGENT_LINGER_MS`] (the bound only has to
+///   outlive the serve window it is validated against). The conformance
+///   `fake_agent` cannot install a signal handler (the OS-cfg gate forbids
+///   OS-specific code), so the `sh` exec is the only Unix shape whose stop
+///   is genuinely slow.
+/// * Windows: the lingering `fake_agent` — the graceful step always elapses
+///   the full window before `TerminateJobObject`, so the same bounded-window
+///   contention is measured without needing a signal handler.
+fn pathological_fixture() -> (ManifestFixture, &'static str) {
+    if std::env::consts::OS == "windows" {
+        (
+            ManifestFixture::new(
+                SERVE_PATHOLOGICAL_KIND,
+                &[&format!("--linger-ms={SERVE_AGENT_LINGER_MS}")],
+            )
+            .exec(fake_agent_bin_in(BinDir::Examples))
+            .guaranteed_on_all_oses("interaction"),
+            "windows: fake_agent --linger-ms (self-exit bound); the graceful stop step \
+             always elapses the full bounded window before TerminateJobObject, so the \
+             supervisor mutex is held for the whole window",
+        )
+    } else {
+        // The self-exit bound is DERIVED from the serve orphan bound (review
+        // round 3): `sleep 60` would self-exit BELOW the 120 s schedule the
+        // fixture is validated against — the sleep only has to outlive the
+        // serve window, so it IS the serve bound (in seconds).
+        (
+            ManifestFixture::new(
+                SERVE_PATHOLOGICAL_KIND,
+                &[
+                    "-c",
+                    &format!("trap '' TERM; sleep {}", SERVE_AGENT_LINGER_MS / 1000),
+                ],
+            )
+            .exec("sh")
+            .guaranteed_on_all_oses("interaction"),
+            "unix: sh -c 'trap \"\" TERM; sleep 120' IGNORES SIGTERM (the lifecycle \
+             suite's proven shape) — the graceful window elapses before the SIGKILL \
+             escalation, holding the supervisor mutex for the whole bounded window; \
+             the self-exit bound IS the serve orphan bound (SERVE_AGENT_LINGER_MS, in \
+             seconds), so the fixture can never self-exit inside the schedule it is \
+             validated against",
+        )
+    }
+}
+
+/// What one serve window's driver collected (raw; `run_serve_scenario`
+/// summarizes it through the same pure math the default phases use).
+struct ServeLoad {
+    /// Per-reader raw sample vectors for each read kind, in task order
+    /// (`SERVE_READER_TASKS` parts each — merged by [`merge_kind_samples`]).
+    fleet: Vec<Vec<f64>>,
+    instance_status: Vec<Vec<f64>>,
+    effective_config: Vec<Vec<f64>>,
+    usage_via_fleet: Vec<Vec<f64>>,
+    /// Events the subscribed follower counted (committed deliveries only).
+    follower_events: u64,
+    /// How many events the follower recovered from `Lagged` (backlog skip) —
+    /// surfaced, never a crash, never a silent drop (AI-18).
+    follower_lagged: u64,
+    /// How long the pathological instance's bounded stop took end-to-end.
+    stop_elapsed_ms: f64,
+    /// The pathological instance's final state (serde-rendered, quotes
+    /// trimmed — e.g. `stopped`).
+    pathological_final_state: String,
+    /// The stop's LAST recorded transition cause, serde-serialized verbatim.
+    pathological_stop_cause: String,
+    /// Delivered iterations PER READER (review round 3): the pace is
+    /// sleep-only think-time, so a reader stalled on the bounded stop
+    /// delivers fewer than the nominal `read_iterations` — recorded beside
+    /// the nominal demand, never implied.
+    reader_iterations: Vec<usize>,
+    /// Reads that STARTED inside the bounded stop's measured window (review
+    /// round 3) — the contention proof: zero means the window measured idle
+    /// supervision, and the run fails with a named exit-2 before any gate
+    /// verdict.
+    reads_started_during_stop: u64,
+    /// Serve-read retry attempts across all readers (review round 3) —
+    /// surfaced in the report, never silent.
+    reader_retries: u64,
+}
+
+/// Everything the `serve_shape` report block and the three serve gates need
+/// (story 17-1) — the summarized outcome of [`run_serve_scenario`].
+struct ServeShapeOutcome {
+    reads: Vec<ReadStats>,
+    overall_p99_ms: f64,
+    steady: SteadyMeasurements,
+    figures: SteadyFigures,
+    running_count: usize,
+    /// The schedule-aware normalization divisor (review round 3): the
+    /// minimum Running count the window's schedule puts in effect (the
+    /// post-stop count) — the conservative per-instance bound, disclosed in
+    /// the report beside the pre-stop sampled count.
+    effective_running_instances: usize,
+    load: ServeLoad,
+    fixture_note: &'static str,
+    /// The serve driver's derived pace + per-reader demand (the load model,
+    /// recorded in the report so the shape is reproducible).
+    pace: Duration,
+    read_iterations: usize,
+    /// The sampler's clamped window (review round 3): the sampling window is
+    /// clamped to the serve load window so a raised
+    /// `PERF_BUDGETS_WINDOW_MS` cannot dilute the figures with idle tail.
+    sampling_window_ms: u64,
+}
+
+/// Drive ONE serve window against the engine's PUBLIC async facade: a
+/// subscribed follower counting the lock-free bus (a `Lagged` is counted and
+/// surfaced, never a crash); `SERVE_READER_TASKS` concurrent reader tasks
+/// round-robin every fixture instance (including the pathological) through
+/// the SAME four content-asserted read kinds the default phase measures; and
+/// ONE bounded stop of the pathological instance fires mid-load. Returns
+/// `Err` (a NAMED reason) when a reader aborted on repeated consecutive
+/// failures or panicked — the window's figures would be incomplete, so the
+/// scenario fails loudly instead of measuring a short storm. Also records,
+/// per reader: the DELIVERED iteration count (the pace is sleep-only; a
+/// stalled reader delivers fewer than nominal), the retries transient read
+/// errors consumed (counted, surfaced — never a first-transient panic), and
+/// whether any read STARTED inside the stop's measured window (the
+/// contention proof, checked by [`serve_contention_exercised`]). Pure
+/// orchestration — no sysinfo (the CPU/RSS window runs on the caller's
+/// separate std::thread), no report, no gates.
+async fn drive_serve_load(
+    engine: Arc<Engine>,
+    names: Vec<String>,
+    follower: broadcast::Receiver<EngineEvent>,
+    follower_stop: Arc<AtomicBool>,
+    pace: Duration,
+) -> Result<ServeLoad, String> {
+    let deadline = Instant::now() + SERVE_WINDOW;
+    // The bounded stop's MEASURED window (review round 3), recorded by the
+    // stop task when the stop returns; readers check whether their iteration
+    // started inside it — the contention proof's raw count.
+    let stop_window = Arc::new(std::sync::OnceLock::<(Instant, Instant)>::new());
+    // Serve-read retries across ALL readers (review round 3) — counted and
+    // surfaced in the report, never silent.
+    let retries = Arc::new(AtomicU64::new(0));
+
+    // ---- The follower FIRST (spawned before any read, so it observes every
+    // committed event of the window): one --follow-style subscribed reader
+    // on the lock-free `Engine::subscribe()` bus. A `Lagged` (the bus moved
+    // past this receiver) is COUNTED and surfaced — never a crash, never a
+    // silent drop (AI-18). It exits when `follower_stop` flips, observed
+    // within one 250 ms poll. ----
+    let follower_flag = Arc::clone(&follower_stop);
+    let follower_handle = tokio::spawn(async move {
+        let mut follower = follower;
+        let mut events = 0u64;
+        let mut lagged = 0u64;
+        loop {
+            if follower_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(250), follower.recv()).await {
+                Ok(Ok(_event)) => events += 1,
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => lagged += skipped,
+                Ok(Err(broadcast::error::RecvError::Closed)) => break,
+                Err(_timeout) => {} // re-check the stop flag
+            }
+        }
+        (events, lagged)
+    });
+
+    // ---- The reader storm: SERVE_READER_TASKS concurrent tasks, each
+    // looping the four read kinds round-robin (task `t` starts at offset
+    // `t` and strides by the task count, so the streams interleave across
+    // the whole fixture), paced at `pace` per iteration — the derived
+    // host-shape load (see `serve_reader_pace`). Content-asserted EXACTLY
+    // like the default reads — a read that silently degraded must not count
+    // as a fast read. Transient ERRORS are retried with a short backoff
+    // (review round 3: the retry machinery the default phase's CI gate has,
+    // mirrored per read); the retries are counted, a retried read's sample
+    // honestly includes its backoff, and only repeated CONSECUTIVE failures
+    // abort the reader (a named error, never a silent short window). ----
+    let mut reader_handles = Vec::with_capacity(SERVE_READER_TASKS);
+    for task in 0..SERVE_READER_TASKS {
+        let engine = Arc::clone(&engine);
+        let names = names.clone();
+        let retries = Arc::clone(&retries);
+        let stop_window = Arc::clone(&stop_window);
+        reader_handles.push(tokio::spawn(async move {
+            let mut fleet = Vec::new();
+            let mut status = Vec::new();
+            let mut config = Vec::new();
+            let mut usage = Vec::new();
+            let mut done = 0usize;
+            let mut overlaps = 0u64;
+            let mut consecutive_failures = 0usize;
+            let mut i = task;
+            while Instant::now() < deadline {
+                let name = names[i % names.len()].clone();
+                // The iteration's START is the contention proof's timestamp:
+                // did a read begin inside the stop's window?
+                let iter_started = Instant::now();
+
+                let attempt = async {
+                    let t = Instant::now();
+                    let entries =
+                        retry_serve_read("serve fleet read", &retries, || engine.fleet()).await?;
+                    let fleet_ms = elapsed_ms(t);
+                    assert_eq!(
+                        entries.len(),
+                        names.len(),
+                        "serve fleet read must list the whole fixture (including the pathological)"
+                    );
+
+                    let t = Instant::now();
+                    let state = retry_serve_read("serve instance_status read", &retries, || {
+                        engine.instance_status(&name)
+                    })
+                    .await?;
+                    let status_ms = elapsed_ms(t);
+                    assert_eq!(
+                        state.instance.name.as_str(),
+                        name,
+                        "serve instance_status must return the requested instance"
+                    );
+
+                    let t = Instant::now();
+                    let effective =
+                        retry_serve_read("serve effective_config read", &retries, || {
+                            engine.effective_config(&name, ConfigLayer::empty())
+                        })
+                        .await?;
+                    let config_ms = elapsed_ms(t);
+                    assert_eq!(
+                        effective.value_display(MODEL_KEY).as_deref(),
+                        Some(MODEL_VALUE),
+                        "the seeded config leaf must read back through the serve read"
+                    );
+
+                    // The usage read, exactly as `kt agent usage <name>` performs
+                    // it through the async facade: fleet() + find. (A missing
+                    // entry is a CONTENT failure — the fixture is static — so it
+                    // stays a loud panic, not a retry.)
+                    let t = Instant::now();
+                    let entry =
+                        retry_serve_read("serve usage read: fleet", &retries, || engine.fleet())
+                            .await?
+                            .into_iter()
+                            .find(|e| e.name.as_str() == name)
+                            .expect("serve usage read: the instance is in the Fleet");
+                    let usage_ms = elapsed_ms(t);
+                    assert_eq!(
+                        entry.name.as_str(),
+                        name,
+                        "the serve usage read found its instance"
+                    );
+                    Ok::<(f64, f64, f64, f64), String>((fleet_ms, status_ms, config_ms, usage_ms))
+                };
+                match attempt.await {
+                    Ok((f, s, c, u)) => {
+                        fleet.push(f);
+                        status.push(s);
+                        config.push(c);
+                        usage.push(u);
+                        done += 1;
+                        consecutive_failures = 0;
+                    }
+                    Err(reason) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= SERVE_MAX_CONSECUTIVE_FAILURES {
+                            return Err(format!(
+                                "aborted after {consecutive_failures} consecutive failed \
+                                 iteration(s); last error: {reason}"
+                            ));
+                        }
+                    }
+                }
+
+                // Contention accounting (review round 3): did this iteration
+                // START inside the stop's measured window? The stop task
+                // records the window when the stop returns, so an iteration
+                // that began inside it sees the record here.
+                if let Some((start, end)) = stop_window.get() {
+                    if iter_started >= *start && iter_started <= *end {
+                        overlaps += 1;
+                    }
+                }
+
+                // The reader's think-time: the pace derives from the default
+                // phase's read demand (see `serve_reader_pace`) — the load
+                // model, not a spinner's cadence.
+                tokio::time::sleep(pace).await;
+                i += SERVE_READER_TASKS;
+            }
+            Ok((fleet, status, config, usage, done, overlaps))
+        }));
+    }
+
+    // ---- The bounded stop: fires SERVE_STOP_DELAY into the window (all
+    // readers mid-storm), with the tight SERVE_STOP_WINDOW — the coarse
+    // model holds the supervisor mutex for the whole graceful step, and
+    // every read that lands there stalls with it. That stall distribution
+    // IS the measurement. ----
+    let stop_engine = Arc::clone(&engine);
+    let stop_window_for_stop = Arc::clone(&stop_window);
+    let stop_handle = tokio::spawn(async move {
+        tokio::time::sleep(SERVE_STOP_DELAY).await;
+        let t = Instant::now();
+        let stopped = stop_engine
+            .stop(SERVE_PATHOLOGICAL_NAME, Some(SERVE_STOP_WINDOW))
+            .await
+            .expect("the serve pathological bounded stop");
+        let stop_elapsed_ms = elapsed_ms(t);
+        // Record the stop's MEASURED window (review round 3): the readers'
+        // contention accounting reads this when their in-flight iterations
+        // complete.
+        let _ = stop_window_for_stop.set((t, Instant::now()));
+        let pathological_final_state = serde_json::to_string(&stopped.state)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        let pathological_stop_cause = stop_engine
+            .transition_events(SERVE_PATHOLOGICAL_NAME)
+            .await
+            .ok()
+            .and_then(|events| events.last().cloned())
+            .map(|event| {
+                serde_json::to_string(&event.cause).unwrap_or_else(|_| "\"unknown\"".to_string())
+            })
+            .unwrap_or_else(|| "\"unknown\"".to_string());
+        (
+            stop_elapsed_ms,
+            pathological_final_state,
+            pathological_stop_cause,
+        )
+    });
+
+    // ---- Collect: readers run to the deadline, the stop completes inside
+    // it, then the follower is drained (one poll interval at most). A reader
+    // that aborted (repeated consecutive failures) or panicked makes the
+    // whole scenario Err — AFTER the stop task is awaited, so the
+    // pathological is stopped on every exit path. ----
+    let mut fleet = Vec::new();
+    let mut status = Vec::new();
+    let mut config = Vec::new();
+    let mut usage = Vec::new();
+    let mut reader_iterations = Vec::with_capacity(SERVE_READER_TASKS);
+    let mut reads_started_during_stop = 0u64;
+    let mut reader_error: Option<String> = None;
+    for (task, handle) in reader_handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok((f, s, c, u, done, overlaps))) => {
+                fleet.push(f);
+                status.push(s);
+                config.push(c);
+                usage.push(u);
+                reader_iterations.push(done);
+                reads_started_during_stop += overlaps;
+            }
+            Ok(Err(reason)) => {
+                reader_error
+                    .get_or_insert_with(|| format!("serve reader task {task} aborted: {reason}"));
+            }
+            Err(join_err) => {
+                reader_error.get_or_insert_with(|| {
+                    format!("serve reader task {task} panicked: {join_err}")
+                });
+            }
+        }
+    }
+    let (stop_elapsed_ms, pathological_final_state, pathological_stop_cause) =
+        stop_handle.await.expect("the serve stop task panicked");
+    follower_stop.store(true, Ordering::Relaxed);
+    let (follower_events, follower_lagged) = follower_handle
+        .await
+        .expect("the serve follower task panicked");
+
+    if let Some(reason) = reader_error {
+        return Err(format!(
+            "{reason} — the window's figures are INCOMPLETE (the bounded stop itself \
+             completed in {stop_elapsed_ms:.1} ms, so the pathological is stopped); \
+             the serve scenario fails loudly rather than measure a short storm"
+        ));
+    }
+
+    Ok(ServeLoad {
+        fleet,
+        instance_status: status,
+        effective_config: config,
+        usage_via_fleet: usage,
+        follower_events,
+        follower_lagged,
+        stop_elapsed_ms,
+        pathological_final_state,
+        pathological_stop_cause,
+        reader_iterations,
+        reads_started_during_stop,
+        reader_retries: retries.load(Ordering::Relaxed),
+    })
+}
+
+/// One serve read with BOUNDED retries (review round 3 — the per-read mirror
+/// of the default phase's CI retry machinery): `op` is attempted up to
+/// `1 + SERVE_READ_RETRIES` times with [`SERVE_READ_RETRY_BACKOFF`] between
+/// attempts; every retry is counted in `retries` (surfaced in the report as
+/// `reader_retries`); exhaustion returns the LAST error, named — the caller's
+/// consecutive-failure accounting decides the abort. The retried read's
+/// latency sample honestly includes the backoff it waited through.
+async fn retry_serve_read<T, E, F>(
+    name: &'static str,
+    retries: &AtomicU64,
+    mut op: impl FnMut() -> F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut last = String::new();
+    for attempt in 0..=SERVE_READ_RETRIES {
+        if attempt > 0 {
+            retries.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(SERVE_READ_RETRY_BACKOFF).await;
+        }
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(format!(
+        "{name} failed after {} attempt(s): {last}",
+        SERVE_READ_RETRIES + 1
+    ))
+}
+
+/// Run the whole serve-shape scenario (story 17-1): build + register + start
+/// the pathological fixture, subscribe, drive one serve window on the
+/// driver's own runtime while a separate std::thread samples the engine
+/// process's CPU/RSS with the same sysinfo discipline, then summarize the
+/// load through the same pure math the default phases use. Returns `Err` (a
+/// NAMED reason) when the scenario cannot yield valid serve evidence — a
+/// reader aborted/panicked, or the contention proof failed (`main` maps that
+/// to a named exit-2 BEFORE any gate verdict; the scenario's own cleanup has
+/// run either way). The pathological runs under its OWN [`RunningGuard`]:
+/// defused after the scenario's successful stop, so Drop (a bounded
+/// best-effort stop) covers every panic path.
+fn run_serve_scenario(
+    engine: &Arc<Engine>,
+    facade: &Blocking<'_>,
+    names: &[String],
+    config: &HarnessConfig,
+) -> Result<ServeShapeOutcome, String> {
+    // ---- The pathological fixture: its OWN manifest dir (a fixture's
+    // write() owns the directory it is given — the heartbeat fixture already
+    // owns the main one). Declared BEFORE the guard so the dir outlives it
+    // (the guard's stop may still need the manifest on a panic path). ----
+    let (fixture, fixture_note) = pathological_fixture();
+    let serve_manifest_tmp = tempfile::TempDir::new().expect("create the serve manifest dir");
+    let serve_manifest = fixture.write(serve_manifest_tmp.path());
+
+    // Register, seed the config leaf the serve readers assert on, THEN
+    // subscribe (before start — a receiver sees only later commits), THEN
+    // start under the guard.
+    facade
+        .register_with_adapter(
+            SERVE_PATHOLOGICAL_NAME,
+            &AdapterRef::Manifest(serve_manifest.clone()),
+        )
+        .unwrap_or_else(|e| panic!("register {SERVE_PATHOLOGICAL_NAME} failed: {e}"));
+    facade
+        .set_config(SERVE_PATHOLOGICAL_NAME, MODEL_KEY, MODEL_VALUE)
+        .unwrap_or_else(|e| panic!("seed config on {SERVE_PATHOLOGICAL_NAME} failed: {e}"));
+    let follower = engine.subscribe();
+    let mut serve_guard = RunningGuard::new(facade, &[SERVE_PATHOLOGICAL_NAME.to_string()]);
+    facade
+        .start(SERVE_PATHOLOGICAL_NAME)
+        .unwrap_or_else(|e| panic!("start {SERVE_PATHOLOGICAL_NAME} failed: {e}"));
+    let status = facade
+        .instance_status(SERVE_PATHOLOGICAL_NAME)
+        .unwrap_or_else(|e| panic!("status read for {SERVE_PATHOLOGICAL_NAME} failed: {e}"));
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "{SERVE_PATHOLOGICAL_NAME} must be Running when the serve window opens"
+    );
+
+    let mut all_names = names.to_vec();
+    all_names.push(SERVE_PATHOLOGICAL_NAME.to_string());
+    let serve_running_count = sample_running_count(facade, &all_names);
+    assert!(
+        serve_running_count > 0,
+        "no instance is Running — the serve budgets are meaningless over zero running instances"
+    );
+    note(&format!(
+        "serve window: {serve_running_count} instances Running ({RUNNING_COUNT} started \
+         heartbeat idlers of {FLEET_SIZE} registered + the pathological); \
+         {SERVE_READER_TASKS} paced reader tasks + 1 follower for {SERVE_WINDOW:?}, \
+         bounded stop at {SERVE_STOP_DELAY:?} ({SERVE_STOP_WINDOW:?} window)"
+    ));
+
+    // ---- The window: CPU/RSS sampled on a separate std::thread (the same
+    // sysinfo discipline: two-refresh deltas, first sample discarded) while
+    // the driver runtime drives the facade from THIS thread. ----
+    let pace = serve_reader_pace(SERVE_WINDOW, config.read_iterations);
+    let engine_for_driver = Arc::clone(engine);
+    let driver_names = all_names.clone();
+    // The SAMPLER window is CLAMPED to the serve load window (review round
+    // 3): a raised PERF_BUDGETS_WINDOW_MS would otherwise sample past the
+    // 12 s load into idle tail, diluting the per-instance figures toward
+    // passing. (HarnessConfig is Copy; only the window field moves.)
+    let sampler_config = HarnessConfig {
+        window: serve_sampling_window(config.window),
+        ..*config
+    };
+    let sampling_window_ms = sampler_config.window.as_millis() as u64;
+    let (load, steady) = std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| measure_steady_windows(&sampler_config, 1));
+        let driver = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(SERVE_DRIVER_WORKERS)
+            .enable_all()
+            .build()
+            .expect("build the serve driver runtime");
+        let load = driver.block_on(drive_serve_load(
+            engine_for_driver,
+            driver_names,
+            follower,
+            Arc::new(AtomicBool::new(false)),
+            pace,
+        ));
+        let steady = sampler.join().expect("the serve sampler thread panicked");
+        (load, steady)
+    });
+
+    // ---- Cleanup helper shape: on ANY invalid-evidence exit path the
+    // pathological is stopped (drive_serve_load awaits the stop task before
+    // returning Err), so the guard defuses and the scenario's own temp dir
+    // drops here — before the Err reaches main. ----
+    let load = match load {
+        Ok(load) => load,
+        Err(reason) => {
+            serve_guard.defuse_if(true);
+            drop(serve_guard);
+            drop(serve_manifest_tmp);
+            return Err(reason);
+        }
+    };
+
+    // ---- Summarize through the SAME pure math the default phases use. ----
+    let reads = vec![
+        summarize_read("fleet", &mut merge_kind_samples(&load.fleet)),
+        summarize_read(
+            "instance_status",
+            &mut merge_kind_samples(&load.instance_status),
+        ),
+        summarize_read(
+            "effective_config",
+            &mut merge_kind_samples(&load.effective_config),
+        ),
+        summarize_read(
+            "usage_via_fleet",
+            &mut merge_kind_samples(&load.usage_via_fleet),
+        ),
+    ];
+    let overall_p99_ms = overall_read_p99(&reads);
+    // The per-instance normalization divisor is the schedule-aware MINIMUM
+    // Running count (review round 3): the pathological leaves the Running
+    // set when its stop completes, and dividing by the pre-window count
+    // would understate per-instance cost after that point (the lenient
+    // direction — wrong for a gate).
+    let effective_running_instances = serve_effective_running_instances(serve_running_count);
+    let figures = SteadyFigures::new(
+        steady.median_cpu_aggregate_pct,
+        steady.median_rss_bytes_mean,
+        steady.rss_bytes_max,
+        effective_running_instances,
+    );
+
+    // The scenario's own stop succeeded end-to-end (drive_serve_load would
+    // have returned Err otherwise): the final state must read `stopped`, and
+    // the guard is defused — Drop covers only the panic paths.
+    assert_eq!(
+        load.pathological_final_state, "stopped",
+        "the pathological instance must reach `stopped` through its bounded stop"
+    );
+
+    // ---- The contention proof (review round 3), BEFORE any gate verdict:
+    // a window where no read started inside the stop's measured window
+    // measured idle supervision, not the lock-contention term the shape
+    // exists to measure — its figures are vacuous, so the scenario fails
+    // with a NAMED error (main: exit 2) instead of routing the fixed
+    // decision rule on them. ----
+    if let Err(reason) = serve_contention_exercised(load.reads_started_during_stop) {
+        serve_guard.defuse_if(true);
+        drop(serve_guard);
+        drop(serve_manifest_tmp);
+        return Err(reason);
+    }
+
+    serve_guard.defuse_if(true);
+    drop(serve_guard);
+    drop(serve_manifest_tmp);
+
+    note(&format!(
+        "serve window complete: reads p99 {overall_p99_ms:.3} ms; bounded stop {:.1} ms \
+         (final state {}, last cause {}); {} read(s) started inside the stop's window; \
+         follower {} event(s), {} Lagged-recovered; {} reader-retries; delivered \
+         iterations per reader {:?} (nominal {})",
+        load.stop_elapsed_ms,
+        load.pathological_final_state,
+        load.pathological_stop_cause,
+        load.reads_started_during_stop,
+        load.follower_events,
+        load.follower_lagged,
+        load.reader_retries,
+        load.reader_iterations,
+        config.read_iterations,
+    ));
+
+    Ok(ServeShapeOutcome {
+        reads,
+        overall_p99_ms,
+        steady,
+        figures,
+        running_count: serve_running_count,
+        effective_running_instances,
+        load,
+        fixture_note,
+        pace,
+        read_iterations: config.read_iterations,
+        sampling_window_ms,
+    })
+}
+
+/// The `serve_shape` report block (story 17-1) — present ONLY on
+/// `--serve-shape` runs (the default invocation's report stays
+/// byte-equivalent). `binding` is the gates' platform scope (review round
+/// 3): on the ratified gate platform the verdicts gate (`hard: true`);
+/// elsewhere they are report-only (`hard: false`) — measured and reported,
+/// never gating. Pure.
+fn serve_shape_json(
+    outcome: &ServeShapeOutcome,
+    gates: &GateReport,
+    tolerance: f64,
+    binding: bool,
+) -> serde_json::Value {
+    let verdicts: Vec<serde_json::Value> = gates
+        .verdicts
+        .iter()
+        .map(|verdict| {
+            let mut json = verdict_json(verdict);
+            json["hard"] = serde_json::json!(binding);
+            json
+        })
+        .collect();
+    let lagged_note = if outcome.load.follower_lagged > 0 {
+        format!(
+            "the follower fell behind the bus and RECOVERED by skipping {} committed \
+             event(s) — surfaced per AI-18, never a crash, never a silent drop",
+            outcome.load.follower_lagged
+        )
+    } else {
+        "the follower kept up (no Lagged recovery needed)".to_string()
+    };
+    serde_json::json!({
+        "story": "17-1",
+        "budget_source": "NFR-4 (the same ratified budgets, serve shape)",
+        "decision_rule": "any serve budget exceeded -> the evidence recommends ACTIVATING \
+             the archived per-instance plan (ai-63b-lock-model-decision-2026-08-27.md); \
+             all hold -> the evidence recommends RE-RATIFYING the coarse two-mutex model, \
+             citing the measured headroom",
+        "gates_bind_on_this_platform": binding,
+        "driver": {
+            "shape": "the PUBLIC async facade on the driver's OWN small multi-thread tokio \
+                 runtime (the docs/embedding.md host shape) — no HTTP transport, no \
+                 private reach-in",
+            "worker_threads": SERVE_DRIVER_WORKERS,
+            "reader_tasks": SERVE_READER_TASKS,
+            "read_iterations_per_reader": outcome.read_iterations,
+            "iterations_delivered_per_reader": outcome.load.reader_iterations,
+            "iterations_note": "the pace is sleep-only think-time: a reader stalled on the \
+                 bounded stop delivers fewer than its nominal count — delivered recorded \
+                 beside nominal, never implied",
+            "reader_retries": outcome.load.reader_retries,
+            "reader_pace_ms": outcome.pace.as_millis() as u64,
+            "pace_derivation": "each reader carries the default phase's OWN read demand \
+                 (READ_ITERATIONS per window — the story-7-5 premise), spread across the \
+                 serve window: window / read_iterations; per reader this EQUALS the \
+                 default phase's demand, so the SERVE_READER_TASKS concurrent readers \
+                 deliver ~4x the default phase's AGGREGATE demand — a serve shape, not a \
+                 single-pass replay",
+            "window_secs": SERVE_WINDOW.as_secs_f64(),
+            "sampling_window_ms": outcome.sampling_window_ms,
+            "sampling_note": "the sampler's window is CLAMPED to the serve load window, so \
+                 a raised PERF_BUDGETS_WINDOW_MS cannot dilute the figures with idle tail",
+        },
+        "fixture": {
+            "fleet_size": FLEET_SIZE + 1,
+            "running_instances": outcome.running_count,
+            "effective_running_instances": outcome.effective_running_instances,
+            "normalization_note": "per-instance figures divide by the schedule-aware MINIMUM \
+                 Running count (the post-stop count) — the conservative bound; the \
+                 pre-stop count would understate per-instance cost after the bounded stop",
+            "pathological_name": SERVE_PATHOLOGICAL_NAME,
+            "pathological_kind": SERVE_PATHOLOGICAL_KIND,
+            "pathological_note": outcome.fixture_note,
+            "orphan_bound_ms": SERVE_AGENT_LINGER_MS,
+        },
+        "read_latency_ms": read_kind_json(&outcome.reads),
+        "read_p99_overall_ms": outcome.overall_p99_ms,
+        "steady_state": steady_json(&outcome.steady, &outcome.figures),
+        "contention": {
+            "reads_started_during_stop": outcome.load.reads_started_during_stop,
+            "note": "reads that STARTED inside the bounded stop's measured window — the \
+                 contention proof; zero would mean idle supervision was measured, and the \
+                 run fails with a named exit-2 before any gate verdict",
+        },
+        "bounded_stop": {
+            "window_secs": SERVE_STOP_WINDOW.as_secs_f64(),
+            "fired_into_window_secs": SERVE_STOP_DELAY.as_secs_f64(),
+            "elapsed_ms": outcome.load.stop_elapsed_ms,
+            "final_state": outcome.load.pathological_final_state,
+            "last_transition_cause": outcome.load.pathological_stop_cause,
+        },
+        "subscriber": {
+            "shape": "one --follow-style subscribed reader on the lock-free \
+                 Engine::subscribe() bus (the story-7-2 surface), counting committed \
+                 events under load — a handful of lifecycle events in the window (the \
+                 pathological's start/stop transitions and any committed usage/breach \
+                 events), so this is BUS LIVENESS under load, not load evidence",
+            "events_counted": outcome.load.follower_events,
+            "lagged_recovered": outcome.load.follower_lagged,
+            "lagged_note": lagged_note,
+        },
+        "ci_tolerance": {
+            "name": "shared_runner_tolerance",
+            "factor": tolerance,
+            "applies_to": "serve_cpu_per_instance_le_2pct, CI mode only",
+            "applied": tolerance != 1.0,
+        },
+        "baseline_rule": "the serve gates bind ONLY on --serve-shape runs; the DEFAULT \
+             gated-metric set never carries serve names (a default run's baseline is \
+             unchanged). A SERVE run trends the serve gates too — but only against a \
+             serve-carrying baseline (seeded per docs/testing.md): the mode-aware \
+             coverage check hard-fails (the existing named exit-2) a serve run whose \
+             --baseline lacks the serve metrics, never a silent pass",
+        "gates": verdicts,
+        "status": if gates.passed { "pass" } else { "fail" },
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Baseline trend tracking + the ratchet (story 15-5) — ADDITIVE to the
 // absolute gates (a gate-platform run must pass both). Pure math + parsing
 // here, pinned by the #[cfg(test)] battery like the gate math above.
@@ -770,6 +1849,11 @@ fn gate(
 struct CliArgs {
     baseline: Option<String>,
     write_baseline: Option<String>,
+    /// Story 17-1: run the serve-shape scenario AFTER the default phases and
+    /// add the `serve_shape` report block + the three serve gates. A boolean
+    /// flag: any `=`-carrying form (`--serve-shape=bogus`) is a named usage
+    /// error + exit 2, never a silently-ignored value.
+    serve_shape: bool,
     help: bool,
 }
 
@@ -780,8 +1864,8 @@ fn usage_text() -> String {
     format!(
         "ktesio perf-budgets harness (story 7-5 / NFR-4) — usage:\n\
          \n\
-         \x20 perf-budgets [--baseline <file>] [--write-baseline <file>]\n\
-         \x20                (each flag also as --flag=<file>)\n\
+         \x20 perf-budgets [--baseline <file>] [--write-baseline <file>] [--serve-shape]\n\
+         \x20                (each flag also as --flag=<file>; --serve-shape takes no value)\n\
          \n\
          \x20 --baseline <file>      load a prior report JSON and add a `trend` block\n\
          \x20                          (per gated metric: baseline/current/delta/verdict).\n\
@@ -791,8 +1875,16 @@ fn usage_text() -> String {
          \x20                          report the trend without gating.\n\
          \x20 --write-baseline <file> write this run's report (trend stripped, provenance\n\
          \x20                          stamped) as the NEXT baseline. REFUSED on a red run\n\
-         \x20                          (absolute gate or ratchet failed): loud note, exit 2,\n\
-         \x20                          the file is never written.\n\
+         \x20                          (absolute gate, serve gate, or ratchet failed): loud\n\
+         \x20                          note, exit 2, the file is never written.\n\
+         \x20 --serve-shape          story 17-1: ALSO run the serve-shape scenario after\n\
+         \x20                          the default phases — the engine's PUBLIC async facade\n\
+         \x20                          under serve-shaped concurrency (concurrent reads +\n\
+         \x20                          usage polling + one subscribed follow-style reader +\n\
+         \x20                          one pathological bounded stop) — and gate the NFR-4\n\
+         \x20                          budgets through the serve gates (their own names;\n\
+         \x20                          bound only on serve runs; not ratcheted until a\n\
+         \x20                          serve-carrying baseline is seeded per docs/testing.md).\n\
          \x20 --help | -h             this text.\n\
          \n\
          \x20 No flags: the absolute budgets gate exactly as before and the report is\n\
@@ -834,13 +1926,30 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             // including one carrying '=': never a split-on-= attempt.
             return Err(format!(
                 "unknown argument {raw:?} \
-                 (supported: --baseline <file>, --write-baseline <file>, --help)"
+                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, --help)"
             ));
         };
+        if flag == "--serve-shape" {
+            // Story 17-1: a BOOLEAN flag — the `=`-carrying form is invalid
+            // usage outright (the spec's `--serve-shape=bogus` row: a named
+            // stderr error + exit 2, before anything spawns), never a
+            // silently-ignored value.
+            if let Some(value) = inline_value {
+                return Err(format!(
+                    "--serve-shape takes no value (got --serve-shape={value:?})"
+                ));
+            }
+            if parsed.serve_shape {
+                return Err("--serve-shape given more than once".to_string());
+            }
+            parsed.serve_shape = true;
+            index += 1;
+            continue;
+        }
         if flag != "--baseline" && flag != "--write-baseline" {
             return Err(format!(
                 "unknown argument {raw:?} \
-                 (supported: --baseline <file>, --write-baseline <file>, --help)"
+                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, --help)"
             ));
         }
         let value = match inline_value {
@@ -934,6 +2043,20 @@ const GATED_METRICS: [&str; 7] = [
     "subscriber_cpu_delta_le_budget",
     "subscriber_rss_delta_le_budget",
     "subscriber_read_p99_delta_le_budget",
+];
+
+/// The serve gates' names (story 17-1), OUT of the default gated set: a
+/// default run's gated-metric set is exactly [`GATED_METRICS`] — the serve
+/// names bind only on serve runs (review round 3, pinned: they are NOT in
+/// the default set). The MODE-AWARE set (review round 3): a SERVE run's
+/// coverage check and trend evaluation expect the default set PLUS these —
+/// but only against a serve-carrying baseline (a serve run whose baseline
+/// lacks them is the existing LOUD named exit-2 schema error, never a
+/// silent pass, and never a fabricated zero).
+const SERVE_GATED_METRICS: [&str; 3] = [
+    "serve_read_p99_lt_1s",
+    "serve_cpu_per_instance_le_2pct",
+    "serve_rss_per_instance_le_50mib",
 ];
 
 /// Pre-measurement baseline coverage validation (review round 1): the
@@ -1138,11 +2261,14 @@ impl NoRatchetReason {
 /// handed) floors at 0.0 — the strict pure-×1.15 rule, never a guess.
 fn ratchet_noise_floor(gate: &str) -> f64 {
     match gate {
-        "read_p99_lt_1s" => 0.5,
-        "cpu_per_instance_le_2pct" | "subscriber_cpu_delta_le_budget" => 0.05,
+        "read_p99_lt_1s" | "serve_read_p99_lt_1s" => 0.5,
+        "cpu_per_instance_le_2pct"
+        | "subscriber_cpu_delta_le_budget"
+        | "serve_cpu_per_instance_le_2pct" => 0.05,
         "rss_per_instance_le_50mib"
         | "rss_max_spike_le_2x_budget"
-        | "subscriber_rss_delta_le_budget" => 0.25,
+        | "subscriber_rss_delta_le_budget"
+        | "serve_rss_per_instance_le_50mib" => 0.25,
         "subscriber_read_p99_delta_le_budget" => 25.0,
         _ => 0.0,
     }
@@ -1469,6 +2595,11 @@ fn baseline_provenance(ci_mode: bool, on_ci_runner: bool, full_git_sha: &str) ->
 /// nesting the comparison it was produced under would grow stale data every
 /// refresh; `parse_baseline` tolerates a stale one, but never writes one)
 /// and the `provenance` block STAMPED (in-file provenance, review round 1).
+/// On a SERVE run the serve gates are MERGED into the top-level gates array
+/// (review round 3), so the written baseline CARRIES the serve figures the
+/// loader reads (`load_baseline` parses exactly that array) — a serve
+/// `--write-baseline` seeds a real serve-carrying baseline, exactly as
+/// docs/testing.md's procedure describes. Pure; pinned by tests.
 fn baseline_report_json(
     report: &serde_json::Value,
     provenance: serde_json::Value,
@@ -1477,20 +2608,59 @@ fn baseline_report_json(
     if let Some(object) = clean.as_object_mut() {
         object.remove("trend");
         object.insert("provenance".to_string(), provenance);
+        // Merge the serve gates into the baseline's gates array (serve runs
+        // only — the serve_shape block is absent otherwise, so a default
+        // run's baseline is byte-shaped as before).
+        if let Some(serve_gates) = object
+            .get("serve_shape")
+            .and_then(|serve| serve.get("gates"))
+            .and_then(|gates| gates.as_array())
+            .cloned()
+        {
+            if let Some(gates) = object.get_mut("gates").and_then(|g| g.as_array_mut()) {
+                gates.extend(serve_gates);
+            }
+        }
     }
     clean
 }
 
+/// The run's exit code, folded from the three independent red sources
+/// (review round 3 — extracted from `main` and pinned so each token has a
+/// test that fails if it is deleted): an absolute-budget failure, a ratchet
+/// failure, or a serve-gate failure reds the run (exit 1); only a fully
+/// green run exits 0. Pure; pinned by tests.
+fn run_exit_code(gates_passed: bool, ratchet_failed: bool, serve_failed: bool) -> i32 {
+    if gates_passed && !ratchet_failed && !serve_failed {
+        0
+    } else {
+        1
+    }
+}
+
 /// The red-run refusal (review round 1, pinned by tests): `--write-baseline`
 /// must NEVER turn a failed run's regressed figures into the canonical
-/// baseline. Refused when any absolute gate failed OR the ratchet failed —
-/// the loud reason says which and points at the procedure.
-fn baseline_write_refusal(gates_passed: bool, ratchet_failed: bool) -> Option<&'static str> {
+/// baseline. Refused when any absolute gate failed, the SERVE gates failed,
+/// OR the ratchet failed — each token is its own named reason (review round
+/// 3 added the serve arm so the token cannot be deleted and pass), and the
+/// loud reason says which and points at the procedure.
+fn baseline_write_refusal(
+    gates_passed: bool,
+    serve_failed: bool,
+    ratchet_failed: bool,
+) -> Option<&'static str> {
     if !gates_passed {
         Some(
             "--write-baseline REFUSED: the absolute budgets FAILED this run — a red \
              run's regressed figures must never become the canonical baseline; fix \
              the regression first (the report above is the measured record)",
+        )
+    } else if serve_failed {
+        Some(
+            "--write-baseline REFUSED: the SERVE budgets FAILED this run — a red \
+             run's regressed figures must never become the canonical baseline (a \
+             serve-carrying baseline included); fix the regression first (the \
+             report above is the measured record)",
         )
     } else if ratchet_failed {
         Some(
@@ -1539,7 +2709,22 @@ fn main() {
     let baseline = match &cli.baseline {
         Some(path) => match load_baseline(std::path::Path::new(path)) {
             Ok(figures) => {
-                let (missing, extra) = baseline_coverage_gaps(&figures, &GATED_METRICS);
+                // The MODE-AWARE gated set (review round 3): a serve run's
+                // baseline must also carry the serve metrics — their absence
+                // is the same LOUD named exit-2 schema error (fired before a
+                // minute of measurement is wasted), never a silent pass and
+                // never a fabricated zero. A default run's set is exactly
+                // GATED_METRICS (the serve names are not in it — pinned).
+                let expected_gated: Vec<&str> = if cli.serve_shape {
+                    GATED_METRICS
+                        .iter()
+                        .chain(SERVE_GATED_METRICS.iter())
+                        .copied()
+                        .collect()
+                } else {
+                    GATED_METRICS.to_vec()
+                };
+                let (missing, extra) = baseline_coverage_gaps(&figures, &expected_gated);
                 if !missing.is_empty() {
                     note(&format!(
                         "baseline {path} schema mismatch: it lacks the gated metric(s) \
@@ -1596,10 +2781,39 @@ fn main() {
     };
     // The liveness gate BEFORE anything is spawned: the orphan bound must
     // cover the gated windows PLUS the subscriber-overhead addendum window
-    // (the same heartbeat idlers are measured in both).
-    if let Err(reason) = check_liveness_schedule(config.settle, config.windows + 1, config.window) {
-        note(&format!("{reason} — exiting 2"));
-        std::process::exit(2);
+    // (the same heartbeat idlers are measured in both). Serve runs skip this
+    // default check (review round 3): their fixture is BUILT with the raised
+    // serve bound, so the default 60 s bound does not apply — the serve
+    // schedule is checked against the raised bound below, alone.
+    if !cli.serve_shape {
+        if let Err(reason) =
+            check_liveness_schedule(config.settle, config.windows + 1, config.window)
+        {
+            note(&format!("{reason} — exiting 2"));
+            std::process::exit(2);
+        }
+    }
+    if cli.serve_shape {
+        // The serve schedule check BEFORE anything spawns (fail-fast): the
+        // serve window + the pathological stop's bound extend the schedule
+        // past the default orphan bound, so serve runs check against the
+        // RAISED bound the heartbeat fixture will actually be built with.
+        if let Err(reason) = check_liveness_schedule_serve(
+            config.settle,
+            config.windows + 1,
+            config.window,
+            SERVE_WINDOW,
+            SERVE_STOP_WINDOW,
+        ) {
+            note(&format!("{reason} — exiting 2"));
+            std::process::exit(2);
+        }
+        note(&format!(
+            "serve-shape run (story 17-1): the heartbeat orphan bound is RAISED to \
+             SERVE_AGENT_LINGER_MS={SERVE_AGENT_LINGER_MS} ms — the serve window plus the \
+             bounded stop extend the measurement schedule past the default \
+             {AGENT_LINGER_MS} ms bound"
+        ));
     }
     note(&format!(
         "ktesio perf-budgets harness (story 7-5 / NFR-4): fleet={FLEET_SIZE} \
@@ -1625,11 +2839,23 @@ fn main() {
     // contract v1, pause + interaction guaranteed ×3, self-reported metering,
     // the `[config.model]` env mapping, and the heartbeat-only args (the
     // steady-state window measures supervision, not metering ingestion).
-    let manifest_dir = ManifestFixture::heartbeat(MANIFEST_KIND, HEARTBEAT_MS, AGENT_LINGER_MS)
+    // The orphan bound the idlers are BUILT with: the default on no-flag
+    // runs (byte-equivalent); the RAISED serve bound on `--serve-shape` runs
+    // (the serve window + the bounded stop extend the schedule).
+    let orphan_bound_ms = if cli.serve_shape {
+        SERVE_AGENT_LINGER_MS
+    } else {
+        AGENT_LINGER_MS
+    };
+    let manifest_dir = ManifestFixture::heartbeat(MANIFEST_KIND, HEARTBEAT_MS, orphan_bound_ms)
         .exec(fake_agent)
         .write(manifest_tmp.path());
 
-    let engine = Engine::open(Some(state.path().to_path_buf())).expect("open the engine");
+    // Arc-wrapped (story 17-1): the serve driver's tokio tasks need 'static
+    // handles to the engine's PUBLIC async methods — the Arc IS the host's
+    // own shape (an embedded host owns the Engine and shares it across its
+    // tasks). The sync phases keep borrowing through the Arc as before.
+    let engine = Arc::new(Engine::open(Some(state.path().to_path_buf())).expect("open the engine"));
     let facade = engine.blocking();
 
     // ---- Setup (NOT a timed window): register 25, seed a real config leaf
@@ -1731,113 +2957,219 @@ fn main() {
     drop(subscription); // release the runtime handle before teardown
     note("subscriber-overhead addendum complete");
 
-    // ---- Report BEFORE teardown, so the measured record survives any
-    // teardown trouble; the exit code still reflects the gates. ----
-    let figures = SteadyFigures::new(
-        steady.median_cpu_aggregate_pct,
-        steady.median_rss_bytes_mean,
-        steady.rss_bytes_max,
-        running_count,
-    );
-    let sub_figures = SteadyFigures::new(
-        sub_steady.median_cpu_aggregate_pct,
-        sub_steady.median_rss_bytes_mean,
-        sub_steady.rss_bytes_max,
-        running_count,
-    );
-    let subscriber_overhead = SubscriberOverhead::new(&figures, p99, &sub_figures, sub_p99);
-    let tolerance = if config.ci {
-        CI_CPU_TOLERANCE_FACTOR
-    } else {
-        1.0
-    };
-    let gates = evaluate_gates(p99, &figures, &subscriber_overhead, tolerance);
-    let mut report = build_report(
-        &config,
-        &reads,
-        p99,
-        &steady,
-        &figures,
-        running_count,
-        read_attempts,
-        tolerance,
-        &gates,
-        &subscriber_overhead,
-    );
-    // ---- The trend block + ratchet (story 15-5), ADDITIVE to the gates:
-    // inserted only when --baseline was given, so the default report stays
-    // byte-equivalent. The ratchet fails the run (exit 1 below) only on its
-    // gate platform — CI mode; every other run reports without gating. All
-    // of the report mutation lives in the pure, pinned apply_trend. On a
-    // trend-evaluation ERROR the report is printed to stdout FIRST (the
-    // measured record survives the error — review round 1), then the named
-    // error + exit 2. ----
-    let mut ratchet_failed = false;
-    if let Some((path, figures)) = &baseline {
-        match evaluate_trend(&gates, figures, path, config.ci) {
-            Ok(trend) => {
-                emit_trend_notes(&trend);
-                ratchet_failed = apply_trend(&mut report, &trend);
-            }
+    // ---- Story 17-1: the serve-shape scenario — ONLY on --serve-shape runs
+    // (the default invocation stops here and stays byte-equivalent). It runs
+    // AFTER every gated phase so it cannot contaminate them. An Err (a reader
+    // aborted or panicked, or the contention proof failed) is carried as a
+    // NAMED scenario error: the measured record below is SKIPPED and the run
+    // exits 2 after teardown — BEFORE any gate verdict exists (gates over a
+    // vacuous window would dress idle-supervision numbers as serve evidence;
+    // review round 3). ----
+    let mut serve_scenario_error: Option<String> = None;
+    let serve = if cli.serve_shape {
+        match run_serve_scenario(&engine, &facade, &names, &config) {
+            Ok(outcome) => Some(outcome),
             Err(reason) => {
-                print_report(&report, &gates);
-                note(&format!("{reason} — exiting 2"));
-                std::process::exit(2);
+                serve_scenario_error = Some(reason);
+                None
             }
         }
-    }
-    print_report(&report, &gates);
-    // ---- --write-baseline: the fresh report (trend stripped, provenance
-    // stamped, trailing newline) as the next baseline. A RED run is REFUSED
-    // (review round 1: a failed run's regressed figures must never become
-    // canonical — loud note + exit 2, the file is never written; the exit-2
-    // takes precedence over the red exit-1 below so the operator sees the
-    // usage error, and the note names the red-ness either way). Otherwise
-    // the operator asked for the FILE, so a write failure is a loud error
-    // that fails the run (exit 2 below) — unlike the optional
-    // PERF_BUDGETS_REPORT_PATH artifact below, whose failure is only noted
-    // (stdout — the measured record — is unaffected there). ----
+    } else {
+        None
+    };
+
+    // The exit fold's inputs, hoisted out of the record block so the tail can
+    // fold them through the pinned `run_exit_code` (review round 3).
+    let mut gates_passed = true;
+    let mut ratchet_failed = false;
+    let mut serve_failed = false;
     let mut baseline_write_failed = false;
-    if let Some(path) = &cli.write_baseline {
-        if let Some(reason) = baseline_write_refusal(gates.passed, ratchet_failed) {
-            // Deferred like the write-failure flag below: the note fires
-            // here, the exit happens after teardown (process::exit skips
-            // destructors — the RunningGuard must get its chance).
+
+    // ---- The measured record + every verdict. Breaks early on a named
+    // serve-scenario error (above): teardown below still runs; the named
+    // exit-2 fires after it. ----
+    'record: {
+        if let Some(reason) = &serve_scenario_error {
             note(reason);
-            baseline_write_failed = true;
+            break 'record;
+        }
+        // ---- Report BEFORE teardown, so the measured record survives any
+        // teardown trouble; the exit code still reflects the gates. ----
+        let figures = SteadyFigures::new(
+            steady.median_cpu_aggregate_pct,
+            steady.median_rss_bytes_mean,
+            steady.rss_bytes_max,
+            running_count,
+        );
+        let sub_figures = SteadyFigures::new(
+            sub_steady.median_cpu_aggregate_pct,
+            sub_steady.median_rss_bytes_mean,
+            sub_steady.rss_bytes_max,
+            running_count,
+        );
+        let subscriber_overhead = SubscriberOverhead::new(&figures, p99, &sub_figures, sub_p99);
+        let tolerance = if config.ci {
+            CI_CPU_TOLERANCE_FACTOR
         } else {
-            let provenance = baseline_provenance(config.ci, on_github_runner(), &git_full_sha());
-            let fresh = baseline_report_json(&report, provenance);
-            let written = serde_json::to_string_pretty(&fresh)
-                .map_err(|e| e.to_string())
-                .map(|text| format!("{text}\n"))
-                .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()));
-            match written {
-                Ok(()) => note(&format!(
-                    "baseline written to {path} (the next baseline; commit it via the \
-                 documented PR procedure — the visible diff IS the ratification)"
-                )),
-                Err(e) => {
-                    baseline_write_failed = true;
-                    note(&format!(
-                        "could not write the baseline to {path} ({e}) — exiting 2"
-                    ));
+            1.0
+        };
+        let gates = evaluate_gates(p99, &figures, &subscriber_overhead, tolerance);
+        gates_passed = gates.passed;
+        let mut report = build_report(
+            &config,
+            &reads,
+            p99,
+            &steady,
+            &figures,
+            running_count,
+            read_attempts,
+            tolerance,
+            &gates,
+            &subscriber_overhead,
+            orphan_bound_ms,
+        );
+        // ---- Story 17-1: the serve gates + the serve_shape report block,
+        // ADDITIVE and only on --serve-shape runs — evaluated BEFORE the
+        // trend block below, because a serve run's ratchet covers them too
+        // (review round 3: the mode-aware trend set; the baseline's coverage
+        // was validated at load). Platform scope (review round 3), the
+        // standing gate-platform rule: on the ratified gate platform the
+        // serve verdicts GATE; elsewhere (Windows — sysinfo's `memory()` is
+        // the working-set-size analog, not a ratified gate platform) they
+        // are REPORT-ONLY with a named note, never gating the run. A
+        // failure still flips the report status + the exit code, and the
+        // FIXED decision rule (spec 17-1) is stated on stderr either way —
+        // the evidence recommends; it never argues past the numbers. ----
+        let mut serve_gates_for_trend: Option<GateReport> = None;
+        if let Some(outcome) = &serve {
+            let binding = serve_gates_bind(std::env::consts::OS);
+            let serve_gates =
+                evaluate_serve_gates(outcome.overall_p99_ms, &outcome.figures, tolerance);
+            serve_failed = binding && !serve_gates.passed;
+            if !binding {
+                note(&format!(
+                    "serve gates are REPORT-ONLY on this platform ({}) — not a ratified \
+                     gate platform; the serve figures are measured and reported below and \
+                     never gate this run",
+                    std::env::consts::OS,
+                ));
+            }
+            report["serve_shape"] = serve_shape_json(outcome, &serve_gates, tolerance, binding);
+            if serve_failed {
+                report["status"] = serde_json::json!("fail");
+            }
+            for verdict in &serve_gates.verdicts {
+                note(&format!(
+                    "serve gate {} measured {:.4} vs effective budget {:.4} — {}",
+                    verdict.name,
+                    verdict.measured,
+                    verdict.effective_budget,
+                    if verdict.passed { "PASS" } else { "FAIL" },
+                ));
+            }
+            if serve_failed {
+                note(
+                    "DECISION RULE (spec 17-1): at least one serve budget was exceeded — the \
+                     evidence recommends ACTIVATING the archived per-instance lock-model plan \
+                     (ai-63b-lock-model-decision-2026-08-27.md)",
+                );
+            } else {
+                note(
+                    "DECISION RULE (spec 17-1): all serve budgets held — the evidence \
+                     recommends RE-RATIFYING the coarse two-mutex lock model, citing the \
+                     measured headroom recorded in the report's serve_shape block",
+                );
+            }
+            serve_gates_for_trend = Some(serve_gates);
+        }
+        // ---- The trend block + ratchet (story 15-5), ADDITIVE to the gates:
+        // inserted only when --baseline was given, so the default report stays
+        // byte-equivalent. The ratchet fails the run (exit 1 below) only on its
+        // gate platform — CI mode; every other run reports without gating. On a
+        // serve run the trend set is MODE-AWARE (review round 3): the serve
+        // gates ride the ratchet too (their noise floors sit in
+        // `ratchet_noise_floor`), and the loaded baseline was already validated
+        // to carry them at load time. All of the report mutation lives in the
+        // pure, pinned apply_trend. On a trend-evaluation ERROR the report is
+        // printed to stdout FIRST (the measured record survives the error —
+        // review round 1), then the named error + exit 2. ----
+        if let Some((path, figures)) = &baseline {
+            let mut trend_gates = gates.clone();
+            if let Some(serve_gates) = &serve_gates_for_trend {
+                trend_gates
+                    .verdicts
+                    .extend(serve_gates.verdicts.iter().cloned());
+            }
+            match evaluate_trend(&trend_gates, figures, path, config.ci) {
+                Ok(trend) => {
+                    emit_trend_notes(&trend);
+                    ratchet_failed = apply_trend(&mut report, &trend);
+                }
+                Err(reason) => {
+                    print_report(&report, &gates);
+                    note(&format!("{reason} — exiting 2"));
+                    std::process::exit(2);
                 }
             }
         }
-    }
-    if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
-        match serde_json::to_string_pretty(&report)
-            .map_err(|e| e.to_string())
-            .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
-        {
-            Ok(()) => note(&format!("JSON report written to {path}")),
-            Err(e) => note(&format!(
-                "could not write the JSON report to {path} ({e}) — the stdout report \
-                 (the measured record) is unaffected"
-            )),
+        print_report(&report, &gates);
+        // ---- --write-baseline: the fresh report (trend stripped, provenance
+        // stamped, trailing newline) as the next baseline. A RED run is REFUSED
+        // (review round 1: a failed run's regressed figures must never become
+        // canonical — loud note + exit 2, the file is never written; the exit-2
+        // takes precedence over the red exit-1 below so the operator sees the
+        // usage error, and the note names the red-ness either way — the fold
+        // itself is the pinned `baseline_write_refusal`, whose serve token is
+        // its own arm since review round 3). Otherwise the operator asked for
+        // the FILE, so a write failure is a loud error that fails the run (exit
+        // 2 below) — unlike the optional PERF_BUDGETS_REPORT_PATH artifact
+        // below, whose failure is only noted (stdout — the measured record — is
+        // unaffected there). ----
+        if let Some(path) = &cli.write_baseline {
+            // Story 17-1: a red SERVE run refuses the write too — a failed run's
+            // figures must never become canonical, whatever gated them.
+            if let Some(reason) = baseline_write_refusal(gates_passed, serve_failed, ratchet_failed)
+            {
+                // Deferred like the write-failure flag below: the note fires
+                // here, the exit happens after teardown (process::exit skips
+                // destructors — the RunningGuard must get its chance).
+                note(reason);
+                baseline_write_failed = true;
+            } else {
+                let provenance =
+                    baseline_provenance(config.ci, on_github_runner(), &git_full_sha());
+                let fresh = baseline_report_json(&report, provenance);
+                let written = serde_json::to_string_pretty(&fresh)
+                    .map_err(|e| e.to_string())
+                    .map(|text| format!("{text}\n"))
+                    .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()));
+                match written {
+                    Ok(()) => note(&format!(
+                        "baseline written to {path} (the next baseline; commit it via the \
+                 documented PR procedure — the visible diff IS the ratification)"
+                    )),
+                    Err(e) => {
+                        baseline_write_failed = true;
+                        note(&format!(
+                            "could not write the baseline to {path} ({e}) — exiting 2"
+                        ));
+                    }
+                }
+            }
         }
-    }
+        if let Ok(path) = std::env::var("PERF_BUDGETS_REPORT_PATH") {
+            match serde_json::to_string_pretty(&report)
+                .map_err(|e| e.to_string())
+                .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
+            {
+                Ok(()) => note(&format!("JSON report written to {path}")),
+                Err(e) => note(&format!(
+                    "could not write the JSON report to {path} ({e}) — the stdout report \
+                 (the measured record) is unaffected"
+                )),
+            }
+        }
+    } // 'record
 
     // ---- Teardown (best-effort; a stop failure is noted, never a panic —
     // and the RunningGuard below would retry it on unwind anyway). ----
@@ -1847,7 +3179,7 @@ fn main() {
             all_stopped = false;
             note(&format!(
                 "stop {name} failed during teardown ({e}); the agent's own \
-                 --linger-ms bound ({AGENT_LINGER_MS} ms) caps any orphan"
+                 --linger-ms bound ({orphan_bound_ms} ms) caps any orphan"
             ));
         }
     }
@@ -1864,12 +3196,18 @@ fn main() {
         // run's exit 1 — the note above already names the red-ness.
         std::process::exit(2);
     }
-    if !gates.passed || ratchet_failed {
-        // The measured record is already on stdout; exit nonzero so the CI
-        // perf-budgets job (and any local gate runner) fails on the
-        // regression — an absolute-budget failure OR a ratchet failure.
-        std::process::exit(1);
+    if let Some(reason) = serve_scenario_error {
+        // A vacuous serve window (review round 3): the named reason is
+        // already on stderr; the run fails with exit 2 — the scenario-error
+        // class — and takes precedence over every other exit below.
+        note(&format!("{reason} — exiting 2"));
+        std::process::exit(2);
     }
+    // The measured record is already on stdout; exit nonzero so the CI
+    // perf-budgets job (and any local gate runner) fails on the regression —
+    // an absolute-budget failure, a ratchet failure, OR a serve-gate failure
+    // (story 17-1). The fold itself is the pinned `run_exit_code`.
+    std::process::exit(run_exit_code(gates_passed, ratchet_failed, serve_failed));
 }
 
 // ---------------------------------------------------------------------------
@@ -2129,10 +3467,64 @@ fn elapsed_ms(started: Instant) -> f64 {
 // Report (pure build + print split, so tests pin the math, not the printing)
 // ---------------------------------------------------------------------------
 
+/// One gate verdict's report JSON — the ONE shape both the default gate
+/// table and the serve gate table render (shared so the two tables cannot
+/// drift).
+fn verdict_json(v: &GateVerdict) -> serde_json::Value {
+    serde_json::json!({
+        "name": v.name,
+        "hard": v.hard,
+        "bound": v.bound.as_str(),
+        "measured": v.measured,
+        "budget": v.budget,
+        "effective_budget": v.effective_budget,
+        "tolerance": v.tolerance,
+        "strict_margin": v.strict_margin,
+        "status": if v.passed { "pass" } else { "fail" },
+    })
+}
+
+/// The per-kind read-latency JSON — the ONE shape both the default report
+/// and the serve block render.
+fn read_kind_json(reads: &[ReadStats]) -> serde_json::Map<String, serde_json::Value> {
+    let mut per_kind = serde_json::Map::new();
+    for stats in reads {
+        per_kind.insert(
+            stats.name.to_string(),
+            serde_json::json!({
+                "p50_ms": stats.p50, "p95_ms": stats.p95, "p99_ms": stats.p99,
+                "max_ms": stats.max, "samples": stats.samples,
+            }),
+        );
+    }
+    per_kind
+}
+
+/// The steady-state JSON block — the ONE shape both the default report and
+/// the serve block render.
+fn steady_json(steady: &SteadyMeasurements, figures: &SteadyFigures) -> serde_json::Value {
+    serde_json::json!({
+        "windows": steady.windows.iter().map(|w| serde_json::json!({
+            "cpu_percent_aggregate_mean": w.cpu_pct_aggregate_mean,
+            "rss_mib_mean": w.rss_bytes_mean / (1024.0 * 1024.0),
+            "rss_mib_max": w.rss_bytes_max as f64 / (1024.0 * 1024.0),
+            "samples": w.samples,
+        })).collect::<Vec<_>>(),
+        "cpu_percent_aggregate_median": steady.median_cpu_aggregate_pct,
+        "rss_mib_aggregate_median": steady.median_rss_bytes_mean / (1024.0 * 1024.0),
+        "cpu_percent_per_instance": figures.cpu_per_instance_pct,
+        "rss_mib_per_instance_mean": figures.rss_per_instance_mib,
+        "rss_mib_per_instance_max": figures.rss_max_per_instance_mib,
+    })
+}
+
 /// Build the machine-readable report (schema v1) from the measurements and
 /// the gate evaluation. Pure — no printing, no environment access. The
 /// schema stays v1: the subscriber-overhead block is ADDITIVE (the AD-14
-/// convention — additive fields keep the version).
+/// convention — additive fields keep the version). `orphan_bound_ms` is the
+/// bound the heartbeat fixture was ACTUALLY built with (the default bound on
+/// no-flag runs — byte-equivalent — the raised serve bound on `--serve-shape`
+/// runs).
 #[allow(clippy::too_many_arguments)]
 fn build_report(
     config: &HarnessConfig,
@@ -2145,34 +3537,9 @@ fn build_report(
     tolerance: f64,
     gates: &GateReport,
     subscriber_overhead: &SubscriberOverhead,
+    orphan_bound_ms: u64,
 ) -> serde_json::Value {
-    let mut per_kind = serde_json::Map::new();
-    for stats in reads {
-        per_kind.insert(
-            stats.name.to_string(),
-            serde_json::json!({
-                "p50_ms": stats.p50, "p95_ms": stats.p95, "p99_ms": stats.p99,
-                "max_ms": stats.max, "samples": stats.samples,
-            }),
-        );
-    }
-    let verdicts: Vec<serde_json::Value> = gates
-        .verdicts
-        .iter()
-        .map(|v| {
-            serde_json::json!({
-                "name": v.name,
-                "hard": v.hard,
-                "bound": v.bound.as_str(),
-                "measured": v.measured,
-                "budget": v.budget,
-                "effective_budget": v.effective_budget,
-                "tolerance": v.tolerance,
-                "strict_margin": v.strict_margin,
-                "status": if v.passed { "pass" } else { "fail" },
-            })
-        })
-        .collect();
+    let verdicts: Vec<serde_json::Value> = gates.verdicts.iter().map(verdict_json).collect();
     serde_json::json!({
         "schema_version": REPORT_SCHEMA_VERSION,
         "story": "7-5",
@@ -2191,7 +3558,7 @@ fn build_report(
             "running_instances": running_count,
             "running_instances_sampled_at_measurement": true,
             "idle_behavior": format!("fake_agent --heartbeat-ms {HEARTBEAT_MS} (heartbeat only; no usage emission)"),
-            "orphan_bound_ms": AGENT_LINGER_MS,
+            "orphan_bound_ms": orphan_bound_ms,
             "state_root": "hermetic temp dir (removed at teardown)",
         },
         "methodology": {
@@ -2215,7 +3582,7 @@ fn build_report(
             ],
             "window_coverage": "the window validates heartbeat-frequency supervision work (reaper cadence + per-second log captures); longer-period supervision tasks (sweeps, retention) are NOT captured — lengthen locally via PERF_BUDGETS_WINDOW_MS (clamped to [10s, 1h])",
         },
-        "read_latency_ms": per_kind,
+        "read_latency_ms": read_kind_json(reads),
         "read_p99_overall_ms": overall_p99_ms,
         "subscriber_overhead": {
             "policy": "GATED at the story-10-3 ratified subscriber-active delta budgets (strict locally; the shared-runner tolerance on CI, one window even on CI — the deltas gate, the absolutes are context); the gated zero-subscriber figures above were measured BEFORE the subscriber attached, by design",
@@ -2234,19 +3601,7 @@ fn build_report(
             "attempts": read_attempts,
             "retry_applied": read_attempts > 1,
         },
-        "steady_state": {
-            "windows": steady.windows.iter().map(|w| serde_json::json!({
-                "cpu_percent_aggregate_mean": w.cpu_pct_aggregate_mean,
-                "rss_mib_mean": w.rss_bytes_mean / (1024.0 * 1024.0),
-                "rss_mib_max": w.rss_bytes_max as f64 / (1024.0 * 1024.0),
-                "samples": w.samples,
-            })).collect::<Vec<_>>(),
-            "cpu_percent_aggregate_median": steady.median_cpu_aggregate_pct,
-            "rss_mib_aggregate_median": steady.median_rss_bytes_mean / (1024.0 * 1024.0),
-            "cpu_percent_per_instance": figures.cpu_per_instance_pct,
-            "rss_mib_per_instance_mean": figures.rss_per_instance_mib,
-            "rss_mib_per_instance_max": figures.rss_max_per_instance_mib,
-        },
+        "steady_state": steady_json(steady, figures),
         "budgets": {
             "read_p99_ms": BUDGET_READ_P99_MS,
             "cpu_per_instance_pct": BUDGET_CPU_PER_INSTANCE_PCT,
@@ -2315,6 +3670,98 @@ fn print_report(report: &serde_json::Value, gates: &GateReport) {
             sub["read_p99_delta_vs_unsubscribed_ms"],
             BUDGET_SUBSCRIBER_READ_P99_DELTA_MS,
         );
+    }
+    // The serve-shape section (story 17-1) — present only on --serve-shape
+    // runs (the default invocation prints nothing here, byte-equivalent).
+    if report.get("serve_shape").is_some() {
+        let serve = &report["serve_shape"];
+        // The block's own absent-token convention (review round 3): a
+        // missing figure prints NaN (floats) or `—` (counts) — never a
+        // fabricated zero that would read as a measurement.
+        let f64_cell = |value: &serde_json::Value| -> String {
+            value
+                .as_f64()
+                .map_or_else(|| "NaN".to_string(), |v| format!("{v:.3}"))
+        };
+        let u64_cell = |value: &serde_json::Value| -> String {
+            value
+                .as_u64()
+                .map_or_else(|| "—".to_string(), |v| v.to_string())
+        };
+        let running = serve["fixture"]["running_instances"]
+            .as_u64()
+            .map_or_else(|| "—".to_string(), |v| v.to_string());
+        let effective = serve["fixture"]["effective_running_instances"]
+            .as_u64()
+            .map_or_else(|| "—".to_string(), |v| v.to_string());
+        println!(
+            "PERF BUDGETS — serve shape (story 17-1): {SERVE_READER_TASKS} reader task(s) on a \
+             {SERVE_DRIVER_WORKERS}-thread driver runtime + 1 subscribed follower + one \
+             pathological bounded stop (window {SERVE_STOP_WINDOW:?}, fired at \
+             {SERVE_STOP_DELAY:?}), over a {SERVE_WINDOW:?} window on {running} Running \
+             instance(s) (normalizing over {effective} effective after the stop)."
+        );
+        println!(
+            "  serve reads p99 (overall worst kind): {} ms (gate < {BUDGET_READ_P99_MS} ms)",
+            f64_cell(&serve["read_p99_overall_ms"]),
+        );
+        if let Some(kinds) = serve["read_latency_ms"].as_object() {
+            for (name, stats) in kinds {
+                println!(
+                    "  {name:<22} p50={:>9.3} ms  p95={:>9.3} ms  p99={:>9.3} ms",
+                    stats["p50_ms"], stats["p95_ms"], stats["p99_ms"],
+                );
+            }
+        }
+        println!(
+            "  serve steady: CPU {:.4}%/instance (gate <= {BUDGET_CPU_PER_INSTANCE_PCT}); RSS mean \
+             {:.2} MiB/instance (gate <= {BUDGET_RSS_PER_INSTANCE_MIB})",
+            serve["steady_state"]["cpu_percent_per_instance"]
+                .as_f64()
+                .unwrap_or(f64::NAN),
+            serve["steady_state"]["rss_mib_per_instance_mean"]
+                .as_f64()
+                .unwrap_or(f64::NAN),
+        );
+        println!(
+            "  serve load: {} iteration(s)/reader delivered (nominal {}), {} reader-retry \
+             attempt(s), {} read(s) started inside the stop's window",
+            serve["driver"]["iterations_delivered_per_reader"]
+                .as_array()
+                .map(|values| values.iter().map(u64_cell).collect::<Vec<_>>().join("/"))
+                .unwrap_or_else(|| "—".to_string()),
+            u64_cell(&serve["driver"]["read_iterations_per_reader"]),
+            u64_cell(&serve["driver"]["reader_retries"]),
+            u64_cell(&serve["contention"]["reads_started_during_stop"]),
+        );
+        println!(
+            "  serve bounded stop: {} ms elapsed, final state {}, last cause {}",
+            serve["bounded_stop"]["elapsed_ms"]
+                .as_f64()
+                .map_or_else(|| "—".to_string(), |v| format!("{v:.1}")),
+            serve["bounded_stop"]["final_state"].as_str().unwrap_or("—"),
+            serve["bounded_stop"]["last_transition_cause"]
+                .as_str()
+                .unwrap_or("—"),
+        );
+        println!(
+            "  serve follower (bus liveness under load, not load evidence): {} event(s) \
+             counted, {} Lagged-recovered — {}",
+            u64_cell(&serve["subscriber"]["events_counted"]),
+            u64_cell(&serve["subscriber"]["lagged_recovered"]),
+            serve["subscriber"]["lagged_note"].as_str().unwrap_or("—"),
+        );
+        if let Some(verdicts) = serve["gates"].as_array() {
+            for verdict in verdicts {
+                println!(
+                    "  gate {:<34} measured={:>10.4}  effective_budget={:>10.4}  {}",
+                    verdict["name"].as_str().unwrap_or("?"),
+                    verdict["measured"].as_f64().unwrap_or(f64::NAN),
+                    verdict["effective_budget"].as_f64().unwrap_or(f64::NAN),
+                    verdict["status"].as_str().unwrap_or("?").to_uppercase(),
+                );
+            }
+        }
     }
     let tolerance_applied = report["ci_tolerance"]["applied"].as_bool().unwrap_or(false);
     if tolerance_applied {
@@ -2713,7 +4160,433 @@ mod tests {
         // the idlers would self-exit mid-window, so the check must reject.
         let err = check_liveness_schedule(Duration::from_secs(2), 1 + 1, Duration::from_secs(30))
             .expect_err("a schedule past the orphan bound must be rejected");
-        assert!(err.contains("AGENT_LINGER_MS"), "names the bound: {err}");
+        assert!(err.contains("linger=60000"), "names the bound: {err}");
+    }
+
+    #[test]
+    fn the_serve_schedule_fits_the_raised_orphan_bound() {
+        // CI: settle 2 s + (3 gated + 1 addendum)×12 s windows + 3×1 s gaps
+        // + the 12 s serve window + the 2 s stop bound = 72 s, + the 5 s
+        // margin = 77 s, strictly inside the raised 120 s serve bound.
+        check_liveness_schedule_serve(
+            Duration::from_secs(2),
+            CI_STEADY_WINDOWS + 1,
+            Duration::from_secs(12),
+            SERVE_WINDOW,
+            SERVE_STOP_WINDOW,
+        )
+        .expect("the serve CI schedule must fit the raised orphan bound");
+        // Local: one gated window + the addendum window (46 s incl. margin).
+        check_liveness_schedule_serve(
+            Duration::from_secs(2),
+            1 + 1,
+            Duration::from_secs(12),
+            SERVE_WINDOW,
+            SERVE_STOP_WINDOW,
+        )
+        .expect("the serve local schedule must fit the raised orphan bound");
+    }
+
+    #[test]
+    fn a_serve_schedule_that_outgrows_the_raised_bound_is_rejected() {
+        // The same rejection math as the default arm, at the raised bound:
+        // 2 s + 4×12 s + 3×1 s + a 60 s serve window + 2 s + 5 s margin =
+        // exactly 120 s — and the bound must STRICTLY exceed the schedule.
+        let err = check_liveness_schedule_serve(
+            Duration::from_secs(2),
+            CI_STEADY_WINDOWS + 1,
+            Duration::from_secs(12),
+            Duration::from_secs(60),
+            SERVE_STOP_WINDOW,
+        )
+        .expect_err("a serve schedule past the raised bound must be rejected");
+        assert!(err.contains("linger=120000"), "names the bound: {err}");
+    }
+
+    #[test]
+    fn the_serve_scenario_consts_are_pinned() {
+        // Story 17-1's fixture premise, pinned like the NFR-4 premise: a
+        // change to the measured shape must consciously edit these
+        // assertions (and docs/testing.md), never silently re-tune a gate.
+        assert_eq!(SERVE_WINDOW, Duration::from_secs(12));
+        assert_eq!(SERVE_STOP_WINDOW, Duration::from_secs(2));
+        assert_eq!(SERVE_STOP_DELAY, Duration::from_secs(3));
+        assert_eq!(SERVE_AGENT_LINGER_MS, 120_000);
+        assert!(
+            SERVE_AGENT_LINGER_MS > AGENT_LINGER_MS,
+            "the serve bound RAISES the default orphan bound"
+        );
+        assert_eq!(SERVE_READER_TASKS, 4);
+        assert_eq!(SERVE_DRIVER_WORKERS, 4);
+        // The load model is DERIVED from the default phase's read-demand
+        // premise, not a free knob: 200 iterations over the 12 s window =
+        // 60 ms between a reader's iterations.
+        assert_eq!(
+            serve_reader_pace(Duration::from_secs(12), 200),
+            Duration::from_millis(60)
+        );
+        // Degenerate demand still yields a real (max) pace — never a divide
+        // by zero.
+        assert_eq!(
+            serve_reader_pace(Duration::from_secs(12), 0),
+            Duration::from_secs(12)
+        );
+        assert_eq!(SERVE_PATHOLOGICAL_NAME, "serve-pathological");
+        assert_eq!(SERVE_PATHOLOGICAL_KIND, "servepathological");
+        // The per-read retry shape (review round 3): bounded, counted, and
+        // only REPEATED consecutive failures abort — pinned so a silent
+        // re-tune cannot move the reader's failure posture.
+        assert_eq!(SERVE_READ_RETRIES, 2);
+        assert_eq!(SERVE_READ_RETRY_BACKOFF, Duration::from_millis(100));
+        assert_eq!(SERVE_MAX_CONSECUTIVE_FAILURES, 3);
+        assert_ne!(
+            SERVE_PATHOLOGICAL_KIND, MANIFEST_KIND,
+            "the pathological fixture is a distinct flow-local identity"
+        );
+    }
+
+    #[test]
+    fn merge_kind_samples_concatenates_every_readers_vector() {
+        // Pure concatenation (the sorted percentile math makes order across
+        // readers irrelevant); an empty part contributes nothing; no parts
+        // at all is empty — a lost vector is a length mismatch, not a
+        // silently short summary.
+        assert_eq!(
+            merge_kind_samples(&[vec![1.0, 2.0], vec![], vec![3.0]]),
+            vec![1.0, 2.0, 3.0]
+        );
+        assert!(merge_kind_samples(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_serve_contention_proof_names_a_vacuous_window() {
+        // Review round 3: zero reads started inside the stop's window means
+        // idle supervision was measured, not the lock-contention term —
+        // the named error fires (main maps it to exit 2 BEFORE any gate
+        // verdict), and any positive count passes.
+        let err = serve_contention_exercised(0).expect_err("zero overlaps must fail");
+        assert!(err.contains("contention NOT exercised"), "{err}");
+        assert!(err.contains("never overlapped any in-flight read"), "{err}");
+        serve_contention_exercised(1).expect("one overlapping read proves contention");
+        serve_contention_exercised(1_000).expect("many do too");
+    }
+
+    #[test]
+    fn the_serve_sampler_window_is_clamped_to_the_load_window() {
+        // Review round 3: a raised PERF_BUDGETS_WINDOW_MS must not sample
+        // past the 12 s load into idle tail (dilution toward passing); the
+        // clamp keeps the sampler at the load window, and a smaller
+        // configured window is left alone (the env's own 10 s floor).
+        assert_eq!(
+            serve_sampling_window(Duration::from_secs(12)),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            serve_sampling_window(Duration::from_secs(3_600)),
+            SERVE_WINDOW,
+            "a raised window clamps DOWN to the load window"
+        );
+        assert_eq!(
+            serve_sampling_window(Duration::from_secs(10)),
+            Duration::from_secs(10),
+            "a smaller window is not raised"
+        );
+    }
+
+    #[test]
+    fn the_serve_running_count_schedule_is_pinned_and_conservative() {
+        // Review round 3: the full count until the bounded stop COMPLETES
+        // (3 s delay + 2 s window), one fewer after — and the normalization
+        // divisor is the MINIMUM over the window (the post-stop count), the
+        // conservative bound: dividing by the pre-window count would
+        // understate per-instance cost after the stop (lenient — wrong for
+        // a gate).
+        assert_eq!(serve_running_at(11, Duration::ZERO), 11);
+        assert_eq!(
+            serve_running_at(
+                11,
+                SERVE_STOP_DELAY + SERVE_STOP_WINDOW - Duration::from_millis(1)
+            ),
+            11
+        );
+        assert_eq!(
+            serve_running_at(11, SERVE_STOP_DELAY + SERVE_STOP_WINDOW),
+            10
+        );
+        assert_eq!(serve_running_at(11, SERVE_WINDOW), 10);
+        assert_eq!(serve_effective_running_instances(11), 10);
+        // Saturating: a degenerate pre-stop count never underflows.
+        assert_eq!(serve_effective_running_instances(0), 0);
+    }
+
+    #[test]
+    fn serve_gates_bind_only_on_the_ratified_gate_platforms() {
+        // Review round 3, the standing gate-platform rule: Linux and macOS
+        // are ratified gate platforms (CI-tolerated and strict-local
+        // respectively); Windows is measured-and-reported ONLY (sysinfo's
+        // `memory()` is the working-set-size analog there) — its serve
+        // verdicts are report-only and never gate the run.
+        assert!(serve_gates_bind("linux"));
+        assert!(serve_gates_bind("macos"));
+        assert!(!serve_gates_bind("windows"), "windows never gates");
+        assert!(
+            !serve_gates_bind("freebsd"),
+            "unratified platforms never gate"
+        );
+    }
+
+    #[test]
+    fn the_serve_gated_set_is_mode_aware_and_never_leaks_into_the_default() {
+        // Review round 3: (a) the DEFAULT gated set never carries a serve
+        // name — a default run's baseline contract is unchanged; (b) a
+        // serve run's coverage check expects the default set PLUS the serve
+        // metrics — a baseline missing them is the existing LOUD named
+        // exit-2 error shape (`missing`, non-empty), never a silent pass;
+        // (c) against a SERVE-CARRYING baseline, the serve gates ride the
+        // ratchet: within-window drift passes, drift past the x1.15 window
+        // is a Beyond verdict that fails a gated (CI) run.
+        for name in SERVE_GATED_METRICS.iter() {
+            assert!(
+                !GATED_METRICS.contains(name),
+                "{name} leaked into the default gated set"
+            );
+        }
+        // The mode-aware expected set, exactly as main builds it.
+        let expected_serve: Vec<&str> = GATED_METRICS
+            .iter()
+            .chain(SERVE_GATED_METRICS.iter())
+            .copied()
+            .collect();
+        assert_eq!(expected_serve.len(), 10);
+        // (b) a default-shaped baseline lacks all three serve metrics.
+        let figures = parse_baseline(&baseline_json_with(&SEVEN), "b.json").unwrap();
+        let (missing, extra) = baseline_coverage_gaps(&figures, &expected_serve);
+        assert!(extra.is_empty());
+        assert_eq!(
+            missing,
+            SERVE_GATED_METRICS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "a serve run's coverage check hard-fails a serve-less baseline"
+        );
+        // (c) a serve-carrying baseline: all ten gates trend.
+        let serve_measured = [5.0, 1.5, 0.8];
+        let mut baseline =
+            serde_json::from_str::<serde_json::Value>(&baseline_json_with(&SEVEN)).unwrap();
+        for (name, measured) in SERVE_GATED_METRICS.iter().zip(serve_measured) {
+            baseline["gates"]
+                .as_array_mut()
+                .expect("gates array")
+                .push(serde_json::json!({ "name": name, "measured": measured }));
+        }
+        let figures = parse_baseline(&baseline.to_string(), "serve-b.json").unwrap();
+        let mut trend_gates = evaluate_gates(5.0, &healthy_steady(), &quiet_subscriber(), 1.0);
+        // The default seven's measureds ARE the baseline's (the same trick
+        // trend_for uses — only the serve figures drift, within window).
+        for (verdict, value) in trend_gates.verdicts.iter_mut().zip(SEVEN) {
+            verdict.measured = value;
+        }
+        let mut serve_gates = evaluate_serve_gates(5.7, &healthy_steady(), 1.0);
+        serve_gates.verdicts[1].measured = 1.7; // CPU: 1.5 -> 1.7 (x1.133)
+        serve_gates.verdicts[2].measured = 0.9; // RSS: 0.8 -> 0.9 (x1.125)
+        trend_gates
+            .verdicts
+            .extend(serve_gates.verdicts.iter().cloned());
+        let trend = evaluate_trend(&trend_gates, &figures, "serve-b.json", true).unwrap();
+        assert_eq!(trend.entries.len(), 10);
+        for entry in &trend.entries[7..] {
+            assert_eq!(entry.verdict, RatchetVerdict::Within, "{entry:?}");
+        }
+        assert!(trend.passed, "{trend:?}");
+        assert!(
+            !trend.fails_run(),
+            "a within-window serve drift passes a gated run"
+        );
+        // A serve figure past the x1.15 window (5.0 -> 6.0 > 5.75) is
+        // Beyond and fails the gated ratchet — the serve teeth are real.
+        let mut trend_gates = evaluate_gates(5.0, &healthy_steady(), &quiet_subscriber(), 1.0);
+        let drifted = evaluate_serve_gates(6.0, &healthy_steady(), 1.0);
+        trend_gates
+            .verdicts
+            .extend(drifted.verdicts.iter().cloned());
+        let trend = evaluate_trend(&trend_gates, &figures, "serve-b.json", true).unwrap();
+        assert_eq!(trend.entries[7].verdict, RatchetVerdict::Beyond);
+        assert!(trend.fails_run(), "a drifted serve metric reds a gated run");
+    }
+
+    #[test]
+    fn a_serve_write_baseline_merges_the_serve_gates_into_the_gates_array() {
+        // Review round 3: the loader (`load_baseline`) reads exactly the
+        // top-level gates array — so a serve `--write-baseline` must merge
+        // the serve verdicts into it, or the seeded serve-carrying baseline
+        // the docs describe could never load. A default report (no
+        // serve_shape block) is byte-shaped as before.
+        let mut report = serde_json::json!({ "status": "pass", "schema_version": REPORT_SCHEMA_VERSION,
+            "environment": { "git_sha": "deadbee", "os": "linux" },
+            "gates": [
+            { "name": "read_p99_lt_1s", "measured": 5.0 }
+        ]});
+        report["serve_shape"] = serde_json::json!({ "gates": [
+            { "name": "serve_read_p99_lt_1s", "measured": 5.7 },
+            { "name": "serve_cpu_per_instance_le_2pct", "measured": 1.7 },
+            { "name": "serve_rss_per_instance_le_50mib", "measured": 0.9 }
+        ]});
+        let clean = baseline_report_json(&report, baseline_provenance(true, false, "a"));
+        let gates = clean["gates"].as_array().expect("gates array");
+        assert_eq!(gates.len(), 4, "the serve gates merged in");
+        assert_eq!(
+            gates[3]["name"],
+            serde_json::json!("serve_rss_per_instance_le_50mib")
+        );
+        // And the merged file PARSES into figures the loader resolves — the
+        // serve names load (this is what a seeded serve-carrying baseline is).
+        let figures = parse_baseline(&clean.to_string(), "seeded.json").unwrap();
+        for name in SERVE_GATED_METRICS {
+            assert!(figures.lookup(name).is_some(), "{name} must load");
+        }
+        // A default-shaped report gains nothing (no serve block, no merge).
+        let plain = serde_json::json!({ "status": "pass", "gates": [
+            { "name": "read_p99_lt_1s", "measured": 5.0 }
+        ]});
+        let clean = baseline_report_json(&plain, baseline_provenance(true, false, "a"));
+        assert_eq!(clean["gates"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn pathological_fixture_branch_matches_the_running_os_and_bound() {
+        // Review round 3: the runtime OS branch (no #[cfg] — the conformance
+        // crate forbids it; every platform pins its OWN arm here) and the
+        // WRITTEN adapter.toml carries the argv shape that arm promises —
+        // including the Unix self-exit bound DERIVED from the serve orphan
+        // bound (the fixture must never self-exit inside the schedule it is
+        // validated against).
+        let (fixture, note) = pathological_fixture();
+        let dir = tempfile::TempDir::new().expect("temp manifest dir");
+        let manifest_dir = fixture.write(dir.path());
+        let written =
+            std::fs::read_to_string(manifest_dir.join("adapter.toml")).expect("read adapter.toml");
+        if std::env::consts::OS == "windows" {
+            assert!(note.starts_with("windows:"), "{note}");
+            assert!(note.contains("TerminateJobObject"), "{note}");
+            assert!(
+                written.contains(&format!("--linger-ms={SERVE_AGENT_LINGER_MS}")),
+                "the Windows arm's self-exit bound is the serve bound: {written}"
+            );
+        } else {
+            assert!(note.starts_with("unix:"), "{note}");
+            assert!(note.contains("SIGTERM"), "{note}");
+            assert!(
+                written.contains(&format!(
+                    "trap '' TERM; sleep {}",
+                    SERVE_AGENT_LINGER_MS / 1000
+                )),
+                "the Unix arm's self-exit bound is the serve bound (derived, not the \
+                 old fixed 60): {written}"
+            );
+            assert!(
+                written.contains("exec = \"sh\""),
+                "the Unix arm execs sh (the only Unix shape whose stop is genuinely \
+                 slow): {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_serve_gate_names_and_order_are_pinned() {
+        // Story 17-1: exactly THREE serve gates, their OWN names, bound only
+        // on serve runs — the default seven's meaning never moves.
+        let gates = evaluate_serve_gates(5.0, &healthy_steady(), 1.0);
+        assert!(gates.passed, "healthy figures must pass: {gates:?}");
+        let names: Vec<_> = gates.verdicts.iter().map(|v| v.name).collect();
+        assert_eq!(
+            names,
+            [
+                "serve_read_p99_lt_1s",
+                "serve_cpu_per_instance_le_2pct",
+                "serve_rss_per_instance_le_50mib",
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_read_p99_gate_is_strict_at_the_budget_boundary() {
+        // p99 EXACTLY at 1000 ms fails the strict-< gate; just under passes.
+        let at = evaluate_serve_gates(BUDGET_READ_P99_MS, &healthy_steady(), 1.0);
+        assert!(!at.passed);
+        assert!(
+            !at.verdicts[0].passed,
+            "strict <: the boundary itself fails"
+        );
+        let under = evaluate_serve_gates(BUDGET_READ_P99_MS - 0.001, &healthy_steady(), 1.0);
+        assert!(under.verdicts[0].passed, "{:?}", under.verdicts[0]);
+    }
+
+    #[test]
+    fn serve_cpu_gate_takes_the_ci_tolerance_like_the_default() {
+        // 2.9 %/instance (aggregate 29 over 10 running): over budget
+        // strictly (x1.0), inside at the shared-runner tolerance (x1.5 -> 3.0).
+        let cpu = SteadyFigures::new(29.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 10);
+        let local = evaluate_serve_gates(5.0, &cpu, 1.0);
+        assert!(!local.passed, "2.9 > 2.0 strictly: {local:?}");
+        assert!(!local.verdicts[1].passed);
+        let ci = evaluate_serve_gates(5.0, &cpu, CI_CPU_TOLERANCE_FACTOR);
+        assert!(ci.passed, "2.9 <= 3.0 with the tolerance: {ci:?}");
+    }
+
+    #[test]
+    fn serve_rss_gate_and_fail_closed_running_count() {
+        // 60 MiB/instance (600 MiB aggregate over 10 running) > 50: fails
+        // the RSS gate with reads and CPU healthy.
+        let rss = SteadyFigures::new(10.0, 600.0 * 1024.0 * 1024.0, 600 * 1024 * 1024, 10);
+        let gates = evaluate_serve_gates(5.0, &rss, 1.0);
+        assert!(!gates.passed, "60 MiB/instance > 50: {gates:?}");
+        assert!(!gates.verdicts[2].passed);
+        // A zero Running count fails closed exactly like the default steady
+        // gates (per_instance's +inf), never divides away to a fake 0.
+        let zero = SteadyFigures::new(10.0, 100.0 * 1024.0 * 1024.0, 150_000_000, 0);
+        let gates = evaluate_serve_gates(5.0, &zero, 1.0);
+        assert!(!gates.passed, "zero running fails closed: {gates:?}");
+    }
+
+    #[test]
+    fn serve_shape_flag_parses_as_a_bare_boolean() {
+        let argv: Vec<String> = ["--serve-shape"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_cli_args(&argv).unwrap().serve_shape);
+        // Alongside the value flags, in both value forms:
+        let argv: Vec<String> = [
+            "--baseline",
+            "b.json",
+            "--serve-shape",
+            "--write-baseline=w.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_cli_args(&argv).unwrap();
+        assert!(parsed.serve_shape);
+        assert_eq!(parsed.baseline.as_deref(), Some("b.json"));
+        assert_eq!(parsed.write_baseline.as_deref(), Some("w.json"));
+    }
+
+    #[test]
+    fn serve_shape_value_and_duplicate_forms_are_named_errors() {
+        // The `=`-carrying form is invalid usage OUTRIGHT — a named error
+        // + exit 2 at main, never a silently-ignored value.
+        let err = bad_args(&["--serve-shape=bogus"]);
+        assert!(err.contains("--serve-shape takes no value"), "{err}");
+        assert!(err.contains("bogus"), "names the rejected value: {err}");
+        let err = bad_args(&["--serve-shape", "--serve-shape"]);
+        assert!(err.contains("more than once"), "{err}");
+        // The unknown-argument error names --serve-shape as supported.
+        let err = bad_args(&["--nonsense"]);
+        assert!(err.contains("--serve-shape"), "{err}");
+        // The usage text carries the flag.
+        assert!(
+            usage_text().contains("--serve-shape"),
+            "{usage}",
+            usage = usage_text()
+        );
     }
 
     #[test]
@@ -2912,6 +4785,7 @@ mod tests {
             CliArgs {
                 baseline: Some("b.json".into()),
                 write_baseline: Some("w.json".into()),
+                serve_shape: false,
                 help: false,
             }
         );
@@ -2924,6 +4798,7 @@ mod tests {
             CliArgs {
                 baseline: Some("b.json".into()),
                 write_baseline: Some("w.json".into()),
+                serve_shape: false,
                 help: false,
             }
         );
@@ -2938,6 +4813,7 @@ mod tests {
             CliArgs {
                 baseline: Some("only.json".into()),
                 write_baseline: None,
+                serve_shape: false,
                 help: false,
             }
         );
@@ -3429,17 +5305,35 @@ mod tests {
     fn write_baseline_refuses_red_runs() {
         // The pure refusal decision (main wires it to a loud note + exit 2
         // and never reaches the write): every red combination refuses, and
-        // each reason names WHICH gate failed and the remedy.
-        let gates_red = baseline_write_refusal(false, false).expect("a red absolute run refuses");
+        // each reason names WHICH gate failed and the remedy. Review round
+        // 3: the serve token is its OWN arm — deleting it cannot pass the
+        // battery.
+        let gates_red =
+            baseline_write_refusal(false, false, false).expect("a red absolute run refuses");
         assert!(gates_red.contains("absolute budgets FAILED"), "{gates_red}");
-        let ratchet_red = baseline_write_refusal(true, true).expect("a red ratchet refuses");
+        let serve_red = baseline_write_refusal(true, true, false).expect("a red serve run refuses");
+        assert!(serve_red.contains("SERVE budgets FAILED"), "{serve_red}");
+        let ratchet_red = baseline_write_refusal(true, false, true).expect("a red ratchet refuses");
         assert!(ratchet_red.contains("ratchet FAILED"), "{ratchet_red}");
         assert!(ratchet_red.contains("docs/testing.md"), "{ratchet_red}");
-        // Both red at once names the absolute-budget failure first.
-        let both = baseline_write_refusal(false, true).expect("red-both refuses");
+        // Both absolute families red at once names the default-budget
+        // failure first; red-both-with-ratchet never reaches the ratchet arm.
+        let both = baseline_write_refusal(false, true, true).expect("red-both refuses");
         assert!(both.contains("absolute budgets FAILED"), "{both}");
-        // A green run is the only write path.
-        assert_eq!(baseline_write_refusal(true, false), None);
+        // A fully green run is the only write path.
+        assert_eq!(baseline_write_refusal(true, false, false), None);
+    }
+
+    #[test]
+    fn run_exit_code_folds_all_three_red_sources() {
+        // Review round 3, pinned so each token has a test that fails if it
+        // is deleted: only a fully green run exits 0; ANY one of the three
+        // red sources (absolute gates, ratchet, serve gates) reds the run.
+        assert_eq!(run_exit_code(true, false, false), 0);
+        assert_eq!(run_exit_code(false, false, false), 1, "absolute gates red");
+        assert_eq!(run_exit_code(true, true, false), 1, "ratchet red");
+        assert_eq!(run_exit_code(true, false, true), 1, "serve gates red");
+        assert_eq!(run_exit_code(false, true, true), 1, "all red");
     }
 
     #[test]
@@ -3639,12 +5533,17 @@ mod tests {
             1.0,
             &green,
             &quiet_subscriber(),
+            AGENT_LINGER_MS,
         );
         assert!(report.get("trend").is_none(), "no --baseline, no trend");
         assert_eq!(report["status"], serde_json::json!("pass"));
         assert!(
             report.get("provenance").is_none(),
             "provenance is writer-only"
+        );
+        assert!(
+            report.get("serve_shape").is_none(),
+            "story 17-1: the serve block exists only on --serve-shape runs"
         );
         // The same report with a failed gate says fail — the status is the
         // gates' own derivation, nothing else.
@@ -3660,9 +5559,162 @@ mod tests {
             1.0,
             &red,
             &quiet_subscriber(),
+            AGENT_LINGER_MS,
         );
         assert!(report.get("trend").is_none());
         assert_eq!(report["status"], serde_json::json!("fail"));
+    }
+
+    #[test]
+    fn serve_shape_json_carries_the_spec_fields() {
+        // The serve block's pinned shape (story 17-1): the decision-rule
+        // provenance, the measured serve figures, the bounded-stop record,
+        // the surfaced subscriber counts, and the serve gates' OWN names —
+        // plus the red arm flipping the block status.
+        let outcome = ServeShapeOutcome {
+            reads: fast_reads(),
+            overall_p99_ms: 5.0,
+            steady: SteadyMeasurements {
+                windows: vec![WindowSample {
+                    cpu_pct_aggregate_mean: 10.0,
+                    rss_bytes_mean: 100.0 * 1024.0 * 1024.0,
+                    rss_bytes_max: 150_000_000,
+                    samples: 11,
+                }],
+                median_cpu_aggregate_pct: 10.0,
+                median_rss_bytes_mean: 100.0 * 1024.0 * 1024.0,
+                rss_bytes_max: 150_000_000,
+                first_sample_skipped: true,
+            },
+            figures: healthy_steady(),
+            running_count: FLEET_SIZE + 1,
+            effective_running_instances: FLEET_SIZE,
+            load: ServeLoad {
+                fleet: vec![vec![1.0]],
+                instance_status: vec![vec![1.0]],
+                effective_config: vec![vec![1.0]],
+                usage_via_fleet: vec![vec![1.0]],
+                follower_events: 3,
+                follower_lagged: 0,
+                stop_elapsed_ms: 2010.0,
+                pathological_final_state: "stopped".to_string(),
+                pathological_stop_cause: "{\"kind\":\"stop-forced\"}".to_string(),
+                reader_iterations: vec![198, 197, 198, 196],
+                reads_started_during_stop: 128,
+                reader_retries: 2,
+            },
+            fixture_note: "unix: test note",
+            pace: Duration::from_millis(60),
+            read_iterations: 200,
+            sampling_window_ms: 12_000,
+        };
+        let gates = evaluate_serve_gates(5.0, &healthy_steady(), 1.0);
+        let json = serve_shape_json(&outcome, &gates, 1.0, true);
+        assert_eq!(json["story"], serde_json::json!("17-1"));
+        assert_eq!(json["status"], serde_json::json!("pass"));
+        assert!(
+            json["decision_rule"].as_str().unwrap().contains("ai-63b"),
+            "the block carries the FIXED decision rule's pointer: {json}"
+        );
+        assert_eq!(
+            json["fixture"]["running_instances"],
+            serde_json::json!(FLEET_SIZE + 1)
+        );
+        assert_eq!(
+            json["fixture"]["orphan_bound_ms"],
+            serde_json::json!(SERVE_AGENT_LINGER_MS)
+        );
+        assert_eq!(
+            json["driver"]["reader_tasks"],
+            serde_json::json!(SERVE_READER_TASKS)
+        );
+        // Review round 3 disclosures: delivered iterations beside the
+        // nominal demand, the retry count, the contention proof's count,
+        // the effective (post-stop) normalization divisor, and the clamped
+        // sampling window.
+        assert_eq!(
+            json["driver"]["iterations_delivered_per_reader"],
+            serde_json::json!([198, 197, 198, 196])
+        );
+        assert_eq!(json["driver"]["reader_retries"], serde_json::json!(2));
+        assert_eq!(
+            json["driver"]["sampling_window_ms"],
+            serde_json::json!(12_000)
+        );
+        assert_eq!(
+            json["contention"]["reads_started_during_stop"],
+            serde_json::json!(128)
+        );
+        assert_eq!(
+            json["fixture"]["effective_running_instances"],
+            serde_json::json!(FLEET_SIZE)
+        );
+        // The load-model honesty (review round 3): the derivation names the
+        // per-reader EQUALITY and the ~4x AGGREGATE — never "the same
+        // demand" unqualified.
+        let derivation = json["driver"]["pace_derivation"].as_str().unwrap();
+        assert!(derivation.contains("EQUALS the"), "{derivation}");
+        assert!(derivation.contains("~4x"), "{derivation}");
+        // The follower's honesty: bus liveness under load, not load evidence.
+        let sub_shape = json["subscriber"]["shape"].as_str().unwrap();
+        assert!(sub_shape.contains("BUS LIVENESS"), "{sub_shape}");
+        // The binding flag rides each verdict (true on the gate platform).
+        assert_eq!(json["gates"][0]["hard"], serde_json::json!(true));
+        // Report-only elsewhere: hard flips to false, the block says so.
+        let json = serve_shape_json(&outcome, &gates, 1.0, false);
+        assert_eq!(json["gates"][0]["hard"], serde_json::json!(false));
+        assert_eq!(
+            json["gates_bind_on_this_platform"],
+            serde_json::json!(false)
+        );
+        let json = serve_shape_json(&outcome, &gates, 1.0, true);
+        assert_eq!(
+            json["bounded_stop"]["final_state"],
+            serde_json::json!("stopped")
+        );
+        assert_eq!(
+            json["bounded_stop"]["elapsed_ms"],
+            serde_json::json!(2010.0)
+        );
+        assert_eq!(json["subscriber"]["events_counted"], serde_json::json!(3));
+        assert_eq!(json["subscriber"]["lagged_recovered"], serde_json::json!(0));
+        assert_eq!(json["gates"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            json["gates"][0]["name"],
+            serde_json::json!("serve_read_p99_lt_1s")
+        );
+        // The red arm flips the block's own status (the REPORT's status is
+        // main's job — the pure builder only reflects its inputs).
+        let red = evaluate_serve_gates(1500.0, &healthy_steady(), 1.0);
+        let json = serve_shape_json(&outcome, &red, 1.0, true);
+        assert_eq!(json["status"], serde_json::json!("fail"));
+        // A Lagged recovery is surfaced verbatim in the block (AI-18).
+        let lagged_outcome = ServeShapeOutcome {
+            load: ServeLoad {
+                fleet: vec![vec![1.0]],
+                instance_status: vec![vec![1.0]],
+                effective_config: vec![vec![1.0]],
+                usage_via_fleet: vec![vec![1.0]],
+                follower_events: 30,
+                follower_lagged: 7,
+                stop_elapsed_ms: 2010.0,
+                pathological_final_state: "stopped".to_string(),
+                pathological_stop_cause: "{\"kind\":\"stop-forced\"}".to_string(),
+                reader_iterations: vec![198, 197, 198, 196],
+                reads_started_during_stop: 128,
+                reader_retries: 2,
+            },
+            ..outcome
+        };
+        let json = serve_shape_json(&lagged_outcome, &gates, 1.0, true);
+        assert_eq!(json["subscriber"]["lagged_recovered"], serde_json::json!(7));
+        assert!(
+            json["subscriber"]["lagged_note"]
+                .as_str()
+                .unwrap()
+                .contains("RECOVERED"),
+            "the Lagged note names the recovery: {json}"
+        );
     }
 
     #[test]
