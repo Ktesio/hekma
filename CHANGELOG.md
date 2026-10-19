@@ -4,6 +4,16 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — transition-append compensation (durable-state honesty).**
+> Announced ahead of the release that ships it:
+>
+> - When a lifecycle transition's durable event append fails AFTER the store commit (the store already settled the new state; `instance.log` could not record it), the engine now **compensates the row back to the prior state** — the registry never disagrees with the last durably-landed event — and the surfaced typed `Log` error **names the compensation**. If the compensating write fails too, the error **names both failures** and the row stays honestly at the new state (no retry loop, no fabricated event: a synthetic append would trust the medium that just failed). The success path is byte-identical — no new events, no ordering changes. Library surface: error detail text only; no new variants, no API change.
+
+> **Unreleased — between-commands raw-log backlog: bounded follow prime.**
+> Announced ahead of the release that ships it:
+>
+> - `logs --follow`'s raw fallback cursor no longer primes at the file's current end: it starts at the last N complete lines of `agent.log` (default 200, `HEKMA_LOGS_BACKLOG_LINES`), so output written between commands — while no engine session held a tailer — streams at follow start under the same once-per-session un-attributed qualifier. A gap larger than the window streams only its last N lines and the qualifier names the skipped-beyond count; a partial trailing line is never primed; a garbage env value falls back to the default with a stderr note naming it. The engine's live-capture guard keeps a fresh attributed capture byte-identical, and the one-shot `logs` is untouched. (Landed in #298; announced here per the release-notes discipline.)
+
 > **Unreleased — conformance kit hardening (the TCK's third-party surface).**
 > Announced ahead of the release that ships it:
 >

@@ -3383,15 +3383,17 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     //   `running` (the transition truly did not commit) and no signal may
     //   fire.
     // * Leg B (persist commits, append fails): replace instance.log with a
-    //   DIRECTORY so the transition's event append fails. The durable state
-    //   LEADS (persist-first): the ledger reads `paused`, and the process
-    //   keeps running — no signal was sent.
+    //   DIRECTORY so the transition's event append fails. Story 16-3: the
+    // committed `running → paused` is COMPENSATED back to `running` (the
+    // row never disagrees with the last durably-landed event), the error is
+    // the typed Log error naming the compensation — and the process keeps
+    // running: no signal was sent.
     // * Resume leg (persist-first for SIGCONT): with the process genuinely
     //   SUSPENDED (a real pause in between) and the append sabotaged again,
     //   resume fails at the append AFTER committing `paused → running` —
-    //   and the heartbeat must stay FROZEN: no SIGCONT was delivered. The
-    //   pre-AI-9 signal-first order would have woken the agent behind an
-    //   errored resume.
+    //   story 16-3 compensates the row back to `paused`, and the heartbeat
+    //   must stay FROZEN: no SIGCONT was delivered. The pre-AI-9 signal-first
+    //   order would have woken the agent behind an errored resume.
     //
     // Windows runtime skips (data-driven `OsId`, NO #[cfg] — the
     // tests/pause.rs idiom): Leg A's directory-rename injection is a
@@ -3463,16 +3465,22 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     std::fs::remove_file(&log_path).unwrap();
     std::fs::create_dir(&log_path).unwrap();
     let b_err = sup.pause(&registry, "pz").unwrap_err();
+    let EngineError::Log {
+        detail: b_detail, ..
+    } = &b_err
+    else {
+        panic!("the append failure must surface as a typed Log error, got {b_err:?}")
+    };
     assert!(
-        matches!(&b_err, EngineError::Log { .. }),
-        "the append failure must surface as a typed Log error, got {b_err:?}"
+        b_detail.contains("compensated back to"),
+        "16-3: the surfaced error must name the compensation, got: {b_detail}"
     );
-    // Persist-first: the durable state LEADS — the ledger reads `paused`
-    // even though the append (the event record) failed.
+    // Story 16-3: the committed-but-unlogged `paused` was compensated back
+    // to `running` — the ledger agrees with the last durably-landed event.
     assert_eq!(
         state_of(&registry, "pz"),
-        LifecycleState::Paused,
-        "persist-first: the committed transition must be visible in the ledger"
+        LifecycleState::Running,
+        "16-3: the compensated pause leaves the ledger at running"
     );
     std::thread::sleep(Duration::from_millis(400));
     let b_after = heartbeat_lines(&agent_log);
@@ -3482,12 +3490,9 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
         );
     std::fs::remove_dir(&log_path).unwrap();
 
-    // Realign: Leg B's persist committed `paused`, so a real resume (the
-    // remediation the AI-9 diagnostic names) brings the ledger back to
-    // `running` — the SIGCONT is a harmless no-op on the still-running
-    // process.
-    sup.resume(&registry, "pz").unwrap();
-    assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
+    // (16-3 removed the old realign resume: the compensation already
+    // restored `running`, so the ledger is aligned for the genuine
+    // suspension below.)
 
     // ---- The genuine suspension (so the resume leg proves SIGCONT). ----
     sup.pause(&registry, "pz").unwrap();
@@ -3511,14 +3516,23 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     std::fs::remove_file(&log_path).unwrap();
     std::fs::create_dir(&log_path).unwrap();
     let r_err = sup.resume(&registry, "pz").unwrap_err();
+    let EngineError::Log {
+        detail: r_detail, ..
+    } = &r_err
+    else {
+        panic!("the resume append failure must surface as a typed Log error, got {r_err:?}")
+    };
     assert!(
-        matches!(&r_err, EngineError::Log { .. }),
-        "the resume append failure must surface as a typed Log error, got {r_err:?}"
+        r_detail.contains("compensated back to"),
+        "16-3: the surfaced error must name the compensation, got: {r_detail}"
     );
+    // Story 16-3: the committed-but-unlogged `running` was compensated back
+    // to `paused` — the ledger agrees with the durable log (still at the
+    // last event: paused).
     assert_eq!(
         state_of(&registry, "pz"),
-        LifecycleState::Running,
-        "persist-first resume: the committed paused-to-running transition must be visible"
+        LifecycleState::Paused,
+        "16-3: the compensated resume leaves the ledger at paused"
     );
     std::thread::sleep(Duration::from_millis(300));
     // The frozen-heartbeat half is Unix-only (Windows has no real
@@ -3534,9 +3548,105 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     }
     std::fs::remove_dir(&log_path).unwrap();
 
+    // 16-3 recovery: the row was compensated back to `paused` while the
+    // process is genuinely suspended — the honest way down is a REAL
+    // resume (SIGCONT lands, row → running), then the normal teardown.
+    sup.resume(&registry, "pz").unwrap();
+    assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
+
     // Teardown: the process is SIGSTOPped (SIGTERM would only pend), so the
     // stop's forced escalation is the honest way down.
     sup.stop(&registry, "pz", Some(Duration::from_millis(600)))
+        .unwrap();
+}
+
+#[test]
+fn a_failed_transition_append_compensates_the_row_back_to_the_prior_state() {
+    // Story 16-3, arm 1 (append fails, compensation SUCCEEDS) — the
+    // committed-but-unlogged `running → paused` must not survive as a row
+    // the durable log cannot support. The observable end-state is the PRIOR
+    // state plus a typed Log error that NAMES the compensation (surfaced,
+    // not silent, AI-18) — `prior + an error`, never `new + silence`.
+    // Obstruction: the instance's transition log replaced by a DIRECTORY
+    // (append fails on every OS; the events_subscription VG1 idiom).
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("cz1", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
+    let name = InstanceName::new("cz1").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "cz1").unwrap();
+    assert_eq!(state_of(&registry, "cz1"), LifecycleState::Running);
+
+    let log_path = registry.instance_log_path(&name);
+    std::fs::remove_file(&log_path).unwrap();
+    std::fs::create_dir(&log_path).unwrap();
+
+    let err = sup.pause(&registry, "cz1").unwrap_err();
+    let EngineError::Log { detail, .. } = &err else {
+        panic!("expected a typed Log error from the failed append, got {err:?}")
+    };
+    assert!(
+        detail.contains("compensated back to"),
+        "16-3: the error must name the compensation, got: {detail}"
+    );
+    assert_eq!(
+        state_of(&registry, "cz1"),
+        LifecycleState::Running,
+        "16-3: the row was compensated back to the prior (running) state"
+    );
+
+    std::fs::remove_dir(&log_path).unwrap();
+    sup.stop(&registry, "cz1", Some(Duration::from_millis(600)))
+        .unwrap();
+}
+
+#[test]
+fn when_compensation_also_fails_the_error_names_both_and_the_row_stays_honest() {
+    // Story 16-3, arm 2 (append fails AND the compensating store write
+    // fails) — driven deterministically through the cfg(test)
+    // `compensation_fault_names` seam (the AI-9/AI-12 fault-injection
+    // precedent; no real store outage staged). The contract: the error
+    // names BOTH failures ("COMPENSATION ALSO FAILED"), and the row stays
+    // at the committed-but-unlogged NEW state — the honestly-stuck state,
+    // per the spec's Never list (no compensating retry loop). Recovery is
+    // the operator's real remediation: clear the seam, resume, stop.
+    let (_state, _manifest, registry) =
+        setup_pause_guaranteed("cz2", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
+    let name = InstanceName::new("cz2").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "cz2").unwrap();
+    assert_eq!(state_of(&registry, "cz2"), LifecycleState::Running);
+
+    // Arm the seam: the compensating `set_state` write fails on purpose.
+    sup.compensation_fault_names.insert(name.clone());
+    let log_path = registry.instance_log_path(&name);
+    std::fs::remove_file(&log_path).unwrap();
+    std::fs::create_dir(&log_path).unwrap();
+
+    let err = sup.pause(&registry, "cz2").unwrap_err();
+    let EngineError::Log { detail, .. } = &err else {
+        panic!("expected a typed Log error from the failed append, got {err:?}")
+    };
+    assert!(
+        detail.contains("COMPENSATION ALSO FAILED"),
+        "16-3: the error must name the double failure, got: {detail}"
+    );
+    assert!(
+        detail.contains("injected compensation fault"),
+        "16-3: the error must carry the compensating write's own failure, got: {detail}"
+    );
+    assert_eq!(
+        state_of(&registry, "cz2"),
+        LifecycleState::Paused,
+        "16-3: with compensation failed the row stays at the committed (paused) state — honestly stuck, never silently reverted"
+    );
+
+    // Recovery: disarm the seam, clear the obstruction, then the operator's
+    // remediation (resume → running) and normal teardown.
+    sup.compensation_fault_names.clear();
+    std::fs::remove_dir(&log_path).unwrap();
+    sup.resume(&registry, "cz2").unwrap();
+    assert_eq!(state_of(&registry, "cz2"), LifecycleState::Running);
+    sup.stop(&registry, "cz2", Some(Duration::from_millis(600)))
         .unwrap();
 }
 
@@ -5162,7 +5272,7 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
     // drain that would commit the breaching event. The breach log
     // (`breaches.log`) is a DIFFERENT file and keeps working, which is exactly
     // the "record FIRST, act best-effort" ordering under proof.
-    let (state, _manifest, registry) =
+    let (_state, _manifest, registry) =
         setup_fake("stopfail", &["--emit-usage", "5", "--linger-ms", "600000"]);
     let name = InstanceName::new("stopfail").unwrap();
     // Budget armed so event 1 (30 tokens) crosses a cumulative ceiling of 30.
@@ -5221,15 +5331,16 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
         "the surfaced error must name the sabotaged lifecycle log: {text}"
     );
 
-    // (3) Best-effort means the supervisor survives: the `running → stopping`
-    // persist COMMITS before the sabotaged append (persist-first, the AI-9
-    // contract), so the row honestly reads `stopping` — a failed enforcement
-    // never crashed the supervisor, never faked a terminal state, and the
-    // handle is retained for a later reconciliation.
+    // (3) Best-effort means the supervisor survives. Story 16-3: the
+    // `running → stopping` commit whose append failed was COMPENSATED back
+    // to `running` — the row never disagrees with the last durably-landed
+    // event — a failed enforcement never crashed the supervisor, never
+    // faked a terminal state, and the row sits at a directly stoppable
+    // state again (no reconciliation needed).
     assert_eq!(
         state_of(&registry, "stopfail"),
-        LifecycleState::Stopping,
-        "persist-first: the committed transition must read stopping"
+        LifecycleState::Running,
+        "16-3: the compensated stop-breach leaves the row at running"
     );
 
     // Latch: a further drain of the same scope records NOTHING new (one
@@ -5238,21 +5349,12 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
     let after = Supervisor::read_breach_events(&registry, "stopfail").unwrap();
     assert_eq!(after.len(), 1, "the breach latch must be spent: {after:?}");
 
-    // Repair the lifecycle log so the teardown can append its terminal event,
-    // and flip the row back to `running` so the stop passes the transition
-    // gate ((stopping, Stop) is not a valid command row). A direct store
-    // UPDATE is the test-only seam (the supervisor's own set_state goes
-    // through the registry; this reaches past it deliberately — the state
-    // predates the sabotage, it is not a behavior under test).
+    // Repair the lifecycle log so the teardown's stop can append its
+    // terminal event. Story 16-3 removed the old row flip: the compensation
+    // already restored `running` — a directly valid stop source — where the
+    // uncompensated row sat at `stopping` and needed the test-only SQL seam
+    // to reach a stoppable state.
     std::fs::remove_dir(&instance_log).unwrap();
-    {
-        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
-        conn.execute(
-            "UPDATE agent_instances SET state = 'running' WHERE name = 'stopfail'",
-            [],
-        )
-        .unwrap();
-    }
     let _ = sup.stop(&registry, "stopfail", Some(Duration::from_secs(5)));
 }
 

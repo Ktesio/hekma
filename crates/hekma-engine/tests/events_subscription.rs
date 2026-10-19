@@ -928,45 +928,60 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
         "a failed commit must publish NOTHING, got {quiet:?}"
     );
 
-    // Clear the obstruction: the next commit lands durably AND delivers.
+    // Clear the obstruction: story 16-3 compensated the failed pause's row
+    // back to `running`, so the honest post-clear remediation is a REAL
+    // pause (delivers Paused) followed by a resume (delivers Running) —
+    // both commits land durably AND deliver.
     std::fs::remove_dir(&log).expect("clear the obstruction");
-    facade.resume("sub-silent").expect("resume after clearing");
+    assert_eq!(
+        facade
+            .instance_status("sub-silent")
+            .expect("status after the compensated pause")
+            .instance
+            .state,
+        hekma_engine::LifecycleState::Running,
+        "16-3: the failed pause was compensated — the row reads running"
+    );
+    facade.pause("sub-silent").expect("pause after clearing");
+    facade
+        .resume("sub-silent")
+        .expect("resume after the real pause");
     barrier(&facade);
     let (after, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
     let resumed = transitions_of(&after);
     assert_eq!(
         resumed.len(),
-        1,
-        "exactly the post-clear commit delivered: {after:?}"
+        2,
+        "exactly the two post-clear commits delivered: {after:?}"
     );
     assert_eq!(
         resumed[0].new_state,
+        hekma_engine::LifecycleState::Paused,
+        "the first post-clear delivery is the successful pause"
+    );
+    assert_eq!(
+        resumed[1].new_state,
         hekma_engine::LifecycleState::Running,
-        "the delivered event is the successful commit"
+        "the second post-clear delivery is the successful resume"
     );
 
     // The failed event is on NEITHER surface: no paused edge ever published
-    // (baseline or after), and the durable log — recreated by the first
-    // post-clear append — holds EXACTLY what was delivered since the
-    // obstruction (the paused append never landed, so it is missing from both
-    // surfaces equally; the obstruction itself destroyed the pre-existing log
-    // lines, which is the file's loss, not the bus's).
+    // during the obstruction window (baseline + the quiet drain above), and
+    // the durable log — recreated by the first post-clear append — holds
+    // EXACTLY what was delivered since the obstruction (both post-clear
+    // events, the real pause's Paused edge included; the obstruction itself
+    // destroyed the pre-existing log lines, which is the file's loss, not
+    // the bus's).
     assert!(
         transitions_of(&baseline)
             .iter()
             .all(|t| t.new_state != hekma_engine::LifecycleState::Paused),
         "no paused edge delivered before the obstruction"
     );
-    assert!(
-        resumed
-            .iter()
-            .all(|t| t.new_state != hekma_engine::LifecycleState::Paused),
-        "the failed append must never publish"
-    );
     assert_eq!(
         committed_transitions(&facade, "sub-silent"),
-        vec![resumed[0].clone()],
+        resumed.into_iter().cloned().collect::<Vec<_>>(),
         "the post-clear durable log equals exactly what was delivered"
     );
 
