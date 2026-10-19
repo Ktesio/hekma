@@ -232,3 +232,24 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: A `record_transition` failure AFTER the `→ starting` store transaction commits leaves the state committed with its transition EVENT unrecorded (no `instance.log` append, no bus publish, no attributed capture line) — the start then aborts with `EngineError::Log` while the row says `starting` (reconciled to `failed` only by a later adoption/reaper pass). The event append runs deliberately AFTER the commit (a subscriber never sees an uncommitted event, story 7-2's ordering obligation), so the window is between the store COMMIT and the durable log append.
   evidence: The round's single DEFER: a PRE-EXISTING window the old autocommit `set_state` path shared verbatim (state commit → event append had the same gap); the 15-6 extraction into `transition_with_backing_snapshot` made it VISIBLE but did not widen it. Not a regression of this story — closing it means either folding the event append into the store transaction (durable log as a store write — an architecture change to AD-12's file-based event log) or a compensating state-revert on append failure (its own partial-failure window); both are design decisions for a focused story, not review patches. Stated honestly in docs/architecture.md's concurrency section.
   resolved: story 16-3 (spec-16-3-transition-append-compensation; PR #302, 2026-10-18) — a failed post-commit event append now compensates the row back to `prior` with the Log error naming the compensation; a failed compensation names both failures and leaves the row honestly at `new`; the success path is byte-identical. docs/architecture.md's concurrency section now states the compensated semantics.
+
+## Deferred from: sprint-change-proposal-2026-09-30-hosted-platform-readiness (correct-course, Batch; approved 2026-09-30)
+
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (privilege separation + attested egress)
+  summary: In-container enforcement that the agent cannot bypass (privilege separation between the Service Host and the agent, plus an attested-egress header an external choke point can verify) is DEFERRED; the first Host keeps enforcement of record at its external choke point.
+  evidence: the proposal §1 threat-model finding; docs/design/metering-agents-you-dont-control.md:94 (the loopback bind is not a sandbox)
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (windowed + runtime-hour budgets)
+  summary: Per-window (daily/monthly) and runtime-hour (compute-time) budgets stay DEFERRED; trigger: a Host asks for either against Hekma's own evaluator.
+  evidence: PRD FR-18 note (per-window deferred); ARCHITECTURE-SPINE.md Deferred list
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (lifecycle hooks)
+  summary: Pre-start / pre-stop lifecycle hooks (e.g. state hydrate/dehydrate for ephemeral disks) are DEFERRED; trigger: a Host shows its own hook machinery failing where engine hooks would not.
+  evidence: the proposal §4.6 item 3
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (declarative fleet file)
+  summary: A declarative fleet file reconciled at Service Host boot is DEFERRED; trigger: a Host runs more than one agent per Service Host (the first Host runs one per container).
+  evidence: the proposal §4.6 item 4; Story 17.2 scope (renumbered from 15.2)
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (incremental SSE relay + multi-route upstreams)
+  summary: The store-and-forward relay (whole-body buffering, up to 64 MiB) and the single upstream per instance stay; incremental SSE relay and multi-route upstreams are DEFERRED; trigger: a Host whose model path streams to the agent, or reaches more than one upstream.
+  evidence: crates/hekma-engine/src/metering/listener.rs:147-162, 372-393
+- source_spec: `sprint-change-proposal-2026-09-30-hosted-platform-readiness.md` (approval routing + `hekma conformance` CLI)
+  summary: ACP `session/request_permission` stays auto-denied (D3) and the TCK stays a Rust library; routing approvals to the Host and a conformance CLI for non-Rust adapter authors are DEFERRED; triggers: the first Host that surfaces approvals to its users, and the first non-Rust adapter author.
+  evidence: ARCHITECTURE-SPINE.md AD-19 (permission requests answered denied); hekma-conformance is publish=false and library-only
