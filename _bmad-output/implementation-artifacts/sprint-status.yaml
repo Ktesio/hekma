@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-18-2026"
+last_updated: "10-19-2026 06:33"
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -173,7 +173,8 @@ development_status:
   9-2-reposition-the-top-level-kt-identity-to-the-agent-runner: done  # (was tracked as 9-2-rebrand-kt-identity-and-make-agent-list-show-canonical) committed 45d203e on feat/epic-9-retire-legacy-cli (on top of 9-1); CI green cross-OS incl. coverage on PR #114. Review APPROVED-WITH-NITS (rebrand text verified verbatim-consistent with the live README/GitHub description; canonical-surface guard proven non-vacuous via live smoke; 0.6.0 bump isolated to workspace.package; dangling deps confirmed gone). 1 LOW cosmetic nit (story-file wording, reconciled) — no functional follow-up.
   9-3-reconcile-the-stale-architecture-and-skill-manager-docs-arch: done  # (was tracked as 9-3-reconcile-architecture-and-skill-docs-and-rescope-ad16-epic8) Part A (docs reconcile) committed fc53278, cross-OS CI green incl. coverage+docs job on PR #114. Part B (AD-16/Epic-8 re-scope): drafted as proposal (respected the architect/Islam gate — nothing applied without ratification), Islam ratified "apply, keep 8-1 separate" via AskUserQuestion, applied to ARCHITECTURE-SPINE.md (AD-16 additive correction) + epics.md (Epic 8 summary, Story 8-1 full rewrite, 8-4 marked superseded, 8-5 AC fixed, FR-37/38 amended text, FR Coverage Map). GitHub synced: #62/#95/#98/#99 updated to match, #96/#97 got dependency notes. All 3 Epic 9 stories now done; PR #114 undrafted, ready for Islam's merge nod.
   epic-9-retrospective: done
-  epic-16: in-progress  # Hardening & Housekeeping Backlog (the Fibery feature): opened 2026-10-18 by story 16-1 — the 15-1 review's deferred skip-note-visibility finding pulled forward as the backlog's first story.
+  epic-16: done  # 🎉 COMPLETE 2026-10-19: all three stories merged (16-1 bd59373/#296, 16-2 ee7e02f/#298, 16-3 b759502/#302) — the Fibery backlog feature's first tranche; Fibery tasks 391/392/393 all Done with landing comments. Retro per convention: epic-16-retro-2026-10-19.md (accepted-with-open-items, profiled criteria).
+  epic-16-retrospective: done  # 2026-10-19 — epic-16-retro-2026-10-19.md, run headless at close (the same-change convention): verdict accepted-with-open-items (profiled; pending_stories []); findings F1 (resumed-WIP re-gate drill held, AI-21/AI-57), F2/F3 (16-2 docs + spec-closeout omissions, fixed in #302), F4 (branch-policy --admin merge friction); behavior checks observed live through the real CLI; action items A1/A2 recorded below.
   16-1-skip-note-visibility-uncaptured-stderr-notes: done  # LANDED 2026-10-18 on feat/skip-note-visibility (spec 16-1): hekma-conformance gains test_notes::note_uncaptured — the skip note written straight to the process's REAL stderr (fd 2 via File::from_raw_fd + ManuallyDrop so the process keeps its stderr; Windows arm via the raw handle), best-effort, never panicking (broken-pipe writes swallowed — eprintln! would panic); unit-pinned by a re-exec round-trip (the fd-2 note reaches a real piped stderr of a PASSING test while a sibling eprintln! control token stays in libtest's capture sink) + a closed-pipe no-panic pin; acp_lifecycle's 6 skip-note sites switch to the helper (same bytes, same stream under --nocapture) and the 3 SILENT binary-absent returns in the register/start/send/stop smokes GAIN the same noted skip; testing.md's --nocapture limitation sentence flipped (notes visible under plain cargo test; --nocapture kept only where it serves live diagnostics). Gates: fmt / clippy -D warnings / HEKMA_TEST_REAL_AGENT_SMOKES=0 workspace tests / check_docs green; acceptance grep (plain `cargo test -p hekma-engine --test acp_lifecycle real_` | grep -c "note: real-agent") ≥1 with NO --nocapture.
   16-2-raw-backlog-follow-prime-bounded-window: done  # LANDED 2026-10-18 on feat/logs-backlog-prime (spec 16-2, the 15-2 review's deferred gap, RATIFIED by Islam as the bounded-follow-backlog option): `logs --follow`'s raw fallback cursor primes at the last N COMPLETE lines (default 200, env HEKMA_LOGS_BACKLOG_LINES) instead of the file's current end, so between-commands gap lines stream at follow start under the SAME once-per-session un-attributed qualifier; a gap larger than the window streams only its last N lines and the qualifier NAMES the skipped-beyond count (surfaced, not silent); a partial trailing line is never primed (boundary math in the pure prime_backlog_window helper + the prime_backlog_lines path wrapper in supervisor/interaction.rs, unit-pinned N<total / N≥total / partial / empty / N=0 / real-file / absent-file); NO --raw flag (explicitly rejected), one-shot logs and the attributed read path untouched, live-capture guard makes a fresh attributed capture byte-identical (prime_raw_backlog returns the current end, nothing skipped); garbage env (non-numeric/zero/negative/empty/overflow) falls back to the default with a stderr note naming the value (resolve_backlog_lines unit-pinned); engine facade gains Engine::prime_raw_backlog + Blocking twin (engine-level pins in tests/logs.rs: the fallback-active arm resolves the window through the existing poll, the live-tailer arm is a no-op at the current end with nothing skipped); CLI e2e: the 15-2 raw-fallback test flips its backlog expectation (the pre-existing backlog line now streams within the default window) and a NEW test primes a 4-line pre-follow gap with the window env-tuned to 2 (last 2 stream, older 2 stay skipped, fresh post-start line streams, qualifier names the count exactly once); commands.md's logs section gains the bounded-backlog paragraph; deferred-work.md's 15-2 entry stays unresolved until merge.
   16-3-transition-append-compensation: done  # LANDED 2026-10-18 on feat/transition-append-compensation (spec 16-3, the 15-6 review's deferred window, PR #302): when a transition's durable event append fails AFTER the store commit, record_transition COMPENSATES the row back to `prior` (compensate_transition, best-effort under the supervisor lock) so the registry never disagrees with the last durably-landed event — the surfaced typed Log error NAMES the compensation; a failed compensating write names BOTH failures and leaves the row honestly at `new` (no retry loop, no fabricated event). Deterministic arms: supervisor pause/resume legs re-pinned (compensated rows, frozen heartbeat + no-signal invariants kept), the stop-breach leg re-pinned (row returns to running — the test-only SQL re-flip retired), lifecycle start arm (registered→starting append fail → row back to registered, no launch, remediation start succeeds), events_subscription re-pinned (compensated pause publishes nothing; post-clear pause+resume deliver exactly the committed pairs, durable log == deliveries); docs/architecture.md concurrency sentence replaced; CHANGELOG/RELEASE_NOTES Unreleased (16-3 + the 16-2 announcement its landing omitted); spec-16-2 status flip completed.
@@ -1519,16 +1520,16 @@ action_items:
       (crates/hekma-conformance/src/uj3.rs:418), log_file_captures_child_stdout spawn
       start-time race (crates/hekma-engine/src/backends/unix/mod.rs:1042), two_engines
       embed_clean concurrency (crates/hekma-engine/tests/embed_clean.rs:323). Reproduce
-      under load; fix the race or add principled tolerance (no blind retry). WINDOWS EXTENSION (2026-09-23, hardening-session bisect): the same family
-      is red on windows-latest — tck::tests::engine_observed_manifest_adapter_passes_the_observed_section
+      under load; fix the race or add principled tolerance (no blind retry). WINDOWS
+      EXTENSION (2026-09-23, hardening-session bisect): the same family is red on
+      windows-latest — tck::tests::engine_observed_manifest_adapter_passes_the_observed_section
       hits the 30s SECTION_TIMEOUT waiting for 3 engine-observed rows (have 2) under
-      runner contention (self-heals on nextest TRY 2; identical Rust content green at
-      the 17:01Z #193 merge run, red at 19:51Z with only docs/ci-python deltas), AND a
-      second symptom: one engine test HANGS (identity not yet pinned — the job burns
-      its 25m timeout, nextest 'Cancelling due to interrupt: 1 test still running').
+      runner contention (self-heals on nextest TRY 2; identical Rust content green
+      at the 17:01Z #193 merge run, red at 19:51Z with only docs/ci-python deltas),
+      AND a second symptom: one engine test HANGS (identity not yet pinned — the job
+      burns its 25m timeout, nextest 'Cancelling due to interrupt: 1 test still running').
       Same charter: reproduce under load, fix the race or add principled tolerance
-      (no blind retry). [epic-12
-      retro action 1, MED]"
+      (no blind retry). [epic-12 retro action 1, MED]"
     owner: "next CI-touching story"
     status: open
     ref: "/Users/imagdy/dev/hekma/_bmad-output/implementation-artifacts/epic-12-retro-2026-09-19.md"
@@ -1601,3 +1602,18 @@ action_items:
     owner: "Islam confirm / agent execute"
     status: done
     ref: "_bmad-output/implementation-artifacts/epic-14-retro-2026-09-22.md"
+  - id: "epic-16-retro-item-103-landing-checklist-rule-a-spec-s-changelo"
+    epic: 16
+    action: "Landing checklist rule: a spec's CHANGELOG/RELEASE_NOTES task is ticked
+      only when the PR diff shows the entries (kills the F2/F3 class; one sentence
+      in AGENTS.md)"
+    owner: "Islam"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-16-retro-2026-10-19.md"
+  - id: "epic-16-retro-item-104-decide-the-single-maintainer-merge-path"
+    epic: 16
+    action: "Decide the single-maintainer merge path: relax the base-branch ruleset
+      for the owner, or canonize gh pr merge --admin in AGENTS.md (the #302 F4 friction)"
+    owner: "Islam"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-16-retro-2026-10-19.md"
