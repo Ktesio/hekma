@@ -1847,6 +1847,39 @@ mod tests {
     }
 
     #[test]
+    fn reveal_secrets_rejects_a_malformed_name_before_any_resolution() {
+        // The reveal path is read-only, but it still validates the name
+        // FIRST: a malformed name is the typed InvalidName — never a path
+        // into the registry layout, never a resolution attempt.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        assert!(matches!(
+            facade
+                .reveal_secrets("Bad Name", ConfigLayer::empty())
+                .unwrap_err(),
+            ConfigError::InvalidName { name, .. } if name == "Bad Name"
+        ));
+    }
+
+    #[test]
+    fn failed_cause_detail_is_none_for_a_cause_that_is_not_a_failure() {
+        // The `instance_status` event-log fallback must not invent a failure
+        // detail for a cause that does not describe one — a graceful stop
+        // carries no crash text, so the status line stays plain.
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::StopGraceful),
+            None,
+            "a graceful stop is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::AdapterReady),
+            None,
+            "an adapter-ready transition is not a failure cause"
+        );
+    }
+
+    #[test]
     fn stop_error_to_registry_maps_each_arm() {
         // AI-11: a live-instance teardown failure during `remove` is mapped into a
         // RegistryError so `remove` (which speaks RegistryError) aborts WITHOUT
