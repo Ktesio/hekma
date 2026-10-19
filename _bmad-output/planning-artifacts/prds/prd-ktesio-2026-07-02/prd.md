@@ -2,7 +2,7 @@
 title: "PRD: Ktesio — Unified Personal-Agent Runtime Engine"
 status: review
 created: 2026-07-02
-updated: 2026-08-28
+updated: 2026-09-30
 ---
 
 # PRD: Ktesio — Unified Personal-Agent Runtime Engine
@@ -75,6 +75,12 @@ The bet is that consistency itself is the product. Agents become interchangeable
 - **Skill Set** — the locked collection of Skills provisioned into one Agent Home.
 - **Fleet** — all Agent Instances the Engine manages in a given installation.
 - **`kt`** — the Ktesio CLI; the Engine's complete reference frontend.
+- **Service Host** — a long-running process that owns an Engine continuously and serves a local Control API to the Host that runs it (FR-41).
+- **Control API** — the Service Host's versioned local HTTP/JSON surface: lifecycle, configuration, usage, and events by stream or cursor.
+- **Task** — a Host-defined unit of work inside a Run (e.g. one request the Host sent the Agent). Budgets and latches can be scoped to it (FR-43).
+- **Drain** — stop new work, wait for in-flight work up to a bounded window, then stop (FR-42).
+- **Readiness / Liveness Probe** — Adapter-declared checks that an Agent can serve, and is still alive, beyond its process existing (FR-42).
+- **Governance Vectors** — the versioned, portable test cases that state the Engine's budget and cost decision rules (FR-44).
 
 ## 4. Features
 
@@ -143,6 +149,10 @@ The Engine detects an Agent Instance exiting outside a requested stop, marks it 
 **Consequences (testable):**
 - With `on-failure`, a crashed Agent Instance restarts with backoff and the restart count is visible; with `never`, it stays `failed` with the exit diagnostic. Backoff parameters are configurable with sane defaults. `[ASSUMPTION: backoff defaults.]`
 - Crash-looping is bounded: after N consecutive failures the Engine stops retrying and says why. `[ASSUMPTION: N configurable, default 5.]`
+
+> *(Amended 2026-09-30.)* `always` is subsumed. Every exit the Engine did not request already
+> restarts under `on-failure`. What services actually need is exit-code classes (restart-requested,
+> clean) and a stable-window reset of the crash-loop counter — FR-42.
 
 #### FR-10: State persistence across Engine restarts
 The Fleet's registrations, budgets, Usage Ledgers, and last-known Lifecycle States survive Engine/`kt` restarts and host machine reboots.
@@ -342,6 +352,89 @@ The `kt` binary name, crates.io package, Homebrew tap, and install scripts carry
 **Consequences (testable):**
 - Upgrading from v0.5.0 via each published channel yields a working `kt` whose surface is the agent runner plus binary self-maintenance; the retired legacy command names are absent, and their removal is stated in the v0.6.0 release notes the upgrade points at.
 
+### 4.11 ACP Backend *(added 2026-09-19; landed in this document 2026-09-30)*
+
+#### FR-40: ACP backend support
+Any agent that speaks the Agent Client Protocol (ACP) v1 can be registered, started and supervised
+as a Hekma backend via the builtin `acp` kind. Core controls — start, stop, pause, resume, send,
+stop escalation, config, memory backing, fleet surfaces and adoption — behave as they do for other
+kinds.
+**Consequences (testable):**
+- Usage is acquired in tiers — engine-observed, then the stderr sentinel — and ACP context usage is
+  surfaced but never billed. When no tier yields usage, the surfaces show an honest not-available
+  marker naming the tiers attempted. Nothing is fabricated.
+- Client capabilities beyond the ACP baseline are not advertised; requests for them are refused with
+  a surfaced diagnostic.
+- A detached start is refused (the protocol's pipes die with the spawner); the session resumes at
+  the next start's handshake when the agent supports it.
+
+### 4.12 Hosted-Platform Readiness *(added 2026-09-30 — v1.x; sprint-change-proposal-2026-09-30-hosted-platform-readiness.md)*
+
+#### FR-41: Service host mode
+A Host can run the Engine as a long-running Service Host that owns supervision, metering listeners
+and enforcement continuously, and drive it through a local, versioned Control API instead of
+linking the library.
+**Consequences (testable):**
+- Supervision, crash detection, budget enforcement and event delivery run continuously while the
+  host runs. On SIGTERM the host drains and stops every Agent Instance within a bounded window, and
+  it never SIGKILLs an agent on its own exit before that window ends.
+- Exactly one Service Host owns a state directory at a time; a second owner is refused with a clear
+  diagnostic.
+- The Control API binds only where configured, requires a bearer resolved through the secret
+  mechanism, and returns no secrets and no raw agent output unless explicitly enabled.
+- Events are available live (stream) and by cursor-based pull with one global order across event
+  families, so a Host whose disk is ephemeral can export what it needs before the host exits.
+- The Control API carries its own version and is marked unstable until a second Host validates it.
+
+#### FR-42: Service-grade lifecycle
+An Adapter can declare how its Agent proves it is ready, how it proves it is alive, which exit codes
+are not failures, and how it pauses cooperatively; the Operator or Host can drain an Agent Instance
+before stopping it.
+**Consequences (testable):**
+- `starting → running` happens only when the declared readiness probe passes within its timeout;
+  otherwise the instance lands in `failed` with the probe's reason.
+- A declared liveness failure (e.g. a stale heartbeat) moves a `running` instance to `failed` with
+  cause `unresponsive`, and the Restart Policy applies.
+- A declared restart-requested exit relaunches without counting toward the crash loop, and a
+  declared clean exit is not a crash. The crash-loop counter resets after a stable window.
+- A declared pause command drives pause and resume, surfaced as best-effort when it only stops new
+  work.
+- Drain stops new work, waits for in-flight work up to a bounded window, then stops, recording
+  whether it completed or timed out.
+- These declarations are an additive Adapter Contract minor (v1.1.0), so a gateway-style service
+  agent is expressible as a manifest adapter.
+
+#### FR-43: Governance at the wire and per unit of work
+A Host can scope budgets to its own units of work and have a breach refuse further model calls at
+the Engine's metering proxy.
+**Consequences (testable):**
+- A Host can begin and end a Task on a running Agent Instance. Usage in between is attributed to the
+  Task, and per-Task budgets and latches apply alongside the per-Run and cumulative ones.
+- A `block` Breach Action refuses further model calls through the proxy with a typed, non-retryable
+  response until the ceiling is raised or reset. The breach is recorded like any other.
+- Raising a ceiling re-arms its latch within the same Run.
+- Per-call records are available to the Host — status class, latency, model when present, tokens,
+  Task, sub-second time — and never contain request or response content.
+- The docs state that the fence is as cooperative as the meter: an Agent that bypasses the injected
+  endpoint bypasses both (NFR-6).
+
+#### FR-44: Portable governance semantics
+The Engine's budget and cost decision rules are published as versioned Governance Vectors that a
+Host implementation in another language can run.
+**Consequences (testable):**
+- The vectors cover thresholds, latches and re-arm, evaluation order, integer arithmetic, rounding,
+  saturation and repricing. CI verifies each vector against the Engine's own evaluator.
+- Vectors are versioned and checksummed; changing a rule changes the vectors and the version.
+
+#### FR-45: Reconciliation with confirmed actuals
+A Host can submit provider- or Host-confirmed usage for a Run or Task, and the Engine records it as
+`reconciled` alongside its own `estimated` figures.
+**Consequences (testable):**
+- Reconciled figures never overwrite estimated rows. Both stay readable, and the drift between them
+  is reported.
+- Surfaces label each figure `estimated` or `reconciled` (AD-8), and totals state which label they
+  carry.
+
 ## 5. Cross-Cutting NFRs
 
 - **NFR-1 Resilience.** An Agent crashing never crashes the Engine or `kt`; the Engine cleans up or adopts orphaned Agent processes after its own crash on next start. Partial failures across the Fleet degrade gracefully with per-instance reasons and remediations (durable gate).
@@ -404,6 +497,10 @@ Carried from the brief (confirmed direction, list awaiting Islam's re-confirmati
 - skills.sh public search of the legacy manager — dropped in the refocus. `[ASSUMPTION — §13 Q7.]`
 - Hosted/web anything, team governance, sandboxing — non-goals (§8).
 
+### 9.3 v1.x additions
+
+FR-40 (shipped in Epic 14) and FR-41..FR-45 (Epics 15–17, added 2026-09-30) are v1.x additions, not the v1 MVP.
+
 ## 10. Why Now
 
 The 2025–2026 agent landscape fragmented into single-stack frameworks, single-agent harnesses, parallel launchers, in-code governance SDKs, and proxy-level budget tools — while personal agents (Hermes Agent and peers) became genuinely adoptable by individuals. The operator-facing runner that unifies lifecycle *and* dollar governance across heterogeneous agents is the identified gap (brief addendum §A/§B, research-grounded hypothesis). Platforms hosting personal agents are emerging now and are rebuilding runtime plumbing each — the embeddable-engine window is open before someone else standardizes it.
@@ -435,9 +532,13 @@ Suggested epic seams (not a plan, a shape): Engine core + state machine + persis
 3. ~~Breach Action default~~ **RESOLVED 2026-07-02:** `pause` ratified as the shipped default (per-instance configurable stands).
 4. **v1 Memory Backing set:** `filesystem` + `native` proposed (FR-16); confirm or extend. Owner: Islam.
 5. **Non-goals re-confirmation** (§8 list, post-embedding-expansion). Owner: Islam.
-6. **Engine delivery surface beyond Rust lib** (service/IPC for non-Rust Hosts): v1 = lib only `[ASSUMPTION]`; decide the v1.x path. Owner: Islam + architecture.
+6. **Engine delivery surface beyond Rust lib** (service/IPC for non-Rust Hosts): v1 = lib only `[ASSUMPTION]`; decide the v1.x path. Owner: Islam + architecture. **Answered 2026-09-30 (ratified with sprint-change-proposal-2026-09-30-hosted-platform-readiness.md):** a Service Host with a local HTTP/JSON Control API (FR-41, AD-20),
+  unstable `0.x` until a second Host validates it. The library remains the primary embedding surface.
 7. **Deprecation window mechanics & skills.sh search fate** (§4.10, §9.2). Owner: Islam.
-8. **Metering mandatory at registration** (FR-19 rejects Adapters with no Metering Source): confirm this hard line. Owner: Islam.
+8. **Metering mandatory at registration** (FR-19 rejects Adapters with no Metering Source): confirm this hard line. Owner: Islam. **Answered 2026-09-30 (ratified with the same proposal):** metering stays mandatory at registration for manifest adapters
+  (FR-19). The `acp` kind's surfaced gap (FR-40) is the one sanctioned exception. A Host that meters
+  at its own choke point may feed Hekma through reconciliation (FR-45), which satisfies FR-19's
+  intent without faking a source.
 
 ## 14. Assumptions Index
 
