@@ -756,7 +756,20 @@ jobs:
           #     there is no data-driven OsId form for a signal STREAM). The
           #     file is the crate's ONLY cfg; the wait is thin and its
           #     Windows half is the documented OS asymmetry.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:|^crates/hekma-host/src/signals\.rs:'
+          #   * hekma-host tests/control_api.rs — story 17-3: the suite's
+          #     bearer resolves through the engine's SECRETS-FILE leg, whose
+          #     0600 refusal is a unix permission-model check (PermissionsExt),
+          #     so exercising the happy path means WRITING a 0600 secrets file
+          #     — the same "the write arms ARE the OS API boundary" class as
+          #     the engine's atomic_config_writes.rs entry (on Windows the
+          #     file-leg ACL check accepts a fresh user-owned file, so the
+          #     write is bare; the gate itself — the agent-driving tests'
+          #     Windows skip — is data-driven OsId::current, never cfg).
+          #   * hekma tests/serve_cli.rs — story 17-3 (review item 24b): the
+          #     real-binary Control-API leg writes the SAME 0600 secrets file
+          #     so the spawned serve resolves the bearer through the file leg
+          #     — the identical sanctioned class as the host suite's entry.
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:|^crates/hekma-host/src/signals\.rs:|^crates/hekma-host/tests/control_api\.rs:|^crates/hekma/tests/serve_cli\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
@@ -774,10 +787,10 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs), and hekma-host's signals.rs (the host's shutdown-signal wait). A new cfg use in any other file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs), hekma-host's signals.rs (the host's shutdown-signal wait), hekma-host's control_api.rs (the secrets-file 0600 write), and hekma's serve_cli.rs (the same 0600 write, real-binary leg). A new cfg use in any other file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
             exit 1
           fi
-          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites / the host's signals.rs."
+          echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites / the host's signals.rs / the host's control_api.rs / the hekma serve_cli.rs secrets write."
       - name: Enforce single currency-formatting module (story 3-3, AD-8)
         shell: bash
         run: |

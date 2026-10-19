@@ -418,7 +418,7 @@ hekma agent config get demo --reveal
 
 Values resolve across four layers — engine defaults &lt; agent-kind defaults &lt; instance config &lt; invocation overrides — and each value names its winning source layer (a **Source** column, or a `source` field with `--json`).
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--state-dir <dir>]`
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr>] [--bearer-secret <name>] [--state-dir <dir>]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -426,15 +426,21 @@ Run the long-running **Service Host**: one process that owns a state directory f
 hekma serve
 hekma serve --stop-window 10
 hekma serve --metering-listen 8400 --state-dir ~/agents-state
+hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
 ```
 
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
 - `--metering-listen <port>` — a fixed loopback port for every `engine-observed` instance's metering listener for this host's lifetime (default `0` = OS-ephemeral). With a fixed port, a host restart re-binds the SAME port, so a detached `engine-observed` instance adopted by the new host keeps its injected `base_url` live — without it, an adopted observed instance is stranded (its listener died with the starting command) and the adoption says so. A port that is already in use **refuses the start** with a typed diagnostic naming the port — the host never silently hops to another port. Port `0` keeps the pre-serve ephemeral behavior.
+- `--listen <addr>` / `--bearer-secret <name>` — expose the **Control API** (v0, unstable): an HTTP/JSON surface over the hosted fleet — registration, lifecycle, config, budgets and usage, live SSE events — guarded by the resolved bearer token. Both flags or neither (a half-configured API is a usage error); the secret NAME resolves like every Hekma secret (env var, then the state root's `secrets.toml`), and an unresolvable name — or a secret that resolved to an EMPTY value — refuses the startup before anything binds. Loopback tooling for a trusted operator — not a multi-tenant service. See [the Control API reference](control-api.md).
 - `--state-dir <dir>` — serve this state directory instead of the resolved default (`HEKMA_STATE_DIR`/`KTESIO_STATE_DIR`, else the platform data dir; same resolution order as every other command).
 
 ### Single-writer lock
 
 The host takes `<state-root>/host.lock` before anything opens. A second `hekma serve` on the same state directory is refused (exit code `2`) naming the live holder's PID and the remediation — **stop that host first, or serve a different state directory**. The refusal never advises deleting the lock file: a dead host releases the OS lock by itself (a crashed host's stale lock re-acquires cleanly — the file's contents are never trusted to mean a live holder), and deleting a LIVE holder's lock would let a third `serve` mint a fresh lock inode and put two hosts on one state root. The lock releases when the host process exits.
+
+### Control API (v0, unstable)
+
+With `--listen` + `--bearer-secret` the host serves a local HTTP/JSON surface over the fleet it is supervising: `GET /v0/version` (self-describing), the Fleet and per-instance reads, `POST`-registration and the start/stop/pause/resume verbs, masked config get/set, the per-instance cursor pull, and the live SSE event stream. Every route requires the bearer (401 otherwise, with a `WWW-Authenticate: Bearer` challenge), every payload is schema-versioned, and errors are versioned JSON bodies with typed `kind`s. The surface is marked **unstable** — additive-only until a second hosting platform validates it — and it is loopback operator tooling, served from the host process itself, not a hardened multi-tenant service. The full route table, the event contracts, and the shutdown order live in [the Control API reference](control-api.md).
 
 ### Hosted children: the environment allowlist
 
@@ -449,7 +455,7 @@ The floor values come from the host's own environment; everything beyond the dec
 
 ### Shutdown drain
 
-On the shutdown signal every RUNNING agent is stopped through the same bounded ladder `hekma agent stop` uses, each with the configured `--stop-window`. The stops are **issued concurrently** and each outcome is surfaced the moment its ladder settles. The wall clock, honestly: the engine's stop ladder runs under its supervision lock, so agents that must run out the full window before the force-kill escalation queue behind each other (worst case one window per escalated agent); agents that exit promptly on the graceful signal settle fast. The plan is re-checked after the pass: an instance that entered `running` mid-drain (a concurrent `agent start`) gets one extra ladder pass, and anything still running after that is named honestly on stderr (it will be terminated by the engine's exit teardown WITHOUT the bounded ladder). Signals arriving DURING the drain are swallowed and noted — a second SIGTERM from an impatient operator or service manager never kills the host mid-ladder; the drain already running completes.
+On the shutdown signal the Control API (when configured) stops accepting first and its open SSE streams end — a client sees the API go away before any agent is touched — then every RUNNING agent is stopped through the same bounded ladder `hekma agent stop` uses, each with the configured `--stop-window`. The stops are **issued concurrently** and each outcome is surfaced the moment its ladder settles. The wall clock, honestly: the engine's stop ladder runs under its supervision lock, so agents that must run out the full window before the force-kill escalation queue behind each other (worst case one window per escalated agent); agents that exit promptly on the graceful signal settle fast. The plan is re-checked after the pass: an instance that entered `running` mid-drain (a concurrent `agent start`) gets one extra ladder pass, and anything still running after that is named honestly on stderr (it will be terminated by the engine's exit teardown WITHOUT the bounded ladder). Signals arriving DURING the drain are swallowed and noted — a second SIGTERM from an impatient operator or service manager never kills the host mid-ladder; the drain already running completes.
 
 Every outcome is surfaced on stderr (stopped gracefully / force-killed after the window / ended on its own before the ladder reached it / failed to stop, with the reason). Even a failed per-instance stop does not fail the host's exit: the drain ran and the host's contract was kept, so `hekma serve` exits `0` on shutdown either way — the stream, not the exit code, carries the failure. Note the service-manager consequence: because a failed per-instance stop still exits `0`, a `Restart=on-failure` unit will NOT restart the host over it — the diagnostic stream is the record (deliberate; revisited when the container recipe lands).
 
