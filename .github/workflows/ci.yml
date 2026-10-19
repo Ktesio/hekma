@@ -479,8 +479,17 @@ jobs:
     # (benches/baselines/perf-ubuntu-x86_64.json) and fails when any gated
     # metric is worse than baseline x 1.15 (additive to the absolute
     # budgets; see docs/testing.md's update procedure for refreshes).
+    # Story 17-1: the job ALSO runs the serve-shape scenario (--serve-shape,
+    # its own step below) — the NFR-4 budgets re-measured
+    # through the engine's PUBLIC async facade under serve-shaped
+    # concurrency, gated by the serve gates (their own names; bound only on
+    # serve runs; not ratcheted — the canonical baseline carries no serve
+    # metrics). Its report file rides the SAME artifact as the default
+    # report (two files, one artifact).
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Story 17-1: the job now runs the harness TWICE (default + --serve-shape,
+    # ~2 min more on a warm cache) — the ceiling grows with it.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -549,16 +558,41 @@ jobs:
             exit 1
           }
           target/release/examples/perf-budgets --baseline benches/baselines/perf-ubuntu-x86_64.json
+      - name: Run the serve-shape scenario (story 17-1; regressions fail this job)
+        # The SECOND explicit run (story 17-1): gated budgets CI never runs
+        # are not gates, so the serve shape is its own blocking step, not a
+        # rider on the default run above. It runs WITHOUT --baseline — the
+        # canonical baseline carries no serve metrics, and the serve gates
+        # bind only on serve runs (the scenario-scoped baseline rule in
+        # docs/testing.md) — and gates the NFR-4 budgets through the three
+        # serve gates (read p99 < 1s; CPU <= 2%/instance at the shared-runner
+        # tolerance; RSS <= 50 MiB/instance). Same contract as the step
+        # above: no redirection, no `|| true`, the bare binary invocation
+        # (+ its flags) as the last line, so a nonzero exit reds this job.
+        timeout-minutes: 10
+        env:
+          PERF_BUDGETS_REPORT_PATH: perf-budgets-serve-report.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x target/release/examples/perf-budgets || {
+            echo "::error::perf-budgets binary not found at target/release/examples/perf-budgets — the build step above failed or the output path moved."
+            exit 1
+          }
+          target/release/examples/perf-budgets --serve-shape
       - name: Upload the measured report (artifact)
         # The measured record of record also lives in this job's log; the
         # artifact makes it downloadable for trend inspection. `if: always()`
         # so a red (regression) run's numbers are preserved too — that is
-        # exactly when the record matters most.
+        # exactly when the record matters most. Story 17-1: ONE artifact
+        # carries BOTH report files (the default run's and the serve run's).
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: perf-budgets-report
-          path: perf-budgets-report.json
+          path: |
+            perf-budgets-report.json
+            perf-budgets-serve-report.json
           if-no-files-found: warn
 
   docs:
@@ -621,7 +655,7 @@ jobs:
           violations=''
           if [ -n "$edges" ]; then
             filter_status=0
-            violations="$(printf '%s\n' "$edges" | grep -Evx 'hekma-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'hekma-(engine|adapter-api|adapters-hermes|host)')" || filter_status=$?
             if [ "$filter_status" -ge 2 ]; then
               echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
               exit "$filter_status"

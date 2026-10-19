@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-19-2026 12:00"  # bumped by the 15-17 → 17-19 renumber (epic numbers 15/16 consumed on main by the autonomous Fibery-backlog tranches)
+last_updated: "10-19-2026 12:40"  # 17-1 ratified (D1/D2/D3 applied); PR pending push window
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -177,8 +177,8 @@ development_status:
   # (epic-15 done 2026-10-17, epic-16 done 2026-10-19) had consumed the numbers 15/16 while this
   # approved 2026-09-30 correct-course output sat uncommitted locally. Stories shift with their
   # epics: Service Host 15.x→17.x, Service-Grade Lifecycle 16.x→18.x, Wire Governance 17.x→19.x.
-  epic-17: backlog  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber)
-  17-1-host-mode-spec-the-shim-crate-and-the-lock-model: backlog
+  epic-17: in-progress  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber)
+  17-1-host-mode-spec-the-shim-crate-and-the-lock-model: in-review  # D1/D2/D3 ratified 2026-10-19 (hekma-host / axum 0.8 / re-ratify coarse); PR pending the push window
   17-2-hekma-serve-the-long-running-host: backlog
   17-3-control-api-v0: backlog
   17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: backlog
