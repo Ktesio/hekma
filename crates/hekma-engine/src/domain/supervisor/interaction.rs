@@ -634,22 +634,116 @@ impl Supervisor {
 ///   and `skipped_beyond = total − N`.
 /// * absent file → `(0, 0)` (an honest empty read, the story 15-2 precedent).
 ///
-/// The whole file is scanned ONCE per follow start (never per poll — the
-/// 15-2 poll stays tail-only). `N = 0` degrades to "prime nothing" (the
-/// cursor lands at the end of the complete region): defensive only, since
-/// the CLI never sends a non-positive window.
+/// The whole file is scanned at follow start in BOUNDED CHUNKS (never per
+/// poll — the 15-2 poll stays tail-only): see [`prime_backlog_lines`] for
+/// the streaming shape. `N = 0` degrades to "prime nothing" (the cursor
+/// lands at the end of the complete region): defensive only, since the CLI
+/// never sends a non-positive window.
 pub(super) fn prime_backlog_lines(path: &std::path::Path, n: u64) -> Result<(u64, u64), String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    prime_backlog_lines_chunked(path, n, PRIME_SCAN_CHUNK_BYTES)
+}
+
+/// Scan chunk size for the streaming backlog prime: peak memory at one
+/// follow start is bounded by this, never by the raw `agent.log`'s size
+/// (issue #297 item 1 — a never-rotated, GB-scale log must not materialize
+/// in RAM just to locate a 200-line window).
+const PRIME_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The streaming engine behind [`prime_backlog_lines`], with the chunk size
+/// as a parameter so tests can drive the chunk-BOUNDARY arithmetic with
+/// small fixtures (`chunk = 1` makes every byte a boundary; the shipped
+/// size is [`PRIME_SCAN_CHUNK_BYTES`]). Two chunked passes over ONE opened
+/// handle:
+///
+/// 1. **count** — every `\n` terminates exactly one complete line; sum the
+///    newlines. `skipped = total.saturating_sub(n)`; zero → `(0, 0)` and
+///    pass 2 never runs.
+/// 2. **locate** — rewind the SAME handle to byte 0 and walk to the byte
+///    just after the `skipped`-th newline, tracking the chunk's absolute
+///    base offset.
+///
+/// Holding one handle across both passes makes the snapshot self-consistent
+/// without reading the file into memory: rotation's atomic rename swaps the
+/// PATH's inode, but this handle keeps reading the file it opened, so both
+/// passes always observe the same bytes (a concurrent grower appends beyond
+/// what pass 1 counted — the follow loop's own poll streams that later,
+/// unchanged). This is the streaming twin of `prime_backlog_window`'s
+/// one-shot math and must agree with it on every input (the equivalence
+/// family in `supervisor/tests.rs` pins that).
+pub(super) fn prime_backlog_lines_chunked(
+    path: &std::path::Path,
+    n: u64,
+    chunk_bytes: usize,
+) -> Result<(u64, u64), String> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
         Err(e) => return Err(e.to_string()),
     };
-    Ok(prime_backlog_window(&bytes, n))
+    let mut file = std::io::BufReader::with_capacity(chunk_bytes.max(1), file);
+
+    // Pass 1 — count the complete lines.
+    let mut total: u64 = 0;
+    loop {
+        let buf = match file.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) => return Err(e.to_string()),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        total += buf.iter().filter(|b| **b == b'\n').count() as u64;
+        let len = buf.len();
+        file.consume(len);
+    }
+    let skipped = total.saturating_sub(n);
+    if skipped == 0 {
+        return Ok((0, 0));
+    }
+
+    // Pass 2 — locate the window boundary on the same bytes.
+    if let Err(e) = file.seek(SeekFrom::Start(0)) {
+        return Err(e.to_string());
+    }
+    let mut remaining = skipped;
+    let mut base: u64 = 0;
+    loop {
+        let buf = match file.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) => return Err(e.to_string()),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        for (i, b) in buf.iter().enumerate() {
+            if *b == b'\n' {
+                remaining -= 1;
+                if remaining == 0 {
+                    return Ok((base + i as u64 + 1, skipped));
+                }
+            }
+        }
+        let len = buf.len();
+        base += len as u64;
+        file.consume(len);
+    }
+    // Pass 1 counted `skipped` newlines in these same bytes on this same
+    // handle, so EOF here means the file was truncated in place underneath
+    // us — unreachable under the append-only log discipline. Mirror
+    // `prime_backlog_window`'s defensive fallback: cursor at the observed
+    // end of the complete region.
+    Ok((base, skipped))
 }
 
-/// The pure offset math behind [`prime_backlog_lines`] — no I/O, fully
+/// The pure offset math behind `prime_backlog_lines` — no I/O, fully
 /// unit-testable: given the raw file's bytes and the window size `n`,
-/// return `(cursor, skipped_beyond)`.
+/// return `(cursor, skipped_beyond)`. Test-only ORACLE since the streaming
+/// rewrite (issue #297 item 1): production no longer routes through it, but
+/// the streaming reader must agree with this function on every input (the
+/// equivalence family in `supervisor/tests.rs` pins it), so it stays as the
+/// readable statement of the window math.
+#[cfg(test)]
 pub(super) fn prime_backlog_window(bytes: &[u8], n: u64) -> (u64, u64) {
     // Every `\n` terminates exactly one complete line; a trailing partial
     // line contributes none.
