@@ -2,7 +2,7 @@
 title: 'Host-mode spec — the shim crate and the lock model (serve-shape measurement + bounded-options proposal)'
 type: 'feature'
 created: '2026-10-19'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'f3e2d3910ee5fe7c9f71f6e4793cc7ff48690609'
 context:
@@ -74,7 +74,7 @@ context:
 - [x] `scripts/test_automation.py` — EXTEND the perf-job pins (and boundary pins if touched) to match the workflow in the same change.
 - [x] `docs/testing.md` — DOCUMENT the scenario (what it drives, budgets, invocation, wiring) and APPEND this story's measured figures to the measured record; `scripts/check_docs.py` validates.
 - [x] `_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md` — CREATE the bounded-options proposal: ≥ 2 crate-name candidates (today's `hekma-*` convention; e.g. `hekma-host`) with drafted AD-2 allowlist-entry wording; HTTP stack candidates at minimum axum / hyper directly (already in-tree) / a no-new-heavy-dep minimal option — each with dependency footprint under NFR-8, SSE support, maintenance risk; plus the AD-18 recommendation from the measurement (re-ratify coarse WITH the numbers, or activate the archived ai-63b plan).
-- [ ] `ARCHITECTURE-SPINE.md` + `sprint-status.yaml` + docs — RATIFICATION-GATED: apply Islam's pick to AD-20's "Settled" note and the tracker in one change — runs ONLY after the human decision.
+- [x] `ARCHITECTURE-SPINE.md` + `sprint-status.yaml` + docs — RATIFICATION-GATED: apply Islam's pick to AD-20's "Settled" note and the tracker in one change — runs ONLY after the human decision. (2026-10-19: picked D1 hekma-host / D2 axum 0.8 / D3 re-ratify coarse; applied in the same change — spine Amendments 2026-10-19, ci.yml allowlist `|host` + automation pin, docs/testing.md naming, tracker note, proposal §5 record.)
 
 **Acceptance Criteria:**
 - Given the no-flag invocation, when the harness runs, then its report and exit behavior are byte-equivalent to pre-17-1 and all seven existing gates behave identically.
@@ -108,6 +108,11 @@ context:
   needs a maintainer call; recorded in deferred-work.md). Run of record after
   hardening: p99 5.07 ms / CPU 1.94 %/instance (effective 10) / RSS 0.96 MiB /
   4 overlapping reads / 0 retries. Verdict unchanged: budgets hold.
+- 2026-10-19 (ratification, human gate closed): Islam picked D1 `hekma-host` / D2 axum 0.8 /
+  D3 re-ratify coarse (all recommendations as proposed). Applied verbatim in one change:
+  spine Amendments (2026-10-19) + AD-20 settled note + AD-18 trigger-(1) closure;
+  ci.yml boundary allowlist `|host` + the test_automation pin; docs/testing.md names the
+  crate; proposal §5 records the pick; this task list is now complete. Spec → done.
 - 2026-10-19 (orchestrator, review triage): clarified the Verification manual
   check — sprint-status STATUS-sync (in-progress/review flips) is the build
   workflow's own sync step and is not part of the AI-58 ratification gate,
@@ -135,3 +140,51 @@ context:
 
 **Manual checks (if no CLI):**
 - `git status`/diff shows NO change to the spine, PRD, epics.md, or sprint-status beyond the ratification-gated task, and no planning-artifact change except the named proposal doc — AI-58 honored.
+
+## Suggested Review Order
+
+**The serve scenario (entry point)**
+
+- Entry: the whole scenario — fixture, driver runtime, stop task, follower, sampler — orchestrates here.
+  [`perf-budgets.rs:1533`](../../crates/hekma-engine/examples/perf-budgets.rs#L1533)
+
+- The concurrency driver: 4 readers + follower + pathological bounded stop on the PUBLIC async facade.
+  [`perf-budgets.rs:1218`](../../crates/hekma-engine/examples/perf-budgets.rs#L1218)
+
+**The gates and their teeth**
+
+- Serve verdicts: three own-named NFR-4 gates, platform-scoped, conservative normalization.
+  [`perf-budgets.rs:964`](../../crates/hekma-engine/examples/perf-budgets.rs#L964)
+
+- The exit fold (mutation-pinned): red serve → exit 1; teeth, not advisory output.
+  [`perf-budgets.rs:2633`](../../crates/hekma-engine/examples/perf-budgets.rs#L2633)
+
+- `--write-baseline` refuses a red serve run by name (serve_failed arm).
+  [`perf-budgets.rs:2647`](../../crates/hekma-engine/examples/perf-budgets.rs#L2647)
+
+**Measurement honesty**
+
+- Zero-overlap contention proof: named exit-2 before any verdict — no vacuous evidence.
+  [`perf-budgets.rs:1016`](../../crates/hekma-engine/examples/perf-budgets.rs#L1016)
+
+- Sampler clamped to the load window; schedule-aware conservative divisor.
+  [`perf-budgets.rs:1035`](../../crates/hekma-engine/examples/perf-budgets.rs#L1035)
+
+- Per-OS gate binding scope (linux/macos gate; elsewhere report-only + note).
+  [`perf-budgets.rs:1070`](../../crates/hekma-engine/examples/perf-budgets.rs#L1070)
+
+**CI wiring + pins**
+
+- The second blocking CI step (bare `--serve-shape` last line; own report file, same artifact).
+  [`ci.yml:582`](../../.github/workflows/ci.yml#L582)
+
+- The fold's mutation pin — delete any token and this test reds.
+  [`perf-budgets.rs:5328`](../../crates/hekma-engine/examples/perf-budgets.rs#L5328)
+
+**Docs + the decision proposal**
+
+- The serve-shape section + measured record (load model, provenance, run of record).
+  [`testing.md:270`](../../docs/testing.md#L270)
+
+- The bounded-options proposal for the ratification: D1/D2/D3, one recommendation each.
+  [`host-mode-decisions-2026-10-19.md`](../planning-artifacts/host-mode-decisions-2026-10-19.md)

@@ -542,7 +542,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("cargo +stable check -p hekma", ci)
         self.assertIn("cargo +stable tree -p hekma -e normal,build --all-features", ci)
         # Boundary gate is an allowlist: only these internal edges may exist.
-        self.assertIn("hekma-(engine|adapter-api|adapters-hermes)", ci)
+        self.assertIn("hekma-(engine|adapter-api|adapters-hermes|host)", ci)
         # OS-cfg gate uses the broadened class pattern (compound cfg forms).
         self.assertIn("cfg[!(]?.*(unix|windows|target_os|target_family)", ci)
         self.assertIn("crates/hekma-engine/src/backends/", ci)

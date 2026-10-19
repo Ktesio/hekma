@@ -655,7 +655,7 @@ jobs:
           violations=''
           if [ -n "$edges" ]; then
             filter_status=0
-            violations="$(printf '%s\n' "$edges" | grep -Evx 'hekma-(engine|adapter-api|adapters-hermes)')" || filter_status=$?
+            violations="$(printf '%s\n' "$edges" | grep -Evx 'hekma-(engine|adapter-api|adapters-hermes|host)')" || filter_status=$?
             if [ "$filter_status" -ge 2 ]; then
               echo "::error::grep exited ${filter_status} while applying the internal-crate allowlist."
               exit "$filter_status"

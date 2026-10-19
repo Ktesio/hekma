@@ -269,7 +269,7 @@ Process metrics come from `sysinfo` — a DEV-dependency of `hekma-engine` only,
 
 ### The serve-shape scenario (`--serve-shape`)
 
-AD-18's reopen trigger fired when AD-20 (the Service Host) was ratified: a long-lived host drives the engine's PUBLIC async facade under serve-shaped concurrency, and the coarse two-mutex lock model must be **measured** against NFR-4 under that shape — never argued. `--serve-shape` extends the harness **additively**: the default no-flag invocation stays byte-equivalent (the `serve_shape` report block exists only on serve runs), `schema_version` stays 1, and the serve gates carry their OWN names and bind **only on serve runs**.
+AD-18's reopen trigger fired when AD-20 (the Service Host — the `hekma-host` crate, settled 2026-10-19) was ratified: a long-lived host drives the engine's PUBLIC async facade under serve-shaped concurrency, and the coarse two-mutex lock model must be **measured** against NFR-4 under that shape — never argued. `--serve-shape` extends the harness **additively**: the default no-flag invocation stays byte-equivalent (the `serve_shape` report block exists only on serve runs), `schema_version` stays 1, and the serve gates carry their OWN names and bind **only on serve runs**.
 
 **The shape.** After every gated phase (so it cannot contaminate them), on the same fixture PLUS one pathological instance, the harness drives the engine exactly as an embedded host would (docs/embedding.md: "call its async methods on your own runtime"): a small multi-thread tokio runtime **owned by the driver** calls the public async methods concurrently — no HTTP transport (the lock question is engine-side; a transport would only add noise), no private reach-in. For one 12 s window:
 

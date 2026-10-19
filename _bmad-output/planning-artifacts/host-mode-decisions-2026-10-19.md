@@ -2,7 +2,7 @@
 type: architecture-decision-proposal
 date: 2026-10-19
 author: Winston (System Architect) via the BMAD build of epic-17 story 17.1, for Islam
-status: draft-awaiting-ratification  # AI-58 draft-then-ratify: ZERO planning artifacts were touched to produce this. Every recommendation below is applied verbatim only after Islam picks, in ONE change (see §4).
+status: ratified-2026-10-19  # AI-58 draft-then-ratify: ZERO planning artifacts were touched to produce this. Ratified by Islam 2026-10-19 — D1 hekma-host / D2 axum 0.8 / D3 re-ratify coarse (all recommendations as proposed); §4's one-change application landed in the same change.
 decides: "The three decisions AD-20 deferred to the host-mode spec stage — D1: the host crate's name; D2: the Control API's HTTP stack (NFR-8 review); D3: the AD-18 lock-model outcome (reopen trigger (1), fired by AD-20's ratification)."
 gate: "AD-20: 'Settled at 15.1's spec stage' — realized as this spec stage. Nothing here edits ARCHITECTURE-SPINE.md, the PRD, epics.md, or the sprint tracker; §4 lists the exact edits ratification applies."
 method: "D3 decided BY MEASUREMENT — the perf-budgets harness's new --serve-shape scenario drove the engine's PUBLIC async facade under serve-shaped concurrency on 2026-10-19 and the fixed decision rule was applied to the numbers. D1/D2 decided by bounded options with stated trade-offs, exactly one recommendation each."
@@ -244,3 +244,13 @@ After Islam picks (or amends), ONE change applies the picks verbatim:
 
 No spine/PRD/epics/tracker byte was touched to produce this document (verified: this worktree's
 diff contains only the harness, CI, docs/testing.md, the automation pins, and this file).
+
+## 5. Ratification record (2026-10-19)
+
+Islam picked all three recommendations as proposed: **D1 `hekma-host` · D2 axum 0.8 · D3
+re-ratify coarse.** Applied verbatim in one change to: ARCHITECTURE-SPINE.md (AD-2 crate-list
+amendment, AD-20 settled note → outcome, AD-18 trigger-(1) closure note, *Amendments
+(2026-10-19)* block), `.github/workflows/ci.yml` (boundary allowlist `|host`),
+`scripts/test_automation.py` (the allowlist pin), `docs/testing.md` (the host crate named), and
+the sprint tracker (17-1's ratification-gated task ticked). The AD-18 per-instance plan stays
+archived; the standing reopen triggers remain the guard.
