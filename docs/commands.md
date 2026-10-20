@@ -464,7 +464,7 @@ Agents started under `serve` run with a **child-environment allowlist**: a hoste
 The floor exists because a strictly cleared environment breaks real children outright (no `PATH` → no program resolution or shelling out; on Windows, stripped `SystemRoot`/`ComSpec` break process startup). It is OS plumbing, not host-environment leakage:
 
 - **Unix:** `PATH`, `HOME`
-- **Windows:** `SystemRoot`, `SystemDrive`, `ComSpec`, `TEMP`, `TMP`, `PATH`
+- **Windows:** `SystemRoot`, `SystemDrive`, `ComSpec`, `TEMP`, `TMP`, `PATH`, `HOME`
 
 The floor values come from the host's own environment; everything beyond the declared mappings and this floor is still cleared. The declared-env contract is unchanged for every other variable.
 

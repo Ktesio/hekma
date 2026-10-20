@@ -44,11 +44,10 @@ pub(crate) fn digest(data: &[u8]) -> [u8; 32] {
     // Message padding (FIPS 180-4 §5.1.1): append 0x80, then k zero bits so
     // the total length ≡ 56 (mod 64), then the 64-bit big-endian bit length.
     let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
-        compress(&mut h, block.try_into().expect("chunks_exact yields 64"));
+    let (blocks, remainder) = data.as_chunks::<64>();
+    for block in blocks {
+        compress(&mut h, block);
     }
-    let remainder = blocks.remainder();
     let mut last = [0u8; 64];
     last[..remainder.len()].copy_from_slice(remainder);
     last[remainder.len()] = 0x80;
@@ -62,7 +61,8 @@ pub(crate) fn digest(data: &[u8]) -> [u8; 32] {
     compress(&mut h, &last);
 
     let mut out = [0u8; 32];
-    for (word, chunk) in h.iter().zip(out.chunks_exact_mut(4)) {
+    let (out_words, _) = out.as_chunks_mut::<4>();
+    for (word, chunk) in h.iter().zip(out_words) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     out
@@ -81,8 +81,9 @@ pub(crate) fn to_hex(digest: &[u8; 32]) -> String {
 /// updating `h` in place.
 fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (word, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes(chunk.try_into().expect("chunks_exact yields 4"));
+    let (block_words, _) = block.as_chunks::<4>();
+    for (word, chunk) in w.iter_mut().zip(block_words) {
+        *word = u32::from_be_bytes(*chunk);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);

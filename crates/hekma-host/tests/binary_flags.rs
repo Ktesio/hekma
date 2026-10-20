@@ -4,14 +4,22 @@
 //! REAL binary (`CARGO_BIN_EXE_hekma-host`), so the 17-5 container binary
 //! can reach every capture posture, not a hardcoded Full.
 //!
-//! The parse-refusal pin runs everywhere. The end-to-end OFF leg (the flag
-//! lands in a serving engine and `/v0/version` self-describes it) is
-//! `#[cfg(unix)]`: it needs a SIGTERM to shut the child down cleanly, and
-//! the Windows console-event harness is the recorded deferred-work gap (the
-//! serve CLI e2e's disclosure — the same posture applies here).
+//! The parse-refusal pins run everywhere. The end-to-end OFF leg (the flag
+//! lands in a serving engine and `/v0/version` self-describes it)
+//! RUNTIME-SKIPS on Windows via the house OS-id check (no cfg attributes —
+//! the boundary gate confines conditional code to backends/): it shuts the
+//! child down with POSIX `kill -TERM`, and the Windows console-event
+//! harness is the recorded deferred-work gap (the serve CLI e2e's
+//! disclosure — the same posture applies here).
 
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+/// The house runtime-skip check (the serve CLI e2e's idiom): no cfg
+/// attributes in this file — the OS is data, decided at runtime.
+fn is_windows() -> bool {
+    hekma_engine::OsId::current() == hekma_engine::OsId::Windows
+}
 
 /// The HTTP client (the control_api suite's idiom: statuses are data, not
 /// errors, and every wait is bounded).
@@ -24,8 +32,8 @@ fn client() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-/// The binary's path (the integration-test convention).
-#[cfg(unix)]
+/// The binary's path (the integration-test convention — the env var is set
+/// for integration tests on every OS).
 fn hekma_host_bin() -> &'static str {
     env!("CARGO_BIN_EXE_hekma-host")
 }
@@ -74,9 +82,15 @@ fn a_missing_log_capture_value_is_a_usage_refusal() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn the_log_capture_flag_lands_in_the_serving_engine_and_the_version_says_so() {
+    if is_windows() {
+        return; // POSIX `kill -TERM` shutdown; on Windows the same flag path
+                // is exercised by the parse-refusal pins above and by the
+                // library-level serve suite — the real-console-event e2e
+                // is the recorded deferred-work gap (the serve CLI e2e's
+                // disclosure — the same posture applies here).
+    }
     // The end-to-end parity leg: `hekma-host --log-capture off` serves with
     // capture OFF, and `/v0/version`'s self-description names it (review
     // finding 21's field, reached through the BINARY's flag).
