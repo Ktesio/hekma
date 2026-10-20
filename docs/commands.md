@@ -422,6 +422,8 @@ Values resolve across four layers — engine defaults &lt; agent-kind defaults &
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
+> Running the host inside a container — the static musl build, the host vs PID 1, the drain-vs-stop-grace mapping, and the volume-backed state directory — has its own page: [Running Hekma as a container supervisor](hosting.md).
+
 ```bash
 hekma serve
 hekma serve --stop-window 10

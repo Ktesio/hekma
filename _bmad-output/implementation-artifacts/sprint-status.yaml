@@ -182,7 +182,7 @@ development_status:
   17-2-hekma-serve-the-long-running-host: in-review  # implemented + 3-layer review hardening complete 2026-10-19; PR #311 open, rebased onto merged #310 + maintainer Windows-fix batch 2026-10-20 (f0424ef)
   17-3-control-api-v0: in-review  # implemented + 29-finding review hardening complete 2026-10-19; PR #312 open, rebased 2026-10-20 (922ae18)
   17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: in-review  # implemented + 26-finding review hardening complete 2026-10-20; PR follows immediately (base 17-3)
-  17-5-static-linux-release-and-the-container-recipe: backlog
+  17-5-static-linux-release-and-the-container-recipe: in-review  # implemented + 17-finding review round complete 2026-10-20 (release-blocking static-pie gate caught + fixed); PR follows immediately (base 17-4)
   epic-17-retrospective: optional
   epic-18: backlog  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber)
   18-1-readiness-probes: backlog
