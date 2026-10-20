@@ -2649,6 +2649,14 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 17-4 (review finding 1): the outbox journal/ack file is
+        // unreadable and the engine refuses to open rather than mint
+        // duplicate event sequences. The detail names the file and the full
+        // quarantine + re-sync remediation — surfaced verbatim.
+        RegistryError::OutboxOpenRefused { detail } => AgentIo {
+            message: format!("{detail}. Nothing was started or changed."),
+        }
+        .into(),
     }
 }
 

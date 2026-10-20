@@ -41,6 +41,8 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::{setsid, Pid};
 
+#[cfg(test)]
+use crate::ports::LogCaptureMode;
 use crate::ports::{
     spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
     ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
@@ -416,6 +418,7 @@ impl ProcessBackend for UnixBackend {
                 stderr_raw_path,
                 attributed_log_path,
                 spec.instance_name.clone(),
+                spec.capture_mode,
             )
         });
         Ok(UnixProcess {
@@ -1094,6 +1097,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         }
     }
 
@@ -1735,6 +1739,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         s.env.clear();
 
@@ -1901,6 +1906,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
             log_file: Some(agent_log.clone()),
             attributed_log_path: Some(dir.path().join("output.log")),
             stderr_log_file: Some(dir.path().join("stderr.raw")),
@@ -2009,6 +2015,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         s.env.insert("KT_TEST".to_string(), "applied".to_string());
         let backend = UnixBackend::new();
@@ -2060,6 +2067,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         s.env.clear();
 
@@ -2182,6 +2190,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         let mut proc = backend
             .spawn(&s)
@@ -2243,6 +2252,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
 
@@ -2322,6 +2332,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         let backend = UnixBackend::new();
         let mut proc = backend.spawn(&s).expect("spawn fake_agent");
@@ -2411,6 +2422,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         let mut original = backend.spawn(&s).expect("spawn sleep with capture");
         assert!(backend.log_capture(&original).is_some());

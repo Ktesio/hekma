@@ -296,6 +296,12 @@ impl Supervisor {
             // removed below. TERMINAL mode (story 12-4): a commit failure here
             // announces the loss — no next pass.
             self.drain_observed_for(registry, &name, DrainMode::Terminal);
+            // Story 17-4: in metadata mode the raw capture files leave the disk
+            // with the Run — the final usage pass above has already parsed them
+            // (metadata parses before unlink). Covers the crash, stuck-stopping,
+            // and silent-drop branches below uniformly: every one of them ends
+            // this Run. Best-effort, surfaced failure.
+            self.unlink_raw_logs_if_metadata(registry, &name);
 
             // Read the store state: only an instance the store still shows
             // running/paused is an UNREQUESTED crash. A `stopping` (operator
@@ -964,6 +970,14 @@ impl Supervisor {
                             // genuinely unreadable code falls to the
                             // unavailable-code cause there.
                             adopted: true,
+                            // Story 17-4 (review finding 11): an adopted
+                            // Run's capture posture is the ORIGINATING
+                            // engine's, which this engine cannot know —
+                            // `None` keeps the host's mode from ever
+                            // unlinking another engine's raw logs, and the
+                            // capture-read refusal qualifies the unknown
+                            // provenance instead of claiming a shape.
+                            capture_mode: None,
                             // Story 14-1 (spine AD-19): an ADOPTED acp instance
                             // is re-held as a bare process — its ACP pipe
                             // halves died with the engine that spawned it, so

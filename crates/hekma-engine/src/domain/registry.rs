@@ -1406,6 +1406,22 @@ impl Registry {
             .join(format!("output.log.{generation}"))
     }
 
+    /// The engine-GLOBAL outbox journal FILE (story 17-4, the AD-14
+    /// amendment) — the append-only JSON-Lines journal at the STATE BASE (not
+    /// per-Agent-Home: the whole point is the cross-instance global order).
+    /// The engine is the SOLE writer, at the three family commit sites under
+    /// the supervisor lock; Hosts read it only through `Engine::export_events`.
+    pub(crate) fn outbox_journal_path(&self) -> std::path::PathBuf {
+        self.paths.outbox_journal()
+    }
+
+    /// The outbox's durable consumer-cursor FILE (story 17-4) — the
+    /// atomically-written ack record beside the journal. Written only through
+    /// the export-ack path.
+    pub(crate) fn outbox_ack_path(&self) -> std::path::PathBuf {
+        self.paths.outbox_ack()
+    }
+
     /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
     /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {

@@ -882,7 +882,7 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
     // in the new shape): each fragment must match EXACTLY ONE site, so a
     // removed or reworded diagnostic route — or a second direct stderr writer
     // sneaking past the print scan above — fails here. ----
-    let sink_pins: [(&str, &str, &str); 11] = [
+    let sink_pins: [(&str, &str, &str); 14] = [
         // The ONE diagnostic emission choke point (every pinned diagnostic routes
         // through it; the `[hekma] ` prefix + terminating newline live here).
         (
@@ -900,12 +900,37 @@ fn the_engine_never_reads_stdin_prints_prompts_or_installs_global_process_state(
         // The enforcement breadcrumb's route into the sink (a breach action
         // that could not be honored, or a breach record that failed to append
         // — an operator breadcrumb, never the record). The marker is the
-        // whole single-line call, so it stays distinct from the AI-41 site
-        // below (a multi-line `format!` whose call line carries no args).
+        // breadcrumb's own route line (the message is bound to a local first,
+        // the same idiom as every other pinned route — string CONTENTS are
+        // blanked by the scan's cleaner, so a marker must be code only).
         (
             "domain/supervisor/usage.rs",
-            "self.emit_diagnostic(&format!(",
+            "self.emit_diagnostic(&breadcrumb);",
             "the enforcement breadcrumb's route into the sink",
+        ),
+        // Story 17-4 (the AD-12 amendment): the COORDINATED agent.log
+        // truncate notice — every truncate-to-0 at the capture bound is
+        // announced (the bound was crossed; metering stayed
+        // double-count-free), never silent.
+        (
+            "domain/supervisor/usage.rs",
+            "self.emit_diagnostic(&truncated_notice);",
+            "the 17-4 coordinated agent.log truncate notice's route into the sink",
+        ),
+        // Story 17-4: the truncate DEFERRAL notice — a failed set_len(0) is
+        // announced and the truncate retries next tick, never silent.
+        (
+            "domain/supervisor/usage.rs",
+            "self.emit_diagnostic(&truncate_deferred);",
+            "the 17-4 truncate-deferral notice's route into the sink",
+        ),
+        // Story 17-4: the metadata-mode unlink failure notice — a raw capture
+        // file that could not be removed at stop/terminal (metadata mode
+        // keeps no agent content at rest) is announced, never silent.
+        (
+            "domain/supervisor/usage.rs",
+            "self.emit_diagnostic(&unlink_failure);",
+            "the 17-4 metadata unlink-failure notice's route into the sink",
         ),
         // AI-41 (story 11-1): a usage event whose ledger INSERT failed — the
         // event was NOT counted and the drain will retry it. A NEW third

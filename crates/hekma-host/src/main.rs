@@ -13,6 +13,9 @@
 //! finding 9), `--metering-listen <port>`, and — story 17-3 — `--listen
 //! <addr>` + `--bearer-secret <name>` (the Control API; BOTH or NEITHER — a
 //! half-configured API is a usage error, and an unparseable address is too).
+//! Story 17-4 (review finding 17): `--log-capture <full|metadata|off>` —
+//! the SAME flag and values as `hekma serve`, so the container binary can
+//! reach every capture posture.
 //! Anything else is a usage error:
 //! the message AND the usage text go to STDERR (help is the only stdout
 //! product; finding 19), exit 2. `ServeError` variants map onto the same
@@ -37,6 +40,7 @@ fn main() {
     let mut metering_listen: u16 = 0;
     let mut control_listen: Option<std::net::SocketAddr> = None;
     let mut bearer_secret: Option<String> = None;
+    let mut log_capture: Option<hekma_engine::LogCaptureMode> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -104,6 +108,23 @@ fn main() {
                     None => usage_error("--bearer-secret needs a secret NAME"),
                 }
             }
+            "--log-capture" => {
+                i += 1;
+                // Story 17-4 (review finding 17): the SAME flag, values, and
+                // parse refusal as `hekma serve` (one surface to learn) —
+                // the 17-5 container binary must reach every capture
+                // mode, not a hardcoded Full. The engine's FromStr names
+                // the accepted values in its error (surfaced verbatim).
+                match args
+                    .get(i)
+                    .and_then(|v| v.parse::<hekma_engine::LogCaptureMode>().ok())
+                {
+                    Some(mode) => log_capture = Some(mode),
+                    None => {
+                        usage_error("--log-capture needs one of \"full\", \"metadata\", or \"off\"")
+                    }
+                }
+            }
             other => usage_error(&format!("unknown argument {other:?}")),
         }
         i += 1;
@@ -114,6 +135,10 @@ fn main() {
         metering_listen_port: metering_listen,
         control_listen,
         bearer_secret,
+        // Story 17-4 (review finding 17): the parsed flag (absent = the
+        // engine's `full` default — the same single defaulting site as the
+        // CLI, never a second one here).
+        log_capture: log_capture.unwrap_or_default(),
         diagnostics: None,
     };
     match hekma_host::serve(options) {
@@ -162,6 +187,10 @@ fn usage_text() -> String {
                                   Control API (an env var, or a key in the\n    \
                                   state dir's secrets file). Required with\n    \
                                   --listen; the API never serves unauthenticated\n    \
+         --log-capture <mode>     The capture posture: full (default),\n    \
+                                  metadata (hashed records at rest), or off\n    \
+                                  (nothing captured). Same flag and values\n    \
+                                  as `hekma serve`\n    \
          -h, --help               Print this help\n    \
          -V, --version            Print the version\n\
      \n\

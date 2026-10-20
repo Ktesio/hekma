@@ -168,6 +168,19 @@ enum Commands {
         /// then the state dir's secrets file. Requires --listen.
         #[arg(long, value_name = "NAME", requires = "listen")]
         bearer_secret: Option<String>,
+        /// The log-capture posture for every agent this host supervises
+        /// (story 17-4): `full` (the default) captures everything
+        /// byte-identically; `metadata` keeps agent content OFF persistent
+        /// disk at rest (transient raw redirects while running, hashed
+        /// metadata records + unlinked raw files at stop); `off` captures
+        /// nothing (null streams, honest absence everywhere, degraded
+        /// log-sentinel metering — never a fabricated size). The DEFAULT
+        /// LIVES IN `serve::run` (`unwrap_or_default`) — review finding 19
+        /// removed the redundant clap `default_value` so exactly one site
+        /// defaults, and `None` (no flag) is distinguishable from an
+        /// explicit `--log-capture full` in the parse.
+        #[arg(long, value_name = "MODE")]
+        log_capture: Option<hekma_engine::LogCaptureMode>,
     },
 }
 
@@ -391,12 +404,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             state_dir,
             listen,
             bearer_secret,
+            log_capture,
         }) => cli::serve::run(
             stop_window,
             metering_listen,
             state_dir,
             listen,
             bearer_secret,
+            // Review finding 19: the flag passes through as an Option —
+            // `serve::run`'s single `unwrap_or_default` is THE defaulting
+            // site (no clap `default_value` duplicates it).
+            log_capture,
         ),
         Some(Commands::Agent { command }) => match command {
             AgentCommands::Register {
@@ -952,6 +970,49 @@ mod tests {
         }
         if Cli::try_parse_from(["hekma", "serve", "--bearer-secret", "CONTROL_BEARER"]).is_ok() {
             panic!("--bearer-secret without --listen must be refused");
+        }
+    }
+
+    #[test]
+    fn test_serve_log_capture_flag_parses_and_lands_in_the_right_field() {
+        // Story 17-4 (the 17-3 parse-pin lesson): `--log-capture` is pinned
+        // at BOTH binary surfaces. This pin holds the clap parse — every
+        // accepted value lands in the RIGHT field, the default is `full`,
+        // and an invalid value is a PARSE refusal (never a silent default to
+        // a different mode).
+        let default = Cli::try_parse_from(["hekma", "serve"]).expect("bare serve parses");
+        let Some(Commands::Serve { log_capture, .. }) = &default.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(
+            *log_capture, None,
+            "no flag parses as None — the default lives ONLY in serve::run \
+             (review finding 19: no clap default_value duplicates it)"
+        );
+
+        for (text, expected) in [
+            ("full", hekma_engine::LogCaptureMode::Full),
+            ("metadata", hekma_engine::LogCaptureMode::Metadata),
+            ("off", hekma_engine::LogCaptureMode::Off),
+        ] {
+            let cli = Cli::try_parse_from(["hekma", "serve", "--log-capture", text])
+                .unwrap_or_else(|err| panic!("--log-capture {text} must parse: {err}"));
+            let Some(Commands::Serve { log_capture, .. }) = &cli.command else {
+                panic!("expected the serve subcommand");
+            };
+            assert_eq!(
+                *log_capture,
+                Some(expected),
+                "--log-capture {text} lands in the log_capture field"
+            );
+        }
+
+        match Cli::try_parse_from(["hekma", "serve", "--log-capture", "sometimes"]) {
+            Ok(_) => panic!("an invalid mode must be a parse refusal"),
+            Err(err) => assert!(
+                err.use_stderr(),
+                "an invalid mode is a usage error naming the accepted values"
+            ),
         }
     }
 }

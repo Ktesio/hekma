@@ -2030,3 +2030,54 @@ fn a_prompt_to_an_agent_that_stops_draining_times_out_then_fails_fast() {
     let stopped = blocking.stop(name, None).expect("stop");
     assert_eq!(stopped.state, LifecycleState::Stopped);
 }
+
+#[test]
+fn an_off_engine_acp_instance_fleets_the_capture_off_sentinel() {
+    // Story 17-4 (review finding 23): the fleet gap notice's sentinel tier
+    // reads `capture-off` for a zero-ledger acp instance under an OFF
+    // engine — the ENGINE-LEVEL leg (Off mode through open_with_options, a
+    // REAL spawned acp agent, the real fleet path). The pure-constructor
+    // pin (fleet.rs) proves the wire value; this proves the WIRING: the
+    // supervisor's mode reaches `fleet_entry`'s gap notice for a live
+    // instance whose sentinel drain genuinely has no log to parse.
+    let base = TempDir::new().unwrap();
+    let engine = hekma_engine::Engine::open_with_options(
+        Some(base.path().to_path_buf()),
+        hekma_engine::EngineOptions {
+            log_capture: hekma_engine::LogCaptureMode::Off,
+            ..hekma_engine::EngineOptions::default()
+        },
+    )
+    .expect("open off-mode engine");
+    let name = "acp-off-sentinel";
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, "chunky", &[]);
+
+    let blocking = engine.blocking();
+    let started = blocking.start(name).expect("start");
+    assert_eq!(started.state, LifecycleState::Running);
+    poll_until("the off-mode acp instance is up", || {
+        blocking
+            .fleet_entry(name)
+            .map(|e| e.state == LifecycleState::Running)
+            .unwrap_or(false)
+    });
+
+    // No input was ever sent → the ledger stays at ZERO billing-grade
+    // usage → the gap notice is present, and its sentinel tier names the
+    // capture-off fact (never "no-lines-seen", which would imply a drain
+    // that never ran — capture was OFF).
+    let entry = blocking.fleet_entry(name).expect("fleet entry");
+    let gap = entry
+        .usage_gap
+        .as_ref()
+        .expect("a zero-ledger acp instance carries the honest gap notice: {entry:?}");
+    assert_eq!(
+        gap.sentinel, "capture-off",
+        "the sentinel tier names the capture-off fact: {gap:?}"
+    );
+
+    // Stop still works under Off (the posture changes no lifecycle path).
+    let stopped = blocking.stop(name, None).expect("stop");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+}

@@ -45,6 +45,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,9 +55,9 @@ use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
 use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
-    assemble_usage_event, BackendError, LogCapture, MemoryBackingKind, ObservedUsageSource,
-    ParsedUsage, ProcessBackend, ProcessStatus, SelfReportedUsageSource, SpawnRecord, SpawnSpec,
-    UsageSource, KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
+    assemble_usage_event, BackendError, LogCapture, LogCaptureMode, MemoryBackingKind,
+    ObservedUsageSource, ParsedUsage, ProcessBackend, ProcessStatus, SelfReportedUsageSource,
+    SpawnRecord, SpawnSpec, UsageSource, KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -71,6 +72,10 @@ use super::event::{
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
+use super::outbox::{
+    append_with_retention, read_ack, read_journal_tolerant, OutboxEntry, OUTBOX_MAX_BYTES,
+    OUTBOX_SCHEMA_VERSION,
+};
 use super::registry::Registry;
 use super::restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
 use super::transition::{next_state, LifecycleCommand};
@@ -127,6 +132,12 @@ const MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS: u32 = 40;
 /// the cursor forever) and the diagnostic noise (≤ one diagnostic per attempt
 /// per offset, then the skip note).
 const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
+
+/// The outbox size cache's "unknown" sentinel ([`Supervisor::
+/// outbox_size_bytes`], review finding 7): a real journal is bounded by the
+/// 30MB cap, far below `u64::MAX`, so the sentinel can never collide with a
+/// true size. A failed append stores it; the next append stats the file.
+const OUTBOX_SIZE_UNKNOWN: u64 = u64::MAX;
 
 /// Story 12-4 AMENDMENT (review loop 1): how many minted events the observed
 /// drain's pending park buffer may hold at once. During a store outage EVERY
@@ -559,6 +570,15 @@ struct Supervised {
     /// sentinel channel is stdout) — a plain fact carried beside the handle
     /// so the drain cadence never re-reads the registry per tick.
     is_acp: bool,
+    /// Story 17-4 (review finding 11): the capture posture THIS ENGINE used
+    /// when it spawned this process — the per-Run truth the metadata-mode
+    /// unlink and the capture-read refusal consult, never the engine's
+    /// CURRENT mode (an instance adopted from another engine was spawned
+    /// under the ORIGINATING engine's posture, which this engine does not
+    /// know: `None` here. A `None` Run's raw logs are never unlinked — the
+    /// host's mode must not destroy another engine's files — and refusal
+    /// messages qualify the unknown provenance honestly).
+    capture_mode: Option<LogCaptureMode>,
     /// Story 12-4: the OBSERVED channel's park — `Some((pending, attempts))`
     /// while a store error keeps minted-but-uncommitted observed events parked
     /// (the analog of `usage_park_attempts`, which is the SELF-REPORTED
@@ -786,6 +806,45 @@ pub struct Supervisor {
     /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
     /// the supervisor owns the decision, the backends stay dumb executors).
     child_env_allowlist: bool,
+    /// Story 17-4 — the engine's global outbox seq counter. Holds the LAST
+    /// MINTED seq (0 fresh — no seq minted yet), so the append's
+    /// `fetch_add(1) + 1` mints 1 first (0 is [`super::OutboxCursor::START`]'s
+    /// "nothing yet" sentinel and never names a real entry). `fetch_add`
+    /// BEFORE the append so concurrent appends (impossible today — every
+    /// caller holds the supervisor lock — but the atomic keeps the invariant
+    /// structural) cannot share a seq; a FAILED append ROLLS BACK the
+    /// counter so a later successful append reuses the seq (a gap would make
+    /// a reader see a hole where none existed).
+    outbox_next_seq: AtomicU64,
+    /// Story 17-4 (review finding 7) — the outbox journal's CACHED byte
+    /// size, so the hot append needs NO whole-journal read under the
+    /// supervision lock: the cap check compares this + the incoming line,
+    /// `repair_torn_tail` decides from one byte, and only an actual
+    /// compaction pays the O(journal) read. Seeded from the file at open
+    /// ([`Self::rederive_outbox_seq`]), advanced by each append's returned
+    /// post-write stat, invalidated to [`OUTBOX_SIZE_UNKNOWN`] on any failed
+    /// append so the next append re-derives. Every reader/writer holds the
+    /// supervisor lock, so the in-memory accounting is sound; the u64::MAX
+    /// sentinel means "unknown — stat the file" (a real journal is bounded
+    /// by the 30MB cap, far below it).
+    outbox_size_bytes: AtomicU64,
+    /// Story 17-4 — the engine's log-capture posture (the AD-12 amendment),
+    /// set open-time via [`Supervisor::set_serve_options`] from
+    /// `EngineOptions::log_capture`. Resolved into each spawn's
+    /// [`SpawnSpec::capture_mode`] and the fleet gap-notice sentinel.
+    log_capture_mode: LogCaptureMode,
+    /// Story 17-4 (TEST seam): overrides the 10MB `agent.log` truncate cap
+    /// so the coordinated-truncate path is drivable at toy sizes. Never compiled outside test builds.
+    #[cfg(test)]
+    agent_log_cap_override: Option<u64>,
+    /// Story 17-4 (review finding 14): the per-channel truncate-deferral
+    /// latch — a FAILED `set_len(0)` announces ONCE (true) and re-arms only
+    /// when a truncate succeeds, so a persistently failing truncate cannot
+    /// re-emit the deferral diagnostic on every drain tick (the repo's other
+    /// surfaced states latch the same way).
+    agent_log_truncate_deferred: bool,
+    /// The stderr channel's twin of [`Self::agent_log_truncate_deferred`].
+    agent_stderr_truncate_deferred: bool,
     /// Review finding 16: whether [`Supervisor::set_serve_options`] has run
     /// on this supervisor — the OPEN-TIME-ONLY latch. The engine's open path
     /// applies once, on a fresh supervisor, before any lifecycle; any second
@@ -866,6 +925,13 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
+            outbox_next_seq: AtomicU64::new(0),
+            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
+            log_capture_mode: LogCaptureMode::default(),
+            #[cfg(test)]
+            agent_log_cap_override: None,
+            agent_log_truncate_deferred: false,
+            agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -896,6 +962,13 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
+            outbox_next_seq: AtomicU64::new(0),
+            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
+            log_capture_mode: LogCaptureMode::default(),
+            #[cfg(test)]
+            agent_log_cap_override: None,
+            agent_log_truncate_deferred: false,
+            agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -926,6 +999,13 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
+            outbox_next_seq: AtomicU64::new(0),
+            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
+            log_capture_mode: LogCaptureMode::default(),
+            #[cfg(test)]
+            agent_log_cap_override: None,
+            agent_log_truncate_deferred: false,
+            agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -993,21 +1073,25 @@ impl Supervisor {
     /// Apply the story-17-2 Host serve options BEFORE any start/adoption run:
     /// `port` (0 = ephemeral) pins every `engine-observed` loopback listener,
     /// `child_env_allowlist` (`true`) makes every spawn clear-then-apply the
-    /// manifest-declared environment. `pub(crate)` — the engine threads these
-    /// from [`EngineOptions`](crate::EngineOptions) inside `open_with_options`;
+    /// manifest-declared environment, and `log_capture_mode` (story 17-4)
+    /// pins the engine's capture posture for every later spawn.
+    /// `pub(crate)` — the engine threads these from
+    /// [`EngineOptions`](crate::EngineOptions) inside `open_with_options`;
     /// there is no post-open mutation seam (a port change mid-flight would
     /// strand already-started listeners, so serve options are open-time only).
     pub(crate) fn set_serve_options(
         &mut self,
         port: u16,
         child_env_allowlist: bool,
+        log_capture_mode: LogCaptureMode,
     ) -> Result<(), ServeOptionsRefused> {
         // Review finding 16: the serve options are OPEN-TIME ONLY, enforced
         // here — a supervisor whose lifecycle has begun (a process already
         // held: a start or an adoption ran) must never have them (re-)
         // applied. A port change mid-flight would strand already-started
         // listeners; an allowlist flip would make sibling children
-        // inconsistent. The `running` map is non-empty from the first
+        // inconsistent; a capture-mode flip would leave mixed-posture raw
+        // files on disk. The `running` map is non-empty from the first
         // supervised process onward.
         if !self.running.is_empty() {
             return Err(ServeOptionsRefused::LifecycleBegun {
@@ -1020,7 +1104,158 @@ impl Supervisor {
         self.serve_options_applied = true;
         self.metering_listen_port = port;
         self.child_env_allowlist = child_env_allowlist;
+        self.log_capture_mode = log_capture_mode;
         Ok(())
+    }
+
+    /// The engine's log-capture posture (story 17-4). `Copy` — a snapshot,
+    /// read under the supervisor lock like every other field.
+    pub(crate) fn log_capture_mode(&self) -> LogCaptureMode {
+        self.log_capture_mode
+    }
+
+    /// The (test-overridable) `agent.log` truncate cap —
+    /// [`crate::ports::LOG_ROTATE_MAX_BYTES`] in production (story 17-4 keeps
+    /// the raw redirect bounded at the same 10MB the attributed capture
+    /// rotates at); a toy size under `#[cfg(test)]`.
+    #[cfg(test)]
+    pub(crate) fn agent_log_cap(&self) -> u64 {
+        self.agent_log_cap_override
+            .unwrap_or(crate::ports::LOG_ROTATE_MAX_BYTES)
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn agent_log_cap(&self) -> u64 {
+        crate::ports::LOG_ROTATE_MAX_BYTES
+    }
+
+    /// Re-derive the outbox seq counter from the journal's committed tail
+    /// (story 17-4). Called ONCE at engine open, BEFORE any lifecycle can
+    /// append: a restart must continue the seq sequence (a restart from 1
+    /// would mint duplicate seqs, and a reader's "seq strictly greater than
+    /// cursor" walk would silently skip the reused range). The counter holds
+    /// the LAST minted seq, so the tail IS the resumed value — the next
+    /// append mints tail + 1, exactly. An absent or empty journal leaves the
+    /// counter at 0 (the first seq minted is 1) — UNLESS an ack file
+    /// survives it, in which case the counter seeds `max(tail, ack)`: the
+    /// ack is the seq floor (review finding 1) — minting a reused range
+    /// below a surviving ack would deliver events every Host cursor has
+    /// already skipped past, i.e. silently lose them.
+    ///
+    /// On a READ FAILURE the open REFUSES (review finding 1): a mis-derived
+    /// counter can mint DUPLICATE seqs, and an ack landing on a duplicate
+    /// lets compaction evict NEVER-DELIVERED events — silent loss. The
+    /// typed refusal names the file and the remediation (quarantine by
+    /// renaming; per-family `resync_events` remains the complete heal); the
+    /// caller maps it to [`crate::domain::RegistryError::OutboxOpenRefused`]
+    /// and the engine does not open.
+    ///
+    /// Also seeds the O(1) append's size cache (review finding 7) from the
+    /// journal's real byte size. Runs BEFORE the registry moves under the
+    /// engine's mutex, so the journal read and the counter/cache writes are
+    /// serialized against every later append by construction.
+    pub(crate) fn rederive_outbox_seq(&self, registry: &Registry) -> Result<(), String> {
+        let journal = registry.outbox_journal_path();
+        let view = read_journal_tolerant(&journal).map_err(|detail| {
+            format!(
+                "the outbox journal could not be read, and event sequences must not be \
+                 minted from an unverified counter (a duplicate seq under an ack lets \
+                 compaction evict never-delivered events): {detail}"
+            )
+        })?;
+        let ack_path = registry.outbox_ack_path();
+        let ack = read_ack(&ack_path).map_err(|detail| {
+            format!(
+                "the outbox ack file could not be read, and the ack is the seq floor \
+                 (seeding below it would mint a reused range every Host cursor has \
+                 already skipped past): {detail}"
+            )
+        })?;
+        let seed = view.tail.max(ack.unwrap_or(0));
+        self.outbox_next_seq.store(seed, Ordering::Relaxed);
+        let size = std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
+        self.outbox_size_bytes.store(size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Append one committed event to the engine's global outbox journal
+    /// (story 17-4) — BEST-EFFORT by contract: the outbox is an
+    /// export/replay AMENITY for ephemeral hosts, never a supervision
+    /// record (the instance logs + ledger are authoritative), so an append
+    /// failure is a surfaced diagnostic and a seq ROLLBACK, never a failed
+    /// transition. Callers run at the three commit points (transition,
+    /// breach, usage), immediately AFTER the durable family commit and
+    /// BEFORE the bus publish — under the supervisor lock, same as
+    /// `publish`, so journal order == bus order == durable-log order.
+    ///
+    /// Compaction (check-before-write, [`append_with_retention`]) runs under
+    /// the same lock, so appends and compactions can never interleave. The
+    /// append is O(1) amortized (review finding 7): the cap check compares
+    /// the cached size + the incoming line, the torn-tail repair decides
+    /// from one byte, and only an actual compaction reads the journal. An
+    /// un-acked eviction (the cap crossed while a Host has not acked) is
+    /// SURFACED as a diagnostic naming the loss — never silent (AI-18).
+    fn outbox_append(&self, registry: &Registry, event: EngineEvent) {
+        let seq = self.outbox_next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let entry = OutboxEntry {
+            schema_version: OUTBOX_SCHEMA_VERSION,
+            seq,
+            event,
+        };
+        let ack = match read_ack(&registry.outbox_ack_path()) {
+            Ok(ack) => ack,
+            Err(detail) => {
+                // Review finding 6: a corrupt/unreadable ack file must SAY
+                // it lost the ack at this compaction decision. Treating
+                // every retained entry as un-acked is the SAFE direction
+                // (nothing acked is evicted as free), but pretending the
+                // read succeeded would misattribute a later eviction as
+                // "un-acked loss" — a lie about what the Host consumed.
+                self.emit_diagnostic(&format!(
+                    "outbox: the ack file could not be read ({detail}); treating every \
+                     retained entry as UN-ACKED for this append's compaction (the safe \
+                     direction — nothing already-consumed is evicted as free, but the \
+                     journal may hold entries a Host has already acked; the ack file \
+                     should be inspected: {detail})",
+                ));
+                None
+            }
+        };
+        let raw = self.outbox_size_bytes.load(Ordering::Relaxed);
+        let cached = (raw != OUTBOX_SIZE_UNKNOWN).then_some(raw);
+        match append_with_retention(
+            &registry.outbox_journal_path(),
+            ack,
+            &entry,
+            OUTBOX_MAX_BYTES,
+            cached,
+        ) {
+            Ok((outcome, new_size)) => {
+                self.outbox_size_bytes.store(new_size, Ordering::Relaxed);
+                if outcome.dropped_unacked > 0 {
+                    self.emit_diagnostic(&format!(
+                        "outbox compaction dropped {} un-acked event(s) to stay under the \
+                         {}MB cap — a Host that has not acked the export cursor lost \
+                         replayable events",
+                        outcome.dropped_unacked,
+                        OUTBOX_MAX_BYTES / (1024 * 1024)
+                    ));
+                }
+            }
+            Err(detail) => {
+                // Roll the seq back: the entry never landed, so the seq must
+                // be reusable (a gap would fabricate a hole for exporters).
+                // The size cache is invalidated too — whatever the append
+                // touched (repair, compaction) may have moved the file.
+                self.outbox_next_seq.fetch_sub(1, Ordering::Relaxed);
+                self.outbox_size_bytes
+                    .store(OUTBOX_SIZE_UNKNOWN, Ordering::Relaxed);
+                self.emit_diagnostic(&format!(
+                    "outbox append failed (seq {seq}); the export journal lags the committed \
+                     record: {detail}"
+                ));
+            }
+        }
     }
 
     /// Emit ONE engine diagnostic (story 10-2) — the engine's ONLY diagnostic
@@ -1320,6 +1555,12 @@ impl Supervisor {
         // bus order is exactly the durable-log order. Ordering obligation:
         // this runs under the supervisor lock (see the `domain::bus`
         // caller-enforced invariant).
+        // Story 17-4: the outbox journal mirrors the same committed event at
+        // the SAME commit point — AFTER the durable family append, BEFORE the
+        // bus publish — so journal order == bus order == durable-log order.
+        // Best-effort (see `outbox_append`): a journal failure never fails
+        // the transition.
+        self.outbox_append(registry, EngineEvent::Transition(event.clone()));
         self.publish(EngineEvent::Transition(event.clone()));
         if let Some(capture) = log_capture {
             let text = engine_transition_line_text(&event);

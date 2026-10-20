@@ -45,6 +45,7 @@ pub fn run(
     state_dir: Option<String>,
     listen: Option<std::net::SocketAddr>,
     bearer_secret: Option<String>,
+    log_capture: Option<hekma_engine::LogCaptureMode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = hekma_host::ServeOptions {
         state_base: state_dir.map(PathBuf::from),
@@ -52,6 +53,11 @@ pub fn run(
         metering_listen_port: metering_listen,
         control_listen: listen,
         bearer_secret,
+        // Story 17-4: the capture posture — `None` (no flag) means the
+        // engine default (`full`, byte-identical to 17-3); the parsed flag
+        // value overrides. An UNPARSEABLE value never reaches here: clap's
+        // value parser refused at parse time.
+        log_capture: log_capture.unwrap_or_default(),
         // The stderr default: host + engine notices interleave on stderr,
         // byte-compatible with every other diagnostic surface.
         diagnostics: None,
@@ -75,4 +81,35 @@ pub fn run(
             }),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_half_configured_control_api_is_the_usage_class_refusal() {
+        // The class split (review finding 8), pinned IN-PROCESS: the host
+        // validates its options BEFORE anything is touched, so the refusal
+        // returns immediately — `--listen` without its bearer secret is the
+        // ServeOptionsInvalid arm (Usage class, exit 2 at the classifier),
+        // never a startup failure, and the remediation is named verbatim.
+        let err = run(
+            None,
+            0,
+            None, // the state base is never reached: validation fires first
+            Some("127.0.0.1:18499".parse().unwrap()),
+            None, // the bearer secret — deliberately absent
+            None,
+        )
+        .expect_err("a half-configured API refuses");
+        let mapped = err
+            .downcast_ref::<ServeOptionsInvalid>()
+            .expect("the InvalidOptions arm maps to the Usage class");
+        assert!(
+            mapped.message.contains("--bearer-secret"),
+            "the remediation is named: {}",
+            mapped.message
+        );
+    }
 }

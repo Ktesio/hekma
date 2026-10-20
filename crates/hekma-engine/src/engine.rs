@@ -65,12 +65,13 @@ use hekma_adapter_api::EffectiveCapabilities;
 
 use crate::adapter::AdapterRef;
 use crate::domain::{
-    broadcast, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer, DiagnosticSink,
-    EffectiveConfig, EngineError, EngineEvent, EventBus, FleetEntry, InstanceName, LifecycleState,
-    LogLine, Registry, RegistryError, RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor,
-    Supervisor, TransitionCause, TransitionEvent,
+    ack_core, broadcast, export_core, AgentInstance, BudgetBreachEvent, ConfigError, ConfigLayer,
+    DiagnosticSink, EffectiveConfig, EngineError, EngineEvent, EventBus, ExportBatch, FleetEntry,
+    InstanceName, LifecycleState, LogLine, OutboxCursor, Registry, RegistryError,
+    RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor, Supervisor, TransitionCause,
+    TransitionEvent,
 };
-use crate::ports::SpawnRecord;
+use crate::ports::{LogCaptureMode, SpawnRecord};
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
 /// `[ASSUMPTION]`). Small enough that a crash is detected promptly, large enough
@@ -217,6 +218,13 @@ pub struct EngineOptions {
     /// `child_env_allowlist`: no ambient Host-shell variables leak into hosted
     /// agents). `false` (the default) keeps full inheritance.
     pub child_env_allowlist: bool,
+    /// The engine's log-capture posture (story 17-4, the AD-12 amendment):
+    /// what is written to disk for a spawned agent's stdout/stderr. `full`
+    /// (the default) is byte-identical to the pre-17-4 capture; `metadata`
+    /// keeps raw content only transiently (metadata-only at rest, raw files
+    /// unlinked at stop); `off` captures nothing and every surface shows
+    /// honest absence. Open-time only, like the rest of the serve options.
+    pub log_capture: LogCaptureMode,
     /// The host-provided diagnostic sink, installed BEFORE orphan adoption
     /// and the crash-detection reaper start — identical semantics to
     /// [`Engine::open_with_diagnostics`]'s `sink` parameter.
@@ -230,8 +238,65 @@ impl std::fmt::Debug for EngineOptions {
         f.debug_struct("EngineOptions")
             .field("metering_listen_port", &self.metering_listen_port)
             .field("child_env_allowlist", &self.child_env_allowlist)
+            .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
             .finish()
+    }
+}
+
+/// The story-17-4 capture-read guard (AI-18 — honest absence, never a
+/// fabricated read), evaluated at the [`Engine`] facade because only the
+/// supervisor knows the engine-wide capture mode. Returns the typed refusal
+/// when the requested read cannot return what it promises under the active
+/// mode; `None` means "proceed".
+///
+/// * [`LogCaptureMode::Off`] refuses EVERY capture read: nothing was ever
+///   captured, so even an empty success would imply "captured, then
+///   exhausted" — a lie by shape. The refusal names the mode and the
+///   remediation (`--log-capture full|metadata`).
+/// * [`LogCaptureMode::Metadata`] refuses the ATTRIBUTED `output.log` reads
+///   only: that file holds hashed metadata records (size/sha256/attribution),
+///   not attributable line content — parsing it as [`LogLine`]s would either
+///   fail or mislead. The RAW reads proceed (the transient-while-running
+///   window is real content; the post-stop unlink surfaces as the existing
+///   honest missing-file semantics).
+fn capture_read_refusal(
+    mode: LogCaptureMode,
+    name: &InstanceName,
+    attributed: bool,
+    registry: &Registry,
+) -> Option<EngineError> {
+    let path = if attributed {
+        registry.attributed_output_log_path(name)
+    } else {
+        registry.agent_output_log_path(name)
+    };
+    let path = path.to_string_lossy().into_owned();
+    match (mode, attributed) {
+        (LogCaptureMode::Off, _) => Some(EngineError::Log {
+            name: name.as_str().to_string(),
+            path,
+            detail: "log capture is off for this engine: no output was ever captured \
+                     (fleet shows the `capture-off` gap); to capture output, a serve user \
+                     restarts with --log-capture full (or metadata), and a command-scoped \
+                     engine (kt agent ...) takes the posture from the embedding process's \
+                     EngineOptions::log_capture / serve configuration — there is no \
+                     per-command flag"
+                .to_string(),
+        }),
+        (LogCaptureMode::Metadata, true) => Some(EngineError::Log {
+            name: name.as_str().to_string(),
+            path,
+            detail: "this engine runs with --log-capture metadata: output.log holds hashed \
+                     metadata records (timestamp/stream/attribution/byte_len/sha256), not \
+                     attributable line content, for every Run THIS engine spawned; an \
+                     ADOPTED instance's output.log was written under its original engine's \
+                     mode, which this engine does not know, so its shape is not assumed \
+                     here. Read the raw agent.log while the instance runs, or restart the \
+                     serve surface with --log-capture full"
+                .to_string(),
+        }),
+        _ => None,
     }
 }
 
@@ -311,6 +376,7 @@ impl Engine {
         let EngineOptions {
             metering_listen_port,
             child_env_allowlist,
+            log_capture,
             diagnostics,
         } = options;
         let registry = Registry::open(base)?;
@@ -333,10 +399,21 @@ impl Engine {
         // this very open.
         let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
         supervisor
-            .set_serve_options(metering_listen_port, child_env_allowlist)
+            .set_serve_options(metering_listen_port, child_env_allowlist, log_capture)
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
+        // Story 17-4: continue the outbox seq sequence from whatever a prior
+        // engine lifetime committed (BEFORE the registry moves under the
+        // mutex, so the journal read and the counter write are serialized
+        // against every later append by construction). A read failure
+        // REFUSES the open (review finding 1): minting from an unverified
+        // counter can duplicate seqs, and an ack landing on a duplicate lets
+        // compaction evict never-delivered events — the typed refusal names
+        // the file and the quarantine/remediation procedure.
+        supervisor
+            .rederive_outbox_seq(&registry)
+            .map_err(|detail| RegistryError::OutboxOpenRefused { detail })?;
         if let Some(sink) = diagnostics {
             supervisor.install_diagnostics(sink);
         }
@@ -922,10 +999,14 @@ impl Engine {
         // context-usage state. NEVER fabricated; every other kind (and a
         // usage-carrying acp instance) omits the field.
         let usage_gap = if is_acp && cumulative.total_tokens() == 0 {
-            Some(crate::domain::UsageGapNotice::acp(
+            Some(crate::domain::UsageGapNotice::acp_with_capture(
                 metering_source == "engine-observed",
                 supervisor.sentinel_lines_seen(&instance.name),
                 acp_context_usage.is_some(),
+                // Story 17-4: an OFF engine never captured a log, so the
+                // sentinel tier reports the `capture-off` sentinel — never a
+                // "no-lines-seen" that implies a drain which never ran.
+                supervisor.log_capture_mode() == LogCaptureMode::Off,
             ))
         } else {
             None
@@ -1457,6 +1538,92 @@ impl Engine {
         .await
     }
 
+    /// The engine's configured log-capture posture (story 17-4, review
+    /// finding 21): `full` | `metadata` | `off` — `/v0/version`'s
+    /// self-description carries it, so a Host learns what `output.log`
+    /// holds and which capture surfaces serve, without a failed round-trip.
+    pub async fn log_capture_mode(&self) -> LogCaptureMode {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .supervisor
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .log_capture_mode()
+        })
+        .await
+    }
+
+    /// Pull ONE bounded batch of committed events from the engine's global
+    /// outbox journal (story 17-4) — the export surface ephemeral hosts use
+    /// to mirror committed truth to durable storage before the engine (and
+    /// its state dir) disappears. ONE global order across every event family
+    /// (transitions, budget breaches, usage updates): the journal append
+    /// order, which is the commit order (each hook fires at the same commit
+    /// point as the bus publish).
+    ///
+    /// `after` is the resume cursor: `None` starts from the DURABLE ACK
+    /// cursor (what this host has already persisted — the common "give me
+    /// what's new" pull), an explicit cursor overrides it. `max` bounds the
+    /// batch (`0` = the [`crate::domain::EXPORT_BATCH_DEFAULT_MAX`] default;
+    /// capped at [`crate::domain::EXPORT_BATCH_MAX_CAP`]). Every entry carries
+    /// its own `seq`, so a consumer can resume from the last one it durably
+    /// stored. A cursor below the journal's retained floor (compaction
+    /// already dropped those entries) or past the committed tail refuses with
+    /// the STABLE marker sentences the Control API maps to 409
+    /// `cursor_invalid` — never a silent clamp.
+    ///
+    /// The read takes the REGISTRY lock only (tolerant of concurrent
+    /// appends); the tolerant reader skips a torn crash-cut tail fragment.
+    pub async fn export_events(
+        &self,
+        after: Option<OutboxCursor>,
+        max: u32,
+    ) -> Result<ExportBatch, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            export_core(
+                &registry.outbox_journal_path(),
+                &registry.outbox_ack_path(),
+                after,
+                max,
+            )
+        })
+        .await
+    }
+
+    /// Advance the durable export ACK cursor (story 17-4): everything with
+    /// `seq <= ack` is CONSUMED and becomes compaction-eligible (the journal
+    /// drops the acked prefix once the size cap demands space). MONOTONIC —
+    /// the persisted cursor is `max(current, given)`, so a re-ack or a
+    /// backward ack is the current cursor (idempotent), never a rewind. An
+    /// ack PAST the journal's committed tail refuses with the stable
+    /// past-tail sentence (409 `cursor_invalid` at the Control API) — an ack
+    /// is a claim about entries that exist. The cursor persists
+    /// (`outbox-ack.json`, atomic write), so it survives a host restart.
+    ///
+    /// Holds the SUPERVISOR lock: ack advances what compaction may drop, so
+    /// it must not interleave an append's compaction decision.
+    pub async fn ack_export(&self, seq: u64) -> Result<u64, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            // The SUPERVISOR lock is held across the ack: it serializes the
+            // cursor advance against any append's compaction decision (a
+            // compaction deciding what to keep against a MOVING ack cursor is
+            // the one unsound interleaving). The guard binding is what holds
+            // it.
+            let _supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            ack_core(
+                &registry.outbox_journal_path(),
+                &registry.outbox_ack_path(),
+                seq,
+            )
+        })
+        .await
+    }
+
     /// Read the retained ATTRIBUTED output log for an instance (story 4-2,
     /// AC-A) — a ONE-SHOT full read of whatever is currently retained (the
     /// current generation plus any rotated predecessors), in on-disk append
@@ -1475,6 +1642,22 @@ impl Engine {
         let name = name.to_string();
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
+            // Story 17-4: the capture-mode guard is evaluated HERE (the
+            // supervisor owns the engine-wide mode) — an Off engine never
+            // captured anything, and a Metadata engine's `output.log` is
+            // metadata-shaped, so neither can return attributable lines.
+            let mode = inner
+                .supervisor
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .log_capture_mode();
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
+                return Err(err);
+            }
             Supervisor::read_agent_log(&registry, &name)
         })
         .await
@@ -1495,6 +1678,20 @@ impl Engine {
         let name = name.to_string();
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
+            // Story 17-4: same capture-mode guard as `read_agent_log` (the
+            // follow loop surfaces the refusal every poll).
+            let mode = inner
+                .supervisor
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .log_capture_mode();
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            if let Some(err) = capture_read_refusal(mode, &iname, true, &registry) {
+                return Err(err);
+            }
             Supervisor::read_agent_log_since(&registry, &name, cursor)
         })
         .await
@@ -1516,6 +1713,21 @@ impl Engine {
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
             let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            // Story 17-4: OFF refuses honestly (nothing was ever captured —
+            // an empty vector would LIE by implying a captured-then-exhausted
+            // log). METADATA proceeds: the raw file exists while the instance
+            // runs (that is the metadata contract's transient window) and its
+            // honest absence after the stop-time unlink is exactly what the
+            // existing missing-file semantics already report.
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            if let Some(err) =
+                capture_read_refusal(supervisor.log_capture_mode(), &iname, false, &registry)
+            {
+                return Err(err);
+            }
             supervisor.read_raw_output_since(&registry, &name, cursor)
         })
         .await
@@ -1537,6 +1749,18 @@ impl Engine {
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
             let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            // Story 17-4: the same Off guard as `read_raw_output_since` (its
+            // companion priming call — an Off engine refuses at the prime,
+            // before the follow loop starts polling).
+            let iname = InstanceName::new(&name).map_err(|reason| EngineError::InvalidName {
+                name: name.clone(),
+                reason,
+            })?;
+            if let Some(err) =
+                capture_read_refusal(supervisor.log_capture_mode(), &iname, false, &registry)
+            {
+                return Err(err);
+            }
             supervisor.prime_raw_backlog(&registry, &name, backlog_lines)
         })
         .await
@@ -1614,6 +1838,13 @@ impl Blocking<'_> {
     /// `NotFound` (the CLI's exit-3 diagnostic).
     pub fn fleet_entry(&self, name: &str) -> Result<FleetEntry, RegistryError> {
         self.engine.rt.block_on(self.engine.fleet_entry(name))
+    }
+
+    /// Blocking [`Engine::log_capture_mode`] (story 17-4, review finding 21:
+    /// the facade parity audit requires every public async entry point to
+    /// have this twin — embedders on the sync facade read the same posture).
+    pub fn log_capture_mode(&self) -> LogCaptureMode {
+        self.engine.rt.block_on(self.engine.log_capture_mode())
     }
 
     /// Blocking [`Engine::effective_capabilities`].
@@ -1707,6 +1938,24 @@ impl Blocking<'_> {
         self.engine
             .rt
             .block_on(self.engine.resync_events(name, after))
+    }
+
+    /// Blocking [`Engine::export_events`] (story 17-4) — the ephemeral-host
+    /// export pull the `kt agent serve` Control API route drives.
+    pub fn export_events(
+        &self,
+        after: Option<OutboxCursor>,
+        max: u32,
+    ) -> Result<ExportBatch, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.export_events(after, max))
+    }
+
+    /// Blocking [`Engine::ack_export`] (story 17-4) — the monotonic durable
+    /// ack advance the Control API's ack route drives.
+    pub fn ack_export(&self, seq: u64) -> Result<u64, EngineError> {
+        self.engine.rt.block_on(self.engine.ack_export(seq))
     }
 
     /// Blocking [`Engine::read_agent_log`] (story 4-2, AC-A).
