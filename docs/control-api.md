@@ -38,7 +38,9 @@ the API is up, the host prints a
 stderr; that notice is the address of record (with port `0`, it carries the
 OS-chosen port). A **non-loopback** bind works (container recipes legitimately
 bind `0.0.0.0`) but warns loudly: this surface has no TLS and bearer-only
-auth — do not expose it on an untrusted network.
+auth — do not expose it on an untrusted network. For the full container
+posture — the static build, the stop-grace mapping, the volume-backed state —
+see [Running Hekma as a container supervisor](hosting.md).
 
 ## Auth
 

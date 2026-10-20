@@ -32,10 +32,35 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-            
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            # The static Linux leg (musl): the archive ships hekma + hkm +
+            # hekma-host for containers/scratch. The flag gates the three
+            # leg-local additions below — the musl-tools install, the
+            # musl-gcc linker/CC build env, and the static-ness gate.
+            musl: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install musl tools
+        # Build-time CI provision ONLY: musl-gcc never enters the runtime
+        # dependency graph (no Cargo.toml/Cargo.lock byte changes).
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Configure the musl build env
+        # GATED export via $GITHUB_ENV — the vars exist ONLY on the musl leg
+        # (no empty-string exports on the other legs). They compile the C deps
+        # (libsqlite3-sys's bundled SQLite, ring's assembly) through musl-gcc.
+        if: matrix.musl
+        shell: bash
+        run: |
+          {
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc"
+            echo "CC_x86_64_unknown_linux_musl=musl-gcc"
+          } >> "$GITHUB_ENV"
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
       - name: Build
@@ -43,6 +68,30 @@ jobs:
         # MSRV (1.96.1) for local convenience; shipped release artifacts must be
         # built with latest stable, and a +toolchain argument overrides the file.
         run: cargo +stable build --release --target ${{ matrix.target }}
+      - name: Verify static
+        # A silently dynamic musl artifact (a missed linker env, a C dep that
+        # leaked glibc) fails the job HERE — it never ships. BOTH wordings are
+        # matched because rustc's x86_64-unknown-linux-musl default is
+        # static-pie, and `file` prints "static-pie linked" for those (plain
+        # static binaries print "statically linked"); only a DYNAMIC artifact
+        # matches neither.
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in hekma hkm hekma-host; do
+            file "target/${{ matrix.target }}/release/${bin}" | grep -Eq 'static(ally|-pie) linked'
+          done
+      - name: Stage hekma-host
+        # THIS leg only: the container-relevant set is the CLI pair PLUS the
+        # standalone host binary (a container runs hekma-host without the CLI).
+        # Every other leg keeps the pinned `hekma + hkm` archive contents.
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/hekma-host" dist/package/
       - name: Package Unix
         if: runner.os != 'Windows'
         shell: bash
@@ -60,6 +109,20 @@ jobs:
           else
             (cd dist && shasum -a 256 "${asset}" > "${asset}.sha256")
           fi
+      - name: Verify archive contents
+        # The static-ness gate proves the BINARIES; this proves the ARCHIVE:
+        # hekma-host must actually be inside the shipped tarball (it is staged
+        # on THIS leg only), or the job fails before anything is uploaded.
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="hekma-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
+          # Package Unix tars with `tar -C dist/package .`, so members carry
+          # the ./ prefix.
+          tar -tzf "dist/${asset}" | grep -qx "./hekma"
+          tar -tzf "dist/${asset}" | grep -qx "./hkm"
+          tar -tzf "dist/${asset}" | grep -qx "./hekma-host"
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
