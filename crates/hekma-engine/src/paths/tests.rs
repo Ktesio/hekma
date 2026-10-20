@@ -27,6 +27,10 @@ fn override_base_is_used_verbatim() {
     // Story 2-4: the engine secrets file is a state-dir-level file beside the
     // state DB (NOT per-Agent-Home), named secrets.toml.
     assert_eq!(paths.secrets_file(), tmp.path().join("secrets.toml"));
+    // Story 17-4: the outbox journal + its durable ack cursor are
+    // state-dir-level files too (the global order is cross-instance).
+    assert_eq!(paths.outbox_journal(), tmp.path().join("outbox.jsonl"));
+    assert_eq!(paths.outbox_ack(), tmp.path().join("outbox-ack.json"));
 }
 
 #[test]

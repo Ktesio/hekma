@@ -534,12 +534,44 @@ impl Supervisor {
             self.emit_diagnostic(&notice);
         }
 
+        // Story 17-4: resolve the engine's capture posture into THIS spawn's
+        // wiring — the supervisor owns the decision, the backends stay dumb
+        // executors. `full` (the default) is the byte-identical pre-17-4
+        // triple. `metadata` keeps the SAME three-path redirect (the
+        // crash-immune raw files exist while running; the capture's tailer
+        // writes metadata-only records and stop unlinks the raw files).
+        // `off` resolves all three paths to `None` — the backends' existing
+        // `Stdio::null()` arm — so nothing is ever written, no tailer runs,
+        // and no `output.log` exists; the honest-absence surfaces (typed
+        // read errors, the fleet gap notice's `capture-off` sentinel) key off
+        // the mode, never off fabricated data.
+        let capture_mode = self.log_capture_mode();
+        let (stdout_capture, attributed_capture, stderr_capture) = match capture_mode {
+            LogCaptureMode::Off => {
+                // Surfaced, not silent (AI-18): an off-mode start DEGRADES
+                // log-sentinel metering (the sentinel drain has no log to
+                // drain) — say so once per start, on the engine diagnostic
+                // surface, never a fabricated size downstream.
+                self.emit_diagnostic(
+                    "log capture is off: agent output is not captured; usage sentinels \
+                     parsed from agent logs are unavailable for this instance (fleet shows \
+                     a `capture-off` gap)",
+                );
+                (None, None, None)
+            }
+            LogCaptureMode::Full | LogCaptureMode::Metadata => (
+                Some(agent_log_path.clone()),
+                Some(registry.attributed_output_log_path(&name)),
+                Some(registry.agent_stderr_log_path(&name)),
+            ),
+        };
+
         let spec = SpawnSpec {
             exec: launch.exec.clone(),
             args: launch.args,
             env: launch.env,
             working_dir: home.clone(),
-            log_file: Some(agent_log_path.clone()),
+            log_file: stdout_capture,
             // Story 4-2 (AC-E): capture is unconditional, computed from the
             // SAME Registry path authority as `log_file` (never gated on
             // `pipe_stdin`/`Capability::Interaction` — that gate governs only
@@ -547,11 +579,14 @@ impl Supervisor {
             // the stdout capture file is fed by the connection's READER (the
             // stdout itself is the protocol pipe) — the raw record stays
             // byte-honest, and the tailer attribution machinery is unchanged.
-            attributed_log_path: Some(registry.attributed_output_log_path(&name)),
+            // Story 17-4: "unconditional" now scopes to Full/Metadata; `off`
+            // resolves all three paths `None` above (the null-stream arm).
+            attributed_log_path: attributed_capture,
             // Fix pass (review of #80): the crash-immune raw STDERR capture,
             // computed from the SAME path authority, paired 1:1:1 with
-            // `log_file`/`attributed_log_path` (all three Some together).
-            stderr_log_file: Some(registry.agent_stderr_log_path(&name)),
+            // `log_file`/`attributed_log_path` (all three Some together in
+            // Full/Metadata; all three None in Off).
+            stderr_log_file: stderr_capture,
             instance_name: name.as_str().to_string(),
             // Story 12-1: a DETACHED spawn is never given a stdin pipe — the
             // pipe's write end would be held by this soon-to-exit CLI, and a
@@ -579,6 +614,8 @@ impl Supervisor {
             // decision, the backends stay dumb executors). Every pre-17-2
             // caller (and the default) keeps full inheritance.
             inherit_env: !self.child_env_allowlist,
+            // Story 17-4: THIS spawn's capture posture, resolved above.
+            capture_mode,
         };
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
@@ -844,6 +881,12 @@ impl Supervisor {
                 stop_unconfirmed: false,
                 // A fresh start (operator or restart) spawned this process itself.
                 adopted: false,
+                // Story 17-4 (review finding 11): the capture posture THIS
+                // spawn ran under (resolved above, threaded into the
+                // SpawnSpec) — the per-Run fact the metadata-mode unlink
+                // consults, so a host's CURRENT mode never deletes another
+                // engine's files.
+                capture_mode: Some(capture_mode),
                 // Story 14-1: the acp transport lives with the handle (a fresh
                 // session for this Run; teardown drops with the Supervised).
                 acp,

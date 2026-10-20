@@ -97,6 +97,7 @@ mod engine;
 mod metering;
 pub mod paths;
 pub mod ports;
+mod sha256;
 mod store;
 mod time;
 
@@ -109,16 +110,22 @@ pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
     BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink,
-    EffectiveConfig, EngineError, EngineEvent, EstimateLabel, FleetEntry, FleetListing,
-    FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState, LogLine,
-    LogStream, Micros, NameError, Rate, Registry, RegistryError, RemoveDisposition, ResolvedValue,
-    RestartPolicy, ResyncBatch, ResyncCursor, RunId, SourceLayer, Supervision, TokenBudget,
-    TransitionCause, TransitionEvent, UsageEvent, UsageGapNotice, UsageTotals, UsageUpdateEvent,
-    UsageView, BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION,
-    FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK,
+    EffectiveConfig, EngineError, EngineEvent, EstimateLabel, ExportBatch, FleetEntry,
+    FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
+    LogLine, LogStream, Micros, NameError, OutboxCursor, OutboxEntry, Rate, Registry,
+    RegistryError, RemoveDisposition, ResolvedValue, RestartPolicy, ResyncBatch, ResyncCursor,
+    RunId, SourceLayer, Supervision, TokenBudget, TransitionCause, TransitionEvent, UsageEvent,
+    UsageGapNotice, UsageTotals, UsageUpdateEvent, UsageView, BELOW_FLOOR_SENTENCE,
+    BUDGET_SCHEMA_VERSION, EVENT_BUS_CAPACITY, EVENT_SCHEMA_VERSION, EXPORT_BATCH_DEFAULT_MAX,
+    EXPORT_BATCH_MAX_CAP, FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR,
+    OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PASS_THROUGH_PREFIX, PAST_TAIL_SENTENCE, SECRET_MASK,
     USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// Story 17-4: the log-capture mode vocabulary (the `metering_listen_port`
+// thread — serve/config surface, named by `kt serve --log-capture` and the
+// host's `ServeOptions`).
+pub use ports::LogCaptureMode;
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary
 // `kt` parses `--kind` against and the status shape the public read returns.
 pub use ports::{GuaranteeLevel, MemoryBackingKind, MemoryBackingStatus};

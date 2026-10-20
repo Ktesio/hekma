@@ -345,6 +345,11 @@ impl Supervisor {
         // once the kill closes the pipe, so this is the last chance to
         // surface it before the connection drops with the handle below.
         self.drain_acp_notices_for(&name);
+        // Story 17-4: in metadata mode the raw capture files leave the disk
+        // WITH the Run — the final usage pass above has already parsed them
+        // (metadata parses before unlink), so no agent content stays at rest.
+        // Best-effort, surfaced failure.
+        self.unlink_raw_logs_if_metadata(registry, &name);
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.clear_poll_error_streak(&name);

@@ -5975,10 +5975,12 @@ fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
     let (_state, _manifest, registry) = setup_fake("serveopts", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     // (1) Fresh supervisor, pre-lifecycle: the apply lands.
-    sup.set_serve_options(8400, true)
+    sup.set_serve_options(8400, true, LogCaptureMode::default())
         .expect("the first apply on a fresh supervisor must land");
     // (2) A second application — even still pre-lifecycle — is refused.
-    let err = sup.set_serve_options(0, false).unwrap_err();
+    let err = sup
+        .set_serve_options(0, false, LogCaptureMode::default())
+        .unwrap_err();
     assert!(
         matches!(err, ServeOptionsRefused::AlreadyApplied),
         "the second apply must be AlreadyApplied: {err}"
@@ -5986,7 +5988,9 @@ fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
     // (3) Begin the lifecycle for real, then the refusal is LifecycleBegun —
     // checked BEFORE the latch (a held process is the stronger violation).
     sup.start(&registry, "serveopts").unwrap();
-    let err = sup.set_serve_options(8400, true).unwrap_err();
+    let err = sup
+        .set_serve_options(8400, true, LogCaptureMode::default())
+        .unwrap_err();
     assert!(
         matches!(err, ServeOptionsRefused::LifecycleBegun { held: 1 }),
         "a post-start apply must be LifecycleBegun(1): {err}"
@@ -5994,4 +5998,584 @@ fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
     // Cleanup: the spawned child must not outlive the test.
     sup.stop(&registry, "serveopts", Some(Duration::from_secs(5)))
         .unwrap();
+}
+
+#[test]
+fn should_truncate_pure_seam_fires_at_and_past_the_cap_only() {
+    // The story-17-4 pure seam (the should_rotate style): the raw agent.log
+    // truncates exactly when it has REACHED the cap — below it never, at it
+    // and past it always.
+    assert!(!Supervisor::should_truncate(0, 64));
+    assert!(!Supervisor::should_truncate(63, 64));
+    assert!(Supervisor::should_truncate(64, 64));
+    assert!(Supervisor::should_truncate(65, 64));
+}
+
+#[test]
+fn transitions_land_in_the_outbox_journal_with_monotonic_seqs() {
+    // Story 17-4: every committed transition mirrors into the global outbox
+    // journal at the SAME commit point (after the durable family append,
+    // before the bus publish), seq monotonic from 1, schema-stamped.
+    let (state, _manifest, registry) = setup_fake("obx", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "obx").unwrap();
+    let _ = sup.stop(&registry, "obx", Some(Duration::from_secs(5)));
+
+    let journal = registry.outbox_journal_path();
+    assert!(journal.exists(), "the journal exists after transitions");
+    assert_eq!(
+        journal.parent().unwrap(),
+        state.path(),
+        "the journal lives at the state root (the paths authority)"
+    );
+    let view = read_journal_tolerant(&journal).expect("the journal reads");
+    assert!(!view.torn_tail_skipped, "a clean run tears nothing");
+    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[1] == w[0] + 1),
+        "seqs are consecutive: {seqs:?}"
+    );
+    assert_eq!(seqs.first(), Some(&1), "the first seq is 1 (START is 0)");
+    for entry in &view.entries {
+        assert_eq!(entry.schema_version, OUTBOX_SCHEMA_VERSION);
+        assert!(
+            matches!(entry.event, EngineEvent::Transition(_)),
+            "start/stop commit transitions: {entry:?}"
+        );
+    }
+    // At least the starting→(running/failed)→stopping→stopped sequence.
+    assert!(
+        seqs.len() >= 3,
+        "start+stop commit ≥3 transitions: {seqs:?}"
+    );
+    assert_eq!(view.tail, *seqs.last().unwrap());
+}
+
+#[test]
+fn outbox_seq_continues_after_a_restart_never_reuses_a_seq() {
+    // The rederive contract: a fresh supervisor continues the seq sequence
+    // from the journal's committed tail — a restart that restarted at 1
+    // would mint duplicate seqs and silently break cursor walks.
+    let (_state, _manifest, registry) = setup_fake("obxr", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    sup1.start(&registry, "obxr").unwrap();
+    let _ = sup1.stop(&registry, "obxr", Some(Duration::from_secs(5)));
+    let tail_before = read_journal_tolerant(&registry.outbox_journal_path())
+        .unwrap()
+        .tail;
+
+    // A FRESH supervisor (a new engine lifetime) rederives, then commits more.
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    sup2.rederive_outbox_seq(&registry).expect("rederive");
+    sup2.start(&registry, "obxr").unwrap();
+    let _ = sup2.stop(&registry, "obxr", Some(Duration::from_secs(5)));
+
+    let view = read_journal_tolerant(&registry.outbox_journal_path()).unwrap();
+    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
+    assert!(
+        seqs.iter()
+            .all(|seq| *seq > tail_before || seqs.windows(2).any(|w| w[0] == w[1] - 1)),
+        "seqs never repeat: {seqs:?}"
+    );
+    // The STRICT pin: the first post-restart seq is exactly tail+1.
+    assert_eq!(
+        seqs.get(tail_before as usize),
+        Some(&(tail_before + 1)),
+        "the restart continues at tail+1 (no reuse, no gap): {seqs:?}"
+    );
+}
+
+#[test]
+fn an_outbox_append_failure_rolls_the_seq_back_and_surfaces_a_diagnostic() {
+    // The best-effort contract, fault-injected at the journal path (the
+    // paths-suite directory idiom): the family commit is never the outbox's
+    // hostage — a failed append rolls the seq BACK (no fabricated hole for
+    // exporters) and emits the AI-18 diagnostic naming the seq, and the
+    // next append REUSES that seq.
+    let (_state, _manifest, registry) = setup_fake("obxf", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+
+    // A DIRECTORY occupies the journal: every append's torn-tail repair
+    // read fails before anything is written.
+    let journal = registry.outbox_journal_path();
+    std::fs::create_dir(&journal).unwrap();
+    sup.outbox_append(
+        &registry,
+        EngineEvent::Transition(TransitionEvent::new(
+            "obxf",
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            TransitionCause::AdapterReady,
+            "2026-10-19T00:00:01Z".to_string(),
+        )),
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("outbox append failed (seq 1)"),
+        "the failure is surfaced with its seq: {text}"
+    );
+
+    // Recover the path and append again: the rolled-back seq is REUSED —
+    // the journal carries no hole and no burned sequence.
+    std::fs::remove_dir(&journal).unwrap();
+    sup.outbox_append(
+        &registry,
+        EngineEvent::Transition(TransitionEvent::new(
+            "obxf",
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            TransitionCause::AdapterReady,
+            "2026-10-19T00:00:02Z".to_string(),
+        )),
+    );
+    let view = read_journal_tolerant(&journal).unwrap();
+    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
+    assert_eq!(
+        seqs,
+        vec![1],
+        "the failed append's seq was reused: {seqs:?}"
+    );
+    assert!(
+        !sink_text(&buffer).contains("seq 2"),
+        "no second seq was burned on the retry: {}",
+        sink_text(&buffer)
+    );
+}
+
+#[test]
+fn an_outbox_eviction_at_the_real_cap_surfaces_the_un_acked_loss() {
+    // The eviction diagnostic at the REAL 30MB cap (the toy-cap decision
+    // arms live in the pure plan + append_with_retention tests; this is the
+    // supervisor-level surfaced LOSS, AI-18): a journal staged past the cap
+    // forces the next append to evict UN-ACKED entries from the front —
+    // never the very last — and the diagnostic names the loss for the Host
+    // that has not acked its export cursor.
+    let (_state, _manifest, registry) = setup_fake("obxe", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+
+    // Fat entries (a 100KB launch-detail string dominates each line) so
+    // ~320 lines cross OUTBOX_MAX_BYTES. The seq counter rederives from the
+    // staged tail, exactly as an engine reopen would.
+    let fat = "x".repeat(100_000);
+    let mut staged = String::new();
+    for seq in 1..=320u64 {
+        let entry = OutboxEntry {
+            schema_version: OUTBOX_SCHEMA_VERSION,
+            seq,
+            event: EngineEvent::Transition(TransitionEvent::new(
+                "obxe",
+                LifecycleState::Starting,
+                LifecycleState::Failed,
+                TransitionCause::LaunchError {
+                    detail: fat.clone(),
+                },
+                format!("2026-10-19T00:{:02}:{:02}Z", seq / 60, seq % 60),
+            )),
+        };
+        staged.push_str(&serde_json::to_string(&entry).unwrap());
+        staged.push('\n');
+    }
+    let journal = registry.outbox_journal_path();
+    std::fs::write(&journal, staged).unwrap();
+    sup.rederive_outbox_seq(&registry).expect("rederive");
+
+    // The next append crosses the cap: the un-acked eviction, surfaced.
+    sup.outbox_append(
+        &registry,
+        EngineEvent::Transition(TransitionEvent::new(
+            "obxe",
+            LifecycleState::Failed,
+            LifecycleState::Registered,
+            TransitionCause::AdapterReady,
+            "2026-10-19T01:00:00Z".to_string(),
+        )),
+    );
+    assert!(
+        sink_text(&buffer).contains("outbox compaction dropped"),
+        "the un-acked eviction is surfaced: {}",
+        sink_text(&buffer)
+    );
+    let view = read_journal_tolerant(&journal).unwrap();
+    assert!(
+        view.entries.first().unwrap().seq > 1,
+        "the oldest un-acked entries were evicted: first={}",
+        view.entries.first().unwrap().seq
+    );
+    assert_eq!(
+        view.tail, 321,
+        "the LAST entry (the fresh append) survives the eviction"
+    );
+}
+
+#[test]
+fn metadata_mode_unlinks_raw_files_at_stop_and_output_log_stays_metadata_shaped() {
+    // Story 17-4's metadata matrix, supervisor-level: the raw crash-immune
+    // redirects exist WHILE running (content allowed transiently), the
+    // tailer writes `{record:"metadata",...}` records (never line content)
+    // into output.log, the sentinel metering STILL lands (metadata parses
+    // before unlink), and stop unlinks the raw files — only the
+    // metadata-shaped output.log remains at rest.
+    let (state, _manifest, registry) =
+        setup_fake("meta", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("meta").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+        .expect("the mode pins pre-lifecycle");
+    sup.start(&registry, "meta").unwrap();
+
+    let agent_log = registry.agent_output_log_path(&name);
+    let output_log = registry.attributed_output_log_path(&name);
+    // WHILE RUNNING: the raw file exists, output.log carries metadata records.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&output_log) {
+            if text.contains("\"record\":\"metadata\"") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata records never appeared in output.log"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(agent_log.exists(), "the raw redirect lives while running");
+    let output_text = std::fs::read_to_string(&output_log).unwrap();
+    assert!(
+        !output_text.contains("ready pid="),
+        "no raw content in a metadata output.log:\n{output_text}"
+    );
+    assert!(
+        output_text.contains("\"byte_len\"") && output_text.contains("\"sha256\""),
+        "the records carry the size/hash facts:\n{output_text}"
+    );
+    // The sentinel metering STILL lands while running (metadata parses
+    // before any unlink): both emitted events commit.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_usage_all(&registry);
+        if ledger_totals(state.path(), name.as_str()).0 >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sentinel metering never committed in metadata mode"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // STOP: the raw files are unlinked (metadata-only at rest); the
+    // metadata-shaped output.log remains.
+    let _ = sup.stop(&registry, "meta", Some(Duration::from_secs(5)));
+    assert!(
+        !agent_log.exists(),
+        "metadata mode unlinks agent.log at stop"
+    );
+    assert!(
+        !registry.agent_stderr_log_path(&name).exists(),
+        "metadata mode unlinks agent-stderr.log at stop"
+    );
+    assert!(
+        output_log.exists(),
+        "the metadata-shaped output.log remains"
+    );
+    // The metadata drain still committed BOTH events (the at-rest bound
+    // never costs the billing truth).
+    assert_eq!(ledger_totals(state.path(), name.as_str()).0, 2);
+}
+
+#[test]
+fn metadata_unlink_of_already_absent_raw_files_stays_silent() {
+    // The NotFound arm: the metadata-mode cleanup over a root with NO raw
+    // files (nothing was ever created) is the ordinary case — silent, never
+    // a diagnostic, never an error.
+    let (_state, _manifest, registry) = setup_fake("obxu", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+        .expect("the mode pins pre-lifecycle");
+    let name = InstanceName::new("obxu").unwrap();
+    sup.unlink_raw_logs_if_metadata(&registry, &name);
+    assert!(
+        sink_text(&buffer).is_empty(),
+        "absence is the ordinary case, not a failure: {}",
+        sink_text(&buffer)
+    );
+}
+
+#[test]
+fn metadata_unlink_surfaces_a_stuck_raw_file_without_abandoning_the_cleanup() {
+    // The AI-18 arm: a raw capture path that CANNOT be unlinked (a
+    // directory occupies it) is surfaced with the path and the OS detail —
+    // and the cleanup still runs to its end (the sibling file's unlink is
+    // attempted regardless). Best-effort never means silent.
+    let (_state, _manifest, registry) = setup_fake("obxs", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+        .expect("the mode pins pre-lifecycle");
+    let name = InstanceName::new("obxs").unwrap();
+    std::fs::create_dir_all(registry.agent_output_log_path(&name)).unwrap();
+    sup.unlink_raw_logs_if_metadata(&registry, &name);
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("could not unlink the raw capture file"),
+        "the stuck unlink is surfaced: {text}"
+    );
+    assert!(
+        text.contains("agent.log"),
+        "the offending path is named: {text}"
+    );
+}
+
+#[test]
+fn metadata_unlink_covers_the_crash_reap_path_too() {
+    // Review finding 24: the at-rest bound holds for a CRASHED agent too.
+    // The clean-stop path was covered by the metadata e2e above; this drives
+    // the reaper's CRASH reap (external kill → poll_once → terminal drain →
+    // unlink) and asserts the raw files leave the disk while the
+    // metadata-shaped output.log remains.
+    let (state, _manifest, registry) =
+        setup_fake("metak", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("metak").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+        .expect("the mode pins pre-lifecycle");
+    sup.start(&registry, "metak").unwrap();
+
+    let agent_log = registry.agent_output_log_path(&name);
+    let output_log = registry.attributed_output_log_path(&name);
+    // WHILE RUNNING: the raw redirect exists and output.log carries
+    // metadata records (the files the at-rest bound must remove/keep).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&output_log) {
+            if text.contains("\"record\":\"metadata\"") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata records never appeared in output.log"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(agent_log.exists(), "the raw redirect lives while running");
+
+    // EXTERNAL kill (the backend's stop, OUTSIDE the lifecycle): no stop
+    // path runs, so the reaper's crash reap is the only cleanup left.
+    {
+        let supervised = sup.running.get_mut(&name).unwrap();
+        sup.backend
+            .stop(&mut supervised.handle, Duration::from_secs(2))
+            .expect("the external kill lands promptly");
+    }
+    // The reaper cadence: poll_once detects the exit, drains terminally
+    // (the sentinel metering's last pass), and unlinks the raw files —
+    // the exact arm under test here.
+    let _ = wait_for_crash(&mut sup, &registry);
+    assert_eq!(state_of(&registry, "metak"), LifecycleState::Failed);
+    assert!(
+        !agent_log.exists(),
+        "the crash reap unlinks agent.log (the at-rest bound covers crashes)"
+    );
+    assert!(
+        !registry.agent_stderr_log_path(&name).exists(),
+        "the crash reap unlinks agent-stderr.log"
+    );
+    assert!(
+        output_log.exists(),
+        "the metadata-shaped output.log remains at rest"
+    );
+    // The billing truth survived the crash (metadata parses before unlink).
+    assert_eq!(ledger_totals(state.path(), name.as_str()).0, 2);
+}
+
+#[test]
+fn off_mode_spawns_null_streams_and_the_start_note_names_the_degraded_metering() {
+    // Story 17-4's off matrix, supervisor-level: nothing is ever written
+    // (null streams — no raw files, no tailer, no output.log), the start
+    // emits the degraded-metering note (surfaced, not silent), and the
+    // usage drain over the absent file is an honest no-op (never a
+    // fabricated count).
+    let (state, _manifest, registry) =
+        setup_fake("offc", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("offc").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.set_serve_options(0, false, LogCaptureMode::Off)
+        .expect("the mode pins pre-lifecycle");
+    sup.start(&registry, "offc").unwrap();
+    assert!(
+        sink_text(&sink).contains("log capture is off"),
+        "the start note names the degraded metering:\n{}",
+        sink_text(&sink)
+    );
+    assert!(
+        !registry.agent_output_log_path(&name).exists(),
+        "off mode never creates agent.log"
+    );
+    assert!(
+        !registry.agent_stderr_log_path(&name).exists(),
+        "off mode never creates agent-stderr.log"
+    );
+    assert!(
+        !registry.attributed_output_log_path(&name).exists(),
+        "off mode never creates output.log"
+    );
+    // The drain over the absent file: an honest no-op — zero ledger rows
+    // (never a fabricated count), never a crash.
+    for _ in 0..10 {
+        sup.drain_usage_all(&registry);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        ledger_totals(state.path(), name.as_str()).0,
+        0,
+        "off mode invents no usage"
+    );
+    let _ = sup.stop(&registry, "offc", Some(Duration::from_secs(5)));
+    assert!(
+        !registry.agent_output_log_path(&name).exists(),
+        "off mode leaves nothing at rest either"
+    );
+}
+
+#[test]
+fn a_midrun_drain_over_a_deleted_raw_log_is_an_honest_no_op() {
+    // The absent-file arm of the 17-4 truncate guard (an operator deleted
+    // the raw capture midrun — Full mode still has its usage source, so the
+    // stdout drain tick runs): the guard exits quietly over the absent
+    // file, the drain proceeds, nothing fabricates usage, nothing crashes.
+    // Windows branch: the child holds agent.log open without
+    // FILE_SHARE_DELETE, so the midrun `remove_file` fails there (a sharing
+    // violation, not the scenario) — the deletion drill is POSIX-only; the
+    // guard's absent-file arm itself is OS-agnostic (a plain `metadata`
+    // miss) and is reached on every OS by the Off-mode matrix above.
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let (state, _manifest, registry) =
+        setup_fake("obxd", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("obxd").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.set_serve_options(0, false, LogCaptureMode::Full)
+        .expect("the mode pins pre-lifecycle");
+    sup.start(&registry, "obxd").unwrap();
+    let agent_log = registry.agent_output_log_path(&name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !agent_log.exists() {
+        assert!(Instant::now() < deadline, "agent.log never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_file(&agent_log).unwrap();
+    // The midrun stdout drain tick runs the truncate guard over the ABSENT
+    // file (the guard's first check) and the rest of the drain is unchanged.
+    sup.drain_usage_all(&registry);
+    let _ = sup.stop(&registry, "obxd", Some(Duration::from_secs(5)));
+    assert!(!agent_log.exists(), "absence stays absence");
+    // The ledger only ever holds usage the fake actually emitted — never a
+    // fabricated count from the deleted file.
+    let (events, _) = ledger_totals(state.path(), name.as_str());
+    assert!(events <= 2, "no invented usage rows: {events}");
+}
+
+#[test]
+fn agent_log_truncates_at_the_toy_cap_and_metering_stays_double_count_free() {
+    // The story-17-4 coordinated truncate, end-to-end at a TOY cap (the
+    // #[cfg(test)] override): the raw agent.log truncates to 0 at the drain
+    // tick once BOTH consumers are past the cut, the truncation notice is
+    // SURFACED, and the sentinel metering across truncations stays
+    // double-count-free AND loss-free.
+    //
+    // WHY THIS IS EXPECTED TO PASS ON WINDOWS TOO (review finding 15 —
+    // reasoned, deliberately UNGATED so the Windows CI matrix delivers the
+    // real verdict): the engine truncates via a FRESH `OpenOptions::
+    // write(true)` open + `set_len(0)`, while the child's inherited stdout
+    // handle and the engine's own append handle stay open. Rust's std opens
+    // files on Windows with FILE_SHARE_READ | FILE_SHARE_WRITE |
+    // FILE_SHARE_DELETE, and INHERITED handles keep the original open's
+    // share mode — so the truncate-open succeeds and `set_len(0)` is legal
+    // while the other handles hold the file. Post-truncate, the child keeps
+    // writing through an O_APPEND-equivalent (the redirect was opened with
+    // `append(true)` → FILE_APPEND_DATA), so its writes land at the NEW
+    // end-of-file (offset 0+) — no overwrite of the fresh file, no
+    // sparse-hole corruption. The one Windows-only hazard would be the child
+    // holding the file WITHOUT share-write — it cannot: the share mode is
+    // fixed at the ORIGINAL open (the engine's), which granted all three.
+    // If the Windows CI matrix still goes red here, the fallback is the
+    // maintainer's `OsId` runtime-skip idiom PLUS a deferred-work entry —
+    // not a preemptive gate.
+    let (state, _manifest, registry) =
+        setup_fake("trunc", &["--emit-usage", "5", "--linger-ms", "600000"]);
+    let name = InstanceName::new("trunc").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.agent_log_cap_override = Some(64);
+    sup.start(&registry, "trunc").unwrap();
+    let log = registry.agent_output_log_path(&name);
+
+    // Drain on the reaper cadence while the agent emits (5 lines over
+    // ~100ms). Sample lengths so the proof is a OBSERVED SHRINK, not a
+    // guess about the final layout. The sample lands BEFORE the drain:
+    // the drain tick is the truncate point, so a post-drain sample always
+    // sits on the fresh 0 and never sees the growth — the pre-drain length
+    // is the observation that catches it (the file never shrinks on its
+    // own, so ANY recorded decrease is a truncate).
+    let mut lengths: Vec<u64> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(meta) = std::fs::metadata(&log) {
+            let len = meta.len();
+            if lengths.last() != Some(&len) {
+                lengths.push(len);
+            }
+        }
+        sup.drain_usage_all(&registry);
+        if ledger_totals(state.path(), name.as_str()).0 >= 5 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the 5 usage events never committed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A few more drains let the final tail drain + truncate land.
+    for _ in 0..6 {
+        if let Ok(meta) = std::fs::metadata(&log) {
+            let len = meta.len();
+            if lengths.last() != Some(&len) {
+                lengths.push(len);
+            }
+        }
+        sup.drain_usage_all(&registry);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // (1) The file was OBSERVED to shrink (the truncate happened at a drain
+    // tick, not a test fabrication).
+    let shrank = lengths.windows(2).any(|w| w[1] < w[0]);
+    assert!(
+        shrank,
+        "the coordinated truncate must shrink agent.log at the cap; samples: {lengths:?}"
+    );
+    // (2) The truncation notice is on the diagnostic record.
+    assert!(
+        sink_text(&sink).contains("was truncated to 0"),
+        "each truncation is surfaced:\n{}",
+        sink_text(&sink)
+    );
+    // (3) NO double count, NO loss: exactly the 5 emitted events are in the
+    // ledger (dedup backstop + cursor discipline held across truncations).
+    assert_eq!(ledger_totals(state.path(), name.as_str()).0, 5);
+    // (4) The final state respects the bound (the last catch-up + truncate
+    // fires once the trailing complete lines drained).
+    let final_len = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        final_len < 64,
+        "the live file stays bounded by the cap (last truncate landed): {final_len}"
+    );
+    let _ = sup.stop(&registry, "trunc", Some(Duration::from_secs(5)));
 }
