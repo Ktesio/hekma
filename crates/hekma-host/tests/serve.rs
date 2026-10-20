@@ -222,8 +222,22 @@ fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
             state_base: Some(PathBuf::from("/tmp/hekma-state")),
             stop_window: Some(9),
             metering_listen_port: 4321,
+            control_listen: Some(
+                "127.0.0.1:8400"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("static test address parses")
+            ),
+            bearer_secret: Some("render_check_bearer".to_string()),
             diagnostics: Some(sink),
         }
+    );
+    assert!(
+        with_sink.contains("control_listen") && with_sink.contains("127.0.0.1:8400"),
+        "control_listen is rendered with its value: {with_sink}"
+    );
+    assert!(
+        with_sink.contains("bearer_secret") && with_sink.contains("render_check_bearer"),
+        "bearer_secret is rendered with its configured name: {with_sink}"
     );
     assert!(
         with_sink.contains("state_base") && with_sink.contains("/tmp/hekma-state"),

@@ -12,8 +12,11 @@
 //!   parse refusal, exit 2).
 //!
 //! POSIX shapes (`kill`, SIGTERM) are Unix-only: the Windows legs runtime-
-//! skip via the data-driven OS id (NO `#[cfg]` — this file is outside the
-//! backends/ allowlist), exactly the `lifecycle.rs` pattern.
+//! skip via the data-driven OS id (the `lifecycle.rs` pattern). ONE
+//! exception since 17-3 (review item 24b): the Control-API e2e leg writes a
+//! 0600 `secrets.toml` — the OS permission boundary IS the API there — so
+//! this file carries a single `#[cfg(unix)]` chmod, disclosed through the
+//! integration-test allowlist (AI-35) like the host suite's.
 
 mod helpers;
 
@@ -554,5 +557,131 @@ env = "OPENAI_BASE_URL"
             "re-bound the observed-metering listener on the fixed loopback port {port}"
         )),
         "the adoption re-bind names the pinned port:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Story 17-3 (review item 24b): the Control-API flag pair over the REAL
+// binary. The clap-parse half of this pin lives in `crates/hekma/src/lib.rs`
+// (`test_serve_control_api_flag_pair_lands_in_the_right_fields`); THIS leg
+// proves the WIRING: serve with the pair, the bearer resolved from the
+// state dir's secrets file, `/v0/version` answered 200 WITH the bearer and
+// 401 without — then the bounded SIGTERM shutdown, exit 0.
+// ---------------------------------------------------------------------------
+
+/// The bearer secret NAME the real-binary leg resolves (the secrets-file
+/// leg; the process env is left untouched).
+const CONTROL_API_BEARER_NAME: &str = "serve_cli_control_bearer";
+/// The bearer token VALUE that name resolves to.
+const CONTROL_API_BEARER_VALUE: &str = "serve-cli-bearer-token-17-3";
+
+/// A minimal raw-socket `GET /v0/version`: returns the HTTP status code, or
+/// `None` when the connection cannot even form (the API is not up yet). The
+/// `hekma` crate carries no HTTP dev-dependency — the check is two raw
+/// sockets wide.
+fn raw_version_status(addr: &str, with_bearer: bool) -> Option<u16> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).ok()?;
+    let auth = if with_bearer {
+        format!("Authorization: Bearer {CONTROL_API_BEARER_VALUE}\r\n")
+    } else {
+        String::new()
+    };
+    stream
+        .write_all(
+            format!("GET /v0/version HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response
+        .strip_prefix("HTTP/1.1 ")?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn serve_control_api_flag_pair_resolves_the_bearer_and_answers_over_the_wire() {
+    if is_windows() {
+        return; // POSIX `kill`-based SIGTERM; see the sibling test's note.
+    }
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // The bearer secret rides the SECRETS FILE leg. The Unix chmod is
+    // REQUIRED — the resolver refuses a group/other-accessible secrets file
+    // (the AI-35-disclosed `#[cfg(unix)]`; this file's allowlist entry was
+    // added for exactly this write). On Windows the fresh-file ACL check
+    // accepts a user-owned file.
+    let secrets = state_dir.join(hekma_engine::paths::SECRETS_FILE);
+    std::fs::write(
+        &secrets,
+        format!("{CONTROL_API_BEARER_NAME} = \"{CONTROL_API_BEARER_VALUE}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // A loopback port that is free RIGHT NOW (bind-then-drop probe).
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let (mut child, drainer) = spawn_serve_with(
+        &state_dir,
+        &[
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--bearer-secret",
+            CONTROL_API_BEARER_NAME,
+        ],
+    );
+
+    // WITH the bearer: 200 (the surface self-describes). WITHOUT: 401.
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = raw_version_status(&addr, true) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the control api never answered on {addr}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        status, 200,
+        "the resolved bearer authenticates over the wire"
+    );
+    let status = raw_version_status(&addr, false)
+        .expect("the API that answered WITH a bearer must answer without one too");
+    assert_eq!(status, 401, "an anonymous request is refused");
+
+    // The bounded SIGTERM shutdown — exit 0 — and the notice record.
+    let status = signal_and_wait(&mut child, "the control-api e2e leg");
+    assert_eq!(status.code(), Some(0), "serve must exit 0 after SIGTERM");
+    let stderr = drainer.join().unwrap();
+    assert!(
+        stderr.contains("control api listening on"),
+        "the listening notice is on the record:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("control api stopped"),
+        "the down notice is on the record:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("NON-LOOPBACK"),
+        "a loopback bind never warns:\n{stderr}"
     );
 }

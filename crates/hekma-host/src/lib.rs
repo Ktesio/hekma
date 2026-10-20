@@ -10,8 +10,9 @@
 //! free of async/tokio tokens, the embed-clean discipline). Internally the
 //! host owns one tokio [`Runtime`] — the same shape the engine itself uses —
 //! on which the shutdown-signal wait and the engine's async drain calls run.
-//! No HTTP here: the Control API is story 17-3 (axum stays out of this tree;
-//! verify with `cargo tree -p hekma-host -e normal` = hekma-engine + tokio).
+//! The optional Control API (story 17-3, `--listen` + `--bearer-secret`)
+//! mounts on that SAME runtime after the engine opens; without the flags it
+//! does not exist and serve is byte-identical to 17-2.
 //!
 //! Dependency posture (NFR-8 / AD-2): the ONLY normal dependency is
 //! [`hekma_engine`](hekma_engine)'s PUBLIC API. The engine stays the sole
@@ -32,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+mod control;
 mod drain;
 mod lock;
 mod signals;
@@ -72,6 +74,16 @@ pub struct ServeOptions {
     /// instance's injected `base_url` live across host restarts (the AI-46
     /// strand closure).
     pub metering_listen_port: u16,
+    /// The address the v0 Control API binds (`None` = API off — the default;
+    /// serve is byte-identical to 17-2). Requires [`ServeOptions::bearer_secret`]
+    /// (a missing partner is [`ServeError::InvalidOptions`] — the API never
+    /// serves unauthenticated and never half-configured).
+    pub control_listen: Option<std::net::SocketAddr>,
+    /// The NAME of the bearer secret guarding the Control API — resolved ONCE
+    /// at startup through the engine's composite resolver (env, then the
+    /// state-dir secrets file). Requires [`ServeOptions::control_listen`].
+    /// The resolved VALUE never enters options, a response, or a notice.
+    pub bearer_secret: Option<String>,
     /// The sink for host + engine notices. `None` (the default) routes both
     /// to stderr, byte-compatible with the engine's no-sink behavior.
     pub diagnostics: Option<DiagnosticSink>,
@@ -90,11 +102,16 @@ pub const MAX_STOP_WINDOW_SECS: u64 = 86_400;
 impl std::fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Manual impl: a boxed writer sink is not `Debug` and must never be
-        // printed (no-leak discipline).
+        // printed (no-leak discipline). The bearer field is the secret NAME
+        // (never a value — resolution happens inside `serve`), printed as
+        // the configuration fact it is; the RESOLVED value never enters this
+        // struct at all.
         f.debug_struct("ServeOptions")
             .field("state_base", &self.state_base)
             .field("stop_window", &self.stop_window)
             .field("metering_listen_port", &self.metering_listen_port)
+            .field("control_listen", &self.control_listen)
+            .field("bearer_secret", &self.bearer_secret)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
             .finish()
     }
@@ -118,10 +135,13 @@ pub enum ServeError {
         /// The holder's PID, when readable.
         holder: Option<u32>,
     },
-    /// The caller's options are invalid — today: a stop window outside
+    /// The caller's options are invalid — a stop window outside
     /// [`MIN_STOP_WINDOW_SECS`]..=[`MAX_STOP_WINDOW_SECS`] (review finding
     /// 9: a sub-second or multi-day window is a rejected INVOCATION, not a
-    /// failed environment). Usage-class, like the CLI's parse refusal.
+    /// failed environment), or a HALF-configured Control API (one of
+    /// `control_listen` / `bearer_secret` without its partner — the API
+    /// never serves unauthenticated, never half-configured; story 17-3).
+    /// Usage-class, like the CLI's parse refusal.
     InvalidOptions {
         /// The human-readable rejection (names the value and the bounds).
         message: String,
@@ -249,6 +269,16 @@ impl Notifier {
 /// 7. Emit the shutdown-complete notice (naming the received signal) and
 ///    return.
 ///
+/// With the Control API configured (`control_listen` + `bearer_secret`,
+/// story 17-3) two extra steps interleave: the bearer secret resolves
+/// through the engine's composite AFTER the lock and BEFORE the runtime
+/// (an unresolvable reference is a typed [`ServeError::Startup`] — nothing
+/// binds, nothing opens), and the API binds on the host runtime right
+/// after the started notice (a bind failure is a surfaced `Startup` naming
+/// the address). On shutdown the API stops accepting FIRST — graceful, a
+/// bounded grace, then the SSE streams abort — and only then does step 6
+/// run.
+///
 /// Errors: [`ServeError::StateDirLocked`] / [`ServeError::InvalidOptions`] /
 /// [`ServeError::Startup`] — the first two BEFORE any supervision work, so
 /// a refused host leaves no partial state.
@@ -275,6 +305,8 @@ where
         state_base,
         stop_window,
         metering_listen_port,
+        control_listen,
+        bearer_secret,
         diagnostics,
     } = options;
     let has_caller_sink = diagnostics.is_some();
@@ -283,11 +315,13 @@ where
         None => Notifier::stderr(),
     };
 
-    // (0) The stop window, validated BEFORE anything is touched (review
-    // finding 9): an out-of-bounds window is a rejected INVOCATION
-    // (`InvalidOptions`), never a 0-second "graceful" ladder discovered at
-    // drain time. `None` keeps the engine's DEFAULT_STOP_WINDOW (the single
-    // source of the default — never re-hardcoded here).
+    // (0) The options, validated BEFORE anything is touched (review finding
+    // 9's discipline, extended to the Control-API pair): an out-of-bounds
+    // window, a malformed listen address, or a HALF-configured API (one flag
+    // without its partner — the API never serves unauthenticated, never
+    // half-configured) is a rejected INVOCATION (`InvalidOptions`), never a
+    // runtime surprise. `None` keeps the engine's DEFAULT_STOP_WINDOW (the
+    // single source of the default — never re-hardcoded here).
     let window = std::time::Duration::from_secs(match stop_window {
         None => hekma_engine::domain::DEFAULT_STOP_WINDOW.as_secs(),
         Some(secs) if (MIN_STOP_WINDOW_SECS..=MAX_STOP_WINDOW_SECS).contains(&secs) => secs,
@@ -305,6 +339,36 @@ where
             return Err(err);
         }
     });
+    match (&control_listen, &bearer_secret) {
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+        (Some(addr), None) => {
+            let err = ServeError::InvalidOptions {
+                message: format!(
+                    "--listen {addr} requires --bearer-secret: the Control API never \
+                     serves unauthenticated; pass both flags (or neither, to keep the \
+                     API off)"
+                ),
+            };
+            if has_caller_sink {
+                notifier.note(&err.to_string());
+            }
+            return Err(err);
+        }
+        (None, Some(_)) => {
+            let err = ServeError::InvalidOptions {
+                message: "--bearer-secret requires --listen: there is no API to guard \
+                          while the Control API is off; pass both flags (or neither, to \
+                          keep the API off)"
+                    .to_string(),
+            };
+            if has_caller_sink {
+                notifier.note(&err.to_string());
+            }
+            return Err(err);
+        }
+    }
+    let control_addr = control_listen;
 
     // (1) The state root, via the engine's path authority (the host NEVER
     // joins path segments of the state layout itself — only the engine's own
@@ -350,6 +414,56 @@ where
                 notifier.note(&err.to_string());
             }
             return Err(err);
+        }
+    };
+
+    // (2.5) The Control API's bearer secret — resolved ONCE, through the
+    // engine's composite (env first, then the state-dir secrets file — the
+    // host never builds a second resolution mechanism, AD-10), AFTER the
+    // lock and BEFORE the runtime/engine open: an unresolvable reference is
+    // a typed `Startup` refusal and NOTHING binds, NOTHING opens (the I/O
+    // matrix's "no engine work done"). A half-configured pair was already
+    // refused above; reaching here with a name means `--listen` is set.
+    let bearer = match &bearer_secret {
+        None => None,
+        Some(name) => {
+            let resolver =
+                hekma_engine::ports::CompositeSecretResolver::env_then_file(paths.secrets_file());
+            match resolver.require(name) {
+                Ok(secret) => {
+                    // An EMPTY resolved secret can never authenticate (an
+                    // empty presented bearer is refused by construction), so
+                    // binding would mint an API that 401s every request
+                    // forever with no diagnosis. Refuse NOW, typed, naming
+                    // the reference (review item 2) — the I/O matrix's
+                    // "refuse before anything binds or opens".
+                    if secret.expose_secret().is_empty() {
+                        let err = ServeError::Startup {
+                            message: format!(
+                                "the control API's bearer secret {name:?} resolved to an \
+                                 EMPTY value — an empty bearer can never authenticate; set \
+                                 a non-empty value for it (env or the secrets file)"
+                            ),
+                        };
+                        if has_caller_sink {
+                            notifier.note(&err.to_string());
+                        }
+                        return Err(err);
+                    }
+                    Some(control::BearerToken::new(secret))
+                }
+                Err(err) => {
+                    let err = ServeError::Startup {
+                        message: format!(
+                            "the control API's bearer secret could not be resolved: {err}"
+                        ),
+                    };
+                    if has_caller_sink {
+                        notifier.note(&err.to_string());
+                    }
+                    return Err(err);
+                }
+            }
         }
     };
 
@@ -433,6 +547,61 @@ where
         paths.state_base().display()
     ));
 
+    // (5.5) The Control API mounts here (story 17-3): AFTER the engine opens
+    // and the started notice lands, BEFORE the signal wait. `None` (the
+    // default) skips the whole block — serve stays byte-identical to 17-2.
+    // A bind failure is a surfaced `Startup` error NAMING the address and
+    // the host ABORTS (the frozen I/O matrix's system class — exit nonzero;
+    // review item 1: an earlier comment here wrongly claimed the host
+    // continues). Because the engine has OPENED by now and may have ADOPTED
+    // agents, the failure path first runs the SAME bounded drain the signal
+    // path runs — no adopted agent dies uncounted — and only then does the
+    // error return.
+    let api = match (control_addr, bearer) {
+        (Some(addr), Some(bearer)) => {
+            let engine_for_api = Arc::clone(&engine);
+            let sink_for_api = notifier.sink.clone();
+            match rt.block_on(control::ControlApi::bind(
+                addr,
+                engine_for_api,
+                bearer,
+                sink_for_api,
+            )) {
+                Ok(api) => {
+                    // A NON-LOOPBACK bind is legitimate (17-5's container
+                    // recipe binds 0.0.0.0) but it must WARN (review item
+                    // 15): this surface has no TLS and bearer-only auth.
+                    if !api.is_loopback() {
+                        notifier.note(&format!(
+                            "warning: the control api is bound on a NON-LOOPBACK address \
+                             {} — it has no TLS and bearer-only auth; do not expose it on \
+                             an untrusted network",
+                            api.local_addr()
+                        ));
+                    }
+                    notifier.note(&format!(
+                        "control api listening on {} (v0, unstable — bearer required)",
+                        api.local_addr()
+                    ));
+                    Some(api)
+                }
+                Err(message) => {
+                    // Bounded drain FIRST (the adopted-agent ladder), then
+                    // the surfaced abort.
+                    let _outcomes =
+                        rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+                    let err = ServeError::Startup { message };
+                    if has_caller_sink {
+                        notifier.note(&err.to_string());
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        // The pair was validated together at step (0); this arm is unreachable.
+        _ => None,
+    };
+
     // (6) Resolve the received signal's name — either it already arrived
     // during the arming window or the open (held by the armed streams), or
     // we wait for it now. The streams stay armed through the whole drain
@@ -458,6 +627,26 @@ where
         "{received} received; stopping running agents (graceful window {}s) ...",
         window.as_secs_f32()
     ));
+
+    // (6.5) The API stops accepting FIRST (the frozen mount order): graceful
+    // shutdown of the accept loop and a bounded grace for in-flight requests.
+    // The open SSE streams end ON the signal (the cooperative close), so the
+    // grace normally suffices; a client that STILL holds a connection past
+    // it — a stalled request body, a non-cooperative client — is ABORTED at
+    // the grace, and the abort is surfaced (review item 16 / AI-18). The
+    // down-notice keeps the stream honest: a client can see the API go away
+    // BEFORE agents stop.
+    if let Some(api) = api {
+        let aborted = rt.block_on(api.shutdown());
+        notifier.note("control api stopped; no requests are accepted for the rest of the shutdown");
+        if aborted {
+            notifier.note(
+                "control api: a client still held a connection past the graceful window — \
+                 the connection was aborted (the drain re-issues any interrupted stop, so \
+                 outcomes converge)",
+            );
+        }
+    }
 
     // (7) The drain — every RUNNING agent through the bounded ladder, stops
     // issued CONCURRENTLY (one window's wall clock, finding 4), newcomers

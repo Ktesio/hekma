@@ -10,6 +10,7 @@ const files = [
   'migration.md',
   'troubleshooting.md',
   'commands.md',
+  'control-api.md',
   'manifest.md',
   'adapter-contract.md',
   'embedding.md',

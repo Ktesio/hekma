@@ -30,16 +30,28 @@ use std::path::PathBuf;
 use crate::error::{ServeOptionsInvalid, ServeStartupFailed, ServeStateDirBusy};
 
 /// `hekma serve [--stop-window <secs>] [--metering-listen <port>]
-/// [--state-dir <dir>]` — serve until SIGTERM/SIGINT, then drain.
+/// [--state-dir <dir>] [--listen <addr> --bearer-secret <name>]` — serve
+/// until SIGTERM/SIGINT, then drain.
+///
+/// The Control-API flags pass the parsed address + the secret NAME straight
+/// through (the host owns the resolution; this file stays sync and free of
+/// async/secret tokens — the embed-clean audit holds). The mutual
+/// requires-between-flags is ALSO enforced in the host (`ServeError::
+/// InvalidOptions`) so a library caller gets the same typed refusal a CLI
+/// user gets from clap.
 pub fn run(
     stop_window: Option<u64>,
     metering_listen: u16,
     state_dir: Option<String>,
+    listen: Option<std::net::SocketAddr>,
+    bearer_secret: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = hekma_host::ServeOptions {
         state_base: state_dir.map(PathBuf::from),
         stop_window,
         metering_listen_port: metering_listen,
+        control_listen: listen,
+        bearer_secret,
         // The stderr default: host + engine notices interleave on stderr,
         // byte-compatible with every other diagnostic surface.
         diagnostics: None,
