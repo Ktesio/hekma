@@ -6,6 +6,7 @@
 //! `hekma serve` CLI end-to-end test and the in-crate signals test).
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hekma_host::{serve_with_signal, ServeError, ServeOptions};
@@ -205,5 +206,329 @@ fn the_no_instance_drain_completes_with_no_outcomes() {
     assert!(
         text.contains("no running agents; nothing to stop"),
         "the no-op is said, not silent:\n{text}"
+    );
+}
+
+#[test]
+fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
+    // The manual `Debug` impl must name every option field (an operator
+    // dumping their serve config reads real values, not `..`) while NEVER
+    // printing the boxed writer sink (no-leak discipline — the sink is not
+    // `Debug` and must stay out of the render).
+    let (sink_handle, sink) = SharedSink::new();
+    let with_sink = format!(
+        "{:?}",
+        ServeOptions {
+            state_base: Some(PathBuf::from("/tmp/hekma-state")),
+            stop_window: Some(9),
+            metering_listen_port: 4321,
+            diagnostics: Some(sink),
+        }
+    );
+    assert!(
+        with_sink.contains("state_base") && with_sink.contains("/tmp/hekma-state"),
+        "state_base is rendered with its value: {with_sink}"
+    );
+    assert!(
+        with_sink.contains("stop_window") && with_sink.contains("9"),
+        "stop_window is rendered with its value: {with_sink}"
+    );
+    assert!(
+        with_sink.contains("metering_listen_port") && with_sink.contains("4321"),
+        "metering_listen_port is rendered with its value: {with_sink}"
+    );
+    assert!(
+        with_sink.contains("diagnostics") && with_sink.contains("<sink>"),
+        "the sink renders as the <sink> placeholder, never its innards: {with_sink}"
+    );
+    assert!(
+        !with_sink.contains("SharedSink"),
+        "no sink internals leak into the debug render: {with_sink}"
+    );
+    let _ = sink_handle; // the sink is only carried, never written here
+    let without_sink = format!("{:?}", ServeOptions::default());
+    assert!(
+        without_sink.contains("diagnostics: None"),
+        "the no-sink default renders honestly: {without_sink}"
+    );
+}
+
+#[test]
+fn every_serve_error_variant_renders_its_own_remediation() {
+    // Each refusal/overlay wording is part of the contract (the CLI maps
+    // them onto the exit-code table; the operator reads them verbatim): a
+    // held lock names the holder pid or the unreadable record, an invalid
+    // invocation says its message as-is, and a startup failure says the
+    // host could not start.
+    let locked_with_holder = ServeError::StateDirLocked {
+        lock_path: PathBuf::from("/srv/hekma/host.lock"),
+        holder: Some(4242),
+    };
+    let text = locked_with_holder.to_string();
+    assert!(
+        text.contains("/srv/hekma/host.lock")
+            && text.contains("4242")
+            && text.contains("already served by another host"),
+        "the held-lock refusal names the path AND the holder pid: {text}"
+    );
+    assert!(
+        text.contains("stop that host first") && text.contains("serve a different state directory"),
+        "the remediation rides along: {text}"
+    );
+    let locked_unreadable = ServeError::StateDirLocked {
+        lock_path: PathBuf::from("/srv/hekma/host.lock"),
+        holder: None,
+    };
+    let text = locked_unreadable.to_string();
+    assert!(
+        text.contains("/srv/hekma/host.lock") && text.contains("could not be read"),
+        "an unreadable holder record says so instead of guessing a pid: {text}"
+    );
+    let invalid = ServeError::InvalidOptions {
+        message: "invalid stop window 0".to_string(),
+    };
+    assert_eq!(invalid.to_string(), "invalid stop window 0");
+    let startup = ServeError::Startup {
+        message: "boom".to_string(),
+    };
+    assert_eq!(startup.to_string(), "the host could not start: boom");
+}
+
+#[test]
+fn an_out_of_bounds_stop_window_is_refused_before_anything_is_touched() {
+    // Review finding 9: the window is validated BEFORE any path, lock, or
+    // engine work — a sub-second or multi-day window is a rejected
+    // INVOCATION (`InvalidOptions`) that leaves the state root untouched,
+    // and with a caller sink the refusal is ALSO noted through it (AI-18).
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    for bad in [0, hekma_host::MAX_STOP_WINDOW_SECS + 1] {
+        let options = ServeOptions {
+            state_base: Some(state.path().to_path_buf()),
+            stop_window: Some(bad),
+            diagnostics: Some(sink.clone()),
+            ..ServeOptions::default()
+        };
+        let err = serve_with_signal(options, immediate_signal()).expect_err("refused");
+        match err {
+            ServeError::InvalidOptions { message } => {
+                assert!(
+                    message.contains(&format!("invalid stop window {bad}")),
+                    "the rejection names the value: {message}"
+                );
+                assert!(
+                    message.contains(&hekma_host::MIN_STOP_WINDOW_SECS.to_string())
+                        && message.contains(&hekma_host::MAX_STOP_WINDOW_SECS.to_string()),
+                    "the rejection names both bounds: {message}"
+                );
+            }
+            other => panic!("expected InvalidOptions, got {other:?}"),
+        }
+    }
+    assert!(
+        sink_handle.text().contains("invalid stop window"),
+        "with a caller sink the refusal is ALSO noted through it:\n{}",
+        sink_handle.text()
+    );
+    assert!(
+        !state.path().join("state.db").exists()
+            && !state
+                .path()
+                .join(hekma_engine::paths::HOST_LOCK_FILE)
+                .exists(),
+        "a rejected invocation touches nothing"
+    );
+}
+
+#[test]
+fn a_state_dir_whose_parent_is_a_regular_file_fails_to_start_honestly() {
+    // A state base that cannot exist (its parent is a file) is a Startup
+    // failure naming the directory — the host says why it could not start
+    // instead of unwrapping deep inside the open.
+    let state = tempfile::tempdir().unwrap();
+    let not_a_dir = state.path().join("not-a-dir");
+    std::fs::write(&not_a_dir, b"a regular file").unwrap();
+    let options = ServeOptions {
+        state_base: Some(not_a_dir.join("inner")),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("cannot start");
+    match err {
+        ServeError::Startup { message } => assert!(
+            message.contains("could not create the state directory"),
+            "the failure names the state directory: {message}"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_lock_path_that_cannot_be_a_file_surfaces_the_io_failure() {
+    // A `host.lock` path occupied by a directory can never be locked: the
+    // refusal must come back as the typed `Startup` (lock IO class) naming
+    // the path — noted through the caller sink too (AI-18) — never a panic
+    // or an engine opened alongside.
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir(state.path().join(hekma_engine::paths::HOST_LOCK_FILE)).unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("cannot lock");
+    match err {
+        ServeError::Startup { message } => assert!(
+            message.contains("could not acquire the host lock"),
+            "the failure names the lock acquisition: {message}"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    assert!(
+        sink_handle
+            .text()
+            .contains("could not acquire the host lock"),
+        "the lock IO failure is surfaced through the sink:\n{}",
+        sink_handle.text()
+    );
+    assert!(
+        !state.path().join("state.db").exists(),
+        "a lock-IO refusal must not open an engine"
+    );
+}
+
+/// A signal factory whose registration fails DURING the arming window (the
+/// wait task resolves `Err` before the engine opens — review finding 2's
+/// typed-Startup path).
+async fn early_failing_wait(_sink: hekma_engine::DiagnosticSink) -> Result<&'static str, String> {
+    Err(String::from("early registration failure: test"))
+}
+
+#[test]
+fn a_registration_failure_during_arming_is_a_typed_startup_error() {
+    // The typed-Startup contract (review finding 2): a registration failure
+    // surfaces verbatim, never a panic. Whether the arming handshake or the
+    // post-open wait observes the resolved `Err` is scheduler timing — the
+    // surfaced error is the same either way, so this test pins ONLY the
+    // contract (the deterministic post-open discriminators live in the
+    // late-arm tests below).
+    let state = tempfile::tempdir().unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, early_failing_wait).expect_err("registration failure");
+    match err {
+        ServeError::Startup { message } => assert_eq!(
+            message, "early registration failure: test",
+            "the registration failure surfaces verbatim"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+}
+
+/// A signal factory that dies only AFTER the arming window (it sleeps past
+/// the arming handshake, the engine opens, and only then the wait task
+/// panics) — the post-open JoinError arm.
+async fn late_panicking_wait(_sink: hekma_engine::DiagnosticSink) -> Result<&'static str, String> {
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    panic!("the shutdown-signal wait task died in a test");
+}
+
+#[test]
+fn a_dead_signal_wait_task_after_the_open_is_surfaced_as_a_startup_error() {
+    // A wait task that dies AFTER the engine opened must still surface as
+    // the typed Startup (the JoinError wording, never a hang) — and the
+    // state store proves this ran the POST-open arm, the discriminator from
+    // the pre-open contract test above. Silence the deliberate panic's
+    // default hook output (the ASSERTION is the surfaced error, not the
+    // panic printer), then restore it.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let state = tempfile::tempdir().unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, late_panicking_wait).expect_err("dead wait task");
+    std::panic::set_hook(previous_hook);
+    match err {
+        ServeError::Startup { message } => assert!(
+            message.contains("wait task failed"),
+            "the JoinError is surfaced honestly: {message}"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    assert!(
+        state.path().join("state.db").exists(),
+        "the post-open arm runs AFTER the open — the discriminator from the pre-open contract"
+    );
+}
+
+/// A signal factory that fails only AFTER the arming window (it sleeps past
+/// the arming handshake, the engine opens, and only then resolves `Err`).
+async fn late_failing_wait(_sink: hekma_engine::DiagnosticSink) -> Result<&'static str, String> {
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    Err(String::from("late registration failure: test"))
+}
+
+#[test]
+fn a_registration_failure_after_the_engine_opened_is_still_typed_startup() {
+    // The LATE arm of the same contract: the armed wait resolves Err after
+    // the open. The discriminator from the early arm is the state store —
+    // here the engine DID open (the failure is post-open), and the typed
+    // Startup still carries the verbatim registration failure.
+    let state = tempfile::tempdir().unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, late_failing_wait).expect_err("late failure");
+    match err {
+        ServeError::Startup { message } => assert_eq!(
+            message, "late registration failure: test",
+            "the late registration failure surfaces verbatim"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    assert!(
+        state.path().join("state.db").exists(),
+        "the late arm runs AFTER the open — the discriminator from the early arm"
+    );
+}
+
+#[test]
+fn a_poisoned_sink_never_silences_the_refusal_notice() {
+    // Review finding 17: a sink mutex POISONED by a panicking writer is
+    // recovered (`into_inner`) — a torn stream must not silence later host
+    // notices. The invalid-window refusal (which notes through the sink)
+    // still lands its line even on the poisoned sink.
+    let (sink_handle, sink) = SharedSink::new();
+    let to_poison = sink.clone();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Hold the sink's mutex while panicking: the guard drops during the
+        // unwind and the mutex poisons — exactly the mid-write panic shape.
+        let _held = to_poison.lock().unwrap();
+        std::panic::panic_any("deliberately poison the sink mutex");
+    }));
+    std::panic::set_hook(previous_hook);
+    let state = tempfile::tempdir().unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        stop_window: Some(0),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("refused");
+    assert!(
+        matches!(err, ServeError::InvalidOptions { .. }),
+        "the refusal itself is unchanged by the poisoned sink: {err:?}"
+    );
+    assert!(
+        sink_handle.text().contains("invalid stop window"),
+        "the poisoned sink was recovered and the notice still landed:\n{}",
+        sink_handle.text()
     );
 }
