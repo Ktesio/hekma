@@ -121,12 +121,57 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("org.opencontainers.image", workflow)
         self.assertNotIn("application/vnd.ktesio.release.v1", workflow)
 
+    def test_release_workflow_builds_and_verifies_the_static_musl_leg(self) -> None:
+        # The static Linux leg is a matrix-flag-gated addition to the same
+        # release flow: musl-tools provisioned at build time, the C deps
+        # compiled through musl-gcc (gated $GITHUB_ENV export — no empty-string
+        # env on other legs), a static-ness gate, the shipped archive PROVEN to
+        # contain all three binaries, and hekma-host staged on THIS leg only —
+        # the glibc archive keeps its pinned `hekma + hkm` contents.
+        workflow = (release_docs.ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("target: x86_64-unknown-linux-musl", workflow)
+        self.assertIn("musl: true", workflow)
+        self.assertIn("sudo apt-get install -y musl-tools", workflow)
+        self.assertIn("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER", workflow)
+        self.assertIn("CC_x86_64_unknown_linux_musl", workflow)
+        # Both wordings: rustc's musl default is static-pie (`file` prints
+        # "static-pie linked"); plain static binaries print "statically
+        # linked". The pin and the gate must not drift apart.
+        self.assertIn("static(ally|-pie) linked", workflow)
+        # The archive-content gate: all three binaries listed from the
+        # shipped tarball (the `./` prefix matches what Package Unix tars).
+        for binary in ("./hekma", "./hkm", "./hekma-host"):
+            self.assertIn(f'tar -tzf "dist/${{asset}}" | grep -qx "{binary}"', workflow)
+        # The GATING: every musl-only concern is conditioned on the matrix
+        # flag, and the hekma-host stage specifically runs NOWHERE else — a
+        # workflow that stages hekma-host on every leg (or gates nothing)
+        # fails this pin.
+        for step in (
+            "Install musl tools",
+            "Configure the musl build env",
+            "Verify static",
+            "Verify archive contents",
+            "Stage hekma-host",
+        ):
+            start = workflow.index(f"name: {step}")
+            end = workflow.index("- name:", start)
+            step_body = workflow[start:end]
+            self.assertIn("if: matrix.musl", step_body)
+        self.assertGreaterEqual(workflow.count("if: matrix.musl"), 5)
+
     def test_homebrew_formula_uses_release_assets_and_checksums(self) -> None:
         checksums = {
             "hekma-v1.2.3-x86_64-apple-darwin.tar.gz": "a" * 64,
             "hekma-v1.2.3-aarch64-apple-darwin.tar.gz": "b" * 64,
             "hekma-v1.2.3-x86_64-unknown-linux-gnu.tar.gz": "c" * 64,
             "hekma-v1.2.3-x86_64-pc-windows-msvc.zip": "d" * 64,
+            # The static musl archive rides the aggregate checksums file; the
+            # formula generator must TOLERATE the extra entry (its missing-
+            # asset check only requires its own Homebrew targets).
+            "hekma-v1.2.3-x86_64-unknown-linux-musl.tar.gz": "e" * 64,
         }
 
         formula = homebrew_formula.render_formula("v1.2.3", checksums)
@@ -141,6 +186,11 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("on_linux do", formula)
         self.assertIn("x86_64-unknown-linux-gnu", formula)
         self.assertNotIn("x86_64-pc-windows-msvc", formula)
+        # Homebrew installs the glibc Linux artifact; the static musl archive
+        # is a release-page download for containers/scratch. The formula must
+        # contain NO musl reference even when the aggregate checksums file
+        # carries the musl asset.
+        self.assertNotIn("musl", formula)
         # BOTH shipped binaries install from the one formula.
         self.assertIn('bin.install "hekma"', formula)
         self.assertIn('bin.install "hkm"', formula)
