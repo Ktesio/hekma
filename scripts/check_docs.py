@@ -109,6 +109,7 @@ KT_COMMANDS = {
     "self-update",
     "help",
     "agent",
+    "serve",
 }
 # `hekma agent` owns its own subcommand tree (crates/hekma/src/lib.rs `AgentCommands`).
 # Model it the same way as the top level — an allowlist per nesting level — so the

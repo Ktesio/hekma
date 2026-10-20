@@ -39,6 +39,10 @@
 //! <state_base>/
 //!   state.db                 # the one SQLite state store (AD-6)
 //!   secrets.toml             # the engine-SHARED 0600 secret store (AD-10; optional)
+//!   host.lock                # the long-running Host's single-writer advisory
+//!                            #   lock (story 17-2): one `hekma serve` process
+//!                            #   holds it for its whole lifetime; `pid=<n>`
+//!                            #   names the holder; stale residue re-acquires
 //!   agents/
 //!     <instance_name>/       # one Agent Home per instance
 //!       config.toml          # instance-level config (AD-9)
@@ -206,6 +210,18 @@ pub const STATE_DIR_ENV_ALIAS: &str = "HEKMA_STATE_DIR";
 
 /// File name of the SQLite state store inside the state base. `[ASSUMPTION]`
 pub const STATE_DB_FILE: &str = "state.db";
+
+/// File name of the long-running Host's advisory lock inside the state base
+/// (story 17-2): the SINGLE-writer lock one `hekma serve` process holds for
+/// its whole lifetime, so two Hosts can never supervise (or spawn against)
+/// the same state dir concurrently. Advisory (`File::try_lock`), NOT a
+/// lock table column — the Host must refuse BEFORE any engine open, and the
+/// lock must survive with no engine running at all. The holder writes
+/// `pid=<n>` into the file so a refusal can NAME the live holder; a stale
+/// file (no live holder — a crashed Host's residue) is re-acquired, never a
+/// refusal. Owned by the `hekma-host` crate; the engine itself never takes
+/// it. `[ASSUMPTION]`
+pub const HOST_LOCK_FILE: &str = "host.lock";
 
 /// File name of the engine SECRETS store inside the state base (story 2-4, spine
 /// AD-10 "the engine secrets file, mode 0600"). A state-dir-level file (NOT

@@ -418,6 +418,41 @@ hekma agent config get demo --reveal
 
 Values resolve across four layers — engine defaults &lt; agent-kind defaults &lt; instance config &lt; invocation overrides — and each value names its winning source layer (a **Source** column, or a `source` field with `--json`).
 
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--state-dir <dir>]`
+
+Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
+
+```bash
+hekma serve
+hekma serve --stop-window 10
+hekma serve --metering-listen 8400 --state-dir ~/agents-state
+```
+
+- `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
+- `--metering-listen <port>` — a fixed loopback port for every `engine-observed` instance's metering listener for this host's lifetime (default `0` = OS-ephemeral). With a fixed port, a host restart re-binds the SAME port, so a detached `engine-observed` instance adopted by the new host keeps its injected `base_url` live — without it, an adopted observed instance is stranded (its listener died with the starting command) and the adoption says so. A port that is already in use **refuses the start** with a typed diagnostic naming the port — the host never silently hops to another port. Port `0` keeps the pre-serve ephemeral behavior.
+- `--state-dir <dir>` — serve this state directory instead of the resolved default (`HEKMA_STATE_DIR`/`KTESIO_STATE_DIR`, else the platform data dir; same resolution order as every other command).
+
+### Single-writer lock
+
+The host takes `<state-root>/host.lock` before anything opens. A second `hekma serve` on the same state directory is refused (exit code `2`) naming the live holder's PID and the remediation — **stop that host first, or serve a different state directory**. The refusal never advises deleting the lock file: a dead host releases the OS lock by itself (a crashed host's stale lock re-acquires cleanly — the file's contents are never trusted to mean a live holder), and deleting a LIVE holder's lock would let a third `serve` mint a fresh lock inode and put two hosts on one state root. The lock releases when the host process exits.
+
+### Hosted children: the environment allowlist
+
+Agents started under `serve` run with a **child-environment allowlist**: a hosted child inherits ONLY the environment variables its adapter declares — plus a minimal **OS-baseline floor** of process plumbing — never the host shell's full ambient environment (no credentials, shell exports, or CI variables pass). This is always on under serve; it cannot be turned off.
+
+The floor exists because a strictly cleared environment breaks real children outright (no `PATH` → no program resolution or shelling out; on Windows, stripped `SystemRoot`/`ComSpec` break process startup). It is OS plumbing, not host-environment leakage:
+
+- **Unix:** `PATH`, `HOME`
+- **Windows:** `SystemRoot`, `SystemDrive`, `ComSpec`, `TEMP`, `TMP`, `PATH`
+
+The floor values come from the host's own environment; everything beyond the declared mappings and this floor is still cleared. The declared-env contract is unchanged for every other variable.
+
+### Shutdown drain
+
+On the shutdown signal every RUNNING agent is stopped through the same bounded ladder `hekma agent stop` uses, each with the configured `--stop-window`. The stops are **issued concurrently** and each outcome is surfaced the moment its ladder settles. The wall clock, honestly: the engine's stop ladder runs under its supervision lock, so agents that must run out the full window before the force-kill escalation queue behind each other (worst case one window per escalated agent); agents that exit promptly on the graceful signal settle fast. The plan is re-checked after the pass: an instance that entered `running` mid-drain (a concurrent `agent start`) gets one extra ladder pass, and anything still running after that is named honestly on stderr (it will be terminated by the engine's exit teardown WITHOUT the bounded ladder). Signals arriving DURING the drain are swallowed and noted — a second SIGTERM from an impatient operator or service manager never kills the host mid-ladder; the drain already running completes.
+
+Every outcome is surfaced on stderr (stopped gracefully / force-killed after the window / ended on its own before the ladder reached it / failed to stop, with the reason). Even a failed per-instance stop does not fail the host's exit: the drain ran and the host's contract was kept, so `hekma serve` exits `0` on shutdown either way — the stream, not the exit code, carries the failure. Note the service-manager consequence: because a failed per-instance stop still exits `0`, a `Restart=on-failure` unit will NOT restart the host over it — the diagnostic stream is the record (deliberate; revisited when the container recipe lands).
+
 ## Unified Config Keys
 
 Set these with `hekma agent config set <name> <key> <value>`.
@@ -453,8 +488,8 @@ Every `hekma` command returns one of these numeric exit codes, so failures can b
 | Code | Meaning | Typical causes |
 |------|---------|----------------|
 | `0` | Success | The command completed; `--help` and `--version` also exit `0` |
-| `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter manifest whose `contract_version` major does not match this engine's (the FR-30 negotiation gate — the error names both versions and the rule), an adapter declaring no capabilities or no metering source, a failed self-update |
-| `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, or a duplicate instance name |
+| `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter manifest whose `contract_version` major does not match this engine's (the FR-30 negotiation gate — the error names both versions and the rule), an adapter declaring no capabilities or no metering source, a failed self-update, or a `hekma serve` that could not START (state-dir creation, lock I/O, engine open, runtime build, signal registration — an environment/system failure, not an invocation error) |
+| `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, a duplicate instance name, a `hekma serve` on a state directory another host already serves (the diagnostic names the live holder PID and the stop-it-or-switch-roots remediation), or a serve option value outside its documented bounds (e.g. `--stop-window` outside `1..=86400`) |
 | `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, a stop that could not be confirmed, or a second `send` to an `acp` instance while an ACP turn is still in flight (the first turn is unaffected) |
 | `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `hekma agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `hekma agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `hekma agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
@@ -490,7 +525,7 @@ Two environment variables control `hekma`'s own behavior (they are never injecte
 
 ### Update checks
 
-When a `hekma` subcommand runs, Hekma checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `hekma self-update`. Machine-readable JSON on stdout is unaffected. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
+When a `hekma` subcommand runs, Hekma checks whether a newer GitHub Release is available, using an hourly cache. If an update is available, it prints a short stderr notice asking you to run `hekma self-update`. Machine-readable JSON on stdout is unaffected. `hekma serve` is exempt — a long-running host is not a point-in-time command, and its stderr stream carries host diagnostics, not update notices. Disable checks with `KTESIO_NO_UPDATE_CHECK=1` (also skipped when `CI=true`).
 
 ### `hekma self-update`
 

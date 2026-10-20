@@ -573,6 +573,12 @@ impl Supervisor {
             // docs): the Unix handle skips its Drop killpg; the Windows spawn
             // never creates/assigns the kill-on-close Job Object.
             detach,
+            // Story 17-2: the Host's `child_env_allowlist` flips this to
+            // `false` so the child's environment is CLEARED first and only the
+            // manifest-declared mappings are applied (the supervisor owns the
+            // decision, the backends stay dumb executors). Every pre-17-2
+            // caller (and the default) keeps full inheritance.
+            inherit_env: !self.child_env_allowlist,
         };
 
         // (4) Spawn. A spawn failure lands the instance in `failed` with the
@@ -856,8 +862,9 @@ impl Supervisor {
     /// real upstream provider URL (`metering.upstream_base_url`) from `effective`;
     /// (2) requires the engine runtime handle (the listener's accept loop runs on
     /// it) — absent → a clear error (only the handle-less unit-test supervisor lacks
-    /// it, and it never starts an observed instance); (3) binds `127.0.0.1:0`
-    /// (loopback ONLY — AC-B) and spawns the accept loop. Every failure maps to a
+    /// it, and it never starts an observed instance); (3) binds `127.0.0.1` on the
+    /// Host seam's port (loopback ONLY — AC-B; port 0 = ephemeral, the pre-17-2
+    /// default) and spawns the accept loop. Every failure maps to a
     /// TRAFFIC-FREE [`EngineError::ObservedMetering`] (no body/header/key — 2-4
     /// no-leak). The returned [`ObservedListener`] is moved into `Supervised`; its
     /// `base_url` is what the caller injects via the config-mapping (AC6).
@@ -896,15 +903,22 @@ impl Supervisor {
                      (engine-observed metering requires the async engine)"
                     .to_string(),
             })?;
-        // Bind loopback + spawn. A ListenerError is TRAFFIC-FREE by construction
-        // (bind/upstream-shape only — never a body/header/key), so mapping it into
-        // the detail cannot leak a secret (2-4 rigor).
-        let listener = ObservedListener::start(runtime, upstream).map_err(|e: ListenerError| {
-            EngineError::ObservedMetering {
-                name: name.as_str().to_string(),
-                detail: e.to_string(),
-            }
-        })?;
+        // Bind loopback + spawn. The PORT comes from the story-17-2 Host seam
+        // (`metering_listen_port`: 0 = the OS-ephemeral default every pre-17-2
+        // caller takes; non-zero = the Host's pinned `metering.listen` port, so
+        // restarts/adoption re-bind the SAME port). The ADDRESS stays
+        // engine-computed loopback (AC-B). A ListenerError is TRAFFIC-FREE by
+        // construction (bind/upstream-shape only — never a body/header/key), so
+        // mapping it into the detail cannot leak a secret (2-4 rigor); a pinned
+        // port that is already taken surfaces here as the typed bind error
+        // (AI-18 — never a silent hop).
+        let listener =
+            ObservedListener::start_on_port(runtime, upstream, self.metering_listen_port).map_err(
+                |e: ListenerError| EngineError::ObservedMetering {
+                    name: name.as_str().to_string(),
+                    detail: e.to_string(),
+                },
+            )?;
         Ok(Some(listener))
     }
 

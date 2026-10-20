@@ -278,11 +278,12 @@ class ReleaseDocsTests(unittest.TestCase):
             '-p "$pkg" --out Lcov --output-dir "cov/$pkg"',
             ci_flat,
         )
-        # The exact five workspace crates, lightest → heaviest with hekma-engine
-        # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers logged).
+        # The exact six workspace crates, lightest → heaviest with hekma-engine
+        # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers
+        # logged). Story 17-2 added hekma-host before the engines.
         self.assertIn(
             "set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes "
-            "hekma hekma-engine",
+            "hekma-host hekma hekma-engine",
             ci,
         )
         # Each per-crate run is grouped and dumps free/df first, so a per-crate OOM
@@ -559,7 +560,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # unwritable-root shape, justified in the step comment). Story 16-1
         # added the conformance test_notes.rs entry (the uncaptured-note
         # helper's raw fd/handle write arms — platform-only imports that
-        # cannot be data-driven, justified in the step comment).
+        # cannot be data-driven, justified in the step comment). Story 17-2
+        # added the hekma-host signals.rs entry (tokio's signal-stream
+        # registration is unix/windows-cfg'd inside the tokio crate itself;
+        # the host's SIGTERM wait cannot be written data-driven).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
@@ -567,7 +571,8 @@ class ReleaseDocsTests(unittest.TestCase):
             r"|^crates/hekma-engine/tests/atomic_config_writes\.rs:"
             r"|^crates/hekma-engine/tests/memory\.rs:"
             r"|^crates/hekma-conformance/src/tck\.rs:"
-            r"|^crates/hekma-conformance/src/test_notes\.rs:'",
+            r"|^crates/hekma-conformance/src/test_notes\.rs:"
+            r"|^crates/hekma-host/src/signals\.rs:'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
