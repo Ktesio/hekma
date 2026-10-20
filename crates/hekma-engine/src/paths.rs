@@ -43,6 +43,19 @@
 //!                            #   lock (story 17-2): one `hekma serve` process
 //!                            #   holds it for its whole lifetime; `pid=<n>`
 //!                            #   names the holder; stale residue re-acquires
+//!   outbox.jsonl             # the engine-GLOBAL event outbox journal (story
+//!                            #   17-4, AD-14 amendment): append-only JSON-Lines
+//!                            #   carrying transitions/breaches/usage under ONE
+//!                            #   monotonically increasing `seq`, written at the
+//!                            #   three family commit sites; the Host pulls it
+//!                            #   by cursor (`/v0/export`) and acknowledges a
+//!                            #   seq (below); bounded like the log families
+//!                            #   (10MB × 3) with un-acked eviction SURFACED
+//!   outbox-ack.json          # the durable consumer cursor for the outbox
+//!                            #   (story 17-4): `{"schema_version":1,"seq":n}`,
+//!                            #   written atomically (`write_atomically`) by
+//!                            #   the export-ack route; one cursor because the
+//!                            #   host lock guarantees exactly one Host owner
 //!   agents/
 //!     <instance_name>/       # one Agent Home per instance
 //!       config.toml          # instance-level config (AD-9)
@@ -236,6 +249,27 @@ pub const SECRETS_FILE: &str = "secrets.toml";
 /// Directory (under the state base) that holds all Agent Homes. `[ASSUMPTION]`
 pub const AGENTS_DIR: &str = "agents";
 
+/// File name of the engine-GLOBAL outbox journal inside the state base (story
+/// 17-4, the AD-14 amendment): an append-only JSON-Lines file carrying the
+/// transition, breach, and usage event families under ONE monotonically
+/// increasing `seq`, written at the three family commit sites. A state-dir-level
+/// file (NOT per-Agent-Home — the whole point is the cross-instance global
+/// order an ephemeral Host can pull). Bounded to
+/// `LOG_ROTATE_MAX_BYTES × LOG_ROTATE_GENERATIONS` (the log families' "10MB × 3"
+/// discipline) by prefix compaction at append/ack time; any eviction of
+/// UN-ACKED entries is surfaced through the batch's `retained_from` + the typed
+/// below-floor refusal — never silent. `[ASSUMPTION]`
+pub const OUTBOX_JOURNAL_FILE: &str = "outbox.jsonl";
+
+/// File name of the outbox's durable consumer cursor inside the state base
+/// (story 17-4): `{"schema_version":1,"seq":n}` — the highest seq a Host has
+/// ACKNOWLEDGED, written atomically ([`write_atomically`]) by the export-ack
+/// route so a host restart resumes from the acked position (the resync
+/// contract's cursor durability, promoted to the outbox). ONE cursor because
+/// the host lock (`HOST_LOCK_FILE`) guarantees exactly one Host owns the state
+/// dir. `[ASSUMPTION]`
+pub const OUTBOX_ACK_FILE: &str = "outbox-ack.json";
+
 /// File name of the per-instance config file inside an Agent Home. `[ASSUMPTION]`
 pub const INSTANCE_CONFIG_FILE: &str = "config.toml";
 
@@ -387,6 +421,23 @@ impl EnginePaths {
     /// Directory holding all Agent Homes.
     pub fn agents_dir(&self) -> PathBuf {
         self.state_base.join(AGENTS_DIR)
+    }
+
+    /// Absolute path to the engine-GLOBAL outbox journal (story 17-4, the
+    /// AD-14 amendment) — the append-only JSON-Lines event journal at the
+    /// state base. The engine is the SOLE writer (path authority + the
+    /// supervisor lock at the three commit sites); Hosts read it only through
+    /// `Engine::export_events`, never by constructing the path.
+    pub fn outbox_journal(&self) -> PathBuf {
+        self.state_base.join(OUTBOX_JOURNAL_FILE)
+    }
+
+    /// Absolute path to the outbox's durable consumer-cursor file (story
+    /// 17-4) — the atomically-written `{"schema_version":1,"seq":n}` ack
+    /// record beside the journal. Written ONLY through `Engine::ack_export`
+    /// (via [`write_atomically`]); the default export pull resumes from it.
+    pub fn outbox_ack(&self) -> PathBuf {
+        self.state_base.join(OUTBOX_ACK_FILE)
     }
 
     /// Absolute Agent Home directory for `name` (keyed by the unique name).

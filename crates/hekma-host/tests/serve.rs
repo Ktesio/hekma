@@ -228,6 +228,7 @@ fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
                     .expect("static test address parses")
             ),
             bearer_secret: Some("render_check_bearer".to_string()),
+            log_capture: hekma_engine::LogCaptureMode::Metadata,
             diagnostics: Some(sink),
         }
     );
@@ -238,6 +239,10 @@ fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
     assert!(
         with_sink.contains("bearer_secret") && with_sink.contains("render_check_bearer"),
         "bearer_secret is rendered with its configured name: {with_sink}"
+    );
+    assert!(
+        with_sink.contains("log_capture") && with_sink.contains("Metadata"),
+        "log_capture is rendered with its configured mode: {with_sink}"
     );
     assert!(
         with_sink.contains("state_base") && with_sink.contains("/tmp/hekma-state"),

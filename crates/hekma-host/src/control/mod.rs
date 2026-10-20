@@ -116,6 +116,10 @@ fn router(state: ApiState) -> Router {
         .route("/v0/instances/{name}/resume", post(routes::resume))
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
+        // The ephemeral-host export surface (story 17-4): the global outbox
+        // pull + the durable ack advance.
+        .route("/v0/export", get(routes::export_pull))
+        .route("/v0/export/ack", post(routes::export_ack))
         // Envelope the routing rejections TOO (review item 9): an unmatched
         // path is an envelope 404, a known path with the wrong method an
         // envelope 405 — never a bare status. Both run INSIDE the auth layer

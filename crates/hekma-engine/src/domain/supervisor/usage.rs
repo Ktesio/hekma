@@ -345,6 +345,232 @@ impl Supervisor {
             // miscount) — a billing path must never panic.
             DrainPlan::Shrunk { .. } => {}
         }
+        // Story 17-4 (review findings 9/10): BOTH channels' raw files get the
+        // coordinated truncate (`agent.log` AND `agent-stderr.log`), and the
+        // check runs on the TERMINAL drain too — a cap-crossing burst between
+        // the last mid-run tick and stop must not leave the file over-cap at
+        // rest forever. The terminal check runs BEFORE the metadata-mode
+        // unlink and the at-rest handoff; the process is dead by then, so no
+        // appends race it.
+        if mode == DrainMode::MidRun || mode == DrainMode::Terminal {
+            self.maybe_truncate_raw_log(registry, name, channel, mode);
+        }
+    }
+
+    /// The PURE truncate decision (story 17-4; the [`should_rotate`]-style
+    /// seam — unit-tested without I/O): the raw `agent.log` has reached its
+    /// cap and must be truncated. Cap-as-parameter so tests drive the
+    /// coordinated-truncate path at toy sizes. `pub(super)` — the sibling
+    /// `tests` module pins the seam directly.
+    pub(super) fn should_truncate(file_len: u64, cap: u64) -> bool {
+        file_len >= cap
+    }
+
+    /// The COORDINATED raw-log truncate (story 17-4, the AD-12 amendment;
+    /// review findings 8/9/10 generalized it): per CHANNEL (`agent.log` /
+    /// `agent-stderr.log`) and per DRAIN MODE (mid-run AND terminal — a
+    /// cap-crossing burst between the last mid-run tick and stop must not
+    /// leave the file over-cap at rest). The child's stdout/stderr fds are
+    /// inode-pinned to their direct-redirect files, so rename-generations
+    /// cannot bound the live files — but the raw opens are O_APPEND, so
+    /// TRUNCATING to 0 at a drain tick is safe the moment BOTH consumers sit
+    /// past the cut:
+    ///
+    /// * the usage-drain cursor (this channel's) — this drain just ran, so
+    ///   the cursor is as caught-up as it gets this tick;
+    /// * the capture tailer's cursor for the same stream — polled live.
+    ///
+    /// If either lags (a partial trailing line unconsumed, a tailer pass
+    /// behind), truncation is DEFERRED — never forced (unread bytes would be
+    /// silently destroyed). On the TERMINAL drain there is no next tick, so
+    /// the tailer gets one forced catch-up pass first (`LogCapture::
+    /// catch_up_now`) — after death no more bytes arrive, so the cursor
+    /// catches up fully and the truncate fires instead of deferring into an
+    /// at-rest over-cap file.
+    ///
+    /// When both are past the cut the engine truncates to 0, snaps BOTH
+    /// cursors to 0 (so post-truncate appends are ingested/tailed from byte
+    /// 0 — no Shrunk skip, no double-count), and emits ONE diagnostic notice
+    /// per truncation (surfaced, not silent). The truncate + the tailer
+    /// cursor snap happen UNDER ONE hold of the capture's cursor mutex
+    /// (review finding 8): a tailer pass can never observe the truncated
+    /// file with a pre-truncate cursor (its shrink guard would swallow the
+    /// post-truncate appends). A truncate FAILURE is latched (review
+    /// finding 14): the deferral notice fires ONCE per continuous failure
+    /// state and re-arms only when a truncate succeeds — a persistently
+    /// failing `set_len` must not re-announce every tick. Best-effort: a
+    /// failure is a surfaced diagnostic and a deferral, never a failed drain.
+    ///
+    /// Known (accepted, documented) race: a child appending between the
+    /// length check and the `set_len(0)` can lose those few bytes. The window
+    /// is microseconds; O_APPEND writes after the truncate continue cleanly
+    /// from the new end. A billing-correct alternative does not exist without
+    /// kernel support (the fd pin forbids rename-generations).
+    fn maybe_truncate_raw_log(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        channel: UsageChannel,
+        mode: DrainMode,
+    ) {
+        let capture = self.log_capture_for(name);
+        if mode == DrainMode::Terminal {
+            // The tailer's last chance: fold everything the dead process
+            // wrote into the attributed capture BEFORE the at-rest check.
+            if let Some(capture) = &capture {
+                capture.catch_up_now();
+            }
+        }
+        let path = channel.log_path(registry, name);
+        let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) else {
+            return; // no file (Off mode never creates one; absence is fine)
+        };
+        if !Self::should_truncate(len, self.agent_log_cap()) {
+            self.clear_truncate_deferral(channel);
+            return;
+        }
+        // Consumer 1: the usage cursor. It must sit at (or past) the file's
+        // end — a lagging cursor means unread bytes; defer.
+        let usage_cursor = match self.running.get(name) {
+            Some(s) => channel.cursor(s),
+            None => return,
+        };
+        if usage_cursor < len {
+            return;
+        }
+        // Consumer 2: the capture tailer. An ADOPTED handle has no capture
+        // (and no tailer thread) — there is no second cursor to lag, so the
+        // file's only reader is the usage drain, already verified above. An
+        // Off-mode instance has no file at all (returned above).
+        let tailer_cursor = match &capture {
+            Some(capture) => match channel {
+                UsageChannel::Stdout => capture.stdout_tail_cursor(),
+                UsageChannel::Stderr => capture.stderr_tail_cursor(),
+            },
+            None => len,
+        };
+        if tailer_cursor < len {
+            return; // tailer lagging — deferred (mid-run: to the next tick)
+        }
+        // Both consumers past the cut: truncate, snap the tailer's cursor
+        // under the SAME lock hold, snap this drain's cursor, surface.
+        let file_label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the raw capture file".to_string());
+        let truncated = match &capture {
+            Some(capture) => capture.truncate_raw_and_snap(&path, channel == UsageChannel::Stdout),
+            None => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .ok()
+                .and_then(|file| file.set_len(0).ok()),
+        };
+        match truncated {
+            Some(()) => {
+                self.clear_truncate_deferral(channel);
+                if let Some(s) = self.running.get_mut(name) {
+                    channel.set_cursor(s, 0);
+                }
+                let truncated_notice = format!(
+                    "{}: {} reached the {}MB capture bound and was truncated to 0 \
+                     (usage cursor and tailer were both past the cut; metering is \
+                     double-count-free)",
+                    name.as_str(),
+                    file_label,
+                    self.agent_log_cap() / (1024 * 1024)
+                );
+                self.emit_diagnostic(&truncated_notice);
+            }
+            None => {
+                // Review finding 14: latch the deferral — ONE notice per
+                // continuous failure state, re-armed by the next success.
+                if self.note_truncate_deferral(channel) {
+                    let truncate_deferred = format!(
+                        "{}: {} reached the {}MB capture bound but the truncate failed; \
+                         deferring (this notice latches until a truncate succeeds)",
+                        name.as_str(),
+                        file_label,
+                        self.agent_log_cap() / (1024 * 1024)
+                    );
+                    self.emit_diagnostic(&truncate_deferred);
+                }
+            }
+        }
+    }
+
+    /// The truncate-deferral latch, per channel (review finding 14): records
+    /// a failed truncate and returns whether this is the FIRST failure of a
+    /// continuous state (the caller emits only then).
+    fn note_truncate_deferral(&mut self, channel: UsageChannel) -> bool {
+        match channel {
+            UsageChannel::Stdout => std::mem::replace(&mut self.agent_log_truncate_deferred, true),
+            UsageChannel::Stderr => {
+                std::mem::replace(&mut self.agent_stderr_truncate_deferred, true)
+            }
+        }
+    }
+
+    /// Re-arm the truncate-deferral latch (a truncate succeeded — a fresh
+    /// failure may announce itself again).
+    fn clear_truncate_deferral(&mut self, channel: UsageChannel) {
+        match channel {
+            UsageChannel::Stdout => self.agent_log_truncate_deferred = false,
+            UsageChannel::Stderr => self.agent_stderr_truncate_deferred = false,
+        }
+    }
+
+    /// Unlink the instance's TWO raw capture files in METADATA mode (story
+    /// 17-4) — the at-rest bound: the raw redirects exist only TRANSIENTLY
+    /// while the process runs (the crash-immune direct-redirect mechanism
+    /// requires the files; the pipe alternative is the documented
+    /// review-of-#80 liveness regression). Called at every TERMINAL path
+    /// AFTER the final usage drain (metadata parses before unlink — the
+    /// sentinel metering has already had its last pass), so a stopped Run
+    /// leaves NO agent content on disk: only the metadata-shaped `output.log`
+    /// (and the instance/breach logs) remain.
+    ///
+    /// The gate is the RUN's recorded spawn-time capture mode (review
+    /// finding 11) — `Some(Metadata)`, meaning THIS engine spawned the
+    /// process under metadata — never the engine's CURRENT mode: an adopted
+    /// Run (`None`, or any non-metadata posture) keeps its raw logs, because
+    /// a host's mode must not destroy files another engine's Run wrote. A
+    /// Run-less call (no `running` entry at all) falls back to the engine's
+    /// mode: production callers (stop, reap) always hold the entry — the
+    /// fallback exists for direct callers that have no Run to consult, and
+    /// degrades to exactly the pre-finding-11 behavior there.
+    ///
+    /// Best-effort with SURFACED failure (AI-18): a missing file is the
+    /// ordinary Off-adjacent case (never created) and stays silent; any other
+    /// unlink failure emits a diagnostic naming the path and the error, and
+    /// never fails the stop/reap itself.
+    pub(super) fn unlink_raw_logs_if_metadata(&self, registry: &Registry, name: &InstanceName) {
+        let metadata = match self.running.get(name).map(|s| s.capture_mode) {
+            Some(Some(LogCaptureMode::Metadata)) => true,
+            Some(_) => false,
+            None => self.log_capture_mode == LogCaptureMode::Metadata,
+        };
+        if !metadata {
+            return;
+        }
+        for path in [
+            registry.agent_output_log_path(name),
+            registry.agent_stderr_log_path(name),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    let unlink_failure = format!(
+                        "{}: could not unlink the raw capture file {} (metadata mode keeps no \
+                         agent content at rest): {e}",
+                        name.as_str(),
+                        path.display()
+                    );
+                    self.emit_diagnostic(&unlink_failure);
+                }
+            }
+        }
     }
 
     /// Drain ENGINE-OBSERVED usage from EVERY currently-running observed instance
@@ -654,6 +880,11 @@ impl Supervisor {
                 // sequence: usage → token breach → pause → dollar breach).
                 // Ordering obligation: this runs under the supervisor lock
                 // (see the `domain::bus` caller-enforced invariant).
+                // Story 17-4: the outbox journal mirrors the same committed
+                // usage event at the SAME commit point — after the durable
+                // ledger commit, before the bus publish. Best-effort (see
+                // `outbox_append`).
+                self.outbox_append(registry, EngineEvent::UsageUpdate(update.clone()));
                 self.publish(EngineEvent::UsageUpdate(update.clone()));
                 self.enforce_budget(registry, name, run_id, metering_source);
                 Ok(Some(update))
@@ -1046,6 +1277,10 @@ impl Supervisor {
                 // append publishes nothing). Ordering obligation: this runs
                 // under the supervisor lock (see the `domain::bus`
                 // caller-enforced invariant).
+                // Story 17-4: the outbox journal mirrors the same committed
+                // breach event at the SAME commit point. Best-effort (see
+                // `outbox_append`).
+                self.outbox_append(registry, EngineEvent::BudgetBreach(event.clone()));
                 self.publish(EngineEvent::BudgetBreach(event.clone()));
             }
             Err(e) => {
@@ -1072,7 +1307,8 @@ impl Supervisor {
     /// strict-parse log to avoid corrupting the transition-event reader) but
     /// kept for signature symmetry with the other enforcement helpers.
     fn log_enforcement_diagnostic(&self, _registry: &Registry, name: &InstanceName, detail: &str) {
-        self.emit_diagnostic(&format!("{}: {detail}", name.as_str()));
+        let breadcrumb = format!("{}: {detail}", name.as_str());
+        self.emit_diagnostic(&breadcrumb);
     }
 
     /// Read back the recorded [`BudgetBreachEvent`]s for an instance from its

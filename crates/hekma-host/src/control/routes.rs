@@ -28,7 +28,11 @@ use super::ApiState;
 
 /// `GET /v0/version` — the self-description (routes, auth, and stability
 /// discovery all start here).
-pub(crate) async fn version() -> Json<dto::VersionDocument> {
+pub(crate) async fn version(State(state): State<ApiState>) -> Json<dto::VersionDocument> {
+    // Story 17-4 (review finding 21): the capture posture rides the version
+    // self-description — an off engine says so HERE, on the surface a Host
+    // reads first, not only in a failed read round-trip.
+    let log_capture = state.engine.log_capture_mode().await;
     Json(dto::VersionDocument {
         api: dto::API_ID,
         version: dto::API_VERSION,
@@ -42,6 +46,7 @@ pub(crate) async fn version() -> Json<dto::VersionDocument> {
             budget: hekma_engine::BUDGET_SCHEMA_VERSION,
             log: hekma_engine::LOG_SCHEMA_VERSION,
         },
+        log_capture: log_capture.as_str(),
     })
 }
 
@@ -360,4 +365,86 @@ pub(crate) async fn events_pull(
     };
     let batch = state.engine.resync_events(&name, cursor).await?;
     Ok(Json(batch))
+}
+
+/// The `?cursor=`/`?limit=` query parameters of the export pull (story
+/// 17-4). `cursor` is a JSON-encoded [`OutboxCursor`](hekma_engine::OutboxCursor)
+/// (`{"seq":n}`); ABSENT means "resume from the durable ACK cursor" — the
+/// common give-me-whats-new pull (NOT `OutboxCursor::START`, which would
+/// re-deliver the whole retained journal; a from-zero backfill is explicit:
+/// `?cursor={"seq":0}`). `limit` bounds the batch (`None` = the engine's
+/// default max). It is a RAW STRING parsed in [`export_pull`] (review
+/// finding 16): a typed `Option<u32>` would let axum's `Query` extractor
+/// reject a non-numeric or oversized value OUTSIDE the versioned envelope
+/// (a plain-text rejection, not a `400` error document) — manual parsing
+/// keeps EVERY query-parameter failure inside the envelope.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ExportQuery {
+    /// The JSON-encoded export resume cursor.
+    pub cursor: Option<String>,
+    /// The batch-size bound (raw — parsed in [`export_pull`]).
+    pub limit: Option<String>,
+}
+
+/// `GET /v0/export?cursor=&limit=` — the outbox pull (story 17-4): ONE
+/// bounded batch of committed events in ONE global order (journal order ==
+/// commit order), the engine's `export_events` verbatim. A cursor below the
+/// journal's retained floor or past its committed tail is a typed 409
+/// (`cursor_invalid`) — the engine's guard, mapped in [`super::error`] by
+/// the stable refusal sentences.
+pub(crate) async fn export_pull(
+    State(state): State<ApiState>,
+    Query(query): Query<ExportQuery>,
+) -> ApiResult<Json<dto::ExportBody>> {
+    let cursor = match query.cursor.as_deref() {
+        None => None,
+        Some(text) => Some(serde_json::from_str(text).map_err(|err| {
+            ApiError::invalid_body(format!(
+                "the cursor query parameter must be a JSON-encoded export cursor \
+                 ({{\"seq\":n}}): {err}"
+            ))
+        })?),
+    };
+    // Review finding 16: the limit is parsed INSIDE the handler so every
+    // failure is a versioned `400` envelope — never axum's plain-text
+    // extractor rejection. `0` is refused outright: a zero batch is
+    // meaningless, and silently delivering the default batch would lie
+    // about the request (the ABSENT parameter, not `0`, means "default").
+    let max = match query.limit.as_deref() {
+        None => 0u32,
+        Some(text) => match text.parse::<u32>() {
+            Ok(0) => {
+                return Err(ApiError::invalid_body(
+                    "the limit query parameter must be >= 1 (omit it for the engine's \
+                     default batch size)"
+                        .to_string(),
+                ))
+            }
+            Ok(n) => n,
+            Err(err) => {
+                return Err(ApiError::invalid_body(format!(
+                    "the limit query parameter must be a positive whole number (u32): \
+                     {err}"
+                )))
+            }
+        },
+    };
+    let batch = state.engine.export_events(cursor, max).await?;
+    Ok(Json(batch))
+}
+
+/// `POST /v0/export/ack` — advance the durable export ack cursor (story
+/// 17-4): everything with `seq <= ack` is consumed and compaction-eligible.
+/// Monotonic (`max(current, given)`); the response returns the cursor AS
+/// PERSISTED so a re-ack reads back its own idempotence. An ack past the
+/// journal's committed tail is a typed 409 (`cursor_invalid`).
+pub(crate) async fn export_ack(
+    State(state): State<ApiState>,
+    body: axum::Json<dto::ExportAckRequest>,
+) -> ApiResult<Json<dto::ExportAckDocument>> {
+    let persisted = state.engine.ack_export(body.seq).await?;
+    Ok(Json(dto::ExportAckDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        seq: persisted,
+    }))
 }

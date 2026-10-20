@@ -103,6 +103,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE,
 };
 
+#[cfg(test)]
+use crate::ports::LogCaptureMode;
 use crate::ports::{
     spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
     ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
@@ -251,11 +253,14 @@ pub struct WindowsBackend;
 /// The OS-baseline environment FLOOR (review finding 7): the variables an
 /// `inherit_env: false` child keeps BEYOND its declared mappings — the
 /// plumbing the Windows CRT/process startup reads (`SystemRoot`,
-/// `SystemDrive`, `ComSpec`) plus temp dirs (`TEMP`, `TMP`) and program
-/// resolution (`PATH`). Stripping them breaks real children outright. NOT
-/// host-environment leakage: the declared-env contract is unchanged for
-/// everything else (see the spawn guard + docs/commands.md). Mirrors the
-/// Unix backend's identical floor shape.
+/// `SystemDrive`, `ComSpec`) plus temp dirs (`TEMP`, `TMP`), program
+/// resolution (`PATH`), and the home directory (`HOME` — not set by Windows
+/// itself, but the de-facto plumbing every POSIX-derived toolchain the child
+/// may shell out to reads: Git-for-Windows, MSYS, SSH, node/python CLIs).
+/// Stripping them breaks real children outright. NOT host-environment
+/// leakage: the declared-env contract is unchanged for everything else (see
+/// the spawn guard + docs/commands.md). Mirrors the Unix backend's identical
+/// floor shape (`PATH`, `HOME`).
 const ENV_FLOOR: &[&str] = &[
     "SystemRoot",
     "SystemDrive",
@@ -263,6 +268,7 @@ const ENV_FLOOR: &[&str] = &[
     "TEMP",
     "TMP",
     "PATH",
+    "HOME",
 ];
 
 impl WindowsBackend {
@@ -340,11 +346,13 @@ impl ProcessBackend for WindowsBackend {
         // declared mappings below — plus the OS-baseline FLOOR (review
         // finding 7): on Windows a child stripped of SystemRoot/SystemDrive/
         // ComSpec/TEMP/TMP cannot reliably start a process at all (CRT
-        // initialization reads them). Mirrors the Unix backend's identical
-        // guard + floor shape. The floor is NOT host-environment leakage: it
-        // is documented OS plumbing (see docs/commands.md), and everything
-        // ELSE ambient still never passes. `true` (the default) is the
-        // pre-17-2 `envs`-on-top semantics.
+        // initialization reads them), and a child without PATH/HOME loses
+        // program resolution and the POSIX-ecosystem plumbing (Git-for-
+        // Windows, MSYS) real agents shell out to. Mirrors the Unix backend's
+        // identical guard + floor shape (`PATH`, `HOME` on both). The floor is
+        // NOT host-environment leakage: it is documented OS plumbing (see
+        // docs/commands.md), and everything ELSE ambient still never passes.
+        // `true` (the default) is the pre-17-2 `envs`-on-top semantics.
         if !spec.inherit_env {
             command.env_clear();
             for (key, value) in std::env::vars_os() {
@@ -611,6 +619,7 @@ impl ProcessBackend for WindowsBackend {
                 stderr_raw_path,
                 attributed_log_path,
                 spec.instance_name.clone(),
+                spec.capture_mode,
             )
         });
         Ok(WindowsProcess {
@@ -1210,6 +1219,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         }
     }
 

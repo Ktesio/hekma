@@ -109,6 +109,7 @@ fn spawn_serve_with_api(base: PathBuf, sink: SharedSink) -> ServeHandle {
         bearer_secret: Some(BEARER_NAME.to_string()),
         metering_listen_port: 0,
         stop_window: Some(2),
+        log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink)),
     };
     let mut server = spawn_serve(options);
@@ -236,6 +237,10 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         ("POST", format!("http://{addr}/v0/instances/ghost/stop")),
         ("POST", format!("http://{addr}/v0/instances/ghost/pause")),
         ("POST", format!("http://{addr}/v0/instances/ghost/resume")),
+        // The ephemeral-host export surface (story 17-4) is behind the SAME
+        // auth layer — no anonymous route.
+        ("GET", format!("http://{addr}/v0/export")),
+        ("POST", format!("http://{addr}/v0/export/ack")),
     ]
 }
 
@@ -341,8 +346,16 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         };
         let identity = url.ends_with("/v0/version")
             || url.ends_with("/v0/fleet")
-            || url.ends_with("/v0/events");
+            || url.ends_with("/v0/events")
+            // The outbox pull (story 17-4) with a valid bearer answers 200 —
+            // an empty/never-written journal is a valid EMPTY batch, not a
+            // missing resource.
+            || url.ends_with("/v0/export");
         let register = method == "POST" && url.ends_with("/v0/instances");
+        // The ack POST reached its handler but this loop's register-shaped
+        // body carries no `seq` — the Json extractor's 422 is the
+        // handler-reached answer (auth passed, the request shape was wrong).
+        let ack_wrong_body = method == "POST" && url.ends_with("/v0/export/ack");
         let expected = match (register, identity) {
             // The SSE stream answers 200 and STAYS OPEN — never drained
             // here (read_to_string would block until shutdown); dropping
@@ -351,6 +364,7 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
             // The register POST runs its exactly-one-of + engine validation
             // (an unknown kind → 400).
             (true, false) => StatusCode::BAD_REQUEST,
+            (false, false) if ack_wrong_body => StatusCode::UNPROCESSABLE_ENTITY,
             // Every other ghost route: the HANDLER's engine lookup answers
             // 404 (auth passed, the resource does not exist).
             (false, false) => StatusCode::NOT_FOUND,
@@ -395,6 +409,12 @@ fn the_version_document_self_describes_the_surface() {
     assert_eq!(json["schema_version"], 1);
     assert_eq!(json["engine"]["fleet"], 2);
     assert_eq!(json["engine"]["event"], 1);
+    // Review finding 21: the capture posture is part of the
+    // self-description — a Host learns it without a failed round-trip.
+    assert_eq!(
+        json["log_capture"], "full",
+        "the default serve posture is named on the version document"
+    );
 
     server.stop().unwrap();
 }
@@ -954,6 +974,349 @@ fn the_cursor_pull_is_lossless_idempotent_and_truncation_guarded() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+
+    server.stop().unwrap();
+}
+
+/// Stage ONE valid outbox journal entry with the given seq (built through
+/// the engine's OWN types, so the wire shape can never drift from what the
+/// engine writes).
+fn outbox_entry_line(seq: u64) -> String {
+    let entry = hekma_engine::OutboxEntry {
+        schema_version: hekma_engine::OUTBOX_SCHEMA_VERSION,
+        seq,
+        event: hekma_engine::EngineEvent::Transition(hekma_engine::TransitionEvent::new(
+            "probe",
+            hekma_engine::LifecycleState::Starting,
+            hekma_engine::LifecycleState::Running,
+            hekma_engine::TransitionCause::AdapterReady,
+            "2026-10-19T00:00:00Z".to_string(),
+        )),
+    };
+    format!("{}\n", serde_json::to_string(&entry).unwrap())
+}
+
+#[test]
+fn export_pull_ack_cursor_survives_a_host_restart_and_invalid_cursors_refuse() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "worker");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let instance = format!("http://{}/v0/instances/worker", server.addr);
+
+    // Drive a real lifecycle so the outbox journal holds committed
+    // transitions (register happened on the PRE-SERVE engine; start/stop
+    // commit through THIS host).
+    let response = client
+        .post(format!("{instance}/start"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client
+        .post(format!("{instance}/stop"))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"window_secs": 1}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // PULL (the default: resume from the durable ack — absent, so from the
+    // journal's beginning): at least the start/stop transitions, in ONE
+    // global order, every entry seq-stamped.
+    let mut response = get_ok(&client, &server.addr, "/v0/export");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(
+        json["schema_version"], 1,
+        "the journal's own version: {json}"
+    );
+    let events = json["events"].as_array().expect("events array");
+    assert!(
+        events.len() >= 2,
+        "the host's committed transitions are exported: {json}"
+    );
+    assert_eq!(
+        json["torn_tail_skipped"], false,
+        "a clean journal surfaces no torn-tail skip: {json}"
+    );
+    let max_seq = events
+        .iter()
+        .map(|e| e["seq"].as_u64().expect("each entry carries its seq"))
+        .max()
+        .expect("a non-empty batch has a max seq");
+
+    // ACK the tail: 200, and the response returns the cursor AS PERSISTED.
+    let mut response = client
+        .post(format!("http://{}/v0/export/ack", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"seq": max_seq}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["seq"], max_seq, "the ack reads back persisted: {json}");
+
+    // An ack PAST the committed tail: the typed 409 cursor_invalid — never
+    // a clamp, never a fabricated advance.
+    let mut response = client
+        .post(format!("http://{addr}/v0/export/ack", addr = server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"seq": 9_999_999}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "cursor_invalid");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("past the journal's committed tail"));
+
+    // THE RESTART: stop host #1, open host #2 on the SAME state root. The
+    // ack cursor is DURABLE (outbox-ack.json) — the default pull resumes
+    // AFTER it (an EMPTY batch: everything acked is consumed), while the
+    // explicit from-zero cursor re-pulls everything still retained.
+    server.stop().unwrap();
+    let (sink_handle2, _diagnostics2) = SharedSink::new();
+    let server2 = spawn_serve_with_api(base, sink_handle2);
+    let mut response = get_ok(&client, &server2.addr, "/v0/export");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(
+        json["events"],
+        serde_json::json!([]),
+        "the ack survived the restart — the default pull resumes AFTER it: {json}"
+    );
+    let explicit_zero = serde_json::json!({"seq": 0});
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/export?cursor={}",
+            server2.addr,
+            percent_encode(&explicit_zero.to_string())
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert!(
+        json["events"].as_array().expect("events array").len() >= 2,
+        "an explicit from-zero cursor re-pulls the retained journal: {json}"
+    );
+    server2.stop().unwrap();
+}
+
+#[test]
+fn an_export_cursor_below_the_retained_floor_is_409_never_a_clamp() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // Stage the journal DIRECTLY: one entry at seq 5 (a compaction already
+    // dropped 1..=4 in this scenario). registered_fake_agent's manifest dir
+    // is irrelevant here — no instance is started; the floor guard is what
+    // is under test.
+    let journal = base.join(hekma_engine::paths::OUTBOX_JOURNAL_FILE);
+    std::fs::write(&journal, outbox_entry_line(5)).unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    // BELOW the retained floor (cursor 3 would silently skip the dropped
+    // 1..=4): the typed 409 cursor_invalid naming the floor.
+    let below = serde_json::json!({"seq": 3});
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/export?cursor={}",
+            server.addr,
+            percent_encode(&below.to_string())
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "cursor_invalid");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("below the journal's retained floor"));
+
+    // PAST the committed tail: the same 409 class, the tail sentence.
+    let past = serde_json::json!({"seq": 99});
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/export?cursor={}",
+            server.addr,
+            percent_encode(&past.to_string())
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "cursor_invalid");
+
+    // The floor-minus-one cursor IS servable (a fresh consumer resuming at
+    // the floor gets the retained entries).
+    let at_floor = serde_json::json!({"seq": 4});
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/export?cursor={}",
+            server.addr,
+            percent_encode(&at_floor.to_string())
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(
+        json["events"].as_array().expect("events array").len(),
+        1,
+        "the retained entry delivers past the floor-minus-one cursor: {json}"
+    );
+
+    // A MALFORMED cursor (not JSON at all) never reaches the engine: it is
+    // the export route's own parse refusal — 400 invalid_body naming the
+    // wire rule — the query-parameter sibling of the body extractors' 422.
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/export?cursor={}",
+            server.addr,
+            percent_encode("not json at all")
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "invalid_body");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSON-encoded export cursor"),
+        "the refusal names the cursor's wire shape: {json}"
+    );
+    server.stop().unwrap();
+}
+
+#[test]
+fn an_invalid_instance_name_on_the_config_routes_is_400_invalid_name() {
+    // The config routes carry the name through the ConfigError mapper: a
+    // bogus name is the typed 400 invalid_name — never a 500, never a
+    // "not found" that would imply the name was valid but absent.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/instances/Not%20Valid%21/config",
+            server.addr
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "invalid_name");
+    server.stop().unwrap();
+}
+
+#[test]
+fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host() {
+    // The story-17-4 verification leg (17-2 shipped the surface): an
+    // explicit non-default base — the "Host-chosen volume" — holds the LOCK,
+    // the DB, the SECRETS file, AND the OUTBOX pair; and a second host on
+    // the same base is REFUSED naming the live holder.
+    let state = tempfile::tempdir().unwrap();
+    let volume = state.path().join("mounted-volume").join("hekma-state");
+    std::fs::create_dir_all(&volume).unwrap();
+    let _manifest = registered_fake_agent(&volume, "worker");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(volume.clone(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    // Drive one committed transition so the outbox journal EXISTS on the
+    // volume (the lock/db land at open; the journal at the first commit),
+    // then pull and ACK the batch — the ack file lands at the first ack
+    // (an absent ack file is the "nothing consumed yet" state, so the
+    // assertion below needs the real write path, not a synthetic file).
+    let response = client
+        .post(format!("http://{}/v0/instances/worker/start", server.addr))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = client
+        .post(format!("http://{}/v0/instances/worker/stop", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"window_secs": 1}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = client
+        .get(format!("http://{}/v0/export", server.addr))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let batch = json_body(&mut response);
+    let cursor = batch["cursor"]["seq"]
+        .as_u64()
+        .expect("the batch carries its resume cursor");
+    let response = client
+        .post(format!("http://{}/v0/export/ack", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({ "seq": cursor }))
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the ack of the pulled cursor lands"
+    );
+
+    for name in [
+        hekma_engine::paths::HOST_LOCK_FILE,
+        hekma_engine::paths::SECRETS_FILE,
+        hekma_engine::paths::OUTBOX_JOURNAL_FILE,
+        hekma_engine::paths::OUTBOX_ACK_FILE,
+    ] {
+        assert!(
+            volume.join(name).exists(),
+            "{name} must live under the EXPLICIT base ({})",
+            volume.display()
+        );
+    }
+    // The state DB is the paths authority's `state.db` under the same root.
+    let db = std::fs::read_dir(&volume)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().ends_with(".db"));
+    assert!(db, "the state DB lives under the explicit base");
+
+    // A SECOND host on the same base: refused, naming the live holder.
+    let options = hekma_host::ServeOptions {
+        state_base: Some(volume.clone()),
+        control_listen: Some("127.0.0.1:0".parse().unwrap()),
+        bearer_secret: Some(BEARER_NAME.to_string()),
+        metering_listen_port: 0,
+        stop_window: Some(2),
+        log_capture: hekma_engine::LogCaptureMode::Full,
+        diagnostics: None,
+    };
+    let err = hekma_host::serve(options).expect_err("the second host must be refused");
+    assert!(
+        matches!(err, hekma_host::ServeError::StateDirLocked { .. }),
+        "the refusal is the typed StateDirLocked: {err}"
+    );
+    assert!(
+        err.to_string().contains("pid"),
+        "the refusal names the live holder: {err}"
+    );
 
     server.stop().unwrap();
 }
@@ -1677,6 +2040,7 @@ fn a_non_loopback_bind_warns_loudly() {
         bearer_secret: Some(BEARER_NAME.to_string()),
         metering_listen_port: 0,
         stop_window: Some(1),
+        log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink_handle)),
     };
     let server = spawn_serve(options);
@@ -1857,6 +2221,169 @@ fn concurrent_config_puts_serialize_per_host_and_each_read_back_reflects_its_own
             read_back, written,
             "each PUT's read-back must reflect its own write"
         );
+    }
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn un_acked_events_repull_after_an_acked_prefix_rotates_away() {
+    // Review finding 25 (the spec's promised host-level leg, driven END-TO-END
+    // through /v0/export): a journal near the 30MB cap, an acked PREFIX, a
+    // real lifecycle append that crosses the cap (the append-time compaction
+    // rotates the acked prefix away) — and the default pull afterwards
+    // delivers exactly the UN-ACKED tail through the API. Nothing re-delivered,
+    // nothing silently skipped.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "worker");
+
+    // Stage the journal SYNTHETICALLY near the cap: 400 fat transition
+    // entries (a ~100KB `at` payload each ≈ 41MB — already over the cap at
+    // rest, which the check-before-write contract tolerates: only an APPEND
+    // compacts, and open's rederive reads without compacting). Seqs 1..=400.
+    let fat = "x".repeat(100 * 1024);
+    let journal = base.join(hekma_engine::paths::OUTBOX_JOURNAL_FILE);
+    let mut staged = String::with_capacity(400 * (fat.len() + 300));
+    for seq in 1..=400u64 {
+        let entry = hekma_engine::OutboxEntry {
+            schema_version: hekma_engine::OUTBOX_SCHEMA_VERSION,
+            seq,
+            event: hekma_engine::EngineEvent::Transition(hekma_engine::TransitionEvent::new(
+                "probe",
+                hekma_engine::LifecycleState::Starting,
+                hekma_engine::LifecycleState::Running,
+                hekma_engine::TransitionCause::AdapterReady,
+                format!("2026-10-19T00:00:00Z{fat}"),
+            )),
+        };
+        staged.push_str(&serde_json::to_string(&entry).unwrap());
+        staged.push('\n');
+    }
+    std::fs::write(&journal, staged).unwrap();
+
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let instance = format!("http://{}/v0/instances/worker", server.addr);
+
+    // ACK a PREFIX (350 of 400): 200, persisted.
+    let mut response = client
+        .post(format!("http://{}/v0/export/ack", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"seq": 350}))
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["seq"], 350);
+
+    // Force the rotation: a REAL lifecycle append (seq 401) crosses the cap —
+    // the append-time compaction drops the ACKED prefix (1..=350) and keeps
+    // the un-acked tail (351..=400) — NEVER the whole journal, never the
+    // last entry.
+    let response = client
+        .post(format!("{instance}/start"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The default pull resumes from the ACK (350): the UN-ACKED tail comes
+    // back — 351..=tail — even though 1..=350 were physically rotated away.
+    // (The start commits TWO transitions — starting→running and the ready
+    // cause — so the tail is 402; the contract under test is "everything
+    // after the ack, in order", not a specific count.)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let (delivered, retained_from) = loop {
+        let mut response = get_ok(&client, &server.addr, "/v0/export");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = json_body(&mut response);
+        let events = json["events"].as_array().expect("events array");
+        if !events.is_empty() {
+            let delivered: Vec<u64> = events
+                .iter()
+                .map(|e| e["seq"].as_u64().expect("each entry carries its seq"))
+                .collect();
+            break (delivered, json["retained_from"].as_u64().unwrap());
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the post-rotation pull never delivered the un-acked tail"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    };
+    assert_eq!(
+        delivered.first(),
+        Some(&351),
+        "the pull resumes EXACTLY after the ack: {delivered:?}"
+    );
+    assert!(
+        delivered.last() >= Some(&401),
+        "the real lifecycle append(s) are in the delivered tail: {delivered:?}"
+    );
+    assert!(
+        delivered.windows(2).all(|w| w[1] == w[0] + 1),
+        "one contiguous order, no gaps: {delivered:?}"
+    );
+    assert_eq!(
+        retained_from, 351,
+        "the batch names the NEW retention floor (1..=350 rotated away)"
+    );
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn export_limit_parse_failures_are_versioned_400s_never_extractor_text() {
+    // Review finding 16: `limit` is parsed INSIDE the handler so every
+    // failure is a versioned `400 invalid_body` envelope — axum's typed
+    // `Option<u32>` extractor would reject a non-numeric value as plain
+    // text OUTSIDE the envelope. `limit=0` is refused outright (it would
+    // otherwise silently deliver the DEFAULT batch — a lie about the
+    // request; the ABSENT parameter means default).
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+
+    let cases = [
+        ("abc", "must be a positive whole number"),
+        ("-1", "must be a positive whole number"),
+        ("0", "must be >= 1"),
+        ("99999999999999", "must be a positive whole number"),
+    ];
+    for (value, expected_fragment) in cases {
+        let mut response = get_ok(&client, &server.addr, &format!("/v0/export?limit={value}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "limit={value} must be a 400"
+        );
+        let json = json_body(&mut response);
+        assert_eq!(json["schema_version"], 1, "the envelope is versioned");
+        assert_eq!(json["error"]["kind"], "invalid_body", "limit={value}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("limit query parameter"),
+            "the refusal names the parameter: {message}"
+        );
+        assert!(
+            message.contains(expected_fragment),
+            "limit={value}: the refusal names the rule ({expected_fragment}): {message}"
+        );
+    }
+
+    // The boundary sanity: an omitted limit and a valid limit both serve.
+    for query in ["", "?limit=1"] {
+        let mut response = get_ok(&client, &server.addr, &format!("/v0/export{query}"));
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "limit query {query:?} serves"
+        );
+        let json = json_body(&mut response);
+        assert_eq!(json["schema_version"], 1);
     }
 
     server.stop().unwrap();

@@ -377,6 +377,14 @@ impl UsageGapNotice {
     pub const SENTINEL_NO_LINES_SEEN: &'static str = "no-lines-seen";
     /// The sentinel-tier wire value once a sentinel line has been seen.
     pub const SENTINEL_LINES_SEEN: &'static str = "lines-seen";
+    /// The sentinel-tier wire value when log capture is OFF entirely (story
+    /// 17-4): no raw log exists to parse sentinels from, so the sentinel tier
+    /// did not merely "see nothing" — it was UNAVAILABLE. Honest absence, the
+    /// [`crate::domain::UsageGapNotice`] analog of the fleet metering cells'
+    /// `—` token: a distinct wire value a consumer can distinguish from
+    /// "the agent ran with capture on but emitted no sentinels", never a
+    /// fabricated tier reading.
+    pub const SENTINEL_CAPTURE_OFF: &'static str = "capture-off";
 
     /// Compose the gap notice from the tier facts (pure — the engine
     /// computes, the CLI renders). `notice` names the grain split (billing vs
@@ -386,12 +394,33 @@ impl UsageGapNotice {
         sentinel_seen: bool,
         context_usage_reported: bool,
     ) -> Self {
+        Self::acp_with_capture(
+            observed_configured,
+            sentinel_seen,
+            context_usage_reported,
+            false,
+        )
+    }
+
+    /// The capture-mode-aware constructor (story 17-4): `capture_off` swaps
+    /// the sentinel tier's wire value to [`Self::SENTINEL_CAPTURE_OFF`] —
+    /// with capture off there is no log to parse, so "no-lines-seen" would
+    /// imply a drain that never ran. Every pre-17-4 caller (and the default)
+    /// passes `false` via [`Self::acp`], byte-identical.
+    pub fn acp_with_capture(
+        observed_configured: bool,
+        sentinel_seen: bool,
+        context_usage_reported: bool,
+        capture_off: bool,
+    ) -> Self {
         let observed = if observed_configured {
             Self::OBSERVED_CONFIGURED
         } else {
             Self::OBSERVED_NOT_CONFIGURED
         };
-        let sentinel = if sentinel_seen {
+        let sentinel = if capture_off {
+            Self::SENTINEL_CAPTURE_OFF
+        } else if sentinel_seen {
             Self::SENTINEL_LINES_SEEN
         } else {
             Self::SENTINEL_NO_LINES_SEEN
@@ -1646,5 +1675,43 @@ mod tests {
         assert_eq!(v.cumulative_limit, Some(100));
         assert_eq!(v.cumulative_cost_cap, None, "no Rate ⇒ dollar cap inert");
         assert_eq!(v.estimate_label, None);
+    }
+
+    #[test]
+    fn acp_with_capture_reports_the_capture_off_sentinel_without_touching_the_other_tiers() {
+        // Story 17-4: with capture OFF the sentinel tier reads `capture-off`
+        // — a distinct wire value (the honest-absence analog of the fleet
+        // cells' `—` token) a consumer can tell apart from "the agent ran
+        // with capture on but emitted no sentinels". The OTHER tiers pass
+        // through unchanged, and the default constructor (`acp`) stays
+        // byte-identical to its pre-17-4 shape.
+        let off = UsageGapNotice::acp_with_capture(true, false, true, true);
+        assert_eq!(off.sentinel, UsageGapNotice::SENTINEL_CAPTURE_OFF);
+        assert_eq!(off.observed, UsageGapNotice::OBSERVED_CONFIGURED);
+        assert!(off.context_usage_reported);
+        assert!(
+            off.notice.contains("capture-off"),
+            "the notice names the sentinel state: {}",
+            off.notice
+        );
+
+        // capture_off only swaps the SENTINEL tier: an on-capture instance
+        // (capture_off=false) with the same facts reads lines-seen/no-lines.
+        let seen = UsageGapNotice::acp_with_capture(false, true, false, false);
+        assert_eq!(seen.sentinel, UsageGapNotice::SENTINEL_LINES_SEEN);
+        assert_eq!(seen.observed, UsageGapNotice::OBSERVED_NOT_CONFIGURED);
+        // The legacy constructor delegates with capture_off=false.
+        let legacy = UsageGapNotice::acp(true, false, false);
+        assert_eq!(legacy.sentinel, UsageGapNotice::SENTINEL_NO_LINES_SEEN);
+        let same = UsageGapNotice::acp_with_capture(true, false, false, false);
+        assert_eq!(legacy, same, "acp == acp_with_capture(..., false)");
+    }
+
+    #[test]
+    fn the_supervision_display_matches_the_as_str_vocabulary() {
+        // The Fleet cell's text comes from Display (delegating to `as_str`);
+        // the vocabulary is the frozen one the docs table names.
+        assert_eq!(Supervision::Detached.to_string(), "detached");
+        assert_eq!(Supervision::Session.to_string(), "session");
     }
 }
