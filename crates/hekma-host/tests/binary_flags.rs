@@ -6,19 +6,37 @@
 //!
 //! The parse-refusal pins run everywhere. The end-to-end OFF leg (the flag
 //! lands in a serving engine and `/v0/version` self-describes it)
-//! RUNTIME-SKIPS on Windows via the house OS-id check (no cfg attributes —
-//! the boundary gate confines conditional code to backends/): it shuts the
+//! RUNTIME-SKIPS on Windows via the house OS-id check (the OS is data,
+//! decided at runtime): it shuts the
 //! child down with POSIX `kill -TERM`, and the Windows console-event
 //! harness is the recorded deferred-work gap (the serve CLI e2e's
 //! disclosure — the same posture applies here).
+//!
+//! The file's ONE cfg is the secrets file's 0600 chmod helper below — the
+//! control_api suite's sanctioned class: `PermissionsExt` is an OS-API-
+//! boundary import that cannot be made data-driven (OsId cannot import a
+//! platform-only trait), and on Windows the file-leg ACL check accepts a
+//! fresh user-owned file, so the plain write is enough there.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// The house runtime-skip check (the serve CLI e2e's idiom): no cfg
-/// attributes in this file — the OS is data, decided at runtime.
+/// The house runtime-skip check (the serve CLI e2e's idiom): every TEST's
+/// OS handling is data, decided at runtime — the file's only cfg is the
+/// chmod helper's `PermissionsExt` import (the header's disclosure).
 fn is_windows() -> bool {
     hekma_engine::OsId::current() == hekma_engine::OsId::Windows
+}
+
+/// The secrets file's 0600 write (the control_api suite's shape): the mode
+/// set needs `PermissionsExt` — an OS-API-boundary import that cannot be
+/// data-driven — so it is the file's ONE cfg, disclosed in the boundary
+/// gate's allowlist; on Windows the file-leg ACL check accepts a fresh
+/// user-owned file and the plain write above is enough.
+#[cfg(unix)]
+fn chmod_600(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 /// The HTTP client (the control_api suite's idiom: statuses are data, not
@@ -99,8 +117,10 @@ fn the_log_capture_flag_lands_in_the_serving_engine_and_the_version_says_so() {
     // The secrets file the bearer resolver reads (the API is on).
     let secrets = base.join(hekma_engine::paths::SECRETS_FILE);
     std::fs::write(&secrets, "CONTROL_BEARER = \"test-bearer-value\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The resolver's 0600 refusal is a unix permission-model check — the
+    // same sanctioned write the control_api and serve_cli suites make.
+    #[cfg(unix)]
+    chmod_600(&secrets);
 
     // An OS-ephemeral port for the API (bind-and-release; the classical
     // small race is acceptable in a hermetic test).
