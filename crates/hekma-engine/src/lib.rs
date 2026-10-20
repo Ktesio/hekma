@@ -118,7 +118,7 @@ pub use domain::{
     FLEET_SCHEMA_VERSION, LOG_SCHEMA_VERSION, MICROS_PER_DOLLAR, PASS_THROUGH_PREFIX, SECRET_MASK,
     USAGE_SCHEMA_VERSION,
 };
-pub use engine::{Blocking, Engine, EventSubscription, InstanceStatus};
+pub use engine::{Blocking, Engine, EngineOptions, EventSubscription, InstanceStatus};
 // Re-export the Memory Backing surface (story 5-1, AD-11): the kind vocabulary
 // `kt` parses `--kind` against and the status shape the public read returns.
 pub use ports::{GuaranteeLevel, MemoryBackingKind, MemoryBackingStatus};

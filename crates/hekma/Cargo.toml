@@ -25,6 +25,11 @@ path = "src/bin/hkm.rs"
 
 [dependencies]
 hekma-engine = { workspace = true }
+# Story 17-2 (AD-2 amendment): the long-running Service Host — the `serve`
+# subcommand's engine. The ONLY new normal edge (`cargo tree -p hekma -e
+# normal` gains exactly `hekma-host` + its engine/tokio subtree, no axum);
+# the CLI source stays synchronous (the embed-clean audit pins that).
+hekma-host = { workspace = true }
 clap = { workspace = true }
 console = { workspace = true }
 miette = { workspace = true }

@@ -681,6 +681,62 @@ struct Supervised {
 /// writer before the swap so buffered bytes are not silently lost).
 pub type DiagnosticSink = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// Why [`Supervisor::set_serve_options`] refused (review finding 16): the
+/// serve options are OPEN-TIME ONLY, and the guard turns misuse into a typed
+/// refusal instead of a silent re-pin (a port change mid-flight would strand
+/// already-started listeners; an allowlist flip would make sibling children
+/// inconsistent).
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ServeOptionsRefused {
+    /// A process is already supervised (a start or an adoption ran) — the
+    /// lifecycle has begun, so the options can no longer be applied.
+    #[error("serve options are open-time only: {held} process(es) are already supervised")]
+    LifecycleBegun {
+        /// How many processes are currently supervised.
+        held: usize,
+    },
+    /// Applied twice on the same supervisor — even pre-lifecycle, the
+    /// second application would silently overwrite the first's decision.
+    #[error("serve options were already applied on this supervisor")]
+    AlreadyApplied,
+}
+
+/// The fixed-port adoption re-bind DECISION (story 17-2's AI-46 closure,
+/// extracted by review finding 14): whether an adopted instance gets a live
+/// observed-metering listener re-bound on the supervisor's fixed port.
+///
+/// PURE and unit-tested on every OS: the process-level re-bind e2e legs skip
+/// on the x86-64 Linux CI runner (#109) and tarpaulin — the coverage gate —
+/// runs ONLY on linux, so the DECISION LOGIC itself must be reachable by
+/// tests that always run. The e2e tests keep proving the PROCESS behavior;
+/// this seam proves the rule.
+pub(crate) enum AdoptionRebind {
+    /// The instance is `engine-observed` AND the supervisor opened with a
+    /// fixed port: attempt the live re-bind (`start_observed_listener`).
+    Attempt,
+    /// The instance is NOT `engine-observed`: there is no listener to
+    /// re-bind (the pre-17-2 behavior for self-reported instances).
+    SkipNotObserved,
+    /// The supervisor opened with port 0 (every pre-17-2 open): a re-bind
+    /// cannot guess the previous engine's ephemeral port — the story-11-3
+    /// strand diagnostic stays.
+    SkipNoFixedPort,
+}
+
+pub(crate) fn adoption_rebind_decision(
+    metering_source: &str,
+    metering_listen_port: u16,
+) -> AdoptionRebind {
+    match (
+        metering_source == "engine-observed",
+        metering_listen_port != 0,
+    ) {
+        (true, true) => AdoptionRebind::Attempt,
+        (true, false) => AdoptionRebind::SkipNoFixedPort,
+        (false, _) => AdoptionRebind::SkipNotObserved,
+    }
+}
+
 /// The lifecycle supervisor: owns running process handles + drives transitions.
 ///
 /// Constructed empty by [`Engine::open`](crate::Engine::open). Holds ONE
@@ -717,6 +773,25 @@ pub struct Supervisor {
     /// own `Mutex` is contended only by the rare diagnostics — never a hot
     /// path — and installs/rotations serialize with emissions correctly.
     diagnostics: Option<DiagnosticSink>,
+    /// Story 17-2 — the Host's `metering.listen` port (0 = the OS-ephemeral
+    /// default every pre-17-2 caller takes). When non-zero, an `engine-observed`
+    /// start pins the loopback listener to THIS port (via
+    /// `ObservedListener::start_on_port`) so engine restarts and orphan
+    /// adoptions re-bind the SAME port and the injected `base_url` stays live.
+    /// Defaults to `0`; the engine sets it from
+    /// [`EngineOptions`](crate::EngineOptions) before any start/adoption runs.
+    metering_listen_port: u16,
+    /// Story 17-2 — the Host's `child_env_allowlist` (default `false`): when
+    /// `true`, every spawn clears the inherited environment first and applies
+    /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
+    /// the supervisor owns the decision, the backends stay dumb executors).
+    child_env_allowlist: bool,
+    /// Review finding 16: whether [`Supervisor::set_serve_options`] has run
+    /// on this supervisor — the OPEN-TIME-ONLY latch. The engine's open path
+    /// applies once, on a fresh supervisor, before any lifecycle; any second
+    /// application (or one after a start/adoption populated `running`) is a
+    /// typed [`ServeOptionsRefused`] refusal, never a silent re-pin.
+    serve_options_applied: bool,
     /// AI-12: the per-instance CONSECUTIVE `backend.poll` error count, kept
     /// across reaper passes so a PERSISTENT poll failure can trip
     /// [`MAX_CONSECUTIVE_POLL_ERRORS`] and be treated as a crash signal instead
@@ -788,6 +863,9 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: None,
             diagnostics: None,
+            metering_listen_port: 0,
+            child_env_allowlist: false,
+            serve_options_applied: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -815,6 +893,9 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: Some(runtime),
             diagnostics: None,
+            metering_listen_port: 0,
+            child_env_allowlist: false,
+            serve_options_applied: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -842,6 +923,9 @@ impl Supervisor {
             events: EventBus::new(),
             runtime: None,
             diagnostics: None,
+            metering_listen_port: 0,
+            child_env_allowlist: false,
+            serve_options_applied: false,
             poll_error_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -904,6 +988,39 @@ impl Supervisor {
             }));
         }
         self.diagnostics = Some(sink);
+    }
+
+    /// Apply the story-17-2 Host serve options BEFORE any start/adoption run:
+    /// `port` (0 = ephemeral) pins every `engine-observed` loopback listener,
+    /// `child_env_allowlist` (`true`) makes every spawn clear-then-apply the
+    /// manifest-declared environment. `pub(crate)` — the engine threads these
+    /// from [`EngineOptions`](crate::EngineOptions) inside `open_with_options`;
+    /// there is no post-open mutation seam (a port change mid-flight would
+    /// strand already-started listeners, so serve options are open-time only).
+    pub(crate) fn set_serve_options(
+        &mut self,
+        port: u16,
+        child_env_allowlist: bool,
+    ) -> Result<(), ServeOptionsRefused> {
+        // Review finding 16: the serve options are OPEN-TIME ONLY, enforced
+        // here — a supervisor whose lifecycle has begun (a process already
+        // held: a start or an adoption ran) must never have them (re-)
+        // applied. A port change mid-flight would strand already-started
+        // listeners; an allowlist flip would make sibling children
+        // inconsistent. The `running` map is non-empty from the first
+        // supervised process onward.
+        if !self.running.is_empty() {
+            return Err(ServeOptionsRefused::LifecycleBegun {
+                held: self.running.len(),
+            });
+        }
+        if self.serve_options_applied {
+            return Err(ServeOptionsRefused::AlreadyApplied);
+        }
+        self.serve_options_applied = true;
+        self.metering_listen_port = port;
+        self.child_env_allowlist = child_env_allowlist;
+        Ok(())
     }
 
     /// Emit ONE engine diagnostic (story 10-2) — the engine's ONLY diagnostic

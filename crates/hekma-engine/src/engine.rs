@@ -180,7 +180,7 @@ impl Drop for Engine {
 ///
 /// The [`Registry`] owns a rusqlite `Connection` (`Send` but `!Sync`); wrapping
 /// it in a [`Mutex`] makes the whole `EngineInner` `Send + Sync` so a
-/// `spawn_blocking` closure can capture an `Arc<EngineInner>`. Registration is
+/// `spawn_blocking` closure can capture an [`Arc<EngineInner>`]. Registration is
 /// not a hot path and the engine is single-lifetime, so a coarse mutex is the
 /// correct, simplest altitude here.
 struct EngineInner {
@@ -190,6 +190,49 @@ struct EngineInner {
     /// [`Engine::subscribe`] hands out receivers without ever contending on
     /// the supervisor lock. Both clones share one broadcast channel.
     events: EventBus,
+}
+
+/// Open-time options for the long-running Host (story 17-2) — the additive,
+/// backward-compatible seam behind
+/// [`Engine::open_with_options`]. `Default` reproduces
+/// [`Engine::open`]'s behavior byte-for-byte (ephemeral listener ports, full
+/// child-environment inheritance, no diagnostic sink), so every pre-17-2
+/// caller is unchanged.
+///
+/// These are OPEN-TIME only (there is no post-open mutation): a port change
+/// mid-flight would strand already-started listeners, and an allowlist flip
+/// would make siblings inconsistent, so the supervisor reads them from the
+/// first moment adoption and any start can run.
+#[derive(Clone, Default)]
+pub struct EngineOptions {
+    /// The fixed loopback PORT every `engine-observed` instance's metering
+    /// listener binds (`0` = the OS-ephemeral default). Non-zero pins the port
+    /// so engine restarts and orphan adoptions re-bind the SAME port and the
+    /// injected `base_url` stays live (the AI-46 strand closure). A pinned
+    /// port that is already taken surfaces the typed bind error at start —
+    /// never a silent hop.
+    pub metering_listen_port: u16,
+    /// When `true`, every child spawn CLEARS the inherited environment first
+    /// and applies ONLY the manifest-declared mappings (the Host's
+    /// `child_env_allowlist`: no ambient Host-shell variables leak into hosted
+    /// agents). `false` (the default) keeps full inheritance.
+    pub child_env_allowlist: bool,
+    /// The host-provided diagnostic sink, installed BEFORE orphan adoption
+    /// and the crash-detection reaper start — identical semantics to
+    /// [`Engine::open_with_diagnostics`]'s `sink` parameter.
+    pub diagnostics: Option<DiagnosticSink>,
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual impl: `DiagnosticSink` (a boxed writer) is not `Debug`, and a
+        // sink must never be printed anyway (no-leak discipline).
+        f.debug_struct("EngineOptions")
+            .field("metering_listen_port", &self.metering_listen_port)
+            .field("child_env_allowlist", &self.child_env_allowlist)
+            .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
 }
 
 impl Engine {
@@ -206,7 +249,7 @@ impl Engine {
     ///    task that periodically runs [`Supervisor::poll_once`] via
     ///    `spawn_blocking` and times the Restart Policy backoffs.
     pub fn open(base: Option<PathBuf>) -> Result<Self, RegistryError> {
-        Self::open_inner(base, None)
+        Self::open_inner(base, EngineOptions::default())
     }
 
     /// Open an engine with a host-provided diagnostic sink INSTALLED FROM THE
@@ -228,17 +271,48 @@ impl Engine {
         base: Option<PathBuf>,
         sink: DiagnosticSink,
     ) -> Result<Self, RegistryError> {
-        Self::open_inner(base, Some(sink))
+        Self::open_inner(
+            base,
+            EngineOptions {
+                diagnostics: Some(sink),
+                ..EngineOptions::default()
+            },
+        )
     }
 
-    /// The shared open path (story 10-2): `open` passes no sink (the
-    /// diagnostics keep their default stderr behavior, byte-identical to the
-    /// pre-sink engine), `open_with_diagnostics` installs the host's writer
-    /// before any supervision work starts.
-    fn open_inner(
+    /// Open an engine with the story-17-2 Host options (the long-running
+    /// Host's only open seam).
+    ///
+    /// Behaviorally [`Engine::open`] with the given
+    /// [`EngineOptions`] applied from the FIRST moment: the fixed
+    /// metering port and the child-environment allowlist are on the supervisor
+    /// before orphan adoption runs (so an ADOPTED `engine-observed` instance
+    /// re-binds the pinned port and adopted children already spawned with the
+    /// clear-then-apply environment by their original engine keep their
+    /// contract on any restart this engine performs), and the diagnostic sink
+    /// — when given — is installed before any supervision work starts
+    /// (identical to [`Engine::open_with_diagnostics`]).
+    ///
+    /// [`EngineOptions::default()`] is byte-identical to [`Engine::open`]:
+    /// ephemeral listener ports, full environment inheritance, no sink.
+    pub fn open_with_options(
         base: Option<PathBuf>,
-        diagnostics: Option<DiagnosticSink>,
+        options: EngineOptions,
     ) -> Result<Self, RegistryError> {
+        Self::open_inner(base, options)
+    }
+
+    /// The shared open path (story 10-2 + 17-2): `open` passes the default
+    /// options (the diagnostics keep their default stderr behavior,
+    /// byte-identical to the pre-sink engine), `open_with_diagnostics`
+    /// installs the host's writer before any supervision work starts, and
+    /// `open_with_options` threads the Host's serve options through.
+    fn open_inner(base: Option<PathBuf>, options: EngineOptions) -> Result<Self, RegistryError> {
+        let EngineOptions {
+            metering_listen_port,
+            child_env_allowlist,
+            diagnostics,
+        } = options;
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
             name: "<engine-runtime>".to_string(),
@@ -253,8 +327,16 @@ impl Engine {
         // clone OUTSIDE the supervisor mutex so `subscribe()` is lock-free (see
         // EngineInner::events). Story 10-2: install the host's diagnostic sink
         // (when given) BEFORE adoption + the reaper spawn, so no diagnostic can
-        // fire before the sink is in place.
+        // fire before the sink is in place. Story 17-2: the Host's fixed
+        // metering port + child-env allowlist are ALSO in place before
+        // adoption — an adopted observed instance re-binds the pinned port on
+        // this very open.
         let mut supervisor = Supervisor::with_runtime(rt.handle().clone());
+        supervisor
+            .set_serve_options(metering_listen_port, child_env_allowlist)
+            .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
+                detail: err.to_string(),
+            })?;
         if let Some(sink) = diagnostics {
             supervisor.install_diagnostics(sink);
         }

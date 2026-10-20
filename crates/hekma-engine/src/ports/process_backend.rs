@@ -168,6 +168,18 @@ pub struct SpawnSpec {
     /// stay capability-agnostic dumb executors, exactly like
     /// [`SpawnSpec::pipe_stdin`].
     pub pipe_stdout: bool,
+    /// Whether the child INHERITS the engine's (shell's) environment before the
+    /// per-key overrides in [`SpawnSpec::env`] are applied on top (story 17-2,
+    /// the Host's `child_env_allowlist` seam). `true` (every pre-17-2 caller)
+    /// keeps today's `Command::envs` semantics: the child sees the engine's
+    /// whole environment PLUS the mapped keys. `false` clears the environment
+    /// FIRST, then applies ONLY the declared mappings — the long-running Host
+    /// hard-sets this so every hosted child gets a minimal, manifest-declared
+    /// environment (no ambient `PATH`-adjacent secrets from the Host's own
+    /// shell). The supervisor resolves this bool, the backends stay
+    /// environment-agnostic dumb executors, exactly like
+    /// [`SpawnSpec::pipe_stdin`].
+    pub inherit_env: bool,
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -1381,6 +1393,7 @@ mod tests {
             pipe_stdin: true,
             pipe_stdout: false,
             detach: false,
+            inherit_env: true,
         };
         let b = a.clone();
         assert_eq!(a, b);

@@ -5927,3 +5927,71 @@ fn a_pre_v9_mint_write_failure_surfaces_the_per_command_mint_note() {
     sup2.stop(&registry, "mintfail", Some(Duration::from_secs(5)))
         .unwrap();
 }
+
+#[test]
+fn the_adoption_rebind_decision_covers_every_source_and_port_shape() {
+    // Review finding 14's pin: the fixed-port adoption re-bind DECISION is a
+    // pure seam so its rule is unit-tested on EVERY OS — the process-level
+    // re-bind e2e legs skip on the x86-64 Linux CI runner (#109) and
+    // tarpaulin (the coverage gate) runs ONLY on linux, so the decision
+    // logic itself must be reachable by tests that always run. The rule:
+    // Attempt only for engine-observed AND a fixed port; an ephemeral open
+    // (port 0) skips WITH the strand diagnostic; a non-observed instance has
+    // no listener to re-bind at all.
+    use super::adoption_rebind_decision;
+    use super::AdoptionRebind;
+    // The headline: observed + fixed port → attempt the live re-bind.
+    assert!(matches!(
+        adoption_rebind_decision("engine-observed", 8400),
+        AdoptionRebind::Attempt
+    ));
+    // Observed but the engine opened ephemeral (every pre-17-2 open): a
+    // re-bind cannot guess the previous engine's port → skip (the 11-3
+    // strand note stays).
+    assert!(matches!(
+        adoption_rebind_decision("engine-observed", 0),
+        AdoptionRebind::SkipNoFixedPort
+    ));
+    // Fixed port but self-reported: there is no listener to re-bind.
+    assert!(matches!(
+        adoption_rebind_decision("self-reported", 8400),
+        AdoptionRebind::SkipNotObserved
+    ));
+    assert!(matches!(
+        adoption_rebind_decision("self-reported", 0),
+        AdoptionRebind::SkipNotObserved
+    ));
+}
+
+#[test]
+fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
+    // Review finding 16's pin: `set_serve_options` is OPEN-TIME ONLY, and
+    // the guard turns misuse into typed refusals — (1) a fresh supervisor
+    // applies once; (2) a second application is refused (AlreadyApplied)
+    // even pre-lifecycle; (3) once a process is supervised (a real spawn
+    // below), the refusal is LifecycleBegun — a mid-flight re-pin would
+    // strand already-started listeners / make sibling children
+    // inconsistent.
+    let (_state, _manifest, registry) = setup_fake("serveopts", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // (1) Fresh supervisor, pre-lifecycle: the apply lands.
+    sup.set_serve_options(8400, true)
+        .expect("the first apply on a fresh supervisor must land");
+    // (2) A second application — even still pre-lifecycle — is refused.
+    let err = sup.set_serve_options(0, false).unwrap_err();
+    assert!(
+        matches!(err, ServeOptionsRefused::AlreadyApplied),
+        "the second apply must be AlreadyApplied: {err}"
+    );
+    // (3) Begin the lifecycle for real, then the refusal is LifecycleBegun —
+    // checked BEFORE the latch (a held process is the stronger violation).
+    sup.start(&registry, "serveopts").unwrap();
+    let err = sup.set_serve_options(8400, true).unwrap_err();
+    assert!(
+        matches!(err, ServeOptionsRefused::LifecycleBegun { held: 1 }),
+        "a post-start apply must be LifecycleBegun(1): {err}"
+    );
+    // Cleanup: the spawned child must not outlive the test.
+    sup.stop(&registry, "serveopts", Some(Duration::from_secs(5)))
+        .unwrap();
+}
