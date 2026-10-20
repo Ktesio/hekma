@@ -180,7 +180,7 @@ development_status:
   epic-17: in-progress  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber)
   17-1-host-mode-spec-the-shim-crate-and-the-lock-model: in-review  # D1/D2/D3 ratified 2026-10-19 (hekma-host / axum 0.8 / re-ratify coarse); PR pending the push window
   17-2-hekma-serve-the-long-running-host: in-review  # implemented + 3-layer review hardening complete 2026-10-19; PR pending the push window
-  17-3-control-api-v0: backlog
+  17-3-control-api-v0: in-review  # implemented + 29-finding review hardening complete 2026-10-19; PR pending
   17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: backlog
   17-5-static-linux-release-and-the-container-recipe: backlog
   epic-17-retrospective: optional

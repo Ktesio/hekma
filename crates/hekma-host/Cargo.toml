@@ -25,6 +25,34 @@ hekma-engine = { workspace = true }
 # channel that holds an early signal across the engine open — the review
 # finding 1 fix) + `time` (the arming-handshake timeout).
 tokio = { workspace = true, features = ["signal", "sync", "time"] }
+# The Control API's HTTP stack (story 17-3; D2 ratified axum 0.8, NFR-8
+# review in `_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md`):
+# `default-features = false` + the LEAN feature set the v0 route table needs —
+# `http1` (a local loopback bind, HTTP/1.1 only), `json` (Json extractors),
+# `tokio` (the serve glue on the host's runtime), `query` (the resync cursor
+# pull). Everything else the defaults would drag in (`form`, `matched-path`,
+# `original-uri`, `tower-log`, `tracing`) stays OUT. NOTE: the spec's feature
+# list also named `sse`; axum 0.8 has NO such feature — SSE support moved into
+# the unconditionally-compiled response types in 0.7 (`axum::response::sse`
+# carries no `#[cfg(feature)]` gate in the 0.8.9 source), so the live-events
+# route needs no flag and the listed `["http1","json","tokio","sse","query"]`
+# resolves with `sse` dropped — recorded in the story report. The tree diff is
+# recorded in the story's PR (the D2 erratum: the diff records where axum
+# ENTERS — 17-3, not 17-2); hyper-direct remains the honest fallback if a
+# future review shows the tower family growing beyond the ratified estimate.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+# The DTOs (`serde` derive on the host's own wire shapes) and the JSON
+# encoder/decoder every handler body uses — the SAME workspace pins the
+# engine's payload structs already carry; the host defines its OWN shape
+# types (AD-2 amendment) and serializes the engine's versioned payloads
+# verbatim through them.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The SSE stream's `unfold` combinator (the per-client receiver → frame
+# loop). ALREADY in the normal tree as axum's own dependency — declaring it
+# here adds NO new package to `cargo tree -p hekma-host -e normal`; it only
+# names what we compile against directly.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # Hermetic per-test state roots.
@@ -36,6 +64,10 @@ tokio = { workspace = true }
 # The `fake_agent` fixture (the same dev/test kit the engine's own
 # subprocess tests use — off every shipping graph).
 hekma-conformance = { path = "../hekma-conformance" }
+# The conformance suite drives the API over REAL HTTP with a sync client
+# (plain `#[test]` fns, like the rest of the crate's suite). The SAME
+# workspace pin `kt` already ships; dev-only, off every shipping graph.
+ureq = { workspace = true }
 
 [[bin]]
 name = "hekma-host"

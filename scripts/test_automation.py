@@ -563,7 +563,14 @@ class ReleaseDocsTests(unittest.TestCase):
         # cannot be data-driven, justified in the step comment). Story 17-2
         # added the hekma-host signals.rs entry (tokio's signal-stream
         # registration is unix/windows-cfg'd inside the tokio crate itself;
-        # the host's SIGTERM wait cannot be written data-driven).
+        # the host's SIGTERM wait cannot be written data-driven). Story 17-3
+        # added the hekma-host control_api.rs entry (the Control-API suite
+        # WRITES a 0600 secrets.toml so the engine's secrets-file leg resolves
+        # — PermissionsExt is the OS API boundary there, the same sanctioned
+        # class as the engine's atomic_config_writes.rs; the suite's
+        # Windows-skip itself is data-driven OsId::current, never cfg) and —
+        # review item 24b — the hekma serve_cli.rs entry (the real-binary
+        # Control-API leg writes the SAME 0600 secrets file).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
@@ -572,7 +579,9 @@ class ReleaseDocsTests(unittest.TestCase):
             r"|^crates/hekma-engine/tests/memory\.rs:"
             r"|^crates/hekma-conformance/src/tck\.rs:"
             r"|^crates/hekma-conformance/src/test_notes\.rs:"
-            r"|^crates/hekma-host/src/signals\.rs:'",
+            r"|^crates/hekma-host/src/signals\.rs:"
+            r"|^crates/hekma-host/tests/control_api\.rs:"
+            r"|^crates/hekma/tests/serve_cli\.rs:'",
             ci,
         )
         # Currency gate (story 3-3, AD-8): exactly one module formats a `$` string.
@@ -737,6 +746,40 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         # (3) The transient-skip regex is the semver job's own retry predicate.
         self.assertIn("000|429|5[0-9][0-9]", semver_job)
+
+    def test_config_version_mirror_across_the_cli_and_host_crates(self) -> None:
+        # Review item 14: the Control API serves the SAME config-get document
+        # the CLI does, so its schema-version constant must STAY EQUAL to the
+        # CLI's. The two live in different crates (the CLI crate is not a host
+        # dependency — AD-2), so the host cannot see the CLI's constant at
+        # compile time; the dto.rs re-declaration documents this pin as the
+        # mirror's enforcement, and THIS source scan is it: both declarations
+        # are read from source and compared, so drift fails the automation
+        # run (not a doc claim that greps nothing).
+        cli_source = (release_docs.ROOT / "crates/hekma/src/cli/agent.rs").read_text(
+            encoding="utf-8"
+        )
+        host_source = (
+            release_docs.ROOT / "crates/hekma-host/src/control/dto.rs"
+        ).read_text(encoding="utf-8")
+
+        def declared_version(source: str, marker: str) -> int:
+            for line in source.splitlines():
+                stripped = line.split("//", 1)[0].strip()
+                if stripped.startswith(marker) and "=" in stripped:
+                    value = stripped.rsplit("=", 1)[1].strip().rstrip(";")
+                    return int(value)
+            raise AssertionError(f"no {marker} declaration found in source")
+
+        cli_version = declared_version(cli_source, "const CONFIG_GET_SCHEMA_VERSION")
+        host_version = declared_version(host_source, "pub(crate) const CONFIG_GET_SCHEMA_VERSION")
+        self.assertEqual(
+            cli_version,
+            host_version,
+            "the Control API's config document version drifted from the CLI's "
+            "config-get version — the two surfaces render the SAME document "
+            "and must stamp it identically",
+        )
 
     def test_ci_builds_and_runs_the_embedding_quickstart(self) -> None:
         # Story 7-4: the embedding quickstart (the publish capstone's host
