@@ -570,7 +570,11 @@ class ReleaseDocsTests(unittest.TestCase):
         # class as the engine's atomic_config_writes.rs; the suite's
         # Windows-skip itself is data-driven OsId::current, never cfg) and —
         # review item 24b — the hekma serve_cli.rs entry (the real-binary
-        # Control-API leg writes the SAME 0600 secrets file).
+        # Control-API leg writes the SAME 0600 secrets file). Story 17-4
+        # added the hekma-host binary_flags.rs entry (the binary's
+        # --log-capture e2e writes the SAME 0600 secrets file — the
+        # identical sanctioned class; the leg's Windows skip stays
+        # data-driven OsId::current, never cfg).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
@@ -581,6 +585,7 @@ class ReleaseDocsTests(unittest.TestCase):
             r"|^crates/hekma-conformance/src/test_notes\.rs:"
             r"|^crates/hekma-host/src/signals\.rs:"
             r"|^crates/hekma-host/tests/control_api\.rs:"
+            r"|^crates/hekma-host/tests/binary_flags\.rs:"
             r"|^crates/hekma/tests/serve_cli\.rs:'",
             ci,
         )
