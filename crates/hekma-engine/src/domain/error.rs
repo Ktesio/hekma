@@ -129,6 +129,19 @@ pub enum RegistryError {
         detail: String,
     },
 
+    /// Engine open REFUSED (story 17-4 review finding 1): the outbox journal
+    /// or ack file could not be read, and event sequences must not be minted
+    /// from an unverified counter — a duplicate seq under an ack lets
+    /// compaction evict never-delivered events (silent loss). The operator
+    /// quarantines the named file (rename); the detail carries the full
+    /// remediation, and per-family `resync_events` remains the complete heal.
+    #[error("engine open refused — the outbox state is unreadable: {detail}")]
+    OutboxOpenRefused {
+        /// Why the read failed, the named file, and the full
+        /// quarantine/re-sync remediation.
+        detail: String,
+    },
+
     /// A filesystem operation on the Agent Home failed.
     ///
     /// Carries the offending path so the diagnostic can name it (NFR-1). Used

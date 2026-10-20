@@ -357,7 +357,8 @@ fn serve_help_and_bad_stop_window_parse_pins() {
     assert!(
         help.stdout.contains("--stop-window")
             && help.stdout.contains("--metering-listen")
-            && help.stdout.contains("--state-dir"),
+            && help.stdout.contains("--state-dir")
+            && help.stdout.contains("--log-capture"),
         "the help names the flags:\n{}",
         help.stdout
     );
@@ -391,11 +392,66 @@ fn serve_help_and_bad_stop_window_parse_pins() {
         "a window over 86400 is a parse refusal: {}",
         bad_high.stderr
     );
+    // Story 17-4 (the parse-pin lesson, real-binary leg): an invalid
+    // `--log-capture` value is a clap PARSE refusal — exit 2, the flag
+    // named — never a silent fall-back to a different mode.
+    let bad_mode = run_hekma_agent(
+        ["serve", "--log-capture", "sometimes"].as_slice(),
+        &ctx_dir(),
+        &ctx_dir(),
+    );
+    assert_eq!(
+        bad_mode.code,
+        Some(2),
+        "an invalid log-capture mode is a parse refusal: {}",
+        bad_mode.stderr
+    );
+    assert!(
+        bad_mode.stderr.contains("--log-capture"),
+        "clap names the offending flag: {}",
+        bad_mode.stderr
+    );
 }
 
 /// A throwaway cwd for the parse pins (they open nothing).
 fn ctx_dir() -> std::path::PathBuf {
     std::env::temp_dir()
+}
+
+#[test]
+fn serve_option_refusals_exit_by_the_frozen_classes() {
+    // The CLI-first error classes on the serve surface: a half-configured
+    // Control API (`--listen` without its bearer secret) is a rejected
+    // INVOCATION (Usage class, exit 2, the remediation named), and an
+    // unusable state root (a FILE occupying it) is an environment/system
+    // failure (Startup class, exit 1) — never a panic, never a wrong class.
+    let no_secret = run_hekma_agent(
+        ["serve", "--listen", "127.0.0.1:18499"].as_slice(),
+        &ctx_dir(),
+        &ctx_dir(),
+    );
+    assert_eq!(
+        no_secret.code,
+        Some(2),
+        "a half-configured API is a Usage-class refusal: {}",
+        no_secret.stderr
+    );
+    assert!(
+        no_secret.stderr.contains("--bearer-secret"),
+        "the remediation is named: {}",
+        no_secret.stderr
+    );
+
+    let blocker = ctx_dir().join("hekma-serve-state-blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let startup = run_hekma_agent(["serve"].as_slice(), &ctx_dir(), &blocker);
+    assert_eq!(
+        startup.code,
+        Some(1),
+        "an unusable state root is a Startup-class failure: {}",
+        startup.stderr
+    );
+    let _ = std::fs::remove_file(&blocker);
 }
 
 #[test]
@@ -604,6 +660,242 @@ fn raw_version_status(addr: &str, with_bearer: bool) -> Option<u16> {
         .next()?
         .parse()
         .ok()
+}
+
+/// A minimal authenticated HTTP/1.1 request over a fresh TCP connection,
+/// returning `(status, full response text)`; `None` = the API never
+/// answered. The `body` rides with `Content-Length` (an absent body is the
+/// empty string).
+fn raw_request(addr: &str, method: &str, path: &str, body: Option<&str>) -> Option<(u16, String)> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr).ok()?;
+    let body = body.unwrap_or("");
+    stream
+        .write_all(
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer \
+                 {CONTROL_API_BEARER_VALUE}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let status = response
+        .strip_prefix("HTTP/1.1 ")?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((status, response))
+}
+
+/// The response body of a raw response text (past the header blank line).
+fn response_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or("")
+}
+
+#[test]
+fn serve_log_capture_metadata_leaves_no_agent_content_at_rest_and_exports_events() {
+    if is_windows() {
+        return; // POSIX `kill`-based SIGTERM; see the sibling test's note.
+    }
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let manifest = fake_agent_manifest(&ctx.project_dir, "hosted");
+    run_hekma_agent(
+        [
+            "agent",
+            "register",
+            "hosted",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ]
+        .as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+
+    // The bearer secret rides the SECRETS FILE leg (same chmod discipline
+    // as the sibling control-api test — the AI-35-disclosed #[cfg(unix)]).
+    let secrets = state_dir.join(hekma_engine::paths::SECRETS_FILE);
+    std::fs::write(
+        &secrets,
+        format!("{CONTROL_API_BEARER_NAME} = \"{CONTROL_API_BEARER_VALUE}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let (mut child, drainer) = spawn_serve_with(
+        &state_dir,
+        &[
+            // Story 17-4: the HOST spawns every agent in METADATA mode —
+            // this e2e proves the at-rest shape through the REAL binary.
+            "--log-capture",
+            "metadata",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--bearer-secret",
+            CONTROL_API_BEARER_NAME,
+        ],
+    );
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match raw_request(&addr, "GET", "/v0/version", None) {
+            Some((200, _)) => break,
+            Some((status, _)) => panic!("the version probe answered {status}"),
+            None => assert!(Instant::now() < deadline, "the control api never answered"),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // START through the HOST — the host's engine spawns with the metadata
+    // posture (the CLI-engine detached-start path would be Full).
+    let (status, _) = raw_request(&addr, "POST", "/v0/instances/hosted/start", None)
+        .expect("the start route answered");
+    assert_eq!(status, 200, "the host-mode start must succeed");
+    let agent_log = agent_log_path(&state_dir, "hosted");
+    let pid = wait_for_agent_pid(&agent_log);
+
+    // WHILE RUNNING: the raw capture exists (the transient window is the
+    // metadata contract), and `output.log` is METADATA-shaped — records,
+    // never the agent's content.
+    let output_log = state_dir
+        .join("agents")
+        .join("hosted")
+        .join("logs")
+        .join("output.log");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&output_log) {
+            if text.contains("\"record\":\"metadata\"") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata records never appeared in output.log"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output_text = std::fs::read_to_string(&output_log).unwrap();
+    assert!(
+        !output_text.contains("ready pid="),
+        "no raw agent content may land in a metadata-mode output.log:\n{output_text}"
+    );
+    assert!(
+        output_text.contains("\"byte_len\"") && output_text.contains("\"sha256\""),
+        "the metadata records carry the size/hash facts:\n{output_text}"
+    );
+
+    // STOP through the host: the raw files are UNLINKED (metadata-only at
+    // rest), the metadata-shaped output.log remains.
+    let (status, _) = raw_request(&addr, "POST", "/v0/instances/hosted/stop", Some("{}"))
+        .expect("the stop route answered");
+    assert_eq!(status, 200, "the host-mode stop must succeed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(pid) {
+        assert!(Instant::now() < deadline, "the agent survived the stop");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let stderr_log = state_dir
+        .join("agents")
+        .join("hosted")
+        .join("logs")
+        .join("agent-stderr.log");
+    assert!(
+        !agent_log.exists(),
+        "metadata mode unlinks agent.log at stop"
+    );
+    assert!(
+        !stderr_log.exists(),
+        "metadata mode unlinks agent-stderr.log at stop"
+    );
+    assert!(
+        output_log.exists(),
+        "the metadata-shaped output.log remains at rest"
+    );
+
+    // The host's committed transitions (start/stop) are in the GLOBAL
+    // outbox: the export pull serves them verbatim, and the ack cursor is
+    // monotonic + idempotent. A from-zero pull is EXPLICIT (the default
+    // resume-from-ack is the common case; this leg pins the explicit form).
+    let (status, response) =
+        raw_request(&addr, "GET", "/v0/export?cursor=%7B%22seq%22%3A0%7D", None)
+            .expect("the export route answered");
+    assert_eq!(status, 200, "the export pull succeeded: {response}");
+    let body = response_body(&response);
+    assert!(
+        body.contains("\"events\"") && body.contains("\"cursor\""),
+        "the ExportBatch wire shape is served verbatim:\n{body}"
+    );
+    // The highest exported seq = the ack target: everything the pull showed.
+    let max_seq: u64 = body
+        .split("\"seq\":")
+        .skip(1)
+        .filter_map(|rest| {
+            rest.split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|digits| digits.parse::<u64>().ok())
+        })
+        .max()
+        .expect("the batch carries seqs");
+    let (status, response) = raw_request(
+        &addr,
+        "POST",
+        "/v0/export/ack",
+        Some(&format!("{{\"seq\":{max_seq}}}")),
+    )
+    .expect("the ack route answered");
+    assert_eq!(status, 200, "the ack succeeded: {response}");
+    assert!(
+        response_body(&response).contains(&format!("\"seq\":{max_seq}")),
+        "the ack returns the cursor AS PERSISTED: {response}"
+    );
+    // Idempotent re-ack: same persisted cursor, still 200.
+    let (status, response) = raw_request(
+        &addr,
+        "POST",
+        "/v0/export/ack",
+        Some(&format!("{{\"seq\":{max_seq}}}")),
+    )
+    .expect("the re-ack answered");
+    assert_eq!(status, 200, "a re-ack is an idempotent 200: {response}");
+    // An ack PAST the committed tail is the typed 409, never a clamp.
+    let (status, response) = raw_request(&addr, "POST", "/v0/export/ack", Some("{\"seq\":999999}"))
+        .expect("the past-tail ack answered");
+    assert_eq!(status, 409, "a past-tail ack is 409: {response}");
+    assert!(
+        response.contains("cursor_invalid"),
+        "the 409 names the cursor_invalid kind: {response}"
+    );
+
+    // The bounded SIGTERM shutdown — exit 0 — and the notice record.
+    let status = signal_and_wait(&mut child, "the metadata e2e leg");
+    assert_eq!(status.code(), Some(0), "serve must exit 0 after SIGTERM");
+    let stderr = drainer.join().unwrap();
+    assert!(
+        stderr.contains("shutdown complete"),
+        "the shutdown notice is on the record:\n{stderr}"
+    );
 }
 
 #[test]

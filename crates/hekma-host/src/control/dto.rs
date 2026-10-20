@@ -71,6 +71,13 @@ pub(crate) struct VersionDocument {
     pub host_version: &'static str,
     /// The engine-side wire-schema versions this build projects.
     pub engine: EngineVersions,
+    /// The engine's log-capture posture (story 17-4, review finding 21):
+    /// `full` | `metadata` | `off` — the self-description that tells a Host
+    /// what `output.log` holds and which capture surfaces serve, without a
+    /// failed round-trip (and the honest bound on what "off" announces:
+    /// the version document, the typed read refusals, and the Fleet's
+    /// `capture-off` gap cell).
+    pub log_capture: &'static str,
 }
 
 /// The engine-side wire-schema versions [`VersionDocument`] carries — the
@@ -230,6 +237,39 @@ pub(crate) struct ConfigPutRequest {
     pub value: String,
 }
 
+/// `GET /v0/export` — the outbox-pull body (story 17-4): the engine's
+/// [`ExportBatch`](hekma_engine::ExportBatch) served VERBATIM (the
+/// projection rule above — the host wraps nothing it can reuse). The batch
+/// is already `schema_version`-stamped (`OUTBOX_SCHEMA_VERSION`),
+/// single-ordered across event families, cursor-bearing, and
+/// `torn_tail_skipped`-honest — re-wrapping it would mint a second version
+/// space for a shape the engine already versions.
+///
+/// The ack document's mirror ([`ExportAckDocument`]) is Control-API-original
+/// (no CLI renders it), so it alone carries [`CONTROL_API_SCHEMA_VERSION`].
+pub(crate) type ExportBody = hekma_engine::ExportBatch;
+
+/// `POST /v0/export/ack` — the request body: the highest seq the caller has
+/// DURABLY stored. The engine monotonically advances to
+/// `max(current, given)`.
+#[derive(Deserialize)]
+pub(crate) struct ExportAckRequest {
+    /// The highest exported seq the caller has durably persisted.
+    pub seq: u64,
+}
+
+/// `POST /v0/export/ack` — the response body: the ack cursor AS PERSISTED
+/// (the monotonic `max(current, given)` — so a re-ack reads back its own
+/// idempotence instead of guessing). Control-API-original, stamped
+/// [`CONTROL_API_SCHEMA_VERSION`].
+#[derive(Serialize)]
+pub(crate) struct ExportAckDocument {
+    /// The Control-API-original family version.
+    pub schema_version: u32,
+    /// The ack cursor now durable in the engine's `outbox-ack.json`.
+    pub seq: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +298,7 @@ mod tests {
                 budget: hekma_engine::BUDGET_SCHEMA_VERSION,
                 log: hekma_engine::LOG_SCHEMA_VERSION,
             },
+            log_capture: hekma_engine::LogCaptureMode::Full.as_str(),
         };
         let json = serde_json::to_value(&document).unwrap();
         assert_eq!(json["api"], "hekma-control-api");

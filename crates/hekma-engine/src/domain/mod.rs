@@ -19,6 +19,7 @@ mod fleet;
 mod instance;
 mod lifecycle;
 mod name;
+mod outbox;
 mod registry;
 mod restart;
 mod resync;
@@ -57,6 +58,11 @@ pub use fleet::{
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
+pub(crate) use outbox::{ack_core, export_core};
+pub use outbox::{
+    ExportBatch, OutboxCursor, OutboxEntry, BELOW_FLOOR_SENTENCE, EXPORT_BATCH_DEFAULT_MAX,
+    EXPORT_BATCH_MAX_CAP, OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PAST_TAIL_SENTENCE,
+};
 pub use registry::{Registry, RemoveDisposition};
 pub use resync::{ResyncBatch, ResyncCursor};
 // The resync core is engine-internal glue the facade calls (the story-10-3

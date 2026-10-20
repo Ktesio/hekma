@@ -131,10 +131,26 @@ impl ApiError {
     /// around it), never as the whole message.
     const RESYNC_TRUNCATION_SENTENCE: &'static str = "is past this family's committed count";
 
+    /// The stable export-cursor refusal sentences the engine's outbox reader
+    /// builds (story 17-4, one construction site each: `domain::outbox`,
+    /// re-exported crate-root so the host MATCHES — never re-hardcodes — the
+    /// wording). Matched as SUBSTRINGs (the counts are interpolated around
+    /// them), never as whole messages.
+    const OUTBOX_BELOW_FLOOR_SENTENCE: &'static str = hekma_engine::BELOW_FLOOR_SENTENCE;
+    const OUTBOX_PAST_TAIL_SENTENCE: &'static str = hekma_engine::PAST_TAIL_SENTENCE;
+
     /// The spec's cursor rule: a cursor past a family's committed count is a
     /// typed `409`, never a clamp.
     fn is_cursor_past_family(detail: &str) -> bool {
         detail.contains(Self::RESYNC_TRUNCATION_SENTENCE)
+    }
+
+    /// The spec's export-cursor rule (story 17-4): below the retained floor
+    /// (compaction dropped those entries) or past the committed tail — a
+    /// typed `409 cursor_invalid`, never a clamp.
+    fn is_outbox_cursor_refusal(detail: &str) -> bool {
+        detail.contains(Self::OUTBOX_BELOW_FLOOR_SENTENCE)
+            || detail.contains(Self::OUTBOX_PAST_TAIL_SENTENCE)
     }
 
     /// The versioned body this error renders — the serialization seam
@@ -167,6 +183,12 @@ impl From<EngineError> for ApiError {
             // The resync truncation guard rides `Log` — recognize its stable
             // sentence and lift it to the spec'd 409 (never a clamp).
             EngineError::Log { detail, .. } if Self::is_cursor_past_family(&detail) => {
+                Self::new(ApiErrorKind::CursorInvalid, message)
+            }
+            // The outbox export-cursor refusals (story 17-4) ride `Log` the
+            // same way — below the retained floor or past the committed tail
+            // is the spec'd 409 `cursor_invalid`, never a clamp.
+            EngineError::Log { detail, .. } if Self::is_outbox_cursor_refusal(&detail) => {
                 Self::new(ApiErrorKind::CursorInvalid, message)
             }
             // Every other engine error is a surfaced server-side reason (a
@@ -401,6 +423,46 @@ mod tests {
             detail: detail.into(),
         });
         assert_eq!(status, StatusCode::CONFLICT, "cursor-past-family is 409");
+        assert_eq!(kind, "cursor_invalid");
+    }
+
+    #[test]
+    fn an_export_cursor_below_the_retained_floor_maps_409_cursor_invalid() {
+        // Story 17-4: the below-floor refusal, with the engine's own stable
+        // sentence interpolated into the real message shape the outbox
+        // reader builds — the mapper must lift THIS Log variant to 409 too.
+        let detail = format!(
+            "the export cursor (3) is {below} (7) — the journal's compaction has already \
+             dropped entries at or below your cursor; exporting from it would SILENTLY \
+             skip the dropped records, so this fails instead. Re-ack from the batch's \
+             returned cursor, or start a fresh consumer at OutboxCursor::START \
+             deliberately",
+            below = hekma_engine::BELOW_FLOOR_SENTENCE,
+        );
+        let (status, kind, _) = map_engine(EngineError::Log {
+            name: "<outbox>".into(),
+            path: "/state/outbox.jsonl".into(),
+            detail,
+        });
+        assert_eq!(status, StatusCode::CONFLICT, "below-floor is 409");
+        assert_eq!(kind, "cursor_invalid");
+    }
+
+    #[test]
+    fn an_export_cursor_past_the_committed_tail_maps_409_cursor_invalid() {
+        // Story 17-4: the past-tail refusal (shared by the export pull and
+        // the ack advance) maps to the same 409.
+        let detail = format!(
+            "the export cursor (99) is {past} (5) — an ack or a pull past the tail would \
+             silently skip entries that have not been written yet, so this fails instead",
+            past = hekma_engine::PAST_TAIL_SENTENCE,
+        );
+        let (status, kind, _) = map_engine(EngineError::Log {
+            name: "<outbox>".into(),
+            path: "/state/outbox-ack.json".into(),
+            detail,
+        });
+        assert_eq!(status, StatusCode::CONFLICT, "past-tail is 409");
         assert_eq!(kind, "cursor_invalid");
     }
 

@@ -103,6 +103,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE,
 };
 
+#[cfg(test)]
+use crate::ports::LogCaptureMode;
 use crate::ports::{
     spawn_output_capture, write_stdin_bounded, BackendError, LogCapture, ProcessBackend,
     ProcessFingerprint, ProcessStatus, SecretError, SpawnSpec, StdinState, StopOutcome,
@@ -611,6 +613,7 @@ impl ProcessBackend for WindowsBackend {
                 stderr_raw_path,
                 attributed_log_path,
                 spec.instance_name.clone(),
+                spec.capture_mode,
             )
         });
         Ok(WindowsProcess {
@@ -1210,6 +1213,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         }
     }
 

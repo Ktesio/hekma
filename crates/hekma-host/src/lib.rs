@@ -84,6 +84,12 @@ pub struct ServeOptions {
     /// state-dir secrets file). Requires [`ServeOptions::control_listen`].
     /// The resolved VALUE never enters options, a response, or a notice.
     pub bearer_secret: Option<String>,
+    /// The engine's log-capture posture for this host's lifetime (story 17-4,
+    /// the `--log-capture` thread): `full` (the default) is byte-identical to
+    /// 17-3; `metadata` keeps agent content off persistent disk at rest;
+    /// `off` captures nothing. Open-time only — every spawn this host
+    /// supervises resolves the SAME mode.
+    pub log_capture: hekma_engine::LogCaptureMode,
     /// The sink for host + engine notices. `None` (the default) routes both
     /// to stderr, byte-compatible with the engine's no-sink behavior.
     pub diagnostics: Option<DiagnosticSink>,
@@ -112,6 +118,7 @@ impl std::fmt::Debug for ServeOptions {
             .field("metering_listen_port", &self.metering_listen_port)
             .field("control_listen", &self.control_listen)
             .field("bearer_secret", &self.bearer_secret)
+            .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
             .finish()
     }
@@ -307,6 +314,7 @@ where
         metering_listen_port,
         control_listen,
         bearer_secret,
+        log_capture,
         diagnostics,
     } = options;
     let has_caller_sink = diagnostics.is_some();
@@ -532,6 +540,10 @@ where
             hekma_engine::EngineOptions {
                 metering_listen_port,
                 child_env_allowlist: true,
+                // Story 17-4: the engine's log-capture posture — every spawn
+                // this host supervises resolves the SAME mode (open-time
+                // only, the metering-port thread).
+                log_capture,
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.

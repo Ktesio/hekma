@@ -37,7 +37,80 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::domain::{LogLine, LogStream};
+use crate::sha256;
 use crate::time::now_rfc3339;
+
+/// The log-capture posture for one engine (story 17-4, the AD-12 amendment):
+/// what the engine writes to disk for a spawned agent's stdout/stderr.
+///
+/// * [`LogCaptureMode::Full`] — today's behavior, byte-identical: the
+///   crash-immune direct file redirects (`agent.log` / `agent-stderr.log`)
+///   plus the tailer-attributed `output.log`. The default everywhere.
+/// * [`LogCaptureMode::Metadata`] — content allowed on disk ONLY
+///   transiently (the crash-immune redirect requires it — the pipe
+///   alternative is the documented review-of-#80 liveness regression, see
+///   [`SpawnSpec::log_file`]'s docs), METADATA-ONLY at rest: the tailer
+///   writes `{ts, stream, attribution, byte_len, sha256}` records instead of
+///   line content, and the raw files are unlinked at stop after the final
+///   usage drain (best-effort, surfaced failure). A Host whose agent output
+///   may carry user content keeps that content off persistent disk while
+///   keeping real sizes/hashes/timestamps and the billing sentinel drain.
+/// * [`LogCaptureMode::Off`] — nothing, ever: the spawn redirects both
+///   streams to `Stdio::null()` (the pre-4.2 safe default's arm), no raw
+///   files, no tailer, no `output.log`. Every surface shows honest absence
+///   (reads are a typed error naming the mode; the fleet gap notice's
+///   sentinel tier reads `capture-off`), and the start emits a stderr note
+///   naming the degraded log-sentinel metering — never a fabricated size.
+///
+/// A whole-engine deployment posture (a serve/config knob), not per-instance
+/// config — it threads `ServeOptions` → `EngineOptions` → `set_serve_options`
+/// → `SpawnSpec`, exactly like 17-2's `metering_listen_port`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogCaptureMode {
+    /// Capture everything, byte-identical to the pre-17-4 behavior. The
+    /// default.
+    #[default]
+    Full,
+    /// Metadata-only at rest: transient raw redirects while running, hashed
+    /// metadata records in `output.log`, raw files unlinked at stop.
+    Metadata,
+    /// Capture nothing: null streams, no files, honest absence everywhere.
+    Off,
+}
+
+impl LogCaptureMode {
+    /// The stable kebab-case wire/flag form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogCaptureMode::Full => "full",
+            LogCaptureMode::Metadata => "metadata",
+            LogCaptureMode::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for LogCaptureMode {
+    /// The parse error names the accepted values (surfaced by the CLI's clap
+    /// parse refusal — an invalid mode never silently degrades to a default).
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "full" => Ok(LogCaptureMode::Full),
+            "metadata" => Ok(LogCaptureMode::Metadata),
+            "off" => Ok(LogCaptureMode::Off),
+            other => Err(format!(
+                "invalid log-capture mode {other:?}: expected \"full\", \"metadata\", or \"off\""
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for LogCaptureMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The resolved launch of an Agent Instance (built from a manifest `OpTemplate`
 /// or a native adapter). Everything the backend needs to spawn the process, in
@@ -180,6 +253,17 @@ pub struct SpawnSpec {
     /// environment-agnostic dumb executors, exactly like
     /// [`SpawnSpec::pipe_stdin`].
     pub inherit_env: bool,
+    /// The log-capture posture for THIS spawn (story 17-4, the AD-12
+    /// amendment). [`LogCaptureMode::Full`] (the default) is byte-identical
+    /// to the pre-17-4 wiring. [`LogCaptureMode::Metadata`] spawns with the
+    /// SAME three-path redirect (the crash-immune raw files exist while
+    /// running) but the tailer writes metadata-only records and the raw files
+    /// are unlinked at stop. [`LogCaptureMode::Off`] spawns with all three
+    /// capture paths `None` — the backends' existing `Stdio::null()` arm —
+    /// so nothing is ever written; the supervisor resolves the mode, the
+    /// backends stay capture-agnostic dumb executors, exactly like
+    /// [`SpawnSpec::pipe_stdin`].
+    pub capture_mode: LogCaptureMode,
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).
@@ -737,6 +821,38 @@ fn append_attributed_lines(path: &Path, lines: &[LogLine]) {
     }
 }
 
+/// Append a BATCH of pre-serialized JSON lines to `path` in ONE file open —
+/// the [`MetadataLogRecord`] sibling of [`append_attributed_lines`] (story
+/// 17-4). Same rotation/batching/best-effort contract, same single-
+/// `write_all` discipline: `json_lines` are complete, newline-terminated
+/// JSON-Lines rows already rendered by the caller (which owns the record →
+/// JSON mapping), so this function stays format-agnostic. Rotation is
+/// checked before the batch exactly like the Full-mode path, so a Metadata
+/// `output.log` is bounded by the same [`LOG_ROTATE_MAX_BYTES`]×
+/// [`LOG_ROTATE_GENERATIONS`] window. A free function so it is directly
+/// unit-testable.
+fn append_json_lines(path: &Path, json_lines: &[String]) {
+    if json_lines.is_empty() {
+        return;
+    }
+    let current_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if should_rotate(current_len) {
+        rotate_generations(path, LOG_ROTATE_GENERATIONS);
+    }
+    let mut buf = String::with_capacity(json_lines.iter().map(|l| l.len() + 1).sum());
+    for line in json_lines {
+        buf.push_str(line);
+        buf.push('\n');
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(buf.as_bytes());
+    }
+}
+
 /// The rotated-generation sibling of `base` (story 4-2) — `base` with `.N`
 /// appended to its raw [`std::ffi::OsStr`] (not a lossy `Display`
 /// concatenation, so a non-UTF8 path stays exact). `n == 1` is the most-
@@ -839,10 +955,63 @@ struct TailCursors {
     stderr: u64,
 }
 
+/// The schema version stamped on every [`MetadataLogRecord`] story 17-4
+/// writes in Metadata mode (independent of the outbox's journal schema —
+/// this is the `output.log` record shape's own version).
+pub(crate) const METADATA_RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// One METADATA-mode `output.log` record (story 17-4): the FACTS about one
+/// consumed raw line — when, which stream, whose, how big, what hash —
+/// NEVER the line's content. The raw content exists only transiently in the
+/// crash-immune redirect files (unlinked at stop), so the at-rest
+/// `output.log` stays uniformly metadata-shaped: a reader of
+/// `output.log` in Metadata mode gets sizes/hashes/timestamps/attribution
+/// it can meter and audit against, without user content ever landing in the
+/// durable capture. Serialized one JSON object per line (JSON-Lines), the
+/// same one-object-per-line discipline as the Full-mode [`LogLine`] records
+/// it replaces — existing generation-rotation and read-side tooling stays
+/// line-oriented.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MetadataLogRecord {
+    /// Schema version ([`METADATA_RECORD_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The literal `"metadata"` — a self-describing discriminator so a
+    /// future schema can add further record kinds without a format break.
+    /// (`String` rather than `&'static str` so the record also
+    /// deserializes — the tests, and any future metadata-log reader, parse
+    /// the exact shape that is written.)
+    pub record: String,
+    /// RFC-3339 timestamp of the tail pass that consumed the raw line.
+    pub ts: String,
+    /// Which raw stream the line came from (kebab-case, as everywhere else).
+    pub stream: LogStream,
+    /// The Agent Instance name the line is attributed to.
+    pub attribution: String,
+    /// The raw line's byte length (the line's own bytes, excluding its
+    /// trailing `\n`) — the metering-relevant size.
+    pub byte_len: u64,
+    /// SHA-256 of the raw line's bytes (hex) — audit without content.
+    pub sha256: String,
+}
+
 /// A handle to one instance's output-capture pipeline (fix pass, review of
 /// #80). Cloning is cheap (two `Arc` clones + small `PathBuf`/`String`
 /// clones): the supervisor clones it to send `Engine`-attributed lines
 /// (Task 4) via [`LogCapture::send_engine_line`].
+///
+/// Story 17-4: the capture carries its mode ([`LogCaptureMode`]).
+/// [`LogCaptureMode::Metadata`] turns the tailer into a METADATA writer —
+/// each consumed raw line becomes a `{ts, stream, attribution, byte_len,
+/// sha256}` record in `output.log`, never the line content (the raw content
+/// exists only transiently in the crash-immune redirect files, unlinked at
+/// stop) — and [`LogCapture::send_engine_line`] CONVERTS the engine's own
+/// lifecycle lines to metadata records too (review finding 13: non-user
+/// content, hashed — the at-rest `output.log` stays uniformly
+/// metadata-shaped AND complete). (The raw
+/// crash-immune redirects themselves are unchanged — the pipe alternative is
+/// the documented review-of-#80 liveness regression.) [`LogCaptureMode::Off`]
+/// never builds a capture at all (no raw files → the backends' null-stream
+/// arm), so this struct only ever exists in Full/Metadata.
 #[derive(Clone, Debug)]
 pub struct LogCapture {
     /// The Agent Instance name, stamped on every [`LogLine`] this capture
@@ -866,6 +1035,9 @@ pub struct LogCapture {
     /// leaking a thread per stop/restart for the remainder of the engine's
     /// life.
     stop: Arc<AtomicBool>,
+    /// This capture's posture (story 17-4): Full writes attributed line
+    /// content; Metadata writes hashed metadata records only.
+    mode: LogCaptureMode,
 }
 
 impl LogCapture {
@@ -882,6 +1054,7 @@ impl LogCapture {
             LogStream::AgentOut,
             &self.instance,
             &self.attributed_log_path,
+            self.mode,
         );
         tail_new_lines(
             &self.stderr_raw,
@@ -889,6 +1062,7 @@ impl LogCapture {
             LogStream::AgentErr,
             &self.instance,
             &self.attributed_log_path,
+            self.mode,
         );
     }
 
@@ -915,13 +1089,96 @@ impl LogCapture {
     /// a helper process starting an instance then exiting right away used
     /// to lose the "engine: ... -> running" line if the old writer thread
     /// never got scheduled first).
+    ///
+    /// Story 17-4 (review finding 13): in Metadata mode the line is
+    /// CONVERTED to a metadata record — the engine's lifecycle lines are
+    /// non-user content (the engine's own words), but the metadata stream
+    /// must stay COMPLETE (output.log is the only durable capture at
+    /// rest), so the record hashes the line's bytes instead of dropping
+    /// them. The `stream` field stays `Engine`, marking the provenance.
     pub(crate) fn send_engine_line(&self, line: LogLine) {
         let mut cursors = self
             .cursors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.catch_up_locked(&mut cursors);
+        if self.mode == LogCaptureMode::Metadata {
+            // Metadata mode: FACTS about the engine line, never its content
+            // — same record shape as the tailer's, `stream: Engine`. (The
+            // instance log remains the machine-authoritative lifecycle
+            // record; this keeps the metadata capture complete.)
+            let record = MetadataLogRecord {
+                schema_version: METADATA_RECORD_SCHEMA_VERSION,
+                record: "metadata".to_string(),
+                ts: line.at.clone(),
+                stream: line.stream,
+                attribution: line.instance.clone(),
+                byte_len: line.text.len() as u64,
+                sha256: sha256::to_hex(&sha256::digest(line.text.as_bytes())),
+            };
+            if let Ok(json) = serde_json::to_string(&record) {
+                append_json_lines(&self.attributed_log_path, &[json]);
+            }
+            return;
+        }
         append_attributed_line(&self.attributed_log_path, &line);
+    }
+
+    /// The tailer's current STDOUT cursor (bytes of the raw `agent.log` the
+    /// tailer has already folded into `output.log`) — story 17-4's
+    /// agent.log-truncate safety condition needs it: the coordinated
+    /// truncate only fires when BOTH consumers (the usage ingester AND the
+    /// tailer) have fully consumed the file, so no unread content is ever
+    /// destroyed.
+    pub(crate) fn stdout_tail_cursor(&self) -> u64 {
+        self.cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stdout
+    }
+
+    /// The tailer's current STDERR cursor — the `agent-stderr.log` twin of
+    /// [`Self::stdout_tail_cursor`] (review finding 9: the stderr raw file
+    /// gets the same coordinated truncate, so the same consumer check needs
+    /// its cursor).
+    pub(crate) fn stderr_tail_cursor(&self) -> u64 {
+        self.cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stderr
+    }
+
+    /// Truncate the named raw file to zero AND snap the matching tailer
+    /// cursor to 0 — ATOMICALLY under the cursors mutex (review finding 8).
+    /// A concurrent tailer pass holds the same mutex across its read and its
+    /// cursor write-back, so it can never observe the truncated file with a
+    /// pre-truncate cursor: the old non-atomic order (check cursor →
+    /// `set_len(0)` → snap) let a pass that began before the truncate
+    /// shrink-guard-swallow the post-truncate appends (their lines silently
+    /// skipped from `output.log`). `stdout` selects which cursor snaps.
+    /// Returns `None` on any I/O failure (the caller defers, latched).
+    pub(crate) fn truncate_raw_and_snap(&self, path: &Path, stdout: bool) -> Option<()> {
+        let mut cursors = self
+            .cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = std::fs::OpenOptions::new().write(true).open(path).ok()?;
+        file.set_len(0).ok()?;
+        if stdout {
+            cursors.stdout = 0;
+        } else {
+            cursors.stderr = 0;
+        }
+        Some(())
+    }
+
+    /// Force ONE catch-up pass right now (review finding 10): the TERMINAL
+    /// drain calls this before the at-rest truncate check, so the tailer's
+    /// cursor reflects everything the (now-dead) process wrote and the
+    /// truncate can actually fire instead of deferring into an at-rest
+    /// over-cap file. Same lock discipline as every other fold.
+    pub(crate) fn catch_up_now(&self) {
+        self.catch_up();
     }
 
     /// Signal the background tailer thread to perform one final catch-up
@@ -934,14 +1191,15 @@ impl LogCapture {
 
 /// Read new, COMPLETE lines from `path` since `*cursor` (a byte offset),
 /// appending them as a SINGLE BATCH (synchronously —
-/// [`append_attributed_lines`], one file open for the whole batch) of
-/// attributed, timestamped [`LogLine`]s into `attributed_log_path` (fix
-/// pass, review of #80) — the pull-based replacement for the old blocking
-/// pipe reader threads, with NO channel hand-off. A trailing partial line
-/// (no `\n` yet) is left un-consumed for the next call. Best-effort: any
-/// read hiccup (the file momentarily missing, a transient I/O error) is a
-/// silent skip, never fatal — this is a derived, best-effort VIEW, mirroring
-/// this codebase's existing best-effort discipline for background capture.
+/// [`append_attributed_lines`] in Full mode, [`append_json_lines`] metadata
+/// records in Metadata mode, story 17-4; one file open for the whole batch)
+/// into `attributed_log_path` (fix pass, review of #80) — the pull-based
+/// replacement for the old blocking pipe reader threads, with NO channel
+/// hand-off. A trailing partial line (no `\n` yet) is left un-consumed for
+/// the next call. Best-effort: any read hiccup (the file momentarily
+/// missing, a transient I/O error) is a silent skip, never fatal — this is
+/// a derived, best-effort VIEW, mirroring this codebase's existing
+/// best-effort discipline for background capture.
 ///
 /// BOUNDED per call to [`MAX_TAIL_BYTES_PER_PASS`] AND [`MAX_TAIL_LINES_PER_PASS`]
 /// (fix pass, review of #80 — see their docs for why BOTH are needed: bytes
@@ -964,6 +1222,7 @@ fn tail_new_lines(
     stream: LogStream,
     instance: &str,
     attributed_log_path: &Path,
+    mode: LogCaptureMode,
 ) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -1007,13 +1266,60 @@ fn tail_new_lines(
     if consumable == 0 {
         return;
     }
+    // The consumed window's raw line slices, computed ONLY in Metadata mode
+    // (split BEFORE any UTF-8 lossiness, `str::lines`-compatible: the final
+    // '\n' terminates the window, and a '\r' before it is stripped like
+    // `lines` strips CRLF). Metadata mode hashes/lengths THESE bytes
+    // (review finding 12) — an invalid-UTF-8 line must meter and audit as
+    // the bytes the agent actually wrote, never the lossy replacement text.
     let text = String::from_utf8_lossy(&buf[..consumable]).into_owned();
     let at = now_rfc3339();
-    let lines: Vec<LogLine> = text
-        .lines()
-        .map(|line| LogLine::new(instance, stream, line, at.clone()))
-        .collect();
-    append_attributed_lines(attributed_log_path, &lines);
+    match mode {
+        LogCaptureMode::Full => {
+            let lines: Vec<LogLine> = text
+                .lines()
+                .map(|line| LogLine::new(instance, stream, line, at.clone()))
+                .collect();
+            append_attributed_lines(attributed_log_path, &lines);
+        }
+        LogCaptureMode::Metadata => {
+            // Story 17-4: write FACTS, never content — one metadata record
+            // per consumed line (ts/stream/attribution/byte_len/sha256),
+            // JSON-Lines, the same rotation discipline as Full. The facts
+            // are computed over the RAW byte slices (review finding 12).
+            let raw_lines: Vec<&[u8]> = buf[..consumable]
+                .split(|&b| b == b'\n')
+                .filter(|slice| !slice.is_empty())
+                .map(|slice| match slice.split_last() {
+                    Some((&b'\r', rest)) => rest,
+                    _ => slice,
+                })
+                .collect();
+            let records: Vec<String> = raw_lines
+                .iter()
+                .map(|raw| {
+                    let record = MetadataLogRecord {
+                        schema_version: METADATA_RECORD_SCHEMA_VERSION,
+                        record: "metadata".to_string(),
+                        ts: at.clone(),
+                        stream,
+                        attribution: instance.to_string(),
+                        byte_len: raw.len() as u64,
+                        sha256: sha256::to_hex(&sha256::digest(raw)),
+                    };
+                    serde_json::to_string(&record).unwrap_or_default()
+                })
+                .filter(|json| !json.is_empty())
+                .collect();
+            append_json_lines(attributed_log_path, &records);
+        }
+        // Defensive only: Off never builds a [`LogCapture`] at all (the
+        // supervisor resolves the mode into three `None` capture paths, so
+        // no tailer exists to call this). If misuse ever constructed one
+        // anyway, the mode's contract is NOTHING on disk — consume the
+        // bytes silently-forward and write nothing, never Full content.
+        LogCaptureMode::Off => {}
+    }
     *cursor += consumable as u64;
 }
 
@@ -1080,6 +1386,7 @@ pub(crate) fn spawn_output_capture(
     stderr_raw_path: PathBuf,
     attributed_log_path: PathBuf,
     instance: String,
+    mode: LogCaptureMode,
 ) -> LogCapture {
     let cursors = Arc::new(Mutex::new(TailCursors {
         stdout: std::fs::metadata(&stdout_raw_path)
@@ -1097,6 +1404,7 @@ pub(crate) fn spawn_output_capture(
         attributed_log_path,
         cursors,
         stop,
+        mode,
     };
     let _tailer_handle = spawn_tailer_thread(capture.clone());
     capture
@@ -1394,6 +1702,7 @@ mod tests {
             pipe_stdout: false,
             detach: false,
             inherit_env: true,
+            capture_mode: LogCaptureMode::default(),
         };
         let b = a.clone();
         assert_eq!(a, b);
@@ -1657,6 +1966,7 @@ mod tests {
             stderr_raw,
             attributed.clone(),
             "svc".to_string(),
+            LogCaptureMode::Full,
         );
         capture.signal_stop(); // no background tailer ticks racing this test
 
@@ -1725,7 +2035,14 @@ mod tests {
         let attributed = dir.path().join("output.log");
         std::fs::write(&raw, b"a\nb\nc").unwrap(); // "c" has no trailing '\n'
         let mut cursor = 0u64;
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         let lines = read_attributed(&attributed);
         assert_eq!(
             lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
@@ -1742,7 +2059,14 @@ mod tests {
         use std::io::Write as _;
         writeln!(file, "\nd").unwrap();
         drop(file);
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         let lines2 = read_attributed(&attributed);
         assert_eq!(
             lines2
@@ -1765,10 +2089,24 @@ mod tests {
         let attributed = dir.path().join("output.log");
         std::fs::write(&raw, b"a\nb\n").unwrap();
         let mut cursor = 0u64;
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         assert_eq!(cursor, 4);
         // Call again with NO new bytes written — must append nothing further.
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         let lines = read_attributed(&attributed);
         assert_eq!(
             lines.len(),
@@ -1788,7 +2126,14 @@ mod tests {
         let attributed = dir.path().join("output.log");
         std::fs::write(&raw, b"a\nb\nc\n").unwrap();
         let mut cursor = 100u64; // artificially past the (real) 6-byte length
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         assert_eq!(cursor, 6, "cursor snaps to the file's actual length");
         assert!(
             !attributed.exists() || read_attributed(&attributed).is_empty(),
@@ -1828,6 +2173,7 @@ mod tests {
             LogStream::AgentOut,
             "svc",
             &attributed,
+            LogCaptureMode::Full,
         );
         assert_eq!(cursor, 0, "a failed pass must not advance the cursor");
         assert!(
@@ -1861,7 +2207,14 @@ mod tests {
         std::fs::write(&raw, big.as_bytes()).unwrap();
         let mut cursor = 0u64;
         let t0 = std::time::Instant::now();
-        tail_new_lines(&raw, &mut cursor, LogStream::AgentOut, "svc", &attributed);
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_secs(2),
@@ -1902,6 +2255,7 @@ mod tests {
             stderr_raw.clone(),
             attributed.clone(),
             "svc".to_string(),
+            LogCaptureMode::Full,
         );
         // Signal stop IMMEDIATELY (before the tailer's own 20ms poll can
         // fire) so THIS test's own send_engine_line call is what performs
@@ -1956,6 +2310,7 @@ mod tests {
             attributed_log_path: dir.path().join("output.log"),
             cursors: Arc::new(Mutex::new(TailCursors::default())),
             stop: Arc::clone(&stop),
+            mode: LogCaptureMode::default(),
         };
         let handle = spawn_tailer_thread(capture);
         stop.store(true, Ordering::Relaxed);
@@ -1963,5 +2318,275 @@ mod tests {
         // would fail the test via the harness's own timeout, proving the
         // thread does NOT loop forever once stop is set.
         handle.join().expect("tailer thread must not panic");
+    }
+
+    #[test]
+    fn tail_new_lines_in_metadata_mode_writes_records_never_content() {
+        // Story 17-4: the Metadata-mode tailer writes one
+        // `{schema_version, record:"metadata", ts, stream, attribution,
+        // byte_len, sha256}` record per consumed line — the raw line's
+        // CONTENT never lands in output.log.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"hello secret\n").unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Metadata,
+        );
+        assert_eq!(cursor, 13, "the cursor advances past the whole line");
+        let text = std::fs::read_to_string(&attributed).unwrap();
+        let record: MetadataLogRecord = serde_json::from_str(text.trim()).expect("one JSON row");
+        assert_eq!(record.schema_version, METADATA_RECORD_SCHEMA_VERSION);
+        assert_eq!(record.record, "metadata");
+        assert_eq!(record.stream, LogStream::AgentOut);
+        assert_eq!(record.attribution, "svc");
+        assert_eq!(record.byte_len, 12, "the line's own bytes, no newline");
+        assert_eq!(
+            record.sha256,
+            sha256::to_hex(&sha256::digest(b"hello secret")),
+            "the hash is over the raw line's bytes"
+        );
+        assert!(
+            !text.contains("hello secret"),
+            "the content NEVER lands in the metadata capture: {text}"
+        );
+    }
+
+    #[test]
+    fn tail_new_lines_in_metadata_mode_hashes_each_line_distinctly() {
+        // Two different lines → two records, each with ITS OWN byte_len and
+        // hash (a per-batch hash would be useless for metering).
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"alpha\nbeta\n").unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentErr,
+            "svc",
+            &attributed,
+            LogCaptureMode::Metadata,
+        );
+        let text = std::fs::read_to_string(&attributed).unwrap();
+        let records: Vec<MetadataLogRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].byte_len, 5);
+        assert_eq!(records[1].byte_len, 4);
+        assert_ne!(records[0].sha256, records[1].sha256);
+        assert_eq!(records[0].stream, LogStream::AgentErr);
+    }
+
+    #[test]
+    fn metadata_facts_are_computed_over_the_raw_bytes_even_for_invalid_utf8() {
+        // Review finding 12: byte_len and sha256 are computed over the
+        // line's RAW byte slice, BEFORE any UTF-8 lossiness — a line with
+        // invalid UTF-8 must meter and audit as the bytes the agent
+        // actually wrote, never the lossy replacement text (whose length
+        // and hash would both differ). `0xFF 0xFE` is invalid UTF-8; a
+        // lossy conversion turns it into two U+FFFD replacement chars (6
+        // bytes encoded), so the pre-fix code would have metered 6, not 2.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, b"\xFF\xFE\nok\n").unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Metadata,
+        );
+        let text = std::fs::read_to_string(&attributed).unwrap();
+        let records: Vec<MetadataLogRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].byte_len, 2, "the RAW bytes are metered");
+        assert_eq!(
+            records[0].sha256,
+            sha256::to_hex(&sha256::digest(&[0xFF, 0xFE])),
+            "the hash is over the raw bytes, not lossy text"
+        );
+        assert_eq!(records[1].byte_len, 2, "the neighboring line is unaffected");
+        assert_ne!(records[0].sha256, records[1].sha256);
+    }
+
+    #[test]
+    fn send_engine_line_converts_to_a_metadata_record_in_metadata_mode() {
+        // Review finding 13: the engine's lifecycle lines are non-user
+        // content, but the metadata stream must stay COMPLETE — the line is
+        // converted to a metadata record (its bytes hashed, never written),
+        // with `stream: Engine` marking the provenance.
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_raw = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&stdout_raw, b"").unwrap();
+        std::fs::write(&stderr_raw, b"").unwrap();
+        let capture = spawn_output_capture(
+            stdout_raw,
+            stderr_raw,
+            attributed.clone(),
+            "svc".to_string(),
+            LogCaptureMode::Metadata,
+        );
+        capture.signal_stop(); // no tailer ticks racing this test
+        capture.send_engine_line(LogLine::new(
+            "svc",
+            LogStream::Engine,
+            "engine: starting -> running",
+            now_rfc3339(),
+        ));
+        let text = std::fs::read_to_string(&attributed).unwrap_or_default();
+        assert!(
+            !text.contains("engine: starting -> running"),
+            "metadata mode must not append engine CONTENT: {text}"
+        );
+        let record: MetadataLogRecord =
+            serde_json::from_str(text.trim()).expect("one JSON metadata row");
+        assert_eq!(record.stream, LogStream::Engine, "the provenance is kept");
+        assert_eq!(record.attribution, "svc");
+        assert_eq!(record.byte_len, "engine: starting -> running".len() as u64);
+        assert_eq!(
+            record.sha256,
+            sha256::to_hex(&sha256::digest(b"engine: starting -> running")),
+            "the record hashes the engine line's bytes"
+        );
+    }
+
+    #[test]
+    fn truncate_raw_and_snap_zeros_the_file_and_its_tailer_cursor_atomically() {
+        // The coordinated-truncate pair (review finding 8): the truncate AND
+        // the cursor snap happen under ONE hold of the cursors mutex — a
+        // concurrent tailer pass can never observe the truncated file with a
+        // pre-truncate cursor (its shrink guard would swallow the
+        // post-truncate appends). The file itself lands at zero length.
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_raw = dir.path().join("agent.log");
+        let stderr_raw = dir.path().join("agent-stderr.log");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&stdout_raw, b"").unwrap();
+        std::fs::write(&stderr_raw, b"").unwrap();
+        let capture = spawn_output_capture(
+            stdout_raw.clone(),
+            stderr_raw.clone(),
+            attributed,
+            "svc".to_string(),
+            LogCaptureMode::Full,
+        );
+        capture.signal_stop();
+        assert_eq!(
+            capture.stdout_tail_cursor(),
+            0,
+            "anchored at the empty file"
+        );
+        std::fs::write(&stdout_raw, b"caught up\n").unwrap();
+        capture.catch_up();
+        assert_eq!(
+            capture.stdout_tail_cursor(),
+            10,
+            "the cursor tracks the consumed bytes"
+        );
+        capture
+            .truncate_raw_and_snap(&stdout_raw, true)
+            .expect("the truncate succeeds");
+        assert_eq!(
+            capture.stdout_tail_cursor(),
+            0,
+            "the truncate snaps the cursor to the fresh file's start"
+        );
+        assert_eq!(
+            std::fs::metadata(&stdout_raw).unwrap().len(),
+            0,
+            "the raw file is truncated to zero"
+        );
+        // The stderr twin snaps ITS OWN cursor (review finding 9).
+        std::fs::write(&stderr_raw, b"err line\n").unwrap();
+        capture.catch_up();
+        assert_eq!(capture.stderr_tail_cursor(), 9);
+        capture
+            .truncate_raw_and_snap(&stderr_raw, false)
+            .expect("the stderr truncate succeeds");
+        assert_eq!(capture.stderr_tail_cursor(), 0);
+        assert_eq!(
+            capture.stdout_tail_cursor(),
+            0,
+            "the stdout cursor is untouched"
+        );
+    }
+
+    #[test]
+    fn append_json_lines_writes_newline_terminated_rows_and_no_op_on_empty() {
+        // The metadata append helper: one file open, every row
+        // newline-terminated (the JSON-Lines discipline the tolerant
+        // readers depend on); an empty batch never creates the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.log");
+        append_json_lines(&path, &[]);
+        assert!(!path.exists(), "an empty batch creates nothing");
+        append_json_lines(&path, &["{\"a\":1}".to_string(), "{\"a\":2}".to_string()]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "{\"a\":1}\n{\"a\":2}\n");
+    }
+
+    #[test]
+    fn metadata_mode_json_parse_fails_softly_never_panics() {
+        // A metadata record that cannot serialize is FILTERED (the row is
+        // dropped), never a panic in the tailer thread — the same
+        // best-effort discipline as the Full-mode append. (In practice a
+        // MetadataLogRecord of plain strings/numbers always serializes; the
+        // filter is the structural guarantee.)
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        let attributed = dir.path().join("output.log");
+        std::fs::write(&raw, "line\u{1F600}\n".as_bytes()).unwrap();
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Metadata,
+        );
+        let text = std::fs::read_to_string(&attributed).unwrap();
+        let record: MetadataLogRecord = serde_json::from_str(text.trim()).unwrap();
+        // byte_len counts the line's UTF-8 BYTES (the emoji is 4 bytes:
+        // 4 + 4 = 8, the trailing newline excluded).
+        assert_eq!(record.byte_len, 8);
+    }
+
+    #[test]
+    fn append_json_lines_rotates_a_log_that_crossed_the_cap() {
+        // The rotation TRIGGER at the append call site (the pure
+        // `should_rotate` seam is pinned separately): a log already at the
+        // cap rotates BEFORE the new lines land — the current generation
+        // moves aside and the base file holds only the fresh append.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("agent.log");
+        std::fs::write(&log, vec![b'x'; LOG_ROTATE_MAX_BYTES as usize]).unwrap();
+        append_json_lines(&log, &[serde_json::to_string(&"a line").unwrap()]);
+        assert!(
+            std::fs::metadata(&log).unwrap().len() < LOG_ROTATE_MAX_BYTES,
+            "the crossed cap rotated the current generation aside"
+        );
+        assert!(
+            generation_path(&log, 1).exists(),
+            "the crossed generation was retained, not dropped"
+        );
     }
 }
