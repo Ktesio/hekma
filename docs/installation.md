@@ -86,6 +86,13 @@ hekma-<tag>-<target>.zip
 
 Each release also includes `.sha256` files and an aggregate checksum file.
 
+For containers there is an additional Linux archive —
+`hekma-<tag>-x86_64-unknown-linux-musl.tar.gz`, the statically linked build
+whose binaries (including the standalone `hekma-host`) run on `scratch` and
+distroless images with no glibc. It is a manual download, not an installer
+target; see [Running Hekma as a container supervisor](hosting.md) for the
+recipe.
+
 ## Install with Homebrew
 
 After a release is published to the Homebrew tap:
