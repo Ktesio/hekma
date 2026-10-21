@@ -111,7 +111,16 @@ jobs:
     # under runner contention — GitHub marks a job timeout as CANCELLED, so
     # three consecutive runs died silently at ~25m05s (2026-09-22/23, the
     # #235 window; bisect: identical Rust content green at the #193 merge
-    # run). 40 restores real headroom. nextest's per-test kill-timeout (see
+    # run). 40 restored that headroom then; the suite has since grown past
+    # 1,671 nextest tests (epics 15-17) and the windows-latest leg rides
+    # 33-38m GREEN (37m26s on the epic-17 tree, run 39445820001), so a
+    # cold-cache leg has no budget left: run 39472620931 (post-epic-17
+    # main) missed BOTH windows caches (cargo registry keyed by the new
+    # Cargo.lock + the evicted Windows-cargo-nextest-bin, which recompiled
+    # nextest from source for ~5.5m), spent 9m00s before the suite even
+    # started, and the 40m job timeout killed the suite mid-run (GitHub
+    # marks it CANCELLED, fail-fast then took the queued macos leg with
+    # it) — 50 restores cold-cache headroom. nextest's per-test kill-timeout (see
     # .config/nextest.toml) remains the cross-OS per-test hang guard; the
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
@@ -120,7 +129,7 @@ jobs:
     # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
     # 15+5m service window instead of 45m and surfaces as a fast visible
     # cancel rather than a silent three-quarter-hour burn.
-    timeout-minutes: ${{ matrix.test_job_timeout_minutes || 40 }}
+    timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

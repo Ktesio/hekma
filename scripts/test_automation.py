@@ -551,8 +551,15 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
         self.assertIn("- os: ubuntu-26.04", ci)
         self.assertIn("test_job_timeout_minutes: 15", ci)
+        # Default test-job budget 40→50 (2026-10-20): the suite passed 1,671
+        # nextest tests with epic-17 and the windows-latest leg rides 33-38m
+        # green; run 39472620931 lost ~9m to a double cold-cache miss (new
+        # Cargo.lock key + an evicted Windows-cargo-nextest-bin that rebuilt
+        # nextest from source) and the 40m job timeout cancelled the suite
+        # mid-run. 50 keeps cold-cache headroom; ubuntu stays 15m via the
+        # matrix include above.
         self.assertIn(
-            "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 40 }}", ci
+            "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}", ci
         )
         self.assertIn('status-level = "leak"', nextest)
         # The SOURCE fix: a max-threads=1 test-group over exactly the engine
