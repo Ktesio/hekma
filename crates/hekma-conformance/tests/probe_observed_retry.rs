@@ -9,18 +9,25 @@
 //! 30s section budget — observed twice on 2026-10-20 windows runs (nextest's
 //! fresh-process retry passed both times, ~39s).
 //!
-//! The shape: the probe is pointed at a loopback port that is DELIBERATELY
-//! unbound for the first ~400ms (connects refused), then served by a minimal
-//! pure-`std` stub. The assertion: all `--observed-calls` calls are eventually
-//! placed (the stub serves every one of them) and the probe's stderr carries
-//! the retry evidence. Pure `std`, NO OS-cfg — refused-connect behavior on an
-//! unbound loopback port is uniform across the three CI legs.
+//! The shape: the probe is pointed at a loopback port that stays DELIBERATELY
+//! unbound (connects refused) until the probe's FIRST retry announcement is
+//! read off its stderr — the refusal window opens and closes on observed
+//! behavior, never on wall-clock. A fixed window (the first draft held the
+//! port closed for a flat 400ms) is a startup race: a windows-latest process
+//! spawn can outlast the window, the probe's first connect then lands on an
+//! already-bound stub, nothing is refused, and the test fails its own
+//! retry-evidence assert with empty stderr — deterministically, five attempts
+//! across two windows runs on 2026-10-20. The assertion: all
+//! `--observed-calls` calls are eventually placed (the stub serves every one
+//! of them) and the probe's stderr carries the retry evidence. Pure `std`,
+//! NO OS-cfg — refused-connect behavior on an unbound loopback port is
+//! uniform across the three CI legs.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Serve ONE request on `stream`: read the request head+body (bounded — the
@@ -49,26 +56,17 @@ fn serve_one(stream: TcpStream) -> std::io::Result<()> {
 fn observed_calls_survive_a_transiently_refused_listener() {
     // Reserve the loopback port, then UNBIND it: the probe's early connects
     // must be REFUSED (RST), not queued, so only the retry ladder can place
-    // call 1. The stub binds the same port 400ms in — inside the ladder's
-    // bounded retry window (5 attempts × 250ms), far from its edge.
+    // call 1. The stub binds the same port the moment the probe's first
+    // retry announcement is READ off its stderr — inside the ladder's
+    // bounded retry window (the next attempt sleeps 250ms; a thread wakeup
+    // plus a loopback bind is microseconds), with no dependence on when the
+    // probe's process reaches its first connect.
     let probe = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
     let addr = probe.local_addr().expect("loopback addr");
     drop(probe);
 
     let served = Arc::new(AtomicUsize::new(0));
     let want_calls = 3usize;
-
-    let stub_addr = addr;
-    let stub_served = Arc::clone(&served);
-    let stub = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        let listener = TcpListener::bind(stub_addr).expect("stub binds the reserved port");
-        for _ in 0..want_calls {
-            let (stream, _) = listener.accept().expect("stub accepts");
-            serve_one(stream).expect("stub serves one request");
-            stub_served.fetch_add(1, Ordering::SeqCst);
-        }
-    });
 
     let mut child = Command::new(hekma_conformance::fake_agent_bin())
         .arg("--observed-calls")
@@ -80,6 +78,71 @@ fn observed_calls_survive_a_transiently_refused_listener() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn fake_agent");
+
+    // Stream the probe's stderr from a reader thread: it (a) signals the stub
+    // the moment the first retry announcement arrives — that is what closes
+    // the refusal window — and (b) accumulates the text the final assert
+    // pins. Reading incrementally (not only after kill) is also the shape
+    // least able to drop pipe content on any leg.
+    let stderr_pipe = child.stderr.take().expect("stderr is piped above");
+    let stderr_seen = Arc::new(Mutex::new(String::new()));
+    let (first_retry_tx, first_retry_rx) = mpsc::channel::<()>();
+    let reader_seen = Arc::clone(&stderr_seen);
+    let reader = std::thread::spawn(move || {
+        let mut lines = BufReader::new(stderr_pipe);
+        let mut announced = false;
+        loop {
+            let mut raw = Vec::new();
+            match lines.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => break, // EOF once the probe is killed
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&raw).into_owned();
+                    reader_seen.lock().expect("stderr lock").push_str(&line);
+                    if !announced
+                        && line.contains("fake_agent: observed call attempt")
+                        && line.contains("retrying")
+                    {
+                        announced = true;
+                        let _ = first_retry_tx.send(());
+                    }
+                }
+            }
+        }
+    });
+
+    let stub_addr = addr;
+    let stub_served = Arc::clone(&served);
+    let stub = std::thread::spawn(move || {
+        // Hold the port refused until the probe RETRIES — proof the refusal
+        // was hit AND announced. A fire-once skip-forever probe (the bug this
+        // pins against) never announces, the window never closes, and the
+        // serve-loop deadline below fails the test with the shortfall.
+        if first_retry_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            return Err(
+                "no retry announcement reached the probe's stderr within 30s — the \
+                 refused connect was skipped instead of retried"
+                    .to_string(),
+            );
+        }
+        let listener = match TcpListener::bind(stub_addr) {
+            Ok(listener) => listener,
+            Err(e) => return Err(format!("stub binds the reserved port: {e}")),
+        };
+        for _ in 0..want_calls {
+            let (stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(e) => return Err(format!("stub accepts: {e}")),
+            };
+            if let Err(e) = serve_one(stream) {
+                return Err(format!("stub serves one request: {e}"));
+            }
+            stub_served.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    });
 
     // Every requested call must be served within a generous bound (the ladder
     // itself needs <1.5s worst case; the poll is not a timing dependency).
@@ -107,14 +170,15 @@ fn observed_calls_survive_a_transiently_refused_listener() {
         !out.success(),
         "the probe lingers by design; kill must end it"
     );
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    reader.join().expect("stderr reader thread");
+    let stderr = stderr_seen.lock().expect("stderr lock").clone();
     assert!(
         stderr.contains("fake_agent: observed call attempt") && stderr.contains("retrying"),
         "retry attempts must be announced on stderr, got: {stderr}"
     );
 
-    stub.join().expect("stub thread");
+    match stub.join().expect("stub thread") {
+        Ok(()) => {}
+        Err(e) => panic!("{e}"),
+    }
 }
