@@ -750,6 +750,14 @@ jobs:
           #     fd/handle constructors cannot be made data-driven (OsId
           #     cannot import a platform-only trait). The arms are the
           #     boundary gate's own sanctioned class.
+          #   * conformance test_support.rs — the fixture writer's
+          #     non-UTF-8-exec panic test needs an OsStr that is not valid
+          #     Unicode as INPUT, and constructing one exists only through
+          #     per-OS std APIs (std::os::unix::ffi::OsStrExt::from_bytes /
+          #     std::os::windows::ffi::OsStringExt::from_wide) — the same
+          #     "the constructor is the OS API boundary" class as
+          #     test_notes.rs above; the asserted contract (loud panic, no
+          #     munge, nothing written) is OS-uniform.
           #   * conformance tck.rs — story 15-3's EngineOpen stage drive
           #     needs an EMPTY-but-UNWRITABLE state root (the fresh-root
           #     contract refuses any non-empty root at StateRoot first), and
@@ -783,7 +791,7 @@ jobs:
           #     the spawned host resolves the bearer through the file leg —
           #     the identical sanctioned class as the control_api.rs entry
           #     above; the leg's Windows skip stays data-driven OsId::current.
-          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:|^crates/hekma-host/src/signals\.rs:|^crates/hekma-host/tests/control_api\.rs:|^crates/hekma-host/tests/binary_flags\.rs:|^crates/hekma/tests/serve_cli\.rs:'
+          allowlist='^crates/hekma-engine/src/backends/|^crates/hekma/src/update_check\.rs:|^crates/hekma/src/cli/self_update\.rs:|^crates/hekma-engine/tests/atomic_config_writes\.rs:|^crates/hekma-engine/tests/memory\.rs:|^crates/hekma-conformance/src/tck\.rs:|^crates/hekma-conformance/src/test_notes\.rs:|^crates/hekma-conformance/src/test_support\.rs:|^crates/hekma-host/src/signals\.rs:|^crates/hekma-host/tests/control_api\.rs:|^crates/hekma-host/tests/binary_flags\.rs:|^crates/hekma/tests/serve_cli\.rs:'
           scan_status=0
           hits="$(grep -rn --include='*.rs' -E "$pattern" crates/)" || scan_status=$?
           if [ "$scan_status" -ge 2 ]; then
