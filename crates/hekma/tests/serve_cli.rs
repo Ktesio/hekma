@@ -433,13 +433,11 @@ fn serve_option_refusals_exit_by_the_frozen_classes() {
     assert_eq!(
         no_secret.code,
         Some(2),
-        "a half-configured API is a Usage-class refusal: {}",
-        no_secret.stderr
+        "a half-configured API is a Usage-class refusal"
     );
     assert!(
         no_secret.stderr.contains("--bearer-secret"),
-        "the remediation is named: {}",
-        no_secret.stderr
+        "the remediation is named in stderr"
     );
 
     let blocker = ctx_dir().join("hekma-serve-state-blocker");

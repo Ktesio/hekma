@@ -1553,9 +1553,12 @@ fn a_bind_conflict_surfaces_the_address_and_refuses_the_start() {
         Err(hekma_host::ServeError::Startup { message }) => {
             assert!(
                 message.contains(&taken.to_string()),
-                "the surfaced reason NAMES the address ({taken}):\n{message}"
+                "the surfaced reason names the taken address"
             );
-            assert!(message.contains("could not bind"), "{message}");
+            assert!(
+                message.contains("could not bind"),
+                "the surfaced reason names the bind failure"
+            );
         }
         other => panic!("a bind conflict must be a Startup refusal: {other:?}"),
     }
@@ -1586,11 +1589,17 @@ fn an_unresolvable_bearer_refuses_startup_before_any_engine_work() {
         Err(hekma_host::ServeError::Startup { message }) => {
             assert!(
                 message.contains("bearer secret could not be resolved"),
-                "{message}"
+                "the refusal names the unresolvable bearer"
             );
-            assert!(message.contains("no_such_bearer_anywhere"), "{message}");
+            assert!(
+                message.contains("no_such_bearer_anywhere"),
+                "the refusal names the missing secret reference"
+            );
             // The remediation rides the engine's Unresolved text.
-            assert!(message.contains("secrets file"), "{message}");
+            assert!(
+                message.contains("secrets file"),
+                "the remediation names the secrets file"
+            );
         }
         other => panic!("an unresolvable bearer must refuse startup: {other:?}"),
     }
@@ -2108,10 +2117,13 @@ fn an_empty_resolved_secret_refuses_startup_naming_the_reference() {
     let result = hekma_host::serve_with_signal(options, |_| std::future::ready(Ok("SIGTEST")));
     match result {
         Err(hekma_host::ServeError::Startup { message }) => {
-            assert!(message.contains("EMPTY value"), "{message}");
+            assert!(
+                message.contains("EMPTY value"),
+                "the refusal names the empty resolved secret"
+            );
             assert!(
                 message.contains(BEARER_NAME),
-                "the refusal NAMES the reference: {message}"
+                "the refusal names the secret reference"
             );
         }
         other => panic!("an empty resolved secret must refuse startup: {other:?}"),
