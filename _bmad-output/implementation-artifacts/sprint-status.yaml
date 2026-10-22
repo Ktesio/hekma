@@ -177,13 +177,13 @@ development_status:
   # (epic-15 done 2026-10-17, epic-16 done 2026-10-19) had consumed the numbers 15/16 while this
   # approved 2026-09-30 correct-course output sat uncommitted locally. Stories shift with their
   # epics: Service Host 15.x→17.x, Service-Grade Lifecycle 16.x→18.x, Wire Governance 17.x→19.x.
-  epic-17: in-progress  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber)
+  epic-17: done  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service Host; FR-41; AD-20; AD-18 trigger 1 → 17-1; was Epic 15 pre-renumber); closed 2026-10-22 — all five stories merged
   17-1-host-mode-spec-the-shim-crate-and-the-lock-model: done  # D1/D2/D3 ratified 2026-10-19 (hekma-host / axum 0.8 / re-ratify coarse); PR #310 squash-merged 2026-10-20 (501cc85)
-  17-2-hekma-serve-the-long-running-host: in-review  # implemented + 3-layer review hardening complete 2026-10-19; PR #311 open, rebased onto merged #310 + maintainer Windows-fix batch 2026-10-20 (f0424ef)
-  17-3-control-api-v0: in-review  # implemented + 29-finding review hardening complete 2026-10-19; PR #312 open, rebased 2026-10-20 (922ae18)
-  17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: in-review  # implemented + 26-finding review hardening complete 2026-10-20; PR follows immediately (base 17-3)
-  17-5-static-linux-release-and-the-container-recipe: in-review  # implemented + 17-finding review round complete 2026-10-20 (release-blocking static-pie gate caught + fixed); PR follows immediately (base 17-4)
-  epic-17-retrospective: optional
+  17-2-hekma-serve-the-long-running-host: done  # implemented + 3-layer review hardening; PR #311 merged 2026-10-20 (includes the maintainer's Windows-fix batch + engine 0.8.0 slot bump)
+  17-3-control-api-v0: done  # implemented + 29-finding review hardening; PR #312 merged 2026-10-20
+  17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: done  # implemented + 26-finding review hardening + CI round (stable-clippy as_chunks, data-driven OS skips, Windows env-floor HOME, outbox-failure pin); PR #313 merged 2026-10-20
+  17-5-static-linux-release-and-the-container-recipe: done  # implemented + 17-finding review round (release-blocking static-pie gate caught + fixed); PR #314 merged 2026-10-20; first live musl proof lands at the next v* tag
+  epic-17-retrospective: skipped  # maintainer decision 2026-10-22 — the epic closes without a retro; the epic's process lessons live in the story specs' change logs and the deferred-work record
   epic-18: backlog  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber)
   18-1-readiness-probes: backlog
   18-2-liveness-and-the-unresponsive-failure: backlog
