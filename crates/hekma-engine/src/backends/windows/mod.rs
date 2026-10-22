@@ -824,6 +824,30 @@ impl ProcessBackend for WindowsBackend {
         }))
     }
 
+    fn self_fingerprint(&self) -> Option<ProcessFingerprint> {
+        // The owner stamp for the live-owner adoption boundary: THIS
+        // process's own pid + creation-time token, read through the same
+        // GetProcessTimes source `adopt` verifies against. None = the
+        // documented degraded fallback (a record with no owner keeps the
+        // pre-owner adoption posture).
+        let pid = std::process::id();
+        process_start_time(pid).map(|start_time| ProcessFingerprint::new(pid, start_time))
+    }
+
+    fn probe_alive(&self, fingerprint: &ProcessFingerprint) -> Option<bool> {
+        // The owner-liveness probe without re-holding a handle: open by pid
+        // for query, read the creation time, compare (the PID-reuse guard —
+        // a reused pid's creation time differs). A pid that cannot be
+        // OPENED reads as Some(false): on Windows that is either a gone pid
+        // or an access-denied one, and the consequence-free direction
+        // applies (an adopted Windows handle never kills at drop, so a
+        // wrongly-deemed-dead owner can never cost the agent its life here).
+        match process_start_time(fingerprint.pid) {
+            Some(live_start) => Some(live_start == fingerprint.start_time),
+            None => Some(false),
+        }
+    }
+
     fn has_stdin(&self, handle: &Self::Handle) -> bool {
         handle.stdin.is_live()
     }

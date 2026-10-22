@@ -1540,6 +1540,41 @@ pub trait ProcessBackend {
         detached: bool,
     ) -> Result<Option<Self::Handle>, BackendError>;
 
+    /// THIS process's own [`ProcessFingerprint`] — the engine stamps it onto
+    /// the write-ahead spawn record as the SUPERVISING OWNER, so a later
+    /// engine can tell "the engine that spawned this agent is still alive
+    /// and supervising it" from "the record was left by a crashed engine"
+    /// (the live-owner adoption boundary: adoption must never steal — and
+    /// kill-on-drop — an attached agent a LIVE engine process still holds).
+    ///
+    /// `None` when the start-time source cannot read this process's own
+    /// token (the degraded-OS fallback shape of [`ProcessBackend::adopt`]):
+    /// the record then carries no owner and adoption keeps the pre-owner
+    /// behavior (adopt armed) — an honest degradation, never a spawn
+    /// failure. Cheap (one `/proc`-style read), sync, and idempotent per
+    /// process.
+    fn self_fingerprint(&self) -> Option<ProcessFingerprint>;
+
+    /// Whether `fingerprint` names a LIVE process right now — the same
+    /// pid + start-time identity check [`ProcessBackend::adopt`] applies,
+    /// WITHOUT re-holding a handle. This is the OWNER-liveness probe of the
+    /// live-owner adoption boundary: before adopting a non-detached record
+    /// whose recorded owner is another engine, the adopter asks whether that
+    /// owner process is still alive; a live owner means the record is
+    /// SUPERVISED ELSEWHERE and must be left alone.
+    ///
+    /// Returns `Some(true)` (a live process with the exact identity),
+    /// `Some(false)` (the pid is gone, or reused by a different process —
+    /// the PID-reuse guard applies here exactly as in `adopt`), or `None`
+    /// (INDERTERMINATE: the identity could not be established — e.g. an
+    /// unopenable process). `None` must be treated by callers as "cannot
+    /// PROVE the owner dead", the fail-open-to-adoption posture that keeps
+    /// NFR-1 (no unsupervised orphan after a crash) intact on degraded
+    /// hosts; on Windows an unopenable owner reads as `Some(false)`, which
+    /// is consequence-free there because an adopted Windows handle never
+    /// kills at drop. Sync (one probe syscall + one start-time read).
+    fn probe_alive(&self, fingerprint: &ProcessFingerprint) -> Option<bool>;
+
     /// Whether this handle holds a live stdin pipe it can write to right now
     /// (story 4.1, AC-D). `true` only for a FRESHLY SPAWNED handle whose
     /// `ChildStdin` was captured at spawn time AND whose declared
