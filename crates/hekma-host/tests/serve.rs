@@ -416,6 +416,147 @@ fn a_lock_path_that_cannot_be_a_file_surfaces_the_io_failure() {
     );
 }
 
+#[test]
+fn a_listen_without_a_bearer_secret_is_refused_and_noted_through_the_sink() {
+    // The half-configured Control API (a listen address with no bearer
+    // secret) is a rejected INVOCATION — the API never serves
+    // unauthenticated and never half-configured. The CLI suite pins the
+    // BINARY surface (the exit classes); this pins the LIBRARY surface: the
+    // typed `InvalidOptions` naming both flags, the same refusal noted
+    // through the caller sink (AI-18), and a rejected invocation touching
+    // nothing (no lock file — validation runs before any state work).
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        control_listen: Some(addr),
+        bearer_secret: None,
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("a half-configured API");
+    match err {
+        ServeError::InvalidOptions { message } => assert!(
+            message.contains("--listen 127.0.0.1:0 requires --bearer-secret")
+                && message.contains("never serves unauthenticated"),
+            "the refusal names the flag pair and the reason: {message}"
+        ),
+        other => panic!("expected InvalidOptions, got {other:?}"),
+    }
+    assert!(
+        sink_handle
+            .text()
+            .contains("--listen 127.0.0.1:0 requires --bearer-secret"),
+        "with a caller sink the refusal is ALSO noted through it:\n{}",
+        sink_handle.text()
+    );
+    assert!(
+        !state
+            .path()
+            .join(hekma_engine::paths::HOST_LOCK_FILE)
+            .exists(),
+        "a rejected invocation touches nothing"
+    );
+}
+
+#[test]
+fn a_bearer_secret_without_a_listen_is_refused_and_noted_through_the_sink() {
+    // The mirror half-configuration (a secret name with the API off) is the
+    // same rejected-invocation class: there is no API to guard, and the
+    // refusal says so naming both flags — through the error AND the caller
+    // sink (AI-18), touching nothing.
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, sink) = SharedSink::new();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        control_listen: None,
+        bearer_secret: Some("any-secret-name".to_string()),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("a half-configured API");
+    match err {
+        ServeError::InvalidOptions { message } => assert!(
+            message.contains("--bearer-secret requires --listen")
+                && message.contains("no API to guard"),
+            "the refusal names the flag pair and the reason: {message}"
+        ),
+        other => panic!("expected InvalidOptions, got {other:?}"),
+    }
+    assert!(
+        sink_handle
+            .text()
+            .contains("--bearer-secret requires --listen"),
+        "with a caller sink the refusal is ALSO noted through it:\n{}",
+        sink_handle.text()
+    );
+    assert!(
+        !state
+            .path()
+            .join(hekma_engine::paths::HOST_LOCK_FILE)
+            .exists(),
+        "a rejected invocation touches nothing"
+    );
+}
+
+#[test]
+fn a_relative_state_dir_env_is_refused_as_a_startup_failure() {
+    // `state_base: None` routes resolution through the engine's env order;
+    // a RELATIVE `HEKMA_STATE_DIR` is the engine's typed refusal (a
+    // relative base would bake CWD-relative paths into the stored Agent
+    // Home paths). The host surfaces it as its OWN typed Startup, before
+    // any lock or state-dir work. This is the only env reader in this test
+    // binary (every other test passes an explicit base); the value is
+    // saved and restored around the call, before any assert can fail.
+    let saved = std::env::var_os(hekma_engine::paths::STATE_DIR_ENV_ALIAS);
+    std::env::set_var(hekma_engine::paths::STATE_DIR_ENV_ALIAS, "relative-state");
+    let err = serve_with_signal(ServeOptions::default(), immediate_signal())
+        .expect_err("a relative env base must be refused");
+    match saved {
+        Some(value) => std::env::set_var(hekma_engine::paths::STATE_DIR_ENV_ALIAS, value),
+        None => std::env::remove_var(hekma_engine::paths::STATE_DIR_ENV_ALIAS),
+    }
+    match err {
+        ServeError::Startup { message } => assert!(
+            message.contains("must be an absolute path") && message.contains("relative-state"),
+            "the refusal names the value and the rule"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_state_db_that_cannot_open_surfaces_as_the_typed_startup() {
+    // A state root whose engine database can never open (here: `state.db`
+    // occupied by a directory — sqlite cannot open it) is the host's typed
+    // Startup, never an unwrap deep inside the open. Ordering proof: the
+    // refusal happens AFTER the host lock (the lock file exists) and
+    // BEFORE any supervision work — no engine was opened, so no drain had
+    // anything to do.
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir(state.path().join(hekma_engine::paths::STATE_DB_FILE)).unwrap();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal()).expect_err("cannot open the engine");
+    match err {
+        ServeError::Startup { message } => assert!(
+            message.contains("database"),
+            "the engine's open failure surfaces through the Startup"
+        ),
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    assert!(
+        state
+            .path()
+            .join(hekma_engine::paths::HOST_LOCK_FILE)
+            .exists(),
+        "the lock ran first — the engine-open failure is a LATER refusal"
+    );
+}
+
 /// A signal factory whose registration fails DURING the arming window (the
 /// wait task resolves `Err` before the engine opens — review finding 2's
 /// typed-Startup path).
