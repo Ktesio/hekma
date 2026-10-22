@@ -375,7 +375,7 @@ fn a_state_dir_whose_parent_is_a_regular_file_fails_to_start_honestly() {
     match err {
         ServeError::Startup { message } => assert!(
             message.contains("could not create the state directory"),
-            "the failure names the state directory: {message}"
+            "the failure names the state directory"
         ),
         other => panic!("expected Startup, got {other:?}"),
     }
@@ -399,7 +399,7 @@ fn a_lock_path_that_cannot_be_a_file_surfaces_the_io_failure() {
     match err {
         ServeError::Startup { message } => assert!(
             message.contains("could not acquire the host lock"),
-            "the failure names the lock acquisition: {message}"
+            "the failure names the lock acquisition"
         ),
         other => panic!("expected Startup, got {other:?}"),
     }
@@ -474,7 +474,7 @@ fn a_dead_signal_wait_task_after_the_open_is_surfaced_as_a_startup_error() {
     match err {
         ServeError::Startup { message } => assert!(
             message.contains("wait task failed"),
-            "the JoinError is surfaced honestly: {message}"
+            "the JoinError is surfaced honestly"
         ),
         other => panic!("expected Startup, got {other:?}"),
     }
