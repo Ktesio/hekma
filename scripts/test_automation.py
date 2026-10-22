@@ -325,6 +325,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn(
             "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
             "--verbose --exclude-files 'crates/hekma-conformance/src/bin/*' "
+            "--exclude-files 'crates/hekma-engine/examples/*' "
             '-p "$pkg" --out Lcov --output-dir "cov/$pkg"',
             ci_flat,
         )
