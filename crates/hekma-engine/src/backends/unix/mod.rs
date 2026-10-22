@@ -619,6 +619,30 @@ impl ProcessBackend for UnixBackend {
         }))
     }
 
+    fn self_fingerprint(&self) -> Option<ProcessFingerprint> {
+        // The owner stamp for the live-owner adoption boundary: THIS
+        // process's own pid + start-time token, the same identity pair
+        // `adopt` verifies. /proc/self (Linux) / libproc (macOS) self-reads
+        // cannot realistically fail; the None arm is the documented degraded
+        // fallback (a record with no owner keeps the pre-owner adoption
+        // posture) and covers the no-start-time-source Unix fallback OSes.
+        let pid = std::process::id();
+        process_start_time(pid).map(|start_time| ProcessFingerprint::new(pid, start_time))
+    }
+
+    fn probe_alive(&self, fingerprint: &ProcessFingerprint) -> Option<bool> {
+        // The owner-liveness probe: `adopt`'s exact identity check (pid alive
+        // AND the current start-time still equals the recorded one — the
+        // PID-reuse guard), without re-holding a handle. Unreadable
+        // start-time on a live pid = indeterminate (None), which callers
+        // fail OPEN to adoption with (never strand a crashed engine's orphan
+        // on a flaky read).
+        if !pid_is_alive(fingerprint.pid) {
+            return Some(false);
+        }
+        process_start_time(fingerprint.pid).map(|live_start| live_start == fingerprint.start_time)
+    }
+
     fn has_stdin(&self, handle: &Self::Handle) -> bool {
         handle.stdin.is_live()
     }
