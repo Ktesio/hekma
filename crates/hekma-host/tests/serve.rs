@@ -520,7 +520,7 @@ fn a_relative_state_dir_env_is_refused_as_a_startup_failure() {
     match err {
         ServeError::Startup { message } => assert!(
             message.contains("must be an absolute path") && message.contains("relative-state"),
-            "the refusal names the value and the rule: {message}"
+            "the refusal names the value and the rule"
         ),
         other => panic!("expected Startup, got {other:?}"),
     }
@@ -544,7 +544,7 @@ fn a_state_db_that_cannot_open_surfaces_as_the_typed_startup() {
     match err {
         ServeError::Startup { message } => assert!(
             message.contains("database"),
-            "the engine's open failure surfaces through the Startup: {message}"
+            "the engine's open failure surfaces through the Startup"
         ),
         other => panic!("expected Startup, got {other:?}"),
     }
