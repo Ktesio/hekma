@@ -126,7 +126,11 @@
 //!   agent reports NOTHING itself — the engine OBSERVES its model traffic. A tiny
 //!   pure-`std` HTTP/1.1 client (a raw `TcpStream` — NO dependency, NO OS-cfg) makes
 //!   the calls, count-bounded so a test waits for `<N>` committed observed rows (the
-//!   DB is the source of truth), never a wall-clock sleep. Pure `std`, NO OS-cfg.
+//!   DB is the source of truth), never a wall-clock sleep. Transient transport
+//!   failures are retried a bounded number of times (with stderr evidence) before a
+//!   call is given up — a momentary loopback refusal must not shrink the call count
+//!   (the windows-latest flake where one skipped call left the section waiting for a
+//!   row that never commits). Pure `std`, NO OS-cfg.
 //! * `--observed-stream-calls <N>` (story 12-2)  the STREAMING sibling of
 //!   `--observed-calls`: each POST body sets `"stream": true` (no
 //!   `stream_options` of its own — the engine's listener injects
@@ -600,18 +604,26 @@ fn main() {
         match std::env::var("OPENAI_BASE_URL") {
             Ok(base_url) if !base_url.trim().is_empty() => {
                 for _ in 0..opts.observed_calls {
-                    // Best-effort per call: a transport hiccup is skipped (the test
-                    // asserts on committed rows, not on this loop). A small pause lets
-                    // the ~250ms reaper drain the observed queue between calls.
-                    let _ = post_completion(base_url.trim(), opts.observed_auth.as_deref());
+                    // Best-effort per call, RETRYING transient transport failures a
+                    // bounded number of times (see [`observed_call_with_retry`]); a
+                    // small pause lets the ~250ms reaper drain the observed queue
+                    // between calls.
+                    observed_call_with_retry(
+                        post_completion,
+                        base_url.trim(),
+                        opts.observed_auth.as_deref(),
+                    );
                     sleep(Duration::from_millis(20));
                 }
                 // Story 12-2: the streaming variant — same endpoint, a `"stream": true`
                 // body, and the SSE response discarded unread (the usage the engine
-                // meters arrives in the terminal SSE frame).
+                // meters arrives in the terminal SSE frame). Same bounded retry.
                 for _ in 0..opts.observed_stream_calls {
-                    let _ =
-                        post_streaming_completion(base_url.trim(), opts.observed_auth.as_deref());
+                    observed_call_with_retry(
+                        post_streaming_completion,
+                        base_url.trim(),
+                        opts.observed_auth.as_deref(),
+                    );
                     sleep(Duration::from_millis(20));
                 }
             }
@@ -729,6 +741,56 @@ fn write_marker(path: &Option<PathBuf>, phase: &str) {
             path,
             format!("fake_agent {phase} pid={}\n", std::process::id()),
         );
+    }
+}
+
+/// How many times ONE observed call may be attempted before it is given up
+/// (see [`observed_call_with_retry`]).
+const OBSERVED_RETRY_ATTEMPTS: u32 = 5;
+/// The pause between observed-call retry attempts (same order as the reaper's
+/// drain cadence, so a transiently-refused listener has room to recover).
+const OBSERVED_RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+/// Place ONE observed call through `call`, retrying transient transport
+/// failures a bounded number of times ([`OBSERVED_RETRY_ATTEMPTS`] tries,
+/// [`OBSERVED_RETRY_PAUSE`] apart) before giving up, with every failed
+/// attempt announced on stderr so the engine's captured agent log carries the
+/// evidence. The observed-call loops stay count-bounded best-effort — the
+/// tests assert on committed ledger rows, never on this loop — but a MOMENTARY
+/// loopback refusal must not permanently shrink the call count: on a loaded
+/// windows-latest runner the loopback listener's SYN backlog can refuse a
+/// connect outright, a fire-once skip then leaves that row forever
+/// uncommitted, and a healthy run fails as `timed out waiting for N
+/// engine-observed rows (have N-1)` after burning the full section budget
+/// (the flake observed twice on 2026-10-20: try 1 failed with `have 2` of 3,
+/// the fresh-process nextest retry passed in ~39s). Bounded on purpose: a
+/// genuinely unreachable listener still gives up and lets the row-count poll
+/// report the shortfall.
+#[cfg(not(tarpaulin_include))]
+fn observed_call_with_retry(
+    call: impl Fn(&str, Option<&str>) -> std::io::Result<()>,
+    base_url: &str,
+    auth: Option<&str>,
+) {
+    for attempt in 1..=OBSERVED_RETRY_ATTEMPTS {
+        match call(base_url, auth) {
+            Ok(()) => return,
+            Err(e) if attempt < OBSERVED_RETRY_ATTEMPTS => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fake_agent: observed call attempt {attempt}/{OBSERVED_RETRY_ATTEMPTS} \
+                     failed ({e}); retrying"
+                );
+                sleep(OBSERVED_RETRY_PAUSE);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "fake_agent: observed call failed after {OBSERVED_RETRY_ATTEMPTS} attempts \
+                     ({e}); giving up on this call"
+                );
+            }
+        }
     }
 }
 
@@ -875,4 +937,74 @@ fn write_dump(path: &Option<PathBuf>, drop_env: &[String]) {
         body.push('\n');
     }
     let _ = std::fs::write(path, body);
+}
+
+#[cfg(test)]
+mod observed_retry_tests {
+    //! The retry ladder is pure control flow — pinned here with injected call
+    //! outcomes (no socket, no OS). The wiring through the REAL binary (a
+    //! transiently-refused loopback listener) is pinned end-to-end in
+    //! `tests/probe_observed_retry.rs`.
+    use super::observed_call_with_retry;
+    use std::cell::Cell;
+    use std::io::{Error, ErrorKind};
+
+    fn refused() -> Error {
+        Error::new(ErrorKind::ConnectionRefused, "refused (injected)")
+    }
+
+    #[test]
+    fn a_transient_failure_is_retried_until_success() {
+        let calls = Cell::new(0u32);
+        observed_call_with_retry(
+            |_, _| {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n < 2 {
+                    Err(refused())
+                } else {
+                    Ok(())
+                }
+            },
+            "http://127.0.0.1:1",
+            None,
+        );
+        assert_eq!(
+            calls.get(),
+            3,
+            "two failures then success = exactly 3 calls"
+        );
+    }
+
+    #[test]
+    fn a_first_try_success_places_exactly_one_call() {
+        let calls = Cell::new(0u32);
+        observed_call_with_retry(
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+            "http://127.0.0.1:1",
+            None,
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn a_persistent_failure_gives_up_after_the_bounded_attempts() {
+        let calls = Cell::new(0u32);
+        observed_call_with_retry(
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Err(refused())
+            },
+            "http://127.0.0.1:1",
+            None,
+        );
+        assert_eq!(
+            calls.get(),
+            super::OBSERVED_RETRY_ATTEMPTS,
+            "bounded: never more than the configured attempt count"
+        );
+    }
 }
