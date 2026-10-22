@@ -27,6 +27,16 @@
 //! * `version-counter` — the `initialize` response counters with
 //!   `protocolVersion` 2 (outside the tolerated set {1}), then exits: the
 //!   engine must refuse the start with a surfaced, traffic-free refusal.
+//! * `error-initialize` / `bare-initialize` — the handshake-fault family,
+//!   initialize half: the `initialize` answer is respectively a JSON-RPC
+//!   ERROR object (code `-32000`, the logged-out-CLI shape) or a VALID
+//!   result with NO `protocolVersion`; the agent exits right after. The
+//!   engine must refuse the start naming the method and the reason
+//!   (traffic-free), and land the instance `failed`.
+//! * `error-session-new` / `bare-session-new` — the handshake-fault
+//!   family, session half: `initialize` succeeds, then the `session/new`
+//!   answer is respectively a JSON-RPC ERROR object or a valid result with
+//!   NO `sessionId`; the agent exits right after. Same refusal surface.
 //! * `malformed-line` — after the initialize response, emit ONE non-JSON
 //!   line on stdout, then behave exactly like `chunky`: the engine must
 //!   surface + skip the malformed line and the stream must continue (the
@@ -576,6 +586,31 @@ fn main() {
                     "protocolVersion": version,
                     "agentCapabilities": agent_capabilities,
                 });
+                if mode == "error-initialize" || mode == "bare-initialize" {
+                    // The handshake-fault family, initialize half: an agent
+                    // that refuses the handshake itself. `error-initialize`
+                    // answers with a JSON-RPC ERROR object — the logged-out-
+                    // CLI shape observed with a real Gemini (`-32000`; the
+                    // engine surfaces the CODE traffic-free) — while
+                    // `bare-initialize` answers a VALID result that simply
+                    // carries no `protocolVersion`. Both close the transport
+                    // right after (the version-counter precedent): the
+                    // engine will refuse the start, so lingering would only
+                    // make the teardown wait on a parked child.
+                    let mut stdout = std::io::stdout();
+                    let line = if mode == "error-initialize" {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": "not logged in" }
+                        })
+                    } else {
+                        response(id, serde_json::json!({ "agentCapabilities": {} }))
+                    };
+                    let _ = writeln!(stdout, "{line}");
+                    let _ = stdout.flush();
+                    break;
+                }
                 if mode == "opencode-dialect" {
                     // Story 15-1: the real opencode v2 initialize shape —
                     // rich capabilities + an authMethods array riding
@@ -610,6 +645,27 @@ fn main() {
                 }
             }
             ("session/new", _) => {
+                if mode == "error-session-new" || mode == "bare-session-new" {
+                    // The handshake-fault family, session half: initialize
+                    // succeeded, but the SESSION step refuses. `error-
+                    // session-new` answers a JSON-RPC error (code -32000);
+                    // `bare-session-new` answers a valid result with NO
+                    // `sessionId`. Same close-after shape as the initialize
+                    // half — the start is refused, so exit promptly.
+                    let mut stdout = std::io::stdout();
+                    let line = if mode == "error-session-new" {
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": "no session" }
+                        })
+                    } else {
+                        response(id, serde_json::json!({ "mcpServers": [] }))
+                    };
+                    let _ = writeln!(stdout, "{line}");
+                    let _ = stdout.flush();
+                    break;
+                }
                 let mut new_result =
                     serde_json::json!({ "sessionId": SESSION_ID, "mcpServers": [] });
                 if mode == "opencode-dialect" {
