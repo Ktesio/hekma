@@ -282,6 +282,89 @@ fn version_counter_refuses_the_start() {
     );
 }
 
+/// The shared shape of the handshake-fault family (below): `start` refuses
+/// with `LaunchFailed` naming the handshake boundary plus every expected
+/// vocabulary fragment (traffic-free), and the instance lands `failed`.
+fn handshake_fault_refusal(name: &str, mode: &str, expected: &[&str]) {
+    let base = TempDir::new().unwrap();
+    let engine = open(&base, None);
+    register_acp(&engine, base.path(), name);
+    configure_and_start(&engine, name, mode, &[]);
+
+    let err = engine.blocking().start(name).unwrap_err();
+    match &err {
+        EngineError::LaunchFailed { detail, .. } => {
+            assert!(
+                detail.contains("ACP handshake failed"),
+                "the handshake boundary named: {detail}"
+            );
+            for fragment in expected {
+                assert!(
+                    detail.contains(fragment),
+                    "expected '{fragment}' in: {detail}"
+                );
+            }
+        }
+        other => panic!("expected LaunchFailed, got {other:?}"),
+    }
+
+    let instance = engine
+        .blocking()
+        .list()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(instance.state, LifecycleState::Failed);
+}
+
+/// Handshake fault, initialize half: the agent answers `initialize` with a
+/// JSON-RPC ERROR object (the logged-out-CLI shape observed with a real
+/// Gemini — code -32000; the agent-authored message is never surfaced,
+/// only the code).
+#[test]
+fn error_initialize_refuses_the_start_naming_the_code() {
+    handshake_fault_refusal(
+        "acp-err-init",
+        "error-initialize",
+        &["'initialize' response was unusable", "code -32000"],
+    );
+}
+
+/// Handshake fault, initialize half: the agent answers a VALID result that
+/// carries no `protocolVersion` — refused naming the missing field.
+#[test]
+fn bare_initialize_refuses_the_start_naming_the_missing_version() {
+    handshake_fault_refusal(
+        "acp-bare-init",
+        "bare-initialize",
+        &["no usable protocolVersion"],
+    );
+}
+
+/// Handshake fault, session half: `initialize` succeeds, then `session/new`
+/// is answered with a JSON-RPC ERROR object — refused naming the method and
+/// the code.
+#[test]
+fn error_session_new_refuses_the_start_naming_the_code() {
+    handshake_fault_refusal(
+        "acp-err-new",
+        "error-session-new",
+        &["'session/new' response was unusable", "code -32000"],
+    );
+}
+
+/// Handshake fault, session half: `session/new` is answered a valid result
+/// with no `sessionId` — refused naming the missing field.
+#[test]
+fn bare_session_new_refuses_the_start_naming_the_missing_session_id() {
+    handshake_fault_refusal(
+        "acp-bare-new",
+        "bare-session-new",
+        &["carried no sessionId"],
+    );
+}
+
 /// AC1's turn half: `send` writes ONE `session/prompt` and returns
 /// immediately; the turn's three message chunks + the final stopReason land
 /// asynchronously in the per-instance output log (raw record + the
