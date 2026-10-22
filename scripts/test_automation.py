@@ -640,6 +640,7 @@ class ReleaseDocsTests(unittest.TestCase):
             r"|^crates/hekma-engine/tests/memory\.rs:"
             r"|^crates/hekma-conformance/src/tck\.rs:"
             r"|^crates/hekma-conformance/src/test_notes\.rs:"
+            r"|^crates/hekma-conformance/src/test_support\.rs:"
             r"|^crates/hekma-host/src/signals\.rs:"
             r"|^crates/hekma-host/tests/control_api\.rs:"
             r"|^crates/hekma-host/tests/binary_flags\.rs:"

@@ -999,4 +999,86 @@ mod tests {
             bin.display()
         );
     }
+
+    #[test]
+    fn write_panics_loudly_when_the_manifest_dir_cannot_be_created() {
+        // The documented failure contract of the fixture writer's FIRST step:
+        // an uncreatable manifest dir is a LOUD panic (never a silent
+        // fallthrough that would leave callers writing adapter.toml into a
+        // half-built directory). A regular file at the parent path makes
+        // create_dir_all fail identically on every OS — no OS-only API, so
+        // this test needs no cfg (the boundary gate's data-driven ideal).
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"regular file, not a directory").expect("write the blocker file");
+        let fixture = ManifestFixture::new("k", &["--linger-ms", "1"]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.write(&dir.path().join("blocker").join("manifest-home"))
+        }));
+        let panic = result.expect_err("creating a dir under a regular file must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("could not create the fixture manifest dir"),
+            "the panic names the failing step"
+        );
+        assert!(
+            message.contains("blocker"),
+            "the panic names the dir it could not create"
+        );
+    }
+
+    #[test]
+    fn write_panics_loudly_on_a_non_utf8_exec_path() {
+        // The struct docs' loud-failure rule: a non-UTF-8 exec path must
+        // PANIC, not be munged by to_string_lossy into a launch that never
+        // resolves (the TOML wire is UTF-8 regardless of the host OS). The
+        // assertion is the OS-uniform contract; only the INPUT constructor
+        // is per-OS — there is no data-driven OsId form for an OsStr
+        // constructor (raw bytes on Unix, a lone surrogate on Windows), the
+        // same sanctioned OS-API-boundary class as test_notes.rs' write
+        // arms, which is why this file carries a boundary-gate allowlist
+        // entry.
+        let dir = TempDir::new().unwrap();
+        let fixture = ManifestFixture::new("k", &["--linger-ms", "1"]).exec(non_utf8_exec_path());
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.write(dir.path())));
+        let panic = result.expect_err("a non-UTF-8 exec path must panic, not munge");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("the panic carries a formatted message");
+        assert!(
+            message.contains("is not valid UTF-8"),
+            "the panic names the UTF-8 contract"
+        );
+        assert!(
+            message.contains("TOML manifest"),
+            "the panic names why: the TOML wire is UTF-8"
+        );
+        // The loud-failure rule's flip side: NOTHING was written before the
+        // panic fired — the refusal happens before the first byte of
+        // adapter.toml lands, so a caller cannot mistake a munged manifest
+        // for a written one.
+        assert!(
+            !dir.path().join("adapter.toml").exists(),
+            "no manifest is written for a refused exec path"
+        );
+    }
+
+    /// An exec path whose OsStr is not valid Unicode: on Unix, raw
+    /// non-UTF-8 bytes; on Windows, an unpaired surrogate. Both make
+    /// `to_str()` return None — the only input shape that reaches the
+    /// writer's non-UTF-8 refusal.
+    #[cfg(unix)]
+    fn non_utf8_exec_path() -> PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b"/agents/fake-agent-\xff"))
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_exec_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_wide(&[0xD800, 0x0041]))
+    }
 }
