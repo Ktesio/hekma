@@ -836,16 +836,55 @@ impl ProcessBackend for WindowsBackend {
 
     fn probe_alive(&self, fingerprint: &ProcessFingerprint) -> Option<bool> {
         // The owner-liveness probe without re-holding a handle: open by pid
-        // for query, read the creation time, compare (the PID-reuse guard —
-        // a reused pid's creation time differs). A pid that cannot be
-        // OPENED reads as Some(false): on Windows that is either a gone pid
-        // or an access-denied one, and the consequence-free direction
-        // applies (an adopted Windows handle never kills at drop, so a
-        // wrongly-deemed-dead owner can never cost the agent its life here).
-        match process_start_time(fingerprint.pid) {
-            Some(live_start) => Some(live_start == fingerprint.start_time),
-            None => Some(false),
+        // (query + synchronize), verify IDENTITY (the creation time still
+        // equals the recorded one — the PID-reuse guard; a reused pid's
+        // creation time differs), then verify LIVENESS (the handle is not
+        // signaled). IDENTITY ALONE IS NOT LIVENESS HERE: a TERMINATED
+        // process whose handles are still open somewhere (a parent that has
+        // not closed them, a job object, the test runner) remains openable
+        // and keeps reporting its original creation time — reading that as
+        // a live owner would strand the record (exactly the windows-latest
+        // failure shape: the engine-death helper's exited process stays
+        // queryable, so the row never reconciled). The signaled/unsignaled
+        // distinction is the same primitive `reap_if_exited`'s branches
+        // use. A pid that cannot be OPENED reads as Some(false): on Windows
+        // that is a gone pid or an access-denied one, and the
+        // consequence-free direction applies (an adopted Windows handle
+        // never kills at drop, so a wrongly-deemed-dead owner can never cost
+        // the agent its life here).
+        let h = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                fingerprint.pid,
+            )
+        };
+        if h.is_null() {
+            return Some(false);
         }
+        let verdict = (|| -> Option<bool> {
+            let mut creation = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let mut exit = creation;
+            let mut kernel = creation;
+            let mut user = creation;
+            let ok =
+                unsafe { GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) };
+            if ok == 0 {
+                return None;
+            }
+            let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+            if ticks == 0 || ticks != fingerprint.start_time {
+                // Gone, or reused by a DIFFERENT process — not the owner.
+                return Some(false);
+            }
+            // Same identity: alive iff the handle is not signaled.
+            Some(unsafe { WaitForSingleObject(h, 0) } != WAIT_OBJECT_0)
+        })();
+        unsafe { CloseHandle(h) };
+        verdict
     }
 
     fn has_stdin(&self, handle: &Self::Handle) -> bool {
