@@ -1452,8 +1452,14 @@ jobs:
           # agents — coverage must include it (the ≥95% gate is aggregate).
           set -- hekma-adapter-api hekma-conformance hekma-adapters-hermes hekma-host hekma hekma-engine
           # The conformance test-support BINS (fake_agent, fake_acp_agent,
-          # hermes_shim) are excluded from instrumentation: their lines are
-          # not part of any crate's gate. This exclusion is the REPORT-side
+          # hermes_shim) and the engine's EXAMPLE targets (perf-budgets, the
+          # committed-baseline ratchet harness the perf-budgets job builds
+          # --release and RUNS under its own gate; embedding-quickstart, the
+          # docs artifact the build job smoke-runs) are excluded from
+          # instrumentation: their lines are exercised by the lanes that own
+          # them, never by a unit test, so counting them in the unit-coverage
+          # denominator is cross-lane noise (the same documented posture as
+          # the helpers, docs/testing.md). This exclusion is the REPORT-side
           # defense; the PANIC-side defenses are the explicit plain build of
           # all three helpers above (a killed instrumented child leaves a
           # PARTIAL profraw that crashes llvm_profparser at the merge) AND
@@ -1500,6 +1506,7 @@ jobs:
                 --bin hermes_shim --bin fake_acp_agent
               if cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
                   --exclude-files 'crates/hekma-conformance/src/bin/*' \
+                  --exclude-files 'crates/hekma-engine/examples/*' \
                   -p "$pkg" --out Lcov --output-dir "cov/$pkg"; then
                 break
               elif [ "$attempt" -lt 4 ]; then
