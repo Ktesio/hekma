@@ -958,6 +958,14 @@ impl Supervisor {
     /// LATCH ([`Supervised::breached_scopes`], keyed by `(dimension, scope)`)
     /// short-circuits BOTH the [`Self::record_breach`] and the action for an
     /// already-fired pair; the latch resets when a new Run starts.
+    ///
+    /// **STORY 19-1 — the decision half is now [`governance::decide`]:** the reads
+    /// above (config, totals, latch snapshot) build a pure
+    /// [`governance::GovernanceInput`]; [`governance::decide`] evaluates BOTH
+    /// dimensions (token first) and filters each verdict through the latch; the
+    /// loop below applies each returned decision through the SAME
+    /// record-first-then-act path. One decision implementation, shared with the
+    /// conformance-vectors artifact — the enforcement power stays here.
     pub(super) fn enforce_budget(
         &mut self,
         registry: &Registry,
@@ -985,106 +993,137 @@ impl Supervisor {
             return;
         }
 
-        // (2) TOKEN dimension (story 3-2): the just-committed token totals + the pure
-        // evaluator. Reuses the record-first-then-act helper with the tokens dimension.
-        if token_armed {
-            let run_total = registry
+        // (2) Build the PURE decision input: one arm per ARMED dimension (the
+        // totals reads are the same story-3-2/3-3 reads, degrade-to-zero
+        // included); `None` = skipped entirely. The latch snapshot comes off the
+        // supervisor's per-Run set (an unsupervised instance snapshots empty —
+        // decide() then fires, and apply_breach declines below, as before).
+        let token = token_armed.then(|| governance::TokenArm {
+            run_total: registry
                 .run_usage_totals(name, run_id)
                 .map(|t| t.total_tokens())
-                .unwrap_or(0);
-            let cumulative_total = registry
+                .unwrap_or(0),
+            cumulative_total: registry
                 .usage_totals(name)
                 .map(|t| t.total_tokens())
-                .unwrap_or(0);
-            let decision =
-                BudgetEvaluator::evaluate(run_total, cumulative_total, &budget, token_action);
-            if let BreachDecision::Breached {
-                scope,
-                action,
-                limit,
-                observed,
-            } = decision
-            {
-                let cause = TransitionCause::budget_exceeded(scope, limit, observed);
-                self.apply_breach(
-                    registry,
-                    name,
-                    run_id,
-                    BreachDimension::Tokens,
-                    scope,
-                    action,
-                    cause,
-                    metering_source,
-                    // The token breach event carries token counts (no dollar fields).
-                    |registry, sup, run_id, scope, action, src| {
-                        sup.record_token_breach(
-                            registry, name, run_id, scope, limit, observed, action, src,
-                        );
-                    },
-                );
-            }
-        }
-
-        // (3) DOLLAR dimension (story 3-3): derive the per-run + cumulative COST from
-        // the ledger (each row priced at its own persisted Rate — no retro-repricing),
-        // then the pure CostEvaluator. Only when a Rate is present AND the cap is set
-        // (AC-B inert otherwise). v1 the estimate label is always `estimated`.
-        if dollar_armed {
-            let run_cost = registry
+                .unwrap_or(0),
+            budget,
+            action: token_action,
+        });
+        let dollar = dollar_armed.then(|| governance::DollarArm {
+            run_cost: registry
                 .run_cost_totals(name, run_id)
-                .unwrap_or(Micros::ZERO);
-            let cumulative_cost = registry.cost_totals(name).unwrap_or(Micros::ZERO);
-            let decision =
-                CostEvaluator::evaluate(run_cost, cumulative_cost, &cost_cap, cost_action);
-            if let BreachDecision::Breached {
-                scope,
-                action,
-                limit,
-                observed,
-            } = decision
-            {
-                let label = EstimateLabel::Estimated;
-                let cause = TransitionCause::cost_cap_exceeded(
-                    scope,
-                    Micros(limit as i64),
-                    Micros(observed as i64),
-                    label,
-                );
-                self.apply_breach(
-                    registry,
-                    name,
-                    run_id,
-                    BreachDimension::Dollars,
-                    scope,
-                    action,
-                    cause,
-                    metering_source,
-                    // The dollar breach event carries integer micros + the label.
-                    |registry, sup, run_id, scope, action, src| {
-                        sup.record_cost_breach(
-                            registry,
-                            name,
-                            run_id,
-                            scope,
-                            Micros(limit as i64),
-                            Micros(observed as i64),
-                            label,
-                            action,
-                            src,
-                        );
-                    },
-                );
+                .unwrap_or(Micros::ZERO),
+            cumulative_cost: registry.cost_totals(name).unwrap_or(Micros::ZERO),
+            cap: cost_cap,
+            action: cost_action,
+        });
+        let latched = self
+            .running
+            .get(name)
+            .map(|supervised| {
+                supervised
+                    .breached_scopes
+                    .iter()
+                    .map(|(dimension, scope)| governance::LatchKey::new(*dimension, *scope))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // (3) DECIDE — the pure governance core (story 19-1): token dimension
+        // evaluated FIRST, dollar second, each filtered through the latch. No
+        // I/O, no state — the same input always yields the same decisions.
+        let outcome = governance::decide(&governance::GovernanceInput {
+            token,
+            dollar,
+            latched,
+        });
+
+        // (4) APPLY — the record-first-then-act half, per decision in FIRE ORDER
+        // (token before dollar), through the SAME shared path as before.
+        for decision in &outcome.decisions {
+            match decision.dimension {
+                BreachDimension::Tokens => {
+                    let cause = TransitionCause::budget_exceeded(
+                        decision.scope,
+                        decision.limit,
+                        decision.observed,
+                    );
+                    self.apply_breach(
+                        registry,
+                        name,
+                        run_id,
+                        decision.dimension,
+                        decision.scope,
+                        decision.action,
+                        cause,
+                        metering_source,
+                        // The token breach event carries token counts (no dollar fields).
+                        |registry, sup, run_id, scope, action, src| {
+                            sup.record_token_breach(
+                                registry,
+                                name,
+                                run_id,
+                                scope,
+                                decision.limit,
+                                decision.observed,
+                                action,
+                                src,
+                            );
+                        },
+                    );
+                }
+                BreachDimension::Dollars => {
+                    // v1 the estimate label is always `estimated`.
+                    let cause = TransitionCause::cost_cap_exceeded(
+                        decision.scope,
+                        Micros(decision.limit as i64),
+                        Micros(decision.observed as i64),
+                        EstimateLabel::Estimated,
+                    );
+                    self.apply_breach(
+                        registry,
+                        name,
+                        run_id,
+                        decision.dimension,
+                        decision.scope,
+                        decision.action,
+                        cause,
+                        metering_source,
+                        // The dollar breach event carries integer micros + the label.
+                        |registry, sup, run_id, scope, action, src| {
+                            sup.record_cost_breach(
+                                registry,
+                                name,
+                                run_id,
+                                scope,
+                                Micros(decision.limit as i64),
+                                Micros(decision.observed as i64),
+                                EstimateLabel::Estimated,
+                                action,
+                                src,
+                            );
+                        },
+                    );
+                }
             }
         }
     }
 
     /// Apply ONE breach decision for a given `dimension` (story 3-3 shared path):
-    /// consult the per-Run `(dimension, scope)` latch, and if this pair has NOT yet
-    /// fired this Run, RECORD the breach (via `record`, the dimension-specific event
-    /// writer) FIRST/INDEPENDENTLY and THEN execute the action via Epic-1's lifecycle
-    /// (AD-15 — a REASON, not a new edge). A pair already latched short-circuits both.
-    /// A missing `Supervised` (not currently supervised — a race with stop) declines
-    /// to enforce. All best-effort: a lifecycle error is a diagnostic, never a crash.
+    /// MARK the `(dimension, scope)` pair into the per-Run latch, RECORD the breach
+    /// (via `record`, the dimension-specific event writer) FIRST/INDEPENDENTLY and
+    /// THEN execute the action via Epic-1's lifecycle (AD-15 — a REASON, not a new
+    /// edge). A missing `Supervised` (not currently supervised — a race with stop)
+    /// declines to enforce. All best-effort: a lifecycle error is a diagnostic, never
+    /// a crash.
+    ///
+    /// Since story 19-1 the latch CONSULT half (the short-circuit) lives in
+    /// [`governance::decide`], which filters on the snapshot taken before the
+    /// decisions fire; what remains here is the latch MARK half — the insert that
+    /// persists the once-per-Run state for every LATER usage event. A decision
+    /// reaching this point is already latch-cleared, so the insert marks a fresh
+    /// pair; it stays idempotent bookkeeping either way.
     #[allow(clippy::too_many_arguments)]
     fn apply_breach(
         &mut self,
@@ -1098,13 +1137,11 @@ impl Supervisor {
         metering_source: &str,
         record: impl FnOnce(&Registry, &Self, &RunId, BreachScope, BreachAction, &str),
     ) {
-        // IDEMPOTENCE LATCH (story 3-2/3-3): fire at most once per (dimension, scope)
-        // per Run. Insert the pair; if it was already present, short-circuit.
+        // LATCH MARK (story 3-2/3-3; consult half moved to `governance::decide` in
+        // story 19-1): insert the pair so later events stay suppressed this Run.
         match self.running.get_mut(name) {
             Some(supervised) => {
-                if !supervised.breached_scopes.insert((dimension, scope)) {
-                    return;
-                }
+                supervised.breached_scopes.insert((dimension, scope));
             }
             None => return,
         }

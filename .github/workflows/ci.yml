@@ -1216,6 +1216,60 @@ jobs:
         # contributor's local build.
         run: cargo +1.96.1 check --workspace --all-targets
 
+  governance-vectors:
+    name: governance-vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the vectors artifact checksum
+        # The published `.sha256` names the repo-relative path, so this
+        # verifies in place: the committed artifact IS the checksummed bytes.
+        run: sha256sum -c crates/hekma-engine/governance/vectors-v1.json.sha256
+      - name: Parse the vectors artifact (stand-in Host verification)
+        # What a non-Rust Host does with the artifact: parse JSON, pin the
+        # header, assert unique ids, both case kinds, and full rule coverage.
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("crates/hekma-engine/governance/vectors-v1.json")
+          document = json.loads(path.read_text(encoding="utf-8"))
+          assert document["artifact"] == "hekma-governance-vectors", document["artifact"]
+          assert document["schema_version"] == 1, document["schema_version"]
+          assert document["vectors_version"], "vectors_version must be set"
+          kinds = {}
+          tags = set()
+          ids = set()
+          for case in document["cases"]:
+              kind = case["kind"]
+              kinds[kind] = kinds.get(kind, 0) + 1
+              assert case["id"] not in ids, f"duplicate case id {case['id']}"
+              ids.add(case["id"])
+              tags.update(case["covers"])
+          expected = {
+              "threshold-ge",
+              "latch-per-scope",
+              "latch-re-arm",
+              "token-before-dollar",
+              "integer-micros",
+              "round-half-up",
+              "saturation",
+              "no-retro-repricing",
+          }
+          missing = expected - tags
+          assert not missing, f"uncovered rules: {sorted(missing)}"
+          assert kinds.get("decision"), f"no decision cases: {kinds}"
+          assert kinds.get("derivation"), f"no derivation cases: {kinds}"
+          print(
+              "governance vectors ok:"
+              f" {len(document['cases'])} cases {kinds},"
+              f" {len(tags)} rules covered"
+          )
+          PY
+
   coverage:
     name: coverage
     # 2026-10-17 (#292): pinned to ubuntu-26.04 like the test matrix's linux
@@ -1230,7 +1284,7 @@ jobs:
     # freeze — so the pin moves the last 24.04 consumer off the drifting
     # ubuntu-latest label (migrating Oct 19–Nov 19 anyway).
     runs-on: ubuntu-26.04
-    needs: [fmt, clippy, test, build, docs, boundary, semver]
+    needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]
     # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
     # jobs' normal-profile target, so nothing is reusable. That one-time cold build

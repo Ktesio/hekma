@@ -122,6 +122,24 @@ pub use domain::{
     USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// Story 19-1: the governance conformance vectors (AD-7/FR-44) — the embedded
+// artifact bytes plus the version/checksum accessors a Host pins against, and
+// the pure `decide` core the artifact is generated from. Additive surface.
+pub use domain::{
+    canonical_json, checksum_file_content, decide, generate, governance_vectors_checksum,
+    run_derivation, Case, CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, GOVERNANCE_VECTORS_ARTIFACT_ID,
+    GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
+    GOVERNANCE_VECTORS_VERSION,
+};
+/// The governance conformance vectors artifact, embedded verbatim at build
+/// time (`governance/vectors-v1.json` — the canonical bytes the committed
+/// file, the `.sha256` sidecar, and the checksum accessor all agree on).
+/// Byte-for-byte what `kt agent governance-vectors --json` prints.
+pub fn governance_vectors_json() -> &'static str {
+    include_str!("../governance/vectors-v1.json")
+}
 // Story 17-4: the log-capture mode vocabulary (the `metering_listen_port`
 // thread — serve/config surface, named by `kt serve --log-capture` and the
 // host's `ServeOptions`).

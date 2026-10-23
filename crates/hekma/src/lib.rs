@@ -308,6 +308,15 @@ enum AgentCommands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Print the governance conformance vectors — the versioned,
+    /// SHA-256-checksummed decision artifact a Host pins to prove its
+    /// external guard matches the engine's budget/cost rules
+    GovernanceVectors {
+        /// Emit the raw artifact bytes verbatim (byte-identical to the
+        /// released `vectors-v1.json` — the pin target for a checksum match)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -451,6 +460,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MemoryCommands::Detach { name, json } => cli::agent::memory_detach(&name, json),
             },
+            AgentCommands::GovernanceVectors { json } => cli::agent::governance_vectors(json),
         },
         None => {
             Cli::command().print_help()?;
@@ -570,6 +580,9 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "memory"));
+        assert!(agent
+            .get_subcommands()
+            .any(|c| c.get_name() == "governance-vectors"));
     }
 
     #[test]
@@ -634,6 +647,19 @@ mod tests {
             "hekma", "agent", "memory", "attach", "demo", "--kind", "bogus"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn test_agent_governance_vectors_parse() {
+        // Story 19-1: `governance-vectors` and `governance-vectors --json`
+        // parse; the verb takes no positional arguments.
+        assert!(Cli::try_parse_from(["hekma", "agent", "governance-vectors"]).is_ok());
+        assert!(Cli::try_parse_from(["hekma", "agent", "governance-vectors", "--json"]).is_ok());
+        // No positional arguments exist.
+        assert!(
+            Cli::try_parse_from(["hekma", "agent", "governance-vectors", "extra"]).is_err(),
+            "governance-vectors takes no positional argument"
+        );
     }
 
     #[test]

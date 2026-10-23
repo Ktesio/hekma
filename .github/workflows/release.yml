@@ -217,6 +217,16 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Stage governance vectors artifact
+        # Story 19-1: the conformance vectors ship as a release asset so a
+        # Host pins the EXACT bytes a release carried. The dist-local sidecar
+        # uses the bare filename (the house pattern for every dist asset) —
+        # same digest as the repo's repo-relative sidecar.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp crates/hekma-engine/governance/vectors-v1.json dist/
+          (cd dist && sha256sum vectors-v1.json > vectors-v1.json.sha256)
       - name: Prepare release notes and checksums
         shell: bash
         run: |
@@ -256,6 +266,7 @@ jobs:
             dist/*.zip
             dist/*.sha256
             dist/*-checksums.txt
+            dist/vectors-v1.json
           )
           gh release upload "$tag" "${release_assets[@]}" --clobber
       - name: Publish GitHub Release
