@@ -83,7 +83,7 @@ use crate::ports::{
 /// pre-v9 record (adoption mints + writes back + one-time note), or a
 /// policy/settle pid-0 seed row (no current Run). Not part of any key; no
 /// column renamed/removed.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -279,6 +279,38 @@ ALTER TABLE agent_runtime ADD COLUMN acp_session_id TEXT;
 ///   column is renamed/removed, so v1..v8 → v9 preserves every row.
 const SCHEMA_V9: &str = "\
 ALTER TABLE agent_runtime ADD COLUMN run_id TEXT;
+";
+
+/// Schema v10 DDL (the live-owner adoption boundary): the spawn record's
+/// SUPERVISING-OWNER fingerprint.
+///
+/// ADDITIVE over the frozen `agent_runtime` columns, following the v6/v8/v9
+/// (nullable ALTERs on the same table) pattern exactly: TWO NULLABLE INTEGER
+/// columns.
+///
+/// * `owner_pid INTEGER` (NULLABLE) — the pid of the ENGINE PROCESS that
+///   spawned (or, after a cross-engine adoption, re-holds) the supervised
+///   process. NULL = a pre-v10 record (written before the boundary existed)
+///   or a spawn whose own start-time token could not be read — both keep the
+///   pre-boundary adoption posture (adopt armed), never a refusal.
+/// * `owner_start_time INTEGER` (NULLABLE) — the owner process's start-time
+///   token (the same opaque per-OS unit `start_time` uses), the PID-reuse
+///   guard for the owner: a recycled owner pid whose start-time differs is
+///   NOT the recorded owner (dead for adoption purposes).
+///
+/// Read by `Engine::open`'s orphan adoption for every NON-detached record: a
+/// LIVE owner that is not this process means the agent is supervised by a
+/// live engine elsewhere, so the record is SKIPPED (never re-held armed —
+/// the kill-on-drop teardown of a re-adopted handle was stopping other
+/// processes' attached agents, e.g. `hekma agent list` killing an agent a
+/// running `hekma serve` was supervising). A dead owner adopts exactly as
+/// before (the story 1-6 crash-recovery contract is unchanged), and the
+/// adopter RE-STAMPS itself as the owner. Detached records ignore the owner
+/// (their adoption is disarmed by the detach flag regardless). No column
+/// renamed/removed, so v1..v9 → v10 preserves every row.
+const SCHEMA_V10: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN owner_pid INTEGER;
+ALTER TABLE agent_runtime ADD COLUMN owner_start_time INTEGER;
 ";
 
 /// The AD-17 bounded-wait bound (story 15-6): how long a writer waits for
@@ -528,6 +560,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 9 {
         migrate_step(conn, 9, SCHEMA_V9)?;
+    }
+    if version < 10 {
+        migrate_step(conn, 10, SCHEMA_V10)?;
     }
 
     Ok(())
@@ -1048,8 +1083,8 @@ impl StateStore for SqliteStore {
             .execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
-                  detached, acp_session_id, run_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                  detached, acp_session_id, run_id, owner_pid, owner_start_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
@@ -1057,7 +1092,9 @@ impl StateStore for SqliteStore {
                  last_known_cause = excluded.last_known_cause, \
                  detached = excluded.detached, \
                  acp_session_id = excluded.acp_session_id, \
-                 run_id = excluded.run_id",
+                 run_id = excluded.run_id, \
+                 owner_pid = excluded.owner_pid, \
+                 owner_start_time = excluded.owner_start_time",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -1068,6 +1105,8 @@ impl StateStore for SqliteStore {
                     record.detach as i64,
                     record.acp_session_id,
                     record.run_id.as_ref().map(|run| run.as_str()),
+                    record.owner.map(|owner| owner.pid as i64),
+                    record.owner.map(|owner| owner.start_time as i64),
                 ],
             )
             .map_err(backend)?;
@@ -1236,7 +1275,7 @@ impl StateStore for SqliteStore {
         self.conn
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
-                 detached, acp_session_id, run_id \
+                 detached, acp_session_id, run_id, owner_pid, owner_start_time \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -1252,7 +1291,8 @@ impl StateStore for SqliteStore {
             .conn
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
-                 r.last_known_cause, r.detached, r.acp_session_id, r.run_id \
+                 r.last_known_cause, r.detached, r.acp_session_id, r.run_id, \
+                 r.owner_pid, r.owner_start_time \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1697,6 +1737,21 @@ fn row_to_spawn_record(
     let run_id = run_id_raw
         .filter(|raw| !raw.is_empty())
         .map(RunId::from_wire);
+    // The live-owner adoption boundary: NULL in either column = a pre-v10
+    // record or a spawn whose own start-time token was unreadable (no owner
+    // knowledge — the pre-boundary adopt-armed posture). A pid present with
+    // a MISSING start-time degrades the same way (an owner identity that
+    // cannot be verified against a live pid is no identity at all); a
+    // zero/negative value in either column reads as None for the same
+    // honest-degradation reason as the fingerprint fields above.
+    let owner_pid: Option<i64> = row.get("owner_pid").map_err(backend)?;
+    let owner_start: Option<i64> = row.get("owner_start_time").map_err(backend)?;
+    let owner = match (owner_pid, owner_start) {
+        (Some(pid), Some(start)) if pid > 0 && start > 0 => {
+            Some(ProcessFingerprint::new(pid as u32, start as u64))
+        }
+        _ => None,
+    };
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1711,6 +1766,7 @@ fn row_to_spawn_record(
         detach: detached != 0,
         acp_session_id,
         run_id,
+        owner,
     })
 }
 
@@ -1933,10 +1989,10 @@ mod tests {
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): assert the actual
         // version — comparing to SCHEMA_VERSION would pass even if the
-        // stamp and the constant drifted together. (The v9 step, story
-        // 15-2, is the current last step; bump this literal when the next
-        // additive step lands.)
-        assert_eq!(version, 9);
+        // stamp and the constant drifted together. (The v10 step, the
+        // live-owner adoption boundary's owner columns, is the current last
+        // step; bump this literal when the next additive step lands.)
+        assert_eq!(version, 10);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -2068,6 +2124,7 @@ mod tests {
             detach: false,
             acp_session_id: None,
             run_id: None,
+            owner: None,
         }
     }
 
@@ -2496,16 +2553,12 @@ mod tests {
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO agent_instances \
-                 (name, kind, state, agent_home, created_at, updated_at) \
-                 VALUES ('legacy', 'mock', 'running', '/x', '2026-10-16T00:00:00Z', '2026-10-16T00:00:00Z')",
+                "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) VALUES ('legacy', 'mock', 'running', '/x', '2026-10-16T00:00:00Z', '2026-10-16T00:00:00Z')",
                 [],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO agent_runtime \
-                 (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, detached, acp_session_id) \
-                 VALUES (1, 4242, 77, 'on-failure', 0, NULL, 1, NULL)",
+                "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, detached, acp_session_id) VALUES (1, 4242, 77, 'on-failure', 0, NULL, 1, NULL)",
                 [],
             )
             .unwrap();
@@ -2518,11 +2571,71 @@ mod tests {
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 9 (the v9 step, story 15-2, is the current last step).
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");
         assert_eq!(rec.run_id, None, "a pre-v9 record reads run_id = None");
+    }
+
+    #[test]
+    fn pre_v10_spawn_record_migrates_to_a_none_owner_and_round_trips() {
+        // Back-compat (the live-owner adoption boundary): a v9 DB whose
+        // agent_runtime rows predate the owner columns migrates additively —
+        // every existing row reads owner = None (the pre-boundary adopt
+        // posture), user_version lands at 10, and a record written WITH an
+        // owner round-trips the fingerprint exactly (the pid + start-time
+        // identity the adoption gate probes).
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            // Hand-build a v9-shaped DB: the v1..v8 DDL + the v9 run_id
+            // column, stamped at user_version 9.
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;\n                 CREATE TABLE agent_instances (\n                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,\n                     kind TEXT NOT NULL, state TEXT NOT NULL,\n                     agent_home TEXT NOT NULL, created_at TEXT NOT NULL,\n                     updated_at TEXT NOT NULL);\n                 CREATE TABLE usage_events (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     run_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,\n                     output_tokens INTEGER NOT NULL, metering_source TEXT NOT NULL,\n                     occurred_at TEXT NOT NULL);\n                 CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);\n                 CREATE TABLE agent_runtime (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     pid INTEGER NOT NULL, start_time INTEGER NOT NULL,\n                     restart_policy TEXT NOT NULL, restart_count INTEGER NOT NULL DEFAULT 0,\n                     last_known_cause TEXT, detached INTEGER NOT NULL DEFAULT 0,\n                     acp_session_id TEXT, run_id TEXT);\n                 PRAGMA user_version = 9;\n                 COMMIT;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) VALUES ('legacy', 'mock', 'running', '/x', '2026-10-22T00:00:00Z', '2026-10-22T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, detached, acp_session_id, run_id) VALUES (1, 4242, 77, 'on-failure', 0, NULL, 0, NULL, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        // Reopen: the v10 ALTERs add the owner columns (NULL for the legacy
+        // row).
+        let store = SqliteStore::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
+        // 10 (the v10 step, the live-owner boundary's owner columns, is the
+        // current last step).
+        assert_eq!(version, 10);
+        let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
+        assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
+        assert!(!rec.detach, "the legacy attached flag survives");
+        assert_eq!(
+            rec.owner, None,
+            "a pre-v10 record reads owner = None (the pre-boundary adopt posture)"
+        );
+        // A record written WITH an owner round-trips the exact fingerprint —
+        // the identity a later engine's live-owner probe compares against.
+        let mut stamped = rec.clone();
+        stamped.owner = Some(ProcessFingerprint::new(31337, 987_654_321));
+        store.upsert_spawn_record(&stamped).unwrap();
+        let back = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
+        assert_eq!(
+            back.owner,
+            Some(ProcessFingerprint::new(31337, 987_654_321)),
+            "the owner fingerprint round-trips exactly"
+        );
     }
 
     #[test]
@@ -3536,7 +3649,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -3680,7 +3793,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -3758,7 +3871,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()
