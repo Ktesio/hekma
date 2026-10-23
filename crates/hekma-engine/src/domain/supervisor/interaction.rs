@@ -152,8 +152,8 @@ impl Supervisor {
             return Err(EngineError::InteractionUnavailable {
                 name: name.as_str().to_string(),
                 detail: "no live stdin pipe is held for this instance in this engine session \
-                         (an adopted instance has no recoverable pipe; durable cross-invocation \
-                         interaction needs a persistent engine session, planned for Epic 7/v1.x)"
+                         (an adopted instance has no input pipe; send input from the program \
+                         that started the agent, which must still hold the engine)"
                     .to_string(),
             });
         }

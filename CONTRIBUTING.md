@@ -1,6 +1,6 @@
-# Contributing to Ktesio
+# Contributing to Hekma
 
-Thank you for your interest in contributing to Ktesio.
+Thank you for your interest in contributing to Hekma.
 
 This project aims to be useful, reliable, and easy to adopt. Contributions are welcome, but we want the project to stay clear, maintainable, and legally safe.
 

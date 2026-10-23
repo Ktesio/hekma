@@ -3061,7 +3061,7 @@ fn adopt_orphans_surfaces_the_park_loss_window_on_a_successful_adoption() {
         "the adoption must surface the engine-restart fact: {text}"
     );
     assert!(
-        text.contains("goes unaccounted"),
+        text.contains("not yet recorded when it exited is not counted"),
         "the adoption must name the un-flushed park window: {text}"
     );
     // The detached fixture is stopped explicitly: adoption re-held it
@@ -4619,7 +4619,7 @@ fn a_post_commit_signal_failure_emits_the_divergence_breadcrumb_and_returns_err(
         "the breadcrumb must state the divergence: {text}"
     );
     assert!(
-        text.contains("kt agent resume sigfault"),
+        text.contains("hekma agent resume sigfault"),
         "a plain-command pause remediation must offer `resume` to realign: {text}"
     );
     assert!(
@@ -4656,11 +4656,11 @@ fn a_post_commit_signal_failure_emits_the_divergence_breadcrumb_and_returns_err(
         "the breach-driven remediation must say WHY stop is the only advice: {tail}"
     );
     assert!(
-        tail.contains("kt agent stop sigfault"),
+        tail.contains("hekma agent stop sigfault"),
         "the breach-driven remediation must lead with `stop`: {tail}"
     );
     assert!(
-        !tail.contains("kt agent resume"),
+        !tail.contains("agent resume"),
         "a breach-driven pause must NEVER advise `resume` (the latch is spent): {tail}"
     );
 
@@ -4727,11 +4727,11 @@ fn a_post_commit_signal_failure_on_resume_advises_stop_only_and_stop_lands() {
         "the breadcrumb must state the divergence: {text}"
     );
     assert!(
-        text.contains("kt agent stop sigresume"),
+        text.contains("hekma agent stop sigresume"),
         "the resume remediation must lead with `stop`: {text}"
     );
     assert!(
-        !text.contains("kt agent resume"),
+        !text.contains("agent resume"),
         "the resume remediation must NEVER advise `resume` (the row already says running): {text}"
     );
     // Persist-first held: the committed transition survived the signal failure.
