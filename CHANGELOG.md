@@ -9,6 +9,11 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 >
 > - `hekma serve` killed PAUSED agents without a graceful stop at shutdown: the drain plan enumerated only `Running` rows, so a paused agent skipped every ladder pass and was then SIGKILLed by the engine-exit kill-on-drop teardown — no graceful window, no stop transition, and a phantom `paused` row over a dead process. Two fixes compose: the drain now takes `Paused` rows through the SAME bounded ladder (the host's signal notice, zero-agent note, and still-alive roll-up name the paused scope), and the engine's stop path RESUMES a real suspension before the ladder — POSIX holds a signal to a `SIGSTOP`ped process pending until `SIGCONT`, so the graceful `SIGTERM` could never be delivered to a suspended agent and a stop from `paused` ALWAYS escalated to a forced kill (a direct `hekma agent stop` of a paused instance hit the same wall). The resume is best-effort and surfaced; on Windows the best-effort pause never suspends, so the resume is the documented no-op there and the ladder is unchanged.
 
+> **Unreleased — concurrent `config set` no longer silently loses keys.**
+> Announced ahead of the release that ships it:
+>
+> - `hekma agent config set` (any engine) serialized its read→merge→write of the instance `config.toml` only per-write (the atomic rename prevents a torn file, not a lost update): two concurrent set processes — two operators, an operator + a script — could interleave as A-reads/B-reads/A-writes/B-writes, and B's document silently dropped A's key while BOTH commands exited 0 (reproduced live: 12 parallel CLI writers on distinct keys landed only 10, different keys lost per run; the regression pin loses a key on 6/6 runs on main). The load→set→write sequence is now serialized across processes by a per-instance advisory write lock (`config.toml.lock` beside the config, the `host.lock` pattern: the OS releases it when the holder dies, the residue file is re-acquired never refused, and a stuck holder times out within the store's 5s busy-wait discipline with a typed Store error instead of an unbounded hang).
+
 > **Unreleased — hekma-engine 0.8.0: the host-mode service surface.**
 > Announced ahead of the release that ships it:
 >

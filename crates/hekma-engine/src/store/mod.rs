@@ -8,3 +8,4 @@
 mod sqlite;
 
 pub(crate) use sqlite::SqliteStore;
+pub(crate) use sqlite::BUSY_TIMEOUT_MS;

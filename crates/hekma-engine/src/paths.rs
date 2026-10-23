@@ -59,6 +59,9 @@
 //!   agents/
 //!     <instance_name>/       # one Agent Home per instance
 //!       config.toml          # instance-level config (AD-9)
+//!       config.toml.lock     # advisory cross-process write lock for config
+//!                            #   set's read-modify-write (the host.lock
+//!                            #   pattern; residue file, OS-released)
 //!       adapter.json         # persisted adapter snapshot (story 1-3)
 //!       effective-config.json  # resolved config + per-value provenance, written
 //!                            #   at START, overwritten every start (story 2-3)
@@ -273,6 +276,12 @@ pub const OUTBOX_ACK_FILE: &str = "outbox-ack.json";
 /// File name of the per-instance config file inside an Agent Home. `[ASSUMPTION]`
 pub const INSTANCE_CONFIG_FILE: &str = "config.toml";
 
+/// The per-instance config WRITE lock residue (the `host.lock` pattern): an
+/// advisory OS lock file serializing the `config set` read-modify-write
+/// across PROCESSES. The LOCK is the safety property; the file is residue
+/// (re-acquired, never a refusal — the OS releases it when the holder dies).
+pub const INSTANCE_CONFIG_LOCK_FILE: &str = "config.toml.lock";
+
 /// File name of the persisted effective-config snapshot inside an Agent Home
 /// (story 2-3, spine AD-9 "the effective-config snapshot persisted in the Agent
 /// Home" + AD-6 "effective-config snapshots are files inside the Agent Home").
@@ -451,6 +460,12 @@ impl EnginePaths {
     /// Absolute path to an Agent Home's instance config file.
     pub fn instance_config(&self, name: &InstanceName) -> PathBuf {
         self.agent_home(name).join(INSTANCE_CONFIG_FILE)
+    }
+
+    /// The per-instance config write-lock path (beside the config file, the
+    /// `host.lock` pattern). See [`INSTANCE_CONFIG_LOCK_FILE`].
+    pub fn instance_config_lock(&self, name: &InstanceName) -> PathBuf {
+        self.agent_home(name).join(INSTANCE_CONFIG_LOCK_FILE)
     }
 
     /// Absolute path to an Agent Home's persisted effective-config snapshot

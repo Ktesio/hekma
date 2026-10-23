@@ -206,3 +206,59 @@ fn apply_file_target_failed_write_leaves_the_previous_native_file_unchanged() {
     );
     assert!(temp_residue(tmp.path()).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 4. Cross-PROCESS write serialization: concurrent `config set`s cannot lose
+//    each other's keys (the read-modify-write lock, `config.toml.lock`).
+// ---------------------------------------------------------------------------
+
+/// Register a `mock` instance named `name` over `state` and return nothing —
+/// the minimal fleet entry concurrent writers can target (no process, no
+/// lifecycle; `config set` needs only the row).
+fn register_mock(state: &Path, name: &str) {
+    let engine = Engine::open(Some(state.to_path_buf())).unwrap();
+    engine.blocking().register(name, "mock").unwrap();
+}
+
+#[test]
+fn concurrent_config_sets_from_separate_engines_all_land() {
+    // The CLI shape: every `hekma agent config set` is its own PROCESS with
+    // its own engine over the same state dir. Sixteen of them, launched
+    // together, each writing a DISTINCT pass-through key — every key must
+    // land. Before the per-instance write lock, the load→set→write sequence
+    // interleaved across processes (A-reads/B-reads/A-writes/B-writes) and
+    // the later writer's document silently DROPPED the earlier writer's key
+    // while both processes exited 0 — reproduced live with 12 parallel CLI
+    // writers landing only 10 keys (different keys lost per run). The lock
+    // serializes the read-modify-write; the atomic rename keeps each single
+    // write untorn; together every key survives.
+    let state = TempDir::new().unwrap();
+    register_mock(state.path(), "concurrent");
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let state = state.path().to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            let engine = Engine::open(Some(state)).expect("writer engine open");
+            engine
+                .blocking()
+                .set_config("concurrent", &format!("agent.note{i}"), &format!("v{i}"))
+                .expect("concurrent set must succeed");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("writer thread panicked");
+    }
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
+    let effective = engine
+        .blocking()
+        .effective_config("concurrent", ConfigLayer::empty())
+        .unwrap();
+    for i in 0..16 {
+        let key = format!("agent.note{i}");
+        assert!(
+            effective.values().contains_key(&key),
+            "key {key} was silently lost to a concurrent writer — the \
+             read-modify-write must be serialized across engines/processes"
+        );
+    }
+}
