@@ -599,6 +599,11 @@ impl Supervisor {
             Ok(records) => records,
             Err(_) => return 0,
         };
+        // The LIVE-OWNER adoption boundary: THIS process's own fingerprint,
+        // read once — the identity a record's owner is compared against (a
+        // record this process itself spawned or adopted is always adoptable
+        // by this process; the boundary only guards OTHER live engines).
+        let self_owner = self.backend.self_fingerprint();
         let mut adopted = 0;
         for record in records {
             let name = record.name.clone();
@@ -608,6 +613,40 @@ impl Supervisor {
             // fail, and clearing it would wipe the persisted policy).
             if record.fingerprint.pid == 0 {
                 continue;
+            }
+            // The live-owner gate (NON-detached records only — a detached
+            // record's adoption is disarmed by its detach flag, so a live
+            // owner costs nothing there and the durable-detach promise is
+            // untouched): a record whose recorded SUPERVISING OWNER is still
+            // ALIVE in another process is supervised elsewhere — re-holding
+            // it HERE would arm a second kill-on-drop handle whose teardown
+            // at this command's exit stops another engine's agent (the
+            // `hekma agent list`-kills-`serve`'s-agent bug). SKIP it: the
+            // row and record stay exactly as the live owner left them, and
+            // its owner keeps the sole handle (crash detection, budgets,
+            // stops all stay ITS). An owner that is DEAD (the story 1-6
+            // crashed engine — the exact case adoption exists for), REUSED
+            // (start-time mismatch), ABSENT (pre-boundary record), or THIS
+            // process adopts exactly as before. `probe_alive == None`
+            // (indeterminate) also adopts — the fail-open posture that
+            // keeps NFR-1 intact on a flaky read. Surfaced, not silent
+            // (AI-18): the skip is named so a confused operator reads WHY
+            // `stop` from this command will refuse.
+            if !record.detach {
+                if let Some(owner) = record.owner {
+                    let owner_is_self = self_owner.is_some_and(|me| me.matches(&owner));
+                    if !owner_is_self && self.backend.probe_alive(&owner) == Some(true) {
+                        self.emit_diagnostic(&format!(
+                            "{}: supervised by another live engine (pid {}) — its spawn \
+                             record is left untouched and THIS engine holds no handle for \
+                             it; an explicit stop re-acquires the process on demand, and \
+                             every benign command leaves it alone",
+                            name.as_str(),
+                            owner.pid,
+                        ));
+                        continue;
+                    }
+                }
             }
             // The record's detach flag (story 12-1 AMENDMENT) decides HOW the
             // handle is re-held: a detached spawn's handle comes back DISARMED
@@ -988,6 +1027,16 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
+                    // NOTE (the live-owner boundary, deliberately NOT done
+                    // here): the adopter does NOT re-stamp itself as the
+                    // record's owner. A re-stamp would make every LONG-LIVED
+                    // bystander that adopted a dead owner's record (a
+                    // `logs --follow`, an embedding's read engine) the
+                    // record's "owner", blocking explicit stops from other
+                    // engines — the boundary's protection is scoped to the
+                    // case it exists for: the ORIGINAL spawning owner being
+                    // ALIVE (a running `serve`, an embedding). Dead-owner
+                    // records keep the pre-boundary semantics byte-for-byte.
                     // Story 14-1 + 14-2: surface the acp adoption honesty —
                     // the instance is alive but this engine holds no live ACP
                     // connection for it (the pipe pair died with the previous
