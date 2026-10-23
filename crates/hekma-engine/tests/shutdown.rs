@@ -11,14 +11,30 @@
 //! facade exists to spare embedders), and a quiescent fleet is an honest
 //! no-op on the notice stream.
 //!
-//! ## Robust, cross-OS by construction
+//! ## Cross-OS posture (data-driven, never OS-cfg)
 //!
-//! No `OsId`-gated skip anywhere and no POSIX liveness probes: determinism
-//! comes from asserting on COMMITTED lifecycle state and the returned
-//! outcomes, never on process-suspension timing. The `fake_agent` handles
-//! its stop signal on all three OSes (the lifecycle suite proves the ladder
-//! cross-OS), and the fixture declares `pause` `guaranteed` on all OSes so
-//! the committed `paused` state is deterministic everywhere.
+//! No `OsId`-gated skip and no POSIX liveness probes: determinism comes from
+//! asserting on COMMITTED lifecycle state and the returned outcomes, never on
+//! process-suspension timing. The `fake_agent` fixture declares `pause`
+//! `guaranteed` on all OSes, so the committed `paused` state is deterministic
+//! everywhere. The graceful-vs-forced FLAVOR of a stop is the ONE
+//! platform-honest expectation, decided per OS at runtime: Unix's SIGTERM
+//! default disposition ends the lingering `fake_agent` inside the window
+//! (`Graceful`), while Windows sends NOTHING during the graceful phase (the
+//! backend's documented `[ASSUMPTION]` — no `CTRL_BREAK_EVENT` equivalent
+//! yet), so the window is always fully consumed there and the ladder's honest
+//! outcome is the forced escalation (`Forced`, paused or running alike —
+//! `budget.rs` documents the identical always-consumed-window behavior for
+//! the default 30s stop). What the suite pins on EVERY OS is the item-3
+//! promise itself: paused rows are IN the drain plan (never left to the
+//! engine `Drop`'s kill-on-drop teardown), the ladder is announced and each
+//! outcome surfaced, and every drained row lands `stopped`.
+//!
+//! Windows wall-clock note: every stop there consumes the full window before
+//! escalating (plus the bounded death confirmation), and the multi-agent
+//! drain serializes per agent — a 5s window costs ~2×5s+ for a two-agent
+//! fleet. The windows-latest matrix tolerates this (nextest's slow marker is
+//! 60s per test).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -90,8 +106,35 @@ fn wait_for_state(engine: &Engine, name: &str, wanted: LifecycleState) {
     }
 }
 
+/// The ladder's honest outcome for a lingering agent on THIS OS (see the
+/// module docs): Unix's SIGTERM default disposition ends `fake_agent` within
+/// the window (`Graceful`); Windows sends nothing during the graceful phase
+/// (the backend's documented `[ASSUMPTION]` — no `CTRL_BREAK_EVENT`
+/// equivalent yet), so the window is always fully consumed and the ladder
+/// escalates (`Forced`). Data-driven, never OS-cfg — the boundary gate's
+/// sanctioned form.
+fn expected_result() -> StopResult {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        StopResult::Forced
+    } else {
+        StopResult::Graceful
+    }
+}
+
+/// The notice line the given outcome surfaces (`DrainOutcome`'s `Display`).
+fn expected_note(name: &str) -> String {
+    match expected_result() {
+        StopResult::Graceful => format!("{name}: stopped gracefully"),
+        StopResult::Forced => format!(
+            "{name}: stopped (the graceful window elapsed; the stop ladder \
+             force-killed it)"
+        ),
+        _ => unreachable!("expected_result only yields Graceful or Forced"),
+    }
+}
+
 #[test]
-fn shutdown_stops_every_running_agent_gracefully_and_surfaces_each() {
+fn shutdown_stops_every_running_agent_through_the_ladder_and_surfaces_each() {
     let state = tempfile::tempdir().unwrap();
     let manifest = tempfile::tempdir().unwrap();
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("engine open");
@@ -108,14 +151,17 @@ fn shutdown_stops_every_running_agent_gracefully_and_surfaces_each() {
         vec![
             DrainOutcome {
                 name: "first".to_string(),
-                result: StopResult::Graceful
+                result: expected_result()
             },
             DrainOutcome {
                 name: "second".to_string(),
-                result: StopResult::Graceful
+                result: expected_result()
             },
         ],
-        "both running agents exit within the window, in fleet order"
+        "both running agents exit through the ladder, in fleet order (the \
+         graceful-vs-forced flavor is the platform-honest one — see the \
+         module docs):\
+         {outcomes:?}"
     );
     wait_for_state(&engine, "first", LifecycleState::Stopped);
     wait_for_state(&engine, "second", LifecycleState::Stopped);
@@ -125,7 +171,7 @@ fn shutdown_stops_every_running_agent_gracefully_and_surfaces_each() {
         "each agent's ladder is announced:\n{text}"
     );
     assert!(
-        text.contains("first: stopped gracefully") && text.contains("second: stopped gracefully"),
+        text.contains(&expected_note("first")) && text.contains(&expected_note("second")),
         "each outcome is surfaced:\n{text}"
     );
 }
@@ -136,8 +182,14 @@ fn shutdown_gives_a_paused_agent_the_ladder_not_the_kill_on_drop() {
     // the graceful path entirely at drop. The drain's plan includes Paused
     // rows, and the engine's stop resumes the suspension BEFORE the ladder
     // so the graceful signal can be delivered (the #327 semantics) — the
-    // committed terminal state proves the graceful arm ran, not the
-    // escalation.
+    // committed terminal state proves the ladder arm ran, never the drop's
+    // raw kill-on-drop teardown. The graceful-vs-forced FLAVOR is the
+    // platform-honest expectation (`expected_result`): on Unix the resumed
+    // process honors SIGTERM inside the window (Graceful); on Windows
+    // nothing is sent during the graceful phase (documented `[ASSUMPTION]`),
+    // so the window is consumed and the ladder escalates (Forced) — the
+    // same outcome a RUNNING row gets there, proving the paused row went
+    // through the ORDINARY ladder rather than the drop-time kill.
     let state = tempfile::tempdir().unwrap();
     let manifest = tempfile::tempdir().unwrap();
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("engine open");
@@ -154,15 +206,24 @@ fn shutdown_gives_a_paused_agent_the_ladder_not_the_kill_on_drop() {
         outcomes,
         vec![DrainOutcome {
             name: "frozen".to_string(),
-            result: StopResult::Graceful
+            result: expected_result()
         }],
-        "the paused agent goes through the resume-then-stop ladder gracefully:\
+        "the paused agent goes through the resume-then-stop ladder (the \
+         platform-honest flavor — an ABSENT outcome would mean the row was \
+         left to the engine Drop's kill-on-drop teardown, the item-3 bug):\
          {outcomes:?}"
     );
     wait_for_state(&engine, "frozen", LifecycleState::Stopped);
     assert!(
-        sink_handle.text().contains("frozen: stopped gracefully"),
+        sink_handle
+            .text()
+            .contains("stopping frozen (graceful window"),
         "the ladder ran for the paused row:\n{}",
+        sink_handle.text()
+    );
+    assert!(
+        sink_handle.text().contains(&expected_note("frozen")),
+        "the ladder's outcome is surfaced for the paused row:\n{}",
         sink_handle.text()
     );
 }
@@ -215,9 +276,9 @@ fn shutdown_without_a_sink_returns_outcomes_only() {
         outcomes,
         vec![DrainOutcome {
             name: "quiet".to_string(),
-            result: StopResult::Graceful
+            result: expected_result()
         }],
-        "no sink, same ladder, same outcome"
+        "no sink, same ladder, same platform-honest outcome"
     );
     wait_for_state(&engine, "quiet", LifecycleState::Stopped);
 }
