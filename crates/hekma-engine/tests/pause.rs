@@ -460,6 +460,90 @@ fn stop_from_paused_reaches_stopped() {
 }
 
 #[test]
+fn stop_from_a_really_suspended_pause_is_graceful_unix() {
+    // The regression pin for the reported serve-shutdown bug ("paused agents
+    // killed without a graceful stop"): a SIGSTOPped (guaranteed-paused)
+    // process can NEVER receive the ladder's SIGTERM — POSIX holds a signal
+    // to a stopped process PENDING until SIGCONT — so a stop started from a
+    // real suspension used to burn the whole graceful window waiting for an
+    // exit that could not happen, then escalate to a forced group kill
+    // (`StopForced`). The stop path must RESUME the suspended process first
+    // so the graceful signal can be delivered; `fake_agent` exits on SIGTERM,
+    // so the terminal cause must be `StopGraceful` — on the bug, this exact
+    // shape records `StopForced` after the full window.
+    //
+    // Runtime-skip off Unix (a REAL suspension exists only where pause
+    // projects to guaranteed — the `guaranteed_pause_really_suspends…` skip).
+    // NO `#[cfg]` — data-driven skip.
+    if OsId::current() == OsId::Windows || OsId::current() == OsId::Other {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_pause_manifest(
+        manifest.path(),
+        "svc",
+        &["--heartbeat-ms", "50", "--linger-ms", "600000"],
+        "guaranteed",
+    );
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    facade.start("svc").unwrap();
+
+    let agent_log = state
+        .path()
+        .join("agents")
+        .join("svc")
+        .join("logs")
+        .join("agent.log");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if heartbeat_lines(&agent_log) >= 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "heartbeat never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A REAL suspension, proven the suite's way: the heartbeat freezes and
+    // stays frozen across a window far longer than the heartbeat interval.
+    facade.pause("svc").unwrap();
+    std::thread::sleep(Duration::from_millis(200)); // SIGSTOP + in-flight line settle
+    let baseline = heartbeat_lines(&agent_log);
+    let watch_until = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < watch_until {
+        let now = heartbeat_lines(&agent_log);
+        assert!(
+            now <= baseline,
+            "heartbeat must NOT grow while paused (real SIGSTOP): baseline {baseline}, saw {now}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Stop straight from the real suspension: the discriminator is the
+    // TERMINAL CAUSE. A 3s window gives a resumed, SIGTERM-driven exit ample
+    // room (the agent wakes and exits in milliseconds) while keeping the
+    // forced-escalation fallback bounded.
+    let stopped = facade.stop("svc", Some(Duration::from_secs(3))).unwrap();
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    let events = facade.transition_events("svc").unwrap();
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Stopped)
+        .expect("a terminal stopping→stopped transition must be recorded");
+    assert!(
+        matches!(terminal.cause, hekma_engine::TransitionCause::StopGraceful),
+        "the ladder must resume the suspended process so the graceful SIGTERM \
+         can be delivered — the terminal cause must be graceful, got: {:?}",
+        terminal.cause
+    );
+}
+
+#[test]
 fn guaranteed_pause_without_an_in_memory_handle_is_a_no_op_transition() {
     // Cross-lifetime honesty (single-lifetime boundary, AD-5 is story 1-6): an
     // instance whose row says `running` but for which THIS engine holds no

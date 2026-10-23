@@ -158,7 +158,7 @@ fn drive_both_diagnostics(
     state: &Path,
     unmapped: &Path,
     flow: &Path,
-) -> (String, String, String) {
+) -> (String, String, String, String) {
     let facade = engine.blocking();
 
     // ---- (1) The DC-10 memory-delivery notice. ----
@@ -218,12 +218,28 @@ fn drive_both_diagnostics(
         .expect_err("pausing an already-paused instance is a gate rejection");
     let breadcrumb_line = expected_breadcrumb_line(&pause_err);
 
+    // The THIRD diagnostic this flow now produces (the graceful-stop-of-
+    // paused-agents fix): the teardown stop of the SIGSTOP'd flow instance
+    // first RESUMES it — a suspended process cannot receive the graceful
+    // signal — and that resume is surfaced through the same sink. Pinned as
+    // an exact literal (it embeds only the constant instance name).
+    let resume_line = format!(
+        "[hekma] {BREADCRUMB_INSTANCE}: resumed the paused process before the stop ladder — a \
+         suspended process cannot receive the graceful stop signal (it stays pending until the \
+         process continues)"
+    );
+
     // Teardown (never mask the assertions): the flow instance is SIGSTOP'd
     // (Unix), so its stop takes the shared zero window.
     let _ = facade.stop(NOTICE_INSTANCE, Some(Duration::from_secs(5)));
     let _ = facade.stop(BREADCRUMB_INSTANCE, Some(uj3::STOP_WINDOW));
 
-    (notice_line, breadcrumb_line, breadcrumb_needle.to_string())
+    (
+        notice_line,
+        breadcrumb_line,
+        resume_line,
+        breadcrumb_needle.to_string(),
+    )
 }
 
 /// Poll the sink's captured bytes until `needle` arrives (bounded) and return
@@ -265,13 +281,14 @@ fn an_open_time_sink_receives_both_diagnostics_exact_texts() {
         Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&captured))
             .expect("open engine with sink");
 
-    let (notice_line, breadcrumb_line, needle) =
+    let (notice_line, breadcrumb_line, resume_line, needle) =
         drive_both_diagnostics(&engine, state.path(), &unmapped, &flow);
     let bytes = wait_for_capture(&captured, &needle);
     assert_eq!(
         bytes,
-        format!("{notice_line}\n{breadcrumb_line}\n").into_bytes(),
-        "the sink must receive EXACTLY the two diagnostic lines (in emission order)"
+        format!("{notice_line}\n{breadcrumb_line}\n{resume_line}\n").into_bytes(),
+        "the sink must receive EXACTLY the three diagnostic lines (in emission order: \
+         the notice, the breadcrumb, and the teardown stop's resume-before-ladder note)"
     );
 }
 
@@ -290,13 +307,13 @@ fn a_facade_installed_sink_receives_both_diagnostics_exact_texts() {
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     engine.blocking().with_diagnostics(make_sink(&captured));
 
-    let (notice_line, breadcrumb_line, needle) =
+    let (notice_line, breadcrumb_line, resume_line, needle) =
         drive_both_diagnostics(&engine, state.path(), &unmapped, &flow);
     let bytes = wait_for_capture(&captured, &needle);
     assert_eq!(
         bytes,
-        format!("{notice_line}\n{breadcrumb_line}\n").into_bytes(),
-        "the facade-installed sink must receive EXACTLY the two diagnostic lines"
+        format!("{notice_line}\n{breadcrumb_line}\n{resume_line}\n").into_bytes(),
+        "the facade-installed sink must receive EXACTLY the three diagnostic lines"
     );
 }
 
@@ -510,14 +527,15 @@ fn a_panicking_sink_write_is_caught_and_the_same_sink_keeps_receiving() {
     )
     .expect("open engine with a panic-once sink");
 
-    let (notice_line, breadcrumb_line, needle) =
+    let (notice_line, breadcrumb_line, resume_line, needle) =
         drive_both_diagnostics(&engine, state.path(), &unmapped, &flow);
     let bytes = wait_for_capture(&captured, &needle);
     assert_eq!(
         bytes,
-        format!("{breadcrumb_line}\n").into_bytes(),
-        "the panicking FIRST write is swallowed (the notice is lost, best-effort) and the \
-         SECOND diagnostic lands on the same sink: capture must be exactly the breadcrumb"
+        format!("{breadcrumb_line}\n{resume_line}\n").into_bytes(),
+        "the panicking FIRST write is swallowed (the notice is lost, best-effort) and every \
+         LATER diagnostic lands on the same sink: capture must be exactly the breadcrumb \
+         + the teardown stop's resume note"
     );
     assert!(
         !bytes
@@ -626,7 +644,7 @@ fn diagnostic_sink_helper_subprocess() {
     let unmapped = write_unmapped_manifest(unmapped_dir.path());
     let flow = uj3::write_flow_manifest(flow_dir.path());
 
-    let (notice_line, breadcrumb_line, _needle) = match mode.as_str() {
+    let (notice_line, breadcrumb_line, resume_line, _needle) = match mode.as_str() {
         // No sink: the diagnostics go to the inherited stderr (the parent's
         // capture). The expected-lines file is the byte-exact assertion target.
         "default" => {
@@ -641,21 +659,24 @@ fn diagnostic_sink_helper_subprocess() {
             let engine = Engine::open_with_diagnostics(Some(state.clone()), make_sink(&captured))
                 .expect("open sink engine");
             let outcome = drive_both_diagnostics(&engine, &state, &unmapped, &flow);
-            let bytes = wait_for_capture(&captured, &outcome.2);
+            let bytes = wait_for_capture(&captured, &outcome.3);
             assert_eq!(
                 bytes,
-                format!("{}\n{}\n", outcome.0, outcome.1).into_bytes(),
-                "the child's sink must receive EXACTLY the two diagnostic lines"
+                format!("{}\n{}\n{}\n", outcome.0, outcome.1, outcome.2).into_bytes(),
+                "the child's sink must receive EXACTLY the three diagnostic lines"
             );
             let captured_path = PathBuf::from(std::env::var(CAPTURED_ENV).unwrap());
             std::fs::write(captured_path, bytes).expect("relay the captured sink bytes");
-            (outcome.0, outcome.1, outcome.2)
+            (outcome.0, outcome.1, outcome.2, outcome.3)
         }
         other => panic!("unknown helper mode: {other}"),
     };
 
-    std::fs::write(expected_path, format!("{notice_line}\n{breadcrumb_line}\n"))
-        .expect("write the expected-lines file");
+    std::fs::write(
+        expected_path,
+        format!("{notice_line}\n{breadcrumb_line}\n{resume_line}\n"),
+    )
+    .expect("write the expected-lines file");
 }
 
 /// Run the helper child in `mode` and return (child stderr, expected-lines
@@ -688,7 +709,7 @@ fn run_helper(mode: &str, root: &Path) -> (String, PathBuf, PathBuf) {
     (stderr, expected, captured)
 }
 
-/// Read the two expected lines the child wrote (trailing newline stripped per
+/// Read the expected lines the child wrote (trailing newline stripped per
 /// line for `contains`-style exact-line assertions).
 fn read_expected_lines(expected: &Path) -> Vec<String> {
     String::from_utf8(std::fs::read(expected).expect("read the expected-lines file"))
@@ -707,7 +728,7 @@ fn without_a_sink_both_diagnostics_reach_stderr_byte_identical() {
     let root = TempDir::new().expect("helper root");
     let (stderr, expected, _captured) = run_helper("default", root.path());
     let lines = read_expected_lines(&expected);
-    assert_eq!(lines.len(), 2, "the child pins exactly two diagnostics");
+    assert_eq!(lines.len(), 3, "the child pins exactly three diagnostics");
 
     let engine_lines: Vec<&str> = stderr
         .lines()
@@ -716,8 +737,8 @@ fn without_a_sink_both_diagnostics_reach_stderr_byte_identical() {
     assert_eq!(
         engine_lines,
         lines.iter().map(String::as_str).collect::<Vec<_>>(),
-        "the no-sink stderr must carry EXACTLY the two diagnostic lines \
-         (byte-identical to the pre-sink engine): stderr=\n{stderr}"
+        "the no-sink stderr must carry EXACTLY the three diagnostic lines \
+         (byte-identical to the engine's sink delivery): stderr=\n{stderr}"
     );
 }
 
@@ -730,7 +751,7 @@ fn with_a_sink_installed_stderr_stays_silent() {
     let root = TempDir::new().expect("helper root");
     let (stderr, expected, captured) = run_helper("sink", root.path());
     let lines = read_expected_lines(&expected);
-    assert_eq!(lines.len(), 2, "the child pins exactly two diagnostics");
+    assert_eq!(lines.len(), 3, "the child pins exactly three diagnostics");
 
     assert!(
         !stderr.contains("[hekma]"),
@@ -741,7 +762,7 @@ fn with_a_sink_installed_stderr_stays_silent() {
     let relayed = std::fs::read(captured).expect("read the relayed sink capture");
     assert_eq!(
         relayed,
-        format!("{}\n{}\n", lines[0], lines[1]).into_bytes(),
-        "the relayed sink capture must equal the two expected lines exactly"
+        format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2]).into_bytes(),
+        "the relayed sink capture must equal the three expected lines exactly"
     );
 }
