@@ -316,6 +316,50 @@ impl Supervisor {
                 .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
 
+        // A stop that starts from a REAL suspension must RESUME the process
+        // first: POSIX holds a signal to a SIGSTOPped process PENDING until
+        // SIGCONT, so the ladder's graceful SIGTERM could never be delivered
+        // to a suspended agent — the window always burned and the escalation
+        // force-killed it ("paused agents killed without a graceful stop",
+        // the reported serve-shutdown bug; a direct `kt agent stop` of a
+        // paused instance hit the same wall). Resuming lets the graceful
+        // signal reach the agent, so a cooperative agent exits within the
+        // window and the terminal cause is `StopGraceful`. The gate is the
+        // PRIOR row state (`paused`) — the suspension is a fact about the
+        // process this engine holds a handle for — and the resume runs
+        // BEFORE the acp turn-cancel write below (a frozen agent cannot read
+        // a cancel). Best-effort + surfaced (AI-18): a resume failure
+        // proceeds into the ladder anyway — the window may elapse and
+        // escalate, exactly the pre-fix outcome, never a blocked stop. On
+        // Windows the best-effort pause never suspends (a paused row's
+        // process keeps running), and `resume` there is the documented
+        // no-op — the ladder is unchanged on that platform.
+        if instance.state == LifecycleState::Paused {
+            let resume_outcome = self
+                .running
+                .get_mut(&name)
+                .map(|supervised| self.backend.resume(&mut supervised.handle));
+            match resume_outcome {
+                Some(Ok(())) => {
+                    self.emit_diagnostic(&format!(
+                        "{}: resumed the paused process before the stop ladder — a \
+                         suspended process cannot receive the graceful stop signal (it \
+                         stays pending until the process continues)",
+                        name.as_str(),
+                    ));
+                }
+                Some(Err(detail)) => {
+                    self.emit_diagnostic(&format!(
+                        "{}: could not resume the paused process before the stop ladder \
+                         ({detail}); the ladder proceeds regardless — the graceful window \
+                         may elapse and escalate to a forced kill",
+                        name.as_str(),
+                    ));
+                }
+                None => {}
+            }
+        }
+
         // Story 14-1 (spine AD-19): for an `acp` instance with a turn in
         // flight, write `session/cancel` FIRST (the bounded write; the agent
         // aborts its turn), then proceed through the EXISTING stop ladder

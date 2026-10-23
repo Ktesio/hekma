@@ -4,6 +4,11 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — graceful stops of paused agents (serve shutdown honesty).**
+> Announced ahead of the release that ships it:
+>
+> - `hekma serve` killed PAUSED agents without a graceful stop at shutdown: the drain plan enumerated only `Running` rows, so a paused agent skipped every ladder pass and was then SIGKILLed by the engine-exit kill-on-drop teardown — no graceful window, no stop transition, and a phantom `paused` row over a dead process. Two fixes compose: the drain now takes `Paused` rows through the SAME bounded ladder (the host's signal notice, zero-agent note, and still-alive roll-up name the paused scope), and the engine's stop path RESUMES a real suspension before the ladder — POSIX holds a signal to a `SIGSTOP`ped process pending until `SIGCONT`, so the graceful `SIGTERM` could never be delivered to a suspended agent and a stop from `paused` ALWAYS escalated to a forced kill (a direct `hekma agent stop` of a paused instance hit the same wall). The resume is best-effort and surfaced; on Windows the best-effort pause never suspends, so the resume is the documented no-op there and the ladder is unchanged.
+
 > **Unreleased — hekma-engine 0.8.0: the host-mode service surface.**
 > Announced ahead of the release that ships it:
 >

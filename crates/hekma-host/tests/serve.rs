@@ -66,7 +66,7 @@ fn a_full_host_cycle_completes_and_surfaces_every_notice() {
         "host started",
         "state root",
         "SIGTEST received",
-        "no running agents; nothing to stop",
+        "no running or paused agents; nothing to stop",
         "shutdown complete",
     ] {
         assert!(
@@ -204,7 +204,7 @@ fn the_no_instance_drain_completes_with_no_outcomes() {
     );
     let text = sink_handle.text();
     assert!(
-        text.contains("no running agents; nothing to stop"),
+        text.contains("no running or paused agents; nothing to stop"),
         "the no-op is said, not silent:\n{text}"
     );
 }

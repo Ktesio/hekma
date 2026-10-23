@@ -721,6 +721,210 @@ fn the_lifecycle_verbs_drive_a_real_agent_and_stop_honors_window_secs() {
 }
 
 // ---------------------------------------------------------------------------
+// The shutdown drain's paused-agent leg (the reported serve bug: a PAUSED
+// attached agent was handed to the engine Drop's raw kill-on-drop teardown —
+// killed without a graceful stop — because the drain plan enumerated only
+// Running rows).
+// ---------------------------------------------------------------------------
+
+/// Whether a pid is alive (`kill -0`, zombie-discounted) — the drain suite's
+/// helper shape: NO OS-cfg (branch on the runtime OS id and shell out);
+/// `/proc` reads no-op off Linux.
+fn pid_alive(pid: u32) -> bool {
+    match hekma_engine::OsId::current() {
+        hekma_engine::OsId::Windows => {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output();
+            match out {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+                Err(_) => false,
+            }
+        }
+        _ => {
+            let exists = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            exists && !proc_pid_is_zombie(pid)
+        }
+    }
+}
+
+fn proc_pid_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(')')
+                .map(|(_, rest)| rest.split_whitespace().next() == Some("Z"))
+        })
+        .unwrap_or(false)
+}
+
+fn heartbeat_lines(agent_log: &Path) -> usize {
+    std::fs::read_to_string(agent_log)
+        .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn the_shutdown_drain_stops_a_paused_attached_agent_gracefully() {
+    // The full-stack repro of the reported bug: `serve` supervising an
+    // ATTACHED agent (started through the Control API — the exact shape a
+    // host deployment runs), paused (a REAL SIGSTOP suspension on Unix),
+    // then the shutdown signal. The drain used to enumerate ONLY Running
+    // rows, so the paused agent was skipped by every ladder pass and then
+    // SIGKILLed by the engine Drop's kill-on-drop teardown — no graceful
+    // window, no stop transition, and a phantom `paused` row over a dead
+    // process. The drain must take Paused rows through the SAME bounded
+    // ladder (which resumes the suspension so SIGTERM can be delivered),
+    // leaving `stopped` + a graceful terminal cause on the record.
+    //
+    // Runtime-skip on Windows (POSIX `kill` probes + the real-suspension
+    // proof are Unix-shaped; Windows pause is best-effort — no suspension —
+    // so a paused row's process there is stopped by the ordinary running
+    // ladder, which the windows matrix already proves). NO `#[cfg`.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // Register a HEARTBEATING fake agent (the suite's fixture + heartbeat
+    // args, so the suspension is provable), then drop the registering
+    // engine — serve opens the same root fresh.
+    let manifest_dir = tempfile::tempdir().unwrap();
+    ManifestFixture::new("frozen", &["--heartbeat-ms", "50", "--linger-ms", "600000"])
+        .guaranteed_on_all_oses("pause")
+        .guaranteed_on_all_oses("interaction")
+        .write(manifest_dir.path());
+    {
+        let engine = Engine::open(Some(base.clone())).expect("engine open");
+        engine
+            .blocking()
+            .register_with_adapter(
+                "frozen",
+                &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+            )
+            .expect("register");
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle.clone());
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let instance = format!("http://{}/v0/instances/frozen", server.addr);
+
+    // start → running (ATTACHED under serve's engine).
+    let mut response = client
+        .post(format!("{instance}/start"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["instance"]["state"], "running");
+
+    let agent_log = base
+        .join("agents")
+        .join("frozen")
+        .join("logs")
+        .join("agent.log");
+    let pid = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(&agent_log) {
+                if let Some(line) = contents.lines().find(|l| l.contains("ready pid=")) {
+                    if let Some(idx) = line.find("pid=") {
+                        if let Ok(pid) = line[idx + 4..].trim().parse::<u32>() {
+                            break pid;
+                        }
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent pid never announced"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    // pause → paused, and the heartbeat REALLY freezes (real SIGSTOP).
+    let mut response = client
+        .post(format!("{instance}/pause"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["instance"]["state"], "paused");
+    std::thread::sleep(Duration::from_millis(200)); // SIGSTOP + in-flight line settle
+    let baseline = heartbeat_lines(&agent_log);
+    let watch_until = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < watch_until {
+        let now = heartbeat_lines(&agent_log);
+        assert!(
+            now <= baseline,
+            "heartbeat must NOT grow while paused (real SIGSTOP): baseline {baseline}, saw {now}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Shutdown: the SIGTEST signal drives serve's drain.
+    server.stop().unwrap();
+
+    // The process is gone either way (kill-on-drop also kills) — the
+    // DISCRIMINATOR is the record: the drain must have run the ladder.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while pid_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the drained paused agent must be gone (pid {pid} still alive)"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let text = sink_handle.text();
+    assert!(
+        text.contains("stopping frozen"),
+        "the drain must take the PAUSED agent through the ladder (was excluded \
+         from the plan and killed by the engine-exit teardown):\n{text}"
+    );
+    assert!(
+        text.contains("stopped gracefully"),
+        "the resumed agent honors SIGTERM — the outcome is graceful:\n{text}"
+    );
+
+    // The durable record: `stopped` (never a phantom `paused` row over a
+    // dead process) with a graceful terminal cause.
+    {
+        let engine = Engine::open(Some(base)).expect("verify engine open");
+        let facade = engine.blocking();
+        let fleet = facade.fleet().expect("verify fleet");
+        let entry = fleet
+            .iter()
+            .find(|e| e.name.as_str() == "frozen")
+            .expect("frozen row present");
+        assert_eq!(
+            format!("{:?}", entry.state),
+            "Stopped",
+            "the drained instance must land stopped, not stay a phantom paused row"
+        );
+        let events = facade.transition_events("frozen").expect("verify events");
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| format!("{:?}", e.new_state) == "Stopped")
+            .expect("a terminal stop transition must exist (the drain ran the ladder)");
+        assert!(
+            matches!(terminal.cause, hekma_engine::TransitionCause::StopGraceful),
+            "the terminal cause must be graceful (the ladder resumed the \
+             suspended agent first), got: {:?}",
+            terminal.cause
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The config surface: the CLI-mirroring GET (masked values), the PUT
 // round-trip with the warnings field, and the engine's write rejections.
 // ---------------------------------------------------------------------------
@@ -1480,11 +1684,12 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         "the first notice is the started notice:\n{text}"
     );
     assert_eq!(
-        notices[1], "[hekma] SIGTEST received; stopping running agents (graceful window 1s) ...",
+        notices[1],
+        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
         "the second notice is the signal notice, verbatim:\n{text}"
     );
     assert_eq!(
-        notices[2], "[hekma] no running agents; nothing to stop",
+        notices[2], "[hekma] no running or paused agents; nothing to stop",
         "the third notice is the drain's zero-agent outcome:\n{text}"
     );
     assert_eq!(
