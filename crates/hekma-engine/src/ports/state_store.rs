@@ -235,7 +235,7 @@ pub trait StateStore {
     ) -> Result<(), StoreError> {
         Err(StoreError::Backend(
             "this StateStore implementation does not override set_spawn_run_id \
-             (story 15-2 durable run identity): the engine surfaces this write failure \
+             (needed for a durable run identity): the engine surfaces this write failure \
              and keeps the documented pre-v9 mint-per-adoption posture"
                 .to_string(),
         ))

@@ -135,11 +135,11 @@ impl GuaranteeLevel {
     pub fn boundary_statement(&self) -> &'static str {
         match self {
             GuaranteeLevel::ManagedDirByteDurable => {
-                "Ktesio guarantees the managed directory: it exists, survives restarts \
+                "Hekma guarantees the managed directory: it exists, survives restarts \
                  byte-identically, and travels with the Agent Home."
             }
             GuaranteeLevel::HomePersistenceOnly => {
-                "Ktesio guarantees only Agent Home persistence; memory semantics belong to \
+                "Hekma guarantees only Agent Home persistence; memory semantics belong to \
                  the agent."
             }
         }
@@ -265,11 +265,14 @@ mod tests {
     fn boundary_statements_name_the_boundary_distinctly() {
         // NFR-7 wording pins: the filesystem sentence promises the managed
         // directory; the native sentence delegates and names Agent Home
-        // persistence as ALL Ktesio guarantees.
+        // persistence as ALL Hekma guarantees. Both name the product (Hekma),
+        // since the sentence is printed verbatim by `memory attach`.
         let fs = GuaranteeLevel::ManagedDirByteDurable.boundary_statement();
+        assert!(fs.starts_with("Hekma guarantees"));
         assert!(fs.contains("managed directory"));
         assert!(fs.contains("byte-identically"));
         let native = GuaranteeLevel::HomePersistenceOnly.boundary_statement();
+        assert!(native.starts_with("Hekma guarantees"));
         assert!(native.contains("only Agent Home persistence"));
         assert!(native.contains("belong to the agent"));
     }

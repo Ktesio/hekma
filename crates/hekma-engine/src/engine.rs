@@ -277,11 +277,10 @@ fn capture_read_refusal(
             name: name.as_str().to_string(),
             path,
             detail: "log capture is off for this engine: no output was ever captured \
-                     (fleet shows the `capture-off` gap); to capture output, a serve user \
-                     restarts with --log-capture full (or metadata), and a command-scoped \
-                     engine (kt agent ...) takes the posture from the embedding process's \
-                     EngineOptions::log_capture / serve configuration — there is no \
-                     per-command flag"
+                     (fleet shows the `capture-off` gap); to capture output, restart \
+                     `hekma serve` with --log-capture full (or metadata), or set \
+                     EngineOptions::log_capture in the program that embeds the engine; \
+                     `hekma agent` commands have no flag for it"
                 .to_string(),
         }),
         (LogCaptureMode::Metadata, true) => Some(EngineError::Log {

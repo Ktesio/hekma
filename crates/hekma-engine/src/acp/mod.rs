@@ -93,7 +93,7 @@ pub(crate) fn resolve_acp_launch(
             return Err(refuse(format!(
                 "no launch command is configured for the acp kind; set the config keys \
                  '{ACP_COMMAND_KEY}' (required, the ACP agent executable) and '{ACP_ARGS_KEY}' \
-                 (optional, its arguments) — e.g. `kt agent config set {name} {ACP_COMMAND_KEY} \
+                 (optional, its arguments) — e.g. `hekma agent config set {name} {ACP_COMMAND_KEY} \
                  /path/to/agent`",
                 name = name.as_str(),
             )))
