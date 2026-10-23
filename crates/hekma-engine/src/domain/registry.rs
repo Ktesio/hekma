@@ -2171,6 +2171,7 @@ mod tests {
             detach: false,
             acp_session_id: None,
             run_id: None,
+            owner: None,
         };
         reg.write_spawn_record(&record).unwrap();
         assert_eq!(reg.spawn_record(&name).unwrap(), Some(record));

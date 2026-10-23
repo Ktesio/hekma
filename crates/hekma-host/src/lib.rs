@@ -636,7 +636,7 @@ where
         },
     };
     notifier.note(&format!(
-        "{received} received; stopping running agents (graceful window {}s) ...",
+        "{received} received; stopping running and paused agents (graceful window {}s) ...",
         window.as_secs_f32()
     ));
 

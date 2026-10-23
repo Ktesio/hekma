@@ -4,12 +4,24 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — graceful stops of paused agents (serve shutdown honesty).**
+> Announced ahead of the release that ships it:
+>
+> - `hekma serve` killed PAUSED agents without a graceful stop at shutdown: the drain plan enumerated only `Running` rows, so a paused agent skipped every ladder pass and was then SIGKILLed by the engine-exit kill-on-drop teardown — no graceful window, no stop transition, and a phantom `paused` row over a dead process. Two fixes compose: the drain now takes `Paused` rows through the SAME bounded ladder (the host's signal notice, zero-agent note, and still-alive roll-up name the paused scope), and the engine's stop path RESUMES a real suspension before the ladder — POSIX holds a signal to a `SIGSTOP`ped process pending until `SIGCONT`, so the graceful `SIGTERM` could never be delivered to a suspended agent and a stop from `paused` ALWAYS escalated to a forced kill (a direct `hekma agent stop` of a paused instance hit the same wall). The resume is best-effort and surfaced; on Windows the best-effort pause never suspends, so the resume is the documented no-op there and the ladder is unchanged.
+
 > **Unreleased — hekma-engine 0.8.0: the host-mode service surface.**
 > Announced ahead of the release that ships it:
 >
 > - **`SpawnSpec.inherit_env`** — new public field on the exhaustively-constructed `SpawnSpec` (exhaustive constructors need it): `true` keeps today's `Command::envs` semantics (the child sees the engine's whole environment plus the mapped keys); `false` clears the environment first and applies ONLY the declared mappings — the long-running Host hard-sets `false` so every hosted child gets a minimal, manifest-declared environment (story 17-2's `child_env_allowlist` seam).
 > - **`RegistryError::ServeOptionsOpenTimeOnly`** — new variant on the exhaustive `RegistryError` enum (hosts matching exhaustively need the arm or `_`): the typed refusal for applying serve options to a supervisor whose lifecycle already began or twice on the same supervisor. Never reachable through the shipped open paths (`open`, `open_with_diagnostics`, `open_with_options` all apply once, on a fresh supervisor, before any lifecycle).
+> - **`SpawnRecord.owner`** — new public field on the exhaustively-constructed `SpawnRecord` (exhaustive constructors need it): `Option<ProcessFingerprint>` naming the ENGINE PROCESS supervising the record (schema v10's `owner_pid`/`owner_start_time` columns; `None` for pre-v10 rows and degraded start-time reads). Read by orphan adoption as the LIVE-OWNER boundary — see the live-owner block below. Stop semantics are unchanged: a no-handle stop re-acquires the process on demand.
+> - **`ProcessBackend::self_fingerprint` / `ProcessBackend::probe_alive`** — two new methods on the `ProcessBackend` port (implementors need them): this process's own fingerprint (the owner stamp the spawn path writes), and a no-handle live-identity probe (`adopt`'s exact pid + start-time check) for the owner-liveness gate.
 > - `hekma-engine` → **0.8.0** — v0.11.0 published 0.7.0, so this additive surface takes the next minor (the version-slot move that keeps the release-to-release semver gate honest; the same pattern the 0.7.0 slot move took after v0.10.0).
+
+> **Unreleased — the live-owner adoption boundary (cross-engine supervision honesty).**
+> Announced ahead of the release that ships it:
+>
+> - Any `hekma` command that opened an engine over a state directory re-adopted EVERY live write-ahead spawn record — including ATTACHED agents a LIVE engine process was still supervising elsewhere (a running `hekma serve`, an embedding, a long-lived command) — re-arming kill-on-drop for them, so the first benign command (`hekma agent list`, `show`, …) STOPPED that agent at its own exit. The boundary: the spawn record now carries its supervising OWNER engine's process fingerprint (schema v10, additive nullable columns), and orphan adoption SKIPS a non-detached record whose owner is still alive elsewhere (surfaced as a diagnostic naming the owner pid). Benign commands leave a live owner's agent alone; an explicit `stop` keeps its exact previous meaning — a stop that finds no handle re-acquires the process on demand by its spawn-record fingerprint and runs the real ladder, so cross-engine stops still terminate the agent and the terminal state stays truthful. Dead-owner records (the crashed-engine case adoption exists for) adopt byte-for-byte as before, and detached records ignore the owner entirely (adoption stays disarmed).
 
 > **Unreleased — transition-append compensation (durable-state honesty).**
 > Announced ahead of the release that ships it:

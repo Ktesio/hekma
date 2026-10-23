@@ -676,6 +676,13 @@ impl Supervisor {
             // Story 15-2: the durable Run identity (minted just above, so the
             // id is durable from the first moment the process is supervised).
             run_id: Some(run_id.clone()),
+            // The live-owner adoption boundary: THIS engine process is the
+            // supervising owner from the moment the record commits — a
+            // concurrent engine reading the record can tell a LIVE owner
+            // (skip: the agent is supervised here) from a crashed one (adopt
+            // armed, story 1-6). `None` on a degraded start-time read keeps
+            // the pre-boundary adopt-armed posture, never a spawn failure.
+            owner: self.backend.self_fingerprint(),
         };
         if let Err(e) = registry.write_spawn_record(&record) {
             // Persisting the record failed: kill the just-spawned process and

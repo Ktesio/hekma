@@ -1388,6 +1388,188 @@ fn default_stop_window_is_30s() {
     assert_eq!(DEFAULT_STOP_WINDOW, Duration::from_secs(30));
 }
 
+// ---------------------------------------------------------------------------
+// The live-owner adoption boundary (schema v10): adoption must skip a
+// NON-detached record whose recorded supervising owner is a LIVE process
+// other than this one, adopt + RE-STAMP when the owner is dead (story 1-6
+// crash recovery unchanged), and a stop from a non-owning engine must refuse
+// with a REAL on-demand re-acquisition stop (semantics unchanged). The
+// cross-process truth is pinned by tests/live_owner.rs (a real second
+// engine process); these are the fast in-process shapes of the same gate.
+// ---------------------------------------------------------------------------
+
+/// The crash model for the boundary tests: start `name` DETACHED under `sup`,
+/// then DROP `sup` cleanly — the child SURVIVES (the detached disarm), and
+/// its exit stays reaped by the detached-reaper thread the drop hands the
+/// child to (no zombie — a later stop's death confirmation can actually
+/// observe the exit). The write-ahead record keeps the fingerprint + owner
+/// the start path wrote. Returns the record. Tests then REWRITE the record
+/// into the shape under test (`detach=false` + the chosen owner) exactly
+/// like a prior engine's record would read.
+fn crash_engine_leaving_record(
+    sup: &mut Supervisor,
+    registry: &Registry,
+    name: &str,
+) -> crate::ports::SpawnRecord {
+    sup.start_detached(registry, name).unwrap();
+    let name = InstanceName::new(name).unwrap();
+    let record = registry.spawn_record(&name).unwrap().unwrap();
+    // Clean drop: the DETACHED child survives it (story 12-1) with its exit
+    // owned by the reaper thread — the closest in-process model of a crashed
+    // engine's surviving, always-reapable agent.
+    *sup = Supervisor::with_backoff(fast_backoff());
+    record
+}
+
+/// Best-effort cleanup of a live-but-unsupervised child left by a boundary
+/// test: rewrite its record as a plain attached orphan under a DEAD owner
+/// (an unreachable pid), let a fresh supervisor adopt it, and stop it
+/// through the real ladder (the child's detached-reaper thread reaps the
+/// exit, so the death confirmation succeeds).
+fn adopt_and_stop_orphan(registry: &Registry, name: &str) {
+    let name = InstanceName::new(name).unwrap();
+    let mut record = registry.spawn_record(&name).unwrap().unwrap();
+    record.detach = false;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    registry.write_spawn_record(&record).unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup.adopt_orphans(registry),
+        1,
+        "the dead-owner record adopts"
+    );
+    sup.stop(registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopt_orphans_skips_a_record_whose_owner_is_live_elsewhere() {
+    // THE boundary: a NON-detached record whose owner fingerprint names a
+    // LIVE process that is not this one (here: the AGENT's own fingerprint —
+    // any live non-self identity exercises the same gate) is supervised
+    // elsewhere. Adoption skips it wholesale: nothing held, nothing adopted,
+    // the row and the record byte-unchanged.
+    let (_state, _manifest, registry) = setup_fake("hosted", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let record = crash_engine_leaving_record(&mut sup1, &registry, "hosted");
+    let name = InstanceName::new("hosted").unwrap();
+    // Point the owner at a LIVE non-self process: the surviving child itself.
+    let mut owned_elsewhere = record.clone();
+    owned_elsewhere.detach = false; // the boundary under test is the attached shape
+    owned_elsewhere.owner = Some(record.fingerprint);
+    registry.write_spawn_record(&owned_elsewhere).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        0,
+        "a live-owner record must NOT be adopted"
+    );
+    assert!(sup2.running.is_empty(), "no handle may be re-held");
+    assert_eq!(
+        state_of(&registry, "hosted"),
+        LifecycleState::Running,
+        "the row is the live owner's truth, untouched"
+    );
+    let after = registry.spawn_record(&name).unwrap().unwrap();
+    assert_eq!(
+        after, owned_elsewhere,
+        "the record is byte-unchanged (no re-stamp, no reconcile, no clear)"
+    );
+    drop(sup2);
+    adopt_and_stop_orphan(&registry, "hosted");
+}
+
+#[test]
+fn adopt_orphans_adopts_a_dead_owner_record() {
+    // Story 1-6 unchanged: a record whose owner is DEAD (the crashed engine)
+    // adopts (armed, kill-on-drop at this supervisor's clean exit) — the
+    // boundary never interferes with a dead owner's record.
+    let (_state, _manifest, registry) = setup_fake("orphan", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "orphan");
+    let name = InstanceName::new("orphan").unwrap();
+    // A dead owner: an unreachable pid (probe_alive → Some(false) — the pid
+    // is gone; even a recycled pid fails the start-time identity check).
+    record.detach = false; // the story 1-6 attached-adoption shape
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "a dead-owner record adopts"
+    );
+    assert!(sup2.running.contains_key(&name), "the handle is re-held");
+    sup2.stop(&registry, "orphan", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopt_orphans_ignores_the_owner_for_a_detached_record() {
+    // The durable-detach promise is untouched by the boundary: a DETACHED
+    // record adopts DISARMED regardless of any owner (a live owner costs
+    // nothing there — the handle never kills at drop).
+    let (_state, _manifest, registry) = setup_fake("freebird", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    sup1.start_detached(&registry, "freebird").unwrap();
+    let name = InstanceName::new("freebird").unwrap();
+    let mut record = registry.spawn_record(&name).unwrap().unwrap();
+    assert!(record.detach, "the detached start recorded its detach flag");
+    // A live non-self owner on a DETACHED record: adoption proceeds anyway.
+    record.owner = Some(record.fingerprint);
+    registry.write_spawn_record(&record).unwrap();
+    drop(sup1); // the detached child survives the clean drop (story 12-1)
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "a detached record adopts regardless of its owner"
+    );
+    assert!(sup2.running.contains_key(&name));
+    sup2.stop(&registry, "freebird", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn stop_reacquires_a_live_owners_agent_on_demand_and_really_stops_it() {
+    // The stop-side half of the boundary: a non-owning engine holds no
+    // handle (adoption skipped the live owner's record), so its explicit
+    // stop RE-ACQUIRES the process by the record's fingerprint and runs the
+    // real ladder — the agent dies, the row settles truthfully to Stopped
+    // (never a phantom no-op over a live process; never a refusal).
+    let (_state, _manifest, registry) = setup_fake("heldsvc", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let record = crash_engine_leaving_record(&mut sup1, &registry, "heldsvc");
+    let name = InstanceName::new("heldsvc").unwrap();
+    let mut owned_elsewhere = record.clone();
+    owned_elsewhere.detach = false; // the boundary under test is the attached shape
+    owned_elsewhere.owner = Some(record.fingerprint);
+    registry.write_spawn_record(&owned_elsewhere).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(sup2.adopt_orphans(&registry), 0);
+    assert!(!sup2.running.contains_key(&name), "no handle from adoption");
+    let stopped = sup2
+        .stop(&registry, "heldsvc", Some(Duration::from_secs(5)))
+        .expect("an explicit stop re-acquires the process on demand");
+    assert_eq!(stopped.state, LifecycleState::Stopped);
+    assert!(
+        !sup2.running.contains_key(&name),
+        "the ladder tore the re-held handle down"
+    );
+    assert_eq!(
+        state_of(&registry, "heldsvc"),
+        LifecycleState::Stopped,
+        "the row settles truthfully"
+    );
+    drop(sup2);
+    // No cleanup helper needed: the on-demand stop already settled the
+    // record and ended the process.
+}
+
 #[test]
 fn read_events_from_missing_file_is_empty() {
     let dir = tempfile::tempdir().unwrap();

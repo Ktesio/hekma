@@ -218,6 +218,91 @@ impl Supervisor {
         // with the uniform InvalidTransition, before touching any process.
         let stopping = next_state(instance.state, LifecycleCommand::Stop)?;
 
+        // The live-owner boundary's STOP-side counterpart: an explicit stop
+        // against a record THIS engine holds no handle for (adoption skipped
+        // a LIVE owner's record — or the handle was never re-held for any
+        // other reason) RE-ACQUIRES the process on demand by its durable
+        // fingerprint, so `stop` semantics are EXACTLY what they were before
+        // the boundary: the ladder below really runs against the real
+        // process and the terminal state is true — never a phantom
+        // `stopped` row settled over a live process, and never a silent
+        // no-op where an operator asked for a stop. The re-acquired handle
+        // rides the record's detach flag (a detached record's handle comes
+        // back disarmed — nothing its drop could kill, and the ladder has
+        // confirmed death before then anyway). Benign commands never reach
+        // here: only the explicit stop path does. A record whose process is
+        // GONE adopts nothing — the honest no-process stop below stands.
+        if !self.running.contains_key(&name) {
+            let record = registry
+                .spawn_record(&name)
+                .ok()
+                .flatten()
+                .filter(|record| record.fingerprint.pid != 0);
+            if let Some(record) = record {
+                match self.backend.adopt(&record.fingerprint, record.detach) {
+                    Ok(Some(handle)) => {
+                        self.emit_diagnostic(&format!(
+                            "{}: re-acquired the supervised process for this stop by its \
+                             spawn-record fingerprint (this engine held no handle for it) — \
+                             the stop ladder runs on the re-held handle",
+                            name.as_str(),
+                        ));
+                        // A STOP-ONLY view: no capture pipeline, no listener,
+                        // no acp connection (the adopted process is not
+                        // re-piped); cursors at the CURRENT end of the logs
+                        // (the terminal drains below read to EOF from there,
+                        // exactly the adoption cursor discipline); the Run id
+                        // resumes from the record so any final usage the
+                        // agent flushes before it dies lands under the Run
+                        // it belongs to (a pre-v9 record with no id mints —
+                        // this stop is terminal, so no write-back is needed).
+                        let run_id = record.run_id.clone().unwrap_or_else(RunId::mint);
+                        let is_acp = registry
+                            .lookup(&name)
+                            .map(|instance| crate::acp::is_acp_kind(&instance.kind))
+                            .unwrap_or(false);
+                        self.running.insert(
+                            name.clone(),
+                            Supervised {
+                                handle,
+                                run_id,
+                                metering_source: registry
+                                    .metering_source(&name)
+                                    .unwrap_or_else(|_| "self-reported".to_string()),
+                                usage_cursor: self.agent_log_len(registry, &name),
+                                usage_park_attempts: None,
+                                stderr_usage_cursor: self.agent_stderr_log_len(registry, &name),
+                                stderr_usage_park_attempts: None,
+                                sentinel_lines_seen: false,
+                                is_acp,
+                                capture_mode: None,
+                                observed_park: None,
+                                breached_scopes: Default::default(),
+                                observed_listener: None,
+                                observed_source: None,
+                                stop_unconfirmed: false,
+                                adopted: true,
+                                acp: None,
+                            },
+                        );
+                    }
+                    // The process is gone: the honest no-process stop below.
+                    Ok(None) => {}
+                    Err(detail) => {
+                        // Surfaced (AI-18): the stop proceeds to the old
+                        // no-handle arm, which names the unreachable
+                        // process honestly rather than pretending.
+                        self.emit_diagnostic(&format!(
+                            "{}: could not re-acquire the supervised process for this stop \
+                             ({detail}); if it is still alive the stop settles the record \
+                             without reaching the process",
+                            name.as_str(),
+                        ));
+                    }
+                }
+            }
+        }
+
         let window = window.unwrap_or(DEFAULT_STOP_WINDOW);
         self.ensure_log_dir(registry, &name)?;
 
@@ -230,6 +315,50 @@ impl Supervisor {
             cause_override
                 .unwrap_or_else(|| TransitionCause::command(LifecycleCommand::Stop.as_str())),
         )?;
+
+        // A stop that starts from a REAL suspension must RESUME the process
+        // first: POSIX holds a signal to a SIGSTOPped process PENDING until
+        // SIGCONT, so the ladder's graceful SIGTERM could never be delivered
+        // to a suspended agent — the window always burned and the escalation
+        // force-killed it ("paused agents killed without a graceful stop",
+        // the reported serve-shutdown bug; a direct `kt agent stop` of a
+        // paused instance hit the same wall). Resuming lets the graceful
+        // signal reach the agent, so a cooperative agent exits within the
+        // window and the terminal cause is `StopGraceful`. The gate is the
+        // PRIOR row state (`paused`) — the suspension is a fact about the
+        // process this engine holds a handle for — and the resume runs
+        // BEFORE the acp turn-cancel write below (a frozen agent cannot read
+        // a cancel). Best-effort + surfaced (AI-18): a resume failure
+        // proceeds into the ladder anyway — the window may elapse and
+        // escalate, exactly the pre-fix outcome, never a blocked stop. On
+        // Windows the best-effort pause never suspends (a paused row's
+        // process keeps running), and `resume` there is the documented
+        // no-op — the ladder is unchanged on that platform.
+        if instance.state == LifecycleState::Paused {
+            let resume_outcome = self
+                .running
+                .get_mut(&name)
+                .map(|supervised| self.backend.resume(&mut supervised.handle));
+            match resume_outcome {
+                Some(Ok(())) => {
+                    self.emit_diagnostic(&format!(
+                        "{}: resumed the paused process before the stop ladder — a \
+                         suspended process cannot receive the graceful stop signal (it \
+                         stays pending until the process continues)",
+                        name.as_str(),
+                    ));
+                }
+                Some(Err(detail)) => {
+                    self.emit_diagnostic(&format!(
+                        "{}: could not resume the paused process before the stop ladder \
+                         ({detail}); the ladder proceeds regardless — the graceful window \
+                         may elapse and escalate to a forced kill",
+                        name.as_str(),
+                    ));
+                }
+                None => {}
+            }
+        }
 
         // Story 14-1 (spine AD-19): for an `acp` instance with a turn in
         // flight, write `session/cancel` FIRST (the bounded write; the agent
