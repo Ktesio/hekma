@@ -54,11 +54,10 @@ use super::secret::SecretString;
 /// will add it here. A parse failure is an ENGINE BUG (compile-time constant),
 /// surfaced as a typed [`ConfigError::MalformedLayer`], never a panic.
 const ENGINE_DEFAULTS_TOML: &str = "\
-# Ktesio engine-owned config defaults (spine AD-9 layer 1: weakest).
-# Embedded in the engine; the same for every Agent Instance. Intentionally EMPTY
-# in Epic 2.1: config ships only keys it can honestly honor, and no engine-wide
-# unified key is engine-controlled yet. The unified schema grows additively in
-# later Epic-2 stories (this const gains keys as they become config-controlled).
+# Hekma engine config defaults (the weakest config layer).
+# Embedded in the engine; the same for every Agent Instance. Intentionally empty:
+# no unified config key is engine-controlled yet. Keys are added here as they
+# become engine-controlled.
 ";
 
 /// A human label for the embedded engine-defaults layer in diagnostics (it has
@@ -469,7 +468,7 @@ impl Registry {
         // Minimal instance-level TOML (AD-9: TOML at every layer). Kept tiny;
         // Epic 2 owns the real config schema and layering.
         let body = format!(
-            "# Ktesio Agent Instance config (instance layer).\n\
+            "# Hekma Agent Instance config (instance layer).\n\
              # Managed by the engine; edit with care.\n\
              name = \"{name}\"\n",
             name = name.as_str(),

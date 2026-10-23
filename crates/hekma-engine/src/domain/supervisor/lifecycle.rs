@@ -614,14 +614,14 @@ impl Supervisor {
                         // on a running process); `stop` ends it — but for a
                         // breach-driven pause, `stop` is the ONLY safe advice.
                         (LifecycleCommand::Pause, true) => format!(
-                            "kt agent stop {name} (the pause was budget-driven and the \
+                            "hekma agent stop {name} (the pause was budget-driven and the \
                              per-Run breach latch is spent — resuming would leave the \
                              over-budget run unenforced)"
                         ),
                         (LifecycleCommand::Pause, false) => {
                             format!(
-                                "kt agent resume {name} to realign the ledger, or \
-                                 kt agent stop {name} to end the instance"
+                                "hekma agent resume {name} to realign the ledger, or \
+                                 hekma agent stop {name} to end the instance"
                             )
                         }
                         // Row says `running`, process still suspended: only
@@ -630,10 +630,10 @@ impl Supervisor {
                         // process where SIGTERM cannot).
                         (LifecycleCommand::Resume, _) => {
                             format!(
-                                "kt agent stop {name} (its escalation reaches a suspended process)"
+                                "hekma agent stop {name} (its escalation reaches a suspended process)"
                             )
                         }
-                        (_, _) => format!("kt agent stop {name}"),
+                        (_, _) => format!("hekma agent stop {name}"),
                     };
                     let signal_failure = format!(
                         "{}: the committed {} transition says '{}', but the signal failed: {} — \

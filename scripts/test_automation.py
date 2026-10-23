@@ -415,15 +415,15 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("group: ${{ github.workflow }}-${{ github.ref }}", ci)
         self.assertIn("cancel-in-progress: true", ci)
 
-    def test_docs_probe_workflow_watches_every_registered_page(self) -> None:
-        # Story 11-5 (epic-7-retro-item-2): a scheduled probe watches the
-        # DEPLOYED docs site (Cloudflare Pages, outside repo CI) because a
-        # silent deploy death went unnoticed for two weeks (Aug 2026) while
-        # repo CI stayed green. Pin the shape: schedule + manual dispatch, no
-        # `needs:` coupling to CI, every docs/meta.json page probed for HTTP
-        # 200 with each failure NAMED (never fail-fast — one run must report
-        # the whole blast radius), and a content marker on the newest page so
-        # a 200-from-an-error-page cannot false-pass.
+    def test_docs_probe_workflow_watches_every_published_page(self) -> None:
+        # A scheduled probe watches the DEPLOYED docs site (Cloudflare Pages,
+        # built from the ktesio.dev repository) because a silent deploy death
+        # went unnoticed for two weeks (Aug 2026) while repo CI stayed green.
+        # Pin the shape: schedule + manual dispatch, no `needs:` coupling to
+        # CI, every page in the SITE'S OWN sitemap probed for HTTP 200 with
+        # each failure NAMED (never fail-fast), an empty or missing sitemap is
+        # itself a failure, and two title markers so a 200-from-an-error-page
+        # cannot false-pass.
         probe = (
             release_docs.ROOT / ".github" / "workflows" / "docs-probe.yml"
         ).read_text(encoding="utf-8")
@@ -436,35 +436,40 @@ class ReleaseDocsTests(unittest.TestCase):
             [line for line in probe.splitlines() if line.strip().startswith("needs:")],
             "the docs probe must not declare job-level needs",
         )
-        # The page list is read from the site's own registry at probe time.
-        self.assertIn("jq -r '.pages[] | select(startswith(\"---\") | not)' docs/meta.json", probe)
-        # v0.8.0, amended 2026-09-18: the probe checks the CANONICAL host
-        # only — the retired legacy host is repurposed by the owner, so
-        # there is no legacy-host leg anymore.
-        # Amended again 2026-10-08 (site restructure): the canonical pages
-        # live on the /docs/ MOUNT with trailing slashes. The probe was born
-        # flat and red-failed every scheduled run for three weeks while the
-        # site was healthy — these pins hold it to the mount so that class
-        # of drift lands as a red probe fix, not three weeks of noise.
-        self.assertIn('base="https://hekma.ktesio.dev/docs"', probe)
+        # The page list is the site's own sitemap, read at probe time. The
+        # docs moved out of this repository (2026-10-22), so docs/meta.json
+        # must not drive the probe again.
+        self.assertIn('"$site/sitemap.xml"', probe)
+        self.assertIn("grep -o '<loc>[^<]*</loc>'", probe)
+        self.assertNotIn("jq -r", probe)
+        self.assertNotIn("<<< 'docs/meta.json'", probe)
+        self.assertFalse(
+            [line for line in probe.splitlines()
+             if "docs/meta.json" in line and not line.strip().startswith("#")],
+            "docs/meta.json must not drive the probe",
+        )
+        self.assertNotIn("actions/checkout", probe)
+        # An unreachable or near-empty sitemap fails instead of passing on an
+        # empty list.
+        self.assertIn("could not be fetched", probe)
+        self.assertIn('if [ "$docs_count" -lt 10 ]; then', probe)
+        # Every page must answer 200, and each failure is named.
+        self.assertIn('site="https://hekma.ktesio.dev"', probe)
         self.assertIn("hekma.ktesio.dev page is DOWN", probe)
         self.assertIn("expected 200", probe)
         self.assertNotIn("docs.ktesio.dev", probe)
-        # The two special-case URL mappings mirror docs/lib/source.ts's
-        # slugs(): README is the docs index (/docs/), RELEASE_NOTES serves
-        # at /docs/release-notes/.
-        self.assertIn('README) url="$base/"', probe)
-        self.assertIn('RELEASE_NOTES) url="$base/release-notes/"', probe)
-        # The restructure's contracts, pinned: the landing page carries its
-        # title marker, and the legacy flat URLs (baked into published
-        # release bodies and deprecated-crate READMEs) must keep 301ing to
-        # the exact mount URL — a dropped redirect dangles public links.
-        self.assertIn('marker="Hekma: run AI agents like services"', probe)
-        self.assertIn('RELEASE_NOTES) flat="$base/release-notes" want="$mount/release-notes/"', probe)
-        self.assertIn("legacy flat URL broke", probe)
-        # The newest-page content marker (a bare 200 is not enough).
-        self.assertIn('marker="Release Notes"', probe)
-        self.assertIn('url="https://hekma.ktesio.dev/docs/release-notes/"', probe)
+        # Title markers on the landing page and the docs home.
+        self.assertIn('"<title>Hekma: run AI agents like services</title>"', probe)
+        self.assertIn('"<title>Hekma docs</title>"', probe)
+        # The legacy URLs baked into published release bodies and the
+        # deprecated crates' READMEs must keep 301ing to the exact target,
+        # including the maintainer pages that moved back to this repository.
+        self.assertIn("/migration $mount/migration/", probe)
+        self.assertIn("/release-notes $mount/release-notes/", probe)
+        self.assertIn("/testing $repo_docs/testing.md", probe)
+        self.assertIn("legacy URL broke", probe)
+        # The installer URLs keep serving.
+        self.assertIn('"https://cli.ktesio.dev/hekma/install.sh"', probe)
 
     def test_ci_test_job_runs_on_three_os_matrix(self) -> None:
         # Story 1.4 (AD-4, NFR-2): the `test` job runs on a 3-OS matrix so the

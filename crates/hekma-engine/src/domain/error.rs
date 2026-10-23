@@ -77,7 +77,7 @@ pub enum RegistryError {
     #[error(
         "Agent Instance '{name}' is '{state}'; a Memory Backing cannot be hot-swapped — \
          attach/detach need a terminal state (registered, stopped, or failed). Bring it to \
-         a terminal state first: kt agent stop {name} from running or paused"
+         a terminal state first: hekma agent stop {name} from running or paused"
     )]
     MemoryBackingHotSwap {
         /// The instance whose backing was being changed.
@@ -92,7 +92,7 @@ pub enum RegistryError {
     /// kind is an idempotent success and never reaches this error. Names both
     /// kinds + the remediation.
     #[error(
-        "Agent Instance '{name}' already has a '{attached}' Memory Backing attached; detach it before attaching '{requested}': kt agent memory detach {name}"
+        "Agent Instance '{name}' already has a '{attached}' Memory Backing attached; detach it before attaching '{requested}': hekma agent memory detach {name}"
     )]
     MemoryBackingKindConflict {
         /// The instance whose backing conflicts.
@@ -179,7 +179,7 @@ pub enum RegistryError {
     /// [`RegistryError::Io`] so `kt` can name the orphaned row and its cleanup
     /// (mirrors [`RegistryError::RemoveLeftoverHome`]).
     #[error(
-        "Agent Instance '{name}' left an orphaned registry row after its Agent Home could not be created ({home_error}) and the rollback delete also failed ({rollback_error}); remove it with: kt agent remove {name} --force"
+        "Agent Instance '{name}' left an orphaned registry row after its Agent Home could not be created ({home_error}) and the rollback delete also failed ({rollback_error}); remove it with: hekma agent remove {name} --force"
     )]
     RegisterOrphanRow {
         /// The orphaned instance's name.
@@ -555,7 +555,7 @@ pub enum EngineError {
     #[error(
         "Agent Instance '{name}' already has an ACP turn in flight; the acp kind serializes \
          turns per session — wait for the current turn to complete (its stopReason lands in \
-         `kt agent logs`), or stop the instance"
+         `hekma agent logs`), or stop the instance"
     )]
     AcpTurnInFlight {
         /// The instance the second prompt targeted.

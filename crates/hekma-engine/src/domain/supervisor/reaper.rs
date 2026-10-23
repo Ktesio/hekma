@@ -642,9 +642,8 @@ impl Supervisor {
                     // adoption, through the choke point.
                     self.emit_diagnostic(&format!(
                         "{}: adopted from a previous engine; metering resumes at the \
-                         current end of the instance logs — any usage the previous \
-                         engine still held in memory (its park) at its death is not \
-                         recoverable and goes unaccounted",
+                         current end of the instance logs, so usage the previous engine \
+                         had read but not yet recorded when it exited is not counted",
                         name.as_str(),
                     ));
                     // Story 15-2: RESUME the persisted Run id (the durable Run
