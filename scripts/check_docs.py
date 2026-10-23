@@ -82,7 +82,12 @@ LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 PLANNING_PROVENANCE_RE = re.compile(
     r"(?i)\bstory[ -]?\d"
     r"|\bepic[ -]?\d+\b"
-    r"|\bretro\b"
+    # "retro" as a STANDALONE word is planning provenance ("the retro",
+    # "Retro #165"); hyphen-joined technical tokens are not — the governance
+    # vectors' cover tag `no-retro-repricing` is a wire-contract string the
+    # public docs must quote verbatim. Bound both sides against word chars
+    # AND hyphens so "retroactive"/"no-retro-…" never match.
+    r"|(?<![-\w])retro(?![-\w])"
     r"|\bAI-\d+"
     r"|\bCP-\d"
     r"|\bR\d+[–-]R?\d*"
@@ -128,6 +133,7 @@ AGENT_COMMANDS = {
     "show",
     "config",
     "memory",
+    "governance-vectors",
 }
 # `kt agent config` nests one level deeper (`ConfigCommands`).
 CONFIG_COMMANDS = {"get", "set"}

@@ -420,6 +420,25 @@ hekma agent config get demo --reveal
 
 Values resolve across four layers — engine defaults &lt; agent-kind defaults &lt; instance config &lt; invocation overrides — and each value names its winning source layer (a **Source** column, or a `source` field with `--json`).
 
+## `hekma agent governance-vectors [--json]`
+
+Print the governance conformance vectors — the versioned, SHA-256-checksummed
+decision artifact (see [Governance conformance vectors](governance.md)) that a
+Host pins to prove its external budget/cost guard matches the engine's rules.
+
+```bash
+hekma agent governance-vectors
+hekma agent governance-vectors --json | sha256sum
+```
+
+Bare form prints a summary: the vectors version, the SHA-256 checksum, the
+case count and mix, and the artifact path. `--json` prints the raw canonical
+bytes — byte-for-byte the released `vectors-v1.json` (one trailing newline, no
+added output), so piping the output into `sha256sum` reproduces the published
+checksum exactly. The command reads the artifact embedded in the binary; it
+touches no state directory, needs no registered instance, and works offline.
+The same files ship as release assets with every release.
+
 ## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr>] [--bearer-secret <name>] [--state-dir <dir>] [--log-capture <mode>]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.

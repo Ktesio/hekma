@@ -61,14 +61,15 @@ use crate::ports::{
 };
 use crate::time::now_rfc3339;
 
-use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
+use super::budget::{BreachAction, BreachScope};
 use super::bus::{EngineEvent, EventBus};
 use super::config::{self, ConfigLayer};
-use super::cost::{CostEvaluator, EstimateLabel, Micros};
+use super::cost::{EstimateLabel, Micros};
 use super::error::EngineError;
 use super::event::{
     BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
 };
+use super::governance;
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;

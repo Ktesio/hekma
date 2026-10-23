@@ -4,6 +4,15 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — governance conformance vectors: the portable decision artifact.**
+> Announced ahead of the release that ships it:
+>
+> - **The governance vectors artifact** (`crates/hekma-engine/governance/vectors-v1.json` + its `.sha256` sidecar): a versioned, SHA-256-checksummed JSON document of 20 worked cases (10 decision, 10 derivation) generated FROM the engine's own evaluators and re-run against them by verifier tests on every run — byte-identical or red. It pins the eight budget/cost rules a Host must match (`threshold-ge`, `latch-per-scope`, `latch-re-arm`, `token-before-dollar`, `integer-micros`, `round-half-up`, `saturation`, `no-retro-repricing`), each covered by ≥1 case, with the full-cover assertion also enforced by the verifier.
+> - **`enforce_budget` routes its decision half through the new pure `governance::decide`** (token dimension evaluated first, dollar second, each filtered by the `(dimension, scope)` latch) — one decision implementation shared with the artifact, so the two cannot drift by construction. Zero behavior change: the pre-existing budget/cost/breach test battery passes unchanged, and the single-evaluator guard tests were re-pointed to pin the new architecture (the evaluators live in the decision core; the choke point routes through `decide`). The record-first-then-act halves stay in the supervisor.
+> - **New additive engine surface** — `hekma-engine` → **0.9.0**: `governance::decide` with the `GovernanceInput`/`GovernanceOutcome` types, `run_derivation`, `canonical_json`, `generate`, `checksum_file_content`, the `governance_vectors_checksum()`/`governance_vectors_json()` accessors, the `GOVERNANCE_VECTORS_*` constants, and the case/document schema types. Additive only; no exhaustive enum gained an arm.
+> - **New CLI verb** `hekma agent governance-vectors [--json]`: the human path prints a summary (version, checksum, case mix, artifact path); `--json` prints the canonical bytes verbatim, so `hekma agent governance-vectors --json | sha256sum` reproduces the published checksum exactly.
+> - **Release + docs**: the artifact and its sidecar ship as release assets (the sidecar inside the published checksums manifest); a new CI job verifies the sidecar and parses the artifact as a stand-in Host; `docs/governance.md` documents the schema, the pinning flow, and the versioning policy (additive cases = a minor bump; any expected-output/input/schema change = a major bump, announced).
+
 > **Unreleased — graceful stops of paused agents (serve shutdown honesty).**
 > Announced ahead of the release that ships it:
 >

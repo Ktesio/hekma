@@ -15,6 +15,7 @@ const files = [
   'manifest.md',
   'adapter-contract.md',
   'embedding.md',
+  'governance.md',
   'lockfile.md',
   'architecture.md',
   'agents.md',

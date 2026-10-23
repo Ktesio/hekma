@@ -649,14 +649,22 @@ fn no_retroactive_repricing_a_rate_change_reprices_future_events_only() {
 #[test]
 fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
     // AD-7 companion invariant for DOLLARS (mirroring budget.rs's token audit): NO
-    // code path other than the supervisor's ONE ingestion→commit choke point may
+    // code path other than the ONE governance decision implementation may
     // EVALUATE a Cost Cap. A source scan proves every CALL to
-    // `CostEvaluator::evaluate(` lives ONLY in `domain/supervisor/usage.rs` (+ its own home
-    // `domain/cost.rs` unit tests). If a future change scatters a second enforcement
-    // site, this fails. Pure source scan (no OS cfg); runs on every OS.
+    // `CostEvaluator::evaluate(` lives ONLY in the shared decision core
+    // `domain/governance.rs` (story 19-1: `decide()` — which the supervisor
+    // choke point routes through) + its own home `domain/cost.rs` unit tests. If a
+    // future change scatters a second enforcement site, this fails. Pure source
+    // scan (no OS cfg); runs on every OS.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut eval_files = std::collections::BTreeSet::new();
+    let mut choke_routes_through_decide = false;
     visit_rs(&src, &mut |path, text| {
+        let rel = path
+            .strip_prefix(&src)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
         for line in text.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//")
@@ -665,29 +673,39 @@ fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
             {
                 continue;
             }
+            if rel == "domain/supervisor/usage.rs" && line.contains("governance::decide(") {
+                choke_routes_through_decide = true;
+            }
             if line.contains("CostEvaluator::evaluate(") {
-                eval_files.insert(
-                    path.strip_prefix(&src)
-                        .unwrap_or(path)
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                );
+                eval_files.insert(rel.clone());
             }
         }
     });
-    let allowed: std::collections::BTreeSet<String> =
-        ["domain/supervisor/usage.rs", "domain/cost.rs"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+    // The ONLY files that may CALL the evaluator: `domain/governance.rs` (the
+    // shared decision core — the ONE decision implementation the choke point
+    // routes through; not a second enforcement path) and `domain/cost.rs` (the
+    // evaluator's own home — its pure unit tests exercise it directly; that is
+    // not a second enforcement path either).
+    let allowed: std::collections::BTreeSet<String> = [
+        "domain/supervisor/usage.rs",
+        "domain/cost.rs",
+        "domain/governance.rs",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     let violations: Vec<&String> = eval_files.difference(&allowed).collect();
     assert!(
         violations.is_empty(),
         "CostEvaluator::evaluate is called outside the ingestion choke point: {violations:?}"
     );
     assert!(
-        eval_files.contains("domain/supervisor/usage.rs"),
-        "the enforcement choke point must call CostEvaluator::evaluate; callers: {eval_files:?}"
+        eval_files.contains("domain/governance.rs"),
+        "the shared decision core must call CostEvaluator::evaluate; callers: {eval_files:?}"
+    );
+    assert!(
+        choke_routes_through_decide,
+        "the enforcement choke point must route through governance::decide (story 19-1)"
     );
 }
 

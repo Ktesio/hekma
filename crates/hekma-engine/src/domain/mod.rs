@@ -16,6 +16,7 @@ mod cost;
 mod error;
 mod event;
 mod fleet;
+mod governance;
 mod instance;
 mod lifecycle;
 mod name;
@@ -54,6 +55,14 @@ pub use event::{
 pub use fleet::{
     AcpContextCostView, AcpContextUsageView, BudgetView, FleetEntry, FleetListing, FleetTotals,
     Supervision, UsageGapNotice, UsageView,
+};
+pub use governance::{
+    canonical_json, checksum_file_content, decide, generate, governance_vectors_checksum,
+    run_derivation, Case, CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, GOVERNANCE_VECTORS_ARTIFACT_ID,
+    GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
+    GOVERNANCE_VECTORS_VERSION,
 };
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;

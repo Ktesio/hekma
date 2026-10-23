@@ -2450,6 +2450,76 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
     }
 }
 
+/// `governance-vectors` (story 19-1, AD-7/FR-44): print the governance
+/// conformance vectors — the versioned, SHA-256-checksummed decision artifact
+/// a non-Rust Host pins to prove its external guard matches the engine's
+/// budget/cost rules. `--json` prints the EMBEDDED artifact bytes VERBATIM
+/// (byte-for-byte the released `vectors-v1.json`, the checksum pin target);
+/// the human path prints a summary read from those same embedded bytes.
+pub fn governance_vectors(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let embedded = hekma_engine::governance_vectors_json();
+    if json {
+        // No added newline: the canonical document already ends with exactly
+        // one, so stdout IS the pin target (a `sha256sum` of this output
+        // matches the published `.sha256`).
+        print!("{embedded}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        governance_vectors_summary(embedded, &hekma_engine::governance_vectors_checksum())?
+    );
+    Ok(())
+}
+
+/// The `governance-vectors` human summary — artifact id, vectors + schema
+/// versions, engine version, SHA-256 checksum, and the case mix — read from
+/// the embedded bytes (the binary cannot drift from its artifact). `Err` only
+/// if the embedded document fails to parse: a build defect, reported honestly
+/// (surfaced, not silent) rather than printed as a fabricated summary.
+fn governance_vectors_summary(
+    embedded: &str,
+    checksum: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = match serde_json::from_str(embedded) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(AgentIo {
+                message: format!(
+                    "The embedded governance vectors artifact failed to parse: {err}. \
+                     The artifact in this build is corrupt — please report it."
+                ),
+            }
+            .into())
+        }
+    };
+    let artifact = value["artifact"].as_str().unwrap_or("(missing)");
+    let vectors_version = value["vectors_version"].as_str().unwrap_or("(missing)");
+    let schema_version = value["schema_version"].as_u64().unwrap_or(0);
+    let engine_version = value["provenance"]["engine_version"]
+        .as_str()
+        .unwrap_or("(missing)");
+    let cases = value["cases"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let decision_cases = cases
+        .iter()
+        .filter(|case| case["kind"] == "decision")
+        .count();
+    let derivation_cases = cases.len() - decision_cases;
+    Ok(format!(
+        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation)\n  \
+         artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
+         guard on any upgrade\n",
+        ui::success_text(format!(
+            "governance conformance vectors {vectors_version} — artifact `{artifact}`, \
+             schema v{schema_version}, engine v{engine_version}"
+        )),
+        cases.len(),
+        decision_cases,
+        derivation_cases,
+        hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    ))
+}
+
 /// Open the engine using the default (or env-overridden) state dir.
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
@@ -4897,5 +4967,74 @@ mod tests {
         for mapped in [unresolved, log, metering, backend, store] {
             assert_eq!(classify(mapped.as_ref()), ExitCode::General);
         }
+    }
+
+    // ---- governance-vectors (story 19-1) ----
+
+    #[test]
+    fn governance_vectors_summary_names_the_pin_facts() {
+        let summary = governance_vectors_summary(
+            hekma_engine::governance_vectors_json(),
+            &hekma_engine::governance_vectors_checksum(),
+        )
+        .expect("the embedded artifact parses");
+        // The pin a Host declares against: version + checksum + case count.
+        assert!(
+            summary.contains(hekma_engine::GOVERNANCE_VECTORS_VERSION),
+            "the summary names the vectors version: {summary}"
+        );
+        assert!(
+            summary.contains(&hekma_engine::governance_vectors_checksum()),
+            "the summary carries the sha256: {summary}"
+        );
+        assert!(
+            summary.contains(hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH),
+            "the summary names the artifact path: {summary}"
+        );
+        assert!(
+            summary.contains("10 decision") && summary.contains("10 derivation"),
+            "the summary gives the case mix: {summary}"
+        );
+        assert!(
+            summary.ends_with('\n'),
+            "the summary is newline-terminated: {summary}"
+        );
+    }
+
+    #[test]
+    fn governance_vectors_summary_is_an_honest_error_when_the_document_is_corrupt() {
+        // A corrupt embed must NOT print a fabricated summary — an honest
+        // error naming the defect (surfaced, not silent).
+        let err = governance_vectors_summary("{\"cases\": [", "deadbeef")
+            .expect_err("a corrupt document is an error");
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "the error names the parse failure: {err}"
+        );
+    }
+
+    #[test]
+    fn governance_vectors_handler_runs_both_paths_in_process() {
+        // The handler is I/O-free beyond stdout: both paths succeed in-process
+        // (the human summary + the verbatim `--json` dump, captured by the
+        // test runner). Byte fidelity of the `--json` path is pinned by the
+        // real-binary e2e test (`tests/governance_cli.rs`); here the artifact
+        // contract itself is pinned against the committed file.
+        governance_vectors(false).expect("the human path succeeds");
+        governance_vectors(true).expect("the json path succeeds");
+        let embedded = hekma_engine::governance_vectors_json();
+        let committed = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../hekma-engine/governance/vectors-v1.json"),
+        )
+        .expect("the committed artifact reads");
+        assert_eq!(
+            embedded, committed,
+            "the embedded bytes are the committed artifact, byte for byte"
+        );
+        assert!(
+            embedded.ends_with("}\n") && !embedded.ends_with("\n\n"),
+            "exactly one trailing newline"
+        );
     }
 }

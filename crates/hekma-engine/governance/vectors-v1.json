@@ -1,0 +1,608 @@
+{
+  "artifact": "hekma-governance-vectors",
+  "schema_version": 1,
+  "vectors_version": "1.0.0",
+  "provenance": {
+    "engine_version": "0.9.0",
+    "generated_from": [
+      "BudgetEvaluator",
+      "CostEvaluator",
+      "cost_micros",
+      "cost_micros_with_cached",
+      "governance::decide"
+    ]
+  },
+  "cases": [
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-exact-at-ceiling",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 0,
+          "cumulative_total": 100,
+          "budget": {
+            "per_run": null,
+            "cumulative": 100
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative",
+            "action": "pause",
+            "limit": 100,
+            "observed": 100
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-one-below-ceiling",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 0,
+          "cumulative_total": 99,
+          "budget": {
+            "per_run": null,
+            "cumulative": 100
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": []
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-zero-ceiling-breaches-on-zero",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 0,
+          "cumulative_total": 0,
+          "budget": {
+            "per_run": 0,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run",
+            "action": "pause",
+            "limit": 0,
+            "observed": 0
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-dollar-exact-at-cap",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 10,
+          "cumulative_total": 10,
+          "budget": {
+            "per_run": null,
+            "cumulative": 1000
+          },
+          "action": "pause"
+        },
+        "dollar": {
+          "run_cost": 5000000,
+          "cumulative_cost": 5000000,
+          "cap": {
+            "per_run": 5000000,
+            "cumulative": 50000000
+          },
+          "action": "warn"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "warn",
+            "limit": 5000000,
+            "observed": 5000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-per-scope-holds-across-re-evaluation",
+      "covers": [
+        "latch-per-scope"
+      ],
+      "input": {
+        "token": {
+          "run_total": 100,
+          "cumulative_total": 100,
+          "budget": {
+            "per_run": 100,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-per-scope-token-and-dollar-same-scope-fire",
+      "covers": [
+        "latch-per-scope",
+        "token-before-dollar"
+      ],
+      "input": {
+        "token": {
+          "run_total": 100,
+          "cumulative_total": 100,
+          "budget": {
+            "per_run": 100,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "dollar": {
+          "run_cost": 2000000,
+          "cumulative_cost": 2000000,
+          "cap": {
+            "per_run": 2000000,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run",
+            "action": "pause",
+            "limit": 100,
+            "observed": 100
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "pause",
+            "limit": 2000000,
+            "observed": 2000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-scope-and-dimension-independence",
+      "covers": [
+        "latch-per-scope"
+      ],
+      "input": {
+        "token": {
+          "run_total": 50,
+          "cumulative_total": 5000,
+          "budget": {
+            "per_run": 1000,
+            "cumulative": 1000
+          },
+          "action": "warn"
+        },
+        "dollar": {
+          "run_cost": 3000000,
+          "cumulative_cost": 3000000,
+          "cap": {
+            "per_run": 3000000,
+            "cumulative": null
+          },
+          "action": "warn"
+        },
+        "latched": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative",
+            "action": "warn",
+            "limit": 1000,
+            "observed": 5000
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "warn",
+            "limit": 3000000,
+            "observed": 3000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          },
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-re-arm-fresh-run-fires-again",
+      "covers": [
+        "latch-re-arm"
+      ],
+      "input": {
+        "token": {
+          "run_total": 0,
+          "cumulative_total": 100,
+          "budget": {
+            "per_run": null,
+            "cumulative": 100
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative",
+            "action": "pause",
+            "limit": 100,
+            "observed": 100
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-token-before-dollar-both-armed-both-tripping",
+      "covers": [
+        "token-before-dollar"
+      ],
+      "input": {
+        "token": {
+          "run_total": 0,
+          "cumulative_total": 500,
+          "budget": {
+            "per_run": null,
+            "cumulative": 500
+          },
+          "action": "stop"
+        },
+        "dollar": {
+          "run_cost": 0,
+          "cumulative_cost": 9000000,
+          "cap": {
+            "per_run": null,
+            "cumulative": 9000000
+          },
+          "action": "stop"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative",
+            "action": "stop",
+            "limit": 500,
+            "observed": 500
+          },
+          {
+            "dimension": "dollars",
+            "scope": "cumulative",
+            "action": "stop",
+            "limit": 9000000,
+            "observed": 9000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          },
+          {
+            "dimension": "dollars",
+            "scope": "cumulative"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-unarmed-token-dimension-skipped-dollar-only",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "dollar": {
+          "run_cost": 0,
+          "cumulative_cost": 12500000,
+          "cap": {
+            "per_run": null,
+            "cumulative": 5000000
+          },
+          "action": "stop"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "dollars",
+            "scope": "cumulative",
+            "action": "stop",
+            "limit": 5000000,
+            "observed": 12500000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "dollars",
+            "scope": "cumulative"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-integer-micros-split-per-direction-rates",
+      "covers": [
+        "integer-micros"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 500000,
+      "output_tokens": 250000,
+      "rate": {
+        "input_micros_per_1m": 2000000,
+        "output_micros_per_1m": 8000000
+      },
+      "expected_micros": 3000000
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-integer-micros-single-token-sub-cent",
+      "covers": [
+        "integer-micros"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 1,
+      "output_tokens": 0,
+      "rate": {
+        "input_micros_per_1m": 3000000,
+        "output_micros_per_1m": 15000000
+      },
+      "expected_micros": 3
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-integer-micros-cached-resplit",
+      "covers": [
+        "integer-micros"
+      ],
+      "derivation": "cost-micros-with-cached",
+      "input_tokens": 1000000,
+      "output_tokens": 1000000,
+      "cached_tokens": 800000,
+      "rate": {
+        "input_micros_per_1m": 3000000,
+        "output_micros_per_1m": 15000000,
+        "cached_micros_per_1m": 300000
+      },
+      "expected_micros": 15840000
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-integer-micros-unset-cached-rate-conservative",
+      "covers": [
+        "integer-micros"
+      ],
+      "derivation": "cost-micros-with-cached",
+      "input_tokens": 1000000,
+      "output_tokens": 2000000,
+      "cached_tokens": 800000,
+      "rate": {
+        "input_micros_per_1m": 3000000,
+        "output_micros_per_1m": 15000000
+      },
+      "expected_micros": 33000000
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-round-half-up-tie-rounds-up",
+      "covers": [
+        "round-half-up"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 1500000,
+      "output_tokens": 0,
+      "rate": {
+        "input_micros_per_1m": 1,
+        "output_micros_per_1m": 0
+      },
+      "expected_micros": 2
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-round-half-up-below-tie-rounds-down",
+      "covers": [
+        "round-half-up"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 1499999,
+      "output_tokens": 0,
+      "rate": {
+        "input_micros_per_1m": 1,
+        "output_micros_per_1m": 0
+      },
+      "expected_micros": 1
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-round-half-up-per-direction-independence",
+      "covers": [
+        "round-half-up"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 1500000,
+      "output_tokens": 1499999,
+      "rate": {
+        "input_micros_per_1m": 1,
+        "output_micros_per_1m": 1
+      },
+      "expected_micros": 3
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-saturation-max-tokens-max-rate",
+      "covers": [
+        "saturation"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 18446744073709551615,
+      "output_tokens": 18446744073709551615,
+      "rate": {
+        "input_micros_per_1m": 18446744073709551615,
+        "output_micros_per_1m": 18446744073709551615
+      },
+      "expected_micros": 9223372036854775807
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-saturation-cached-derivation-saturates",
+      "covers": [
+        "saturation"
+      ],
+      "derivation": "cost-micros-with-cached",
+      "input_tokens": 18446744073709551615,
+      "output_tokens": 18446744073709551615,
+      "cached_tokens": 18446744073709551615,
+      "rate": {
+        "input_micros_per_1m": 18446744073709551615,
+        "output_micros_per_1m": 18446744073709551615,
+        "cached_micros_per_1m": 18446744073709551615
+      },
+      "expected_micros": 9223372036854775807
+    },
+    {
+      "kind": "derivation",
+      "id": "derivation-no-retro-repricing-rows-sum-at-their-own-rates",
+      "covers": [
+        "no-retro-repricing"
+      ],
+      "derivation": "two-row-own-rate-sum",
+      "rows": [
+        {
+          "input_tokens": 1000000,
+          "output_tokens": 0,
+          "rate": {
+            "input_micros_per_1m": 1000000,
+            "output_micros_per_1m": 15000000
+          }
+        },
+        {
+          "input_tokens": 1000000,
+          "output_tokens": 0,
+          "rate": {
+            "input_micros_per_1m": 3000000,
+            "output_micros_per_1m": 15000000
+          }
+        }
+      ],
+      "at_latest_rate": 6000000,
+      "expected_micros": 4000000
+    }
+  ]
+}
