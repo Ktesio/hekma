@@ -40,7 +40,7 @@ Per-OS honesty is the adapter author's job: the contract lets an author declare 
 
 - **Start** is the only mandatory template. The resolved launch (exec/args/env) is snapshotted at registration.
 - **An omitted stop template is normative**: the engine's process termination (signal, then escalation) IS the stop; the TCK asserts the child process exits. Adapters to agents with a graceful-stop verb declare a stop template. There is no graceful-stop acknowledgment concept in v1: an agent's self-exit (e.g. an in-chat restart hand-off) is an unrequested exit handled by the crash/restart policy — any non-zero exit while Running is a crash, and the restart policy relaunches with the same persisted launch.
-- **Readiness vs liveness**: v1 defines no readiness concept distinct from process liveness and no endpoint-discovery surface. A supervisor that must know where an HTTP-native child listens should pin its port via the start template and own collision handling, or parse the child's documented startup line — that is an adapter-convention concern, not contract machinery.
+- **Readiness vs liveness**: the contract now separates the two (added at 1.1.0, additive same-major). Liveness stays process-level: the engine's startup watch declares a freshly spawned process that does not die immediately `running`-eligible. **Readiness** is an adapter-declared gate — the optional `[readiness]` section (ONE probe: `http-get`, `file-fresh`, or `log-contains`, each with its own `timeout_ms` budget) that must pass before the transition to `running` commits. There is still no endpoint-discovery surface: the `http-get` probe polls the URL the manifest itself declares (loopback `http://` only), so pinning the port and naming the health path remain the adapter author's job — the contract carries the gate, not the discovery. See [the manifest's `[readiness]` section](manifest.md#readiness--the-readiness-probe-added-at-contract-110).
 - **Agent-side abort** is out of contract scope: verbs are start/stop/pause/resume. An agent's own abort facility (e.g. ending one session's work inside a still-running server) is the agent's business; the contract's stop asserts process-level outcomes only.
 
 ## Interaction channels
@@ -149,7 +149,7 @@ The pre-freeze paper validation of opencode raised six change proposals and elev
 | Isolation keys | Ratified (docs-only): isolation keys named per agent (opencode: `XDG_DATA_HOME` + `XDG_CONFIG_HOME`) with the churn caveat — undocumented levers acceptable with per-release re-validation. |
 | Memory wire freeze | Ratified: the memory wire froze in v1 — typed snake_case `GuaranteeLevel`/`MemoryBackingKind` strings adopted verbatim on the new `--json` documents (the ONE announced key-set edit); adapters that cannot consume `memory.dir` simply declare no mapping (delivered nowhere, honestly surfaced). |
 | Unknown-vs-zero | Ratified: omitted usage is surfaced as unknown, never coerced to zero (surfaced-not-silent labels). |
-| Readiness vs liveness | Deferred-post-v1: no readiness/liveness distinction or endpoint-discovery surface in v1; pin-the-port or startup-line-parsing are adapter conventions. |
+| Readiness vs liveness | Ratified at 1.1.0 (additive same-major): the optional `[readiness]` section adds an adapter-declared readiness gate (one probe of `http-get` / `file-fresh` / `log-contains`, engine-owned poll cadence, timeout = terminal failure). Endpoint discovery stays out of contract — the probe polls a manifest-declared URL, so pin-the-port remains the adapter author's job. |
 | Isolated-roots posture | Recommended normative (docs-only): per-instance isolated roots for networked adapters; shared-root modes are out of contract scope. |
 | Agent-side abort | Deferred-post-v1: agent-side abort is out of contract; engine-owned termination semantics only, TCK asserts process-level outcomes. |
 | Per-OS honesty | Docs-only: per-OS honesty is already the declaration's job — a windows `best_effort` cap for WSL-recommended agents is an adapter-author choice, not a contract mandate. |
@@ -161,6 +161,15 @@ For adapter authors upgrading from a pre-freeze seed manifest:
 1. Set `contract_version = "1.0.0"`. Any `0.x` value now fails registration with the both-versions error quoted above.
 2. `[interaction].channel` accepts `"http"` in addition to `"stdio"` — optional, documentary.
 3. The manifest syntax is otherwise unchanged; every 0.x-era section parses identically under 1.0.0.
+
+## What changed in v1.1.0
+
+One additive, same-major change: the optional `[readiness]` section. Full field reference in [the manifest docs](manifest.md#readiness--the-readiness-probe-added-at-contract-110); the contract-level rules:
+
+- **Exactly one probe** — the section is a single gate (`http-get`, `file-fresh`, or `log-contains`), not a pipeline. A future ordered-gate list would grow inside the section without another breaking change.
+- **The gate is the last start step**: startup watch → (ACP handshake, for ACP transports) → probe → `running`. A probe that does not pass within its own `timeout_ms` lands the instance `failed` with the probe named (`readiness-timeout`), and that failure is **terminal** — the Restart Policy is never consulted.
+- **Engine-owned cadence**: the manifest declares the budget (`timeout_ms`, `1..=600000` ms); the engine polls at its own cadence. Validation enforces the per-kind value rules (`http://` URLs only, `max_age_ms <= timeout_ms`, non-empty `line`) and rejects another kind's fields.
+- **An engine that does not speak 1.1.0 rejects the section** — for free, by the same rule that protects every future additive change: a contract-1.0.0 engine's manifest schema has no `[readiness]`, so its `deny_unknown_fields` parse fails naming the section. Same major on BOTH sides (the versioning policy's older-same-major-engine rule): run `hekma --version` before registering a readiness-declaring manifest against an older engine.
 
 ## See Also
 

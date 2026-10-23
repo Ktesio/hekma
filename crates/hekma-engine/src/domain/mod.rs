@@ -21,6 +21,10 @@ mod instance;
 mod lifecycle;
 mod name;
 mod outbox;
+/// The readiness-probe runner (contract `1.1.0`): engine-side evaluation of a
+/// manifest's declared `[readiness]` gate. Private to the crate — the
+/// supervisor's start path is the only caller.
+pub(crate) mod readiness;
 mod registry;
 mod restart;
 mod resync;

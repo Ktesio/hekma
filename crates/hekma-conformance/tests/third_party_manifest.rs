@@ -144,7 +144,7 @@ fn third_party_manifest_adapter_is_proven_conformant_by_the_public_harness() {
     let json = serde_json::to_string(&report).expect("report serializes");
     assert!(json.contains("\"schema_version\":1"), "{json}");
     // The negotiated contract version rides on every report (retro #163, B8).
-    assert!(json.contains("\"contract_version\":\"1.0.0\""), "{json}");
+    assert!(json.contains("\"contract_version\":\"1.1.0\""), "{json}");
     assert!(json.contains("\"adapter_kind\":\"third-party-adapter\""));
     assert!(json.contains("\"status\":\"pass\""));
     assert!(json.contains("\"status\":\"not_applicable\""));

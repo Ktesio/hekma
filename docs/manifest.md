@@ -16,7 +16,7 @@ The manifest is parsed and validated **before** any state is written. Unknown ke
 ## Complete Example
 
 ```toml
-contract_version = "1.0.0"
+contract_version = "1.1.0"
 
 [adapter]
 kind = "my-agent"
@@ -47,6 +47,12 @@ source = "self-reported"
 [interaction]
 channel = "stdio"
 
+[readiness]
+kind = "http-get"
+timeout_ms = 5000
+url = "http://127.0.0.1:8080/health"
+expected_status = 200
+
 [config.model]
 env = "MODEL"
 ```
@@ -57,7 +63,7 @@ A manifest is valid only if it declares all of the following. Validation reports
 
 ### `contract_version`
 
-The Adapter Contract version the manifest targets, as a semver string (current: `"1.0.0"`). A non-semver value is rejected. The parse is **strict `X.Y.Z`**: no `v` prefix and no partial versions (`1`, `1.0`); a prerelease or build-metadata suffix (`1.0.0-rc.1+build.5`) parses, and negotiation compares majors only.
+The Adapter Contract version the manifest targets, as a semver string (current: `"1.1.0"`). A non-semver value is rejected. The parse is **strict `X.Y.Z`**: no `v` prefix and no partial versions (`1`, `1.0`); a prerelease or build-metadata suffix (`1.1.0-rc.1+build.5`) parses, and negotiation compares majors only. A manifest declaring an older same-major version (`"1.0.0"`) loads unchanged — same major, same schema.
 
 The engine **negotiates** at registration (contract v1, FR-30): a manifest is rejected when its `contract_version` **major** differs from the engine's — *compatible iff the major versions match*. Read the rule precisely: major-match is **necessary but not sufficient**. It guarantees only that the engine never rejects a manifest solely for version distance within the major — a NEWER same-major manifest that uses a section this engine's schema does not know yet still fails the unknown-key check (`deny_unknown_fields`), because the schema stays additive only within a major. A mismatch fails the load naming **both** versions and quoting the rule, e.g.:
 
@@ -175,6 +181,30 @@ Notes:
 - **`{env:VAR}` substitution honesty** (contract v1 rider): some agents substitute `{env:VAR}` placeholders in their own config and render an **unset variable as an empty string, silently**. An adapter to such an agent MUST map every substituted key through a delivery that guarantees the variable is set — or fail the render with a named reason — before the child launches. A silently-empty rendered config is a contract violation, not a quirk to tolerate.
 - **Self-updating agents** (contract v1): an adapter for an agent that downloads its own updates MUST map that agent's update-disable mechanism (env or config) so the pinned, supervised binary stays pinned. The adapter docs must additionally state whether the agent's config chain contains a higher-authority (managed/MDM) layer that can override supervisor-delivered values, so an operator on a managed machine can verify the pin survived.
 - **Isolation keys**: an adapter documents which environment levers give each Agent Instance its own data/config roots (for Hermes, `HERMES_HOME`; for XDG-based agents like opencode, `XDG_DATA_HOME` + `XDG_CONFIG_HOME`). Per-instance isolated roots inside each Agent Home are the RECOMMENDED normative posture (they make shared-root concurrency out of scope); where a lever is an undocumented agent interface, say so and re-validate it per pinned release. Per-OS support levels remain the declaration's own honesty job — an agent whose vendor recommends a compatibility layer on Windows is best declared `best-effort` there, but that cap is the adapter author's choice, not a contract mandate.
+
+### `[readiness]` — the readiness probe (added at contract 1.1.0)
+
+ONE declared probe the engine must satisfy before the instance reaches `running`. Optional: a manifest without this section behaves exactly as before (the process-level startup watch alone). With it, `hekma agent start` reaches `running` only once the probe passes within its own `timeout_ms`; a timeout lands the instance `failed` with the probe **named** — and that failure is **terminal**: the Restart Policy is not consulted, because an adapter that launched but never became ready is a broken deployment a restart would only replay.
+
+```toml
+[readiness]
+kind = "http-get"
+timeout_ms = 5000
+url = "http://127.0.0.1:8080/health"
+expected_status = 200
+```
+
+Exactly ONE probe per manifest — the section is a single gate, not a pipeline. The `kind` is a closed enum: `http-get`, `file-fresh`, or `log-contains`. Each kind carries its own fields, and fields belonging to a different kind are rejected (a stray `url` under `file-fresh` names the offender — typo protection, not silent acceptance).
+
+| Field | Kind | Meaning |
+|-------|------|---------|
+| `kind` | all | Which probe: `http-get`, `file-fresh`, or `log-contains`. |
+| `timeout_ms` | all | The probe's whole budget, `1..=600000` ms. The **engine owns the poll cadence** within this budget (about 100 ms) — a manifest declares operator intent, never engine timing. |
+| `url` + `expected_status` | `http-get` | An **`http://` URL only** (no TLS, no other schemes — the probe targets the agent's own listener on the same host) and the ONE status that counts as ready. A connection refused before the listener is up is a plain not-yet, retried on the cadence — never an error. |
+| `path` + `max_age_ms` | `file-fresh` | A file the agent (re)writes to prove readiness, relative to the Agent Home, and the maximum modification age that counts as fresh (`max_age_ms <= timeout_ms`). Ages are `SystemTime` deltas only: the engine compares mtimes without rounding, so the result is honest to the OS's timestamp granularity — on filesystems with coarse mtime resolution (e.g. some Windows filesystems stamp at 1–2 s granularity), a `max_age_ms` finer than that granularity cannot be honored reliably. Keep budgets comfortably above it. |
+| `line` | `log-contains` | A **substring** that must appear in the engine-owned agent output log after this Run's spawn point (a prior Run's captured output stays behind the cursor — the probe only sees this Run's bytes). The engine is regex-free by design; this is a plain substring match. **Under `log capture = "off"` no log exists**, so this probe is unsatisfiable there: it runs out its budget honestly and fails with the probe named — a fake pass is never manufactured. |
+
+The gate sits at the END of the start sequence, after the process-level startup watch and (for ACP transports) the session handshake — the probe is the last word before `running`. The wait happens while the start command runs (bounded by `timeout_ms`, so it can never wedge supervision), including for `--detach` starts: a detached start returns ready-or-failed. The engine emits a diagnostic naming the probe when the wait begins, and a failed start's recorded cause carries the probe description plus the wait actually elapsed — visible in `hekma agent show` (`Failed cause:`) and the transition log (`readiness-timeout`).
 
 ## See Also
 

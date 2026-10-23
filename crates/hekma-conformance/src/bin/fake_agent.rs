@@ -60,6 +60,22 @@
 //!   the self-crash is UNBOUNDED (every launch crashes) — the existing crash-loop
 //!   behavior is unchanged. Pure `std`, NO OS-cfg (a plain file read/write).
 //!
+//! * `--http-ready <PORT>:<STATUS>`  (the readiness probes)  serve a tiny
+//!   HTTP/1.1 endpoint on `127.0.0.1:<PORT>` that answers every connection with
+//!   `<STATUS>` — the target a manifest's `http-get` readiness probe polls. Pure
+//!   `std`, NO OS-cfg.
+//! * `--ready-file <PATH>:<DELAY_MS>`  create `<PATH>` after `<DELAY_MS>` — the
+//!   signal a manifest's `file-fresh` readiness probe waits for; the delay
+//!   proves the probe genuinely waited. Pure `std`, NO OS-cfg.
+//! * `--ready-line <LINE>:<DELAY_MS>`  print `<LINE>` to stdout after
+//!   `<DELAY_MS>` — the signal a manifest's `log-contains` readiness probe scans
+//!   the captured agent log for. Pure `std`, NO OS-cfg.
+//! * `--never-ready <HANG_MS>`  announce NOTHING (no ready line, no marker) and
+//!   hang for `<HANG_MS>`, then exit 0 — the timeout subject: the engine's
+//!   readiness probe must time out (or observe the exit through the crash path)
+//!   long before the hang ends, and this process must never be declared
+//!   `running`. Pure `std`, NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -152,7 +168,7 @@
 //!   flag exists to prove does NOT happen once piping is gated on the
 //!   declared Capability. Pure `std`, NO OS-cfg.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::{self, sleep};
@@ -241,6 +257,27 @@ struct Opts {
     /// for the conformance kit's declared-but-failing row; see `write_dump`).
     /// Empty = dump the full environment (the default).
     drop_env: Vec<String>,
+    /// Serve ONE declared-ready HTTP endpoint on `127.0.0.1:<port>` (the
+    /// readiness-gate story): a tiny std-only HTTP/1.1 responder that answers
+    /// every connection with the given status. Lets a manifest's `http-get`
+    /// readiness probe pass against THIS process. `None` = no endpoint.
+    http_ready: Option<(u16, u16)>,
+    /// Create this file after `<delay_ms>` (the readiness-gate story): the
+    /// readiness signal a manifest's `file-fresh` probe watches for. The delay
+    /// gates WHEN the file appears (so a test can prove the probe genuinely
+    /// waited). `None` = no file.
+    ready_file: Option<(PathBuf, u64)>,
+    /// Print this line to stdout after `<delay_ms>` (the readiness-gate
+    /// story): the readiness signal a manifest's `log-contains` probe scans
+    /// the captured agent log for. The delay gates WHEN the line appears.
+    /// `None` = no extra line.
+    ready_line: Option<(String, u64)>,
+    /// NEVER announce readiness (the readiness-gate story's timeout subject):
+    /// skip the ready line + marker entirely, sleep the given duration, then
+    /// exit 0. The engine's probe should time out (terminal, no restart) or
+    /// observe the exit (crash path) long before this sleep ends. `None` =
+    /// announce readiness normally (the default).
+    never_ready: Option<Duration>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -300,6 +337,10 @@ fn parse() -> Opts {
     let mut echo_stdin = false;
     let mut sniff_stdin_at_startup = false;
     let mut drop_env: Vec<String> = Vec::new();
+    let mut http_ready: Option<(u16, u16)> = None;
+    let mut ready_file: Option<(PathBuf, u64)> = None;
+    let mut ready_line: Option<(String, u64)> = None;
+    let mut never_ready: Option<Duration> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -359,6 +400,61 @@ fn parse() -> Opts {
             }
             "--echo-stdin" => echo_stdin = true,
             "--sniff-stdin-at-startup" => sniff_stdin_at_startup = true,
+            // Readiness-probe fixtures (the readiness-gate story). The paired
+            // values FAIL FAST on a missing/malformed pair (the
+            // `--observed-stream-calls` convention): a mistyped fixture must
+            // never silently become "no readiness signal", or a probe-timeout
+            // test would pass for the wrong reason.
+            "--http-ready" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(port, status)| port.parse::<u16>().ok().zip(status.parse::<u16>().ok()))
+            {
+                Some(pair) => http_ready = Some(pair),
+                None => {
+                    eprintln!(
+                        "fake_agent: --http-ready requires PORT:STATUS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--ready-file" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(path, ms)| ms.parse::<u64>().ok().map(|ms| (path, ms)))
+            {
+                Some((path, ms)) => ready_file = Some((PathBuf::from(path), ms)),
+                None => {
+                    eprintln!(
+                        "fake_agent: --ready-file requires PATH:DELAY_MS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--ready-line" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(line, ms)| ms.parse::<u64>().ok().map(|ms| (line, ms)))
+            {
+                Some((line, ms)) => ready_line = Some((line.to_string(), ms)),
+                None => {
+                    eprintln!(
+                        "fake_agent: --ready-line requires LINE:DELAY_MS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--never-ready" => {
+                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    never_ready = Some(Duration::from_millis(ms));
+                }
+            }
             // A lying-subject mode: omit the named env var from the `--dump`
             // artifact (see `write_dump`). Repeatable, one name per flag.
             "--drop-env" => {
@@ -453,6 +549,10 @@ fn parse() -> Opts {
         echo_stdin,
         sniff_stdin_at_startup,
         drop_env,
+        http_ready,
+        ready_file,
+        ready_line,
+        never_ready,
     }
 }
 
@@ -480,6 +580,33 @@ fn main() {
         // Still drop a marker if asked, so a test can prove it launched at all.
         write_marker(&opts.marker, "exit-fast");
         std::process::exit(code);
+    }
+
+    // NEVER-READY (the readiness-gate story's timeout subject): announce
+    // NOTHING (no ready line, no marker) and just hang. The engine's
+    // readiness probe should time out against this process (terminal) — or,
+    // if the hang is SHORTER than the probe budget, observe the clean exit
+    // through the crash path. Either way this process must never be declared
+    // `running`. Placed BEFORE the crash machinery: the readiness story has
+    // no crash schedule of its own.
+    if let Some(hang) = opts.never_ready {
+        sleep(hang);
+        std::process::exit(0);
+    }
+
+    // Readiness-probe fixtures: each thread starts EARLY (before the ready
+    // line below), so the SIGNAL is armed as soon as the engine's probe (which
+    // runs after the startup watch + ACP handshake) looks for it; each
+    // fixture's OWN delay gates when the signal actually appears, which is
+    // how a test proves the probe genuinely waited. Pure `std`, NO OS-cfg.
+    if let Some((port, status)) = opts.http_ready {
+        thread::spawn(move || serve_http_ready(port, status));
+    }
+    if let Some((path, ms)) = opts.ready_file.clone() {
+        thread::spawn(move || touch_ready_file(path, Duration::from_millis(ms)));
+    }
+    if let Some((line, ms)) = opts.ready_line.clone() {
+        thread::spawn(move || print_ready_line(line, Duration::from_millis(ms)));
     }
 
     // Resolve whether THIS launch should self-crash. Default: honor
@@ -710,6 +837,67 @@ fn main() {
     }
     // Lingered the whole window without being killed: exit cleanly.
     std::process::exit(0);
+}
+
+/// Split a `VALUE:DELAY_MS` fixture argument at its LAST colon, so a VALUE
+/// that itself contains colons (a URL, a Windows drive path) survives intact.
+/// Returns `(value, delay)` or `None` when the colon is missing.
+#[cfg(not(tarpaulin_include))]
+fn parse_colon_pair(arg: &str) -> Option<(&str, &str)> {
+    arg.rsplit_once(':')
+}
+
+/// Serve the `--http-ready` readiness endpoint: bind `127.0.0.1:<port>` and
+/// answer EVERY connection with the declared status (HTTP/1.1, `Connection:
+/// close`, a two-byte body), then close. Loops until the process exits — the
+/// engine's probe may attempt repeatedly before the listener is needed, and a
+/// test may GET it independently. A bind failure is announced to stderr and
+/// the thread gives up (the engine's probe then times out against a port
+/// nothing listens on — an honest failure, never a fake pass). Pure `std`,
+/// NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn serve_http_ready(port: u16, status: u16) {
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("fake_agent: --http-ready could not bind 127.0.0.1:{port}: {err}");
+            return;
+        }
+    };
+    let response =
+        format!("HTTP/1.1 {status} ready\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    for mut stream in listener.incoming().flatten() {
+        // Drain a bounded slice of the request (the engine's probe sends
+        // one small GET), answer, and drop — `Connection: close` plus the
+        // drop gives the client a clean EOF.
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+/// The `--ready-file` fixture: after the declared delay, create the readiness
+/// file (parents best-effort created). The WRITE is the readiness signal a
+/// `file-fresh` probe's mtime check sees.
+#[cfg(not(tarpaulin_include))]
+fn touch_ready_file(path: PathBuf, delay: Duration) {
+    sleep(delay);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"ready");
+}
+
+/// The `--ready-line` fixture: after the declared delay, print the readiness
+/// line to stdout and flush — the bytes a `log-contains` probe scans the
+/// captured agent log for.
+#[cfg(not(tarpaulin_include))]
+fn print_ready_line(line: String, delay: Duration) {
+    sleep(delay);
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// Read the cross-restart launch-crash counter (see `--crash-times`). A missing,

@@ -4,6 +4,13 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — readiness probes: the adapter-declared gate on `starting → running`.**
+> Announced ahead of the release that ships it:
+>
+> - **The optional `[readiness]` manifest section** (Adapter Contract **1.0.0 → 1.1.0**, additive same-major): ONE declared probe — `http-get` (an `http://` URL + expected status), `file-fresh` (a file's maximum modification age, relative to the Agent Home), or `log-contains` (a substring in this Run's captured agent output) — with its own `timeout_ms` budget (`1..=600000`). Validation enforces the per-kind value rules and rejects another kind's fields (`deny_unknown_fields` typo protection). A manifest without the section behaves exactly as before — the pre-1.1.0 start sequence is byte-identical, pinned by test. An engine built at contract 1.0.0 rejects the section at parse time, naming it (the older-same-major-engine rule, for free).
+> - **The gate**: the start waits — after spawn, after the startup watch, and after any ACP handshake — for the probe to pass on the ENGINE-owned poll cadence (~100 ms); the instance reaches `running` only once it does. The wait is surfaced (a stderr note names the probe as it begins) and bounded (`--detach` returns ready-or-failed). A probe that never passes lands `failed` with the `readiness-timeout` cause naming the probe + the honest wait (also visible via `show`'s failed cause) — and that failure is TERMINAL: the Restart Policy is never consulted, because an adapter that launched but never became ready is a broken deployment a restart would replay. An agent that EXITS while the probe waits follows the ordinary crash path verbatim (`crashed` cause, Restart Policy consulted; the restart is queued and runs on the engine cadence with its normal backoff). Under `log capture = "off"` a `log-contains` probe is unsatisfiable and times out honestly — never a fake pass.
+> - **New additive surfaces**: `hekma-adapter-api` → **0.3.0** (`CONTRACT_VERSION` 1.1.0; the `Readiness`/`ReadinessGate`/`ReadinessProbe` + per-kind types, resolved by validation); `hekma-engine` unchanged at 0.9.0, BUT the public `TransitionCause` enum gains the `ReadinessTimeout { probe, waited_ms }` arm — **hosts matching `TransitionCause` exhaustively need the new arm** (the same rule the `DetachedResumed` arm announced). No new CLI verbs, no new exit codes.
+
 > **Unreleased — governance conformance vectors: the portable decision artifact.**
 > Announced ahead of the release that ships it:
 >

@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use hekma_adapter_api::{
     CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, Manifest,
-    ManifestError, MeteringSource, OsId,
+    ManifestError, MeteringSource, OsId, ReadinessGate,
 };
 
 use crate::domain::{pass_through_tail, EffectiveConfig};
@@ -288,6 +288,22 @@ pub enum LaunchResolveError {
         /// Why the rule is invalid.
         detail: String,
     },
+
+    /// The adapter's `[readiness]` section is invalid (contract `1.1.0`, Epic
+    /// 18) — a value outside the section's rules, or a `kind` whose own fields
+    /// are missing/foreign fields present. Manifest sections are validated at
+    /// registration, but re-checked here (the same symmetric re-read the
+    /// config mapping gets): a manifest can drift after registration, and the
+    /// start — not the registry — is the last gate before a probe runs.
+    /// Names the section + why.
+    #[error("adapter '{adapter}' has an invalid [readiness] section: {detail}")]
+    InvalidReadinessProbe {
+        /// The adapter kind/identity whose readiness section is invalid.
+        adapter: String,
+        /// Why the section is invalid (from
+        /// [`hekma_adapter_api::Readiness::probe`], verbatim).
+        detail: String,
+    },
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
@@ -455,6 +471,42 @@ pub fn resolve_config_mapping(
         });
     }
     Ok(mapping)
+}
+
+/// Resolve the adapter's optional declared readiness gate
+/// ([`hekma_adapter_api::ReadinessGate`] — the probe + its own `timeout_ms`
+/// budget) for a start (contract `1.1.0`, Epic 18): a MANIFEST adapter's gate
+/// comes from its parsed `[readiness]` section; a NATIVE adapter declares NO
+/// readiness section (its readiness is code — `None`). Mirrors
+/// [`resolve_config_mapping`]: the launch resolution already re-read the
+/// manifest, but this stays defensive + symmetric — parse, validate the
+/// section via [`hekma_adapter_api::Readiness::gate`] (the SAME validation
+/// registration ran), and refuse the start on any drift rather than launching
+/// with a probe the engine cannot legally run. No re-negotiation here: the
+/// launch resolution's version gate already covered this file read.
+pub fn resolve_readiness_probe(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<Option<ReadinessGate>, LaunchResolveError> {
+    let Some(path) = manifest_path else {
+        return Ok(None);
+    };
+    let text =
+        std::fs::read_to_string(path).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    let manifest =
+        Manifest::from_toml_str(&text).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    manifest
+        .readiness_probe()
+        .map_err(|e| LaunchResolveError::InvalidReadinessProbe {
+            adapter: kind.to_string(),
+            detail: e.to_string(),
+        })
 }
 
 /// What [`apply_config_mapping`] REPORTS back about the mapping it applied

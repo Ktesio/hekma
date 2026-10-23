@@ -88,6 +88,11 @@ pub struct ManifestFixture {
     capabilities: Vec<CapabilityBlock>,
     metering_source: String,
     config_env: Vec<(String, String)>,
+    /// The raw `[readiness]` section BODY (the lines under the header, header
+    /// excluded), appended verbatim as the LAST section. Raw TOML (not
+    /// per-field chain methods) because the readiness tests are exactly about
+    /// the SECTION's shape — valid and invalid — and the shapes are tiny.
+    readiness: Option<String>,
 }
 
 /// One `[capabilities.<name>]` block: the per-OS `os = "level"` entries in
@@ -111,6 +116,7 @@ impl ManifestFixture {
             capabilities: Vec::new(),
             metering_source: MeteringSource::SelfReported.as_str().to_string(),
             config_env: Vec::new(),
+            readiness: None,
         }
     }
 
@@ -278,6 +284,17 @@ impl ManifestFixture {
         self
     }
 
+    /// A raw `[readiness]` section — `body` is the section's lines WITHOUT
+    /// the header, appended verbatim as the LAST section of the manifest
+    /// (after the `[config.*]` blocks), e.g.
+    /// `"kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://127.0.0.1:9/health\"\nexpected_status = 200"`.
+    /// Raw because the readiness tests are exactly about the section's shape
+    /// — valid and invalid — and every shape is two to four short lines.
+    pub fn readiness(mut self, body: &str) -> Self {
+        self.readiness = Some(body.to_string());
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -325,10 +342,14 @@ impl ManifestFixture {
             .iter()
             .map(|(key, env)| format!("\n[config.{key}]\nenv = \"{env}\""))
             .collect::<String>();
+        let readiness = self
+            .readiness
+            .map(|body| format!("\n[readiness]\n{body}\n"))
+            .unwrap_or_default();
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{capabilities}\n\n\
-             [metering]\nsource = \"{metering}\"{config}\n",
+             [metering]\nsource = \"{metering}\"{config}{readiness}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
@@ -336,6 +357,7 @@ impl ManifestFixture {
             capabilities = capabilities,
             metering = self.metering_source,
             config = config,
+            readiness = readiness,
         );
         let path = dir.join("adapter.toml");
         std::fs::write(&path, body).expect("write the fixture manifest");
@@ -736,7 +758,7 @@ mod tests {
     fn the_uj3_flow_preset_carries_the_pinned_shape() {
         let dir = TempDir::new().unwrap();
         let text = toml_of(ManifestFixture::uj3_flow(), dir.path());
-        assert!(text.contains("contract_version = \"1.0.0\""));
+        assert!(text.contains("contract_version = \"1.1.0\""));
         assert!(text.contains(&format!("kind = \"{}\"", crate::uj3::MANIFEST_KIND)));
         assert!(text.contains("source = \"self-reported\""));
         assert!(text.contains(&format!("--emit-usage\", \"{}\"", crate::uj3::EMIT_EVENTS)));

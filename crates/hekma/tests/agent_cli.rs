@@ -1297,6 +1297,65 @@ fn start_unknown_instance_exits_nonzero() {
 }
 
 #[test]
+fn start_readiness_timeout_exits_nonzero_and_names_the_probe() {
+    // The readiness probes at the CLI: a manifest whose `[readiness]` probe
+    // never passes (`--never-ready` announces nothing) → `hekma agent start`
+    // exits NON-ZERO, stderr names the probe (the rendered description + the
+    // honest wait), the engine's probe-wait note is surfaced on the same
+    // stream, and `show` reports the failed cause naming the probe.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = ctx.project_dir.join("never-ready-adapter");
+    ManifestFixture::new("fake", &["--never-ready", "10000"])
+        .guaranteed_on_all_oses("interaction")
+        .readiness("kind = \"log-contains\"\ntimeout_ms = 1500\nline = \"never printed\"")
+        .write(&m);
+
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "sleepy",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_hekma_agent(&["agent", "start", "sleepy"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "a readiness timeout must exit non-zero");
+    assert!(
+        run.stderr.contains("readiness probe log-contains"),
+        "stderr must name the probe: stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("never printed"),
+        "stderr must name the probe's target: stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("waiting up to 1500ms for the declared readiness probe"),
+        "the probe-wait phase must be surfaced on stderr BEFORE the failure: stderr={}",
+        run.stderr
+    );
+
+    // The instance is `failed`, and `show` carries the probe-naming cause.
+    let list = run_hekma_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(list.stdout.contains("failed"), "stdout={}", list.stdout);
+    let show = run_hekma_agent(&["agent", "show", "sleepy"], &ctx.project_dir, state_dir);
+    let shown = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        shown.contains("readiness probe log-contains") && shown.contains("Failed cause"),
+        "show must surface the readiness-timeout cause: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+}
+
+#[test]
 fn stop_accepts_timeout_flag() {
     // The `--timeout <secs>` flag parses and drives the graceful window. Stop on
     // a registered instance still rejects (AC4) but proves the flag is accepted.
@@ -6168,7 +6227,7 @@ fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_th
         run.stderr
     );
     assert!(
-        run.stderr.contains("1.0.0"),
+        run.stderr.contains("1.1.0"),
         "names the engine version: {}",
         run.stderr
     );
