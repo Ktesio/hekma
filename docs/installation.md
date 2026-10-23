@@ -55,7 +55,7 @@ a directory that is not on `PATH`, it prints the directory to add.
 ```bash
 git clone https://github.com/Ktesio/hekma.git
 cd hekma
-cargo install --path .
+cargo install --path crates/hekma
 ```
 
 Verify:

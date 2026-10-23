@@ -231,7 +231,7 @@ pub enum ListenerError {
     /// never happen for `127.0.0.1:0`, but is enforced defensively: a non-loopback
     /// listen address is refused, never served (the security invariant). Carries
     /// the offending address (an ip:port, no traffic).
-    #[error("the engine-observed listener resolved a NON-LOOPBACK address ({addr}); refusing to serve (loopback-only, AC-B)")]
+    #[error("the engine-observed listener resolved a NON-LOOPBACK address ({addr}); refusing to serve (it binds to loopback only)")]
     NonLoopbackBind {
         /// The refused (non-loopback) address.
         addr: SocketAddr,

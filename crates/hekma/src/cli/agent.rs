@@ -2821,11 +2821,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
         // guaranteed`; it is this session's reach that is limited. State the
         // single-lifetime boundary honestly rather than implying a bug.
         EngineError::InteractionUnavailable { name, detail } => AgentInteractionUnavailable {
-            message: format!(
-                "Agent Instance '{name}' cannot receive input right now: {detail}. Durable \
-                 cross-invocation interaction needs a persistent engine session (planned for a \
-                 future release); within a single `hekma` process/embedding session this works."
-            ),
+            message: format!("Agent Instance '{name}' cannot receive input right now: {detail}."),
         }
         .into(),
         // Story 4.1 fix pass (CRITICAL finding, review of #79): `send`'s

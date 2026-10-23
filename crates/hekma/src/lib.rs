@@ -47,7 +47,7 @@ Examples:
 The Control API (--listen + --bearer-secret, both or neither) exposes the
 unstable v0 HTTP/JSON surface — fleet, per-instance lifecycle/config/status,
 and events (SSE + cursor pull) — guarded by the resolved bearer token; see
-docs/control-api.md.";
+https://hekma.ktesio.dev/docs/control-api/.";
 
 const AGENT_AFTER_HELP: &str = "\
 Details:
@@ -68,18 +68,18 @@ Details:
   Declaration. remove deletes the registry entry and, with --delete, the Agent
   Home too (--retain, the default, keeps it); list shows the Fleet; show renders
   one instance's effective capabilities and runtime status. Both list and show
-  accept --json for a machine-readable document (usage is now real token totals
-  from the Usage Ledger, while budget/cap stays the honest seed: '—' in the table,
-  null in JSON). config set writes a key to the Agent Instance layer (validated at write
+  accept --json for a machine-readable document (usage is real token totals from
+  the Usage Ledger; an instance with no budget set shows '—' in the table and null
+  in JSON). config set writes a key to the Agent Instance layer (validated at write
   time — an unknown key outside the agent.* pass-through namespace is rejected
   with the nearest valid key suggested, and nothing is persisted); config get
   prints the effective (resolved) config, where a key set at the instance layer
-  overrides the same key at the kind/engine-default layer, every time (FR-11);
+  overrides the same key at the kind/engine-default layer, every time;
   each value names its source layer (a Source column, or a source field with
   --json), and starting an instance persists an effective-config snapshot in the
   Agent Home. A secret:NAME value is resolved from the environment or the engine
   secrets file at start and delivered to the agent, but is MASKED in config get,
-  the snapshot, logs, and events (FR-14); config get --reveal is the sole way to
+  the snapshot, logs, and events; config get --reveal is the sole way to
   print it unmasked. Removing a running instance requires --force.
 
 Examples:
@@ -150,7 +150,7 @@ enum Commands {
         #[arg(long, value_name = "PORT", default_value_t = 0)]
         metering_listen: u16,
         /// Serve this state directory instead of the resolved default
-        /// (HEKMA_STATE_DIR / KTESIO_STATE_DIR / the platform data dir)
+        /// (HEKMA_STATE_DIR, the legacy KTESIO_STATE_DIR, or the platform data dir)
         #[arg(long, value_name = "DIR")]
         state_dir: Option<String>,
         /// Expose the v0 Control API on this address (e.g. 127.0.0.1:8477).
@@ -168,17 +168,12 @@ enum Commands {
         /// then the state dir's secrets file. Requires --listen.
         #[arg(long, value_name = "NAME", requires = "listen")]
         bearer_secret: Option<String>,
-        /// The log-capture posture for every agent this host supervises
-        /// (story 17-4): `full` (the default) captures everything
-        /// byte-identically; `metadata` keeps agent content OFF persistent
-        /// disk at rest (transient raw redirects while running, hashed
-        /// metadata records + unlinked raw files at stop); `off` captures
-        /// nothing (null streams, honest absence everywhere, degraded
-        /// log-sentinel metering — never a fabricated size). The DEFAULT
-        /// LIVES IN `serve::run` (`unwrap_or_default`) — review finding 19
-        /// removed the redundant clap `default_value` so exactly one site
-        /// defaults, and `None` (no flag) is distinguishable from an
-        /// explicit `--log-capture full` in the parse.
+        // The default lives in `serve::run` (`unwrap_or_default`): there is
+        // no clap `default_value`, so exactly one site defaults and `None`
+        // (no flag) stays distinguishable from an explicit `--log-capture full`.
+        /// Log capture for every agent this host supervises: full (default)
+        /// keeps all output; metadata keeps only sizes and hashes at rest; off
+        /// captures nothing and disables usage reported in logs.
         #[arg(long, value_name = "MODE")]
         log_capture: Option<hekma_engine::LogCaptureMode>,
     },
@@ -221,11 +216,11 @@ enum AgentCommands {
         /// Name of the Agent Instance to start
         name: String,
         /// Detach: keep the agent running after this command exits; the next
-        /// `hekma` command re-adopts it. HONEST ENFORCEMENT WINDOW (ratified
-        /// 12-1): between commands there is NO crash detection, NO budget
-        /// enforcement, and NO event delivery — supervision is command-scoped.
-        /// Refused for engine-observed instances (their loopback listener dies
-        /// with this command).
+        /// `hekma` command re-adopts it. Between commands there is no
+        /// crash detection, no budget enforcement, and no event delivery:
+        /// supervision lasts only while a command runs. Refused for
+        /// engine-observed instances (their loopback listener stops with this
+        /// command).
         #[arg(long)]
         detach: bool,
     },
@@ -249,22 +244,20 @@ enum AgentCommands {
     },
     /// Send text input to a running Agent Instance's native input channel
     ///
-    /// M1 fix (review of #79): `--help`/`-h` are DISABLED on this subcommand
-    /// specifically, and `text` accepts leading-hyphen values, so a `text`
-    /// payload that happens to look like a flag (`"-5 degrees"`, `"--help"`)
-    /// is delivered LITERALLY rather than either failing to parse or being
-    /// silently intercepted as this CLI's own help (which used to print
-    /// help and exit 0 without sending anything — a caller checking only
-    /// the exit code would wrongly believe the send succeeded). A caller
-    /// that genuinely wants help for `send` gets it from `hekma agent --help`
-    /// or `hekma agent send` with a missing argument's error text.
+    /// Text that looks like a flag, such as "-5 degrees" or "--help", is sent
+    /// as input, so --help does not work here; run `hekma agent help send`
+    /// to see this help.
+    // `--help`/`-h` are disabled on this subcommand and `text` accepts
+    // leading-hyphen values, so a payload that looks like a flag is delivered
+    // literally. Intercepting it as help would print help and exit 0 without
+    // sending anything, and a caller checking only the exit code would wrongly
+    // believe the send succeeded.
     #[command(disable_help_flag = true)]
     Send {
         /// Name of the Agent Instance to send input to
         name: String,
-        /// The text to send (a trailing newline is appended if absent).
-        /// Accepts a value starting with `-`/`--` (e.g. `"-5 degrees"`)
-        /// literally, instead of clap trying to parse it as a flag.
+        /// The text to send (a trailing newline is added if missing). A value
+        /// that starts with - or --, such as "-5 degrees", is sent as is.
         #[arg(allow_hyphen_values = true)]
         text: String,
     },
@@ -276,24 +269,24 @@ enum AgentCommands {
         /// arrive; exits cleanly (with a note) once the instance stops or pauses
         #[arg(long, short = 'f')]
         follow: bool,
-        /// Emit each captured line as newline-delimited JSON (one self-versioned
-        /// engine `LogLine` per stdout line, NDJSON — AD-14); identical shape for
-        /// one-shot and `--follow`. Notices/diagnostics stay on stderr.
+        /// Print each captured line as one versioned JSON object per line
+        /// (NDJSON), with the same shape with or without --follow. Notes and
+        /// diagnostics go to stderr.
         #[arg(long)]
         json: bool,
     },
     /// Report Usage Ledger token totals (and derived dollar cost) for one
-    /// instance, or Fleet-wide totals when no name is given (FR-22)
+    /// instance, or Fleet-wide totals when no name is given
     Usage {
         /// Optional Agent Instance name; omitted reports the Fleet-wide totals
         name: Option<String>,
-        /// Emit the usage snapshot as a machine-readable JSON document (AD-14)
+        /// Emit the usage snapshot as a machine-readable JSON document
         #[arg(long)]
         json: bool,
     },
     /// List every Agent Instance in the Fleet
     List {
-        /// Emit the Fleet as a machine-readable JSON document (FR-4 / AD-14)
+        /// Emit the Fleet as a machine-readable JSON document
         #[arg(long)]
         json: bool,
     },
@@ -305,12 +298,12 @@ enum AgentCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Get or set an Agent Instance's unified config (layered, FR-11)
+    /// Get or set an Agent Instance's unified config (layered)
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
     },
-    /// Attach or detach an Agent Instance's Memory Backing (FR-15)
+    /// Attach or detach an Agent Instance's Memory Backing
     Memory {
         #[command(subcommand)]
         command: MemoryCommands,
@@ -329,8 +322,7 @@ enum MemoryCommands {
         /// The Memory Backing kind to attach (accepted: filesystem, native)
         #[arg(long)]
         kind: String,
-        /// Emit the attachment as a machine-readable JSON document (AD-14;
-        /// story 6-6's deferred wire surface, frozen at the contract v1 freeze)
+        /// Emit the attachment as a machine-readable JSON document
         #[arg(long)]
         json: bool,
     },
@@ -339,8 +331,7 @@ enum MemoryCommands {
     Detach {
         /// Name of the Agent Instance
         name: String,
-        /// Emit the detachment as a machine-readable JSON document (AD-14;
-        /// story 6-6's deferred wire surface, frozen at the contract v1 freeze)
+        /// Emit the detachment as a machine-readable JSON document
         #[arg(long)]
         json: bool,
     },
@@ -354,12 +345,10 @@ enum ConfigCommands {
         name: String,
         /// Config key (a known unified key, or an `agent.*` pass-through key)
         key: String,
-        /// Value to set (stored verbatim; a `secret:NAME` reference is resolved +
-        /// masked at start/read, FR-14 — the reference is what is stored here).
-        /// Accepts a value starting with `-`/`--` (e.g. `-x`) LITERALLY — clap
-        /// does not intercept it as a flag (story 11-2, AI-26; mirrors `send`'s
-        /// `text`), so the `--` separator is optional rather than mandatory
-        /// (it still works for callers who prefer it).
+        /// Value to set, stored as given. A `secret:NAME` value stores the
+        /// reference; the secret is resolved at start and masked when read. A
+        /// value that starts with - or --, such as -x, is taken as the value,
+        /// so a -- separator is optional.
         #[arg(allow_hyphen_values = true)]
         value: String,
     },
@@ -369,14 +358,15 @@ enum ConfigCommands {
         name: String,
         /// Optional config key; omitted prints the whole effective config
         key: Option<String>,
-        /// Emit the effective config (value + source layer per leaf) as JSON (FR-13)
+        /// Emit the effective config (value + source layer per leaf) as JSON
         #[arg(long)]
         json: bool,
-        /// Reveal secret values unmasked (the SOLE explicit acknowledgment; FR-14).
-        /// Without it, `secret:` values are masked in both the table and --json.
-        /// Never un-masks the persisted snapshot, logs, or events. Re-resolves
-        /// secrets LIVE (env, then the secrets file) at read time, so a revealed
-        /// value may differ from what a running instance resolved at its start.
+        /// Reveal secret values unmasked (the only way to print them). Without
+        /// it, `secret:` values are masked in both the table and --json.
+        /// Never un-masks the persisted snapshot, logs, or events. Secrets are
+        /// resolved again at read time (env, then the secrets file), so a
+        /// revealed value may differ from what a running instance resolved at
+        /// its start.
         #[arg(long)]
         reveal: bool,
     },
@@ -902,6 +892,65 @@ mod tests {
                 .to_string();
             assert!(help.contains(detail), "{} help missing detail", command);
             assert!(help.contains("Example"), "{} help missing example", command);
+        }
+    }
+
+    /// Render the short and long help of `cmd` and every nested subcommand.
+    fn collect_help(cmd: &mut clap::Command, path: &str, out: &mut Vec<(String, String)>) {
+        out.push((path.to_string(), cmd.render_help().to_string()));
+        out.push((path.to_string(), cmd.render_long_help().to_string()));
+        for sub in cmd.get_subcommands_mut() {
+            let sub_path = format!("{path} {}", sub.get_name());
+            collect_help(sub, &sub_path, out);
+        }
+    }
+
+    #[test]
+    fn test_help_text_carries_no_retired_names_or_planning_ids() {
+        // Help text is read by users: no retired `kt` command, no internal
+        // planning ids or review notes, and no old product name for Hekma.
+        let mut root = Cli::command();
+        root.build();
+        let mut pages = Vec::new();
+        collect_help(&mut root, "hekma", &mut pages);
+        assert!(
+            pages.iter().any(|(path, _)| path == "hekma agent send"),
+            "the walk must reach nested subcommands"
+        );
+        let banned = [
+            "kt agent",
+            "`kt",
+            "FR-",
+            "NFR-",
+            "AD-1",
+            "AD-2",
+            "AD-9",
+            "AI-",
+            "DC-",
+            "story ",
+            "Story ",
+            "Epic",
+            "ratified",
+            "review finding",
+            "review of #",
+            "M1 fix",
+            "honest seed",
+            "its park",
+            "docs/control-api.md",
+        ];
+        for (path, help) in &pages {
+            for term in banned {
+                assert!(
+                    !help.contains(term),
+                    "`{path}` help contains {term:?}:\n{help}"
+                );
+            }
+            // The repository URL keeps the GitHub org name; any other
+            // "Ktesio" would be the old product name.
+            assert!(
+                !help.replace("github.com/Ktesio/", "").contains("Ktesio"),
+                "`{path}` help names Ktesio:\n{help}"
+            );
         }
     }
 

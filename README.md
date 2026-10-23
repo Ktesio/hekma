@@ -1,203 +1,115 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Ktesio/hekma/main/docs/assets/hekma-banner.png" alt="Hekma banner: run AI agents like services — supervise, meter, and budget them" width="100%">
+  <img src="https://raw.githubusercontent.com/Ktesio/hekma/main/docs/assets/hekma-banner.png" alt="Hekma banner: run AI agents like services" width="100%">
 </p>
 
 # Hekma
 
 [![CI](https://github.com/Ktesio/hekma/actions/workflows/ci.yml/badge.svg)](https://github.com/Ktesio/hekma/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/hekma.svg)](https://crates.io/crates/hekma)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/Ktesio/hekma/blob/main/LICENSE)
 
-Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesio.dev](https://ktesio.dev).
+Hekma runs the AI agents you already use like services. It starts, stops, pauses and restarts them, counts the tokens they spend, and pauses or stops an agent as soon as it crosses a token or dollar budget. It is a single Rust binary for macOS, Linux and Windows, and an engine you can embed in your own Rust program.
 
-> **License.** Hekma is a Ktesio project, fully open source under the [Apache License 2.0](LICENSE). Contributions are made under a [CLA](CLA.md) that keeps the project under unified ownership.
+**Docs: [hekma.ktesio.dev/docs](https://hekma.ktesio.dev/docs/)**, starting with the [five-minute quickstart](https://hekma.ktesio.dev/docs/get-started/).
 
-Hekma is a Rust CLI and engine that **runs AI agents like services** — supervise their lifecycle, meter real token usage, and enforce dollar budgets. Register any agent, start and stop it under supervision, watch what it actually consumes, and set token and cost ceilings that stop runaway spend the moment they are crossed.
+An *agent* here is a program that calls a language model on your behalf: a coding agent such as OpenCode, a personal agent such as Hermes Agent, or a script of your own. Hekma runs it as a process and governs it from the outside. It does not help you write agents.
 
-**What "agent" means here.** A third-party program you run on your own machine or server that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Hekma launches, supervises, meters, and budgets that program as a process. It is not a framework for writing agents, and it is not an agent itself.
+## What it does
 
-## Why Hekma?
-
-Long-running AI agents are processes that cost money on every call. Hekma treats them like the services they are:
-
-- **Lifecycle — run agents like services.** `start`, `stop`, `pause`, and `resume` any registered agent through one uniform state machine, with crash detection, a configurable Restart Policy, captured logs, and durable state (one SQLite database) that survives an engine restart or reboot and reconciles orphaned processes honestly.
-- **Metering — real token usage.** Every registered agent declares a Metering Source, and the engine records real per-run and cumulative token totals into a durable Usage Ledger. Usage is either **self-reported** by the agent or **engine-observed** through a loopback proxy, so governance never depends on the agent's cooperation.
-- **Budgets & cost control — ceilings that actually stop spend.** Set per-run and cumulative **token** budgets, and (with a configured Rate) **dollar** cost caps. Each carries a Breach Action — `pause`, `stop`, or `warn` — enforced the instant a ceiling is reached, in the same commit path as the usage that crossed it. Every dollar figure is integer micro-dollars, labeled an estimate.
-- **One vocabulary, any agent.** Register a native builtin, or bring your own agent with a small `adapter.toml` manifest that declares how to launch it, its per-OS capabilities, and its metering source. Configure every agent through one layered-TOML config with per-value provenance and `secret:NAME` references that stay masked in Hekma's surfaces.
-- **Embedding — a library, not just a CLI.** The engine is an embeddable Rust library (`hekma-engine`) with a blocking facade and a subscribe surface, so a host application drives the whole fleet — lifecycle, configuration, budgets, and events — without the CLI. See [Embedding the engine](docs/embedding.md).
+| | |
+|---|---|
+| **Lifecycle** | `start`, `stop`, `pause` and `resume` any agent through one state machine. Crashes are recorded and restarted with backoff, and the fleet's state survives a reboot. |
+| **Metering** | Counts input, output and cached tokens, either reported by the agent or read off the wire by a proxy on `127.0.0.1`. |
+| **Budgets** | Token and dollar ceilings, per run or over the agent's life, with a `pause`, `stop` or `warn` action applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
+| **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. |
+| **Scripting** | Versioned JSON output and stable exit codes on every command. |
+| **Embedding** | The engine is the `hekma-engine` crate, with an event stream, so your program can run the fleet without the CLI. |
 
 ## Install
 
-Hekma ships two command names — `hekma` and the short alias `hkm` — for
-macOS, Linux, and Windows. Both run the same CLI: every command below works
-under either name.
-
-Install on macOS or Linux:
+macOS and Linux:
 
 ```bash
 curl -fsSL https://cli.ktesio.dev/hekma/install.sh | sh
 ```
 
-Install on Windows with PowerShell:
+Windows (PowerShell):
 
 ```powershell
 irm https://cli.ktesio.dev/hekma/install.ps1 | iex
 ```
 
-New macOS and Linux installs prefer Homebrew, then Cargo, then a prebuilt GitHub
-Release binary. New Windows installs prefer Cargo, then a prebuilt GitHub Release
-binary. The installer preserves an existing install channel when it can.
-
-If you already have Rust, install from crates.io (the `hekma` package installs the `hekma` binary):
+The installer uses Homebrew or Cargo when you have them, and otherwise downloads a checksum-verified release binary. You get the `hekma` command and its short alias, `hkm`. Other ways to install:
 
 ```bash
-cargo install hekma
+brew install ktesio/tap/hekma     # Homebrew
+cargo install hekma               # crates.io (Rust 1.96.1 or later)
 ```
 
-Or with Homebrew:
-
-```bash
-brew install ktesio/tap/hekma
-```
-
-> **Upgrading from `kt` (pre-0.8.0 Ktesio releases)?** Your data directory is
-> untouched — Hekma reads the same location. Run the installer again (or
-> `cargo install hekma --force`, or `brew upgrade ktesio/tap/hekma`) and see
-> the [migration guide](docs/migration.md). The old `kt self-update` cannot
-> reach 0.8.0 (the release archives renamed); re-running the installer is the
-> documented path.
->
-> Upgrading from the even older `imagdy/tap` location? Run `brew untap imagdy/tap && brew install ktesio/tap/hekma` once — the tap lives in the Ktesio org.
-
-You can also download a release archive from [GitHub Releases](https://github.com/Ktesio/hekma/releases), unpack it, and place `hekma` on your `PATH`, or build from source:
+To build from source:
 
 ```bash
 git clone https://github.com/Ktesio/hekma.git
 cd hekma
-cargo install --path .
+cargo install --path crates/hekma
 ```
 
-See the [installation guide](docs/installation.md) for update behavior and per-platform notes.
+Release archives for each platform are on [GitHub Releases](https://github.com/Ktesio/hekma/releases). The [install guide](https://hekma.ktesio.dev/docs/installation/) covers updates, uninstalling and where Hekma keeps its state. Upgrading from the old `kt` command? See [Upgrade from kt](https://hekma.ktesio.dev/docs/migration/); your data stays where it is.
 
-## Quickstart
-
-Register an agent, give it a budget, inspect it, and run it under supervision.
-
-### 1. Describe your agent with a manifest adapter
-
-An agent is registered through an `adapter.toml` that declares how to launch it, its per-OS capabilities, and its metering source. Create a directory `my-agent/` with an `adapter.toml`:
-
-```toml
-contract_version = "1.0.0"
-
-[adapter]
-kind = "my-agent"
-name = "My Agent"
-
-# How the engine launches the agent process. exec must be on PATH (or an
-# absolute path); args/env are optional. Replace this with your agent's command.
-[lifecycle.start]
-exec = "my-agent"
-args = ["--serve"]
-
-# A non-empty, per-OS Capability Declaration. "pause" is guaranteed on Unix
-# (SIGSTOP) and best-effort on Windows.
-[capabilities.pause]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "best-effort"
-
-[capabilities.interaction]
-linux = "guaranteed"
-macos = "guaranteed"
-windows = "guaranteed"
-
-# A viable Metering Source: "self-reported" (the agent emits its own usage) or
-# "engine-observed" (the engine meters model traffic through a loopback proxy).
-[metering]
-source = "self-reported"
-```
-
-Register it under a Fleet-unique name:
+## A first look
 
 ```bash
-hekma agent register my-agent --manifest ./my-agent
-```
+# Describe the agent once, in a folder holding its adapter.toml.
+hekma agent register my-agent --manifest `/agents/my-agent
 
-Registration validates the manifest first, then creates an isolated Agent Home and prints its path plus the effective (current-OS) Capability Declaration. (To try the flow without writing a manifest, `hekma agent register demo --kind mock` registers a native builtin — note that `mock` has no launch command, so it cannot be started.)
-
-### 2. Set a budget and a cost cap
-
-Budgets are ordinary layered-config values, inspectable and changeable at any time:
-
-```bash
-# Cap cumulative token usage and pause the agent on breach.
+# Give it a budget: pause it after 500,000 tokens.
 hekma agent config set my-agent budget.tokens.cumulative 500000
 hekma agent config set my-agent budget.breach_action pause
 
-# Optional: price tokens ($/1M) so token usage derives a dollar cost, then cap it.
-hekma agent config set my-agent cost.rate.input 3.00
-hekma agent config set my-agent cost.rate.output 15.00
-hekma agent config set my-agent budget.dollars.cumulative 10.00
+# Run it in the background, and watch it. Metering and budgets run live.
+hekma agent start my-agent --detach
+hekma agent logs my-agent --follow
+
+# See the fleet: state, budget and token usage for every agent.
+hekma agent list
 ```
 
-### 3. Inspect the Fleet
+The [quickstart](https://hekma.ktesio.dev/docs/get-started/) walks through this with a small stand-in agent you can run as is, and [Bring your own agent](https://hekma.ktesio.dev/docs/your-own-agent/) shows how to write the `adapter.toml` for a real one.
 
-```bash
-hekma agent list            # a table: name, kind, state, restarts, budget, usage
-hekma agent show my-agent   # one instance: capabilities, state, budget, usage, cost, metering source
-hekma agent config get my-agent   # the effective config, with the source layer of each value
-```
-
-`hekma agent list --json` and `hekma agent show my-agent --json` emit a versioned, machine-readable document. Token totals are the Usage Ledger sums exactly; dollar figures appear only when a Rate is configured and are always labeled estimates.
-
-### 4. Run it under supervision
-
-```bash
-hekma agent start my-agent
-hekma agent pause my-agent      # honest per-OS: guaranteed / best-effort / unsupported
-hekma agent resume my-agent
-hekma agent stop my-agent --timeout 10   # graceful, then a forced kill after the window
-```
-
-> **Supervision boundary (current behavior):** a standalone `hekma agent start` supervises the process only for that command's lifetime and stops it when the command exits; start it with `hekma agent start --detach` to keep the agent running across commands (the next `hekma` command re-adopts it; between commands it is not supervised — no crash detection, no budget enforcement, no usage/event delivery). If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy.
+**Know this before you rely on it.** In 0.11.0, the CLI supervises an agent only while some `hekma` command is running. A detached agent keeps running between commands, but nothing meters it or enforces its budget until the next command, which is why the example keeps `logs --follow` open. A program that embeds the engine supervises for as long as it runs, and a long-running host, `hekma serve`, is on the main branch for the next release. [Supervision and detached runs](https://hekma.ktesio.dev/docs/detached-runs/) explains the patterns that work today.
 
 ## Commands
 
-The agent runner lives under `hekma agent`. Every command supports `--help`.
+| Command | What it does |
+|---|---|
+| `hekma agent register` | Add an agent from a built-in kind (`--kind acp`) or an `adapter.toml` (`--manifest`) |
+| `hekma agent start`, `stop`, `pause`, `resume` | Drive the lifecycle (`start --detach` keeps the agent running after the command exits) |
+| `hekma agent list`, `show`, `usage` | See state, budgets and token usage (`--json` for scripts) |
+| `hekma agent logs` | Read an agent's output, or follow it live (`--follow`) |
+| `hekma agent config set`, `get` | Set and read configuration, including budgets, rates and `secret:NAME` references |
+| `hekma agent send` | Send a line of input to a running agent |
+| `hekma agent memory attach`, `detach` | Give an agent durable memory |
+| `hekma agent remove` | Remove an agent |
+| `hekma self-update` | Update Hekma through the channel you installed it with |
 
-| Command | Purpose |
-|---------|---------|
-| `hekma agent register` | Register an instance from a native builtin (`--kind`) or an `adapter.toml` manifest adapter (`--manifest`) |
-| `hekma agent list` | List every Agent Instance in the Fleet |
-| `hekma agent show` | Show one instance's capabilities, runtime status, usage, and budget |
-| `hekma agent usage` | Read Usage Ledger totals for one instance, or Fleet-wide |
-| `hekma agent start` / `stop` / `pause` / `resume` | Drive the lifecycle |
-| `hekma agent send` | Send a line of input to a running instance's stdin |
-| `hekma agent logs` | Read an instance's retained output (`--follow` to stream, `--json` emits NDJSON) |
-| `hekma agent remove` | Remove an instance (retain or delete its Agent Home; `--force` if running) |
-| `hekma agent config set` / `get` | Write and read the layered config (validated; `--reveal` un-masks secrets) |
-| `hekma agent memory attach` / `detach` | Attach or detach a Memory Backing (`filesystem` or `native`) |
-| `hekma serve` | Run the long-running Service Host over one state directory: it adopts live agents, holds the single-writer lock, and on SIGTERM drains every running agent through the bounded graceful ladder |
+The [CLI reference](https://hekma.ktesio.dev/docs/commands/) has every flag, the [exit codes](https://hekma.ktesio.dev/docs/exit-codes/) and the [JSON documents](https://hekma.ktesio.dev/docs/json-output/).
 
-`hekma serve` is the hosting posture: instead of supervising agents command-scoped (supervision lives only inside each `hekma` invocation), one long-running process owns the state directory — every live agent is adopted at open, hosted children inherit only their adapter-declared environment (plus a minimal OS-plumbing floor), and a shutdown signal stops every running agent before the host exits. A second host on the same state directory is refused (naming the holder PID), and `--metering-listen <port>` pins the observed-metering proxy to a fixed port so adopted agents survive host restarts. Pointing `--state-dir` at a volume you control puts the entire durable state — supervision record, metering, and the global outbox export pair — on that volume, the posture for hosting on an ephemeral disk. Agent-output capture is a host-wide posture too (`--log-capture full|metadata|off`): the default captures everything; `metadata` keeps agent content off the volume at rest (sizes and hashes stay, raw files are unlinked at stop); `off` captures nothing and announces itself honestly wherever you can look — the `/v0/version` self-description carries the posture, typed log reads refuse naming it, and the Fleet shows the degraded sentinel-metering tier (`capture-off`). With `--listen` + `--bearer-secret`, the host also exposes the **Control API** — a bearer-guarded HTTP/JSON surface (v0, unstable) over the hosted fleet: lifecycle, config, budgets and usage, the global outbox export (a bounded, ack-cursor-resumable pull a replacement host replays after a restart), and live SSE events. See [the command reference](docs/commands.md#hekma-serve---stop-window-secs---metering-listen-port---listen-addr---bearer-secret-name---state-dir-dir---log-capture-mode) and [the Control API reference](docs/control-api.md). For running the host in a container — the static musl build, the stop-grace mapping, and volume-backed state — see [Running Hekma as a container supervisor](docs/hosting.md).
-
-See the [command reference](docs/commands.md) for arguments, flags, and the unified config keys, and the [exit-code table](docs/commands.md#exit-codes) for the documented numeric codes every command returns.
-
-## Prove your adapter conforms
-
-If you build an adapter (a manifest `adapter.toml` shipped with your agent, or a native adapter crate), the **Conformance Test Kit** proves it honors the Adapter Contract — the same controls, metering honesty, and capability declarations every built-in adapter is held to. Add one dev-dependency and one `#[test]`:
+## Embed the engine
 
 ```toml
-# Pin a full commit SHA: until the crates publish a bare `git =`
-# dependency floats on this repo's default-branch HEAD, and a breaking
-# report-shape change would break your build without you moving. Update the
-# pin deliberately.
+[dependencies]
+hekma-engine = "0.7"
+```
+
+The engine runs in your process with a blocking or async API, an event stream, and no global state. Your program then holds the engine for as long as it runs, so supervision, budgets, `send` and ACP prompt turns work continuously. See [Embed the engine](https://hekma.ktesio.dev/docs/embedding/).
+
+## Write an adapter
+
+An adapter tells Hekma how to launch an agent, what it supports on each OS, and where its token counts come from. Most agents need only an `adapter.toml` ([reference](https://hekma.ktesio.dev/docs/manifest/)). The conformance kit, `hekma-conformance`, checks an adapter against the versioned [adapter contract](https://hekma.ktesio.dev/docs/adapter-contract/) from an ordinary `cargo test`. It is not on crates.io yet, so depend on it by git, pinned to a release commit:
+
+```toml
 [dev-dependencies]
-# The kit is not published to a registry yet — depend on it by git until
-# then (a workspace-relative path like `../hekma-conformance` only works
-# inside this repository; a git dependency works for any third party):
-hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "14fbf772710e9151f7a90be8d504a4f67bd95531" }  # pin a current rev
+hekma-conformance = { git = "https://github.com/Ktesio/hekma", rev = "14fbf772710e9151f7a90be8d504a4f67bd95531" }
 ```
 
 ```rust
@@ -208,40 +120,16 @@ fn my_adapter_conforms() {
 }
 ```
 
-The harness registers your adapter with a fresh engine and returns a machine-readable report (versioned with `schema_version`): one entry per contract section — capability projection, lifecycle (including crash), pause, config mapping, both metering sources, memory delivery, and interaction — each `pass`, `fail` (with the first failure reason), or `not_applicable` (justified from your adapter's own declaration: a self-reported metering source, for example, is never asked for engine-observed proof, and a `pause: unsupported` declaration skips the pause demonstration honestly).
+## Status
 
-Plainly, four sections exercise **your adapter itself** — capability projection, lifecycle, pause, and (for manifest adapters) config delivery through your declared rules — while the metering, memory, and interaction sections prove the same engine seams through small probe fixtures the harness brings along, so a failing probe never damages your adapter's run. Native builtins register by kind via `run_conformance(&TckAdapter::Native(...))`; `run_mock_conformance` is the manifest-adapter shorthand. The section semantics are documented in [Testing](docs/testing.md#the-conformance-test-kit).
-
-## Documentation
-
-- [Getting started](docs/get-started.md)
-- [Installation](docs/installation.md)
-- [Command reference](docs/commands.md)
-- [Adapter manifest (`adapter.toml`)](docs/manifest.md)
-- [Adapter Contract](docs/adapter-contract.md)
-- [Embedding the engine (library quickstart)](docs/embedding.md)
-- [Architecture](docs/architecture.md)
-- [Testing](docs/testing.md)
-- [Release process](docs/release-process.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Contributing](CONTRIBUTING.md)
-
-## Project Status
-
-Hekma is early and moving fast. The lifecycle, layered configuration, secrets, the Usage Ledger, token budgets, dollar cost caps, and engine-observed metering are implemented today — as is the event stream: a host (or any Rust consumer) can subscribe to lifecycle, breach, and usage events through `Engine::subscribe` / `Blocking::subscribe` on the embedded engine. The Hermes Agent adapter ships as a native builtin (`--kind hermes`); OpenCode has been validated against the Adapter Contract on paper, with no shipped adapter yet; any other agent registers through an `adapter.toml` manifest that declares how to launch it and where its usage numbers come from. A supervising daemon (durable cross-invocation supervision) and a richer native adapter surface are on the roadmap.
-
-## License
-
-Hekma is **open source**, licensed under the [Apache License 2.0](LICENSE) (`Apache-2.0`).
-
-- **Free for everyone, including commercial use.** You may use, copy, modify, and distribute Hekma under the Apache-2.0 terms — no permission needed.
-- **Trademark, not license.** The Apache license grants no rights to the Ktesio/Hekma names or marks; see [TRADEMARK.md](TRADEMARK.md) for the brand policy.
-- **Patent grant included.** Apache-2.0 carries an explicit patent license from every contributor.
-- **Historical note:** releases up to and including v0.8.1 shipped under a custom source-available license (Ktesio Noncommercial-Attribution 1.0.0). Those tags stay under the license each of them shipped with; v0.9.0+ are Apache-2.0.
-
-Contributions are welcome under the project's [Contributor License Agreement](CLA.md): anyone can contribute, but you assign copyright in your contribution to the project owner so Hekma stays under unified ownership (which also keeps future licensing decisions, in either direction, clean). See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md) for details.
-
+Hekma is at 0.11.0 and moving quickly. The CLI, the JSON output, the exit codes and the adapter contract are compatibility surfaces: a breaking change is announced at least one minor release ahead and lands only in a major release. [Status and roadmap](https://hekma.ktesio.dev/docs/status/) lists what ships today and what is on the main branch, and the [release notes](https://hekma.ktesio.dev/docs/release-notes/) cover each release.
 
 ## Contributing
 
-Contributions are welcome under the project's [Contributor License Agreement](CLA.md): anyone can contribute, but you assign copyright in your contribution to the project owner so Hekma stays under unified ownership. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md) for details.
+Bug reports, ideas and pull requests are welcome. Read [CONTRIBUTING.md](https://github.com/Ktesio/hekma/blob/main/CONTRIBUTING.md) first. Contributions are made under the [Contributor License Agreement](https://github.com/Ktesio/hekma/blob/main/CLA.md), which keeps the project under one owner. Maintainers' guides to [testing](https://github.com/Ktesio/hekma/blob/main/docs/testing.md) and [releasing](https://github.com/Ktesio/hekma/blob/main/docs/release-process.md) live in this repository.
+
+## License
+
+Hekma is open source under the [Apache License 2.0](https://github.com/Ktesio/hekma/blob/main/LICENSE): free to use, change and distribute, including commercially, with an explicit patent grant. The license does not cover the Hekma or Ktesio names; see [TRADEMARK.md](https://github.com/Ktesio/hekma/blob/main/TRADEMARK.md). Releases up to 0.8.1 shipped under an earlier source-available license and keep it.
+
+Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesio.dev](https://ktesio.dev).

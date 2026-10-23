@@ -294,7 +294,7 @@ pub(crate) fn read_journal_tolerant(path: &Path) -> Result<JournalView, String> 
                      post-crash append left); to recover: stop the engine (or host), \
                      quarantine the journal by renaming the file (the next open re-derives \
                      its event sequence from the journal's absence), and re-sync the \
-                     families with resync_events — see docs/control-api.md",
+                     families with resync_events — see https://hekma.ktesio.dev/docs/control-api/",
                     last_idx + 1
                 ));
             }
@@ -321,7 +321,7 @@ pub(crate) fn read_journal_tolerant(path: &Path) -> Result<JournalView, String> 
                      produce (two engines wrote this journal concurrently); quarantine \
                      the journal by renaming it (the next open re-derives the sequence \
                      from its absence) and re-sync the families with resync_events — \
-                     see docs/control-api.md",
+                     see https://hekma.ktesio.dev/docs/control-api/",
                     idx + 1,
                     entry.seq,
                     prev

@@ -6,13 +6,13 @@ labels:
 body:
   - type: markdown
     attributes:
-      value: Thanks for helping improve Ktesio.
+      value: Thanks for helping improve Hekma.
   - type: input
     id: version
     attributes:
-      label: Ktesio version
-      description: Run `kt --version` if available.
-      placeholder: kt 0.1.0
+      label: Hekma version
+      description: Run `hekma --version` if available.
+      placeholder: hekma 0.11.0
     validations:
       required: true
   - type: dropdown
