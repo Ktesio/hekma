@@ -98,6 +98,10 @@ mod metering;
 pub mod paths;
 pub mod ports;
 mod sha256;
+// The shutdown drain (issue #328 item 3): the fleet-wide stop ladder behind
+// `Engine::shutdown` — engine-owned so a plain embedding gets the graceful
+// path without the host crate (`serve`'s drain delegates here).
+mod shutdown;
 mod store;
 mod time;
 
@@ -122,6 +126,10 @@ pub use domain::{
     USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// The shutdown drain's public surface (issue #328 item 3): the planner, the
+// per-instance outcome vocabulary, and (via `Engine::shutdown` / its
+// `blocking()` twin) the drain itself.
+pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // Story 17-4: the log-capture mode vocabulary (the `metering_listen_port`
 // thread — serve/config surface, named by `kt serve --log-capture` and the
 // host's `ServeOptions`).

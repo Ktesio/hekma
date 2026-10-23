@@ -108,6 +108,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
+| `shutdown` / `Blocking::shutdown` | Stop EVERY live agent through the same bounded ladder in one call — the graceful half of the embedder contract (below). |
 | `start_detached` / `Blocking::start_detached` | Spawn an instance that outlives your engine handle; refused with `EngineError::DetachRefused` for engine-observed instances. See the host duty below. |
 | `subscribe` / `Blocking::subscribe` | Receive the event stream (below). |
 | `resync_events` / `Blocking::resync_events` | Backfill the committed events a subscriber missed (below). |
@@ -283,6 +284,48 @@ The contract, in five rules:
    anything — the transition, breach, and usage logs remain the authoritative
    copies, readable via the query APIs.
 
+## Shutdown: the embedder contract
+
+Dropping an `Engine` is a **kill-on-drop teardown**: every attached agent's
+process group is terminated outright — no graceful window, no stop
+transition. `Drop` cannot run a stop ladder (it must not block), so the
+graceful path is a contract the embedder owns:
+
+- **Stop before drop.** An embedder that wants graceful stops calls
+  `shutdown` first and drops the engine only after it settles. This is the
+  same discipline `hekma serve` follows on its shutdown signal — the host's
+  drain is a thin delegate to the engine method.
+- **`shutdown(window, notes)`** runs the per-agent stop ladder for the whole
+  fleet in one call: every `running` **and** `paused` row (a paused row is
+  resumed first, so the graceful signal can be delivered), one agent at a
+  time in fleet order, then one re-enumeration pass for newcomers, then an
+  honest roll-up of anything still alive. Worst-case wall clock is the sum
+  of the windows — the ladders serialize under the engine's supervision lock
+  either way.
+- **Outcomes, not just an `Ok`.** The drain never aborts on one
+  un-stoppable agent; it returns a `DrainOutcome` per instance —
+  `Graceful`, `Forced` (the window elapsed and the ladder escalated),
+  `ExitedOnItsOwn`, `Unverified`, or `Failed` with the reason — so a failed
+  stop degrades the shutdown's tidiness, never its honesty.
+- **Notices are optional.** Pass `Some(&sink)` (a
+  [`DiagnosticSink`](#the-diagnostic-sink)) to get the same `[hekma] `
+  progress lines `serve` prints at shutdown; pass `None` for return values
+  only.
+
+```rust,ignore
+let outcomes = engine.blocking().shutdown(Duration::from_secs(5), None);
+for outcome in &outcomes {
+    println!("{outcome}");
+}
+drop(engine); // now the kill-on-drop teardown finds nothing left to kill
+```
+
+A drain stops every live row this engine can see — adopted detached rows
+included, exactly the rows `serve` drains. The detached-survival contract
+(the [host duty](#the-detached-start-host-duty) above) governs the other
+case: what happens when an engine dies **without** a drain, such as a crash
+— the next engine adopts the survivors.
+
 ## The quickstart example
 
 A complete, runnable host lives at
@@ -316,7 +359,9 @@ seven legs, matching the numbered steps in the file:
    keeps draining), then assert `instance_status` is `running` and the
    `fleet` row carries the configured budget ceiling.
 7. **Stop** with a five-second graceful window, then remove the scratch root
-   (best-effort).
+   (best-effort). With a whole fleet to wind down, `shutdown` runs the same
+   ladder for every live agent in one call — see
+   [the shutdown contract](#shutdown-the-embedder-contract) above.
 
 CI compiles the example on all three OS legs and **runs** it hermetically on
 ubuntu on every push — the quickstart cannot silently rot.
