@@ -99,12 +99,19 @@ pub struct InstanceStatus {
 
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
-/// for the failure-bearing causes (a launch error, or a crash), or `None` for a
+/// for the failure-bearing causes (a launch error, a crash, or a readiness-probe
+/// timeout — the timeout names the probe + the honest wait), or `None` for a
 /// cause that does not describe a failure.
 fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
     match cause {
         TransitionCause::LaunchError { detail } => Some(detail.clone()),
         TransitionCause::Crashed { detail } => Some(detail.clone()),
+        // The readiness gate never opened: name the probe + how long it was
+        // honestly waited, so `show` explains the failed start without a log
+        // dig.
+        TransitionCause::ReadinessTimeout { probe, waited_ms } => {
+            Some(format!("{probe} did not pass within {waited_ms}ms"))
+        }
         _ => None,
     }
 }

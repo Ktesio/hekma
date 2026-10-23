@@ -16,6 +16,17 @@
 //! * `[capabilities]` — a non-empty per-OS Capability Declaration (AD-4).
 //! * `[metering]` — a viable Metering Source (AD-7; the FR-19 hard line, AC4).
 //!
+//! ## Optional sections
+//!
+//! * `[interaction]` — the documentary interaction channel (story 4.1).
+//! * `[config]` — the unified→native config mapping (story 2-2, FR-12).
+//! * `[readiness]` — ONE declared readiness probe gating the engine's
+//!   `starting → running` transition (added at contract `1.0.0 → 1.1.0`):
+//!   `http-get { url, expected_status }`, `file_fresh { path, max_age_ms }`,
+//!   or `log_contains { line }`, each with a `timeout_ms` in `1..=600_000`.
+//!   An engine built at 1.0.0 rejects the section for free
+//!   (`deny_unknown_fields`) — the versioning policy's older-same-major rule.
+//!
 //! `#[serde(deny_unknown_fields)]` (the repo's manifest style) additionally
 //! rejects unknown keys, catching typos.
 //!
@@ -67,6 +78,13 @@ pub struct Manifest {
     /// common). Each `[config.<key>]` sub-table declares one native mechanism
     /// (`env`/`flag`/`file`). Validated by [`Manifest::validate`] when present.
     pub config: Option<ConfigMapping>,
+    /// The declared readiness probe (added at contract `1.0.0 → 1.1.0`).
+    /// OPTIONAL: a manifest without it starts exactly as before. Validated by
+    /// [`Manifest::validate`] when present — a v1.1.0 engine names the section's
+    /// first invalid field; a v1.0.0 engine (whose schema has no `readiness`
+    /// field at all) rejects the section at PARSE time via
+    /// `deny_unknown_fields`, exactly as the versioning policy states.
+    pub readiness: Option<Readiness>,
 }
 
 /// The `[adapter]` identity block.
@@ -192,6 +210,344 @@ pub struct Interaction {
     pub channel: InteractionChannelKind,
 }
 
+/// The declared readiness probe kind (added at contract `1.0.0 → 1.1.0`).
+///
+/// A CLOSED set, mirroring [`InteractionChannelKind`]'s seed-enum pattern:
+/// kebab-case on the wire (`http-get` / `file-fresh` / `log-contains`), an
+/// unrecognized value fails at PARSE time (an unknown variant), and an
+/// `as_str()`/`Display` pair names the wire form. Exactly ONE kind per
+/// manifest — the alternatives are alternatives, not a pipeline (the
+/// `[readiness]` section's shape — a table — is where a future ordered-gate
+/// LIST would grow, without a breaking change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadinessKind {
+    /// An HTTP GET against a URL; the probe passes when the response's status
+    /// equals the declared expected status.
+    HttpGet,
+    /// A file whose modification age is at most the declared maximum — the
+    /// agent proves readiness by (re)writing a file.
+    FileFresh,
+    /// A substring that must appear in the ENGINE-owned agent output log
+    /// after this Run's spawn point — the agent proves readiness by printing
+    /// a line.
+    LogContains,
+}
+
+impl ReadinessKind {
+    /// The kebab-case wire name, matching the serde form and manifest value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadinessKind::HttpGet => "http-get",
+            ReadinessKind::FileFresh => "file-fresh",
+            ReadinessKind::LogContains => "log-contains",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadinessKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `http-get` probe's resolved target: a loopback-first URL and the ONE
+/// status that counts as ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpGetProbe {
+    /// The probe URL. `http://` ONLY (no TLS, no other schemes): the probe
+    /// targets the AGENT's own listener on the same host, so a remote or
+    /// HTTPS target is refused at validation — a remote readiness endpoint
+    /// is a Host concern, not an adapter-contract one.
+    pub url: String,
+    /// The status code that counts as ready. ANY response carrying it passes
+    /// (connection-refused is a not-yet, retried on the engine's poll cadence —
+    /// never an error).
+    pub expected_status: u16,
+}
+
+/// The `file-fresh` probe's resolved target: a path (relative to the Agent
+/// Home when relative) and the maximum modification age that counts as fresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFreshProbe {
+    /// The file the agent (re)writes to prove readiness. A relative path
+    /// resolves against the instance's Agent Home (the agent's own working
+    /// directory); an absolute path is taken verbatim.
+    pub path: String,
+    /// The maximum modification age, in milliseconds. A file modified within
+    /// this window of the check is fresh. SystemTime deltas only — the
+    /// per-OS mtime granularity honesty (e.g. 2 s on Windows FAT) lives in
+    /// the section's docs, never in the comparison.
+    pub max_age_ms: u64,
+}
+
+/// The `log-contains` probe's resolved target: the SUBSTRING that must appear
+/// in the engine-owned agent output log after this Run's spawn point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogContainsProbe {
+    /// The readiness line. A plain SUBSTRING match (the engine is regex-free
+    /// by design) over a bounded incremental read starting at the spawn-time
+    /// cursor. Under the engine's `capture = "off"` posture no log exists, so
+    /// this probe is unsatisfiable there and fails at its timeout — honestly
+    /// named, never a fake pass.
+    pub line: String,
+}
+
+/// The ONE declared readiness probe, RESOLVED (exactly one variant, every
+/// field present and legal). Built only by [`Readiness::gate`] after
+/// validation, so the engine's runner consumes this enum without re-checking
+/// anything: an internally-tagged Rust mirror of the manifest's per-kind
+/// fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadinessProbe {
+    /// An HTTP GET with an expected status.
+    HttpGet(HttpGetProbe),
+    /// A file's maximum modification age.
+    FileFresh(FileFreshProbe),
+    /// A substring in the engine-owned agent log.
+    LogContains(LogContainsProbe),
+}
+
+/// The declared readiness gate RESOLVED (contract `1.1.0`): the probe plus
+/// its OWN budget. The engine's runner waits for [`ReadinessGate::probe`] to
+/// pass within [`ReadinessGate::timeout_ms`] on ITS OWN poll cadence (the
+/// manifest declares the budget, never the cadence).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessGate {
+    /// The probe's whole budget, in milliseconds (`1..=600_000`, enforced by
+    /// [`Readiness::gate`]).
+    pub timeout_ms: u64,
+    /// The one resolved probe.
+    pub probe: ReadinessProbe,
+}
+
+/// The optional `[readiness]` section (added at contract `1.0.0 → 1.1.0`):
+/// exactly ONE declared readiness probe, shaped `{ kind, timeout_ms, <the
+/// kind's own fields> }` —
+///
+/// ```toml
+/// [readiness]
+/// kind = "http-get"
+/// timeout_ms = 5000
+/// url = "http://127.0.0.1:8080/health"
+/// expected_status = 200
+/// ```
+///
+/// OPTIONAL: a manifest without the section behaves exactly as before (the
+/// engine's process-level startup watch alone). Declaring it makes the
+/// engine's supervisor gate `starting → running` on the probe: the instance
+/// reaches `running` only once the probe passes within its declared
+/// `timeout_ms`; a timeout lands it `failed` with the probe NAMED (a
+/// terminal failure, never an auto-restart). The section is
+/// `deny_unknown_fields` like every section struct, so an engine built at
+/// contract 1.0.0 rejects a manifest declaring it (the versioning policy's
+/// older-same-major-engine rule, for free).
+///
+/// Validation is [`Readiness::probe`] (consumed by [`Manifest::validate`]):
+/// the `kind`'s own fields are REQUIRED, every OTHER kind's fields are
+/// FORBIDDEN (a `file-fresh` manifest carrying `url` names the offender),
+/// and the value rules hold: `timeout_ms` in `1..=600_000`; `url` starts
+/// with `http://`; `max_age_ms <= timeout_ms`; `line` non-empty with no NUL
+/// bytes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    /// Which probe this is. A closed enum — an unrecognized value fails at
+    /// PARSE time (an unknown variant naming the section).
+    pub kind: ReadinessKind,
+    /// The probe's whole budget, in milliseconds. `1..=600_000` (ten
+    /// minutes): below 1 is not a poll at all, above the cap a start would
+    /// hold supervision unboundedly. The ENGINE owns the poll cadence within
+    /// this budget — the manifest declares operator intent only.
+    pub timeout_ms: u64,
+    /// `http-get` only: the probe URL (`http://` only).
+    pub url: Option<String>,
+    /// `http-get` only: the status code that counts as ready.
+    pub expected_status: Option<u16>,
+    /// `file-fresh` only: the readiness file (relative to the Agent Home).
+    pub path: Option<String>,
+    /// `file-fresh` only: the maximum modification age, in milliseconds
+    /// (`<= timeout_ms`).
+    pub max_age_ms: Option<u64>,
+    /// `log-contains` only: the readiness line (substring, non-empty, no NULs).
+    pub line: Option<String>,
+}
+
+impl Readiness {
+    /// Resolve this section into its [`ReadinessGate`] (the probe + its own
+    /// budget), enforcing the whole value matrix and naming the first failing
+    /// field (the section's validation — run at registration via
+    /// [`Manifest::validate`] and re-checked at start like the `[config]`
+    /// mapping).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * `timeout_ms` must be `1..=600_000`;
+    /// * the `kind`'s own fields are all required (with per-kind value rules);
+    /// * every OTHER kind's fields are forbidden — a stray `url` under
+    ///   `file-fresh` is a named `InvalidField`, never silently ignored.
+    pub fn gate(&self) -> Result<ReadinessGate, ManifestError> {
+        if self.timeout_ms == 0 || self.timeout_ms > 600_000 {
+            return Err(ManifestError::InvalidField {
+                field: "`timeout_ms` field in the `[readiness]` section".to_string(),
+                detail: format!(
+                    "{} is out of range — the declared probe budget must be between 1 and \
+                     600000 milliseconds",
+                    self.timeout_ms
+                ),
+            });
+        }
+        // The kind's OWN fields, required + per-kind value rules; the
+        // foreign-field sweep runs after, so a manifest that both omits its
+        // own field and carries a foreign one names the missing field first.
+        let probe = match self.kind {
+            ReadinessKind::HttpGet => {
+                let url = required_str(
+                    self.url.as_deref(),
+                    "`url` field in the `[readiness]` section",
+                )?;
+                if !url.starts_with("http://") {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' is not an http:// URL — the readiness probe targets the \
+                             agent's own loopback listener, so only http:// is accepted (no \
+                             TLS, no other schemes)"
+                        ),
+                    });
+                }
+                // The authority (host[:port]) must be present: `http://` alone
+                // or `http:///path` has nowhere to connect and would only
+                // fail obscurely at probe time.
+                let authority = url
+                    .trim_start_matches("http://")
+                    .split(['/', '?', '#'])
+                    .next()
+                    .unwrap_or("");
+                if authority.is_empty() {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' carries no host — the probe URL must name the agent's \
+                             listener host (e.g. http://127.0.0.1:8080/health)"
+                        ),
+                    });
+                }
+                let expected_status = self.expected_status.ok_or_else(|| {
+                    ManifestError::missing(
+                        "`expected_status` field in the `[readiness]` section (the http-get \
+                         probe's ready status)",
+                    )
+                })?;
+                ReadinessProbe::HttpGet(HttpGetProbe {
+                    url: url.to_string(),
+                    expected_status,
+                })
+            }
+            ReadinessKind::FileFresh => {
+                let path = required_str(
+                    self.path.as_deref(),
+                    "`path` field in the `[readiness]` section",
+                )?;
+                if path.contains('\0') {
+                    return Err(ManifestError::InvalidField {
+                        field: "`path` field in the `[readiness]` section".to_string(),
+                        detail: "the readiness file path contains a NUL byte".to_string(),
+                    });
+                }
+                let max_age_ms = self.max_age_ms.ok_or_else(|| {
+                    ManifestError::missing(
+                        "`max_age_ms` field in the `[readiness]` section (the file-fresh \
+                         probe's maximum age)",
+                    )
+                })?;
+                if max_age_ms > self.timeout_ms {
+                    return Err(ManifestError::InvalidField {
+                        field: "`max_age_ms` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "{max_age_ms} exceeds the probe's own timeout_ms ({}) — a file \
+                             cannot be required fresher than the probe is allowed to wait",
+                            self.timeout_ms
+                        ),
+                    });
+                }
+                ReadinessProbe::FileFresh(FileFreshProbe {
+                    path: path.to_string(),
+                    max_age_ms,
+                })
+            }
+            ReadinessKind::LogContains => {
+                let line = required_str(
+                    self.line.as_deref(),
+                    "`line` field in the `[readiness]` section",
+                )?;
+                if line.contains('\0') {
+                    return Err(ManifestError::InvalidField {
+                        field: "`line` field in the `[readiness]` section".to_string(),
+                        detail: "the readiness line contains a NUL byte".to_string(),
+                    });
+                }
+                ReadinessProbe::LogContains(LogContainsProbe {
+                    line: line.to_string(),
+                })
+            }
+        };
+        // The FOREIGN-field sweep: fields belonging to a different kind must
+        // be absent. A present one is a named error (the typo-protection the
+        // house style owes), never a silently-ignored key.
+        let foreign: &[(&str, bool)] = match self.kind {
+            ReadinessKind::HttpGet => &[
+                ("`path`", self.path.is_some()),
+                ("`max_age_ms`", self.max_age_ms.is_some()),
+                ("`line`", self.line.is_some()),
+            ],
+            ReadinessKind::FileFresh => &[
+                ("`url`", self.url.is_some()),
+                ("`expected_status`", self.expected_status.is_some()),
+                ("`line`", self.line.is_some()),
+            ],
+            ReadinessKind::LogContains => &[
+                ("`url`", self.url.is_some()),
+                ("`expected_status`", self.expected_status.is_some()),
+                ("`path`", self.path.is_some()),
+                ("`max_age_ms`", self.max_age_ms.is_some()),
+            ],
+        };
+        if let Some((field, _)) = foreign.iter().find(|(_, present)| *present) {
+            return Err(ManifestError::InvalidField {
+                field: format!("{field} field in the `[readiness]` section"),
+                detail: format!(
+                    "not a `{}` probe field — the `{}` kind carries only its own fields \
+                     ({})",
+                    self.kind,
+                    self.kind,
+                    match self.kind {
+                        ReadinessKind::HttpGet => "`url`, `expected_status`",
+                        ReadinessKind::FileFresh => "`path`, `max_age_ms`",
+                        ReadinessKind::LogContains => "`line`",
+                    }
+                ),
+            });
+        }
+        Ok(ReadinessGate {
+            timeout_ms: self.timeout_ms,
+            probe,
+        })
+    }
+}
+
+/// Convenience constructor naming a required-but-absent `[readiness]` field
+/// (the `missing` phrasing the other section validators use).
+fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, ManifestError> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v),
+        Some(_) => Err(ManifestError::InvalidField {
+            field: field.to_string(),
+            detail: "the value is empty".to_string(),
+        }),
+        None => Err(ManifestError::missing(field)),
+    }
+}
+
 /// Why a manifest is invalid (spine AD-3; `thiserror`, never `miette`).
 ///
 /// Every message NAMES the failing section or the invalid value (AC2), so `hekma`
@@ -283,6 +639,11 @@ impl Manifest {
                 format!("the `[metering]` section has an invalid `source`: {message}")
             } else if expected_clause.contains("stdio") {
                 format!("the `[interaction]` section has an invalid `channel`: {message}")
+            } else if expected_clause.contains("http-get")
+                || expected_clause.contains("file-fresh")
+                || expected_clause.contains("log-contains")
+            {
+                format!("the `[readiness]` section has an invalid `kind`: {message}")
             } else {
                 message
             };
@@ -393,6 +754,16 @@ impl Manifest {
             }
         }
 
+        // [readiness] probe (added at contract 1.1.0), IF present. Absent is
+        // valid (the pre-1.1.0 behavior — no declared probe — and the common
+        // case). A present-but-invalid section names its first failing field
+        // (`Readiness::probe` enforces the value matrix: the timeout range,
+        // the kind's own required fields, the http:// posture, and the
+        // foreign-field sweep).
+        if let Some(readiness) = &self.readiness {
+            readiness.gate()?;
+        }
+
         Ok(())
     }
 
@@ -425,6 +796,21 @@ impl Manifest {
     /// mapping. Mirrors [`Self::capability_declaration`]'s empty-when-absent shape.
     pub fn config_mapping(&self) -> ConfigMapping {
         self.config.clone().unwrap_or_default()
+    }
+
+    /// The declared readiness [`ReadinessGate`] (added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[readiness]` section — the
+    /// engine's start seam treats that as "no probe" (the pre-1.1.0 behavior,
+    /// byte-identical). The `Result` is defensive depth: a validated manifest's
+    /// section already resolved cleanly, but the engine calls THIS accessor, so
+    /// it re-states the failure honestly rather than panicking.
+    pub fn readiness_probe(&self) -> Result<Option<ReadinessGate>, ManifestError> {
+        match &self.readiness {
+            Some(section) => section.gate().map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -999,5 +1385,263 @@ channel = "stdio"
         let toml = format!("{VALID}\n[config.model]\nbogus = \"x\"\n");
         let err = Manifest::from_toml_str(&toml).unwrap_err();
         assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    // -- [readiness] (added at contract 1.0.0 → 1.1.0) ----------------------
+
+    /// Append a `[readiness]` section carrying exactly `body` to [`VALID`].
+    fn with_readiness(body: &str) -> String {
+        format!("{VALID}\n[readiness]\n{body}\n")
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_readiness_section() {
+        // The v1.0.0-rejection PIN (the versioning policy's
+        // older-same-major-engine rule, stated on the release surface): an
+        // engine built at contract 1.0.0 has a `Manifest` schema WITHOUT the
+        // `readiness` field, and `deny_unknown_fields` refuses the unknown
+        // section at PARSE time. Simulated here with the exact pre-1.1.0
+        // shape — the same section list, minus `readiness` — against a
+        // 1.1.0 manifest that declares the section. The diagnostic must NAME
+        // it (`readiness`), so an operator on an older engine learns which
+        // section their engine does not speak.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"ready\"");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("readiness"), "got {err}");
+    }
+
+    #[test]
+    fn no_readiness_section_is_valid_and_resolves_to_none() {
+        // The pre-1.1.0 shape: no section, no probe — the engine's start
+        // behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.readiness_probe().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn readiness_http_get_parses_and_resolves() {
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::HttpGet(HttpGetProbe {
+                    url: "http://127.0.0.1:8080/health".to_string(),
+                    expected_status: 200,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_file_fresh_parses_and_resolves() {
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 250",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::FileFresh(FileFreshProbe {
+                    path: "ready.marker".to_string(),
+                    max_age_ms: 250,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_log_contains_parses_and_resolves() {
+        let toml =
+            with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"listening on\"");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::LogContains(LogContainsProbe {
+                    line: "listening on".to_string(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_timeout_bounds_are_enforced() {
+        // Below 1 is not a poll at all; above 600_000 a start would hold
+        // supervision unboundedly. Both name the field.
+        for timeout in ["0", "600_001"] {
+            let toml = with_readiness(&format!(
+                "kind = \"log-contains\"\ntimeout_ms = {timeout}\nline = \"ready\""
+            ));
+            let m = Manifest::from_toml_str(&toml).unwrap_or_else(|_| {
+                // 600_001 with underscores is not TOML integer syntax — only
+                // `0` reaches this arm as a parse error; write it plain.
+                panic!("toml must parse: {toml}")
+            });
+            let err = m.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("timeout_ms"),
+                "timeout {timeout} must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_non_http_url_is_rejected_naming_the_field() {
+        // The loopback-probe posture: http:// only — no TLS, no other schemes.
+        for url in [
+            "https://127.0.0.1:8080/health",
+            "tcp://127.0.0.1:8080",
+            "127.0.0.1:8080/health",
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"{url}\"\nexpected_status = 200"
+            ));
+            let m = Manifest::from_toml_str(&toml).expect("parse");
+            let err = m.validate().unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("`url`") && text.contains("readiness"),
+                "url {url} must name the field + section: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_url_without_a_host_is_rejected() {
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("no host"),
+            "a host-less URL must name why: {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_max_age_above_timeout_is_rejected() {
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 500\npath = \"ready.marker\"\nmax_age_ms = 501",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("max_age_ms") && text.contains("timeout_ms"),
+            "must name both fields: {text}"
+        );
+    }
+
+    #[test]
+    fn readiness_empty_or_nul_line_is_rejected() {
+        let empty = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"  \"");
+        let err = Manifest::from_toml_str(&empty)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("`line`"), "got {err}");
+
+        let nul = format!(
+            "{}\n[readiness]\nkind = \"log-contains\"\ntimeout_ms = 5000\nline = \"a\\u0000b\"\n",
+            VALID
+        );
+        let err = Manifest::from_toml_str(&nul)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("NUL"),
+            "a NUL byte must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_foreign_kind_fields_are_rejected_naming_the_field() {
+        // Exactly ONE probe per manifest, and the kind's shape is exact: a
+        // `file-fresh` manifest carrying `url` names the stray field (typo
+        // protection — never a silently-ignored key).
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 250\n\
+             url = \"http://127.0.0.1:8080/health\"",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`url`")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_missing_kind_fields_are_rejected_naming_the_field() {
+        // http-get without expected_status.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://127.0.0.1:8080/health\"",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("expected_status"), "got {err}");
+
+        // file-fresh without max_age_ms.
+        let toml =
+            with_readiness("kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"");
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_age_ms"), "got {err}");
+
+        // log-contains without line.
+        let toml = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000");
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("`line`"), "got {err}");
+    }
+
+    #[test]
+    fn readiness_unknown_kind_fails_at_parse_naming_the_section() {
+        // The closed kind vocabulary: an unrecognized value is an unknown
+        // VARIANT at parse time, attributed to the section (the same
+        // disambiguation the metering/interaction enums get).
+        let toml = with_readiness("kind = \"tcp-connect\"\ntimeout_ms = 5000");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Toml { detail } if detail.contains("[readiness]")),
+            "got {err}"
+        );
     }
 }

@@ -88,14 +88,17 @@ use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 pub const DEFAULT_STOP_WINDOW: Duration = Duration::from_secs(30);
 
 /// How long to watch a freshly spawned process for an immediate failure before
-/// declaring it `running` (the readiness definition, `[ASSUMPTION]`).
+/// declaring it `running` (the startup SURVIVAL definition, `[ASSUMPTION]`).
 ///
-/// "Adapter ready" this story = "the process spawned and did not die during this
-/// short startup window". A process that exits (especially non-zero) within it is
-/// treated as a launch failure (AC2 "immediate non-zero exit during startup").
-/// Kept small so `start` stays snappy; the fake test agent's `--exit-fast` path
-/// exits well inside it.
-const READINESS_WINDOW: Duration = Duration::from_millis(300);
+/// Renamed from `READINESS_WINDOW` when real readiness probes arrived (Epic 18):
+/// "adapter ready" is now the DECLARED probe passing (or, with none, this
+/// legacy spawn-and-survive heuristic). The name keeps the two notions from
+/// blurring — this window is only "the process spawned and did not die during
+/// this short startup window". A process that exits (especially non-zero) within
+/// it is treated as a launch failure (AC2 "immediate non-zero exit during
+/// startup"). Kept small so `start` stays snappy; the fake test agent's
+/// `--exit-fast` path exits well inside it.
+const STARTUP_SURVIVAL_WINDOW: Duration = Duration::from_millis(300);
 
 /// How often the readiness watch polls the freshly spawned process.
 const READINESS_POLL: Duration = Duration::from_millis(10);
@@ -913,6 +916,18 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     totals_read_fault_names: std::collections::HashSet<InstanceName>,
+    /// Readiness probes (Epic 18) — restart plans QUEUED by the start path when
+    /// the declared probe observes the process EXIT mid-wait. The start path
+    /// has already driven the `starting → failed` crash transition, but it
+    /// cannot time a backoff (it must return to its caller); so the plan rides
+    /// here and the VERY NEXT [`Supervisor::poll_once`] drains it (top of the
+    /// pass, before crash polling), letting the engine cadence execute the
+    /// restart with its normal backoff timing. Empty on every constructor.
+    /// A `Mutex` (not a plain `Vec`) because the queueing happens on the
+    /// start path's `&self` — the same interior-mutability reason as
+    /// `outbox_next_seq`'s atomic; a poisoned lock is RECOVERED (the guarded
+    /// Vec is always valid — queued plans must survive a panicking peer).
+    pending_restarts: std::sync::Mutex<Vec<RestartPlan>>,
 }
 
 impl Supervisor {
@@ -953,6 +968,7 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -992,6 +1008,7 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1031,6 +1048,7 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1678,18 +1696,70 @@ impl Supervisor {
         name: &InstanceName,
         detail: String,
     ) -> EngineError {
+        self.fail_launch_with_cause(
+            registry,
+            name,
+            TransitionCause::launch_error(detail.clone()),
+            detail,
+        )
+    }
+
+    /// Land a launch failure in `failed` with an EXPLICIT cause + detail.
+    ///
+    /// The generalization of [`Self::fail_launch_detail`]: the readiness-probe
+    /// timeout (Epic 18) fails a launch whose process is ALIVE — the cause is
+    /// NOT `launch-error` but [`TransitionCause::ReadinessTimeout`], so the
+    /// lifecycle record distinguishes "the launch itself failed" from "the
+    /// launch succeeded and the adapter never became ready". Same shape as the
+    /// sibling: transition `starting → failed`, return
+    /// [`EngineError::LaunchFailed`]; a store error on the transition is
+    /// surfaced instead (it is the more fundamental problem).
+    fn fail_launch_with_cause(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+        detail: String,
+    ) -> EngineError {
         if let Err(e) = self.transition(
             registry,
             name,
             LifecycleState::Starting,
             LifecycleState::Failed,
-            TransitionCause::launch_error(detail.clone()),
+            cause,
         ) {
             return e;
         }
         EngineError::LaunchFailed {
             name: name.as_str().to_string(),
             detail,
+        }
+    }
+
+    /// Queue a restart plan the NEXT reaper pass should execute (Epic 18).
+    ///
+    /// The start path discovers an exit during its readiness-probe wait but
+    /// cannot time the backoff itself (it must return to its caller); it lands
+    /// the crash transition inline, queues the plan here, and the next
+    /// [`Supervisor::poll_once`] drains it at the TOP of the pass so the engine
+    /// cadence times the backoff exactly as it does for reaper-detected
+    /// crashes. FIFO (a start enqueues at most one). Takes `&self` (the start
+    /// path holds the supervisor through a shared borrow); a poisoned lock is
+    /// recovered — the guarded Vec is always valid, and a queued restart must
+    /// survive a panicking peer, not vanish.
+    pub(crate) fn queue_pending_restart(&self, plan: RestartPlan) {
+        match self.pending_restarts.lock() {
+            Ok(mut queue) => queue.push(plan),
+            Err(poisoned) => poisoned.into_inner().push(plan),
+        }
+    }
+
+    /// Take every queued restart plan (the reaper pass's first act). Same
+    /// poison recovery as [`Self::queue_pending_restart`].
+    pub(crate) fn drain_pending_restarts(&self) -> Vec<RestartPlan> {
+        match self.pending_restarts.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(poisoned) => std::mem::take(&mut poisoned.into_inner()),
         }
     }
 }
@@ -1841,6 +1911,13 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::BudgetExceeded {
             scope, dimension, ..
         } => format!(" (breach: {scope} {dimension})"),
+        // Readiness timeout (Epic 18): spell the WIRE TAG + the honest wait, same
+        // greppability rule as `detached-resumed` above — the probe description
+        // itself is in the cause payload / `show` detail; the suffix keeps the line
+        // one line.
+        TransitionCause::ReadinessTimeout { waited_ms, .. } => {
+            format!(" (readiness-timeout: waited {waited_ms}ms)")
+        }
     }
 }
 
