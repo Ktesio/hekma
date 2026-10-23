@@ -683,6 +683,17 @@ impl Supervisor {
             // armed, story 1-6). `None` on a degraded start-time read keeps
             // the pre-boundary adopt-armed posture, never a spawn failure.
             owner: self.backend.self_fingerprint(),
+            // The ADOPTION LEASE (schema v11, issue #328) is adoption-only:
+            // a fresh spawn takes NO lease. The spawning engine's ownership
+            // is the `owner` fact above, and the registry already refuses a
+            // duplicate spawn of a live record — the lease exists to pick
+            // exactly ONE winner among engines concurrently ADOPTING a dead
+            // owner's record, which cannot include this one (it holds the
+            // process from the start). `None` here also RESETS any stale
+            // lease on a genuine (re)spawn through the upsert's excluded
+            // columns: a lease must never outlive the process lifetime it
+            // arbitrated.
+            lease: None,
         };
         if let Err(e) = registry.write_spawn_record(&record) {
             // Persisting the record failed: kill the just-spawned process and
