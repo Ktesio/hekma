@@ -385,6 +385,8 @@ With `--json`, stdout carries the versioned confirmation document and nothing el
 
 ## `hekma agent config set <name> <key> <value>`
 
+Concurrent `config set`s on the same instance are safe: the engine serializes each write's read-modify-write of the instance `config.toml` behind a per-instance advisory lock (`config.toml.lock` beside the file — the `host.lock` pattern, released by the OS if a writer dies), so parallel writes from multiple terminals or scripts all land instead of silently dropping each other's keys.
+
 Set one config key on the Agent Instance layer. Validated at write time.
 
 ```bash

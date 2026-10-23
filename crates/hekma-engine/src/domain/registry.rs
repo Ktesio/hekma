@@ -1114,6 +1114,25 @@ impl Registry {
         // re-serialize. All through path authority — the engine owns the path.
         // set_dotted FAILS CLOSED on a scalar-intermediate collision (patch #3),
         // BEFORE the write below, so a conflicting write leaves config unchanged.
+        //
+        // The whole load→set→write sequence is a READ-MODIFY-WRITE, and it is
+        // serialized across PROCESSES by the per-instance advisory lock below:
+        // the atomic rename alone guarantees no TORN file, but two concurrent
+        // `config set`s (two CLI processes, an operator + a script) used to
+        // interleave as A-reads / B-reads / A-writes / B-writes — B's document
+        // silently dropping A's key while BOTH commands exited 0 (proven by
+        // the battle pass: 12 parallel sets on distinct keys landed only 10,
+        // different keys lost per run). The lock is the `host.lock` pattern:
+        // the OS releases it when the holder dies, so a crashed writer never
+        // wedges the instance; the bounded wait mirrors the store's
+        // BUSY_TIMEOUT_MS discipline and surfaces a typed Store error instead
+        // of hanging forever on a stuck holder.
+        let lock_path = self.paths.instance_config_lock(name);
+        let _config_write_lock =
+            Self::acquire_config_write_lock(&lock_path).map_err(|detail| ConfigError::Store {
+                name: name.as_str().to_string(),
+                detail,
+            })?;
         let path = self.paths.instance_config(name);
         let mut table = self.instance_config_layer(name)?.as_table().clone();
         set_dotted(&mut table, key, toml::Value::String(value.to_string()))?;
@@ -1135,6 +1154,65 @@ impl Registry {
             }
         })?;
         Ok(warnings)
+    }
+
+    /// Acquire the per-instance config WRITE lock (see [`Self::set_config`]'s
+    /// step-3 docs): open-or-create the lock residue file and take its
+    /// advisory lock, retrying within a bounded window (the store's
+    /// `BUSY_TIMEOUT_MS` discipline — a legitimate concurrent writer holds it
+    /// for the milliseconds of its own read-modify-write, so waiting briefly
+    /// is correct; a stuck holder times out with a named error instead of an
+    /// unbounded hang, and the OS releases the lock if the holder dies).
+    /// Holding the returned [`std::fs::File`] IS holding the lock — drop ends
+    /// it. The residue file itself is intentionally left behind (the
+    /// `host.lock` precedent: the LOCK decides, never the content).
+    fn acquire_config_write_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| {
+                format!(
+                    "could not open the config write lock at {}: {e}",
+                    path.display()
+                )
+            })?;
+        // Best-effort holder record (the host.lock sugar), written only once
+        // the lock is HELD so contenders never clobber each other's record:
+        // a diagnosability hint — the LOCK is the safety property.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(crate::store::BUSY_TIMEOUT_MS);
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    let mut guard = &file;
+                    let _ = guard.set_len(0);
+                    let _ = writeln!(guard, "pid={}", std::process::id());
+                    let _ = guard.flush();
+                    return Ok(file);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out waiting for the config write lock at {} — another \
+                             config write appears stuck; the OS releases the lock when its \
+                             holder exits, so retrying later is safe",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(format!(
+                        "could not lock the config write lock at {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 
     /// The AI-33 set-time steering fact (story 11-2): does THIS write put a
