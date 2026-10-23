@@ -301,7 +301,7 @@ pub enum LaunchResolveError {
         /// The adapter kind/identity whose readiness section is invalid.
         adapter: String,
         /// Why the section is invalid (from
-        /// [`hekma_adapter_api::Readiness::probe`], verbatim).
+        /// [`hekma_adapter_api::Readiness::gate`], verbatim).
         detail: String,
     },
 }
@@ -905,6 +905,7 @@ impl From<AdapterResolveError> for crate::domain::RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hekma_adapter_api::{HttpGetProbe, ReadinessProbe};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -1920,6 +1921,87 @@ file = { path = "../escape.toml", key = "k" }
         let path = write_manifest(tmp.path(), "not = = valid toml");
         let err = resolve_config_mapping("demo", Some(&path)).unwrap_err();
         assert!(matches!(err, LaunchResolveError::ManifestUnreadable { .. }));
+    }
+
+    #[test]
+    fn resolve_readiness_probe_reads_the_manifest_readiness_section() {
+        // The manifest adapter's readiness gate comes from its parsed
+        // `[readiness]` section, re-checked at start (symmetric with the
+        // config mapping).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[readiness]
+kind = "http-get"
+timeout_ms = 5000
+url = "http://127.0.0.1:8080/health"
+expected_status = 200
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let gate = resolve_readiness_probe("demo", Some(&path)).unwrap();
+        assert_eq!(
+            gate.map(|g| (g.timeout_ms, g.probe)),
+            Some((
+                5000,
+                ReadinessProbe::HttpGet(HttpGetProbe {
+                    url: "http://127.0.0.1:8080/health".to_string(),
+                    expected_status: 200,
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_readiness_probe_native_adapter_declares_none() {
+        // A native adapter declares NO readiness section — its readiness is
+        // code — so `Ok(None)`, never an error (an unknown native kind too:
+        // the launch resolution already rejected it).
+        assert_eq!(resolve_readiness_probe("mock", None).unwrap(), None);
+        assert_eq!(resolve_readiness_probe("nope", None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_readiness_probe_drifted_section_is_invalid_naming_field_and_section() {
+        // The drift gate: the launch resolution already re-read this file,
+        // but if the `[readiness]` section drifted invalid after
+        // registration (here `timeout_ms = 0`), the start refuses with
+        // InvalidReadinessProbe — the engine never launches with a probe it
+        // cannot legally run. The detail names BOTH the field and the
+        // section (the manifest error, verbatim).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[readiness]
+kind = "log-contains"
+timeout_ms = 0
+line = "ready"
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_readiness_probe("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidReadinessProbe { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("timeout_ms"), "{detail}");
+                assert!(detail.contains("[readiness]"), "{detail}");
+            }
+            other => panic!("expected InvalidReadinessProbe, got {other}"),
+        }
     }
 
     #[test]

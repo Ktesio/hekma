@@ -36,6 +36,7 @@
 //! launch is story 1-4.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -343,12 +344,15 @@ pub struct ReadinessGate {
 /// contract 1.0.0 rejects a manifest declaring it (the versioning policy's
 /// older-same-major-engine rule, for free).
 ///
-/// Validation is [`Readiness::probe`] (consumed by [`Manifest::validate`]):
+/// Validation is [`Readiness::gate`] (consumed by [`Manifest::validate`]):
 /// the `kind`'s own fields are REQUIRED, every OTHER kind's fields are
 /// FORBIDDEN (a `file-fresh` manifest carrying `url` names the offender),
-/// and the value rules hold: `timeout_ms` in `1..=600_000`; `url` starts
-/// with `http://`; `max_age_ms <= timeout_ms`; `line` non-empty with no NUL
-/// bytes.
+/// and the value rules hold: `timeout_ms` in `1..=600_000`; `url` is
+/// `http://` targeting a LITERAL loopback address (`127.0.0.0/8` or `::1`,
+/// optional port, no hostnames — the probe never consults a resolver) with
+/// no `#fragment`; `expected_status` in `100..=599`; `max_age_ms` in
+/// `1..=timeout_ms`; `url`/`path`/`line` free of control characters (NUL
+/// and the rest of C0/C1).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Readiness {
@@ -360,16 +364,21 @@ pub struct Readiness {
     /// hold supervision unboundedly. The ENGINE owns the poll cadence within
     /// this budget — the manifest declares operator intent only.
     pub timeout_ms: u64,
-    /// `http-get` only: the probe URL (`http://` only).
+    /// `http-get` only: the probe URL. `http://` only, and the authority
+    /// must be a LITERAL loopback address (`127.0.0.0/8` or `::1`, optional
+    /// `:port`) — never a hostname, so the probe can never consult a
+    /// resolver/DNS.
     pub url: Option<String>,
-    /// `http-get` only: the status code that counts as ready.
+    /// `http-get` only: the status code that counts as ready
+    /// (`100..=599`).
     pub expected_status: Option<u16>,
     /// `file-fresh` only: the readiness file (relative to the Agent Home).
     pub path: Option<String>,
     /// `file-fresh` only: the maximum modification age, in milliseconds
-    /// (`<= timeout_ms`).
+    /// (`1..=timeout_ms`).
     pub max_age_ms: Option<u64>,
-    /// `log-contains` only: the readiness line (substring, non-empty, no NULs).
+    /// `log-contains` only: the readiness line (substring, non-empty, no
+    /// control characters).
     pub line: Option<String>,
 }
 
@@ -385,6 +394,13 @@ impl Readiness {
     /// * the `kind`'s own fields are all required (with per-kind value rules);
     /// * every OTHER kind's fields are forbidden — a stray `url` under
     ///   `file-fresh` is a named `InvalidField`, never silently ignored.
+    ///
+    /// Per-kind value rules: `http-get` takes an `http://` URL whose
+    /// authority is a literal loopback address (`127.0.0.0/8` or `::1`,
+    /// optional `:port` — no hostnames, no userinfo, no fragment) and an
+    /// `expected_status` in `100..=599`; `file-fresh` takes a
+    /// `max_age_ms` in `1..=timeout_ms`; text fields (`url`, `path`,
+    /// `line`) carry no control characters (NUL and the rest of C0/C1).
     pub fn gate(&self) -> Result<ReadinessGate, ManifestError> {
         if self.timeout_ms == 0 || self.timeout_ms > 600_000 {
             return Err(ManifestError::InvalidField {
@@ -405,6 +421,9 @@ impl Readiness {
                     self.url.as_deref(),
                     "`url` field in the `[readiness]` section",
                 )?;
+                if contains_control_char(url) {
+                    return Err(control_char_error("`url`", "URL"));
+                }
                 if !url.starts_with("http://") {
                     return Err(ManifestError::InvalidField {
                         field: "`url` field in the `[readiness]` section".to_string(),
@@ -415,12 +434,26 @@ impl Readiness {
                         ),
                     });
                 }
+                // A `#fragment` never reaches the wire (it is client-side),
+                // so it is refused here at validation and the probe runner
+                // never has to guess what path was meant. Queries (`?`)
+                // stay allowed — servers see them.
+                if url.contains('#') {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' carries a `#fragment` — a fragment never reaches the \
+                             wire, so the probe would not request the path the URL names; \
+                             drop it"
+                        ),
+                    });
+                }
                 // The authority (host[:port]) must be present: `http://` alone
                 // or `http:///path` has nowhere to connect and would only
                 // fail obscurely at probe time.
                 let authority = url
                     .trim_start_matches("http://")
-                    .split(['/', '?', '#'])
+                    .split(['/', '?'])
                     .next()
                     .unwrap_or("");
                 if authority.is_empty() {
@@ -432,12 +465,24 @@ impl Readiness {
                         ),
                     });
                 }
+                // The loopback-literal posture: the authority is a literal
+                // loopback IP, never a name.
+                require_loopback_authority(authority, url)?;
                 let expected_status = self.expected_status.ok_or_else(|| {
                     ManifestError::missing(
                         "`expected_status` field in the `[readiness]` section (the http-get \
                          probe's ready status)",
                     )
                 })?;
+                if !(100..=599).contains(&expected_status) {
+                    return Err(ManifestError::InvalidField {
+                        field: "`expected_status` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "{expected_status} is not an HTTP status code — must be 100..=599 \
+                             (1xx informational through 5xx server error)"
+                        ),
+                    });
+                }
                 ReadinessProbe::HttpGet(HttpGetProbe {
                     url: url.to_string(),
                     expected_status,
@@ -448,11 +493,8 @@ impl Readiness {
                     self.path.as_deref(),
                     "`path` field in the `[readiness]` section",
                 )?;
-                if path.contains('\0') {
-                    return Err(ManifestError::InvalidField {
-                        field: "`path` field in the `[readiness]` section".to_string(),
-                        detail: "the readiness file path contains a NUL byte".to_string(),
-                    });
+                if contains_control_char(path) {
+                    return Err(control_char_error("`path`", "file path"));
                 }
                 let max_age_ms = self.max_age_ms.ok_or_else(|| {
                     ManifestError::missing(
@@ -460,6 +502,14 @@ impl Readiness {
                          probe's maximum age)",
                     )
                 })?;
+                if max_age_ms == 0 {
+                    return Err(ManifestError::InvalidField {
+                        field: "`max_age_ms` field in the `[readiness]` section".to_string(),
+                        detail: "0 is not a freshness window — the file could never count \
+                                 as fresh; the minimum is 1 millisecond"
+                            .to_string(),
+                    });
+                }
                 if max_age_ms > self.timeout_ms {
                     return Err(ManifestError::InvalidField {
                         field: "`max_age_ms` field in the `[readiness]` section".to_string(),
@@ -480,11 +530,8 @@ impl Readiness {
                     self.line.as_deref(),
                     "`line` field in the `[readiness]` section",
                 )?;
-                if line.contains('\0') {
-                    return Err(ManifestError::InvalidField {
-                        field: "`line` field in the `[readiness]` section".to_string(),
-                        detail: "the readiness line contains a NUL byte".to_string(),
-                    });
+                if contains_control_char(line) {
+                    return Err(control_char_error("`line`", "line"));
                 }
                 ReadinessProbe::LogContains(LogContainsProbe {
                     line: line.to_string(),
@@ -546,6 +593,114 @@ fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a s
         }),
         None => Err(ManifestError::missing(field)),
     }
+}
+
+/// Whether `s` carries any control character: the C0 set (U+0000..=U+001F —
+/// NUL, newline, carriage return, tab, escape) or the C1 set
+/// (U+007F..=U+009F). A `[readiness]` text field is matched against captured
+/// process output or used as a filesystem path; control bytes would corrupt
+/// both (a newline in a probe URL is header-injection material), so they are
+/// refused outright at validation.
+fn contains_control_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'))
+}
+
+/// The shared control-character refusal for a `[readiness]` text field.
+/// The message keeps the "NUL" wording the older NUL-only pin asserted, now
+/// covering the whole C0/C1 sweep.
+fn control_char_error(field: &str, what: &str) -> ManifestError {
+    ManifestError::InvalidField {
+        field: format!("{field} field in the `[readiness]` section"),
+        detail: format!(
+            "the readiness {what} contains a control character (NUL and the rest of the \
+             C0/C1 control bytes are forbidden — they would corrupt the matched output or \
+             the path)"
+        ),
+    }
+}
+
+/// Enforce the loopback-probe posture on an http-get URL's authority
+/// (`host[:port]`, already split from scheme and path): the host must be a
+/// LITERAL loopback address — `127.0.0.0/8` or `::1` — and the optional port
+/// must be `1..=65535` (default 80 for `http://`).
+///
+/// No hostnames (`localhost` included): a name would send the probe through
+/// the machine's resolver/DNS, and the readiness gate must only ever touch
+/// this host's own loopback — a literal parses locally, deterministically.
+/// IPv6 takes the bracketed `[addr]:port` form (a bare `::1` is refused —
+/// its colons are ambiguous against the port separator); userinfo (`@`) is
+/// refused.
+fn require_loopback_authority(authority: &str, url: &str) -> Result<(), ManifestError> {
+    const FIELD: &str = "`url` field in the `[readiness]` section";
+    let refuse = |why: String| ManifestError::InvalidField {
+        field: FIELD.to_string(),
+        detail: format!(
+            "{why} — the readiness probe URL must target a literal loopback address \
+                 (e.g. 127.0.0.1 or [::1])"
+        ),
+    };
+    if authority.contains('@') {
+        return Err(refuse(format!(
+            "'{url}' carries userinfo; an authority is host[:port] only"
+        )));
+    }
+    // Split host from port. Inside `[...]` a `:` belongs to the IPv6
+    // literal, so a bracketed authority splits at the closing bracket;
+    // unbracketed, the LAST `:` (if any) is the port separator and more
+    // than one `:` means a bare IPv6 literal that should have been
+    // bracketed.
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((literal, tail)) => {
+                let port = match tail.strip_prefix(':') {
+                    Some(p) => Some(p),
+                    None if tail.is_empty() => None,
+                    None => {
+                        return Err(refuse(format!(
+                            "'{url}' has trailing characters after the bracketed host"
+                        )));
+                    }
+                };
+                (literal, port)
+            }
+            None => {
+                return Err(refuse(format!(
+                    "'{url}' opens a `[` bracket it never closes"
+                )));
+            }
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h, Some(p)),
+            Some(_) => {
+                return Err(refuse(format!(
+                    "'{url}' is a bare IPv6 literal — bracket it: [::1]"
+                )));
+            }
+            None => (authority, None),
+        }
+    };
+    let addr: IpAddr = host.parse().map_err(|_| {
+        refuse(format!(
+            "'{url}' names host '{host}', which is not a literal IP address (hostnames — \
+             including `localhost` — would consult the machine's resolver)"
+        ))
+    })?;
+    if !addr.is_loopback() {
+        return Err(refuse(format!(
+            "'{url}' targets {addr}, which is not a loopback address"
+        )));
+    }
+    if let Some(p) = port {
+        let valid = p.parse::<u16>().map(|n| n > 0).unwrap_or(false);
+        if !valid {
+            return Err(refuse(format!(
+                "'{url}' carries port '{p}' — the port must be a decimal 1..=65535"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Why a manifest is invalid (spine AD-3; `thiserror`, never `miette`).
@@ -757,9 +912,9 @@ impl Manifest {
         // [readiness] probe (added at contract 1.1.0), IF present. Absent is
         // valid (the pre-1.1.0 behavior — no declared probe — and the common
         // case). A present-but-invalid section names its first failing field
-        // (`Readiness::probe` enforces the value matrix: the timeout range,
-        // the kind's own required fields, the http:// posture, and the
-        // foreign-field sweep).
+        // (`Readiness::gate` enforces the value matrix: the timeout range,
+        // the kind's own required fields, the http:// loopback-literal
+        // posture, and the foreign-field sweep).
         if let Some(readiness) = &self.readiness {
             readiness.gate()?;
         }
@@ -1496,16 +1651,16 @@ channel = "stdio"
     #[test]
     fn readiness_timeout_bounds_are_enforced() {
         // Below 1 is not a poll at all; above 600_000 a start would hold
-        // supervision unboundedly. Both name the field.
+        // supervision unboundedly. Both name the field. Both are written as
+        // plain TOML integers — TOML allows digit separators, so `600_001`
+        // parses fine and must reach VALIDATION (the old comment claiming
+        // it was not TOML integer syntax was wrong; the rejection is the
+        // range check, not the parser).
         for timeout in ["0", "600_001"] {
             let toml = with_readiness(&format!(
                 "kind = \"log-contains\"\ntimeout_ms = {timeout}\nline = \"ready\""
             ));
-            let m = Manifest::from_toml_str(&toml).unwrap_or_else(|_| {
-                // 600_001 with underscores is not TOML integer syntax — only
-                // `0` reaches this arm as a parse error; write it plain.
-                panic!("toml must parse: {toml}")
-            });
+            let m = Manifest::from_toml_str(&toml).expect("toml must parse");
             let err = m.validate().unwrap_err();
             assert!(
                 err.to_string().contains("timeout_ms"),
@@ -1546,6 +1701,178 @@ channel = "stdio"
             err.to_string().contains("no host"),
             "a host-less URL must name why: {err}"
         );
+    }
+
+    #[test]
+    fn readiness_http_url_must_target_a_literal_loopback_address() {
+        // The loopback-literal posture: the authority is PARSED as an IP,
+        // never resolved — a name would consult the machine's resolver/DNS,
+        // and the gate must only ever touch this host's own loopback. The
+        // whole `127.0.0.0/8` counts (not just `.1`), `::1` takes the
+        // bracketed form, the port is optional (`http://` default 80) or
+        // `1..=65535`.
+        for url in [
+            "http://127.0.0.1:8080/health",
+            "http://127.0.0.1/",
+            "http://127.0.0.2:9/x",
+            "http://[::1]:9000/x",
+            "http://[::1]/",
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"{url}\"\nexpected_status = 200"
+            ));
+            Manifest::from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("{url} must parse: {e}"))
+                .validate()
+                .unwrap_or_else(|e| panic!("{url} must be accepted: {e}"));
+        }
+
+        for url in [
+            "http://example.com/health",  // a hostname — DNS, never
+            "http://localhost:8080/",     // `localhost` included
+            "http://192.168.1.5/",        // a literal NON-loopback address
+            "http://127.0.0.1:8080@x/",   // userinfo smuggled into the authority
+            "http://user@127.0.0.1/",     // classic userinfo form
+            "http://127.0.0.1:0/",        // port 0 is not a port
+            "http://127.0.0.1:65536/",    // above the u16 port range
+            "http://[::2]/",              // IPv6 but not loopback
+            "http://[::ffff:127.0.0.1]/", // v4-mapped is not `::1`
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"{url}\"\nexpected_status = 200"
+            ));
+            let err = Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("literal loopback address"),
+                "{url} must name the loopback posture: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_url_with_a_fragment_is_rejected_and_a_query_is_allowed() {
+        // A `#fragment` never reaches the wire (it is client-side), so the
+        // probe would not request the path the URL names — rejected here at
+        // validation, before the runner ever sees it.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health#frag\"\nexpected_status = 200",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("fragment"),
+            "the fragment must be named: {err}"
+        );
+
+        // A query (`?`) DOES reach the wire — allowed.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health?probe=1\"\nexpected_status = 200",
+        );
+        Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .expect("a query is part of the request path");
+    }
+
+    #[test]
+    fn readiness_expected_status_bounds_are_enforced() {
+        // A status is 100..=599: below 100 is not an HTTP status, 600+ is
+        // not a code any conforming server may send.
+        for status in [0u16, 99, 600, 1000] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"http://127.0.0.1:8080/health\"\nexpected_status = {status}"
+            ));
+            let err = Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("expected_status"),
+                "status {status} must name the field: {err}"
+            );
+        }
+        // The edges hold: 100 (informational) and 599 (max server error).
+        for status in [100u16, 599] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"http://127.0.0.1:8080/health\"\nexpected_status = {status}"
+            ));
+            Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_or_else(|e| panic!("status {status} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn readiness_zero_max_age_is_rejected() {
+        // A 0 ms freshness window can never be satisfied — the file would
+        // always be at least "now" old — so the probe would spin its whole
+        // budget on an unsatisfiable ask.
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 0",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("max_age_ms") && text.contains("freshness"),
+            "must name the field and why: {text}"
+        );
+    }
+
+    #[test]
+    fn readiness_control_characters_are_rejected_in_url_path_and_line() {
+        // The C0/C1 sweep across all three text fields — beyond NUL, which
+        // keeps its own named pin above. A control byte would corrupt the
+        // matched output stream or the path (and a newline in a URL is
+        // request-smuggling material), so the whole set is refused.
+        let cases: &[(&str, &str)] = &[
+            ("url", "\\u0001"),
+            ("url", "\\u001f"),
+            ("url", "\\u007f"),
+            ("url", "\\u009f"),
+            ("path", "\\u000b"),
+            ("path", "\\u0085"),
+            ("line", "\\n"),
+            ("line", "\\r"),
+            ("line", "\\t"),
+        ];
+        for (field, escaped) in cases {
+            let body = match *field {
+                "url" => format!(
+                    "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                     \"http://127.0.0.1:8080/health{escaped}\"\nexpected_status = 200"
+                ),
+                "path" => format!(
+                    "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \
+                     \"ready{escaped}.marker\"\nmax_age_ms = 250"
+                ),
+                _ => {
+                    format!("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"ready{escaped}\"")
+                }
+            };
+            let err = Manifest::from_toml_str(&with_readiness(&body))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("control character"),
+                "{field} carrying {escaped} must name the control-character rule: {err}"
+            );
+        }
     }
 
     #[test]

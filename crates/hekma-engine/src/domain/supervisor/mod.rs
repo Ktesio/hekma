@@ -1743,10 +1743,20 @@ impl Supervisor {
     /// the crash transition inline, queues the plan here, and the next
     /// [`Supervisor::poll_once`] drains it at the TOP of the pass so the engine
     /// cadence times the backoff exactly as it does for reaper-detected
-    /// crashes. FIFO (a start enqueues at most one). Takes `&self` (the start
-    /// path holds the supervisor through a shared borrow); a poisoned lock is
-    /// recovered — the guarded Vec is always valid, and a queued restart must
-    /// survive a panicking peer, not vanish.
+    /// crashes. FIFO (a start enqueues at most one).
+    ///
+    /// Poison recovery, at its HONEST scope (review round 1): the mutex guard
+    /// protects only the push/take itself, so recovery is sound exactly there
+    /// — a peer panicking BETWEEN taking the lock and finishing its Vec
+    /// mutation leaves the Vec valid (Vec mutation is all-or-nothing at the
+    /// panic boundary for push/`mem::take`), and a queued restart survives a
+    /// panicking peer rather than vanishing. What recovery does NOT cover: a
+    /// plan DRAINED but never executed is gone — if the engine runtime shuts
+    /// down after `drain_pending_restarts` and before the pass executes the
+    /// plans, they are lost (the start path's own queued-restart diagnostic
+    /// names this engine-cadence caveat to the operator). The defensive arms
+    /// remain because the guarantee they buy is real; they are not a promise
+    /// that queued restarts survive runtime death.
     pub(crate) fn queue_pending_restart(&self, plan: RestartPlan) {
         match self.pending_restarts.lock() {
             Ok(mut queue) => queue.push(plan),

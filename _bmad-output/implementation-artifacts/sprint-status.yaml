@@ -185,7 +185,7 @@ development_status:
   17-5-static-linux-release-and-the-container-recipe: done  # implemented + 17-finding review round (release-blocking static-pie gate caught + fixed); PR #314 merged 2026-10-20; first live musl proof lands at the next v* tag
   epic-17-retrospective: skipped  # maintainer decision 2026-10-22 — the epic closes without a retro; the epic's process lessons live in the story specs' change logs and the deferred-work record
   epic-18: in-progress  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber); started 2026-10-23 after 19-1 (which runs first overall), stacked on feat/epic-19-1-governance-vectors
-  18-1-readiness-probes: in-progress  # spec 2026-10-23 (autonomous mode); implementation underway on feat/epic-18-1-readiness-probes
+  18-1-readiness-probes: in-progress  # impl e449914 (gates green); 4-layer review round 1 done 2026-10-24, patch round underway on feat/epic-18-1-readiness-probes
   18-2-liveness-and-the-unresponsive-failure: backlog
   18-3-exit-code-classes-and-the-stable-window-reset: backlog
   18-4-cooperative-pause-commands-and-the-drain-verb: backlog
