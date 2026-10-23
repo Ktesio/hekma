@@ -2462,58 +2462,87 @@ pub fn governance_vectors(json: bool) -> Result<(), Box<dyn std::error::Error>> 
         // No added newline: the canonical document already ends with exactly
         // one, so stdout IS the pin target (a `sha256sum` of this output
         // matches the published `.sha256`).
-        print!("{embedded}");
-        return Ok(());
+        return write_stdout_exactly(embedded);
     }
-    print!(
-        "{}",
-        governance_vectors_summary(embedded, &hekma_engine::governance_vectors_checksum())?
-    );
-    Ok(())
+    let summary =
+        governance_vectors_summary(embedded, &hekma_engine::governance_vectors_checksum())?;
+    write_stdout_exactly(&summary)
+}
+
+/// Write the exact bytes to stdout with the broken-pipe discipline (the
+/// `emit_log_lines` shape, 19-1 review round 1): `print!` PANICS on a write
+/// error and Rust ignores `SIGPIPE`, so `hekma agent governance-vectors
+/// --json | head` used to abort with exit `101` panic noise. A broken pipe
+/// (the consumer went away — `| head`, a closed terminal) is a clean
+/// `Ok(())` (exit 0); any OTHER write failure is a real [`AgentIo`]
+/// diagnostic.
+fn write_stdout_exactly(bytes: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(err) => classify_governance_stdout_write(err),
+    }
+}
+
+/// Map a governance-vectors stdout write failure to either a clean `Ok(())`
+/// (the consumer went away — `| head`, a closed terminal) or a real
+/// [`AgentIo`] diagnostic (a genuine I/O failure, e.g. a full disk when
+/// stdout is a file). Mirrors the log path's `classify_stdout_write`
+/// discipline; separate because the diagnostic names THIS surface.
+fn classify_governance_stdout_write(err: std::io::Error) -> Result<(), Box<dyn std::error::Error>> {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(AgentIo {
+            message: format!("Failed to write the governance vectors output to stdout: {err}"),
+        }
+        .into())
+    }
 }
 
 /// The `governance-vectors` human summary — artifact id, vectors + schema
-/// versions, engine version, SHA-256 checksum, and the case mix — read from
-/// the embedded bytes (the binary cannot drift from its artifact). `Err` only
-/// if the embedded document fails to parse: a build defect, reported honestly
-/// (surfaced, not silent) rather than printed as a fabricated summary.
+/// versions, SHA-256 checksum, and the case mix — read from the embedded
+/// bytes (the binary cannot drift from its artifact). Parsed TYPED against
+/// the engine's own schema types (19-1 review round 1: the untyped-Value
+/// shape printed `"(missing)"` / `schema v0` / `0 cases` for a
+/// parseable-but-wrong document — a fabricated summary). `Err` if the
+/// embedded document fails to parse or misses a field: a build defect,
+/// reported honestly (surfaced, not silent; the error names the defect)
+/// rather than printed as a fabricated summary.
 fn governance_vectors_summary(
     embedded: &str,
     checksum: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let value: serde_json::Value = match serde_json::from_str(embedded) {
-        Ok(value) => value,
+    let document: hekma_engine::VectorsDocument = match serde_json::from_str(embedded) {
+        Ok(document) => document,
         Err(err) => {
             return Err(AgentIo {
                 message: format!(
-                    "The embedded governance vectors artifact failed to parse: {err}. \
+                    "The embedded governance vectors artifact does not match its schema: {err}. \
                      The artifact in this build is corrupt — please report it."
                 ),
             }
             .into())
         }
     };
-    let artifact = value["artifact"].as_str().unwrap_or("(missing)");
-    let vectors_version = value["vectors_version"].as_str().unwrap_or("(missing)");
-    let schema_version = value["schema_version"].as_u64().unwrap_or(0);
-    let engine_version = value["provenance"]["engine_version"]
-        .as_str()
-        .unwrap_or("(missing)");
-    let cases = value["cases"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let decision_cases = cases
+    let decision_cases = document
+        .cases
         .iter()
-        .filter(|case| case["kind"] == "decision")
+        .filter(|case| matches!(case, hekma_engine::Case::Decision(_)))
         .count();
-    let derivation_cases = cases.len() - decision_cases;
+    let derivation_cases = document.cases.len() - decision_cases;
     Ok(format!(
         "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
-            "governance conformance vectors {vectors_version} — artifact `{artifact}`, \
-             schema v{schema_version}, engine v{engine_version}"
+            "governance conformance vectors {} — artifact `{}`, schema v{}",
+            document.vectors_version, document.artifact, document.schema_version
         )),
-        cases.len(),
+        document.cases.len(),
         decision_cases,
         derivation_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
@@ -4992,7 +5021,7 @@ mod tests {
             "the summary names the artifact path: {summary}"
         );
         assert!(
-            summary.contains("10 decision") && summary.contains("10 derivation"),
+            summary.contains("15 decision") && summary.contains("11 derivation"),
             "the summary gives the case mix: {summary}"
         );
         assert!(
@@ -5002,15 +5031,68 @@ mod tests {
     }
 
     #[test]
-    fn governance_vectors_summary_is_an_honest_error_when_the_document_is_corrupt() {
-        // A corrupt embed must NOT print a fabricated summary — an honest
-        // error naming the defect (surfaced, not silent).
-        let err = governance_vectors_summary("{\"cases\": [", "deadbeef")
+    fn governance_vectors_summary_is_an_honest_error_when_the_document_is_wrong() {
+        // A corrupt OR schema-mismatched embed must NOT print a fabricated
+        // summary — an honest error naming the defect (surfaced, not silent;
+        // 19-1 review round 1: the typed parse pins all three shapes).
+        let corrupt = governance_vectors_summary("{\"cases\": [", "deadbeef")
             .expect_err("a corrupt document is an error");
         assert!(
-            err.to_string().contains("failed to parse"),
-            "the error names the parse failure: {err}"
+            corrupt.to_string().contains("does not match its schema"),
+            "the error names the schema mismatch: {corrupt}"
         );
+        // A parseable-but-WRONG document (schema_version is a string) errors —
+        // never a "schema v0" fabrication.
+        let wrong_typed = governance_vectors_summary(
+            "{\"artifact\": \"hekma-governance-vectors\", \"schema_version\": \"1\", \
+             \"vectors_version\": \"1.0.0\", \
+             \"provenance\": {\"generated_from\": []}, \"cases\": []}",
+            "deadbeef",
+        )
+        .expect_err("a wrong-typed field is an error");
+        assert!(
+            wrong_typed
+                .to_string()
+                .contains("does not match its schema"),
+            "the wrong-typed document is an honest error: {wrong_typed}"
+        );
+        // A document MISSING a required field errors — never "(missing)"
+        // placeholders.
+        let missing =
+            governance_vectors_summary("{\"artifact\": \"hekma-governance-vectors\"}", "deadbeef")
+                .expect_err("a missing field is an error");
+        assert!(
+            missing.to_string().contains("does not match its schema"),
+            "the missing-field document is an honest error: {missing}"
+        );
+    }
+
+    #[test]
+    fn a_broken_governance_stdout_pipe_stops_cleanly_while_a_real_io_failure_still_diagnoses() {
+        // THE EPIPE PIN (19-1 review round 1, the log path's fix-pass-M1
+        // parity): `hekma agent governance-vectors --json | head` must exit 0
+        // — the BrokenPipe arm keeps that promise — and it must NOT swallow
+        // other write failures (a full disk when stdout is redirected to a
+        // file is a real error), so both halves are asserted here.
+        use crate::exit_code::{classify, ExitCode};
+
+        classify_governance_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "consumer went away",
+        ))
+        .expect("a closed consumer is a clean stop, not an error");
+
+        let failed = classify_governance_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        ))
+        .expect_err("a genuine write failure must stay an error");
+        assert!(
+            failed.downcast_ref::<AgentIo>().is_some(),
+            "a real stdout write failure must surface as AgentIo: {failed}"
+        );
+        assert!(failed.to_string().contains("no space left on device"));
+        assert_eq!(classify(failed.as_ref()), ExitCode::General);
     }
 
     #[test]
@@ -5019,15 +5101,24 @@ mod tests {
         // (the human summary + the verbatim `--json` dump, captured by the
         // test runner). Byte fidelity of the `--json` path is pinned by the
         // real-binary e2e test (`tests/governance_cli.rs`); here the artifact
-        // contract itself is pinned against the committed file.
+        // contract itself is pinned against the committed file. SIBLING-CHECKOUT
+        // skip-guard (19-1 review round 1, the smokes' noted-skip posture):
+        // the committed artifact lives across the crate boundary and is absent
+        // when the published `hekma` crate is tested standalone.
+        let committed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../hekma-engine/governance/vectors-v1.json");
+        if !committed_path.exists() {
+            hekma_conformance::note_uncaptured(
+                "note: governance-vectors in-process pin skipped: the committed engine \
+                 artifact is not in this checkout (the hekma crate is tested standalone)",
+            );
+            return;
+        }
         governance_vectors(false).expect("the human path succeeds");
         governance_vectors(true).expect("the json path succeeds");
         let embedded = hekma_engine::governance_vectors_json();
-        let committed = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../hekma-engine/governance/vectors-v1.json"),
-        )
-        .expect("the committed artifact reads");
+        let committed =
+            std::fs::read_to_string(&committed_path).expect("the committed artifact reads");
         assert_eq!(
             embedded, committed,
             "the embedded bytes are the committed artifact, byte for byte"

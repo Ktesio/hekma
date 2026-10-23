@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-19-2026 12:40"  # 17-1 ratified (D1/D2/D3 applied); PR pending push window
+last_updated: "10-23-2026"  # epic-19 opened: 19-1 spec authored, implementation underway (autonomous cadence per Islam's 2026-10-23 ruling)
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -191,8 +191,8 @@ development_status:
   18-4-cooperative-pause-commands-and-the-drain-verb: backlog
   18-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
   epic-18-retrospective: optional
-  epic-19: backlog  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber)
-  19-1-governance-conformance-vectors: backlog  # FOUNDATION — runs first; an external Host consumer waits on it
+  epic-19: in-progress  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber); started 2026-10-23 — 19-1 runs FIRST overall per the ratified handoff, then Epic 18's stack, then 19-2..19-5
+  19-1-governance-conformance-vectors: in-progress  # FOUNDATION — runs first; an external Host consumer waits on it. Spec 2026-10-23 (autonomous mode per Islam's cadence ruling); implementation underway on feat/epic-19-1-governance-vectors
   19-2-the-wire-fence-block-breach-action: backlog
   19-3-task-scope-host-units-of-work: backlog
   19-4-per-call-records-for-hosts: backlog

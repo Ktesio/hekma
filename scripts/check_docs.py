@@ -73,6 +73,16 @@ STALE_PATTERNS = [
 ]
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+# "retro" as planning provenance: the word anywhere — "the retro", "Retro
+# #165", AND the hyphen-joined planning ids ("retro-14") and compounds ("the
+# retro-log") a plain word-boundary pattern would miss. The ONE pass is the
+# governance vectors' wire-contract token `no-retro-repricing`, which the
+# public docs must quote verbatim: the lookbehind blocks exactly the "no-"
+# prefix. `retroactive` never matches without any lookbehind work — `\bretro\b`
+# has no trailing word boundary inside the word. The pattern lives in its own
+# constant so `--self-test` pins exactly this behavior (the gate regex
+# consumes the same string; they cannot drift).
+RETRO_PROVENANCE_PATTERN = r"(?<!no-)\bretro\b"
 # Public docs state technical facts without BMAD sprint/planning provenance:
 # no story/epic work-item numbers, retro references, internal review-item IDs
 # (AI-N), change-proposal/risk-registry IDs (CP-N, R-N ranges), PR-number
@@ -82,18 +92,28 @@ LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 PLANNING_PROVENANCE_RE = re.compile(
     r"(?i)\bstory[ -]?\d"
     r"|\bepic[ -]?\d+\b"
-    # "retro" as a STANDALONE word is planning provenance ("the retro",
-    # "Retro #165"); hyphen-joined technical tokens are not — the governance
-    # vectors' cover tag `no-retro-repricing` is a wire-contract string the
-    # public docs must quote verbatim. Bound both sides against word chars
-    # AND hyphens so "retroactive"/"no-retro-…" never match.
-    r"|(?<![-\w])retro(?![-\w])"
-    r"|\bAI-\d+"
+    r"|"
+    + RETRO_PROVENANCE_PATTERN
+    + r"|\bAI-\d+"
     r"|\bCP-\d"
     r"|\bR\d+[–-]R?\d*"
     r"|_bmad-output"
     r"|\bBMAD\b"
 )
+# The `--self-test` samples pinning RETRO_PROVENANCE_PATTERN (19-1 review
+# round 1: the previous `(?<![-\w])retro(?![-\w])` silently passed
+# hyphen-joined planning provenance like `retro-14` / `the retro-log`).
+RETRO_MUST_MATCH = [
+    "retro-14",
+    "the retro-log of the sprint",
+    "retro #165",
+    "Retro 3",
+]
+RETRO_MUST_PASS = [
+    "no-retro-repricing",
+    "retroactive",
+    "no-retroactive-repricing",
+]
 # Dated historical records exempt from the provenance rule: their older
 # sections are point-in-time release/authorization records, and only their
 # CURRENT top banners were reworded.
@@ -141,7 +161,40 @@ CONFIG_COMMANDS = {"get", "set"}
 MEMORY_COMMANDS = {"attach", "detach"}
 
 
+def run_self_test() -> int:
+    """Pin the provenance gate's regex behavior (CI: the docs job runs this
+    beside the ordinary scan). Asserts the `retro` pattern's exact match /
+    no-match contract — BOTH compiled in isolation and as consumed by the
+    full `PLANNING_PROVENANCE_RE` — so a future edit that re-opens the
+    hyphen-joined provenance hole (or breaks the `no-retro-repricing` wire
+    token's verbatim quoting) fails here instead of shipping."""
+    failures: list[str] = []
+    isolated = re.compile(RETRO_PROVENANCE_PATTERN, re.IGNORECASE)
+    for sample in RETRO_MUST_MATCH:
+        if not isolated.search(sample):
+            failures.append(f"the retro pattern must MATCH: {sample!r}")
+        if not PLANNING_PROVENANCE_RE.search(sample):
+            failures.append(f"the full gate regex must MATCH: {sample!r}")
+    for sample in RETRO_MUST_PASS:
+        if isolated.search(sample):
+            failures.append(f"the retro pattern must NOT match: {sample!r}")
+        if PLANNING_PROVENANCE_RE.search(sample):
+            failures.append(f"the full gate regex must NOT match: {sample!r}")
+    if failures:
+        for failure in failures:
+            print(failure, file=sys.stderr)
+        return 1
+    print(
+        f"Provenance-gate self-test ok "
+        f"({len(RETRO_MUST_MATCH)} match, {len(RETRO_MUST_PASS)} pass samples)"
+    )
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv[1:]:
+        return run_self_test()
+
     errors: list[str] = []
 
     for path in DOC_PATHS:

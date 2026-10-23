@@ -3,7 +3,6 @@
   "schema_version": 1,
   "vectors_version": "1.0.0",
   "provenance": {
-    "engine_version": "0.9.0",
     "generated_from": [
       "BudgetEvaluator",
       "CostEvaluator",
@@ -143,6 +142,114 @@
             "action": "warn",
             "limit": 5000000,
             "observed": 5000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-zero-dollar-cap-breaches-on-zero",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "dollar": {
+          "run_cost": 0,
+          "cumulative_cost": 0,
+          "cap": {
+            "per_run": 0,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "pause",
+            "limit": 0,
+            "observed": 0
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-token-both-scopes-trip-per-run-reported",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 15,
+          "cumulative_total": 30,
+          "budget": {
+            "per_run": 10,
+            "cumulative": 20
+          },
+          "action": "warn"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run",
+            "action": "warn",
+            "limit": 10,
+            "observed": 15
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-threshold-ge-dollar-both-scopes-trip-per-run-reported",
+      "covers": [
+        "threshold-ge"
+      ],
+      "input": {
+        "dollar": {
+          "run_cost": 15000000,
+          "cumulative_cost": 30000000,
+          "cap": {
+            "per_run": 10000000,
+            "cumulative": 20000000
+          },
+          "action": "warn"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "warn",
+            "limit": 10000000,
+            "observed": 15000000
           }
         ],
         "latched_after": [
@@ -310,7 +417,77 @@
     },
     {
       "kind": "decision",
-      "id": "decision-latch-re-arm-fresh-run-fires-again",
+      "id": "decision-latch-per-scope-dollar-hold-suppresses-the-dollar-dimension",
+      "covers": [
+        "latch-per-scope"
+      ],
+      "input": {
+        "dollar": {
+          "run_cost": 2000000,
+          "cumulative_cost": 2000000,
+          "cap": {
+            "per_run": 2000000,
+            "cumulative": null
+          },
+          "action": "stop"
+        },
+        "latched": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": [
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-per-scope-doubled-key-normalizes-to-one",
+      "covers": [
+        "latch-per-scope"
+      ],
+      "input": {
+        "token": {
+          "run_total": 100,
+          "cumulative_total": 100,
+          "budget": {
+            "per_run": 100,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          },
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-latch-re-arm-empty-latch-refires",
       "covers": [
         "latch-re-arm"
       ],
@@ -516,6 +693,21 @@
     },
     {
       "kind": "derivation",
+      "id": "derivation-round-half-up-output-tie-rounds-up",
+      "covers": [
+        "round-half-up"
+      ],
+      "derivation": "cost-micros",
+      "input_tokens": 0,
+      "output_tokens": 1500000,
+      "rate": {
+        "input_micros_per_1m": 0,
+        "output_micros_per_1m": 1
+      },
+      "expected_micros": 2
+    },
+    {
+      "kind": "derivation",
       "id": "derivation-round-half-up-below-tie-rounds-down",
       "covers": [
         "round-half-up"
@@ -537,12 +729,12 @@
       ],
       "derivation": "cost-micros",
       "input_tokens": 1500000,
-      "output_tokens": 1499999,
+      "output_tokens": 1500000,
       "rate": {
         "input_micros_per_1m": 1,
         "output_micros_per_1m": 1
       },
-      "expected_micros": 3
+      "expected_micros": 4
     },
     {
       "kind": "derivation",

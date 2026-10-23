@@ -5639,6 +5639,65 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
 }
 
 #[test]
+fn a_failed_totals_read_surfaces_the_degradation_and_decides_on_the_zero() {
+    // Story 19-1 review round 1 (the AI-18 surfaced-not-silent rule): the
+    // `enforce_budget` totals reads degrade to zero on a store failure — and
+    // the degradation is now SURFACED through the enforcement diagnostic
+    // (instance + degraded scope + reason), decisions UNCHANGED: the
+    // fabricated zero still flows into `decide()`, so the ZERO per-run
+    // ceiling fires the breach on it (the pre-existing 3-2/3-3 semantics;
+    // changing the decision is a money-path behavior change deferred to its
+    // own story — the deferred-work entry from 19-1 review round 1). Driven
+    // through the cfg(test) `totals_read_fault_names` seam (the AI-9/AI-12
+    // fault-injection precedent) — no real store outage staged.
+    let (state, _manifest, registry) = setup_fake(
+        "degradedread",
+        &["--emit-usage", "2", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("degradedread").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.per_run", "0")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.totals_read_fault_names.insert(name.clone());
+    sup.start(&registry, "degradedread").unwrap();
+    drain_until_committed(&mut sup, &registry, state.path(), "degradedread", 2);
+
+    // SURFACED: the diagnostic names the instance + the degraded scope.
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("degradedread: the per-run token totals read failed"),
+        "the degraded read must be surfaced naming the instance + scope: {text}"
+    );
+    assert!(
+        text.contains("enforcement degrades it to zero"),
+        "the diagnostic must state the degradation, not just the error: {text}"
+    );
+
+    // DECISIONS UNCHANGED: the degraded 0 crossed the zero ceiling, so the
+    // breach fired on the fabricated total (limit 0, observed 0) — exactly
+    // once (the latch holds the re-evaluations), as `warn` (no transition).
+    let breaches = Supervisor::read_breach_events(&registry, "degradedread").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the degraded zero fired the zero-ceiling breach exactly once: {breaches:?}"
+    );
+    assert_eq!(breaches[0].limit, 0, "the limit is the zero ceiling");
+    assert_eq!(
+        breaches[0].observed, 0,
+        "the observed total is the fabricated degraded zero"
+    );
+    assert_eq!(state_of(&registry, "degradedread"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "degradedread", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_malformed_instance_config_disarms_enforcement_without_a_crash() {
     // The `enforce_budget` config-read guard (usage.rs, the `let Ok(…)` early
     // return): a MALFORMED on-disk instance config layer must degrade to "no

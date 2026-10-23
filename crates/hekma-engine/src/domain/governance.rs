@@ -205,6 +205,12 @@ pub struct GovernanceOutcome {
 ///   entirely (no decision, no re-fire); a fresh latch + the same totals
 ///   fires again (the Run-boundary re-arm). A newly fired pair is appended
 ///   to [`GovernanceOutcome::latched_after`].
+/// * **Normalization** — the `latched` input is DEDUPLICATED (first
+///   occurrence kept, order preserved), so `latched_after` NEVER carries a
+///   duplicate `(dimension, scope)` pair no matter what the caller passes in
+///   (19-1 review round 1: the boundary contract — a consumer chaining
+///   [`GovernanceOutcome::latched_after`] back in gets a well-formed latch
+///   set, and a doubled input key behaves exactly like a single one).
 /// * **Arms** — a `None` arm is an unarmed dimension: skipped entirely, no
 ///   totals read, no decision (the supervisor's armed checks, now data).
 ///
@@ -212,7 +218,7 @@ pub struct GovernanceOutcome {
 /// output, on every OS (the artifact's determinism rides on this).
 pub fn decide(input: &GovernanceInput) -> GovernanceOutcome {
     let mut decisions = Vec::new();
-    let mut latched_after = input.latched.clone();
+    let mut latched_after = normalize_latched(&input.latched);
 
     // (1) TOKEN dimension FIRST (the story-3-2 evaluation order).
     if let Some(token) = &input.token {
@@ -270,6 +276,23 @@ pub fn decide(input: &GovernanceInput) -> GovernanceOutcome {
         decisions,
         latched_after,
     }
+}
+
+/// The latch-input normalization (19-1 review round 1): deduplicate the
+/// `(dimension, scope)` pairs — first occurrence kept, input order preserved
+/// (a linear scan, not a set, so the output ORDER stays deterministic for the
+/// artifact). `decide()` runs this on its `latched` input, so
+/// [`GovernanceOutcome::latched_after`] is always a well-formed set: a
+/// consumer chaining it back can never accumulate duplicates across
+/// evaluations.
+fn normalize_latched(keys: &[LatchKey]) -> Vec<LatchKey> {
+    let mut seen: Vec<LatchKey> = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !seen.contains(key) {
+            seen.push(*key);
+        }
+    }
+    seen
 }
 
 /// The latch filter, shared by both dimensions: an already-latched
@@ -486,12 +509,14 @@ pub enum Case {
 
 /// Where the artifact's cases come from — the exact engine symbols the
 /// generator drives and the verifier re-runs (fixed order; the
-/// byte-compare pins the list).
+/// byte-compare pins the list). Provenance records the GENERATOR FUNCTIONS,
+/// not the crate version: the crate version lives in the CHANGELOG and is
+/// not a pin key — a Host pins `vectors_version` + the SHA-256, both of
+/// which already cover the bytes (19-1 review round 1: `engine_version`
+/// removed — it baked a build-time crate version into checksummed bytes,
+/// forcing a checksum churn on every version bump with zero pin value).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
-    /// The engine version that generated the artifact (the semver the
-    /// decision semantics shipped in).
-    pub engine_version: String,
     /// The evaluated symbols, in evaluation order.
     pub generated_from: Vec<String>,
 }
@@ -572,7 +597,6 @@ pub fn generate() -> VectorsDocument {
         schema_version: GOVERNANCE_VECTORS_SCHEMA_VERSION,
         vectors_version: GOVERNANCE_VECTORS_VERSION.to_string(),
         provenance: Provenance {
-            engine_version: env!("CARGO_PKG_VERSION").to_string(),
             generated_from: GENERATED_FROM
                 .iter()
                 .map(|symbol| symbol.to_string())
@@ -671,6 +695,65 @@ fn decision_cases() -> Vec<Case> {
                 latched: vec![],
             },
         ),
+        // ---- threshold-ge: a ZERO dollar cap breaches on a zero cost (the
+        // dollar arm of the zero-ceiling rule; 19-1 review round 1) ----
+        decision_case(
+            "decision-threshold-ge-zero-dollar-cap-breaches-on-zero",
+            &[CoverTag::ThresholdGe],
+            GovernanceInput {
+                token: None,
+                dollar: Some(DollarArm {
+                    run_cost: Micros(0),
+                    cumulative_cost: Micros(0),
+                    cap: CostCap {
+                        per_run: Some(Micros(0)),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Pause,
+                }),
+                latched: vec![],
+            },
+        ),
+        // ---- threshold-ge: precedence WITHIN a dimension — BOTH token
+        // scopes trip and the PER-RUN bound is the one reported (the
+        // evaluator's tighter-run-local-bound-first rule, 19-1 review
+        // round 1) ----
+        decision_case(
+            "decision-threshold-ge-token-both-scopes-trip-per-run-reported",
+            &[CoverTag::ThresholdGe],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 15,
+                    cumulative_total: 30,
+                    budget: TokenBudget {
+                        per_run: Some(10),
+                        cumulative: Some(20),
+                    },
+                    action: BreachAction::Warn,
+                }),
+                dollar: None,
+                latched: vec![],
+            },
+        ),
+        // ---- threshold-ge: the same within-dimension precedence on the
+        // DOLLAR arm (both cap scopes trip → per-run reported) ----
+        decision_case(
+            "decision-threshold-ge-dollar-both-scopes-trip-per-run-reported",
+            &[CoverTag::ThresholdGe],
+            GovernanceInput {
+                token: None,
+                dollar: Some(DollarArm {
+                    run_cost: Micros(15_000_000),
+                    cumulative_cost: Micros(30_000_000),
+                    cap: CostCap {
+                        per_run: Some(Micros(10_000_000)),
+                        cumulative: Some(Micros(20_000_000)),
+                    },
+                    action: BreachAction::Warn,
+                }),
+                latched: vec![],
+            },
+        ),
         // ---- latch-per-scope: an already-latched pair never re-fires ----
         decision_case(
             "decision-latch-per-scope-holds-across-re-evaluation",
@@ -744,11 +827,59 @@ fn decision_cases() -> Vec<Case> {
                 latched: vec![LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun)],
             },
         ),
-        // ---- latch-re-arm: a FRESH latch at a Run boundary + the same
-        // totals fires again (the totals match the exact-at-ceiling case;
-        // only the latch state differs) ----
+        // ---- latch-per-scope: the DOLLAR dimension's latch HOLD (19-1
+        // review round 1: the token hold case above must not be the only
+        // hold — the dollar latch suppresses its dimension the same way) ----
         decision_case(
-            "decision-latch-re-arm-fresh-run-fires-again",
+            "decision-latch-per-scope-dollar-hold-suppresses-the-dollar-dimension",
+            &[CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: None,
+                dollar: Some(DollarArm {
+                    run_cost: Micros(2_000_000),
+                    cumulative_cost: Micros(2_000_000),
+                    cap: CostCap {
+                        per_run: Some(Micros(2_000_000)),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Stop,
+                }),
+                latched: vec![LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun)],
+            },
+        ),
+        // ---- latch-per-scope: a DOUBLED latch key (the same pair twice in
+        // the snapshot — 19-1 review round 1's normalization contract) holds
+        // exactly like a single one, and latched_after carries the pair
+        // ONCE ----
+        decision_case(
+            "decision-latch-per-scope-doubled-key-normalizes-to-one",
+            &[CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 100,
+                    cumulative_total: 100,
+                    budget: TokenBudget {
+                        per_run: Some(100),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![
+                    LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+                    LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+                ],
+            },
+        ),
+        // ---- latch-re-arm: a FRESH latch at a Run boundary — the case's
+        // input latch is EMPTY and the same tripping totals refire. The
+        // totals match the exact-at-ceiling case byte for byte; the HOLD
+        // cases pin the suppression that this empty latch resets. (19-1
+        // review round 1: renamed + recommented — the old comment claimed
+        // "only the latch state differs", which was false: the input latch
+        // here is empty, not merely different.) ----
+        decision_case(
+            "decision-latch-re-arm-empty-latch-refires",
             &[CoverTag::LatchReArm],
             GovernanceInput {
                 token: Some(TokenArm {
@@ -888,6 +1019,18 @@ fn derivation_cases() -> Vec<Case> {
                 rate: Rate::new(1, 0),
             },
         ),
+        // ---- round-half-up: the OUTPUT direction's tie rounds UP too
+        // (19-1 review round 1: the input-direction tie alone did not pin
+        // the output half of the rule) ----
+        derivation_case(
+            "derivation-round-half-up-output-tie-rounds-up",
+            &[CoverTag::RoundHalfUp],
+            DerivationSpec::CostMicros {
+                input_tokens: 0,
+                output_tokens: 1_500_000,
+                rate: Rate::new(0, 1),
+            },
+        ),
         // ---- round-half-up: one BELOW the tie rounds down ----
         derivation_case(
             "derivation-round-half-up-below-tie-rounds-down",
@@ -898,15 +1041,19 @@ fn derivation_cases() -> Vec<Case> {
                 rate: Rate::new(1, 0),
             },
         ),
-        // ---- round-half-up: the two directions round INDEPENDENTLY (the
-        // input term rounds up while the output term rounds down, in ONE
-        // derivation) ----
+        // ---- round-half-up: the two directions round INDEPENDENTLY — BOTH
+        // at the tie (19-1 review round 1: the previous shape, one direction
+        // at the tie and one below it, was passed by an aggregate-then-round
+        // Host too: 1.5 + 1.499999 = 2.999999 rounds to 3 either way. With
+        // both directions at the tie the honest per-direction sum is
+        // 2 + 2 = 4 while the wrong aggregate 3.0 rounds to 3 — the case now
+        // DISCRIMINATES the implementations.) ----
         derivation_case(
             "derivation-round-half-up-per-direction-independence",
             &[CoverTag::RoundHalfUp],
             DerivationSpec::CostMicros {
                 input_tokens: 1_500_000,
-                output_tokens: 1_499_999,
+                output_tokens: 1_500_000,
                 rate: Rate::new(1, 1),
             },
         ),
@@ -934,12 +1081,16 @@ fn derivation_cases() -> Vec<Case> {
             },
         ),
         // ---- no-retro-repricing: two rows at DIFFERENT rates sum per-row;
-        // the recorded anti-value (the same totals repriced at the latest
-        // rate) is what a re-pricing Host would wrongly produce ----
-        Case::Derivation(DerivationCase {
-            id: "derivation-no-retro-repricing-rows-sum-at-their-own-rates".to_string(),
-            covers: vec![CoverTag::NoRetroRepricing],
-            derivation: DerivationSpec::TwoRowOwnRateSum {
+        // the anti-value input (the same totals repriced at the latest rate)
+        // is what a re-pricing Host would wrongly produce. The expected
+        // micros are COMPUTED here through the same machinery as every other
+        // case (19-1 review round 1: the case previously bypassed
+        // `derivation_case` with a hand-pinned expected value its verifier
+        // never re-derived) ----
+        derivation_case(
+            "derivation-no-retro-repricing-rows-sum-at-their-own-rates",
+            &[CoverTag::NoRetroRepricing],
+            DerivationSpec::TwoRowOwnRateSum {
                 rows: vec![
                     RowPricing {
                         input_tokens: 1_000_000,
@@ -956,8 +1107,7 @@ fn derivation_cases() -> Vec<Case> {
                 ],
                 at_latest_rate: 6_000_000,
             },
-            expected_micros: 4_000_000,
-        }),
+        ),
     ]
 }
 
@@ -1123,6 +1273,75 @@ mod tests {
             outcome.latched_after,
             vec![LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun)],
             "the latch state is unchanged"
+        );
+    }
+
+    #[test]
+    fn decide_normalizes_a_duplicated_latch_input_key() {
+        // THE BOUNDARY NORMALIZATION (19-1 review round 1): a `latched` input
+        // carrying the SAME (dimension, scope) pair twice behaves exactly like
+        // a single one — the pair holds, and `latched_after` carries it ONCE
+        // (a consumer chaining outcomes back can never accumulate
+        // duplicates).
+        let tripping = TokenArm {
+            run_total: 100,
+            cumulative_total: 100,
+            budget: TokenBudget {
+                per_run: Some(100),
+                cumulative: None,
+            },
+            action: BreachAction::Pause,
+        };
+        let doubled = GovernanceInput {
+            token: Some(tripping),
+            dollar: None,
+            latched: vec![
+                LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+                LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+            ],
+        };
+        let outcome = decide(&doubled);
+        assert!(
+            outcome.decisions.is_empty(),
+            "the doubled key still holds the latch: {:?}",
+            outcome.decisions
+        );
+        assert_eq!(
+            outcome.latched_after,
+            vec![LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun)],
+            "latched_after carries the pair exactly once"
+        );
+        // Order + first-occurrence semantics: dedup keeps the input order.
+        let mixed = GovernanceInput {
+            token: Some(tripping),
+            dollar: Some(DollarArm {
+                run_cost: Micros(2_000_000),
+                cumulative_cost: Micros(2_000_000),
+                cap: CostCap {
+                    per_run: Some(Micros(2_000_000)),
+                    cumulative: None,
+                },
+                action: BreachAction::Pause,
+            }),
+            latched: vec![
+                LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun),
+                LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+                LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun),
+            ],
+        };
+        let outcome = decide(&mixed);
+        assert_eq!(
+            outcome.latched_after,
+            vec![
+                LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun),
+                LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+            ],
+            "the duplicated dollar key deduped in place; input order preserved"
+        );
+        assert!(
+            outcome.decisions.is_empty(),
+            "both pairs hold: {:?}",
+            outcome.decisions
         );
     }
 
@@ -1313,14 +1532,48 @@ mod tests {
                         "case `{}`: the committed expected micros does not match the derivation",
                         case.id
                     );
-                    // The no-retro case also asserts its recorded anti-value
-                    // DIFFERS (else the case proves nothing).
-                    if let DerivationSpec::TwoRowOwnRateSum { at_latest_rate, .. } =
-                        &case.derivation
+                    // The no-retro case also pins its ANTI-VALUE, COMPUTED
+                    // (19-1 review round 1 — not the recorded literal): the
+                    // summed tokens repriced at the LAST row's rate are what
+                    // a re-pricing Host would produce. The honest per-row sum
+                    // must differ from that computed anti-value, and the
+                    // recorded `at_latest_rate` input must equal it — neither
+                    // side of the inequality is a hardcoded literal.
+                    if let DerivationSpec::TwoRowOwnRateSum {
+                        rows,
+                        at_latest_rate,
+                    } = &case.derivation
                     {
+                        let total_input = rows
+                            .iter()
+                            .map(|row| row.input_tokens)
+                            .fold(0u64, u64::saturating_add);
+                        let total_output = rows
+                            .iter()
+                            .map(|row| row.output_tokens)
+                            .fold(0u64, u64::saturating_add);
+                        let total_cached = rows
+                            .iter()
+                            .map(|row| row.cached_tokens.unwrap_or(0))
+                            .fold(0u64, u64::saturating_add);
+                        let latest_rate = &rows.last().expect("the case carries rows").rate;
+                        let computed_anti = cost_micros_with_cached(
+                            total_input,
+                            total_output,
+                            Some(total_cached),
+                            latest_rate,
+                        )
+                        .get();
+                        assert_eq!(
+                            *at_latest_rate, computed_anti,
+                            "case `{}`: the recorded anti-value must equal the totals \
+                             repriced at the latest rate",
+                            case.id
+                        );
                         assert_ne!(
-                            case.expected_micros, *at_latest_rate,
-                            "case `{}`: the honest per-row sum must differ from the repricing anti-value",
+                            case.expected_micros, computed_anti,
+                            "case `{}`: the honest per-row sum must differ from the \
+                             computed repricing anti-value",
                             case.id
                         );
                     }
@@ -1359,14 +1612,12 @@ mod tests {
         // The header contract a Host pins against: the artifact id, the
         // schema version, the vectors version, and the provenance list —
         // all from the constants, so they cannot drift from the code.
+        // Provenance carries the generator FUNCTIONS only — no crate
+        // version (not a pin key; the version lives in the CHANGELOG).
         let document = generate();
         assert_eq!(document.artifact, "hekma-governance-vectors");
         assert_eq!(document.schema_version, 1);
         assert_eq!(document.vectors_version, GOVERNANCE_VECTORS_VERSION);
-        assert_eq!(
-            document.provenance.engine_version,
-            env!("CARGO_PKG_VERSION")
-        );
         assert_eq!(
             document.provenance.generated_from,
             vec![
@@ -1426,13 +1677,6 @@ mod tests {
             .iter()
             .find(|case| case["kind"] == "derivation")
             .expect("the artifact carries derivation cases");
-        assert!(
-            derivation_case["derivation"] == "cost-micros"
-                || derivation_case["derivation"] == "cost-micros-with-cached"
-                || derivation_case["derivation"] == "two-row-own-rate-sum",
-            "kebab-case derivation discriminator: {}",
-            derivation_case["derivation"]
-        );
         assert!(derivation_case["expected_micros"].is_i64());
         // The document header keys.
         for key in [
@@ -1443,6 +1687,73 @@ mod tests {
             "cases",
         ] {
             assert!(value.get(key).is_some(), "header key `{key}` present");
+        }
+    }
+
+    #[test]
+    fn every_derivation_variant_serializes_its_exact_wire_discriminator() {
+        // THE DISCRIMINATOR PIN, per variant (19-1 review round 1: the old
+        // assertion was an OR over serde's own renames — it could not fail).
+        // Each `DerivationSpec` variant must serialize to its EXACT
+        // kebab-case wire string; a `rename_all` regression to snake_case (or
+        // a hand-rolled string drift) fails here per variant.
+        let variants: [(DerivationSpec, &str); 3] = [
+            (
+                DerivationSpec::CostMicros {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    rate: Rate::new(1, 0),
+                },
+                "cost-micros",
+            ),
+            (
+                DerivationSpec::CostMicrosWithCached {
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cached_tokens: Some(1),
+                    rate: Rate::new(1, 0).with_cached(1),
+                },
+                "cost-micros-with-cached",
+            ),
+            (
+                DerivationSpec::TwoRowOwnRateSum {
+                    rows: vec![RowPricing {
+                        input_tokens: 1,
+                        output_tokens: 0,
+                        cached_tokens: None,
+                        rate: Rate::new(1, 0),
+                    }],
+                    at_latest_rate: 1,
+                },
+                "two-row-own-rate-sum",
+            ),
+        ];
+        for (spec, wire) in variants {
+            let value = serde_json::to_value(&spec).expect("the spec serializes");
+            assert_eq!(
+                value["derivation"], wire,
+                "the discriminator wire form regressed for `{wire}`: {value}"
+            );
+        }
+        // The COMMITTED artifact's derivation cases carry exactly these
+        // discriminators — the wire contract a Host switches on.
+        let document: VectorsDocument =
+            serde_json::from_str(COMMITTED).expect("the committed artifact parses");
+        for case in &document.cases {
+            let Case::Derivation(case) = case else {
+                continue;
+            };
+            let wire = match &case.derivation {
+                DerivationSpec::CostMicros { .. } => "cost-micros",
+                DerivationSpec::CostMicrosWithCached { .. } => "cost-micros-with-cached",
+                DerivationSpec::TwoRowOwnRateSum { .. } => "two-row-own-rate-sum",
+            };
+            let raw = serde_json::to_value(&case.derivation).expect("the spec serializes");
+            assert_eq!(
+                raw["derivation"], wire,
+                "case `{}`: committed discriminator drifted from the exact wire form",
+                case.id
+            );
         }
     }
 

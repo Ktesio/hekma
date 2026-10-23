@@ -653,9 +653,12 @@ fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
     // EVALUATE a Cost Cap. A source scan proves every CALL to
     // `CostEvaluator::evaluate(` lives ONLY in the shared decision core
     // `domain/governance.rs` (story 19-1: `decide()` — which the supervisor
-    // choke point routes through) + its own home `domain/cost.rs` unit tests. If a
-    // future change scatters a second enforcement site, this fails. Pure source
-    // scan (no OS cfg); runs on every OS.
+    // choke point routes through) + its own home `domain/cost.rs` unit tests —
+    // and NOT in the choke point itself: `usage.rs` must route through
+    // `governance::decide(` and hold no direct evaluator call (19-1 review
+    // round 1: the dead allowance for `usage.rs` is gone). If a future change
+    // scatters a second enforcement site — or walks the choke point back to a
+    // direct call — this fails. Pure source scan (no OS cfg); runs on every OS.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut eval_files = std::collections::BTreeSet::new();
     let mut choke_routes_through_decide = false;
@@ -685,19 +688,22 @@ fn only_the_ingestion_choke_point_evaluates_a_cost_cap() {
     // shared decision core — the ONE decision implementation the choke point
     // routes through; not a second enforcement path) and `domain/cost.rs` (the
     // evaluator's own home — its pure unit tests exercise it directly; that is
-    // not a second enforcement path either).
-    let allowed: std::collections::BTreeSet<String> = [
-        "domain/supervisor/usage.rs",
-        "domain/cost.rs",
-        "domain/governance.rs",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    // not a second enforcement path either). `domain/supervisor/usage.rs` is
+    // deliberately ABSENT: the choke point routes through `decide()`, it never
+    // calls the evaluator directly.
+    let allowed: std::collections::BTreeSet<String> = ["domain/cost.rs", "domain/governance.rs"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let violations: Vec<&String> = eval_files.difference(&allowed).collect();
     assert!(
         violations.is_empty(),
-        "CostEvaluator::evaluate is called outside the ingestion choke point: {violations:?}"
+        "CostEvaluator::evaluate is called outside the shared decision core: {violations:?}"
+    );
+    assert!(
+        !eval_files.contains("domain/supervisor/usage.rs"),
+        "the choke point must NOT call CostEvaluator::evaluate directly — it routes \
+         through governance::decide; callers: {eval_files:?}"
     );
     assert!(
         eval_files.contains("domain/governance.rs"),
