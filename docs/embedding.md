@@ -312,7 +312,7 @@ graceful path is a contract the embedder owns:
   progress lines `serve` prints at shutdown; pass `None` for return values
   only.
 
-```rust,ignore
+```rust
 let outcomes = engine.blocking().shutdown(Duration::from_secs(5), None);
 for outcome in &outcomes {
     println!("{outcome}");
