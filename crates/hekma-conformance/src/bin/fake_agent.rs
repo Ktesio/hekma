@@ -61,9 +61,11 @@
 //!   behavior is unchanged. Pure `std`, NO OS-cfg (a plain file read/write).
 //!
 //! * `--http-ready <PORT>:<STATUS>`  (the readiness probes)  serve a tiny
-//!   HTTP/1.1 endpoint on `127.0.0.1:<PORT>` that answers every connection with
-//!   `<STATUS>` — the target a manifest's `http-get` readiness probe polls. Pure
-//!   `std`, NO OS-cfg.
+//!   HTTP/1.1 endpoint on `127.0.0.1:<PORT>` that answers EVERY connection with
+//!   `<STATUS>` for the process's whole lifetime — a persistent accept loop,
+//!   NOT a one-shot server: the engine's readiness probe opens a fresh
+//!   connection on every poll and each one is answered. The target a manifest's
+//!   `http-get` readiness probe polls. Pure `std`, NO OS-cfg.
 //! * `--ready-file <PATH>:<DELAY_MS>`  create `<PATH>` after `<DELAY_MS>` — the
 //!   signal a manifest's `file-fresh` readiness probe waits for; the delay
 //!   proves the probe genuinely waited. Pure `std`, NO OS-cfg.
@@ -451,8 +453,19 @@ fn parse() -> Opts {
                 }
             },
             "--never-ready" => {
-                if let Some(ms) = args.next().and_then(|s| s.parse::<u64>().ok()) {
-                    never_ready = Some(Duration::from_millis(ms));
+                // Fail FAST on a missing/malformed value (mirror
+                // `--ready-line`): a silently-ignored `--never-ready` would
+                // leave the agent READY and any probe drill measuring
+                // nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => never_ready = Some(Duration::from_millis(ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --never-ready requires a DELAY_MS value (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
             // A lying-subject mode: omit the named env var from the `--dump`
@@ -600,6 +613,9 @@ fn main() {
     // fixture's OWN delay gates when the signal actually appears, which is
     // how a test proves the probe genuinely waited. Pure `std`, NO OS-cfg.
     if let Some((port, status)) = opts.http_ready {
+        // Persistent for this process's lifetime (NOT one-shot): the
+        // engine's readiness probe reconnects on every poll and every
+        // connection is answered.
         thread::spawn(move || serve_http_ready(port, status));
     }
     if let Some((path, ms)) = opts.ready_file.clone() {

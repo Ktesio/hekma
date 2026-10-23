@@ -21,12 +21,15 @@
 //! * a DETACHED start with a probe is bounded — `--detach` returns
 //!   ready-or-failed, never wedged.
 
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hekma_engine::{
-    AdapterRef, Engine, EngineOptions, LifecycleState, LogCaptureMode, RestartPolicy,
+    AdapterRef, DiagnosticSink, Engine, EngineOptions, LifecycleState, LogCaptureMode,
+    RestartPolicy,
 };
 use tempfile::TempDir;
 
@@ -179,8 +182,9 @@ fn http_get_probe_times_out_when_nothing_answers() {
         hekma_engine::TransitionCause::ReadinessTimeout { probe, waited_ms } => {
             assert!(probe.contains("http-get"), "cause names the probe: {probe}");
             assert!(
-                *waited_ms >= 1000 && *waited_ms <= 4000,
-                "the wait is the honest budget (~1000ms), got {waited_ms}ms"
+                *waited_ms >= 1000 && *waited_ms <= 2500,
+                "the wait is the honest budget (~1000ms + scheduling slack), got \
+                 {waited_ms}ms"
             );
         }
         other => panic!("expected readiness-timeout, got {other:?}"),
@@ -191,14 +195,17 @@ fn http_get_probe_times_out_when_nothing_answers() {
 #[test]
 fn file_fresh_probe_passes_when_the_file_arrives() {
     // The `file-fresh` probe: the fake_agent writes `ready.marker` into its
-    // Agent Home (its cwd) after 300ms; the probe resolves the same relative
-    // path against the same Home and the instance gates on it.
+    // Agent Home (its cwd) after 1000ms; the probe resolves the same relative
+    // path against the same Home and the instance gates on it. The delay sits
+    // AFTER the ~300ms startup survival window, so the start can only complete
+    // when the probe GENUINELY waited (a regression that skipped the wait
+    // would return `running` at ~300ms and blow the >= 800ms bound).
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_manifest(
         manifest.path(),
         "markersvc",
-        &["--ready-file", "ready.marker:300", "--linger-ms", "600000"],
+        &["--ready-file", "ready.marker:1000", "--linger-ms", "600000"],
         Some(
             "kind = \"file-fresh\"\ntimeout_ms = 8000\npath = \"ready.marker\"\nmax_age_ms = 8000",
         ),
@@ -213,8 +220,14 @@ fn file_fresh_probe_passes_when_the_file_arrives() {
         )
         .unwrap();
 
+    let began = Instant::now();
     let started = facade.start("markersvc").unwrap();
+    let elapsed = began.elapsed();
     assert_eq!(started.state, LifecycleState::Running);
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "the start must WAIT for the late marker (took {elapsed:?})"
+    );
     facade
         .stop("markersvc", Some(Duration::from_secs(5)))
         .unwrap();
@@ -428,8 +441,8 @@ fn never_ready_probe_times_out_terminal_names_the_probe_and_never_restarts() {
                 "cause names the probe: {probe}"
             );
             assert!(
-                *waited_ms >= 1200 && *waited_ms <= 4000,
-                "waited_ms must bracket the budget, got {waited_ms}ms"
+                *waited_ms >= 1200 && *waited_ms <= 2700,
+                "waited_ms must bracket the budget (+ scheduling slack), got {waited_ms}ms"
             );
         }
         other => panic!("expected readiness-timeout, got {other:?}"),
@@ -583,10 +596,11 @@ fn no_readiness_section_start_sequence_is_byte_identical() {
     let elapsed = began.elapsed();
     assert_eq!(started.state, LifecycleState::Running);
     // No probe, no wait: the start must complete on the ~300ms survival
-    // window. (Generous bound: a regression that made the no-section path
-    // wait on a probe would overshoot by seconds.)
+    // window. (Tight-but-fair bound: a regression that made the no-section
+    // path wait on a probe would overshoot by seconds; the 2s ceiling still
+    // tolerates CI scheduling noise on the ~300ms real work.)
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(2),
         "a no-section start must not gain a wait phase (took {elapsed:?})"
     );
 
@@ -661,4 +675,337 @@ fn detached_start_with_a_probe_is_bounded_and_returns_ready() {
         elapsed < Duration::from_secs(10),
         "the detached start is bounded (took {elapsed:?})"
     );
+}
+
+#[test]
+fn http_get_probe_serving_a_wrong_status_times_out_and_refuses_the_start() {
+    // The dark-port test's sibling: an endpoint that ANSWERS — but with the
+    // WRONG status (503 while the manifest expects 200) — is NOT ready. The
+    // probe must keep polling through the wrong answers and refuse the start
+    // at the budget, with the readiness-timeout cause naming the probe (a
+    // listening port alone must never fake a pass).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let port = free_port();
+    write_manifest(
+        manifest.path(),
+        "wrongsvc",
+        &["--http-ready", &format!("{port}:503"), "--linger-ms", "600000"],
+        Some(&format!(
+            "kind = \"http-get\"\ntimeout_ms = 1000\nurl = \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+        )),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "wrongsvc",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("wrongsvc", RestartPolicy::OnFailure)
+        .unwrap();
+
+    let began = Instant::now();
+    let err = facade.start("wrongsvc").unwrap_err();
+    let elapsed = began.elapsed();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("readiness probe http-get") && msg.contains("did not pass"),
+        "the timeout must name the probe: {msg}"
+    );
+
+    // The start waited the honest budget (not a fast refuse), and the
+    // instance is `failed` TERMINALLY — on-failure does not restart a
+    // readiness timeout, even though the process itself is healthy.
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "the start must poll through the wrong statuses for the budget (took \
+         {elapsed:?})"
+    );
+    assert_eq!(
+        facade.instance_status("wrongsvc").unwrap().instance.state,
+        LifecycleState::Failed
+    );
+    let events = facade.transition_events("wrongsvc").unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.prior_state, LifecycleState::Starting);
+    assert_eq!(last.new_state, LifecycleState::Failed);
+    match &last.cause {
+        hekma_engine::TransitionCause::ReadinessTimeout { probe, waited_ms } => {
+            assert!(probe.contains("http-get"), "cause names the probe: {probe}");
+            assert!(
+                *waited_ms >= 1000 && *waited_ms <= 2500,
+                "the wait is the honest budget (~1000ms + scheduling slack), got \
+                 {waited_ms}ms"
+            );
+        }
+        other => panic!("expected readiness-timeout, got {other:?}"),
+    }
+}
+
+#[test]
+fn detached_start_with_a_never_ready_probe_is_bounded_and_lands_failed() {
+    // The detached-timeout leg of the bound: a DETACHED start whose probe
+    // never passes returns (refuses) within the budget — `--detach` is
+    // ready-OR-failed, never wedged — and the instance is TERMINALLY failed
+    // (a readiness timeout has no restart, detached or not).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "detached-sleepy",
+        &["--never-ready", "10000", "--linger-ms", "600000"],
+        Some("kind = \"log-contains\"\ntimeout_ms = 1200\nline = \"never printed\""),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "detached-sleepy",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("detached-sleepy", RestartPolicy::OnFailure)
+        .unwrap();
+
+    let began = Instant::now();
+    let err = facade.start_detached("detached-sleepy").unwrap_err();
+    let elapsed = began.elapsed();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("readiness probe log-contains"),
+        "the detached refusal names the probe: {msg}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the detached start must refuse within the budget, not wedge (took \
+         {elapsed:?})"
+    );
+    assert_eq!(
+        facade
+            .instance_status("detached-sleepy")
+            .unwrap()
+            .instance
+            .state,
+        LifecycleState::Failed
+    );
+
+    // Terminal: the cadence gets a couple of ticks — nothing restarts, the
+    // row stays `failed` (a detached start that failed its gate must not
+    // leave a `starting` zombie behind for the next open to reconcile).
+    std::thread::sleep(Duration::from_millis(1500));
+    let status = facade.instance_status("detached-sleepy").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Failed);
+    assert_eq!(status.restart_count, 0, "terminal means no restart");
+}
+
+#[test]
+fn detached_start_genuinely_waits_for_a_late_probe() {
+    // The detached-pass leg, with the late-signal drill the attached pass
+    // tests use: the marker lands at 1000ms (after the ~300ms survival
+    // window), so a detached start that skipped the probe would return early
+    // and blow the >= 800ms bound.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "detached-late",
+        &["--ready-file", "ready.marker:1000", "--linger-ms", "4000"],
+        Some(
+            "kind = \"file-fresh\"\ntimeout_ms = 8000\npath = \"ready.marker\"\nmax_age_ms = 8000",
+        ),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "detached-late",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let began = Instant::now();
+    let started = facade.start_detached("detached-late").unwrap();
+    let elapsed = began.elapsed();
+    assert_eq!(started.state, LifecycleState::Running);
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "the detached start must WAIT for the late marker (took {elapsed:?})"
+    );
+}
+
+/// A `Write` adapter delegating into a shared buffer (the `diagnostic_sink.rs`
+/// shape): the test reads the sink's captured bytes while the engine owns the
+/// boxed writer.
+#[derive(Clone)]
+struct SharedCapture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn both_probe_notes_reach_the_host_sink_in_order() {
+    // The dual-note pin: the start path says the probe wait BEGAN (what is
+    // watched, on what budget) and, when it passes, that it PASSED after how
+    // long — both routed through the host's DiagnosticSink beside every other
+    // start diagnostic. The two lines arrive in that order, and both carry
+    // the rendered probe — the observable ordering evidence for the AC (the
+    // pass note is emitted strictly before the `starting → running`
+    // transition fires).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "noted",
+        &["--ready-file", "ready.marker:300", "--linger-ms", "600000"],
+        Some(
+            "kind = \"file-fresh\"\ntimeout_ms = 8000\npath = \"ready.marker\"\nmax_age_ms = 8000",
+        ),
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink)
+        .expect("open engine with sink");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "noted",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let started = facade.start("noted").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    let captured = String::from_utf8(shared.lock().unwrap().clone()).expect("utf-8 sink");
+    let began = captured
+        .lines()
+        .find(|l| l.contains("waiting up to 8000ms for the declared readiness probe"))
+        .unwrap_or_else(|| panic!("the wait-begins note must reach the sink: {captured}"));
+    let passed = captured
+        .lines()
+        .find(|l| l.contains("readiness probe passed after") && l.contains("file-fresh"))
+        .unwrap_or_else(|| panic!("the passed-after note must reach the sink: {captured}"));
+    assert!(
+        began.contains("file-fresh"),
+        "the wait-begins note names the probe: {began}"
+    );
+    let began_pos = captured.find(began).expect("began in capture");
+    let passed_pos = captured.find(passed).expect("passed in capture");
+    assert!(
+        began_pos < passed_pos,
+        "wait-begins precedes passed-after: {captured}"
+    );
+
+    facade.stop("noted", Some(Duration::from_secs(5))).unwrap();
+}
+
+#[test]
+fn log_contains_probe_passes_under_metadata_capture_mode() {
+    // The metadata-at-rest mode keeps the RAW capture live WHILE the instance
+    // runs (transient redirects; raw files unlinked at stop) — so a
+    // `log-contains` probe scanning the engine-owned log PASSES there too.
+    // (Paired with the capture-off test: Off is the only unsatisfiable mode.)
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "metasvc",
+        &[
+            "--ready-line",
+            "readiness-line-meta:300",
+            "--linger-ms",
+            "600000",
+        ],
+        Some("kind = \"log-contains\"\ntimeout_ms = 8000\nline = \"readiness-line-meta\""),
+    );
+
+    let engine = Engine::open_with_options(
+        Some(state.path().to_path_buf()),
+        EngineOptions {
+            log_capture: LogCaptureMode::Metadata,
+            ..EngineOptions::default()
+        },
+    )
+    .expect("open engine with metadata capture");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "metasvc",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let started = facade.start("metasvc").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+    facade
+        .stop("metasvc", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn contract_v1_0_0_manifest_with_readiness_section_is_accepted_by_this_engine() {
+    // The versioning pin, positive leg: `[readiness]` is a LINE-ADDITIVE
+    // minor, so a manifest still declaring `contract_version = "1.0.0"` (a
+    // manifest that predates the section is unusual, but a 1.0.0-declaring
+    // manifest WITH the section is legal the moment the section exists —
+    // same major, additive field) registers, validates, and its probe gates
+    // the start on this 1.1.0 engine. The negative leg (a 1.0.0 ENGINE
+    // refusing the section) is pinned in hekma-adapter-api's
+    // `contract_v1_0_0_engine_rejects_the_readiness_section`.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "oldsig",
+        &["--ready-file", "ready.marker:100", "--linger-ms", "600000"],
+        Some(
+            "kind = \"file-fresh\"\ntimeout_ms = 8000\npath = \"ready.marker\"\nmax_age_ms = 8000",
+        ),
+    );
+    // Rewrite the fixture's declared contract version down to 1.0.0.
+    let manifest_file = manifest.path().join("adapter.toml");
+    let text = std::fs::read_to_string(&manifest_file).expect("read the fixture");
+    let downgraded = text.replace(
+        &format!(
+            "contract_version = \"{}\"",
+            hekma_adapter_api::CONTRACT_VERSION
+        ),
+        "contract_version = \"1.0.0\"",
+    );
+    assert_ne!(text, downgraded, "the version rewrite must have happened");
+    std::fs::write(&manifest_file, downgraded).expect("write the downgraded manifest");
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "oldsig",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+
+    let started = facade.start("oldsig").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+    facade.stop("oldsig", Some(Duration::from_secs(5))).unwrap();
 }

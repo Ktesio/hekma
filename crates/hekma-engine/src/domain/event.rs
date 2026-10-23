@@ -190,8 +190,12 @@ pub enum TransitionCause {
         /// The rendered probe description (e.g.
         /// `"readiness probe http-get http://127.0.0.1:8080/health (expected 200)"`).
         probe: String,
-        /// How long the probe was actually waited, in milliseconds (the
-        /// declared `timeout_ms`, reported back honestly).
+        /// How long the probe was ACTUALLY waited, in milliseconds — the
+        /// real elapsed time from the wait's start to the deadline check,
+        /// which is at most the declared `timeout_ms` plus a little
+        /// scheduling slack (the runner's polls overshoot the deadline by
+        /// at most one poll interval, and the number reported is measured,
+        /// never assumed).
         waited_ms: u64,
     },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
