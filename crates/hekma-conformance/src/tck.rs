@@ -2413,28 +2413,39 @@ fn self_reported_metering_inner_with(
         .start(probe_kind)
         .map_err(|e| format!("probe start failed: {e}"))?;
 
-    // The 3 DISTINCT events commit; the replayed sequence-0 line is then
-    // drained as a no-op. Wait for 3 rows, settle past the replay drain, and
-    // require the count to STAY exactly 3 (an absolute count — a floor-poll
-    // would hide a genuine over-count). A row-count read error propagates
-    // immediately as this section's named fail reason (spec 15-3).
-    wait_for_usage_rows_for(state_root, probe_kind, EXPECTED_SELF_REPORTED_ROWS, timeout)?;
-    std::thread::sleep(Duration::from_millis(800));
-    let rows = usage_row_count(state_root, probe_kind, timeout)?;
-    replay_row_defect(rows)?;
+    // The proof itself, isolated so the STOP below runs on EVERY exit: an
+    // Err from any `?` step used to return PAST the trailing stop and leak
+    // the probe process for its whole linger window — the helper batteries
+    // drive exactly these failure arms on purpose (a lying subject, a
+    // never-echoing probe), and their helper engines are deliberately
+    // `Box::leak`ed (they never drop, so kill-on-drop cleanup never fires).
+    // Stopping on the Err path changes nothing observable for the caller —
+    // the same Err is returned — it only ends the fixture.
+    let outcome = (|| {
+        // The 3 DISTINCT events commit; the replayed sequence-0 line is then
+        // drained as a no-op. Wait for 3 rows, settle past the replay drain,
+        // and require the count to STAY exactly 3 (an absolute count — a
+        // floor-poll would hide a genuine over-count). A row-count read
+        // error propagates immediately as this section's named fail reason
+        // (spec 15-3).
+        wait_for_usage_rows_for(state_root, probe_kind, EXPECTED_SELF_REPORTED_ROWS, timeout)?;
+        std::thread::sleep(Duration::from_millis(800));
+        let rows = usage_row_count(state_root, probe_kind, timeout)?;
+        replay_row_defect(rows)?;
 
-    // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out), and the
-    // metering-source cell reads the wire string the section ran under.
-    let entry = fleet_entry(facade, probe_kind)?;
-    fleet_totals_defect(
-        entry.usage.cumulative_input_tokens,
-        entry.usage.cumulative_output_tokens,
-        EXPECTED_SELF_REPORTED_ROWS,
-        &entry.metering_source,
-    )?;
-
+        // Fleet totals EQUAL the ledger exactly: 3 × (10 in, 20 out), and
+        // the metering-source cell reads the wire string the section ran
+        // under.
+        let entry = fleet_entry(facade, probe_kind)?;
+        fleet_totals_defect(
+            entry.usage.cumulative_input_tokens,
+            entry.usage.cumulative_output_tokens,
+            EXPECTED_SELF_REPORTED_ROWS,
+            &entry.metering_source,
+        )
+    })();
     let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
-    Ok(())
+    outcome
 }
 
 /// Engine-observed metering: the operator sets the real upstream
@@ -2963,12 +2974,19 @@ fn interaction_delivery(
     probe_kind: &str,
     budget: Duration,
 ) -> Result<(), String> {
-    facade
-        .send_input(probe_kind, "tck-echo-line")
-        .map_err(|e| format!("send_input failed: {e}"))?;
-    wait_for_log_line(facade, probe_kind, "stdin: tck-echo-line", budget)?;
+    // The proof is isolated so the STOP below runs on EVERY exit: the
+    // never-echoes helper battery drives this to a TIMEOUT Err on purpose,
+    // and that Err used to return PAST the stop and leak the probe for its
+    // whole linger window (the helper engines are deliberately leaked and
+    // never drop to clean up). The caller still sees the same Err.
+    let outcome = (|| {
+        facade
+            .send_input(probe_kind, "tck-echo-line")
+            .map_err(|e| format!("send_input failed: {e}"))?;
+        wait_for_log_line(facade, probe_kind, "stdin: tck-echo-line", budget)
+    })();
     let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
-    Ok(())
+    outcome
 }
 
 /// The manifest wire level an interaction probe declares for the level under

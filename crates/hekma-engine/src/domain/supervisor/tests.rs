@@ -3064,6 +3064,14 @@ fn adopt_orphans_surfaces_the_park_loss_window_on_a_successful_adoption() {
         text.contains("goes unaccounted"),
         "the adoption must name the un-flushed park window: {text}"
     );
+    // The detached fixture is stopped explicitly: adoption re-held it
+    // DISARMED (the record's detach flag), so dropping `sup2` kills nothing
+    // and the agent would otherwise outlive the test for its whole linger
+    // window (leaking a live process on every green run — proven by the
+    // battle pass: this test's fixture was one of three found running after
+    // a fully green suite).
+    sup2.stop(&registry, "parknote", Some(Duration::from_secs(5)))
+        .expect("stop the adopted detached fixture");
 }
 
 #[test]
