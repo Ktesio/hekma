@@ -219,7 +219,13 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
+        # The coverage job gates on EVERY primary gate — including the
+        # governance-vectors job story 19-1 added, so a vectors artifact that
+        # fails Host-side verification blocks coverage too.
+        self.assertIn(
+            "needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]",
+            ci,
+        )
         # Wedge forensics (2026-10-17, #292): the coverage job is pinned to
         # ubuntu-26.04 — the same class-2 runner-freeze mitigation as the
         # test matrix's linux leg. Both
@@ -888,6 +894,61 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("test -x target/release/examples/embedding-quickstart", build_job)
         self.assertIn("target/release/examples/embedding-quickstart", build_job)
         self.assertTrue(example.is_file(), "the quickstart example must exist")
+
+    def test_ci_stand_in_host_lists_every_all_covers_tag(self) -> None:
+        # Story 19-1 review round 1: the governance-vectors job's stand-in-Host
+        # step re-lists the D5 rule tags as a python literal — a NINTH tag added
+        # to the Rust `ALL_COVERS` const would silently miss it and the CI
+        # check would under-verify. This pin greps the const from the engine
+        # source, resolves each variant to its exact kebab-case wire form via
+        # the `as_str` mapping (so the case conversion can never drift), and
+        # asserts every wire string appears in the ci.yml literal: the two
+        # lists cannot diverge.
+        governance_src = (
+            release_docs.ROOT
+            / "crates"
+            / "hekma-engine"
+            / "src"
+            / "domain"
+            / "governance.rs"
+        ).read_text(encoding="utf-8")
+
+        import re as _re
+
+        # The `ALL_COVERS` const's variant list …
+        const_body = governance_src.split("pub const ALL_COVERS", 1)[1].split("];", 1)[0]
+        variants = _re.findall(r"CoverTag::(\w+)", const_body)
+        self.assertTrue(variants, "the ALL_COVERS const must list CoverTag variants")
+        # … and the `as_str` mapping variant → exact wire string (single source
+        # of the kebab-case form; the test re-derives, never re-states it).
+        as_str_body = governance_src.split("pub fn as_str(&self)", 1)[1].split("}\n}", 1)[0]
+        wire_by_variant = dict(_re.findall(r"CoverTag::(\w+) => \"([\w-]+)\"", as_str_body))
+        missing_mappings = [v for v in variants if v not in wire_by_variant]
+        self.assertEqual(
+            [],
+            missing_mappings,
+            "every ALL_COVERS variant needs an as_str wire form",
+        )
+        tags = [wire_by_variant[v] for v in variants]
+
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        job_start = ci.index("  governance-vectors:")
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        job = ci[job_start:job_end]
+        for tag in tags:
+            self.assertIn(
+                f'"{tag}"',
+                job,
+                f"the stand-in-Host literal must list the `{tag}` rule "
+                "(keep ci.yml in lockstep with the Rust ALL_COVERS const)",
+            )
+        # The job's header sanity-checks stay present: a Host pins the
+        # schema version + vectors version.
+        self.assertIn('document["schema_version"]', job)
+        self.assertIn('document["vectors_version"]', job)
 
     def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
         # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets

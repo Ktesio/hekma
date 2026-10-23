@@ -615,6 +615,12 @@ jobs:
           fetch-depth: 0
       - name: Validate docs
         run: python3 scripts/check_docs.py
+      - name: Validate the docs-gate self-test (provenance-regex pins)
+        # The gate's own regex contract (19-1 review round 1): the `retro`
+        # provenance pattern's match/no-match samples, pinned so the pattern
+        # cannot silently re-open the hyphen-joined provenance hole (or break
+        # the `no-retro-repricing` wire token's verbatim quoting).
+        run: python3 scripts/check_docs.py --self-test
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers

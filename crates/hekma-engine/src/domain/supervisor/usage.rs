@@ -995,26 +995,38 @@ impl Supervisor {
 
         // (2) Build the PURE decision input: one arm per ARMED dimension (the
         // totals reads are the same story-3-2/3-3 reads, degrade-to-zero
-        // included); `None` = skipped entirely. The latch snapshot comes off the
+        // included — but SURFACED: [`Self::surfaced_read`] emits the
+        // enforcement diagnostic on every failed read, 19-1 review round 1);
+        // `None` = skipped entirely. The latch snapshot comes off the
         // supervisor's per-Run set (an unsupervised instance snapshots empty —
         // decide() then fires, and apply_breach declines below, as before).
         let token = token_armed.then(|| governance::TokenArm {
-            run_total: registry
-                .run_usage_totals(name, run_id)
+            run_total: self
+                .surfaced_read(registry, name, "per-run token totals", || {
+                    registry.run_usage_totals(name, run_id)
+                })
                 .map(|t| t.total_tokens())
                 .unwrap_or(0),
-            cumulative_total: registry
-                .usage_totals(name)
+            cumulative_total: self
+                .surfaced_read(registry, name, "cumulative token totals", || {
+                    registry.usage_totals(name)
+                })
                 .map(|t| t.total_tokens())
                 .unwrap_or(0),
             budget,
             action: token_action,
         });
         let dollar = dollar_armed.then(|| governance::DollarArm {
-            run_cost: registry
-                .run_cost_totals(name, run_id)
+            run_cost: self
+                .surfaced_read(registry, name, "per-run dollar cost", || {
+                    registry.run_cost_totals(name, run_id)
+                })
                 .unwrap_or(Micros::ZERO),
-            cumulative_cost: registry.cost_totals(name).unwrap_or(Micros::ZERO),
+            cumulative_cost: self
+                .surfaced_read(registry, name, "cumulative dollar cost", || {
+                    registry.cost_totals(name)
+                })
+                .unwrap_or(Micros::ZERO),
             cap: cost_cap,
             action: cost_action,
         });
@@ -1346,6 +1358,48 @@ impl Supervisor {
     fn log_enforcement_diagnostic(&self, _registry: &Registry, name: &InstanceName, detail: &str) {
         let breadcrumb = format!("{}: {detail}", name.as_str());
         self.emit_diagnostic(&breadcrumb);
+    }
+
+    /// One enforcement totals/cost read, SURFACED (story 19-1 review round 1,
+    /// the AI-18 surfaced-not-silent rule): `Ok` passes through untouched; an
+    /// `Err` emits the enforcement diagnostic naming the instance + the
+    /// degraded scope + the reason, and the caller's zero substitute still
+    /// flows into the decision input — the pre-existing story-3-2/3-3
+    /// degrade-to-zero semantics UNCHANGED (a zero ceiling still fires on the
+    /// fabricated total; only the silence is fixed). Deciding DIFFERENTLY on a
+    /// degraded read (skipping the arm, failing closed) is a money-path
+    /// behavior change, deferred to its own story — the deferred-work entry
+    /// from 19-1's review round 1 records it with its trigger.
+    fn surfaced_read<T>(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        scope: &str,
+        read: impl FnOnce() -> Result<T, crate::domain::RegistryError>,
+    ) -> Result<T, crate::domain::RegistryError> {
+        // cfg(test) FAULT-INJECTION SEAM (the `compensation_fault_names`
+        // precedent): an armed instance's read fails with an injected error so
+        // the surfaced-degradation arm is reachable deterministically.
+        #[cfg(test)]
+        let result = if self.totals_read_fault_names.contains(name) {
+            Err(crate::domain::RegistryError::Io {
+                name: name.as_str().to_string(),
+                path: "<totals read (story 19-1 test seam)>".to_string(),
+                source: std::io::Error::other("injected totals-read fault (test seam)"),
+            })
+        } else {
+            read()
+        };
+        #[cfg(not(test))]
+        let result = read();
+        if let Err(error) = &result {
+            let detail = format!(
+                "the {scope} read failed — enforcement degrades it to zero and decides \
+                 on the degraded total (a zero ceiling still fires on it): {error}"
+            );
+            self.log_enforcement_diagnostic(registry, name, &detail);
+        }
+        result
     }
 
     /// Read back the recorded [`BudgetBreachEvent`]s for an instance from its

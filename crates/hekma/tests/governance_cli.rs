@@ -18,8 +18,28 @@ fn committed_artifact_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../hekma-engine/governance/vectors-v1.json")
 }
 
+/// The house skip-guard (the real-agent smokes' skip-unless-present posture,
+/// surfaced through 16-1's uncaptured-note channel): the artifact lives in the
+/// ENGINE crate's `governance/` directory via a SIBLING-CHECKOUT relative
+/// path, which does not exist when the published `hekma` crate is tested
+/// standalone (19-1 review round 1). Absent artifact → the stderr skip note
+/// + `false`; the caller returns Ok.
+fn artifact_present_or_skip() -> bool {
+    if committed_artifact_path().exists() {
+        return true;
+    }
+    hekma_conformance::note_uncaptured(
+        "note: governance-vectors e2e skipped: the committed engine artifact is not in \
+         this checkout (the hekma crate is tested standalone)",
+    );
+    false
+}
+
 #[test]
 fn governance_vectors_json_stdout_is_byte_identical_to_the_committed_artifact() {
+    if !artifact_present_or_skip() {
+        return;
+    }
     let state = TestContext::new();
     let ctx = TestContext::new();
     let run = run_hekma_agent(
@@ -42,6 +62,9 @@ fn governance_vectors_json_stdout_is_byte_identical_to_the_committed_artifact() 
 
 #[test]
 fn governance_vectors_summary_names_version_checksum_and_case_count() {
+    if !artifact_present_or_skip() {
+        return;
+    }
     let state = TestContext::new();
     let ctx = TestContext::new();
     let run = run_hekma_agent(

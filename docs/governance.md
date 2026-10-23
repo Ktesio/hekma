@@ -47,7 +47,7 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 20 cases; the shape is identical
+An excerpt (the full artifact carries 26 cases; the shape is identical
 throughout):
 
 ```json
@@ -56,7 +56,6 @@ throughout):
   "schema_version": 1,
   "vectors_version": "1.0.0",
   "provenance": {
-    "engine_version": "0.9.0",
     "generated_from": [
       "BudgetEvaluator",
       "CostEvaluator",
@@ -117,7 +116,7 @@ Every case carries `covers` — the rule set it pins:
 | `latch-re-arm` | A fresh latch at a Run boundary plus the same totals fires again. |
 | `token-before-dollar` | With both dimensions armed and both tripping, the token decision is reported first. |
 | `integer-micros` | Money is integer micro-dollars throughout: per-direction rates, the cached re-split, no floating point, no wrap. |
-| `round-half-up` | A token×rate divide rounds half-up; each direction rounds independently. |
+| `round-half-up` | A token×rate divide rounds half-up; each direction rounds independently — pinned by a both-directions-at-the-tie case that an aggregate-then-round implementation fails (4 vs 3). |
 | `saturation` | A runaway product pins at the integer maximum — never wraps, so a cost can never silently un-breach. |
 | `no-retro-repricing` | Each ledger row prices at the rate persisted with it; repricing history at the latest rate produces a different (wrong) value. |
 
@@ -157,8 +156,29 @@ API — see [Embedding the engine](embedding.md).
 
 The checksum protects transport, not semantics: matching bytes mean you have
 the exact artifact a release carried; the version tells you what its cases
-promise. The provenance block records the engine version and the evaluated
-symbols each artifact was generated from.
+promise. The provenance block records the evaluated symbols — the engine
+functions each artifact was generated from and verified against. It names
+GENERATOR FUNCTIONS, not a crate version: the crate version lives in the
+changelog and is not a pin key (a Host pins `vectors_version` + the SHA-256,
+which already cover the exact bytes).
+
+## Parsing the integers (a note for dynamically-typed hosts)
+
+Every numeric field in the artifact is a JSON integer, and two of the pinned
+rules are only visible at the EXTREMES: the saturation cases deliberately
+carry values beyond 2^53 (beyond what a JavaScript `Number` can represent
+losslessly). A host that parses them through a float type will silently
+corrupt the case and can pass or fail for the wrong reason. Parse every
+integer losslessly — in JavaScript, use a BigInt-aware JSON parser (or
+`JSON.parse` with a reviver over the numeric fields). The fields that carry
+extremes:
+
+- `input_tokens` / `output_tokens` — `u64::MAX` in the saturation cases
+  (`derivation-saturation-max-tokens-max-rate`,
+  `derivation-saturation-cached-derivation-saturates`).
+- `rate.input_micros_per_1m` / `rate.output_micros_per_1m` /
+  `rate.cached_micros_per_1m` — `u64::MAX` in the same cases.
+- `expected_micros` — `i64::MAX` (the saturation pin itself).
 
 ## What the vectors are not
 
@@ -186,6 +206,22 @@ change, regenerate both files and review the diff case by case:
 HEKMA_UPDATE_GOVERNANCE_VECTORS=1 cargo test -p hekma-engine governance
 sha256sum -c crates/hekma-engine/governance/vectors-v1.json.sha256
 ```
+
+On macOS, `sha256sum` may be absent — `shasum -a 256` is the same digest:
+
+```bash
+shasum -a 256 -c crates/hekma-engine/governance/vectors-v1.json.sha256
+```
+
+The bless run exits RED on the sibling verifiers in the same run: the
+compile-time EMBEDDED copy (`include_str!`) is the pre-bless bytes until the
+crate is rebuilt, so the byte-compare and checksum tests that execute after
+the write still see stale input. That red is expected — the honest two-step:
+
+1. bless (the command above; it rewrites the artifact + sidecar, then the
+   remaining tests in that run may fail against the stale embed), and
+2. re-run the same suite on a fresh build — it must be GREEN before the
+   change lands.
 
 The regenerated artifact must land in the same change as the semantic change
 that produced it, with the version bump the policy above calls for.

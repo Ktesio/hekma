@@ -904,6 +904,15 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     compensation_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 19-1 review round 1 — cfg(test) FAULT-INJECTION SEAM at the
+    /// enforcement totals reads: an instance name listed here makes EVERY
+    /// totals/cost read in [`Supervisor::enforce_budget`] fail with an
+    /// injected error, driving the degraded-read diagnostic (surfaced, not
+    /// silent) deterministically without staging a real store outage. Same
+    /// placement rationale as `compensation_fault_names` above. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    totals_read_fault_names: std::collections::HashSet<InstanceName>,
 }
 
 impl Supervisor {
@@ -942,6 +951,8 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -979,6 +990,8 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
         }
     }
 
@@ -1016,6 +1029,8 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
         }
     }
 
