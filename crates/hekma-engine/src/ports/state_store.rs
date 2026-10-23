@@ -79,6 +79,29 @@ pub struct SpawnRecord {
     /// life; a genuine restart (stop→start, or the reaper's restart path)
     /// rewrites the record with a freshly minted id and the Run resets.
     pub run_id: Option<RunId>,
+    /// The LIVE-OWNER adoption boundary: the process fingerprint of the
+    /// ENGINE PROCESS that spawned (or, after a cross-engine adoption,
+    /// re-holds) this supervised process — the durable answer to "is the
+    /// engine that owns this agent still ALIVE?".
+    ///
+    /// `Engine::open`'s orphan adoption reads it for every NON-detached
+    /// record: an owner that is STILL ALIVE (and is not this process) means
+    /// the agent is supervised by a live engine elsewhere, so the opening
+    /// engine SKIPS the record entirely — it must not re-hold an armed
+    /// (kill-on-drop) handle whose teardown at the opening command's exit
+    /// would stop another process's agent (the `hekma agent list`-kills-
+    /// `serve`'s-agent bug this field closes). A DEAD owner (the crashed
+    /// engine of story 1-6) adopts exactly as before, and the adopting
+    /// engine RE-STAMPS itself as the owner — so a `serve` that adopted a
+    /// crash's orphans is itself protected from the next benign command.
+    ///
+    /// `None` for pre-boundary records (a v9 row read by a v10 engine — the
+    /// migration leaves the columns NULL) and for a spawn whose own
+    /// start-time token could not be read (the degraded-OS fallback): both
+    /// keep the pre-boundary adoption posture (adopt armed). Detached
+    /// records ignore the owner entirely — their adoption re-holds DISARMED
+    /// either way (the durable-detach promise is unaffected).
+    pub owner: Option<ProcessFingerprint>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.

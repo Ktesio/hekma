@@ -1,8 +1,12 @@
 //! The shutdown drain (story 17-2, reworked by the review findings):
-//! enumerate the Fleet, stop every RUNNING agent through the engine's OWN
-//! bounded stop ladder, surface each per-instance outcome, and never drop
-//! the engine before every stop has settled (the `Drop` teardown — never
-//! before the window ends).
+//! enumerate the Fleet, stop every LIVE agent — `Running` AND `Paused` —
+//! through the engine's OWN bounded stop ladder, surface each per-instance
+//! outcome, and never drop the engine before every stop has settled (the
+//! `Drop` teardown — never before the window ends). A paused agent is
+//! resumed-then-stopped by the same ladder (the engine's stop path resumes a
+//! real suspension first, so the graceful signal can be delivered) — never
+//! handed to the engine Drop's raw kill-on-drop teardown, which was the
+//! "paused agents killed without a graceful stop" bug.
 //!
 //! The host owns the SIGNAL; the engine owns the STOP (AD-20): every stop is
 //! `Engine::stop(name, Some(window))` — the same graceful-then-escalate
@@ -120,15 +124,25 @@ impl std::fmt::Display for DrainOutcome {
 }
 
 /// The pure drain planner: WHICH instances the drain will stop — exactly the
-/// `LifecycleState::Running` entries, in fleet order. Everything else
-/// (registered/paused/stopped/failed rows) is not the drain's business:
-/// paused instances keep the pinned stays-paused contract (AI-7), and
-/// non-running rows have no process to stop. Pure so the selection rule is
+/// live-process rows, `LifecycleState::Running` AND `LifecycleState::Paused`,
+/// in fleet order. A paused agent is stopped through the same bounded ladder
+/// (the engine's stop resumes the suspension first, so the graceful signal
+/// can be delivered) instead of being handed to the engine Drop's raw
+/// kill-on-drop teardown — at shutdown the engine dies with the agent either
+/// way, and the ladder is the only graceful path. Everything else
+/// (registered/stopped/failed rows) is not the drain's business: no process
+/// to stop (the stays-paused contract governs ADOPTION — a stranded paused
+/// row stays paused — not shutdown). Pure so the selection rule is
 /// unit-testable without an engine.
 pub fn drain_plan(entries: &[FleetEntry]) -> Vec<String> {
     entries
         .iter()
-        .filter(|entry| entry.state == LifecycleState::Running)
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                LifecycleState::Running | LifecycleState::Paused
+            )
+        })
         .map(|entry| entry.name.as_str().to_string())
         .collect()
 }
@@ -163,22 +177,22 @@ pub async fn drain_and_stop(
     let newcomer_found = stop_pass(engine, window, &notes, &mut attempted, &mut outcomes).await;
 
     if !found_any && !newcomer_found {
-        notes.note("no running agents; nothing to stop");
+        notes.note("no running or paused agents; nothing to stop");
     }
 
-    // Finding 5's honesty cap: anything STILL Running after both passes is
-    // surfaced (AI-18) — it will be handed to the engine Drop's kill-on-drop
-    // teardown WITHOUT the bounded ladder, and the operator reads exactly
-    // that here, never a silent exit.
+    // Finding 5's honesty cap: anything STILL alive (Running OR Paused)
+    // after both passes is surfaced (AI-18) — it will be handed to the
+    // engine Drop's kill-on-drop teardown WITHOUT the bounded ladder, and
+    // the operator reads exactly that here, never a silent exit.
     match engine.fleet().await {
         Ok(fleet) => {
-            let still_running = drain_plan(&fleet);
-            if !still_running.is_empty() {
+            let still_alive = drain_plan(&fleet);
+            if !still_alive.is_empty() {
                 notes.note(&format!(
-                    "still running after the shutdown drain: {} — the engine's exit \
+                    "still running or paused after the shutdown drain: {} — the engine's exit \
                      teardown will terminate them WITHOUT the bounded ladder; their \
                      stops did not settle within the drain's two passes",
-                    still_running.join(", ")
+                    still_alive.join(", ")
                 ));
             }
         }
@@ -369,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_is_exactly_the_running_entries_in_fleet_order() {
+    fn the_plan_is_exactly_the_live_process_rows_in_fleet_order() {
         let entries = vec![
             entry("idle", LifecycleState::Registered),
             entry("busy", LifecycleState::Running),
@@ -380,8 +394,14 @@ mod tests {
         ];
         assert_eq!(
             drain_plan(&entries),
-            vec!["busy".to_string(), "second".to_string()],
-            "only Running rows, preserving fleet order"
+            vec![
+                "busy".to_string(),
+                "frozen".to_string(),
+                "second".to_string()
+            ],
+            "Running AND Paused rows (the live-process rows), preserving fleet order — \
+             a paused agent must go through the bounded ladder, never the engine \
+             Drop's kill-on-drop teardown"
         );
     }
 
@@ -390,11 +410,12 @@ mod tests {
         assert!(drain_plan(&[]).is_empty(), "empty fleet → empty plan");
         let entries = vec![
             entry("a", LifecycleState::Registered),
-            entry("b", LifecycleState::Paused),
+            entry("b", LifecycleState::Failed),
+            entry("c", LifecycleState::Stopped),
         ];
         assert!(
             drain_plan(&entries).is_empty(),
-            "no Running row → empty plan"
+            "no live-process row → empty plan"
         );
     }
 
