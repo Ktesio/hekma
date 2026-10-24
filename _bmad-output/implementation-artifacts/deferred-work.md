@@ -309,3 +309,15 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (gallery install UX)
   summary: `hekma adapter add <name>` fetching checksummed gallery manifests is deferred; the gallery is a read-only docs catalog validated in CI for v1.
   evidence: FR-48's consequences (curated docs page + CI validation only). Trigger: gallery traffic justifies a submission + install flow.
+
+## Deferred from: spec-20-3 review triage (2026-10-24)
+
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: fragment anchors unvalidated)
+  summary: check_docs strips `#fragment` targets, so the gallery's deep anchors (adapter-contract.md#…, agents.md#the-re-validation-duty) break silently when a heading is reworded — fragment-existence validation is deferred.
+  evidence: scripts/check_docs.py validate_link skips http(s) and fragments (:242-248); ten gallery pages lean on deep anchors. Trigger: the first heading reword breaks a gallery link.
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: lane cost as the gallery grows)
+  summary: the gallery lane runs the full TCK suite serially per manifest (~4s each today); pacing (subsets, parallelization, or a budget cap) is deferred until the manifest count grows.
+  evidence: gallery_manifests.rs single-loop design; measured 3.7-3.9s per manifest at one entry. Trigger: manifest entries grow past a handful or the lane exceeds its budget on windows-latest.
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: same comment error upstream)
+  summary: crates/hekma-engine/tests/hermes.rs carries the same misattributed SAFETY comment ("edition 2024 requires the unsafe block") — fixed in the gallery test, deferred there (untouched file).
+  evidence: set_var/remove_var are unsafe on all editions since Rust 1.82; the workspace is edition 2021. Trigger: any change touching that block.
