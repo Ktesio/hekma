@@ -113,7 +113,7 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
-    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink, DrainOutcome,
+    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink,
     EffectiveConfig, EngineError, EngineEvent, EstimateLabel, ExportBatch, FleetEntry,
     FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
     LogLine, LogStream, Micros, NameError, OutboxCursor, OutboxEntry, Rate, Registry,
