@@ -8973,7 +8973,10 @@ env = "TCK_SUBJECT_MEMORY"
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
             },
-            outcome: ::hekma_engine::DrainOutcome {
+            // The drain-verb outcome — the 18-4 type from `domain`, reached by
+            // path: the crate-ROOT `DrainOutcome` name belongs to the shutdown
+            // drain's per-instance outcome (post-#332 merge disambiguation).
+            outcome: ::hekma_engine::domain::DrainOutcome {
                 completed,
                 waited_ms,
             },
