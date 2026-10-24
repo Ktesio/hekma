@@ -1239,6 +1239,22 @@ fn coop_paused_orphan_stops_without_the_signal_resume_and_says_so() {
     // suspension to undo, and claiming a resume would be exactly the lie the
     // cooperative skip exists to prevent. The skip is surfaced (`paused
     // COOPERATIVELY` reaches the sink) and the signal-path note never fires.
+    //
+    // Windows data-driven skip (the survivor_and_ghost sibling's shape): the
+    // crash leg needs the agent to OUTLIVE the `run_engine1` helper, but on
+    // Windows the spawning engine's Job-Object kill-on-close takes the child
+    // at the helper's exit (the documented NFR-1 semantics) — a crash-shaped
+    // helper can never leave a live adoptable child there, whatever the
+    // pause flavor. The Windows-correct counterpart semantics — engine death
+    // kills the child — are asserted affirmatively on the Windows leg by
+    // `windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed`;
+    // the in-engine half of THIS proof (a cooperatively paused row's stop
+    // skips the OS resume and surfaces the note) is pinned cross-OS by the
+    // drain.rs suite's ladder drills. NO `#[cfg]` (this file is outside the
+    // backends allowlist).
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
     // No Windows runtime skip: the cooperative path is OS-independent by
     // construction (only the same #109 Linux-CI mitigation as its siblings).
     if is_linux_ci() {
