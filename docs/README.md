@@ -24,6 +24,7 @@ Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesi
 
 - [Adapter Contract](adapter-contract.md)
 - [Adapter manifest (`adapter.toml`)](manifest.md)
+- [Adapter gallery](adapters.md)
 - [Supported agents](agents.md)
 - [Embedding the engine](embedding.md)
 - [Architecture](architecture.md)
