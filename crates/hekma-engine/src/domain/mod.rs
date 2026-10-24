@@ -92,7 +92,7 @@ pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE
 pub(crate) use resync::read_committed;
 pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
-pub use supervisor::{DiagnosticSink, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
+pub use supervisor::{DiagnosticSink, DrainOutcome, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
 pub use transition::{next_state, LifecycleCommand, LifecycleError};
 pub use usage::{
     RecordOutcome, RunId, UsageEvent, UsageTotals, UsageUpdateEvent, USAGE_SCHEMA_VERSION,

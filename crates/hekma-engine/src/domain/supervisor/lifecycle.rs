@@ -2,6 +2,7 @@
 //! (epic-13; boundary ratified 2026-09-19, study: Option B). Pure move:
 //! additional `impl Supervisor` block, no signature or behavior change.
 
+use super::drain::{render_command, run_bounded_command, BoundedCommandOutcome};
 use super::*;
 
 impl Supervisor {
@@ -89,7 +90,7 @@ impl Supervisor {
         name: &str,
         window: Option<Duration>,
     ) -> Result<AgentInstance, EngineError> {
-        self.stop_inner(registry, name, window, None)
+        self.stop_inner(registry, name, window, None, None)
     }
 
     /// Stop driven by a budget BREACH (story 3-2). Identical to [`Supervisor::stop`]
@@ -104,7 +105,7 @@ impl Supervisor {
         name: &InstanceName,
         cause: TransitionCause,
     ) -> Result<AgentInstance, EngineError> {
-        self.stop_inner(registry, name.as_str(), None, Some(cause))
+        self.stop_inner(registry, name.as_str(), None, Some(cause), None)
     }
 
     /// The shared stop driver (story 1-4 + story 3-2 cause override).
@@ -113,12 +114,22 @@ impl Supervisor {
     /// (a budget stop records `BudgetExceeded`); `None` uses the plain `stop`
     /// command cause (an operator `kt agent stop` is unchanged). The terminal edge
     /// always records the graceful/forced escalation cause regardless.
-    fn stop_inner(
+    ///
+    /// `terminal_drain` (story 18-4): `Some((completed, waited_ms))` ONLY from
+    /// the drain composite — the DURABLE drain outcome the terminal edge
+    /// records. A graceful finish (no escalation) carries the
+    /// [`TransitionCause::DrainStopped`] cause verbatim; a FORCED finish keeps
+    /// [`TransitionCause::StopForced`] (forced honesty outranks) with the
+    /// drain outcome folded into its detail string, so the outcome stays
+    /// durable either way. Every non-drain caller passes `None` — the
+    /// terminal causes are byte-identical to the pre-18-4 behavior.
+    pub(super) fn stop_inner(
         &mut self,
         registry: &Registry,
         name: &str,
         window: Option<Duration>,
         cause_override: Option<TransitionCause>,
+        terminal_drain: Option<(bool, u64)>,
     ) -> Result<AgentInstance, EngineError> {
         let name = InstanceName::new(name).map_err(|reason| EngineError::InvalidName {
             name: name.to_string(),
@@ -302,6 +313,18 @@ impl Supervisor {
                                 // terminalizes it).
                                 exit_codes: None,
                                 running_since: std::time::Instant::now(),
+                                // Story 18-4: the cooperative posture is
+                                // RE-DERIVED from the durable record — a
+                                // handle re-acquired while a command-pause
+                                // edge is the latest truth keeps its
+                                // cooperative pause honestly (the stop
+                                // ladder's cooperative skip then applies to
+                                // it, exactly as if this engine had run the
+                                // command itself). Cross-lifetime honesty
+                                // per the 18-4 spec: never persisted, always
+                                // re-derived.
+                                cooperatively_paused: classify_pause_kind(registry, &name)
+                                    == PauseKind::Cooperative,
                             },
                         );
                     }
@@ -353,29 +376,55 @@ impl Supervisor {
         // Windows the best-effort pause never suspends (a paused row's
         // process keeps running), and `resume` there is the documented
         // no-op — the ladder is unchanged on that platform.
+        //
+        // Story 18-4 — the COOPERATIVE exception: when the pause was
+        // delivered by the adapter's declared `[lifecycle.pause]` COMMAND
+        // (the in-memory cooperative flag), there is NO OS suspension to
+        // undo — the suspension lives inside the agent, and the OS resume
+        // signal is at best a harmless no-op and at worst a lie the ledger
+        // would inherit. The ladder SKIPS the signal entirely (the stop
+        // ladder's cooperative skip — the agent remains free to honor its
+        // own graceful exit within the window) and says so: one honest
+        // diagnostic naming the skip, never a silent divergence from the
+        // signal path. No handle held → nothing to read and nothing to
+        // signal — the pre-18-4 silence stands.
         if instance.state == LifecycleState::Paused {
-            let resume_outcome = self
+            let cooperatively_paused = self
                 .running
-                .get_mut(&name)
-                .map(|supervised| self.backend.resume(&mut supervised.handle));
-            match resume_outcome {
-                Some(Ok(())) => {
-                    self.emit_diagnostic(&format!(
-                        "{}: resumed the paused process before the stop ladder — a \
-                         suspended process cannot receive the graceful stop signal (it \
-                         stays pending until the process continues)",
-                        name.as_str(),
-                    ));
+                .get(&name)
+                .map(|supervised| supervised.cooperatively_paused)
+                .unwrap_or(false);
+            if cooperatively_paused {
+                self.emit_diagnostic(&format!(
+                    "{}: paused COOPERATIVELY (its declared pause command) — no OS resume \
+                     signal is sent before the stop ladder (the suspension lives in the \
+                     agent, not the process); the ladder proceeds directly",
+                    name.as_str(),
+                ));
+            } else {
+                let resume_outcome = self
+                    .running
+                    .get_mut(&name)
+                    .map(|supervised| self.backend.resume(&mut supervised.handle));
+                match resume_outcome {
+                    Some(Ok(())) => {
+                        self.emit_diagnostic(&format!(
+                            "{}: resumed the paused process before the stop ladder — a \
+                             suspended process cannot receive the graceful stop signal (it \
+                             stays pending until the process continues)",
+                            name.as_str(),
+                        ));
+                    }
+                    Some(Err(detail)) => {
+                        self.emit_diagnostic(&format!(
+                            "{}: could not resume the paused process before the stop ladder \
+                             ({detail}); the ladder proceeds regardless — the graceful window \
+                             may elapse and escalate to a forced kill",
+                            name.as_str(),
+                        ));
+                    }
+                    None => {}
                 }
-                Some(Err(detail)) => {
-                    self.emit_diagnostic(&format!(
-                        "{}: could not resume the paused process before the stop ladder \
-                         ({detail}); the ladder proceeds regardless — the graceful window \
-                         may elapse and escalate to a forced kill",
-                        name.as_str(),
-                    ));
-                }
-                None => {}
             }
         }
 
@@ -518,13 +567,33 @@ impl Supervisor {
             .map_err(registry_to_engine)?;
 
         // stopping → stopped, recording whether escalation happened (AC3).
+        // Story 18-4: a DRAIN's stop folds its durable outcome into the
+        // terminal cause — `DrainStopped { completed, waited_ms }` when the
+        // ladder finished gracefully; a FORCED escalation keeps `StopForced`
+        // (forced honesty outranks the drain bookkeeping) with the outcome
+        // folded into the detail string, so the composite's result is
+        // durable either way. Non-drain callers pass `None` — the causes are
+        // byte-identical to the pre-18-4 behavior.
         let cause = if outcome.forced {
-            TransitionCause::stop_forced(format!(
+            let mut detail = format!(
                 "graceful window ({}s) elapsed; escalated to a forced kill of the process group/job",
                 window.as_secs()
-            ))
+            );
+            if let Some((completed, waited_ms)) = terminal_drain {
+                detail.push_str(&format!(
+                    "; the drain's bounded wait {} after {waited_ms}ms (recorded here \
+                     because the stop escalated)",
+                    if completed { "COMPLETED" } else { "timed out" },
+                ));
+            }
+            TransitionCause::stop_forced(detail)
         } else {
-            TransitionCause::StopGraceful
+            match terminal_drain {
+                Some((completed, waited_ms)) => {
+                    TransitionCause::drain_stopped(completed, waited_ms)
+                }
+                None => TransitionCause::StopGraceful,
+            }
         };
         self.transition_with_log_capture(
             registry,
@@ -656,6 +725,51 @@ impl Supervisor {
         // etc. reject HERE with the uniform InvalidTransition, before any level
         // read or side effect.
         let new_state = next_state(instance.state, command)?;
+
+        // (1b) Story 18-4: the COOPERATIVE-FIRST dispatch. When the adapter
+        // declares a lifecycle command for THIS direction, the COMMAND path
+        // owns the transition — it outranks the signal dispatch below and is
+        // OS-independent by construction (the manifest's own command does
+        // the suspending). A budget override (`cause_override`) deliberately
+        // BYPASSES the cooperative path: a breach-driven pause must keep the
+        // REAL signal suspension (enforcement pauses to stop spend — a
+        // command the agent merely interprets cannot guarantee a real
+        // suspension, and the freeze semantics below depend on one), so the
+        // pre-18-4 dispatch runs verbatim for it. A manifest without a
+        // declared command falls through too — byte-identical to the
+        // pre-18-4 behavior.
+        //
+        // Review round 1 (A1): the RESUME direction is PAUSE-KIND-GATED. The
+        // cooperative arm here is verb-scoped, not pause-kind-blind — a
+        // BREACH-paused (or operator signal-paused) instance whose manifest
+        // declares the pair has a FROZEN process: running the declared
+        // resume command instead of SIGCONT would commit `paused → running`
+        // while the process stays suspended (a lying edge AND a frozen
+        // agent). So the Resume direction takes the cooperative arm ONLY
+        // when the pause WAS cooperative — the same `classify_pause_kind`
+        // re-derivation from the durable record the stop ladder's
+        // cooperative skip, the release pass, and the stop-only re-acquire
+        // already consult (cross-lifetime: an adopted row classifies from
+        // its committed pause edge, not from memory). The PAUSE direction is
+        // unaffected — any running row may pause cooperatively.
+        let cooperative_direction = match command {
+            LifecycleCommand::Pause => true,
+            LifecycleCommand::Resume => {
+                classify_pause_kind(registry, &name) == PauseKind::Cooperative
+            }
+            _ => false,
+        };
+        if cause_override.is_none() && cooperative_direction {
+            if let Some(handled) = self.run_cooperative_lifecycle_command(
+                registry,
+                &name,
+                command,
+                instance.state,
+                new_state,
+            )? {
+                return Ok(handled);
+            }
+        }
 
         // (2) Read the effective (current-OS) pause level from the persisted
         // snapshot (AC5). Projected at read time onto OsId::current(); NOT
@@ -840,6 +954,138 @@ impl Supervisor {
         }
     }
 
+    /// The cooperative command path (story 18-4): resolve the adapter's
+    /// declared lifecycle pair (ONE manifest read — the 18-3 D1 defer
+    /// stands) and, when THIS direction's command is declared, run it and
+    /// commit the transition with the cooperative cause. Returns
+    /// `Ok(Some(instance))` when the cooperative path handled the verb;
+    /// `Ok(None)` when the manifest declares no command for this direction —
+    /// the caller falls through to the pre-18-4 signal dispatch,
+    /// byte-identical.
+    ///
+    /// Ordering (every fallible step precedes any state change): the plan
+    /// resolution and the command run are PRE-transition; a command that
+    /// exits nonzero, cannot spawn, or outlives the standalone
+    /// pause-command cap REJECTS the verb with the durable state untouched
+    /// ([`EngineError::PauseCommandFailed`] — never a fake pause the stop
+    /// ladder would inherit). The transition persists FIRST (AI-9) with the
+    /// [`TransitionCause::PauseCooperative`]/[`TransitionCause::
+    /// ResumeCooperative`] cause recording the rendered command; the
+    /// in-memory flag flips only AFTER the commit (pause sets
+    /// `cooperatively_paused`, resume goes through
+    /// `note_committed_resume_edge` — the shared paused → running edge
+    /// bookkeeping). A commit failure AFTER the command ran is a surfaced
+    /// divergence (AI-18): one diagnostic + the error, never a silent
+    /// skip.
+    fn run_cooperative_lifecycle_command(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        command: LifecycleCommand,
+        prior_state: LifecycleState,
+        new_state: LifecycleState,
+    ) -> Result<Option<AgentInstance>, EngineError> {
+        debug_assert!(
+            matches!(command, LifecycleCommand::Pause | LifecycleCommand::Resume),
+            "the cooperative path only handles Pause/Resume"
+        );
+        let (kind, manifest_path, _) = registry
+            .adapter_launch_facts(name)
+            .map_err(registry_to_engine)?;
+        let plan = crate::adapter::resolve_drain_plan(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(name, e))?;
+        let launch = match command {
+            LifecycleCommand::Pause => plan.pause_command,
+            LifecycleCommand::Resume => plan.resume_command,
+            _ => None,
+        };
+        // No declared command for this direction: the signal path owns it.
+        let Some(launch) = launch else {
+            return Ok(None);
+        };
+        let rendered = render_command(&launch);
+        let direction = command.as_str().to_string();
+
+        // Run the command bounded by the STANDALONE cap (inside a drain the
+        // command shares the drain's bound instead — see `drain`). A failed
+        // or overran command rejects the verb: the lifecycle change NEVER
+        // lands around a command that did not perform it.
+        let outcome = run_bounded_command(
+            &registry.agent_home(name),
+            &launch,
+            self.pause_command_cap,
+            BOUNDED_COMMAND_POLL,
+        );
+        match outcome {
+            BoundedCommandOutcome::Exited0 => {}
+            BoundedCommandOutcome::Failed { detail } => {
+                return Err(EngineError::PauseCommandFailed {
+                    name: name.as_str().to_string(),
+                    direction,
+                    command: rendered,
+                    detail,
+                });
+            }
+            BoundedCommandOutcome::Overran { unreaped_note } => {
+                // A5 (review round 1): the kill's reap is bounded — surface
+                // the unkillable-corpse note if the reap never confirmed,
+                // then reject the verb as before.
+                if let Some(note) = unreaped_note {
+                    self.emit_diagnostic(&note);
+                }
+                return Err(EngineError::PauseCommandFailed {
+                    name: name.as_str().to_string(),
+                    direction,
+                    command: rendered,
+                    detail: format!(
+                        "the command outlived its {}s standalone bound and was killed; \
+                         the lifecycle change was not applied",
+                        self.pause_command_cap.as_secs(),
+                    ),
+                });
+            }
+        }
+
+        // The command RAN — persist the transition (AI-9: the durable state
+        // leads), then the post-commit bookkeeping.
+        self.ensure_log_dir(registry, name)?;
+        let cause = match command {
+            LifecycleCommand::Pause => TransitionCause::pause_cooperative(rendered.clone()),
+            _ => TransitionCause::resume_cooperative(rendered.clone()),
+        };
+        if let Err(err) = self.transition(registry, name, prior_state, new_state, cause) {
+            // Post-commit divergence honesty (AI-18): the command already
+            // ran; the ledger refused. Name both sides + the recovery — a
+            // failed PAUSE commit realigns via `stop` (a `resume` is the
+            // invalid transition from `running`), a failed RESUME commit
+            // realigns by re-running `resume` (the gate accepts
+            // paused → running, and a well-formed command re-runs
+            // harmlessly).
+            let remediation = match command {
+                LifecycleCommand::Pause => format!("hekma agent stop {}", name.as_str()),
+                _ => format!("hekma agent resume {}", name.as_str()),
+            };
+            self.emit_diagnostic(&format!(
+                "{}: the {} command already ran, but recording the {}→{} transition failed \
+                 ({err}) — the ledger and the agent may diverge; recovery: {remediation}",
+                name.as_str(),
+                command.as_str(),
+                prior_state.as_str(),
+                new_state.as_str(),
+            ));
+            return Err(err);
+        }
+        match command {
+            LifecycleCommand::Pause => {
+                if let Some(supervised) = self.running.get_mut(name) {
+                    supervised.cooperatively_paused = true;
+                }
+            }
+            _ => self.note_committed_resume_edge(name),
+        }
+        registry.lookup(name).map_err(registry_to_engine).map(Some)
+    }
+
     /// Bookkeeping for a COMMITTED `paused → running` edge, shared by every
     /// arm that produces one (guaranteed resume, best-effort resume, the
     /// detached-release resume). Two elapsed measures the pause invalidated:
@@ -858,6 +1104,17 @@ impl Supervisor {
     ///   whole window from the resume instant. A crash out of `paused`
     ///   passes `None` anyway (the state gate), but the restamp is what
     ///   makes the POST-resume measurement honest.
+    /// * Story 18-4: CLEARS the cooperative-pause flag. Every committed
+    ///   paused → running edge means the pause (whatever kind) is over; a
+    ///   stale flag would make a LATER stop skip the OS resume for an
+    ///   instance whose suspension is now a real OS one (or would let the
+    ///   release pass misreport). Clearing here — the ONE choke point every
+    ///   committed paused → running edge flows through (operator resume,
+    ///   the detached-release resume) — keeps the flag exactly as long as
+    ///   its pause. (A drain's stop never RESUMES, so it never flows
+    ///   through here: its flag is consumed by the stop ladder's
+    ///   cooperative skip and dies with the handle at the terminal
+    ///   transition.)
     ///
     /// Best-effort: no handle held → nothing to do (an adopted/no-handle
     /// resume has no in-memory state at all).
@@ -865,6 +1122,7 @@ impl Supervisor {
         if let Some(supervised) = self.running.get_mut(name) {
             supervised.liveness_failing_since = None;
             supervised.running_since = std::time::Instant::now();
+            supervised.cooperatively_paused = false;
         }
     }
 
@@ -1021,6 +1279,27 @@ impl Supervisor {
                 ));
                 continue;
             }
+            if classify_pause_kind(registry, &name) == PauseKind::Cooperative {
+                // Story 18-4 (a logged spec deviation — the release pass's
+                // Cooperative arm): a cooperative pause has NO OS suspension
+                // to undo, so there is no signal to send; and running the
+                // adapter's RESUME command here would commit a `paused →
+                // running` resumption during TEARDOWN that the operator never
+                // asked for (the signal path's release auto-resume is
+                // exactly what the cooperative model replaces). NO signal,
+                // NO transition — the row honestly keeps reading `paused` —
+                // and the note names why + the recovery. The handle still
+                // drops disarmed below exactly as before.
+                self.emit_diagnostic(&format!(
+                    "{}: the paused detached child was paused COOPERATIVELY (its declared \
+                     pause command) — no OS resume exists to send at engine release, so no \
+                     resume was attempted and the row stays 'paused'; a later command's \
+                     `hekma agent resume {}` runs the declared resume command",
+                    name.as_str(),
+                    name.as_str(),
+                ));
+                continue;
+            }
             match self.backend.resume(&mut supervised.handle) {
                 Ok(()) => {
                     let detail = "resumed at engine release: a detached child is never \
@@ -1128,10 +1407,12 @@ impl Supervisor {
 /// Reads the instance's transition record (`instance.log`) BACKWARDS for the
 /// most recent `→ paused` edge: a [`TransitionCause::BudgetExceeded`] edge is
 /// a [`PauseKind::Breach`] pause (the enforcement freeze must hold into the
-/// enforcement-free between-commands window); any other cause — an operator
-/// `Command`("pause") or a best-effort qualifier — is [`PauseKind::Operator`].
-/// The MOST RECENT edge wins, so an operator pause AFTER a breach pause is an
-/// operator pause (and vice versa).
+/// enforcement-free between-commands window); a
+/// [`TransitionCause::PauseCooperative`] edge is a [`PauseKind::Cooperative`]
+/// pause (story 18-4 — no OS suspension exists to undo); any other cause — an
+/// operator `Command`("pause") or a best-effort qualifier — is
+/// [`PauseKind::Operator`]. The MOST RECENT edge wins, so an operator pause
+/// AFTER a breach pause is an operator pause (and vice versa).
 ///
 /// Degradation is deliberate: a missing/unreadable log or no `→ paused` edge
 /// classifies as OPERATOR — the freeze applies only on POSITIVE budget
@@ -1147,6 +1428,13 @@ pub(super) enum PauseKind {
     /// [`TransitionCause::BudgetExceeded`]): the release pass leaves the
     /// child SIGSTOPped with a surfaced note.
     Breach,
+    /// A COOPERATIVE pause (story 18-4 — the last `→ paused` edge carries
+    /// [`TransitionCause::PauseCooperative`]): the suspension was delivered
+    /// by the adapter's own declared command, so there is NO OS resume to
+    /// send — the release pass leaves the child untouched (no signal, NO
+    /// transition: a `paused → running` edge would claim a resumption the
+    /// adapter's resume command never performed) with a surfaced note.
+    Cooperative,
 }
 
 /// Classify why `name`'s row reads `paused` (see [`PauseKind`]).
@@ -1159,6 +1447,7 @@ pub(super) fn classify_pause_kind(registry: &Registry, name: &InstanceName) -> P
     match last_pause {
         Some(event) => match &event.cause {
             TransitionCause::BudgetExceeded { .. } => PauseKind::Breach,
+            TransitionCause::PauseCooperative { .. } => PauseKind::Cooperative,
             _ => PauseKind::Operator,
         },
         None => PauseKind::Operator,

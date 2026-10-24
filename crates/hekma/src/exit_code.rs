@@ -25,8 +25,8 @@
 //! | Code | Meaning | Mapped from (`crate::error` diagnostics) |
 //! |------|---------|------------------------------------------|
 //! | `0` | Success | `Ok(())` |
-//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, `ServeStartupFailed` (story 17-2, review finding 8: a host that cannot START is an environment/system failure — state-dir creation, lock I/O, engine open, runtime build, signal registration), + any unmapped error |
-//! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName`, `ServeStateDirBusy` (story 17-2: the state root is already served — the invocation cannot proceed here), `ServeOptionsInvalid` (story 17-2, review finding 9: a serve option value outside its documented bounds) |
+//! | `1` | General/internal error (catch-all) | `AgentIo`, `AgentStore`, `AgentConfig`, `AgentLaunchFailed`, `AgentManifestInvalid`, `AgentContractIncompatible`, `AgentManifestUnreadable`, `AgentNoMeteringSource`, `AgentNoCapabilities`, `SelfUpdateFailed`, `ServeStartupFailed` (story 17-2, review finding 8: a host that cannot START is an environment/system failure — state-dir creation, lock I/O, engine open, runtime build, signal registration), `AgentPauseCommandFailed` (story 18-4: the adapter's own lifecycle command failed — the change was not applied), + any unmapped error |
+//! | `2` | Usage error (invalid invocation) | clap parse/usage (unchanged — clap exits `2` itself), `AgentInvalidName`, `AgentUnknownKind`, `AgentUnknownConfigKey`, `AgentDuplicateName`, `ServeStateDirBusy` (story 17-2: the state root is already served — the invocation cannot proceed here), `ServeOptionsInvalid` (story 17-2, review finding 9: a serve option value outside its documented bounds), `AgentDrainBoundInvalid` (story 18-4: a programmatic drain bound outside `1..=600000` ms — the CLI's clap range refuses it at parse time) |
 //! | `3` | Not found | `AgentNotFound`, `AgentManifestNotFound` |
 //! | `4` | Invalid state | `AgentNotRunning`, `AgentRunningRequiresForce`, `AgentInvalidTransition`, `AgentStopUnconfirmed`, `AgentMemoryHotSwap`, `AgentMemoryKindConflict`, `AgentAcpTurnInFlight` (story 14-1: a second prompt while an acp turn is in flight) |
 //! | `5` | Unsupported capability | `AgentCapabilityUnsupported`, `AgentResumeUnsupported`, `AgentInteractionUnavailable`, `AgentDetachRefused` (story 12-1: a detached start of an engine-observed instance — the operation cannot be done for this instance) |
@@ -122,6 +122,11 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         || err.is::<AgentDuplicateName>()
         || err.is::<crate::error::ServeStateDirBusy>()
         || err.is::<crate::error::ServeOptionsInvalid>()
+        // Story 18-4: a drain bound outside 1..=600000 requested
+        // programmatically — the flag value, not the environment, is at
+        // fault (the same class as ServeOptionsInvalid; the CLI's clap
+        // range refuses it at parse time).
+        || err.is::<crate::error::AgentDrainBoundInvalid>()
     {
         ExitCode::Usage
     // 4 — invalid state: the instance is not in a state that permits the op.
@@ -231,6 +236,12 @@ mod tests {
             boxed(SelfUpdateFailed {
                 message: "self-update".into(),
             }),
+            // Story 18-4: the adapter's own lifecycle command failed (nonzero
+            // exit / spawn failure / bound overrun) — neither a usage error
+            // nor a capability refusal, so it rides the documented catch-all.
+            boxed(crate::error::AgentPauseCommandFailed {
+                message: "pause command failed".into(),
+            }),
         ] {
             assert_eq!(
                 classify(err.as_ref()),
@@ -264,6 +275,12 @@ mod tests {
             }),
             boxed(crate::error::ServeOptionsInvalid {
                 message: "invalid stop window".into(),
+            }),
+            // Story 18-4: the programmatic drain-bound refusal joins the
+            // frozen `2` class (the CLI's clap range refuses it at parse
+            // time; this covers the embedding path).
+            boxed(crate::error::AgentDrainBoundInvalid {
+                message: "invalid drain bound".into(),
             }),
         ] {
             assert_eq!(

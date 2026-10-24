@@ -286,6 +286,19 @@ fn adoption_helper_subprocess() {
             facade.pause("nap").unwrap();
             hekma_conformance::exit_helper_subprocess(0);
         }
+        // 18-4 review round 1 (B1): start `coop`, pause it COOPERATIVELY (the
+        // declared pause command runs to a zero exit — NO OS suspension
+        // exists), then crash. The next engine adopts a live, UNSUSPENDED
+        // process with a `paused` row; its stop ladder must SKIP the OS
+        // resume signal (there is no suspension to undo) and say so.
+        "coop_paused_survivor" => {
+            facade
+                .register_with_adapter("coop", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade.start("coop").unwrap();
+            facade.pause("coop").unwrap();
+            hekma_conformance::exit_helper_subprocess(0);
+        }
         // AI-13: start `mortal` under a `never` Restart Policy, then crash. The
         // parent adopts the live process and later kills it — the reaper's crash
         // cause must record the UNAVAILABLE exit code (an adopted process is not
@@ -1215,6 +1228,83 @@ fn ai7_paused_live_process_is_adopted_and_resumable() {
     // Teardown: stop, confirm no orphan.
     facade.stop("nap", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the resumed process");
+}
+
+#[test]
+fn coop_paused_orphan_stops_without_the_signal_resume_and_says_so() {
+    // 18-4 review round 1 (B1): a COOPERATIVELY paused orphan — its row reads
+    // `paused` from the DECLARED pause command's committed edge, and the
+    // process is live and NOT suspended — survives the engine crash and is
+    // adopted. The stop ladder must SKIP the OS resume signal: there is no
+    // suspension to undo, and claiming a resume would be exactly the lie the
+    // cooperative skip exists to prevent. The skip is surfaced (`paused
+    // COOPERATIVELY` reaches the sink) and the signal-path note never fires.
+    // No Windows runtime skip: the cooperative path is OS-independent by
+    // construction (only the same #109 Linux-CI mitigation as its siblings).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // The PAIR manifest (the touch-pair fixture builder): pause +
+    // resume templates, no `[capabilities.pause]` needed — the cooperative
+    // arm owns the transition on command strength.
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+
+    run_engine1("coop_paused_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "coop"));
+    assert!(
+        pid_alive(pid),
+        "the coop-paused process must survive the engine-1 crash"
+    );
+
+    // Engine 2 adopts the live orphan with the sink installed from the first
+    // moment (the stop ladder's note must reach it).
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
+    let facade = engine.blocking();
+    assert_eq!(
+        facade.instance_status("coop").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the live coop-paused orphan must be adopted while staying paused"
+    );
+    // The committed pause edge is the cooperative one — the durable record
+    // the stop ladder's skip (and every other classify_pause_kind reader)
+    // re-derives from.
+    let events = facade.transition_events("coop").unwrap();
+    let pause_edge = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("the cooperative pause edge exists");
+    let cause = serde_json::to_string(&pause_edge.cause).unwrap();
+    assert!(
+        cause.contains("pause-cooperative"),
+        "the adopted row's pause edge is the committed cooperative one: {cause}"
+    );
+
+    // The stop: the ladder skips the OS resume (surfaced) and lands stopped.
+    facade.stop("coop", Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        facade.instance_status("coop").unwrap().instance.state,
+        LifecycleState::Stopped
+    );
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
+    assert!(
+        sink.contains("paused COOPERATIVELY"),
+        "the cooperative skip must be surfaced to the sink: {sink}"
+    );
+    assert!(
+        !sink.contains("resumed the paused process before the stop ladder"),
+        "a cooperative pause's stop must not claim a signal resume (there is no \
+         suspension to undo): {sink}"
+    );
+    wait_until_gone(pid, "stop must terminate the adopted process");
 }
 
 #[test]

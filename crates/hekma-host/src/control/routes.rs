@@ -322,6 +322,57 @@ pub(crate) async fn stop(
     read_back_show(&state, &name).await
 }
 
+/// `POST /v0/instances/{name}/drain` (story 18-4) — the DRAIN composite:
+/// pause via the adapter's declared `[lifecycle.pause]` COMMAND (cooperative,
+/// no signal), wait — bounded — for the declared idle signal, then stop. The
+/// optional `timeout_ms` body overrides the manifest tier (the three-tier
+/// rule); out-of-bounds (zero, or past the 600_000 ceiling) is a rejected
+/// REQUEST (400), the same shape as `stop`'s `window_secs` — never a
+/// zero-millisecond "drain". BOTH outcomes are a `200` with the outcome
+/// carried honestly in the body (`completed: false` = the bound burned
+/// first; the stop still happened).
+pub(crate) async fn drain(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<dto::DrainDocument>> {
+    let bound = if body.is_empty() {
+        // Absent body → the manifest tier (then the engine default).
+        None
+    } else {
+        let request: dto::DrainRequest = serde_json::from_slice(&body).map_err(|err| {
+            ApiError::invalid_body(format!(
+                "the drain body must be a JSON object like {{\"timeout_ms\":1500}}, \
+                 or no body at all for the manifest tier: {err}"
+            ))
+        })?;
+        match request.timeout_ms {
+            // `{}` / `{"timeout_ms":null}` → the manifest tier too.
+            None => None,
+            Some(ms) => {
+                // The same 1..=600_000 ceiling the adapter contract pins for
+                // the manifest tier (an out-of-bounds bound is a rejected
+                // REQUEST, not a zero-timeout drain).
+                if ms == 0 || ms > 600_000 {
+                    return Err(ApiError::invalid_body(
+                        "timeout_ms must be a whole number of milliseconds from 1 to 600000"
+                            .to_string(),
+                    ));
+                }
+                Some(Duration::from_millis(ms))
+            }
+        }
+    };
+    let report = state.engine.drain(&name, bound).await?;
+    let entry = state.engine.fleet_entry(&name).await?;
+    Ok(Json(dto::DrainDocument {
+        schema_version: hekma_engine::FLEET_SCHEMA_VERSION,
+        instance: entry,
+        completed: report.outcome.completed,
+        waited_ms: report.outcome.waited_ms,
+    }))
+}
+
 /// The post-mutation read-back (`fleet_entry` → the show document): one
 /// keyed O(1) read after a COMMITTED mutation. A read-back failure after the
 /// engine already committed is an honest `500` (never a fabricated success

@@ -36,8 +36,9 @@ mod builtin;
 use std::path::{Path, PathBuf};
 
 use hekma_adapter_api::{
-    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, ExitCodeClasses,
-    LivenessCheck, Manifest, ManifestError, MeteringSource, OsId, ReadinessGate,
+    CapabilityDeclaration, ConfigMapping, ConfigTarget, DrainSpec, EffectiveCapabilities,
+    ExitCodeClasses, LivenessCheck, Manifest, ManifestError, MeteringSource, OpTemplate, OsId,
+    ReadinessGate,
 };
 
 use crate::domain::{pass_through_tail, EffectiveConfig};
@@ -338,6 +339,40 @@ pub enum LaunchResolveError {
         /// [`hekma_adapter_api::ExitCodes::classes`], verbatim).
         detail: String,
     },
+
+    /// The adapter's `[lifecycle]` section declares exactly ONE of the
+    /// pause/resume op templates (story 18-4) — the unresumable-pause trap the
+    /// registration validation refuses. The same symmetric re-read posture as
+    /// [`LaunchResolveError::InvalidExitCodes`]: a manifest that drifted after
+    /// registration (or a hand-edited one) is re-checked at the pause/resume/
+    /// drain verbs, and the half-pair refuses there too rather than executing
+    /// a pause the adapter could never reverse. Names the section + why.
+    #[error("adapter '{adapter}' has an invalid [lifecycle] section: {detail}")]
+    InvalidLifecyclePair {
+        /// The adapter kind/identity whose lifecycle pair is invalid.
+        adapter: String,
+        /// Why the half-pair is refused (the both-fields-named rule).
+        detail: String,
+    },
+
+    /// The adapter's `[drain]` section is invalid (contract `1.1.0`, story
+    /// 18-4) — a timeout outside `1..=600_000`, an `idle_file` that is
+    /// empty, control-character-bearing, absolute, or `..`-escaping, or an
+    /// `idle_file` naming the `[liveness.heartbeat_file].path` (the A8-i
+    /// disjoint rule). The exact
+    /// twin of [`LaunchResolveError::InvalidExitCodes`]: validated at
+    /// registration, re-checked at the drain verb (the same symmetric
+    /// re-read) — a manifest can drift after registration, and the drain —
+    /// not the registry — is the last gate before the engine waits on the
+    /// declared bound. Names the section + why.
+    #[error("adapter '{adapter}' has an invalid [drain] section: {detail}")]
+    InvalidDrain {
+        /// The adapter kind/identity whose drain section is invalid.
+        adapter: String,
+        /// Why the section is invalid (from
+        /// [`hekma_adapter_api::Drain::spec`], verbatim).
+        detail: String,
+    },
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
@@ -613,6 +648,99 @@ pub fn resolve_exit_codes(
             adapter: kind.to_string(),
             detail: e.to_string(),
         })
+}
+
+/// The resolved cooperative-pause surface (story 18-4): the declared
+/// `[lifecycle.pause]`/`[lifecycle.resume]` op templates (as runnable
+/// [`StartLaunch`]s — the same exec/args/env shape the start launch uses) and
+/// the optional `[drain]` section. Produced ONLY by [`resolve_drain_plan`]
+/// (one manifest read per pause/resume/drain call — the D1 defer of 18-3
+/// stands: no read-once refactor of the sibling resolvers).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DrainPlan {
+    /// The declared pause command — `Some` only when the FULL pair is declared
+    /// (a half-pair is a resolver ERROR, never a partial plan).
+    pub pause_command: Option<StartLaunch>,
+    /// The declared resume command (same pairing rule).
+    pub resume_command: Option<StartLaunch>,
+    /// The declared `[drain]` section — `None` when the manifest declares no
+    /// section (the engine's default drain posture applies).
+    pub drain: Option<DrainSpec>,
+}
+
+/// Resolve the adapter's cooperative-pause surface (story 18-4): the
+/// `[lifecycle.pause]`/`[lifecycle.resume]` op template PAIR and the optional
+/// `[drain]` section, for the pause/resume verbs and the drain composite. A
+/// MANIFEST adapter's plan comes from its parsed `adapter.toml`; a NATIVE
+/// adapter declares NO lifecycle pair or drain section (its pause is the
+/// signal path — `DrainPlan::default()`). The exact sibling of
+/// [`resolve_readiness_probe`] / [`resolve_liveness_check`] /
+/// [`resolve_exit_codes`]: parse, validate (the SAME validation registration
+/// ran — the pair rule and [`hekma_adapter_api::Drain::spec`]), and refuse the
+/// verb on any drift rather than executing a template the engine cannot
+/// legally run. No re-negotiation here: the verbs act on an already-registered
+/// instance whose registration gated the version, and this resolver carries
+/// the same read-per-call shape as its siblings (18-3's D1 defer).
+pub fn resolve_drain_plan(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<DrainPlan, LaunchResolveError> {
+    let Some(path) = manifest_path else {
+        return Ok(DrainPlan::default());
+    };
+    let text =
+        std::fs::read_to_string(path).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    let manifest =
+        Manifest::from_toml_str(&text).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    // The PAIR rule (18-4): exactly one of pause/resume is refused here too —
+    // registration validated it, but the manifest may have drifted; a verb
+    // must never execute a pause the adapter could not reverse. Both fields
+    // are named, mirroring the registration message.
+    let lifecycle = manifest.lifecycle.as_ref();
+    let pause = lifecycle.and_then(|l| l.pause.as_ref());
+    let resume = lifecycle.and_then(|l| l.resume.as_ref());
+    if pause.is_some() != resume.is_some() {
+        return Err(LaunchResolveError::InvalidLifecyclePair {
+            adapter: kind.to_string(),
+            detail: "exactly one of `[lifecycle.pause]`/`[lifecycle.resume]` is declared — \
+                     the lifecycle pause/resume templates form a PAIR (a cooperative pause \
+                     the adapter cannot reverse would strand the instance paused forever)"
+                .to_string(),
+        });
+    }
+    let drain = manifest
+        .drain()
+        .map_err(|e| LaunchResolveError::InvalidDrain {
+            adapter: kind.to_string(),
+            detail: e.to_string(),
+        })?;
+    // The drain/liveness DISJOINT rule (18-4 review A8-i): an idle_file that
+    // names the liveness heartbeat's own file is refused here too — validated
+    // at registration, but the manifest may have drifted; a drain must never
+    // wait on a file the heartbeat itself keeps fresh (the wait would complete
+    // vacuously regardless of in-flight work).
+    manifest
+        .validate_drain_liveness_disjoint()
+        .map_err(|e| LaunchResolveError::InvalidDrain {
+            adapter: kind.to_string(),
+            detail: e.to_string(),
+        })?;
+    let template_to_launch = |t: &OpTemplate| StartLaunch {
+        exec: t.exec.clone(),
+        args: t.args.clone(),
+        env: t.env.clone(),
+    };
+    Ok(DrainPlan {
+        pause_command: pause.map(template_to_launch),
+        resume_command: resume.map(template_to_launch),
+        drain,
+    })
 }
 
 /// What [`apply_config_mapping`] REPORTS back about the mapping it applied
@@ -2380,5 +2508,113 @@ clean = [0, 9]
             Some("t"),
             "prefix overwritten to a table"
         );
+    }
+
+    // ---- Story 18-4: the drain-plan resolver (pair + [drain]) ----
+
+    /// A full pair + `[drain]` + `[liveness.heartbeat_file]` fixture — the
+    /// shape the pause/resume/drain verbs resolve against.
+    const DRAIN_PLAN_MANIFEST: &str = r#"
+contract_version = "1.1.0"
+
+[adapter]
+kind = "demo"
+
+[lifecycle.start]
+exec = "demo-agent"
+
+[lifecycle.pause]
+exec = "the-pause"
+args = ["--graceful"]
+
+[lifecycle.resume]
+exec = "the-resume"
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[metering]
+source = "self-reported"
+
+[drain]
+timeout_ms = 5_000
+
+[liveness]
+[liveness.heartbeat_file]
+path = "heartbeat.marker"
+max_age_ms = 5000
+"#;
+
+    #[test]
+    fn resolve_drain_plan_reads_the_pair_and_drain_section() {
+        // The positive leg: the declared pair becomes runnable launches and
+        // the `[drain]` section resolves to its spec (the shape the drain
+        // composite and both verbs consume).
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), DRAIN_PLAN_MANIFEST);
+        let plan = resolve_drain_plan("demo", Some(&path)).unwrap();
+        assert_eq!(
+            plan.pause_command.as_ref().map(|l| l.exec.as_str()),
+            Some("the-pause")
+        );
+        assert_eq!(
+            plan.resume_command.as_ref().map(|l| l.exec.as_str()),
+            Some("the-resume")
+        );
+        assert_eq!(
+            plan.drain,
+            Some(DrainSpec {
+                idle_file: None,
+                timeout_ms: 5_000,
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_drain_plan_refuses_an_idle_file_that_names_the_liveness_heartbeat() {
+        // The A8-i drift gate at the verb: registration refuses the collision,
+        // but a hand-edit after registration can introduce it — the resolver
+        // re-checks and refuses with InvalidDrain (the same surface a drifted
+        // `[drain]` section gets), naming BOTH files, rather than waiting on
+        // a file the heartbeat itself keeps fresh (that wait would complete
+        // vacuously regardless of in-flight work).
+        let tmp = TempDir::new().unwrap();
+        let body = DRAIN_PLAN_MANIFEST.replace(
+            "[drain]\ntimeout_ms = 5_000",
+            "[drain]\nidle_file = \"heartbeat.marker\"\ntimeout_ms = 5_000",
+        );
+        let path = write_manifest(tmp.path(), &body);
+        let err = resolve_drain_plan("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidDrain { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("heartbeat.marker"), "{detail}");
+                assert!(detail.contains("DIFFERENT files"), "{detail}");
+            }
+            other => panic!("expected InvalidDrain, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_drain_plan_refuses_a_drifted_half_pair_for_the_pause_verb() {
+        // The integration drill: the pair registered, then the manifest was
+        // hand-edited to drop `[lifecycle.resume]`. The pause verb resolves
+        // through this same plan, so the half-pair refuses at the verb — a
+        // cooperative pause the adapter cannot reverse would strand the
+        // instance paused forever (the 18-4 PAIR rule re-checked at use, the
+        // same drift posture as the collision gate above).
+        let tmp = TempDir::new().unwrap();
+        let body = DRAIN_PLAN_MANIFEST.replace("[lifecycle.resume]\nexec = \"the-resume\"\n\n", "");
+        let path = write_manifest(tmp.path(), &body);
+        let err = resolve_drain_plan("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidLifecyclePair { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("[lifecycle.resume]"), "{detail}");
+            }
+            other => panic!("expected InvalidLifecyclePair, got {other}"),
+        }
     }
 }

@@ -179,7 +179,27 @@ impl From<EngineError> for ApiError {
             EngineError::NotRunning { .. }
             | EngineError::CapabilityUnsupported { .. }
             | EngineError::ResumeUnsupported { .. }
-            | EngineError::AcpTurnInFlight { .. } => Self::new(ApiErrorKind::Conflict, message),
+            | EngineError::AcpTurnInFlight { .. }
+            // Drain's own running-only gate (story 18-4): the instance
+            // exists, the timing is wrong — the same refused-verb conflict
+            // class, never a 500.
+            | EngineError::DrainRefused { .. }
+            // A lifecycle command that RAN and failed (story 18-4, review
+            // round 1 A7): the instance exists, the adapter's own command
+            // spoke a nonzero exit / spawn failure / overrun — the verb was
+            // refused by the ADAPTER, not broken in the server. The state is
+            // untouched (the rejection is clean), so this is the same
+            // retryable conflict class (409), never a 500: the operator can
+            // fix the adapter and re-issue.
+            | EngineError::PauseCommandFailed { .. } => {
+                Self::new(ApiErrorKind::Conflict, message)
+            }
+            // A drain bound outside 1..=600_000 is the caller's value being
+            // invalid → 400. Unreachable through THIS route (the handler
+            // bounds-checks the body before the engine call) and through the
+            // CLI (clap's range) — the mapping keeps the class honest for any
+            // future programmatic surface.
+            EngineError::DrainBoundInvalid { .. } => Self::new(ApiErrorKind::InvalidBody, message),
             // The resync truncation guard rides `Log` — recognize its stable
             // sentence and lift it to the spec'd 409 (never a clamp).
             EngineError::Log { detail, .. } if Self::is_cursor_past_family(&detail) => {
@@ -400,11 +420,37 @@ mod tests {
             EngineError::AcpTurnInFlight {
                 name: "probe".into(),
             },
+            // Story 18-4: drain's own running-only gate joins the class.
+            EngineError::DrainRefused {
+                name: "probe".into(),
+                state: "stopped".into(),
+            },
+            // Story 18-4 review round 1 (A7): a lifecycle command that ran
+            // and failed (nonzero exit / spawn failure / overrun) joins the
+            // class — the ADAPTER refused the verb, the state is untouched,
+            // so it is a retryable conflict, never a 500.
+            EngineError::PauseCommandFailed {
+                name: "probe".into(),
+                direction: "pause".into(),
+                command: "the-pause --graceful".into(),
+                detail: "exited with code 3".into(),
+            },
         ] {
             let (status, kind, _) = map_engine(err);
             assert_eq!(status, StatusCode::CONFLICT, "state conflicts are 409");
             assert_eq!(kind, "conflict");
         }
+    }
+
+    #[test]
+    fn drain_bound_invalid_maps_400_invalid_body() {
+        // Story 18-4: an out-of-range drain bound is the caller's VALUE being
+        // wrong — the 400 class (unreachable through the HTTP route, which
+        // pre-validates, and the CLI's clap range; pinned for any future
+        // programmatic surface).
+        let (status, kind, _) = map_engine(EngineError::DrainBoundInvalid { bound_ms: 0 });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(kind, "invalid_body");
     }
 
     #[test]
