@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-23-2026"  # 19-1 complete through PR #334; epic-18 opened, 18-1 in progress (autonomous cadence per Islam's 2026-10-23 ruling)
+last_updated: "10-24-2026 17:40"  # stack-base #334 merged main in (post-#332/#333/#337); epic-18 squash-merged onto #334, epic-20 open on main
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -198,6 +198,11 @@ development_status:
   19-4-per-call-records-for-hosts: backlog
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
+  epic-20: backlog  # opened 2026-10-23 by sprint-change-proposal-2026-10-23-adoptability.md (Adoptability: OTLP export FR-46/AD-21 option (a); CI recipe FR-47 in-repo; adapter gallery FR-48; PRD §6 amendment D2; does not disturb epics 18/19; 20.1 = AI-55 two-pass)
+  20-1-otlp-telemetry-export: backlog  # sequences after 19.1 merges, from main; 19.4/19.5-dependent metrics join as follow-ups
+  20-2-agents-in-ci-the-github-actions-recipe: backlog  # can start immediately, parallel with 18/19; dogfood lane on main CI
+  20-3-the-adapter-gallery: backlog  # can start immediately; CI validates manifests against bundled fakes (hermes_shim precedent)
+  epic-20-retrospective: optional
   epic-9: done  # squash-merged to main 2026-07-14 as 39f0a57 (PR #114). kt --help now matches the shipped agent-runner README/GitHub positioning; v0.6.0. All 3 stories + AD-16/Epic-8 re-scope done. Issues #110/#111/#112/#113 closed. Follow-up #109 (adoption x86 CI deadlock root-cause) remains open/tracked separately, not a blocker.
   9-1-remove-the-legacy-skill-manager-command-surface-modules-and: done  # committed 42896b7 on feat/epic-9-retire-legacy-cli; TWO-pass review APPROVED (primary + adversarial: byte-identical agent/self-update help vs baseline, no over/under-deletion, AgentManifest* boundary intact, all 9 gates green / 767 tests). 2 LOW deferred: dangling [workspace.dependencies] (→9-2), stale check_docs KT_COMMANDS allowlist (→9-3).
   9-2-reposition-the-top-level-kt-identity-to-the-agent-runner: done  # (was tracked as 9-2-rebrand-kt-identity-and-make-agent-list-show-canonical) committed 45d203e on feat/epic-9-retire-legacy-cli (on top of 9-1); CI green cross-OS incl. coverage on PR #114. Review APPROVED-WITH-NITS (rebrand text verified verbatim-consistent with the live README/GitHub description; canonical-surface guard proven non-vacuous via live smoke; 0.6.0 bump isolated to workspace.package; dangling deps confirmed gone). 1 LOW cosmetic nit (story-file wording, reconciled) — no functional follow-up.

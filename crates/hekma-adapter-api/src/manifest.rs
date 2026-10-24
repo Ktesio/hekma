@@ -1180,7 +1180,19 @@ impl Drain {
                             .to_string(),
                     });
                 }
-                if std::path::Path::new(path).is_absolute() {
+                // `is_absolute()` alone is NOT the honest absolute test on
+                // Windows: a ROOTED but DRIVELESS path (`/etc/passwd` — a
+                // RootDir with no Prefix) is `!is_absolute()` there, yet it
+                // resolves against the current drive's ROOT, outside the
+                // Agent Home the engine joins the path onto. Refuse ANY
+                // RootDir component (the portable union: a Unix `/x`, a
+                // Windows `/x`, and a drive-qualified `C:\x` all carry one);
+                // the drive-RELATIVE `C:foo` case is the Prefix arm below.
+                if std::path::Path::new(path).is_absolute()
+                    || std::path::Path::new(path)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::RootDir))
+                {
                     return Err(ManifestError::InvalidField {
                         field: "`idle_file` field in the `[drain]` section".to_string(),
                         detail: format!(
@@ -3549,7 +3561,11 @@ channel = "stdio"
             "timeout_ms = 100\nidle_file = \"C:foo.marker\"",
         ))
         .expect("parse");
-        if cfg!(windows) {
+        // Data-driven OS branch (NOT `cfg!` — the boundary CI job forbids
+        // OS-conditional cfg outside the enumerated allowlist; see
+        // ci.yml's boundary step): the prefix component exists only on
+        // Windows builds of std.
+        if crate::os::OsId::current() == crate::os::OsId::Windows {
             let err = m.validate().unwrap_err();
             assert!(
                 matches!(&err, ManifestError::InvalidField { field, detail }

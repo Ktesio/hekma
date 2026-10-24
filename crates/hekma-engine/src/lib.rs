@@ -98,6 +98,10 @@ mod metering;
 pub mod paths;
 pub mod ports;
 mod sha256;
+// The shutdown drain (issue #328 item 3): the fleet-wide stop ladder behind
+// `Engine::shutdown` — engine-owned so a plain embedding gets the graceful
+// path without the host crate (`serve`'s drain delegates here).
+mod shutdown;
 mod store;
 mod time;
 
@@ -109,7 +113,7 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
-    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink, DrainOutcome,
+    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink,
     EffectiveConfig, EngineError, EngineEvent, EstimateLabel, ExportBatch, FleetEntry,
     FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
     LogLine, LogStream, Micros, NameError, OutboxCursor, OutboxEntry, Rate, Registry,
@@ -122,6 +126,10 @@ pub use domain::{
     USAGE_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// The shutdown drain's public surface (issue #328 item 3): the planner, the
+// per-instance outcome vocabulary, and (via `Engine::shutdown` / its
+// `blocking()` twin) the drain itself.
+pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // Story 19-1: the governance conformance vectors (AD-7/FR-44) — the embedded
 // artifact bytes plus the version/checksum accessors a Host pins against, and
 // the pure `decide` core the artifact is generated from. Additive surface.
