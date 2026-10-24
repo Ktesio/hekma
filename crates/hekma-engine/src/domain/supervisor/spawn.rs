@@ -1116,10 +1116,12 @@ impl Supervisor {
         // from this name's PRIOR handle must never pre-load the new one.
         self.clear_poll_error_streak(&name);
         // Story 18-3: a FRESH OPERATOR start clears the restart-requested
-        // streak — the operator's new Run has no recycle chain to pace, so
-        // the first restart-requested relaunch of the new Run waits the BASE
-        // backoff again (the durable crash counter was untouched by that
-        // chain and is not consulted here either). A POLICY RELAUNCH
+        // streak — the operator's new Run has no recycle chain to pace, and
+        // the fresh record's counter is 0, so the first restart-requested
+        // relaunch of the new Run computes the delay index
+        // `current + streak + 1` = 0 + 0 + 1: the BASE backoff (the durable
+        // counter was untouched by the PRIOR chain and is re-seeded at 0 by
+        // this fresh record anyway). A POLICY RELAUNCH
         // (`restart: Some(..)`) deliberately KEEPS the streak: the recycle
         // chain continues across its own relaunches, and the growing delay
         // index (`current + streak + 1`, clamped by `BackoffSchedule`) is

@@ -714,8 +714,10 @@ struct Supervised {
     /// (the `starting → running` commit, every `paused → running` resume —
     /// a pause-interval never counts toward stability; the resumed run
     /// re-proves it) and at ADOPTION (an adopted instance's pre-adoption
-    /// history is unknown, so its run proves stability only under THIS
-    /// engine's watch — the honest no-reset). A crash classification reads
+    /// history is unknown, so the anchor is FRESH: a reset requires a full
+    /// window of running under THIS engine's watch first — a long-watched
+    /// adopted run resets exactly like a spawned one). A crash classification
+    /// reads
     /// it THROUGH THE STATE GATE: only a crash out of EXACTLY `running`
     /// measures `running_since.elapsed()`; a crash out of any other state
     /// (e.g. `paused`) passes `None` — never a reset. Lives on
@@ -936,13 +938,16 @@ pub struct Supervisor {
     /// restart-requested relaunches THIS supervisor has scheduled for the
     /// instance since its last fresh start / adoption / clean exit. It
     /// grows the restart-requested plan's backoff DELAY (delay index =
-    /// the UNCHARGED counter + this streak) so a restart-requested loop
+    /// the UNCHARGED counter + this streak + 1) so a restart-requested loop
     /// still backs off to its cap while the persisted counter stays
     /// byte-unchanged (the charging write must never see a bigger number).
     /// IN-MEMORY ONLY — an engine restart forgets it, honestly: the next
     /// relaunch waits the base again (the crash counter, which PERSISTS,
     /// is the operator's durable signal). Cleared at the fresh-start
-    /// insert, the adoption insert, and a clean exit; mirrors
+    /// insert, the adoption insert, a clean exit, an operator stop, a
+    /// dropped/terminal record, and EVERY charged crash (`plan_restart`
+    /// drops it for all its outcomes — a stable-window reset forgives the
+    /// pacing history along with the chain, 18-3 review); mirrors
     /// `poll_error_streaks`' per-instance shape.
     requested_restart_streaks: HashMap<InstanceName, u32>,
     /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
@@ -1281,12 +1286,26 @@ impl Supervisor {
     /// override through so the integration tests can drive the reset
     /// semantics in milliseconds. NOT an operator config surface (that is
     /// deferred with a trigger, per the 18-3 spec). Like the serve options,
-    /// open-time only: refused once supervision has begun.
+    /// open-time only: refused once supervision has begun. A ZERO window is
+    /// IGNORED (18-3 review): every run is trivially "stable" against it —
+    /// the reset would fire on every crash and the counter could never
+    /// climb — so a zero lands as today's production window instead of
+    /// silently breaking the arithmetic.
     pub(crate) fn override_stable_run_window(&mut self, window: Duration) {
         debug_assert!(
             self.running.is_empty(),
             "the stable-run window is open-time only"
         );
+        if window.is_zero() {
+            // Surfaced, not silent (AI-18): keep the production window and
+            // say why on the diagnostic channel.
+            self.emit_diagnostic(
+                "ignoring a zero stable-run window override — every run would count as \
+                 stable and the consecutive-failure counter could never charge; keeping \
+                 the production window",
+            );
+            return;
+        }
         self.stable_run_window = window;
     }
 
@@ -2141,8 +2160,10 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         },
         // Restart-requested (story 18-3): spell the WIRE TAG + the code — same
         // greppability rule as `detached-resumed`/`unresponsive` above. The
-        // declared-class detail (when the reaper recorded one) appends so the
-        // verdict rides the same line.
+        // reaper ALWAYS records the declared-class detail (plus the
+        // requested-recycle depth, or the `never`-policy verdict — 18-3
+        // review), so it always appends; the bare-code arm renders only for
+        // detail-less hand-built events.
         TransitionCause::RestartRequested { code, detail } => match detail {
             Some(detail) => format!(" (restart-requested: exit code {code} — {detail})"),
             None => format!(" (restart-requested: exit code {code})"),

@@ -192,6 +192,10 @@ impl Supervisor {
                 // Complete the stuck `stopping -> stopped` transition exactly
                 // as the ordinary path below would have on confirmed death.
                 self.clear_poll_error_streak(&name);
+                // 18-3 review: a stop ends any requested-recycle chain —
+                // drop its streak too (no leak; the next start paces
+                // from the base).
+                self.requested_restart_streaks.remove(&name);
                 self.running.remove(&name);
                 // Story 14-2: the settle retains an acp session id (see the
                 // ordinary stop path); identical to a clear otherwise.
@@ -497,6 +501,9 @@ impl Supervisor {
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.clear_poll_error_streak(&name);
+        // 18-3 review: a stop ends any requested-recycle chain — drop its
+        // streak too (no leak; the next start paces from the base).
+        self.requested_restart_streaks.remove(&name);
         self.running.remove(&name);
 
         // Settle the write-ahead spawn record (AD-5): a cleanly-stopped instance

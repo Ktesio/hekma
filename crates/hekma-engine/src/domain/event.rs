@@ -460,15 +460,12 @@ impl TransitionCause {
         }
     }
 
-    /// A RESTART-REQUESTED cause recording the declared `code` the agent
-    /// exited with (story 18-3). No classification detail (the optional
-    /// field stays absent).
-    pub fn restart_requested(code: u16) -> Self {
-        TransitionCause::RestartRequested { code, detail: None }
-    }
-
     /// A RESTART-REQUESTED cause that ALSO carries the classification
     /// `detail` (the declared-class naming) — the `Unresponsive` twin.
+    /// 18-3 review: the detail-less `restart_requested(code)` shape is
+    /// GONE — the reaper always records the declared-class detail (plus
+    /// the requested-recycle depth, or the `never`-policy verdict), so
+    /// this is the only constructor the cause has.
     pub fn restart_requested_with_detail(code: u16, detail: impl Into<String>) -> Self {
         TransitionCause::RestartRequested {
             code,
@@ -882,6 +879,25 @@ mod tests {
                 ),
                 "unresponsive",
             ),
+            (
+                TransitionCause::unresponsive_with_detail(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                    "the file was already stale when first observed",
+                ),
+                "unresponsive",
+            ),
+            // 18-3 review round 1: the detail-less `restart_requested(code)`
+            // constructor is gone — `restart_requested_with_detail` is the
+            // only shape, and its wire tag is pinned here.
+            (
+                TransitionCause::restart_requested_with_detail(
+                    75,
+                    "declared class `restart_requested`; requested-recycle 2",
+                ),
+                "restart-requested",
+            ),
+            (TransitionCause::clean_exit(0), "clean-exit"),
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
                 "budget-exceeded",

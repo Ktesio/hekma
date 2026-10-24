@@ -2425,6 +2425,34 @@ fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
             ),
             " (breach: cumulative dollars)",
         ),
+        // Epic 18 causes (18-2/18-3): every renderer arm is pinned — the
+        // wire tags (`readiness-timeout`, `unresponsive`,
+        // `restart-requested`, `clean-exit`) are greppable contract.
+        (
+            TransitionCause::readiness_timeout("the /health probe", 1500),
+            " (readiness-timeout: waited 1500ms)",
+        ),
+        (
+            TransitionCause::unresponsive("heartbeat file", 900),
+            " (unresponsive: heartbeat file, failing for 900ms)",
+        ),
+        (
+            TransitionCause::unresponsive_with_detail(
+                "heartbeat file",
+                900,
+                "stale when first observed",
+            ),
+            " (unresponsive: heartbeat file, failing for 900ms — stale when first observed)",
+        ),
+        (
+            TransitionCause::restart_requested_with_detail(
+                75,
+                "declared class `restart_requested`; requested-recycle 2",
+            ),
+            " (restart-requested: exit code 75 — declared class `restart_requested`; \
+             requested-recycle 2)",
+        ),
+        (TransitionCause::clean_exit(0), " (clean-exit: exit code 0)"),
     ];
     for (cause, want_suffix) in cases {
         assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");
@@ -6986,5 +7014,34 @@ fn liveness_expiry_refused_by_a_moved_state_skips_failure_and_plan() {
     assert!(
         sup.pending_restarts.lock().unwrap().is_empty(),
         "no restart plan may be queued by a refused expiry"
+    );
+}
+
+#[test]
+fn a_zero_stable_run_window_override_is_ignored_with_a_diagnostic() {
+    // 18-3 review: a zero window would make EVERY run trivially "stable"
+    // (any elapsed >= 0), so the reset would fire on every crash and the
+    // consecutive-failure counter could never climb past 1 — the override
+    // seam refuses a zero by KEEPING the current window and saying so
+    // (surfaced, not silent). A valid override still lands, so the guard
+    // is a gate on zero only.
+    let mut sup = Supervisor::new();
+    let buffer = install_capture_sink(&mut sup);
+    sup.override_stable_run_window(Duration::ZERO);
+    assert_eq!(
+        sup.stable_run_window, STABLE_RUN_WINDOW,
+        "a zero override must NOT land — the production window stays"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("ignoring a zero stable-run window override"),
+        "the refusal must be surfaced, not silent: {text}"
+    );
+    // And the seam still works for a real (non-zero) override.
+    sup.override_stable_run_window(Duration::from_millis(40));
+    assert_eq!(
+        sup.stable_run_window,
+        Duration::from_millis(40),
+        "a valid override must still land"
     );
 }

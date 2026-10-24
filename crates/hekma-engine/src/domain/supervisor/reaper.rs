@@ -379,6 +379,9 @@ impl Supervisor {
                 // The row is gone (removed concurrently) — just drop the handle.
                 Err(_) => {
                     self.clear_poll_error_streak(&name);
+                    // 18-3 review: the row's chain is over with the row —
+                    // drop its requested-recycle streak too (no leak).
+                    self.requested_restart_streaks.remove(&name);
                     self.running.remove(&name);
                     continue;
                 }
@@ -416,6 +419,10 @@ impl Supervisor {
                     // connection drops with the handle.
                     self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
+                    // 18-3 review: a stop ends any requested-recycle chain —
+                    // drop its streak too (no leak; the next start paces
+                    // from the base).
+                    self.requested_restart_streaks.remove(&name);
                     self.running.remove(&name);
                     // Story 14-2: the settle retains an acp session id (see
                     // the ordinary stop path); identical to a clear otherwise.
@@ -440,6 +447,10 @@ impl Supervisor {
                 // requested-stop handle drop (the reader's EOF notice).
                 self.drain_acp_notices_for(&name);
                 self.clear_poll_error_streak(&name);
+                // 18-3 review: a stop ends any requested-recycle chain —
+                // drop its streak too (no leak; the next start paces
+                // from the base).
+                self.requested_restart_streaks.remove(&name);
                 self.running.remove(&name);
                 continue;
             }
@@ -506,9 +517,14 @@ impl Supervisor {
                 // fails to settle, and a later open's reconcile finds no live
                 // PID (honest).
                 let _ = registry.settle_spawn_record(&name);
-                if self.ensure_log_dir(registry, &name).is_err() {
-                    // Mirror the crash path: the durable state still leads.
-                }
+                // 18-3 review: the log-dir prep is BEST-EFFORT here (the
+                // same posture as the crash path below) — the durable
+                // state leads, so a failed prep degrades to a missing
+                // agent.log dir for THIS stop, never a blocked transition.
+                // A swallowed-`is_err()` empty block read as unhandled
+                // control flow; this says the `Err` is accepted, on
+                // purpose, right where it happens.
+                let _ = self.ensure_log_dir(registry, &name);
                 let _ = self.transition_with_log_capture(
                     registry,
                     &name,
@@ -586,7 +602,11 @@ impl Supervisor {
                     // itself.
                     let plan = self.plan_requested_restart(registry, &name, code);
                     let detail = match &plan {
-                        Some(_) => "declared class `restart_requested`".to_string(),
+                        // 18-3 review: the recycle depth rides the cause —
+                        // the pacing is surfaced, not silent.
+                        Some((_, depth)) => {
+                            format!("declared class `restart_requested`; requested-recycle {depth}")
+                        }
                         None => "declared class `restart_requested`; restart policy is \
                                  'never' — not restarting (the operator's policy outranks \
                                  the adapter's ask)"
@@ -594,7 +614,7 @@ impl Supervisor {
                     };
                     (
                         TransitionCause::restart_requested_with_detail(code, detail),
-                        plan,
+                        plan.map(|(plan, _)| plan),
                     )
                 }
                 _ => {
@@ -1035,12 +1055,21 @@ impl Supervisor {
     /// The start path passes `running_for: None` — a launch-phase exit is
     /// never a run (the classes classify runs; so does the reset).
     pub(super) fn plan_restart(
-        &self,
+        &mut self,
         registry: &Registry,
         name: &InstanceName,
         crash_detail: &str,
         running_for: Option<Duration>,
     ) -> RestartDecision {
+        // 18-3 review: EVERY outcome of this fn ends a requested-recycle
+        // chain — a charged crash (reset or plain increment) proves failure,
+        // and both terminal arms (`never`, crash-loop) end the Run — so the
+        // in-memory streak is dropped WITH the chain, right here. One
+        // removal covers the crash path, the liveness-expiry path (both
+        // funnel through this fn), and the stable-reset forgiveness: a run
+        // that proved stability forgives the pacing history, so the next
+        // requested chain paces from the base, not the old depth.
+        self.requested_restart_streaks.remove(name);
         let record = registry.spawn_record(name).ok().flatten();
         let policy = record
             .as_ref()
@@ -1059,9 +1088,13 @@ impl Supervisor {
             };
         }
 
-        // Story 18-3: the stable-window reset joins the charged path — reset
-        // FIRST (its own store line), then this crash charges as failure #1,
-        // and the reset is NAMED in the crash detail (surfaced, not silent).
+        // Story 18-3: the stable-window reset joins the charged path — the
+        // ONE store write below persists the RESET-THEN-CHARGED value (1,
+        // never an interim 0) with the reset NAMED in the crash detail
+        // (surfaced, not silent). 18-3 review: the previous two-write shape
+        // (interim `set_restart_count(name, 0, None)`, then the charge) is
+        // GONE — a single write cannot strand a half-reset streak between
+        // the two lines if the engine dies in between.
         let (next, reset) = next_consecutive_failures(current, running_for, self.stable_run_window);
         let crash_detail = match (reset, running_for) {
             (true, Some(run)) => format!(
@@ -1071,13 +1104,6 @@ impl Supervisor {
             ),
             _ => crash_detail.to_string(),
         };
-        if reset {
-            // The reset is one line in the store: the streak goes to 0
-            // before the charge below re-persists it at 1. Best-effort (a
-            // store hiccup must not panic the reaper); the charge write
-            // below still lands the final value.
-            let _ = registry.set_restart_count(name, 0, None);
-        }
         if is_crash_loop(next) {
             // Crash loop: TERMINAL. Settle the record (F-Low-2), leave `failed`
             // with the reason STATED in the crash cause.
@@ -1133,8 +1159,11 @@ impl Supervisor {
     /// `RestartPolicy::Never` outranks the adapter's ask (the operator's
     /// instrument wins): terminal — settle the record, no plan, no counter
     /// action. The streak clears at every fresh OPERATOR start, adoption,
-    /// and clean exit (a policy relaunch KEEPS it — it IS the chain being
-    /// paced); an engine restart forgets it (the next relaunch waits the base
+    /// clean exit, operator stop, and CHARGED crash (`plan_restart` drops it
+    /// for every one of its outcomes — a stable-window reset FORGIVES the
+    /// pacing history along with the chain); a policy relaunch KEEPS it — it
+    /// IS the chain being paced. An engine restart forgets it (the next
+    /// relaunch waits the base
     /// again — the DURABLE counter, untouched by this path, stays the
     /// operator's signal).
     fn plan_requested_restart(
@@ -1142,7 +1171,7 @@ impl Supervisor {
         registry: &Registry,
         name: &InstanceName,
         _code: u16,
-    ) -> Option<RestartPlan> {
+    ) -> Option<(RestartPlan, u32)> {
         let record = registry.spawn_record(name).ok().flatten();
         let policy = record
             .as_ref()
@@ -1151,28 +1180,38 @@ impl Supervisor {
         if !policy.restarts_on_crash() {
             // `never` outranks the adapter's ask: TERMINAL, no plan, no
             // counter action (the transition to `failed` + the cause's
-            // policy verdict are the caller's).
+            // policy verdict are the caller's). 18-3 review: terminal ends
+            // the chain — drop its streak (no leak).
+            self.requested_restart_streaks.remove(name);
             self.settle_terminal_record(registry, name, policy);
             return None;
         }
         let current = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
-        // The uncharged streak grows the delay: the FIRST requested relaunch
-        // of a chain waits the base, each later one doubles, the cap clamps.
+        // The uncharged streak grows the delay: the delay index is
+        // `current + streak + 1` — NOT the base (a chain riding a charged
+        // count starts higher than the base) — and each later relaunch in
+        // the chain doubles it, the cap clamping.
         let streak = self
             .requested_restart_streaks
             .get(name)
             .copied()
             .unwrap_or(0);
         let delay = self.backoff.delay_for(current + streak + 1);
-        self.requested_restart_streaks
-            .insert(name.clone(), streak + 1);
-        Some(RestartPlan {
-            name: name.clone(),
-            // The UNCHANGED count: the relaunch's fresh record must read the
-            // same number the operator saw before the recycle (see the doc).
-            attempt: current,
-            delay,
-        })
+        // The POST-increment depth rides back to the caller so the cause
+        // can surface `requested-recycle N` — the pacing is visible, not
+        // silent (18-3 review).
+        let depth = streak + 1;
+        self.requested_restart_streaks.insert(name.clone(), depth);
+        Some((
+            RestartPlan {
+                name: name.clone(),
+                // The UNCHANGED count: the relaunch's fresh record must read the
+                // same number the operator saw before the recycle (see the doc).
+                attempt: current,
+                delay,
+            },
+            depth,
+        ))
     }
 
     /// Settle the write-ahead record on a TERMINAL `failed` outcome (F-Low-2).
@@ -1648,10 +1687,14 @@ impl Supervisor {
                     self.clear_poll_error_streak(&name);
                     // Story 18-3: adoption begins a FRESH restart-requested
                     // chain (the previous engine's streak is not observable —
-                    // the in-memory map died with it), so the first
-                    // restart-requested relaunch under THIS engine waits the
-                    // base backoff again. The durable crash counter was
-                    // never touched by that chain and rides as-is.
+                    // the in-memory map died with it). The durable crash
+                    // counter was never touched by that chain and rides
+                    // as-is — so the first requested relaunch under THIS
+                    // engine waits the delay index `current + 0 + 1`: the
+                    // base ONLY when that counter is 0, a higher rung when
+                    // a charged count survived (18-3 review: the old
+                    // "waits the base backoff again" wording misstated the
+                    // formula `plan_requested_restart` actually computes).
                     self.requested_restart_streaks.remove(&name);
                     self.running.insert(
                         name.clone(),
@@ -1750,9 +1793,12 @@ impl Supervisor {
                             // exit-code classes (above) — `None` classifies
                             // nothing (byte-identical). The stability anchor
                             // starts at ADOPTION: the pre-adoption run time
-                            // is not observable, so a crash can only reset
-                            // after THIS engine has watched the run for the
-                            // whole window (the honest no-reset, documented).
+                            // is not observable, so a reset requires a FULL
+                            // window of running under THIS engine's watch
+                            // first (an honest fresh anchor — the review
+                            // renamed this from "no-reset", which misread
+                            // the shape: a long-watched adopted run resets
+                            // exactly like a spawned one).
                             exit_codes: adopted_exit_codes,
                             running_since: std::time::Instant::now(),
                         },

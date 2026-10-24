@@ -662,20 +662,29 @@ fn parse() -> Opts {
                 // the 18-1/18-2 flags took: a silently-ignored fixture would
                 // make a drill assert "still running" for the wrong reason
                 // (the agent never exited) instead of the behavior under
-                // test.
+                // test. 18-3 review round 1 (C5): the CODE is fail-fast too —
+                // a code outside the portable `0..=255` domain could never
+                // survive a real exit status (unix carries the low 8 bits), so
+                // a drill built on one would assert a code the engine could
+                // never observe.
                 match args
                     .next()
                     .as_deref()
                     .and_then(parse_colon_pair)
                     .and_then(|(code, ms)| {
-                        Some((code.parse::<i32>().ok()?, ms.parse::<u64>().ok()?))
+                        let code = code.parse::<i32>().ok()?;
+                        if !(0..=255).contains(&code) {
+                            return None;
+                        }
+                        Some((code, ms.parse::<u64>().ok()?))
                     }) {
                     Some((code, ms)) => exit_with = Some((code, Duration::from_millis(ms))),
                     None => {
                         eprintln!(
-                            "fake_agent: --exit-with requires CODE:AFTER_MS (a signed exit \
-                             code and a non-negative millisecond delay, colon-separated; got \
-                             missing or malformed value)"
+                            "fake_agent: --exit-with requires CODE:AFTER_MS (a code in \
+                             0..=255 — the portable exit-code domain — and a non-negative \
+                             millisecond delay, colon-separated; got a missing, malformed, \
+                             or out-of-range value)"
                         );
                         std::process::exit(2);
                     }
@@ -725,6 +734,44 @@ fn parse() -> Opts {
              (there is no health endpoint to fail)"
         );
         std::process::exit(2);
+    }
+
+    // 18-3 review round 1 (C5): the exit fixture's deadline peers. A
+    // declared exit a peer deadline would beat NEVER fires — a drill built
+    // on it would measure the peer's exit (or hang) instead of the
+    // behavior under test — so refuse at startup, naming both flags.
+    if let Some((code, delay)) = exit_with {
+        if delay >= linger {
+            eprintln!(
+                "fake_agent: --exit-with {code}:{} can never fire — the linger \
+                 window ({}ms) elapses first and the process exits 0 silently; shorten \
+                 the delay below --linger-ms",
+                delay.as_millis(),
+                linger.as_millis()
+            );
+            std::process::exit(2);
+        }
+        // An UNBOUNDED crash (no --crash-times + --crash-state pair) fires on
+        // EVERY launch and — at an equal-or-earlier deadline — wins the
+        // loop's check order over the declared exit. A BOUNDED crash
+        // (crash-times + crash-state) stays legal at any deadline: the
+        // bound's later launches are disarmed and legitimately reach the
+        // declared exit (the 18-3 review's own 7,7,75,75 drill depends on
+        // it).
+        if let Some(crash_after) = crash_after {
+            let bounded = crash_times.is_some() && crash_state.is_some();
+            if !bounded && crash_after <= delay {
+                eprintln!(
+                    "fake_agent: --exit-with {code}:{} can never fire under an \
+                     UNBOUNDED --crash-after-ms ({}ms) — the crash deadline wins the \
+                     loop's check order at an equal-or-earlier deadline; bound the crash \
+                     with --crash-times + --crash-state, or separate the deadlines",
+                    delay.as_millis(),
+                    crash_after.as_millis()
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     Opts {

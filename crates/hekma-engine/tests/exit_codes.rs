@@ -35,12 +35,27 @@
 //!   `pause_interval_never_counts_toward_stability`
 //! * a clean exit must not plan → `clean_exit_lands_stopped_settled_without_a_plan`
 //! * `never` must outrank the ask → `never_policy_outranks_the_restart_request`
+//!
+//! The 18-3 review-round-1 killers, and the tests that carry them:
+//! * the requested path must neither charge nor RESET the counter history →
+//!   `restart_requested_exit_relaunches_without_charging_the_counter` (the
+//!   7,7,75,75 shape; the surfaced `requested-recycle N` depth rides it)
+//! * the reset must fire on the LIVENESS-expiry charged leg and be NAMED in
+//!   the persisted cause →
+//!   `a_liveness_expiry_after_a_stable_run_resets_then_charges_and_names_the_reset`
+//! * the reset naming rides the PERSISTED cause, never the Unresponsive
+//!   event → `the_reset_rides_the_persisted_cause_not_the_unresponsive_event`
+//! * unresolvable adopted classes degrade loudly and classify nothing →
+//!   `adopted_instance_with_unresolvable_exit_codes_classifies_nothing`
 
+use std::io::Write;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hekma_engine::{
-    AdapterRef, Engine, EngineOptions, LifecycleState, RestartPolicy, TransitionCause,
+    AdapterRef, DiagnosticSink, Engine, EngineOptions, LifecycleState, RestartPolicy,
+    TransitionCause,
 };
 use tempfile::TempDir;
 
@@ -115,17 +130,45 @@ fn wait_until_state(
 
 #[test]
 fn restart_requested_exit_relaunches_without_charging_the_counter() {
-    // MUTATION KILLER (a): the restart-requested path runs the crash-path
-    // dance (terminal failed + relaunch, backoff verbatim) but must NEVER
-    // touch the consecutive-failure counter. Two full exit-75 recycles with
-    // the count pinned at 0 after EACH: a mutation that charged would land
-    // the count at 1, then 2. The cause names the declared class.
+    // MUTATION KILLER (a) — 18-3 review round 1 (B3) shape: the
+    // restart-requested path runs the crash-path dance (terminal failed +
+    // relaunch, backoff verbatim) but must NEVER touch the
+    // consecutive-failure counter — neither CHARGE it nor RESET it. The
+    // drill first builds REAL counter history (two charged code-7 crashes
+    // via `--crash-times 2`: the count reads 1, then 2), then runs TWO
+    // exit-75 recycles: the count must STILL read 2 after each. A
+    // charging mutant reads 3, then 4; a ZEROING mutant
+    // (`set_restart_count(name, 0)` on the requested path) reads 0 — both
+    // die, and counter CONTINUITY across the requested path is pinned
+    // (a requested recycle is not the operator's fresh start).
+    //
+    // Shape note (18-3 review deviation, recorded in the spec change
+    // log): a true 7→75→7 interleave is IMPOSSIBLE with the fixture —
+    // launch args are snapshotted at registration, so a manifest rewrite
+    // cannot change a chain's relaunch args, and `--crash-times` bounds
+    // crashes to the FIRST N launches. The honest sequence is therefore
+    // 7, 7, 75, 75 — the charged history first, the recycles after —
+    // which is exactly the order the zeroing mutant is exposed to.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
+    let crash_state = manifest.path().join("crash-count");
     write_manifest(
         manifest.path(),
         "relauncher",
-        &["--exit-with", "75:600", "--linger-ms", "600000"],
+        &[
+            "--crash-after-ms",
+            "900",
+            "--crash-with",
+            "7",
+            "--crash-times",
+            "2",
+            "--crash-state",
+            &crash_state.to_string_lossy(),
+            "--exit-with",
+            "75:2500",
+            "--linger-ms",
+            "600000",
+        ],
         Some("restart_requested = [75]"),
         false,
     );
@@ -147,8 +190,63 @@ fn restart_requested_exit_relaunches_without_charging_the_counter() {
     let count_before = facade.instance_status("relauncher").unwrap().restart_count;
     assert_eq!(count_before, 0, "a fresh start holds the count at 0");
 
-    // Recycle 1: the exit-75 lands `failed` with the RestartRequested cause,
-    // then the policy relaunch runs on the base backoff.
+    // Crash 1 (code 7, young — 900ms ≪ the production window): charged
+    // failure #1, verbatim crash cause, relaunch on the base 1s leg.
+    wait_until_state(
+        &facade,
+        "relauncher",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(15),
+        "the first code-7 crash to land failed",
+    );
+    let events = facade.transition_events("relauncher").unwrap();
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::Crashed { detail } => {
+            assert_eq!(
+                detail.as_str(),
+                "process exited unexpectedly with code 7",
+                "the young charged crash carries the verbatim detail"
+            );
+        }
+        other => panic!("expected a crashed cause, got {other:?}"),
+    }
+    wait_until_state(
+        &facade,
+        "relauncher",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "relaunch 1 to land running (the base leg)",
+    );
+    let count = facade.instance_status("relauncher").unwrap().restart_count;
+    assert_eq!(count, 1, "crash 1 charged failure #1");
+
+    // Crash 2 (code 7, young): charged failure #2, relaunch on the 2s leg.
+    wait_until_state(
+        &facade,
+        "relauncher",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(15),
+        "the second code-7 crash to land failed",
+    );
+    wait_until_state(
+        &facade,
+        "relauncher",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(25),
+        "relaunch 2 to land running (the 2s leg)",
+    );
+    let count = facade.instance_status("relauncher").unwrap().restart_count;
+    assert_eq!(count, 2, "crash 2 charged failure #2 — the history is real");
+
+    // Recycle 1 (exit 75 — the crash bound is spent): the counter must be
+    // UNTOUCHED. The cause names the declared class AND the surfaced
+    // recycle depth (the streak was dropped by the charged crashes, so
+    // this chain starts at depth 1).
     wait_until_state(
         &facade,
         "relauncher",
@@ -170,6 +268,10 @@ fn restart_requested_exit_relaunches_without_charging_the_counter() {
                 detail.contains("declared class `restart_requested`"),
                 "the cause names the declared class: {detail}"
             );
+            assert!(
+                detail.contains("requested-recycle 1"),
+                "the surfaced depth starts the post-crash chain at 1: {detail}"
+            );
         }
         other => panic!("expected a restart-requested cause, got {other:?}"),
     }
@@ -177,14 +279,17 @@ fn restart_requested_exit_relaunches_without_charging_the_counter() {
         &facade,
         "relauncher",
         |s| s == LifecycleState::Running,
-        Duration::from_secs(20),
-        "the first requested relaunch to land running",
+        Duration::from_secs(25),
+        "recycle 1 to land running (delay index 2+0+1 → the 4s leg)",
     );
     let count = facade.instance_status("relauncher").unwrap().restart_count;
-    assert_eq!(count, 0, "recycle 1 must not charge the counter");
+    assert_eq!(
+        count, 2,
+        "recycle 1 must neither charge (3) nor reset (0) the counter"
+    );
 
-    // Recycle 2: same drill — the count is STILL 0 (a charging mutant reads
-    // 2 here).
+    // Recycle 2: same drill — the count is STILL 2, and the depth grew to
+    // 2 (the chain paces; the counter does not).
     wait_until_state(
         &facade,
         "relauncher",
@@ -192,15 +297,35 @@ fn restart_requested_exit_relaunches_without_charging_the_counter() {
         Duration::from_secs(15),
         "the second exit-75 to land failed",
     );
+    let events = facade.transition_events("relauncher").unwrap();
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::RestartRequested { code, detail } => {
+            assert_eq!(*code, 75);
+            let detail = detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("requested-recycle 2"),
+                "the second recycle carries depth 2: {detail}"
+            );
+        }
+        other => panic!("expected a restart-requested cause, got {other:?}"),
+    }
     wait_until_state(
         &facade,
         "relauncher",
         |s| s == LifecycleState::Running,
-        Duration::from_secs(20),
-        "the second requested relaunch to land running",
+        Duration::from_secs(30),
+        "recycle 2 to land running (delay index 2+1+1 → the 8s leg)",
     );
     let count = facade.instance_status("relauncher").unwrap().restart_count;
-    assert_eq!(count, 0, "recycle 2 must not charge the counter either");
+    assert_eq!(
+        count, 2,
+        "recycle 2 must neither charge nor reset the counter either"
+    );
 
     // No crash-loop anywhere, no clean-exit edge: the causes are exactly the
     // declared story.
@@ -413,27 +538,29 @@ fn crash_after_a_stable_run_resets_then_charges_as_failure_one() {
 
 #[test]
 fn pause_interval_never_counts_toward_stability() {
-    // MUTATION KILLER (d): the stability anchor RESTAMPS at every resume —
-    // a pause longer than the window contributes nothing. The drill builds
-    // count 1 with a young crash, then pauses the second run LONGER than
-    // the window, resumes, and lets the run crash almost immediately: the
-    // post-resume run is YOUNG (a reset would be a lie), so the counter
-    // charges to 2. A mutant that kept the pre-pause anchor reads the
-    // paused wall-clock as "stable for > window" and resets (count 1).
+    // MUTATION KILLER (d) — 18-3 review round 1 (B4) shape: the stability
+    // anchor RESTAMPS at every resume, and only the POST-RESUME run counts.
+    // Run 1 is the POSITIVE CONTROL: it holds `running` ~14.7s (the 15s
+    // deadline less start slop) ≥ the 13s window, so its crash
+    // resets-then-charges — count 1, the reset NAMED in the cause. Run 2
+    // pauses as soon as its relaunch lands Running (inside the first
+    // second), holds 3.5s, resumes, and crashes on its own wall-clock 15s
+    // deadline: the post-resume run is ~9.5-11.5s — UNDER the window — so
+    // the crash charges WITHOUT a reset (count 2, no reset text in the
+    // cause). A mutant that kept the pre-pause anchor, or let the pause
+    // interval count toward stability, reads run 2 as ≥ 13s "stable" and
+    // resets (count 1) — dead on run 2; a mutant that never resets dies on
+    // run 1. The crash deadline (15s) comfortably outlives the pause hold
+    // (~4.5s), so the post-resume crash lands `running → failed` on every
+    // OS — one uniform assertion, no per-OS split.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    // Window 3s; the young crash (~1.5s run) stays under it. The fixture's
-    // crash deadline is WALL-CLOCK from its own spawn: after a suspension
-    // longer than the remaining budget, the process exits right after the
-    // resume (unix) — or, where a pause cannot suspend (windows), while the
-    // row still says paused, which rides the same charged crash path with
-    // NO anchor (the state gate) — both shapes land the honest no-reset.
     write_manifest(
         manifest.path(),
         "frozen-crasher",
         &[
             "--crash-after-ms",
-            "1800",
+            "15000",
             "--crash-with",
             "7",
             "--linger-ms",
@@ -443,7 +570,7 @@ fn pause_interval_never_counts_toward_stability() {
         true,
     );
 
-    let engine = open_with_window(&state, 3_000);
+    let engine = open_with_window(&state, 13_000);
     let facade = engine.blocking();
     facade
         .register_with_adapter(
@@ -458,56 +585,99 @@ fn pause_interval_never_counts_toward_stability() {
     let started = facade.start("frozen-crasher").unwrap();
     assert_eq!(started.state, LifecycleState::Running);
 
-    // History: the first young crash charges the counter to 1.
+    // Run 1: the positive control — a genuinely stable crash resets, then
+    // charges as #1, and the reset is NAMED.
     wait_until_state(
         &facade,
         "frozen-crasher",
         |s| s == LifecycleState::Failed,
-        Duration::from_secs(15),
-        "the first young crash to land failed",
+        Duration::from_secs(30),
+        "run 1's stable crash to land failed",
     );
+    let events = facade.transition_events("frozen-crasher").unwrap();
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::Crashed { detail } => {
+            assert!(
+                detail.starts_with("process exited unexpectedly with code 7"),
+                "run 1: the detail leads with the exit: {detail}"
+            );
+            assert!(
+                detail.contains("the previous run was stable for")
+                    && detail.contains("consecutive-failure count reset"),
+                "run 1 (positive control): the reset is NAMED: {detail}"
+            );
+        }
+        other => panic!("expected a crashed cause, got {other:?}"),
+    }
     wait_until_state(
         &facade,
         "frozen-crasher",
         |s| s == LifecycleState::Running,
         Duration::from_secs(20),
-        "the first relaunch to land running",
+        "run 2 to land running",
     );
     let status = facade.instance_status("frozen-crasher").unwrap();
-    assert_eq!(status.restart_count, 1, "history: the count is 1");
+    assert_eq!(status.restart_count, 1, "run 1 reset-then-charged to 1");
 
-    // Pause LONGER than the window, resume, and let the run crash almost
-    // immediately (the fixture's wall-clock deadline is already past).
+    // Pause as soon as run 2 is up — the younger the better (the paused
+    // interval must never leak into the window, and the 15s deadline must
+    // outlive the hold). Poll until the row settles Paused; never assume
+    // the transition landed just because the call returned.
     let paused = facade.pause("frozen-crasher").unwrap();
     assert_eq!(paused.state, LifecycleState::Paused);
+    wait_until_state(
+        &facade,
+        "frozen-crasher",
+        |s| s == LifecycleState::Paused,
+        Duration::from_secs(10),
+        "the pause to settle",
+    );
     std::thread::sleep(Duration::from_millis(3_500));
     facade.resume("frozen-crasher").unwrap();
 
+    // Run 2 crashes on its wall-clock deadline, ~9.5-11.5s into the
+    // POST-RESUME run — under the 13s window: charged WITHOUT a reset.
     wait_until_state(
         &facade,
         "frozen-crasher",
         |s| s == LifecycleState::Failed,
-        Duration::from_secs(15),
-        "the post-resume crash to land failed",
+        Duration::from_secs(30),
+        "run 2's post-resume crash to land failed",
     );
-    // NO reset anywhere in the causes: the pause interval bought nothing.
     let events = facade.transition_events("frozen-crasher").unwrap();
-    assert!(
-        !format!("{events:?}").contains("consecutive-failure count reset"),
-        "a pause interval must never contribute stability: {events:#?}"
-    );
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::Crashed { detail } => {
+            assert_eq!(
+                detail.as_str(),
+                "process exited unexpectedly with code 7",
+                "run 2: the crash charges VERBATIM — a pause interval buys no reset"
+            );
+        }
+        other => panic!("expected a crashed cause, got {other:?}"),
+    }
     wait_until_state(
         &facade,
         "frozen-crasher",
         |s| s == LifecycleState::Running,
         Duration::from_secs(25),
-        "the post-pause relaunch to land running",
+        "run 3 to land running",
     );
     let status = facade.instance_status("frozen-crasher").unwrap();
     assert_eq!(
         status.restart_count, 2,
         "the post-pause crash charged WITHOUT a reset (an anchor that \
-         counted the pause would have reset to 1)"
+         counted the pause — or kept the pre-pause stamp — would have \
+         reset to 1)"
     );
 
     facade
@@ -1099,5 +1269,461 @@ fn adopted_instance_crash_does_not_credit_pre_adoption_time() {
     // the drill leaves no orphan behind.
     facade_b
         .stop("adopted-crasher", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+/// A `Write` adapter delegating into a shared buffer (the liveness.rs /
+/// story-10-2 sink shape): the test reads the sink's captured bytes while
+/// the engine owns the boxed writer.
+#[derive(Clone)]
+struct SharedCapture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Poll the captured sink until a line matching `needle` appears, bounded.
+/// Returns the line (the wording assertions read it).
+fn wait_for_diagnostic(
+    shared: &Arc<Mutex<Vec<u8>>>,
+    needle: &str,
+    within: Duration,
+    what: &str,
+) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        let captured = String::from_utf8(shared.lock().unwrap().clone()).expect("utf-8 sink");
+        if let Some(line) = captured.lines().find(|l| l.contains(needle)) {
+            return line.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what} (sink so far:\n{captured})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Count the sink lines matching `needle` right now (the diagnostics-once
+/// pins assert the count is EXACTLY one).
+fn diagnostic_count(shared: &Arc<Mutex<Vec<u8>>>, needle: &str) -> usize {
+    String::from_utf8(shared.lock().unwrap().clone())
+        .expect("utf-8 sink")
+        .lines()
+        .filter(|l| l.contains(needle))
+        .count()
+}
+
+/// `write_manifest` with a raw `[liveness]` section (the declared
+/// heartbeat check the liveness-leg drills need): the local helper above
+/// has no `.liveness()` passthrough, but the `ManifestFixture` builder
+/// does — this composes the same defaults plus the section.
+fn write_manifest_with_liveness(
+    dir: &Path,
+    kind: &str,
+    args: &[&str],
+    liveness_body: &str,
+    exit_codes_body: Option<&str>,
+) {
+    let fixture = hekma_conformance::test_support::ManifestFixture::new(kind, args)
+        .guaranteed_on_all_oses("interaction")
+        .liveness(liveness_body);
+    let fixture = match exit_codes_body {
+        Some(body) => fixture.exit_codes(body),
+        None => fixture,
+    };
+    fixture.write(dir);
+}
+
+/// The B1/B9 fixture: a heartbeat subject whose FIRST launch crashes young
+/// (the `--crash-times 1` bound) and whose later launches beat
+/// `hb.marker` every 100ms until 6s, then stop — the deterministic
+/// unresponsive-expiry subject for the stable-window reset.
+fn write_heartbeat_crasher(dir: &Path, kind: &str) {
+    let crash_state = dir.join("crash-count");
+    write_manifest_with_liveness(
+        dir,
+        kind,
+        &[
+            "--heartbeat-file",
+            "hb.marker:100",
+            "--heartbeat-stop-after",
+            "6000",
+            "--crash-after-ms",
+            "1200",
+            "--crash-with",
+            "7",
+            "--crash-times",
+            "1",
+            "--crash-state",
+            &crash_state.to_string_lossy(),
+            "--linger-ms",
+            "600000",
+        ],
+        "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 600",
+        None,
+    );
+}
+
+#[test]
+fn a_liveness_expiry_after_a_stable_run_resets_then_charges_and_names_the_reset() {
+    // MUTATION KILLER (B1) — the unresponsive-expiry leg of the stable
+    // reset: a charged crash need not be a process EXIT. Run 1 crashes
+    // young (1.2s < the 2s window) → count 1. Run 2 (the crash bound is
+    // spent) beats its heartbeat until 6s and then stops: the declared
+    // check expires it ~600ms later, after a ~6.6s run ≥ the window — so
+    // the expiry RESETS the streak and charges as #1: the count reads 1
+    // AND the persisted failed-cause names the reset (the naming rides
+    // the ONE `set_restart_count` write; see
+    // `the_reset_rides_the_persisted_cause_not_the_unresponsive_event`
+    // for the event-cause boundary). A mutant that skips the anchor on
+    // the liveness path reads 2; a mutant that drops the cause from the
+    // write reads a bare cause — dead either way.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_heartbeat_crasher(manifest.path(), "stable-hb");
+
+    let engine = open_with_window(&state, 2_000);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "stable-hb",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("stable-hb", RestartPolicy::OnFailure)
+        .unwrap();
+
+    let started = facade.start("stable-hb").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Run 1: the young crash charges #1 — no reset (1.2s < 2s).
+    wait_until_state(
+        &facade,
+        "stable-hb",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(15),
+        "run 1's young crash to land failed",
+    );
+    let status = facade.instance_status("stable-hb").unwrap();
+    assert_eq!(status.restart_count, 1, "run 1 charged young");
+
+    wait_until_state(
+        &facade,
+        "stable-hb",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "run 2 to land running",
+    );
+
+    // Run 2: heartbeat stops at its +6s; the check expires it ~600ms
+    // later — a ~6.6s run, comfortably over the 2s window. Read the
+    // Failed landing FAST: the reset-then-charge relaunch leg is the
+    // base 1s, and the persisted cause is readable while the row sits
+    // Failed (the ~1s window; the 250ms reaper tick leaves ~0.7s).
+    wait_until_state(
+        &facade,
+        "stable-hb",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(30),
+        "run 2's unresponsive expiry to land failed",
+    );
+    let status = facade.instance_status("stable-hb").unwrap();
+    assert_eq!(
+        status.restart_count, 1,
+        "the stable expiry reset-then-charged to 1 (a mutant skipping \
+         the anchor on the liveness path reads 2)"
+    );
+    assert!(
+        status
+            .failed_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("consecutive-failure count reset")),
+        "the persisted cause names the reset: {:?}",
+        status.failed_cause
+    );
+
+    wait_until_state(
+        &facade,
+        "stable-hb",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "run 3 to land running",
+    );
+    facade
+        .stop("stable-hb", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_reset_rides_the_persisted_cause_not_the_unresponsive_event() {
+    // MUTATION KILLER (B9) — the SURFACE boundary of the reset naming:
+    // the persisted failed-cause (last_known_cause, carried by the ONE
+    // `set_restart_count` write) carries the reset text, but the
+    // Unresponsive EVENT cause stays check + streak + onset/verdict —
+    // stuffing the reset into the event would double-render it in
+    // `show` and garble the transition line. Same drill as the B1
+    // killer; the assert here is on the EVENT: the last Failed cause is
+    // `Unresponsive` and its detail names NO reset — while the persisted
+    // cause, read in the same ~1s Failed window, does.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_heartbeat_crasher(manifest.path(), "stable-hb2");
+
+    let engine = open_with_window(&state, 2_000);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "stable-hb2",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("stable-hb2", RestartPolicy::OnFailure)
+        .unwrap();
+
+    let started = facade.start("stable-hb2").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Run 1: the young crash (a plain Crashed event — no Unresponsive
+    // event may exist yet).
+    wait_until_state(
+        &facade,
+        "stable-hb2",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(15),
+        "run 1's young crash to land failed",
+    );
+    let events = facade.transition_events("stable-hb2").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.cause, TransitionCause::Unresponsive { .. })),
+        "the young crash is a Crashed event, not an expiry: {events:#?}"
+    );
+    wait_until_state(
+        &facade,
+        "stable-hb2",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "run 2 to land running",
+    );
+
+    // Run 2's expiry lands Failed. The event must be `Unresponsive` with
+    // NO reset text in its detail; the persisted cause must carry it.
+    wait_until_state(
+        &facade,
+        "stable-hb2",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(30),
+        "run 2's unresponsive expiry to land failed",
+    );
+    let events = facade.transition_events("stable-hb2").unwrap();
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::Unresponsive {
+            check,
+            failing_for_ms,
+            detail,
+        } => {
+            assert!(
+                check.contains("heartbeat"),
+                "the event names the declared check: {check}"
+            );
+            assert!(
+                *failing_for_ms >= 600,
+                "the streak is the crossed window: {failing_for_ms}ms"
+            );
+            assert!(
+                !detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("consecutive-failure count reset")),
+                "the reset naming must NOT ride the Unresponsive event: {detail:?}"
+            );
+        }
+        other => panic!("expected an unresponsive cause, got {other:?}"),
+    }
+    let status = facade.instance_status("stable-hb2").unwrap();
+    assert!(
+        status
+            .failed_cause
+            .as_deref()
+            .is_some_and(|c| c.contains("consecutive-failure count reset")),
+        "the PERSISTED cause is where the reset naming rides: {:?}",
+        status.failed_cause
+    );
+
+    wait_until_state(
+        &facade,
+        "stable-hb2",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "run 3 to land running",
+    );
+    facade
+        .stop("stable-hb2", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopted_instance_with_unresolvable_exit_codes_classifies_nothing() {
+    // MUTATION KILLER (B2) — the adoption-time RE-RESOLUTION of the
+    // declared exit-code classes degrades HONESTLY (the liveness twin's
+    // posture): engine A registers + starts a DETACHED instance under a
+    // valid `restart_requested = [75]`; A drops; the manifest's section
+    // drifts INVALID (an overlap — 75 declared in BOTH lists, which
+    // `ExitCodes::classes` refuses); engine B adopts. The re-resolution
+    // FAILS: exactly ONE diagnostic names it, the adoption still
+    // succeeds (Running), and the adopted exit-75 lands a PLAIN charged
+    // crash — NOT a restart-requested recycle (the classes are simply
+    // not supervised this Run). A mutant that adopted the stale
+    // registration classes (or degraded silently) would recycle on the
+    // declared code — dead.
+    //
+    // OS shape note (no new Windows CI claimed): on UNIX the adopted
+    // exit's code is additionally unavailable BY STRUCTURE (the process
+    // is not this engine's child), so the no-classification pin rides
+    // the codeless-exit gate there; on WINDOWS the adopted poll reads
+    // the real code (GetExitCodeProcess), and it is the `None` classes —
+    // the resolution failure this test pins — that classifies nothing.
+    // Both roads lead to the same plain-crash assert.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let args = ["--exit-with", "75:9000", "--linger-ms", "600000"];
+    write_manifest(
+        manifest.path(),
+        "adopted-exits",
+        &args,
+        Some("restart_requested = [75]"),
+        false,
+    );
+
+    {
+        let engine_a = open(&state);
+        let facade_a = engine_a.blocking();
+        facade_a
+            .register_with_adapter(
+                "adopted-exits",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        facade_a
+            .set_restart_policy("adopted-exits", RestartPolicy::OnFailure)
+            .unwrap();
+        let started = facade_a.start_detached("adopted-exits").unwrap();
+        assert_eq!(started.state, LifecycleState::Running);
+        std::thread::sleep(Duration::from_millis(500));
+    } // engine A drops; the DETACHED agent survives.
+
+    // The section drifts INVALID under the dropped engine: 75 in BOTH
+    // lists — an overlap the resolver refuses. (The launch args were
+    // snapshotted at registration; the rewrite cannot change them.)
+    write_manifest(
+        manifest.path(),
+        "adopted-exits",
+        &args,
+        Some("restart_requested = [75]\nclean = [75]"),
+        false,
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine_b = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink)
+        .expect("open engine B");
+    let facade_b = engine_b.blocking();
+
+    let line = wait_for_diagnostic(
+        &shared,
+        "could not be resolved",
+        Duration::from_secs(10),
+        "the degraded exit-codes resolution diagnostic",
+    );
+    assert!(
+        line.contains("NOT classified this Run"),
+        "the diagnostic names the degradation and its scope: {line}"
+    );
+    assert_eq!(
+        diagnostic_count(&shared, "NOT classified this Run"),
+        1,
+        "exactly ONE degraded-resolution diagnostic"
+    );
+
+    let status = facade_b.instance_status("adopted-exits").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "the adoption succeeds despite the unresolvable classes"
+    );
+
+    // Restore a VALID section now: the adopted Run's classes were resolved
+    // ONCE (at adoption) and stand degraded — the rewrite cannot re-arm
+    // them. But the section is RE-CHECKED at every start, so leaving the
+    // overlap in place would refuse the policy relaunch's own start too;
+    // the drift has served its purpose by the time the diagnostic landed.
+    write_manifest(
+        manifest.path(),
+        "adopted-exits",
+        &args,
+        Some("restart_requested = [75]"),
+        false,
+    );
+
+    // The adopted exit-75 (at its +9s) is a PLAIN charged crash — no
+    // classified cause, no requested recycle.
+    wait_until_state(
+        &facade_b,
+        "adopted-exits",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(25),
+        "the adopted exit-75 to land failed",
+    );
+    let events = facade_b.transition_events("adopted-exits").unwrap();
+    let failed = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Failed)
+        .expect("a failed transition");
+    match &failed.cause {
+        TransitionCause::Crashed { detail } => {
+            assert!(
+                detail.starts_with("process exited unexpectedly"),
+                "an adopted exit with unresolvable classes is a PLAIN crash \
+                 (no classified cause): {detail}"
+            );
+        }
+        other => panic!("expected an unclassified crashed cause, got {other:?}"),
+    }
+    let status = facade_b.instance_status("adopted-exits").unwrap();
+    assert_eq!(
+        status.restart_count, 1,
+        "the unclassified adopted exit CHARGES (the requested path would not)"
+    );
+
+    wait_until_state(
+        &facade_b,
+        "adopted-exits",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "the policy relaunch to land running",
+    );
+    facade_b
+        .stop("adopted-exits", Some(Duration::from_secs(5)))
         .unwrap();
 }
