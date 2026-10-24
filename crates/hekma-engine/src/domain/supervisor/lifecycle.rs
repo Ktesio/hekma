@@ -283,6 +283,12 @@ impl Supervisor {
                                 stop_unconfirmed: false,
                                 adopted: true,
                                 acp: None,
+                                // Story 18-2: a STOP-ONLY re-acquire declares no
+                                // liveness check — this Supervised exists to drive
+                                // the record to a terminal state, so there is no
+                                // window to open and nothing to probe.
+                                liveness_check: None,
+                                liveness_failing_since: None,
                             },
                         );
                     }

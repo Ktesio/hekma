@@ -3,6 +3,7 @@
 //! additional `impl Supervisor` block, no signature or behavior change.
 
 use super::*;
+use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
 
 impl Supervisor {
     /// Clear one instance's consecutive poll-error streak (AI-12). Called at
@@ -87,6 +88,24 @@ impl Supervisor {
     /// increment, one diagnostic, handles stay alive — a fleet-wide poll outage
     /// must never mass-crash running agents through kill-on-drop. Only a handle
     /// erroring ALONE (its peers read fine) accumulates crash-input credit.
+    ///
+    /// **Declared liveness (story 18-2, PHASE 4):** after crash handling, every
+    /// still-held instance whose persisted state is EXACTLY `running` and whose
+    /// adapter declared a `[liveness]` check gets ONE attempt per pass (the
+    /// shared evaluators — heartbeat mtime read, or ONE `http-get` whose
+    /// deadline is `now + HTTP_ATTEMPT_CAP`). A HUNG check therefore stretches
+    /// its own pass by up to ~1s; N hung checks stretch it by up to ~Ns — the
+    /// attempts run sequentially under the supervisor lock, and ONLY failing
+    /// checks pay the cap (a fresh heartbeat costs one stat; an answering
+    /// endpoint costs one fast loopback connect). The unifying semantic — the
+    /// signal failing CONTINUOUSLY for the declared `max_age_ms` — is the PURE
+    /// [`crate::domain::liveness::window_decision`]; expiry drives the EXACT
+    /// crash-path sequence below with a [`TransitionCause::Unresponsive`] (the
+    /// handle drop kills the hung process — the sanctioned teardown, the AI-12
+    /// PersistentPollFailure precedent), and the Restart Policy applies
+    /// verbatim. A paused instance is NEVER probed (a suspended process cannot
+    /// heartbeat — the exact-`running` guard, silent by design), and an
+    /// instance with no declared check behaves byte-identically to before.
     pub fn poll_once(&mut self, registry: &Registry) -> Vec<RestartPlan> {
         // First, INGEST self-reported usage from every running instance's captured
         // output (story 3-1): the reaper is the natural cadence for draining the
@@ -488,6 +507,149 @@ impl Supervisor {
 
             if let Some(plan) = decision.plan {
                 plans.push(plan);
+            }
+        }
+
+        // PHASE 4 — DECLARED LIVENESS (story 18-2). After crash handling: any
+        // handle phase 3 reaped is gone from `self.running`, so this snapshot
+        // holds only the SURVIVING instances. Each one whose adapter declared
+        // a `[liveness]` check and whose persisted state is EXACTLY `running`
+        // gets ONE attempt per pass (see the tick-stretch honesty in this
+        // fn's docs). The window bookkeeping is the PURE
+        // `WindowDecision`; expiry runs the crash-path sequence verbatim.
+        let surviving: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in surviving {
+            // Read the declared check + the open window (if any) up front, so
+            // the mutable borrows below start clean.
+            let (check, failing_since) = {
+                let Some(supervised) = self.running.get(&name) else {
+                    continue;
+                };
+                match &supervised.liveness_check {
+                    Some(check) => (
+                        check.clone(),
+                        supervised.liveness_failing_since.map(|t| t.elapsed()),
+                    ),
+                    // No declared check: process liveness only — the
+                    // byte-identical pre-1.1.0 behavior (and the adopted
+                    // instance whose resolution failed: ONE diagnostic at
+                    // adoption already said so, silent thereafter).
+                    None => continue,
+                }
+            };
+            // The paused guard: ONLY an instance the store shows EXACTLY
+            // `running` is probed. A paused instance is never probed (a
+            // suspended process cannot heartbeat — SIGSTOP, or a Windows
+            // pause that was a no-op: neither may fail the agent), and a
+            // `stopping`/terminal row is somebody else's transition. SILENT
+            // skip by design — a pause is a normal state, not a degradation.
+            match registry.lookup(&name) {
+                Ok(instance) if instance.state == LifecycleState::Running => {}
+                _ => continue,
+            }
+            let max_age_ms = check.max_age_ms();
+            let failing_now =
+                liveness::evaluate(&check, &registry.agent_home(&name)) == LivenessSignal::Failing;
+            match liveness::window_decision(failing_since, failing_now, max_age_ms) {
+                WindowDecision::Healthy => {}
+                WindowDecision::WithinWindow { .. } => {
+                    // A transient blip inside the window: silent — it is none
+                    // of the operator's business until it persists.
+                }
+                WindowDecision::StartWindow => {
+                    // FIRST failing attempt: open the window, emit the ONE
+                    // first-failure diagnostic (surfaced, not silent — the
+                    // operator sees the window open while there is still time
+                    // to care).
+                    if let Some(supervised) = self.running.get_mut(&name) {
+                        supervised.liveness_failing_since = Some(std::time::Instant::now());
+                    }
+                    self.emit_diagnostic(&format!(
+                        "{}: declared liveness check failing ({}) — the window is open; \
+                         failing continuously for {}ms fails the instance",
+                        name.as_str(),
+                        liveness::describe(&check),
+                        max_age_ms,
+                    ));
+                }
+                WindowDecision::Recovered => {
+                    // The signal came back inside the window: close the
+                    // window, emit the ONE recovery diagnostic (a failing
+                    // agent that came back is exactly what an operator wants
+                    // to know about).
+                    if let Some(supervised) = self.running.get_mut(&name) {
+                        supervised.liveness_failing_since = None;
+                    }
+                    self.emit_diagnostic(&format!(
+                        "{}: declared liveness check recovered ({}) — the failure window \
+                         closed before expiring",
+                        name.as_str(),
+                        liveness::describe(&check),
+                    ));
+                }
+                WindowDecision::Expired { failing_for_ms } => {
+                    // UNRESPONSIVE. The crash-path sequence verbatim (phase 3's
+                    // terminal drains → capture → notices → remove → policy
+                    // consult → transition), with the `unresponsive` cause and
+                    // the guaranteed-Running prior state.
+                    let check_desc = liveness::describe(&check);
+                    self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
+                    self.drain_observed_for(registry, &name, DrainMode::Terminal);
+                    self.unlink_raw_logs_if_metadata(registry, &name);
+                    // Capture BEFORE the remove — the drop of the (possibly
+                    // hung) handle is the sanctioned teardown (kill-on-drop,
+                    // the AI-12 PersistentPollFailure precedent: a wedged
+                    // agent will not stop on request, and a bounded-stop
+                    // ladder must not wedge the reaper).
+                    let liveness_log_capture = self
+                        .running
+                        .get(&name)
+                        .and_then(|s| self.backend.log_capture(&s.handle));
+                    self.drain_acp_notices_for(&name);
+                    self.clear_poll_error_streak(&name);
+                    self.running.remove(&name);
+                    let detail = format!(
+                        "declared liveness check unresponsive: {check_desc} failing for \
+                         {failing_for_ms}ms (window {max_age_ms}ms)"
+                    );
+                    let decision = self.plan_restart(registry, &name, &detail);
+                    if self.ensure_log_dir(registry, &name).is_err() {
+                        // Same posture as the crash path: the state persists
+                        // even if the log dir cannot be prepared; the event
+                        // append below stays best-effort.
+                    }
+                    if self
+                        .transition_with_log_capture(
+                            registry,
+                            &name,
+                            LifecycleState::Running,
+                            LifecycleState::Failed,
+                            TransitionCause::unresponsive(check_desc, failing_for_ms),
+                            liveness_log_capture,
+                        )
+                        .is_err()
+                    {
+                        // Persisting the transition failed; leave the record
+                        // for a later reconcile and move on (never panic the
+                        // reaper).
+                        continue;
+                    }
+                    match decision.plan {
+                        Some(plan) => plans.push(plan),
+                        None => {
+                            // Terminal (policy `never`, or the crash-loop
+                            // threshold): no restart cadence will make this
+                            // visible, so the reaper's own surface carries
+                            // the conclusion ONCE (surfaced, not silent — the
+                            // full cause also lives in the event log).
+                            self.emit_diagnostic(&format!(
+                                "{}: {}",
+                                name.as_str(),
+                                decision.crash_cause
+                            ));
+                        }
+                    }
+                }
             }
         }
         plans
@@ -952,6 +1114,49 @@ impl Supervisor {
                     // Read BEFORE the listener moves into `Supervised` (the
                     // strand note below must know whether a live listener landed).
                     let rebind_landed = adopted_listener.is_some();
+                    // Story 18-2: re-resolve the adopted instance's declared
+                    // liveness check from ITS adapter manifest (the same
+                    // resolution the start seam runs). The window itself does
+                    // NOT survive the previous engine — the prior failure
+                    // streak lived in the dead engine's `Supervised` — so an
+                    // adopted instance starts a FRESH window (the honest
+                    // degradation, documented: up to one extra window of
+                    // grace). A resolution failure (manifest drifted invalid,
+                    // or unreadable since registration) is SURFACED (AI-18)
+                    // as ONE diagnostic and the adopted instance is re-held
+                    // with NO declared check — process liveness only — never
+                    // a failed adoption (graceful degradation: the agent is
+                    // running and owned either way).
+                    let adopted_liveness_check = match registry.adapter_launch_facts(&name) {
+                        Ok((kind, manifest_path, _launch)) => {
+                            match crate::adapter::resolve_liveness_check(
+                                &kind,
+                                manifest_path.as_deref(),
+                            ) {
+                                Ok(check) => check,
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the adopted instance's declared liveness check \
+                                         could not be resolved ({err}); supervising PROCESS \
+                                         liveness only for this Run — stop and start the \
+                                         instance to restore the declared check",
+                                        name.as_str(),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.emit_diagnostic(&format!(
+                                "{}: the adopted instance's adapter snapshot could not be \
+                                 read ({err}); its declared liveness check (if any) is NOT \
+                                 supervised this Run — stop and start the instance to \
+                                 restore it",
+                                name.as_str(),
+                            ));
+                            None
+                        }
+                    };
                     self.clear_poll_error_streak(&name);
                     self.running.insert(
                         name.clone(),
@@ -1035,6 +1240,14 @@ impl Supervisor {
                             // note below says so; `session/load` resume is
                             // story 14-2).
                             acp: None,
+                            // Story 18-2: the adopted instance's RE-RESOLVED
+                            // liveness check (above) with a FRESH window —
+                            // the previous engine's failure streak is not
+                            // observable, so adoption grants a whole new
+                            // window (the honest ≤-one-extra-window grace,
+                            // documented in the manifest docs).
+                            liveness_check: adopted_liveness_check,
+                            liveness_failing_since: None,
                         },
                     );
                     adopted += 1;

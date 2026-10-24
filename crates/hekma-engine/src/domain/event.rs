@@ -198,6 +198,28 @@ pub enum TransitionCause {
         /// never assumed).
         waited_ms: u64,
     },
+    /// A DECLARED LIVENESS CHECK went UNRESPONSIVE (story 18-2): the
+    /// `running → failed` edge the reaper drives when the manifest's
+    /// `[liveness]` signal — a heartbeat file gone stale, an HTTP health
+    /// endpoint gone silent — has failed CONTINUOUSLY for the declared
+    /// `max_age_ms` window. NOT terminal — unlike
+    /// [`TransitionCause::ReadinessTimeout`] the Restart Policy applies
+    /// exactly as for a crash (a hung agent is the crash-shape a restart can
+    /// fix: the process is killed by the transition and respawned). Wire tag
+    /// `unresponsive`. DISTINCT from [`TransitionCause::Crashed`] — the
+    /// process may still be ALIVE (hung, wedged, deadlocked): the DECLARED
+    /// signal died, and the transition itself kills the process (the
+    /// handle-drop teardown). Carries the check's rendered description (what
+    /// was watched) and how long it had been failing, so log/`--json`/7-2
+    /// consumers can match on it without re-parsing free text.
+    Unresponsive {
+        /// The rendered check description (e.g.
+        /// `"liveness check heartbeat-file heartbeat.marker (stale after 5000ms)"`).
+        check: String,
+        /// How long the signal had been failing continuously when the
+        /// window expired, in milliseconds (`>= max_age_ms`).
+        failing_for_ms: u64,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -340,6 +362,16 @@ impl TransitionCause {
         TransitionCause::ReadinessTimeout {
             probe: probe.into(),
             waited_ms,
+        }
+    }
+
+    /// An UNRESPONSIVE cause recording the check's rendered `description` +
+    /// how long it had been failing (`failing_for_ms`, `>= max_age_ms`). NOT
+    /// terminal — the reaper pairs this with the ordinary Restart Policy.
+    pub fn unresponsive(check: impl Into<String>, failing_for_ms: u64) -> Self {
+        TransitionCause::Unresponsive {
+            check: check.into(),
+            failing_for_ms,
         }
     }
 
@@ -735,6 +767,13 @@ mod tests {
                     5000,
                 ),
                 "readiness-timeout",
+            ),
+            (
+                TransitionCause::unresponsive(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                ),
+                "unresponsive",
             ),
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),

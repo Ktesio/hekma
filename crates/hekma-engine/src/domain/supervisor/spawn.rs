@@ -253,6 +253,18 @@ impl Supervisor {
         let readiness_gate = adapter::resolve_readiness_probe(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
 
+        // (2b-liveness) Resolve the adapter's optional declared liveness check
+        // (contract `1.1.0`, story 18-2): the `[liveness]` section's ONE
+        // check + its `max_age_ms` window. Pre-transition like every fallible
+        // resolution above — an invalid (or drifted-since-registration)
+        // section rejects the start with NO state change. A manifest without
+        // the section (or a native adapter) resolves `None` — the pre-1.1.0
+        // behavior, byte-identical. The check is carried on the `Supervised`
+        // record below, where the reaper evaluates it per tick while the
+        // instance is EXACTLY `running`.
+        let liveness_check = adapter::resolve_liveness_check(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+
         // (2b-memory) MANAGED MEMORY BACKING (story 5-1, spine AD-11). Read the
         // attached backing (one DB read) and — for a `filesystem` kind — ensure
         // the managed directory exists: ONE idempotent `create_dir_all`, no
@@ -1128,6 +1140,12 @@ impl Supervisor {
                 // Story 14-1: the acp transport lives with the handle (a fresh
                 // session for this Run; teardown drops with the Supervised).
                 acp,
+                // Story 18-2: the declared liveness check (resolved in the
+                // (2b-liveness) block above) + its FRESH failure window — a
+                // new Run grants the agent a whole new window, the restart
+                // resets the streak by construction.
+                liveness_check,
+                liveness_failing_since: None,
             },
         );
 

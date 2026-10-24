@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hekma_adapter_api::{Capability, ConfigMapping, OsId, SupportLevel};
+use hekma_adapter_api::{Capability, ConfigMapping, LivenessCheck, OsId, SupportLevel};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
@@ -662,6 +662,24 @@ struct Supervised {
     /// Dropping the `Supervised` drops the connection, which closes the
     /// child's stdin — the connection teardown on stop/drop/terminal-settle.
     acp: Option<crate::acp::AcpConnection>,
+    /// The declared `[liveness]` check (story 18-2), RESOLVED at spawn —
+    /// `None` for a manifest without the section (process liveness only,
+    /// byte-identical) or an adopted instance whose adapter manifest could
+    /// not be resolved (ONE honest degradation diagnostic at adoption, then
+    /// this stays `None` — the reaper skips it silently thereafter, exactly
+    /// like a manifest that declares no check). The reaper evaluates it ONE
+    /// attempt per tick while the persisted state is EXACTLY `running`.
+    liveness_check: Option<LivenessCheck>,
+    /// The OPEN liveness failure window (story 18-2): `Some(elapsed)` while
+    /// the declared signal has been failing CONTINUOUSLY (stamped at the
+    /// first failing attempt, `None` otherwise). The unifying semantic —
+    /// failing continuously for `max_age_ms` fails the instance — reads this
+    /// against `liveness_check`'s window; a Fresh attempt clears it (one
+    /// recovery diagnostic when it was open). Lives on `Supervised`, so it
+    /// RESETS with the Run (restart = fresh window) and PAUSES with the
+    /// instance (a paused instance is never probed, so the window neither
+    /// grows nor expires while suspended).
+    liveness_failing_since: Option<std::time::Instant>,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -1928,6 +1946,16 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::ReadinessTimeout { waited_ms, .. } => {
             format!(" (readiness-timeout: waited {waited_ms}ms)")
         }
+        // Unresponsive (Epic 18): spell the WIRE TAG + the check and its
+        // failing streak — the transition's whole WHY in one greppable line
+        // (same rule as `readiness-timeout` above). The check description is
+        // also in the cause payload / `show` detail; the suffix names both
+        // numbers so an operator scanning `instance.log` sees the window that
+        // was crossed without opening anything.
+        TransitionCause::Unresponsive {
+            check,
+            failing_for_ms,
+        } => format!(" (unresponsive: {check}, failing for {failing_for_ms}ms)"),
     }
 }
 

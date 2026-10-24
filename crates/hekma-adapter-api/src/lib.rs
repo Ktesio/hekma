@@ -114,6 +114,15 @@ use thiserror::Error;
 /// `deny_unknown_fields` schema refuses the unknown section). Stated on the
 /// release surface; the schema change is pinned by
 /// `contract_v1_0_0_engine_rejects_the_readiness_section`.
+///
+/// **The same `1.1.0` minor also carries `[liveness]` (story 18-2):** the
+/// schema gains an OPTIONAL `[liveness]` section declaring ONE liveness check
+/// (`[liveness.heartbeat_file]` or `[liveness.http_get]`, each with a bounded
+/// `max_age_ms` window) that the engine's reaper evaluates against the RUNNING
+/// agent, moving it `running → failed` (cause `unresponsive`) when the signal
+/// fails continuously for the whole window. Same additive posture: absent
+/// means byte-identical supervision, and the `1.0.0`-engine rejection is
+/// pinned by `contract_v1_0_0_engine_rejects_the_liveness_section`.
 pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The Adapter Contract compatibility rule the engine enforces at registration
@@ -219,9 +228,9 @@ pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, FileFreshProbe, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle,
-    LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate, Readiness, ReadinessGate,
-    ReadinessKind, ReadinessProbe,
+    AdapterIdentity, FileFreshProbe, HeartbeatFileCheck, HttpGetCheck, HttpGetProbe, Interaction,
+    InteractionChannelKind, Lifecycle, Liveness, LivenessCheck, LogContainsProbe, Manifest,
+    ManifestError, Metering, OpTemplate, Readiness, ReadinessGate, ReadinessKind, ReadinessProbe,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;
