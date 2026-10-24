@@ -8,6 +8,7 @@
 mod helpers;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use hekma_conformance::test_support::{current_os_key, fake_agent_bin, ManifestFixture};
 use hekma_conformance::uj3;
@@ -2102,13 +2103,16 @@ fn drain_completes_and_exits_zero_unix() {
     let state_dir = state.project_dir.as_path();
     let m = write_drain_manifest_for_cli(
         &ctx.project_dir,
-        // The idle signal lands 400ms after the AGENT starts — inside the
-        // manifest's 10s bound at any machine speed.
+        // The idle signal lands 800ms after the PAUSE SENTINEL — the file
+        // THIS drain's own pause command writes — so it provably arrives
+        // during the drain's wait at any machine speed (review round 1,
+        // B13's re-anchored fixture; the old process-start clock could let
+        // the file predate the drain entry).
         &[
             "--linger-ms",
             "600000",
-            "--idle-after-ms",
-            "400:idle.sentinel",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
         ],
         "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
     );
@@ -2129,12 +2133,13 @@ fn drain_completes_and_exits_zero_unix() {
     start_via_surviving_engine(state_dir, "svc");
 
     let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
-    assert!(
-        run.success,
-        "a COMPLETED drain exits 0; stderr={}",
-        run.stderr
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a COMPLETED drain exits 0; stderr={} stdout={}",
+        run.stderr,
+        run.stdout
     );
-    assert_eq!(run.code, Some(0), "stdout={}", run.stdout);
     assert!(
         run.stdout.contains("Drained"),
         "the success line is on stdout: {}",
@@ -2148,6 +2153,71 @@ fn drain_completes_and_exits_zero_unix() {
     assert!(
         !run.stderr.contains("did NOT complete"),
         "a completed drain prints NO timed-out note; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_bound_override_reaches_the_engine_unix() {
+    // Review round 1 (B8): the CLI `--timeout-ms` override is the FIRST tier
+    // of the drain's three-tier bound — it must REACH the engine. The
+    // manifest declares a 600_000ms (ten-minute) bound over an idle file
+    // nobody touches; the 900ms override must govern instead. The
+    // override-is-advisory mutant burns the manifest bound (a ten-minute
+    // test); the elapsed wall-clock assert fails it fast.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // No idle fixture: the declared idle file is NEVER touched, so the
+        // drain can only end via its bound.
+        &["--linger-ms", "600000"],
+        "timeout_ms = 600000\nidle_file = \"never.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let started = std::time::Instant::now();
+    let run = run_hekma_agent(
+        &["agent", "drain", "svc", "--timeout-ms", "900"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the 900ms override must govern the drain (the manifest's ten-minute \
+         bound must not burn) — took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("did NOT complete"),
+        "the timed-out outcome is surfaced on stderr: {}",
         run.stderr
     );
 }
@@ -2187,12 +2257,13 @@ fn drain_that_times_out_still_exits_zero_and_says_so_unix() {
     start_via_surviving_engine(state_dir, "svc");
 
     let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
-    assert!(
-        run.success,
-        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={}",
-        run.stderr
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
     );
-    assert_eq!(run.code, Some(0), "stdout={}", run.stdout);
     assert!(
         run.stdout.contains("stopped"),
         "the final state is on stdout in BOTH outcomes: {}",

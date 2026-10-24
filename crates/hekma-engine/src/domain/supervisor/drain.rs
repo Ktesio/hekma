@@ -60,9 +60,146 @@ pub(super) enum BoundedCommandOutcome {
     /// The command could not run to a zero exit: spawn failure, nonzero
     /// exit, or a wait error — `detail` names which and why.
     Failed { detail: String },
-    /// The command outlived its bound; it was KILLED (and reaped) — the
-    /// bound is real, never advisory.
-    Overran,
+    /// The command outlived its bound; it was KILLED — the bound is real,
+    /// never advisory. `unreaped_note` is set ONLY when the killed child
+    /// could not be confirmed reaped within [`KILL_REAP_BOUND`] (an
+    /// unkillable D-state child): ONE honest diagnostic the caller surfaces
+    /// (AI-18) — the verb never blocks past its bound waiting on a corpse.
+    Overran { unreaped_note: Option<String> },
+}
+
+/// How many trailing stderr bytes a bounded lifecycle command's failure
+/// detail carries (story 18-4 review round 1, A4): the tail is the adapter's
+/// own printed why ("why the pause did not happen"), bounded so a chatty or
+/// hostile command cannot blow up the rejection message. The reader keeps a
+/// rolling window of twice this and trims at collection.
+const STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// How long the bounded runner waits for the stderr reader thread to see EOF
+/// after the child is gone (story 18-4 review round 1, A4). Normally the
+/// child's death closes the pipe and the reader is already finished; the
+/// bound only covers the grandchild-shaped corner (a child of the command
+/// inheriting the stderr write end and outliving it) — past it the tail is
+/// collected from what landed and the reader is abandoned (it dies with the
+/// process; joining it would block the verb on someone else's lifetime).
+const STDERR_TAIL_JOIN_GRACE: Duration = Duration::from_millis(1_000);
+
+/// RAII kill-on-drop guard around a bounded lifecycle command's child (story
+/// 18-4 review round 1, A6): an engine drop MID-COMMAND (a panic unwinding
+/// the drain, the host tearing down under it) must not orphan the child.
+/// Drop sends the best-effort kill and does NOT block on a reap (the
+/// bounded-reap discipline is for the verbs' happy path; on a drop path there
+/// is no caller left to surface a note to). Disarmed once the child is
+/// confirmed exited and reaped — a kill after a reap could signal a recycled
+/// pid.
+struct KillOnDrop {
+    child: std::process::Child,
+    armed: bool,
+}
+
+impl KillOnDrop {
+    /// Disarm: the child is exited and reaped (or accounted for) — dropping
+    /// must not kill.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.child.kill();
+        }
+    }
+}
+
+/// Kill the child and REAP it bounded (story 18-4 review round 1, A5): a
+/// plain `child.wait()` after the kill can block forever on an unkillable
+/// (D-state) child, wedging the verb — and with it the supervisor mutex —
+/// past its bound. Instead: kill, then poll `try_wait` on
+/// [`BOUNDED_COMMAND_POLL`] cadence up to [`KILL_REAP_BOUND`]; if the corpse
+/// is still unreaped at the bound, return ONE diagnostic naming it and
+/// proceed — never block past the bound. `rendered` names the command in the
+/// note.
+fn kill_and_reap_bounded(child: &mut std::process::Child, rendered: &str) -> Option<String> {
+    let _ = child.kill();
+    let deadline = Instant::now() + KILL_REAP_BOUND;
+    loop {
+        match child.try_wait() {
+            // Reaped (or the read failed in a way that means it is gone in a
+            // way we cannot read — the same "gone" either way): nothing to
+            // surface.
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Some(format!(
+                        "the lifecycle command '{rendered}' (pid {}) was killed at its bound \
+                         but could not be confirmed reaped within {}s (an unkillable \
+                         process state?); proceeding without blocking on it",
+                        child.id(),
+                        KILL_REAP_BOUND.as_secs(),
+                    ));
+                }
+                std::thread::sleep(BOUNDED_COMMAND_POLL);
+            }
+        }
+    }
+}
+
+/// Drain the bounded stderr tail (story 18-4 review round 1, A4): bounded
+/// join on the reader thread, then the last [`STDERR_TAIL_BYTES`] of what
+/// landed, as UTF-8 (lossy — stderr is bytes). Empty when the command said
+/// nothing (or nothing survived the window).
+fn collect_stderr_tail(
+    buffer: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+) -> String {
+    let grace = Instant::now() + STDERR_TAIL_JOIN_GRACE;
+    while !reader.is_finished() && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let buf = buffer.lock().unwrap();
+    if buf.len() > STDERR_TAIL_BYTES {
+        String::from_utf8_lossy(&buf[buf.len() - STDERR_TAIL_BYTES..]).into_owned()
+    } else {
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+/// Spawn the concurrent stderr tail reader (story 18-4 review round 1, A4):
+/// the reader drains the pipe continuously so a chatty command can never
+/// fill it and block on write (the pipe-full deadlock — a blocked child
+/// never exits, so a read-only-after-exit design could hang on its own
+/// pipe), keeping only a rolling window of the last bytes. Pure `std`.
+fn spawn_stderr_tail_reader(
+    stderr: std::process::ChildStderr,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let handle = {
+        let buffer = std::sync::Arc::clone(&buffer);
+        use std::io::Read as _;
+        std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut chunk = [0u8; 1024];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut buf = buffer.lock().unwrap();
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.len() > STDERR_TAIL_BYTES * 2 {
+                            let excess = buf.len() - STDERR_TAIL_BYTES;
+                            buf.drain(..excess);
+                        }
+                    }
+                }
+            }
+        })
+    };
+    (buffer, handle)
 }
 
 /// Render a [`StartLaunch`] as the human-readable command line the causes
@@ -81,11 +218,23 @@ pub(super) fn render_command(launch: &StartLaunch) -> String {
 /// Run ONE bounded lifecycle command (story 18-4): spawn `launch` with the
 /// Agent `home` as its working directory, its declared envs overlaid on the
 /// inherited environment (the same overlay rule the start launch uses),
-/// stdio discarded (the command's output is the adapter's business — the
-/// side effects on disk are the contract), and poll `try_wait` on `poll`
-/// cadence against the `bound`. On overrun the child is KILLED and reaped
-/// before returning [`BoundedCommandOutcome::Overran`] — a timed-out
-/// command never survives its bound.
+/// and poll `try_wait` on `poll` cadence against the `bound`. On overrun the
+/// child is KILLED and reaped — bounded (A5) — before returning
+/// [`BoundedCommandOutcome::Overran`]; a timed-out command never survives
+/// its bound, and an unkillable corpse never blocks past it (the unreaped
+/// note rides the outcome for the caller to surface).
+///
+/// stdio (story 18-4 review round 1, A4): the child's STDIN is null (a
+/// command that reads stdin must not block on the operator's TTY), stdout is
+/// discarded (the command's output is the adapter's business — the side
+/// effects on disk are the contract), and STDERR is piped through a
+/// concurrent bounded reader: the last [`STDERR_TAIL_BYTES`] are captured
+/// into a FAILED outcome's detail (the adapter's own printed why, beside the
+/// exit status), and the concurrent drain means a chatty command can never
+/// fill the pipe and deadlock on it.
+///
+/// The child is kill-on-drop (A6): an engine drop mid-command kills it
+/// (best-effort, no blocking wait) instead of orphaning it.
 ///
 /// Portable by construction (`std::process` only — no libc, no job objects),
 /// which is exactly the cooperative model's point: the manifest's own
@@ -105,10 +254,11 @@ pub(super) fn run_bounded_command(
         .args(&launch.args)
         .current_dir(home)
         .envs(&launch.env)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+        .stderr(std::process::Stdio::piped());
+    let mut guard = match command.spawn() {
+        Ok(child) => KillOnDrop { child, armed: true },
         Err(source) => {
             return BoundedCommandOutcome::Failed {
                 detail: format!(
@@ -118,18 +268,44 @@ pub(super) fn run_bounded_command(
             }
         }
     };
+    let rendered = render_command(launch);
+    let (tail_buffer, tail_reader) = {
+        let stderr = guard.child.stderr.take();
+        match stderr {
+            Some(stderr) => spawn_stderr_tail_reader(stderr),
+            // The pipe was not handed to us (a platform spawn quirk): no tail
+            // to capture — the reader slot degrades to an already-finished
+            // thread so every collection path stays uniform.
+            None => (
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                std::thread::spawn(|| {}),
+            ),
+        }
+    };
     // Saturating deadline (race-free by construction: ONE Instant, fixed
     // before the loop — never a measured-vs-flat comparison). A bound that
     // cannot be represented ends immediately: the deadline IS now.
     let deadline = Instant::now().checked_add(bound);
     loop {
-        match child.try_wait() {
+        match guard.child.try_wait() {
             Ok(Some(status)) => {
+                let tail = collect_stderr_tail(&tail_buffer, tail_reader);
+                guard.disarm(); // exited and reaped — a kill could hit a recycled pid
                 if status.success() {
                     return BoundedCommandOutcome::Exited0;
                 }
+                let tail_suffix = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; the command's stderr (last {} bytes): {tail}",
+                        STDERR_TAIL_BYTES
+                    )
+                };
                 return BoundedCommandOutcome::Failed {
-                    detail: format!("exited {status} — the lifecycle change was not performed"),
+                    detail: format!(
+                        "exited {status} — the lifecycle change was not performed{tail_suffix}"
+                    ),
                 };
             }
             Ok(None) => {
@@ -138,21 +314,37 @@ pub(super) fn run_bounded_command(
                     None => true,
                 };
                 if expired {
-                    // The bound is real: kill and reap before reporting.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return BoundedCommandOutcome::Overran;
+                    // The bound is real: kill, reap BOUNDED (A5 — an
+                    // unkillable child never blocks past this bound), and
+                    // collect the reader before reporting.
+                    let unreaped_note = kill_and_reap_bounded(&mut guard.child, &rendered);
+                    let _ = collect_stderr_tail(&tail_buffer, tail_reader);
+                    guard.disarm();
+                    return BoundedCommandOutcome::Overran { unreaped_note };
                 }
                 std::thread::sleep(poll);
             }
             Err(source) => {
                 // The wait itself failed (the child is gone in a way we
-                // cannot read). Kill-and-reap is best-effort; report
-                // honestly — this is NOT a zero exit.
-                let _ = child.kill();
-                let _ = child.wait();
+                // cannot read). Bounded kill-and-reap is best-effort; the
+                // captured stderr tail (if any landed) rides the detail —
+                // report honestly, this is NOT a zero exit.
+                let unreaped_note = kill_and_reap_bounded(&mut guard.child, &rendered);
+                let tail = collect_stderr_tail(&tail_buffer, tail_reader);
+                guard.disarm();
+                let reap_suffix = match unreaped_note {
+                    Some(note) => format!("; {note}"),
+                    None => String::new(),
+                };
+                let tail_suffix = if tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("; the command's stderr (tail): {tail}")
+                };
                 return BoundedCommandOutcome::Failed {
-                    detail: format!("waiting on the command failed: {source}"),
+                    detail: format!(
+                        "waiting on the command failed: {source}{reap_suffix}{tail_suffix}"
+                    ),
                 };
             }
         }
@@ -213,7 +405,10 @@ impl Supervisor {
     ///    the deadline — the three-tier bound governs the command too). A
     ///    failed command (nonzero / spawn failure) rejects the drain with the
     ///    state UNTOUCHED ([`EngineError::PauseCommandFailed`] — never a fake
-    ///    pause); an OVERRUN command is killed and IS the timed-out path.
+    ///    pause); an OVERRUN command is killed and IS the timed-out path —
+    ///    and commits NO pause edge (review round 1, A2: a command killed
+    ///    before its side effect landed is not a pause; the row stays
+    ///    `running` through the stop).
     /// 6. step (b): the bounded wait — the shared
     ///    [`super::super::probe_kinds::file_fresh`] evaluator polls the
     ///    declared idle signal (agent-home-relative; freshness with a small
@@ -327,6 +522,11 @@ impl Supervisor {
         let deadline = started.checked_add(bound).unwrap_or(started);
 
         let mut timed_out = false;
+        // A3 (review round 1): set when the AGENT process ends on its own
+        // while the wait runs — the declared idle wait never completed (the
+        // agent is gone), so the outcome is honestly `completed: false` even
+        // though no bound burned.
+        let mut agent_ended = false;
 
         // (5) Step (a): the pause COMMAND, under the drain's own bound (the
         // command shares the deadline — the three-tier bound governs it too).
@@ -342,7 +542,33 @@ impl Supervisor {
                 BOUNDED_COMMAND_POLL,
             );
             match outcome {
-                BoundedCommandOutcome::Exited0 => {}
+                BoundedCommandOutcome::Exited0 => {
+                    // The command RAN — commit the cooperative pause (persist
+                    // first, AI-9), with the rendered command recorded on the
+                    // cause. A commit failure AFTER the command ran is a
+                    // surfaced divergence (the agent was told to pause; the
+                    // ledger refused) — the same post-commit honesty the
+                    // signal path carries.
+                    self.ensure_log_dir(registry, &name)?;
+                    if let Err(err) = self.transition(
+                        registry,
+                        &name,
+                        LifecycleState::Running,
+                        LifecycleState::Paused,
+                        TransitionCause::pause_cooperative(rendered),
+                    ) {
+                        self.emit_diagnostic(&format!(
+                            "{}: the drain's pause command already ran, but recording the \
+                             running→paused transition failed ({err}) — the ledger and the agent \
+                             may diverge; the drain proceeds to the stop either way",
+                            name.as_str(),
+                        ));
+                        return Err(err);
+                    }
+                    if let Some(supervised) = self.running.get_mut(&name) {
+                        supervised.cooperatively_paused = true;
+                    }
+                }
                 BoundedCommandOutcome::Failed { detail } => {
                     // NEVER a fake pause: the command spoke, the drain is
                     // rejected, the durable state is untouched.
@@ -353,38 +579,21 @@ impl Supervisor {
                         detail,
                     });
                 }
-                BoundedCommandOutcome::Overran => {
-                    // The command outlived the drain's own bound: killed,
-                    // and this IS the timed-out path — the drain still
-                    // stops (the last step is unconditional), recording
-                    // `completed: false`. Not a rejection: the bound, not
-                    // the adapter, ended the wait.
+                BoundedCommandOutcome::Overran { unreaped_note } => {
+                    // A2 (review round 1): the command outlived the drain's
+                    // own bound and was KILLED — likely BEFORE its side
+                    // effect landed — so it is NOT a pause, and no
+                    // `pause-cooperative` edge may be committed (a lying edge
+                    // would flip every later `classify_pause_kind` reader).
+                    // The row stays `running`; this IS the timed-out path:
+                    // the drain still stops (the last step is unconditional),
+                    // recording `completed: false`. Not a rejection: the
+                    // bound, not the adapter, ended the wait.
+                    if let Some(note) = unreaped_note {
+                        self.emit_diagnostic(&note);
+                    }
                     timed_out = true;
                 }
-            }
-            // The command RAN — commit the cooperative pause (persist first,
-            // AI-9), with the rendered command recorded on the cause. A
-            // commit failure AFTER the command ran is a surfaced divergence
-            // (the agent was told to pause; the ledger refused) — the same
-            // post-commit honesty the signal path carries.
-            self.ensure_log_dir(registry, &name)?;
-            if let Err(err) = self.transition(
-                registry,
-                &name,
-                LifecycleState::Running,
-                LifecycleState::Paused,
-                TransitionCause::pause_cooperative(rendered),
-            ) {
-                self.emit_diagnostic(&format!(
-                    "{}: the drain's pause command already ran, but recording the \
-                     running→paused transition failed ({err}) — the ledger and the agent \
-                     may diverge; the drain proceeds to the stop either way",
-                    name.as_str(),
-                ));
-                return Err(err);
-            }
-            if let Some(supervised) = self.running.get_mut(&name) {
-                supervised.cooperatively_paused = true;
             }
         }
 
@@ -394,9 +603,36 @@ impl Supervisor {
         // is already satisfied — the command's zero exit was the wait.
         if !timed_out {
             if let Some(idle_path) = &idle_file {
-                let slack_ms = u64::try_from(DRAIN_IDLE_FRESH_SLACK.as_millis())
-                    .unwrap_or(DRAIN_IDLE_FRESH_SLACK.as_millis() as u64);
+                let slack_ms = DRAIN_IDLE_FRESH_SLACK_MS;
                 loop {
+                    // A3 (review round 1): the AGENT may end mid-wait (a
+                    // crash, a declared exit) — a blind file-only poll would
+                    // burn the whole bound over a corpse and misattribute the
+                    // terminal edge. Poll the child too (the reaper's
+                    // `backend.poll` shape; the supervision lock is held for
+                    // the whole wait — the D1 defer — so the reaper cannot
+                    // poll for us). On an exit, break early and proceed to
+                    // the stop: the terminal edge is whatever the honest
+                    // path records (the stop of an already-exited child),
+                    // never a fabricated completion. No handle held (the
+                    // adopted-no-handle shape) → nothing to poll — the file
+                    // poll alone stands.
+                    let child_ended = match self.running.get_mut(&name) {
+                        Some(supervised) => matches!(
+                            self.backend.poll(&mut supervised.handle),
+                            Ok(status) if status.is_exited()
+                        ),
+                        None => false,
+                    };
+                    if child_ended {
+                        self.emit_diagnostic(&format!(
+                            "{}: the agent process ended on its own while the drain waited — \
+                             the declared idle wait did not complete; proceeding to the stop",
+                            name.as_str(),
+                        ));
+                        agent_ended = true;
+                        break;
+                    }
                     match drain_decision(
                         Instant::now(),
                         deadline,
@@ -418,7 +654,7 @@ impl Supervisor {
         // command included) — saturating, as-spent, honest.
         let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = DrainOutcome {
-            completed: !timed_out,
+            completed: !timed_out && !agent_ended,
             waited_ms,
         };
 
@@ -555,9 +791,16 @@ mod tests {
         // The DEFAULT drain bound (the third tier): 30s.
         assert_eq!(DRAIN_DEFAULT_BOUND, Duration::from_secs(30));
         // The idle-freshness slack (engine-owned, above the poll cadence).
-        assert_eq!(DRAIN_IDLE_FRESH_SLACK, Duration::from_millis(2_000));
+        // Review round 1, C5: the plain-ms value is the ONE spelling — the
+        // wait loop passes it straight to `file_fresh` (whose parameter is
+        // u64), so there is no second Duration spelling to drift.
+        assert_eq!(DRAIN_IDLE_FRESH_SLACK_MS, 2_000);
         // The poll cadences: bounded latency, never part of any bound.
         assert_eq!(DRAIN_WAIT_POLL, Duration::from_millis(25));
         assert_eq!(BOUNDED_COMMAND_POLL, Duration::from_millis(20));
+        // The bounded kill-and-reap bound (review round 1, A5): a killed
+        // command's reap may take this long at most before the verb proceeds
+        // with ONE honest note — never blocks past it.
+        assert_eq!(KILL_REAP_BOUND, Duration::from_secs(5));
     }
 }

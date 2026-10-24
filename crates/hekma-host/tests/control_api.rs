@@ -780,16 +780,19 @@ fn registered_drain_fake_agent(
 fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
     let state = tempfile::tempdir().unwrap();
     let base = state.path().to_path_buf();
-    // Completed shape: the idle signal lands 400ms after the AGENT starts —
-    // inside the manifest's 10s bound at any machine speed.
+    // Completed shape: the idle signal lands 800ms after the PAUSE SENTINEL —
+    // the file this drain's own pause command writes — so it provably
+    // arrives during the drain's wait (review round 1, B13's re-anchored
+    // fixture; the old process-start clock could let the file predate the
+    // drain entry and complete for the wrong reason).
     let _idle = registered_drain_fake_agent(
         &base,
         "drainer",
         &[
             "--linger-ms",
             "600000",
-            "--idle-after-ms",
-            "400:idle.sentinel",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
         ],
         "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
     );
@@ -853,6 +856,14 @@ fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
     assert_eq!(json["completed"], true, "{json}");
     assert_eq!(json["instance"]["state"], "stopped");
     let waited = json["waited_ms"].as_u64().unwrap();
+    // The floor (review round 1, B9): the re-anchored idle fixture lands the
+    // file ~800ms AFTER the drain's pause sentinel — so a genuinely waiting
+    // drain always exceeds 500ms; a skip-the-wait mutant (or an idle file
+    // that predated the drain) reads ~0 and fails here.
+    assert!(
+        waited >= 500,
+        "the wait genuinely waited for the anchored idle signal (waited {waited}ms)"
+    );
     assert!(
         waited < 9000,
         "the completed drain finished inside its manifest bound (waited {waited}ms)"

@@ -2362,6 +2362,32 @@ mod tests {
             None,
             "a declared clean exit is not a failure cause"
         );
+        // 18-4 review pin (B12): the cooperative lifecycle causes are state
+        // transitions, not failures — a paused/resumed instance and a
+        // drain's honest stopped outcome (COMPLETED or NOT — even the
+        // overrun edge is a bounded stop, not a crash) must all render
+        // detail-free here. A mutant that routes any of them into the
+        // failure-bearing arms would invent failure text for a pause.
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::pause_cooperative("the-pause --graceful")),
+            None,
+            "a cooperative pause is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::resume_cooperative("the-resume")),
+            None,
+            "a cooperative resume is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::drain_stopped(true, 5_000)),
+            None,
+            "a completed drain is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::drain_stopped(false, 5_000)),
+            None,
+            "an overran drain is a bounded stop, not a failure cause"
+        );
     }
 
     #[test]

@@ -138,6 +138,19 @@
 //!   already there. The drain-side mirror of `--ready-file` (which gates a
 //!   readiness probe the same way). Pure `std`, NO OS-cfg.
 //!
+//! * `--idle-on-pause <DELAY_MS>:<PAUSE>:<IDLE>`  (18-4 review round 1)  wait
+//!   until `<PAUSE>` EXISTS (polling every 25 ms), sleep `<DELAY_MS>`, then
+//!   create `<IDLE>` — the RE-ANCHOR twin of `--idle-after-ms`: the delay
+//!   counts from the pause sentinel's arrival (the file the drain's own pause
+//!   command writes), not from process start, so a drill proves the idle file
+//!   lands DURING the drain's wait rather than predating the drain entry. The
+//!   value splits on the FIRST colon for the delay and the FIRST colon of the
+//!   remainder for `<PAUSE>` (the `--idle-after-ms` discipline — the IDLE
+//!   tail may itself contain colons, a Windows drive path). A write failure
+//!   is announced to stderr and skipped (best-effort — the engine's drain
+//!   then honestly times out instead of faking a completion). Pure `std`,
+//!   NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -402,6 +415,12 @@ struct Opts {
     /// wait observes ARRIVING mid-drain, proving the wait loop genuinely
     /// waited rather than skipped. `None` = no idle file.
     idle_after: Option<(PathBuf, u64)>,
+    /// Create this file `<delay_ms>` after the PAUSE anchor first EXISTS
+    /// (18-4 review round 1, B13): the re-anchored idle fixture — the delay
+    /// counts from the pause sentinel's arrival, not process start, so a
+    /// drain drill proves the idle file lands DURING the drain's wait.
+    /// `None` = no anchored idle file.
+    idle_on_pause: Option<(u64, PathBuf, PathBuf)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -474,6 +493,7 @@ fn parse() -> Opts {
     let mut hang_before: Option<Duration> = None;
     let mut watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)> = None;
     let mut idle_after: Option<(PathBuf, u64)> = None;
+    let mut idle_on_pause: Option<(u64, PathBuf, PathBuf)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -756,8 +776,17 @@ fn parse() -> Opts {
                 }
             }
             "--touch" => {
-                if let Some(path) = args.next() {
-                    touch = Some(PathBuf::from(path));
+                // Fail fast (the hang-before posture): a silently-ignored
+                // touch would turn the lifecycle command into a plain
+                // lingering agent, and a drill would read the engine's
+                // command-timeout path instead of the touch side effect it
+                // means to observe.
+                match args.next() {
+                    Some(path) => touch = Some(PathBuf::from(path)),
+                    None => {
+                        eprintln!("fake_agent: --touch requires PATH (got a missing value)");
+                        std::process::exit(2);
+                    }
                 }
             }
             "--hang-before" => {
@@ -826,6 +855,36 @@ fn parse() -> Opts {
                         eprintln!(
                             "fake_agent: --idle-after-ms requires DELAY_MS:PATH (got missing \
                              or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--idle-on-pause" => {
+                // DELAY_MS:PAUSE:IDLE — split on the FIRST colon for the delay
+                // (a number never contains one), then the FIRST colon of the
+                // remainder for the pause anchor (the `--idle-after-ms`
+                // discipline: the IDLE tail may itself contain colons — a
+                // Windows drive path). FAIL FAST (the ready-file posture): a
+                // silently-ignored anchored idle signal would make a drain
+                // re-anchor drill read "timed out" instead of the
+                // "completed after the pause" behavior under test.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (ms, rest) = v.split_once(':')?;
+                    let (anchor, idle) = rest.split_once(':')?;
+                    let ms = ms.parse::<u64>().ok()?;
+                    if anchor.is_empty() || idle.is_empty() {
+                        return None;
+                    }
+                    Some((ms, PathBuf::from(anchor), PathBuf::from(idle)))
+                });
+                match parsed {
+                    Some(triple) => idle_on_pause = Some(triple),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --idle-on-pause requires DELAY_MS:PAUSE:IDLE (a \
+                             non-negative millisecond delay and two paths, colon-separated; \
+                             got a missing or malformed value)"
                         );
                         std::process::exit(2);
                     }
@@ -955,6 +1014,7 @@ fn parse() -> Opts {
         hang_before,
         watch_sentinel,
         idle_after,
+        idle_on_pause,
     }
 }
 
@@ -1018,7 +1078,18 @@ fn main() {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&path, b"touched");
+        // Review round 1 (A9): a failed write must not read as success — the
+        // touch IS the lifecycle command's observable side effect, so a
+        // failure exits 1 (the engine records the command as failed) and
+        // names the path on stderr (surfaced, never a silent exit-0 with no
+        // file).
+        if let Err(err) = std::fs::write(&path, b"touched") {
+            eprintln!(
+                "fake_agent: --touch could not write {} ({err})",
+                path.display()
+            );
+            std::process::exit(1);
+        }
         std::process::exit(0);
     }
 
@@ -1040,6 +1111,16 @@ fn main() {
     // OS-cfg.
     if let Some((path, ms)) = opts.idle_after.clone() {
         thread::spawn(move || touch_idle_file(path, Duration::from_millis(ms), process_start));
+    }
+
+    // 18-4 review round 1 (B13): the PAUSE-anchored idle fixture — the same
+    // EARLY-start posture as `--idle-after-ms` above, but the delay counts
+    // from the pause sentinel's ARRIVAL (the file the drain's own pause
+    // command writes), so a drain drill proves the idle file lands DURING
+    // the drain's wait rather than predating the drain entry. Pure `std`,
+    // NO OS-cfg.
+    if let Some((ms, anchor, idle)) = opts.idle_on_pause.clone() {
+        thread::spawn(move || touch_idle_on_pause(Duration::from_millis(ms), anchor, idle));
     }
 
     // Readiness-probe fixtures: each thread starts EARLY (before the ready
@@ -1500,6 +1581,33 @@ fn touch_idle_file(path: PathBuf, delay: Duration, process_start: Instant) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, b"idle");
+}
+
+/// The `--idle-on-pause` fixture (18-4 review round 1, B13): create the idle
+/// file `delay` ms after the pause anchor first EXISTS, polling for it every
+/// 25 ms. The RE-ANCHOR twin of `touch_idle_file`: that fixture's delay counts
+/// from PROCESS START, so a drain that pauses LATE can observe an
+/// already-stale idle file and "complete" for the wrong reason; anchored to
+/// the pause sentinel (the file the drain's own pause command writes), the
+/// idle file provably lands DURING the drain's wait. A write failure is
+/// announced to stderr and skipped (best-effort, the `--watch-sentinel`
+/// honesty posture — the engine's drain then honestly times out instead of
+/// faking a completion). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn touch_idle_on_pause(delay: Duration, anchor: PathBuf, idle: PathBuf) {
+    while std::fs::metadata(&anchor).is_err() {
+        sleep(Duration::from_millis(25));
+    }
+    sleep(delay);
+    if let Some(parent) = idle.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&idle, b"idle") {
+        eprintln!(
+            "fake_agent: --idle-on-pause could not write {} ({err}) — no idle signal",
+            idle.display()
+        );
+    }
 }
 
 /// The `--ready-line` fixture: after the declared delay, print the readiness
