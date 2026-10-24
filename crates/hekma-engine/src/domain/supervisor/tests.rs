@@ -2453,6 +2453,25 @@ fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
              requested-recycle 2)",
         ),
         (TransitionCause::clean_exit(0), " (clean-exit: exit code 0)"),
+        // Story 18-4: the cooperative + drain arms are pinned — the wire tags
+        // (`pause-cooperative`, `resume-cooperative`, `drain-stopped`) are
+        // greppable contract, and the drain arm spells the OUTCOME.
+        (
+            TransitionCause::pause_cooperative("fake-agent --touch pause.sentinel"),
+            " (pause-cooperative: fake-agent --touch pause.sentinel)",
+        ),
+        (
+            TransitionCause::resume_cooperative("fake-agent --touch resume.sentinel"),
+            " (resume-cooperative: fake-agent --touch resume.sentinel)",
+        ),
+        (
+            TransitionCause::drain_stopped(true, 1500),
+            " (drain-stopped: completed in 1500ms)",
+        ),
+        (
+            TransitionCause::drain_stopped(false, 30_000),
+            " (drain-stopped: timed out after 30000ms; stopped anyway)",
+        ),
     ];
     for (cause, want_suffix) in cases {
         assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");

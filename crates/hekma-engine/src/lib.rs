@@ -109,7 +109,7 @@ pub use adapter::{AdapterRef, ResolvedAdapter};
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,
-    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink,
+    BudgetBreachEvent, BudgetView, ConfigError, ConfigLayer, CostCap, DiagnosticSink, DrainOutcome,
     EffectiveConfig, EngineError, EngineEvent, EstimateLabel, ExportBatch, FleetEntry,
     FleetListing, FleetTotals, InstanceName, LifecycleCommand, LifecycleError, LifecycleState,
     LogLine, LogStream, Micros, NameError, OutboxCursor, OutboxEntry, Rate, Registry,
@@ -121,7 +121,7 @@ pub use domain::{
     OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PASS_THROUGH_PREFIX, PAST_TAIL_SENTENCE, SECRET_MASK,
     USAGE_SCHEMA_VERSION,
 };
-pub use engine::{Blocking, Engine, EngineOptions, EventSubscription, InstanceStatus};
+pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
 // Story 19-1: the governance conformance vectors (AD-7/FR-44) — the embedded
 // artifact bytes plus the version/checksum accessors a Host pins against, and
 // the pure `decide` core the artifact is generated from. Additive surface.

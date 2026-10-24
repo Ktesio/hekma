@@ -133,6 +133,21 @@ use thiserror::Error;
 /// posture: absent means every unrequested exit is a crash exactly as before,
 /// and the `1.0.0`-engine rejection is pinned by
 /// `contract_v1_0_0_engine_rejects_the_exit_codes_section`.
+///
+/// **The same `1.1.0` minor also carries `[drain]` (story 18-4) — and EXECUTES
+/// the lifecycle pair:** the schema gains an OPTIONAL `[drain]` section
+/// declaring the drain composite's bounded wait (`timeout_ms`, required,
+/// `1..=600_000`; optional `idle_file` — an Agent-Home-relative path the agent
+/// touches when its in-flight work reaches zero). The SAME story makes the
+/// v1.0.0-era `[lifecycle.pause]`/`[lifecycle.resume]` op templates EXECUTED
+/// (cooperative pause/resume commands, causes `pause-cooperative` /
+/// `resume-cooperative`; the declared command outranks the OS-signal path and
+/// is OS-independent) and adds one semantic validation rule: declaring
+/// exactly ONE of the pair is refused at registration (an unresumable pause is
+/// a trap; both fields named). `[drain]` alone is new schema, so the additive
+/// posture holds verbatim: a manifest without it parses identically, and the
+/// `1.0.0`-engine rejection is pinned by
+/// `contract_v1_0_0_engine_rejects_the_drain_section`.
 pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The Adapter Contract compatibility rule the engine enforces at registration
@@ -238,10 +253,10 @@ pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, ExitClass, ExitCodeClasses, ExitCodes, FileFreshProbe, HeartbeatFileCheck,
-    HttpGetCheck, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle, Liveness,
-    LivenessCheck, LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate, Readiness,
-    ReadinessGate, ReadinessKind, ReadinessProbe,
+    AdapterIdentity, Drain, DrainSpec, ExitClass, ExitCodeClasses, ExitCodes, FileFreshProbe,
+    HeartbeatFileCheck, HttpGetCheck, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle,
+    Liveness, LivenessCheck, LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate,
+    Readiness, ReadinessGate, ReadinessKind, ReadinessProbe,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;

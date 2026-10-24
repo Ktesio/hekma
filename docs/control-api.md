@@ -71,6 +71,7 @@ it).
 | `POST` | `/v0/instances/{name}/stop` | Stop through the bounded ladder; optional body `{"window_secs": N}` (1..=86400, out-of-bounds is a 400). A PRESENT body must parse — only a truly ABSENT body means the engine's default window | 200 + read-back |
 | `POST` | `/v0/instances/{name}/pause` | Pause the agent | 200 + read-back |
 | `POST` | `/v0/instances/{name}/resume` | Resume a paused agent | 200 + read-back |
+| `POST` | `/v0/instances/{name}/drain` | Drain the agent (pause command → bounded idle wait → stop); optional body `{"timeout_ms": N}` (`1..=600000`, out-of-bounds is a 400; a truly absent body means the manifest tier, else the engine default). BOTH outcomes are `200` — a timed-out drain still stopped the agent, and the document reports it honestly (`completed: false`, with `waited_ms` the measured wait) rather than as an error. Draining a non-running instance is refused with the lifecycle verbs' 409 conflict. The response is `{"schema_version", "instance", "completed", "waited_ms"}` | 200 + read-back + outcome |
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |

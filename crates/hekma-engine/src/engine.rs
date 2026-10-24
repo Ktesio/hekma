@@ -97,6 +97,21 @@ pub struct InstanceStatus {
     pub failed_cause: Option<String>,
 }
 
+/// The `drain` verb's report (story 18-4): the STOPPED instance plus the
+/// composite's durable [`DrainOutcome`]. Both outcomes — completed and
+/// timed-out — are a SUCCESS at the type level (the drain's last step is
+/// unconditional; a timed-out drain still stopped the agent honestly), so
+/// the outcome fields — not the `Result` — carry the wait's truth, and the
+/// caller surfaces a timed-out drain as a note, never an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainReport {
+    /// The instance in its terminal `stopped` state (with the drain's
+    /// durable cause on its last transition edge).
+    pub instance: AgentInstance,
+    /// What the bounded wait actually did.
+    pub outcome: crate::domain::DrainOutcome,
+}
+
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
 /// for the failure-bearing causes (a launch error, a crash — the 18-3 charged
@@ -285,6 +300,19 @@ pub struct EngineOptions {
     /// never reads as one.
     #[doc(hidden)]
     pub stable_run_window_override: Option<Duration>,
+    /// Story 18-4's TEST SCALING SEAM for the ENGINE-OWNED standalone
+    /// pause-command cap: `Some(cap)` overrides [`PAUSE_COMMAND_CAP`] (30 s)
+    /// on this engine's supervisor, so integration tests can drive the
+    /// cap-overrun rejection in milliseconds — the same injection posture as
+    /// [`EngineOptions::stable_run_window_override`], which production
+    /// callers never take. `None` (the default) is byte-identical production
+    /// behavior. A `Some` ZERO is IGNORED: a zero bound would kill every
+    /// declared pause command before it could start, refusing every declared
+    /// pause, so the supervisor keeps the production cap and emits a
+    /// diagnostic. NOT an operator config surface; this field stays
+    /// `#[doc(hidden)]` so it never reads as one.
+    #[doc(hidden)]
+    pub pause_command_cap_override: Option<Duration>,
 }
 
 impl std::fmt::Debug for EngineOptions {
@@ -299,6 +327,10 @@ impl std::fmt::Debug for EngineOptions {
             .field(
                 "stable_run_window_override",
                 &self.stable_run_window_override,
+            )
+            .field(
+                "pause_command_cap_override",
+                &self.pause_command_cap_override,
             )
             .finish()
     }
@@ -438,6 +470,7 @@ impl Engine {
             log_capture,
             diagnostics,
             stable_run_window_override,
+            pause_command_cap_override,
         } = options;
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
@@ -467,6 +500,12 @@ impl Engine {
         // production caller) leaves the pinned 30 s window untouched.
         if let Some(window) = stable_run_window_override {
             supervisor.override_stable_run_window(window);
+        }
+        // Story 18-4: thread the pause-command cap's TEST SCALING SEAM
+        // through the same way — `None` (every production caller) leaves the
+        // pinned 30 s standalone cap untouched.
+        if let Some(cap) = pause_command_cap_override {
+            supervisor.override_pause_command_cap(cap);
         }
         // Story 17-4: continue the outbox seq sequence from whatever a prior
         // engine lifetime committed (BEFORE the registry moves under the
@@ -1213,6 +1252,33 @@ impl Engine {
         .await
     }
 
+    /// The DRAIN composite (story 18-4): pause the running agent via its
+    /// adapter's declared `[lifecycle.pause]` COMMAND (never a signal,
+    /// OS-independent), wait — BOUNDED — for the declared idle signal, then
+    /// stop through the ordinary ladder. A drain that outlives its bound
+    /// STILL stops: both outcomes are a success at the type level (see
+    /// [`DrainReport`]), and `outcome.completed == false` is the caller's
+    /// honest timed-out signal. The bound is the three-tier rule: the
+    /// caller's `timeout_override` (validated `1..=600_000ms` — zero/past-ceiling
+    /// refuses with [`EngineError::DrainBoundInvalid`]), else the manifest
+    /// `[drain].timeout_ms`, else the engine's 30 s default.
+    pub async fn drain(
+        &self,
+        name: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor
+                .drain(&registry, &name, timeout_override)
+                .map(|(instance, outcome)| DrainReport { instance, outcome })
+        })
+        .await
+    }
+
     /// Send text input to a running Agent Instance's native input channel
     /// (story 4.1, FR-24, spine AD-12). Drives
     /// [`Supervisor::send_input`](crate::domain::Supervisor::send_input)'s
@@ -1945,6 +2011,20 @@ impl Blocking<'_> {
     /// Blocking [`Engine::resume`].
     pub fn resume(&self, name: &str) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.resume(name))
+    }
+
+    /// Blocking [`Engine::drain`] (story 18-4): the composite returns the
+    /// STOPPED instance plus the durable [`DrainOutcome`] — both outcomes
+    /// (completed and timed-out) are successes here; check
+    /// `report.outcome.completed` for the wait's truth.
+    pub fn drain(
+        &self,
+        name: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.drain(name, timeout_override))
     }
 
     /// Blocking [`Engine::send_input`].
