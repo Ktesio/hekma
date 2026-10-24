@@ -78,6 +78,8 @@ The [quickstart](https://hekma.ktesio.dev/docs/get-started/) walks through this 
 
 **Know this before you rely on it.** In 0.11.0, the CLI supervises an agent only while some `hekma` command is running. A detached agent keeps running between commands, but nothing meters it or enforces its budget until the next command, which is why the example keeps `logs --follow` open. A program that embeds the engine supervises for as long as it runs, and a long-running host, `hekma serve`, is on the main branch for the next release. [Supervision and detached runs](https://hekma.ktesio.dev/docs/detached-runs/) explains the patterns that work today.
 
+Letting an agent loose in CI? The [Agents in GitHub Actions](https://hekma.ktesio.dev/docs/agents-in-ci/) recipe caps its spend with a token budget, bounds the job on the wall clock, and lands its token and dollar usage in the step summary.
+
 ## Commands
 
 | Command | What it does |
