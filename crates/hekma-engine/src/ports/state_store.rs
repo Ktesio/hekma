@@ -91,9 +91,12 @@ pub struct SpawnRecord {
     /// (kill-on-drop) handle whose teardown at the opening command's exit
     /// would stop another process's agent (the `hekma agent list`-kills-
     /// `serve`'s-agent bug this field closes). A DEAD owner (the crashed
-    /// engine of story 1-6) adopts exactly as before, and the adopting
-    /// engine RE-STAMPS itself as the owner — so a `serve` that adopted a
-    /// crash's orphans is itself protected from the next benign command.
+    /// engine of story 1-6) adopts exactly as before — the owner column is
+    /// deliberately NOT re-stamped by the adopter (a re-stamp would make
+    /// every long-lived bystander the record's "owner"; the boundary's
+    /// protection stays scoped to the ORIGINAL spawning owner, per the note
+    /// at the adoption site in `reaper.rs`). Concurrent ADOPTION of a dead
+    /// owner's record is instead arbitrated by [`SpawnRecord::lease`].
     ///
     /// `None` for pre-boundary records (a v9 row read by a v10 engine — the
     /// migration leaves the columns NULL) and for a spawn whose own
@@ -102,6 +105,35 @@ pub struct SpawnRecord {
     /// records ignore the owner entirely — their adoption re-holds DISARMED
     /// either way (the durable-detach promise is unaffected).
     pub owner: Option<ProcessFingerprint>,
+    /// The ADOPTION LEASE: the fingerprint of the ENGINE PROCESS that won the
+    /// compare-and-set to re-adopt this record (issue #328's concurrent-open
+    /// race — two engines opening over a crashed owner's record both passed
+    /// the live-owner gate and both re-held armed kill-on-drop handles, so
+    /// whichever engine exited first killed the group out from under the
+    /// other).
+    ///
+    /// The lease is taken by [`StateStore::try_acquire_adoption_lease`] — a
+    /// compare-and-set on these columns guarded by the lease value the caller
+    /// just READ — BEFORE the adopter re-holds the handle, so the losing
+    /// engine never touches a process it must then tear down. It is consulted
+    /// by `Engine::open`'s orphan adoption for every NON-detached record
+    /// after the live-owner gate: a lease held by a LIVE engine that is not
+    /// this process skips the record (that engine supervises it now); a
+    /// dead, reused, or absent lease is compare-and-set; a lost compare-and-
+    /// set (another engine adopted between this engine's read and its write)
+    /// skips the record the same way. A record whose lease already names THIS
+    /// process adopts without re-acquiring (the process's own records are
+    /// always adoptable by it, mirroring the owner self-check).
+    ///
+    /// The lease is never written by the spawn path (`None` on every fresh
+    /// record — the spawning engine's ownership is the `owner` column's fact,
+    /// and the registry already refuses a duplicate spawn of a live record);
+    /// it dies with the row on clear/settle, and a crashed lease-holder's
+    /// stale lease is self-healing (the next open probes it dead and
+    /// compare-and-sets over it). Detached records ignore the lease entirely,
+    /// exactly as they ignore the owner (their adoption is disarmed, so the
+    /// double-armed-handle race cannot bite). `None` for pre-v11 records.
+    pub lease: Option<ProcessFingerprint>,
 }
 
 /// Persistence port for registry + lifecycle + the Usage Ledger.
@@ -289,6 +321,38 @@ pub trait StateStore {
             "this StateStore implementation does not override set_spawn_run_id \
              (needed for a durable run identity): the engine surfaces this write failure \
              and keeps the documented pre-v9 mint-per-adoption posture"
+                .to_string(),
+        ))
+    }
+
+    /// Try to take the ADOPTION LEASE on an instance's spawn record (schema
+    /// v11) — a COMPARE-AND-SET on the record's `lease` columns, guarded by
+    /// the lease value the caller just read (mirroring
+    /// [`StateStore::set_spawn_run_id`]'s fingerprint-guarded write): the
+    /// UPDATE fires only when the row's lease still equals `expected`, and a
+    /// concurrent adopter's winning write makes this call return `Ok(false)`
+    /// — an expected outcome the caller treats as "another engine adopted
+    /// it", never an error. An absent record row is also `Ok(false)` (a
+    /// vanished record adopts nothing). A `StoreError` is a real store
+    /// failure; the caller surfaces it as the write-failure diagnostic and
+    /// leaves the record for the next open (the adoption pass is best-effort
+    /// per record).
+    ///
+    /// DEFAULTED (compile-compatible for external implementors): a store that
+    /// has not implemented the lease fails LOUD with
+    /// [`StoreError::Backend`] naming the operation — the engine surfaces
+    /// that as the write-failure diagnostic and keeps the pre-v11 adopt
+    /// posture for the record, never a silent no-op.
+    fn try_acquire_adoption_lease(
+        &self,
+        _name: &InstanceName,
+        _expected: Option<ProcessFingerprint>,
+        _leaseholder: ProcessFingerprint,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Backend(
+            "this StateStore implementation does not override try_acquire_adoption_lease \\\
+             (needed to arbitrate concurrent adoptions): the engine surfaces this \\\
+             write failure and keeps the pre-v11 adopt posture for the record"
                 .to_string(),
         ))
     }

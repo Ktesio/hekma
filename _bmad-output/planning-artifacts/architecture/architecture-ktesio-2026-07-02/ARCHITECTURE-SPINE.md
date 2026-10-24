@@ -7,8 +7,8 @@ paradigm: 'hexagonal (ports & adapters) around a supervised-process core'
 scope: 'Repositioned Ktesio: embeddable personal-agent runtime engine + kt CLI (PRD prd-ktesio-2026-07-02, FR-1..39)'
 status: final
 created: '2026-07-02'
-updated: '2026-09-30'
-binds: [FR-1..FR-45, NFR-1..NFR-8]
+updated: '2026-10-23'
+binds: [FR-1..FR-48, NFR-1..NFR-8]
 sources:
   - ../../prds/prd-ktesio-2026-07-02/prd.md
   - ../../prds/prd-ktesio-2026-07-02/addendum.md
@@ -199,6 +199,61 @@ stateDiagram-v2
     measurement. Provenance: `_bmad-output/planning-artifacts/host-mode-decisions-2026-10-19.md`
     (ratified by Islam, 2026-10-19). See *Amendments (2026-10-19)*.
 
+### AD-21 — The host owns a minimal OTLP/HTTP+JSON metrics exporter; the engine stays telemetry-free
+- **Binds:** FR-46; AD-2 (no new crate), AD-8 (estimate honesty crosses into telemetry), AD-10
+  (header secrets), AD-14 (third consumer, same schema), AD-17/AD-18 (bounded-work rule on the
+  flush task), AD-20 (host scope), PRD §6 (2026-10-23 amendment), NFR-8 (zero new runtime deps).
+- **Prevents:** the heaviest dependency in workspace history (`opentelemetry` +
+  `opentelemetry-otlp` + transitive) entering for a metric-only v1; telemetry back-pressure ever
+  stalling supervision; an unlabeled dollar figure reaching a dashboard (AD-8's failure mode, one
+  Grafana panel away); a second event dialect (metrics minted from anything other than the AD-14
+  structs).
+- **Rule:** the exporter is a module inside `hekma-host` (`src/otlp/`), not a new crate, not in
+  the engine — the host is the telemetry adapter exactly as it is the HTTP adapter (AD-20). It
+  subscribes **read-only** to the public event bus and derives every metric from the existing
+  versioned AD-14 payloads; no new event kinds, no engine API change, no engine instrumentation.
+  Around that:
+  - **Hand-rolled, zero new runtime deps (option (a), ratified by Islam 2026-10-23).** OTLP/HTTP+JSON
+    is a POST of a JSON metrics batch to `<endpoint>/v1/metrics`, serialized with in-tree
+    `serde_json` over the hyper+rustls client plumbing the metering channel already proved. House
+    precedents: AD-19's hand-rolled ACP client under the identical NFR-8 argument; 17-4's std-only
+    SHA-256. The `cargo tree` diff is zero crates. *Alternatives:* **(b)** the otel SDK — rejected
+    for v1, the standing alternative; reopen triggers: a real traces consumer (post-19.4) or a
+    vendor must-have the hand-rolled path cannot meet. If a second consumer ever appears, that is
+    the moment for a `TelemetrySink` port and possibly the SDK behind it. **(c)** a Prometheus
+    scrape endpoint — rejected by Islam 2026-10-23 (standard OpenTelemetry chosen); an OTel
+    Collector in front of Hekma can still bridge to Prometheus.
+  - **Transport: OTLP/HTTP+JSON, never gRPC.** gRPC means tonic/prost — a second wire stack, a
+    proto toolchain in CI, the largest dep delta available. Binary `application/x-protobuf`
+    encoding is Deferred (volume-triggered).
+  - **Never blocks supervision.** Publish-after-commit comes free from the bus contract; a
+    `Lagged(n)` observation becomes a surfaced drop count (`hekma.otlp.dropped` + a self-metric
+    and a restart note — AI-18), never an error into supervision. The flush task is host-side,
+    off every engine lock; each POST carries an explicit timeout (AD-17); queue overflow drops
+    oldest with a surfaced note. **No durable telemetry persistence** — the outbox stays the only
+    durable/acknowledged export surface (AD-14). In-flight points lost on crash are surfaced once
+    at restart; ledger-sourced re-derivation is Deferred behind a trigger.
+  - **Naming: OTel GenAI semconv first, `hekma.*` only where no semconv exists.**
+    `gen_ai.client.token_usage` (with `gen_ai.token.type` input/output/cached) and
+    `gen_ai.client.operation_duration` — the latter emitted only once per-call latency exists
+    (Story 19.4); absent, never fabricated from run-walltime. `hekma.budget.breaches`,
+    `hekma.agent.state`, `hekma.usage.cost`, `hekma.otlp.dropped` in the `hekma.*` namespace.
+    **Every currency-bearing metric carries `estimate_state: estimated|reconciled`** — a
+    reconciled figure is a NEW data point on the `reconciled` series, never a replacement
+    (AD-8).
+  - **Resource attributes:** minimal — `service.name=hekma-host`, `service.version`,
+    `service.instance.id` (from the state-dir lock identity). No topology detection; that is the
+    collector's layer.
+  - **Config (one surface, both `hekma serve` and `hekma-host`):** `--otlp-endpoint` (default:
+    off — the exporter exists only when configured, like `--listen`), `--otlp-headers` where any
+    value may be `secret:NAME` resolved at startup through `SecretResolver` (unresolvable = typed
+    startup refusal; values live as `SecretString` — AD-10), `--otlp-flush-interval` (bounded,
+    default 10s). Cumulative temporality with an honest restart-reset, stated in docs.
+  - **Versioned exposition.** Metric names, types, attributes and units are pinned in
+    `docs/telemetry.md` under an `otlp-metrics v1` marker with the Control-API additive-only-
+    until-frozen discipline; renames/drops are versioned release-surface changes (AI-55).
+  - **Scope: metric-only v1.** Traces/spans are Deferred.
+
 ### Amendments (2026-09-30) — ratified with sprint-change-proposal-2026-09-30-hosted-platform-readiness.md
 
 - **AD-7 (2026-09-30):**
@@ -245,6 +300,18 @@ stateDiagram-v2
   ≤ 50 MiB (~52×). The bounded stop stalls in-flight reads ~2.0 s (4 of 610 fleet samples) —
   bounded, amortizing, no cascade. **The coarse two-mutex model is re-ratified;** the per-instance
   plan (`ai-63b-lock-model-decision-2026-08-27.md`) stays archived behind the standing triggers.
+
+### Amendments (2026-10-23) — ratified with sprint-change-proposal-2026-10-23-adoptability.md (Epic 20: Adoptability)
+
+- **AD-20 (2026-10-23):** the Service Host may also run a read-only OTLP metrics exporter beside
+  the Control API (AD-21): same boundary — engine public API + bus subscription only — no engine
+  change, no new crate, and it must never block supervision.
+- **AD-14 (2026-10-23, clarifying only):** AD-21's OTLP exporter is a third *consumer* of the same
+  one event schema (a bus subscriber), not an export view and not an outbox consumer; the outbox
+  remains the only durable/acknowledged export surface.
+- **AD-8 (2026-10-23):** the estimate label survives into telemetry — any currency-bearing metric
+  carries `estimate_state` (`estimated`|`reconciled`); a reconciled figure is a new series, never
+  a replacement (AD-21).
 
 ## Consistency Conventions
 
@@ -357,3 +424,4 @@ graph LR
 - *(Scheduled 2026-09-30 and removed from this list: the Service/IPC transport → AD-20 / Epic 17; reconciliation ingestion → Story 19.5. Epic/story numbers renumbered 2026-10-19 from 15/17.5 — epic numbers 15/16 were consumed on main by the autonomous Fibery-backlog tranches.)*
 - **Privilege separation and attested egress** — would make an in-container fence non-bypassable; waits for a Host topology with no external choke point.
 - **Windowed (daily/monthly) and runtime-hour budgets**, **pre-start/pre-stop lifecycle hooks**, **a declarative fleet file**, **static `aarch64` Linux**, **incremental SSE relay**, **multi-route upstreams**, **approval routing** (ACP `request_permission` to the Host), **a `hekma conformance` CLI**, and **a WASM build of the governance core** — each waits for its trigger in `deferred-work.md`.
+- *(Scheduled 2026-10-23, Epic 20 — Adoptability:)* **full otel SDK / gRPC transport** (behind AD-21's reopen triggers), **traces/spans + a spans view** (waits on Story 19.4 plus a named consumer), **a Prometheus native scrape endpoint**, **per-agent collector routing**, **OTLP binary protobuf encoding**, **host self-metrics**, **exemplars/configurable temporality**, and **ledger-sourced exporter re-derivation** — each waits for its trigger in `deferred-work.md`.
