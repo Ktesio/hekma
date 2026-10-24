@@ -99,6 +99,11 @@ pub struct ManifestFixture {
     /// about the section's shape. E.g.
     /// `"[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000"`.
     liveness: Option<String>,
+    /// The raw `[exit_codes]` section BODY (the lines under the header),
+    /// appended verbatim after the `[liveness]` block. Raw for the same
+    /// reason: the exit-codes tests are about the section's shape. E.g.
+    /// `"restart_requested = [75]\nclean = [0]"`.
+    exit_codes: Option<String>,
 }
 
 /// One `[capabilities.<name>]` block: the per-OS `os = "level"` entries in
@@ -124,6 +129,7 @@ impl ManifestFixture {
             config_env: Vec::new(),
             readiness: None,
             liveness: None,
+            exit_codes: None,
         }
     }
 
@@ -314,6 +320,16 @@ impl ManifestFixture {
         self
     }
 
+    /// A raw `[exit_codes]` section — `body` is the section's lines WITHOUT
+    /// the header, appended verbatim AFTER the `[liveness]` block, e.g.
+    /// `"restart_requested = [75]\nclean = [0]"`. Raw because the exit-codes
+    /// tests are exactly about the section's shape — valid and invalid — and
+    /// every shape is one or two short lines.
+    pub fn exit_codes(mut self, body: &str) -> Self {
+        self.exit_codes = Some(body.to_string());
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -369,10 +385,14 @@ impl ManifestFixture {
             .liveness
             .map(|body| format!("\n[liveness]\n{body}\n"))
             .unwrap_or_default();
+        let exit_codes = self
+            .exit_codes
+            .map(|body| format!("\n[exit_codes]\n{body}\n"))
+            .unwrap_or_default();
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{capabilities}\n\n\
-             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}\n",
+             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}{exit_codes}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
@@ -382,6 +402,7 @@ impl ManifestFixture {
             config = config,
             readiness = readiness,
             liveness = liveness,
+            exit_codes = exit_codes,
         );
         let path = dir.join("adapter.toml");
         std::fs::write(&path, body).expect("write the fixture manifest");

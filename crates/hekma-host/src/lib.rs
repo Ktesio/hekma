@@ -544,6 +544,9 @@ where
                 // this host supervises resolves the SAME mode (open-time
                 // only, the metering-port thread).
                 log_capture,
+                // Story 18-3: the host never overrides the engine's pinned
+                // stable-run window (the test-only seam stays `None`).
+                stable_run_window_override: None,
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.

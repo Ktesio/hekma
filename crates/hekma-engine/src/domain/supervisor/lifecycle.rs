@@ -192,6 +192,10 @@ impl Supervisor {
                 // Complete the stuck `stopping -> stopped` transition exactly
                 // as the ordinary path below would have on confirmed death.
                 self.clear_poll_error_streak(&name);
+                // 18-3 review: a stop ends any requested-recycle chain —
+                // drop its streak too (no leak; the next start paces
+                // from the base).
+                self.requested_restart_streaks.remove(&name);
                 self.running.remove(&name);
                 // Story 14-2: the settle retains an acp session id (see the
                 // ordinary stop path); identical to a clear otherwise.
@@ -290,6 +294,14 @@ impl Supervisor {
                                 liveness_check: None,
                                 liveness_failing_since: None,
                                 liveness_reopens: 0,
+                                // Story 18-3: a STOP-ONLY re-acquire classifies
+                                // nothing (the stop is the operator's act) and
+                                // anchors at the re-acquire instant — this
+                                // Supervised never reaches a crash
+                                // classification anyway (the stop ladder
+                                // terminalizes it).
+                                exit_codes: None,
+                                running_since: std::time::Instant::now(),
                             },
                         );
                     }
@@ -489,6 +501,9 @@ impl Supervisor {
         // Drop the handle (also closes the Job / releases the child on Windows) and
         // the Run's metering context — the Run ends at this terminal transition.
         self.clear_poll_error_streak(&name);
+        // 18-3 review: a stop ends any requested-recycle chain — drop its
+        // streak too (no leak; the next start paces from the base).
+        self.requested_restart_streaks.remove(&name);
         self.running.remove(&name);
 
         // Settle the write-ahead spawn record (AD-5): a cleanly-stopped instance
@@ -731,10 +746,10 @@ impl Supervisor {
                 self.transition(registry, &name, instance.state, new_state, cause)?;
                 // Review round 1 (P1): the paused→running edge just COMMITTED —
                 // the open liveness window's pre-pause elapsed time is no longer
-                // evidence (see `clear_liveness_window_after_resume`); clear it
+                // evidence (see `note_committed_resume_edge`); clear it
                 // so the failure cannot land on stale pre-pause milliseconds.
                 if matches!(command, LifecycleCommand::Resume) {
-                    self.clear_liveness_window_after_resume(&name);
+                    self.note_committed_resume_edge(&name);
                 }
                 // AI-9 (loop 1): the transition COMMITTED — if the signal now
                 // fails, the ledger and the live process DIVERGE (the row says
@@ -818,26 +833,38 @@ impl Supervisor {
                 // (the best-effort qualifier is the honesty about the SIGNAL, not
                 // a license to keep stale evidence on the clock).
                 if matches!(command, LifecycleCommand::Resume) {
-                    self.clear_liveness_window_after_resume(&name);
+                    self.note_committed_resume_edge(&name);
                 }
                 registry.lookup(&name).map_err(registry_to_engine)
             }
         }
     }
 
-    /// Review round 1 (P1): a committed `paused → running` edge CLEARS the
-    /// instance's open liveness failure window. The elapsed time the window
-    /// measured BEFORE the pause is not evidence about a different process
-    /// instance — the pre-pause milliseconds say nothing about how long the
-    /// (possibly re-delivered) process has been failing SINCE the resume, and
-    /// a stop→start would grant a whole fresh window; leaving the stale
-    /// window armed let a resumed instance fail the instant it resumed
-    /// (the insta-fail defect the review demonstrated). Best-effort: no
-    /// handle held → nothing to clear (an adopted/no-handle resume has no
-    /// in-memory window at all).
-    fn clear_liveness_window_after_resume(&mut self, name: &InstanceName) {
+    /// Bookkeeping for a COMMITTED `paused → running` edge, shared by every
+    /// arm that produces one (guaranteed resume, best-effort resume, the
+    /// detached-release resume). Two elapsed measures the pause invalidated:
+    ///
+    /// * Review round 1 (P1): CLEARS the instance's open liveness failure
+    ///   window. The elapsed time the window measured BEFORE the pause is
+    ///   not evidence about a different process instance — the pre-pause
+    ///   milliseconds say nothing about how long the (possibly re-delivered)
+    ///   process has been failing SINCE the resume, and a stop→start would
+    ///   grant a whole fresh window; leaving the stale window armed let a
+    ///   resumed instance fail the instant it resumed (the insta-fail
+    ///   defect the review demonstrated).
+    /// * Story 18-3: RESTAMPS the stability anchor (`running_since`) — the
+    ///   pause-interval never counts toward run stability (the process
+    ///   served nothing while paused), so the resumed run re-proves the
+    ///   whole window from the resume instant. A crash out of `paused`
+    ///   passes `None` anyway (the state gate), but the restamp is what
+    ///   makes the POST-resume measurement honest.
+    ///
+    /// Best-effort: no handle held → nothing to do (an adopted/no-handle
+    /// resume has no in-memory state at all).
+    fn note_committed_resume_edge(&mut self, name: &InstanceName) {
         if let Some(supervised) = self.running.get_mut(name) {
             supervised.liveness_failing_since = None;
+            supervised.running_since = std::time::Instant::now();
         }
     }
 
@@ -1014,8 +1041,9 @@ impl Supervisor {
                             // Review round 1 (P1): the committed paused→running
                             // edge clears the stale pre-pause liveness window,
                             // same as an operator `resume` (the instance is now
-                            // running with a fresh clock).
-                            self.clear_liveness_window_after_resume(&name);
+                            // running with a fresh clock). Story 18-3: the same
+                            // edge restamps the stability anchor.
+                            self.note_committed_resume_edge(&name);
                             self.emit_diagnostic(&format!(
                                 "{}: paused detached child resumed at engine release (SIGCONT before \
                                  the handle was released) — a detached instance is only paused while \
