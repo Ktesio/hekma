@@ -3437,10 +3437,68 @@ fn write_pause_guaranteed_manifest(dir: &Path, kind: &str, args: &[&str]) {
     std::fs::write(dir.join("adapter.toml"), body).unwrap();
 }
 
+/// Write a `fake_agent` manifest declaring the COOPERATIVE PAUSE PAIR (story
+/// 18-4): `[lifecycle.pause]` + `[lifecycle.resume]`, each a `fake_agent`
+/// invocation with the given args (in practice a `--touch` fixture).
+/// `pause_level` is the OPTIONAL current-OS `[capabilities.pause]` level —
+/// `None` registers the pair with NO pause capability at all (the
+/// cooperative arm must own the transition on command strength alone),
+/// `Some(level)` layers the signal dispatch beneath the command (the
+/// cooperative-first and breach-signal drills). Interaction is guaranteed
+/// everywhere so registration passes. The lib-test sibling of
+/// `tests/drain.rs`'s `write_drain_manifest`.
+fn write_coop_pair_manifest(
+    dir: &Path,
+    kind: &str,
+    args: &[&str],
+    pause_args: &[&str],
+    resume_args: &[&str],
+    pause_level: Option<&str>,
+) {
+    let bin = hekma_conformance::fake_agent_bin();
+    let args_toml = |args: &[&str]| {
+        args.iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let os = match OsId::current() {
+        OsId::Linux => "linux",
+        OsId::Macos => "macos",
+        OsId::Windows => "windows",
+        OsId::Other => "other",
+    };
+    let capability = match pause_level {
+        Some(level) => format!("\n[capabilities.pause]\n{os} = \"{level}\"\n"),
+        None => String::new(),
+    };
+    let bin_str = bin.to_string_lossy().into_owned();
+    let start_toml = args_toml(args);
+    let pause_toml = args_toml(pause_args);
+    let resume_toml = args_toml(resume_args);
+    let body = format!(
+        "contract_version = \"1.0.0\"\n\n\
+         [adapter]\nkind = \"{kind}\"\n\n\
+         [lifecycle.start]\nexec = {bin_str:?}\nargs = [{start_toml}]\n\n\
+         [lifecycle.pause]\nexec = {bin_str:?}\nargs = [{pause_toml}]\n\n\
+         [lifecycle.resume]\nexec = {bin_str:?}\nargs = [{resume_toml}]\n{capability}\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [metering]\nsource = \"self-reported\"\n"
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
 /// Count `heartbeat <n>` lines in an agent-output log (0 when absent).
 fn heartbeat_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
+        .unwrap_or(0)
+}
+
+/// Count `work <n>` lines in a `--watch-sentinel` work log (0 when absent).
+fn work_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|c| c.lines().filter(|l| l.starts_with("work ")).count())
         .unwrap_or(0)
 }
 
@@ -6167,6 +6225,158 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
                 .is_some_and(|record| record.fingerprint.pid == 0),
         "the settled record is gone or a pid-0 seed"
     );
+}
+
+#[test]
+fn the_release_pass_leaves_a_cooperatively_paused_detached_child_paused() {
+    // The COOPERATIVE arm (18-4, review round 1 B2): a detached child paused
+    // via its DECLARED pause command has no OS suspension to undo, and no
+    // resume the operator asked for — the release pass sends NO signal,
+    // runs NO resume command, records NO paused→running edge, and surfaces
+    // the honest note naming the cooperative kind + the recovery. Registered
+    // WITHOUT any `[capabilities.pause]` support on purpose: the cooperative
+    // arm must own the transition on command strength alone.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coop",
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter("coop", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coop").unwrap();
+    // The cooperative pause: the declared command owns the transition.
+    sup.pause(&registry, "coop").unwrap();
+    assert_eq!(state_of(&registry, "coop"), LifecycleState::Paused);
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "coop"),
+        LifecycleState::Paused,
+        "a cooperative pause has no OS resume to undo at release — the row stays 'paused'"
+    );
+    let events = Supervisor::read_events(&registry, "coop").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "no paused→running edge may be recorded for the cooperative freeze: {events:?}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("paused COOPERATIVELY"),
+        "the note must name the cooperative kind: {text}"
+    );
+    assert!(
+        !text.contains("resumed the paused process"),
+        "the cooperative arm must never run the resume command: {text}"
+    );
+    // Teardown: stop reaches the (alive, cooperative-paused) child.
+    sup.stop(&registry, "coop", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
+    // Review round 1 (A1 + B4): the pair manifest does NOT turn a BREACH
+    // pause's resume into a command resume. The breach pause went through
+    // the REAL signal path (the budget override bypasses the cooperative arm
+    // by design — enforcement must stop spend with a real suspension), so
+    // the process is SIGSTOPped; running the declared resume command instead
+    // would commit `paused → running` while the process stays frozen (a
+    // lying edge AND a frozen agent). The A1 pause-kind gate routes the
+    // resume through the signal dispatch: the cause is the signal resume,
+    // never `resume-cooperative`, the declared commands never run (no
+    // sentinels), and on Unix the work log GROWS again — the process itself
+    // provably unfroze.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "brpair",
+        &[
+            "--emit-usage",
+            "3",
+            "--watch-sentinel",
+            "pause.sentinel:resume.sentinel:work.log",
+            "--linger-ms",
+            "600000",
+        ],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        Some("guaranteed"),
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "brpair",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("brpair").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "brpair").unwrap();
+    // The breach pause lands through the real enforcement path (the paused
+    // edge carries the BudgetExceeded cause; the pause COMMAND must not run).
+    drain_until_state(&mut sup, &registry, "brpair", LifecycleState::Paused);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !registry.agent_home(&name).join("pause.sentinel").exists(),
+        "the breach pause must bypass the cooperative arm — no pause command ran"
+    );
+
+    let resumed = sup.resume(&registry, "brpair").unwrap();
+    assert_eq!(resumed.state, LifecycleState::Running);
+    let events = Supervisor::read_events(&registry, "brpair").unwrap();
+    let resume_edge = events
+        .iter()
+        .rev()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the resume edge must be recorded");
+    let cause = serde_json::to_string(&resume_edge.cause).unwrap();
+    assert!(
+        !cause.contains("resume-cooperative"),
+        "a breach pause's resume is the SIGNAL resume, never the command: {cause}"
+    );
+    assert!(
+        cause.contains("resume"),
+        "the signal resume's cause names the resume command: {cause}"
+    );
+    assert!(
+        !registry.agent_home(&name).join("resume.sentinel").exists(),
+        "the declared resume command must not have run"
+    );
+    // The process itself unfroze: the work log (frozen while SIGSTOPped)
+    // grows again past its suspended count. Unix-only — the SIGSTOP freeze
+    // the growth proves is a Unix mechanism.
+    #[cfg(unix)]
+    {
+        let work = registry.agent_home(&name).join("work.log");
+        let frozen = work_lines(&work);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while work_lines(&work) == frozen {
+            assert!(
+                Instant::now() < deadline,
+                "the work log must grow again after the signal resume ({frozen} lines frozen)"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    sup.stop(&registry, "brpair", Some(Duration::from_secs(5)))
+        .unwrap();
 }
 
 #[test]

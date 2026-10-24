@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use hekma_engine::{
     AdapterRef, Blocking, DiagnosticSink, Engine, EngineError, EngineOptions, LifecycleState, OsId,
+    RestartPolicy,
 };
 use tempfile::TempDir;
 
@@ -467,7 +468,8 @@ fn no_template_manifest_keeps_the_signal_pause() {
         Some("guaranteed"),
     );
 
-    let engine = open(&state);
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open_with_sink(&state, &shared);
     let facade = engine.blocking();
     register_and_start(&facade, &manifest, "svc");
 
@@ -524,7 +526,29 @@ fn no_template_manifest_keeps_the_signal_pause() {
         heartbeat_lines(&log) > baseline
     });
 
+    // Review round 1 (B10), the OTHER stop-ladder arm with a signal pause
+    // riding it: pause AGAIN, then stop — the ladder must RESUME the
+    // suspended process before the graceful signal (a suspended process
+    // cannot receive it) and SAY so. The cooperative-skip mutant (treating a
+    // signal pause like the cooperative one) omits the resume and the note
+    // never fires; the graceful signal would pend forever behind the
+    // suspension.
+    facade.pause("svc").unwrap();
+    assert_eq!(
+        facade.instance_status("svc").unwrap().instance.state,
+        LifecycleState::Paused
+    );
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        facade.instance_status("svc").unwrap().instance.state,
+        LifecycleState::Stopped
+    );
+    let captured = sink_text(&shared);
+    assert!(
+        captured.contains("resumed the paused process before the stop ladder"),
+        "a SIGNAL-paused instance's stop must resume the suspended process first, \
+         and say so (sink: {captured})"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -729,17 +753,79 @@ fn zero_cap_override_is_a_no_op() {
 }
 
 // ---------------------------------------------------------------------------
+// (d5) The cooperative arm outranks the CAPABILITY level — `unsupported`
+// pauses cooperatively when the pair is declared
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unsupported_pause_level_still_pauses_cooperatively_under_a_pair() {
+    // KILLER (d5, review round 1 B5): the COOPERATIVE-FIRST dispatch must own
+    // the transition on COMMAND strength alone — a manifest declaring the
+    // pair with `[capabilities.pause] unsupported` for the current OS still
+    // pauses (the declared command IS the pause mechanism; there is no OS
+    // suspension to be unsupported about). The capability-checking mutant
+    // falls through to the level dispatch and fails fast with
+    // CapabilityUnsupported, stranding the operator.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        Some(&["--touch", "pause.sentinel"]),
+        Some(&["--touch", "resume.sentinel"]),
+        None,
+        Some("unsupported"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let paused = facade.pause("svc").unwrap();
+    assert_eq!(
+        paused.state,
+        LifecycleState::Paused,
+        "a declared pair pauses cooperatively even at capability level `unsupported`"
+    );
+    // The COMMAND ran (the sentinel exists) and the cause is the cooperative
+    // one — never a capability refusal.
+    wait_for(POLL_BUDGET, "the pause sentinel to land", || {
+        sentinel(state.path(), "svc", "pause.sentinel").exists()
+    });
+    let events = facade.transition_events("svc").unwrap();
+    let pause_evt = events
+        .iter()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("a running→paused edge");
+    let cause = serde_json::to_string(&pause_evt.cause).unwrap();
+    assert!(
+        cause.contains("pause-cooperative"),
+        "the unsupported-level pause records the cooperative cause: {cause}"
+    );
+
+    // Teardown: the stop ladder skips the OS resume (cooperative pause) and
+    // stops.
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // (f) The drain's wait genuinely waits — the idle signal lands MID-drain
 // ---------------------------------------------------------------------------
 
 #[test]
 fn drain_completes_when_the_idle_signal_arrives_mid_wait() {
     // KILLER (f): the drain's bounded wait must observe its declared idle
-    // signal ARRIVING (the agent "finishes" ~2.5s after start, while the drain
-    // is still waiting) and complete honestly — `completed: true` with a
+    // signal ARRIVING and complete honestly — `completed: true` with a
     // waited_ms that proves the loop ACTUALLY waited. The skip-the-wait mutant
     // (treat the wait as instantly satisfied) returns in ~0ms and fails the
     // floor; the wait-for-the-bound mutant instead reports `completed: false`.
+    // Review round 1 (B13) RE-ANCHORS the fixture: the idle file now lands
+    // 800ms after the PAUSE SENTINEL (the file the drain's own pause command
+    // writes), not 2.5s after process start — so the signal provably arrives
+    // DURING this drain's wait even if the machine enters the drain late (the
+    // old process-start clock could let the file predate the drain entry and
+    // "complete" for the wrong reason).
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_drain_manifest(
@@ -750,10 +836,11 @@ fn drain_completes_when_the_idle_signal_arrives_mid_wait() {
             "600000",
             "--watch-sentinel",
             "pause.sentinel:resume.sentinel:work.log",
-            // The idle signal lands 2500ms after the AGENT starts — while the
-            // drain (entered well before that) is still waiting.
-            "--idle-after-ms",
-            "2500:idle.sentinel",
+            // The idle signal lands 800ms after the PAUSE ANCHOR exists —
+            // the anchor is written by THIS drain's own pause command, so
+            // the idle file cannot predate the drain entry.
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
         ],
         Some(&["--touch", "pause.sentinel"]),
         Some(&["--touch", "resume.sentinel"]),
@@ -766,11 +853,16 @@ fn drain_completes_when_the_idle_signal_arrives_mid_wait() {
     register_and_start(&facade, &manifest, "svc");
 
     // Let the agent get a heartbeat of work in, then drain — well before the
-    // idle signal can land.
+    // idle signal CAN land (it is anchored to the pause sentinel, which only
+    // the drain's pause command writes).
     let work = sentinel(state.path(), "svc", "work.log");
     wait_for(POLL_BUDGET, "the work log to start", || {
         work_lines(&work) >= 1
     });
+    assert!(
+        !sentinel(state.path(), "svc", "pause.sentinel").exists(),
+        "the pause anchor must not exist before the drain (the drain's own pause command writes it)"
+    );
     assert!(
         !sentinel(state.path(), "svc", "idle.sentinel").exists(),
         "the idle signal must not have landed before the drain"
@@ -877,6 +969,352 @@ fn drain_that_outlives_its_bound_still_stops() {
 }
 
 // ---------------------------------------------------------------------------
+// (g2) An overrunning pause command INSIDE a drain: no pause edge, honest
+// timed-out stop (review round 1, A2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drain_overrunning_pause_command_commits_no_pause_edge_and_stops_honestly() {
+    // KILLER (g2, A2): when the drain's own pause command outlives the DRAIN's
+    // bound, it is killed — likely BEFORE its side effect — so it is NOT a
+    // pause: NO `pause-cooperative` edge may be committed (a lying edge would
+    // flip every later classify_pause_kind reader: the release pass, the stop
+    // ladder's cooperative skip, A1's resume gate). The row stays `running`
+    // through the kill, and the composite proceeds as the TIMED-OUT path —
+    // the drain still stops, recording `completed: false`. The old behavior
+    // (commit the pause anyway, or reject the drain as a command failure)
+    // both fail here: the pause edge would exist, or the drain would error
+    // instead of stopping.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        // Touch then hang: the touch only lands if the kill FAILED to
+        // precede the side effect.
+        Some(&["--touch", "late.sentinel", "--hang-before", "60000"]),
+        Some(&["--touch", "resume.sentinel"]),
+        // The 1200ms manifest bound governs BOTH the pause command and the
+        // wait (one deadline); the declared idle file is never touched by
+        // anyone.
+        Some("timeout_ms = 1200\nidle_file = \"never.sentinel\""),
+        Some("guaranteed"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let report = facade.drain("svc", None).unwrap();
+    assert_eq!(
+        report.instance.state,
+        LifecycleState::Stopped,
+        "the overran-pause drain STILL stops (the last step is unconditional)"
+    );
+    assert!(
+        !report.outcome.completed,
+        "the outcome records the honest false: {:?}",
+        report.outcome
+    );
+    assert!(
+        report.outcome.waited_ms >= 1100,
+        "the killed command burned (at least) the drain bound: waited {}ms",
+        report.outcome.waited_ms
+    );
+    assert!(
+        report.outcome.waited_ms <= 3200,
+        "the kill + bounded reap keeps the phase bounded (+slop): waited {}ms",
+        report.outcome.waited_ms
+    );
+
+    // NO pause edge — the killed command must not read as a pause, and the
+    // killed command's side effect never landed.
+    let events = facade.transition_events("svc").unwrap();
+    assert!(
+        !events.iter().any(|e| e.new_state == LifecycleState::Paused),
+        "an overran pause command must never commit a running→paused edge: {events:?}"
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !sentinel(state.path(), "svc", "late.sentinel").exists(),
+        "the killed command must not have performed its side effect"
+    );
+
+    // The running→stopping edge names the drain; the terminal edge carries
+    // the honest drain-stopped{false} record.
+    let stopping = events
+        .iter()
+        .find(|e| e.new_state == LifecycleState::Stopping)
+        .expect("a running→stopping edge");
+    let stopping_cause = serde_json::to_string(&stopping.cause).unwrap();
+    assert!(
+        stopping_cause.contains("drain"),
+        "the stopping edge names the drain command: {stopping_cause}"
+    );
+    let last = events.last().expect("a stopped edge");
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("drain-stopped") && cause.contains("\"completed\":false"),
+        "the terminal cause records the honest timed-out outcome: {cause}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g3) The agent ENDS mid-wait: no fabricated completion, honest early edge
+// (review round 1, A3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drain_observes_the_agent_ending_mid_wait_and_never_fabricates_completion() {
+    // KILLER (g3, A3): while the drain waits on its declared idle signal, the
+    // AGENT may end on its own (a declared exit here). The blind file-only
+    // poll mutant burns the WHOLE bound over a corpse and then records the
+    // stop; the fake-completion mutant reports `completed: true` for an
+    // agent that is gone. The real behavior polls the child each iteration:
+    // the exit is detected promptly (well inside the bound), the "ended on
+    // its own" diagnostic surfaces, and the outcome is honestly
+    // `completed: false` — the terminal edge is the honest stop, never a
+    // fabricated completion.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        // The agent declares its own exit 1500ms after ITS start: the drain
+        // (entered immediately after start) is guaranteed inside its wait
+        // loop — holding the supervision lock, so the reaper cannot process
+        // the exit first — well before the exit lands.
+        &["--exit-with", "0:1500", "--linger-ms", "600000"],
+        Some(&["--touch", "pause.sentinel"]),
+        Some(&["--touch", "resume.sentinel"]),
+        // A 10s bound and an idle file nobody touches: the ONLY way out is
+        // the agent-ended poll.
+        Some("timeout_ms = 10000\nidle_file = \"idle.sentinel\""),
+        Some("guaranteed"),
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open_with_sink(&state, &shared);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let report = facade.drain("svc", None).unwrap();
+    assert_eq!(
+        report.instance.state,
+        LifecycleState::Stopped,
+        "the drain still stops the (already ended) instance"
+    );
+    assert!(
+        !report.outcome.completed,
+        "an agent that ended mid-wait is NEVER a completed drain: {:?}",
+        report.outcome
+    );
+    assert!(
+        report.outcome.waited_ms >= 500,
+        "the wait genuinely ran (the pause command + the polls): waited {}ms",
+        report.outcome.waited_ms
+    );
+    assert!(
+        report.outcome.waited_ms < 4000,
+        "the agent-ended poll ends the wait WELL inside its 10s bound — the \
+         blind file-only mutant burns the whole bound (waited {}ms)",
+        report.outcome.waited_ms
+    );
+
+    // The diagnostic named the discovery (surfaced, not silent).
+    let captured = sink_text(&shared);
+    assert!(
+        captured.contains("ended on its own while the drain waited"),
+        "the agent-ended discovery must surface (sink: {captured})"
+    );
+
+    // The terminal edge is the honest drain-stopped{false} (the stop of an
+    // already-exited child is NOT forced — no escalation lie either).
+    let events = facade.transition_events("svc").unwrap();
+    let last = events.last().expect("a stopped edge");
+    assert_eq!(last.new_state, LifecycleState::Stopped);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("drain-stopped") && cause.contains("\"completed\":false"),
+        "the terminal cause records the honest agent-ended outcome: {cause}"
+    );
+    assert!(
+        !cause.contains("stop-forced"),
+        "stopping an already-exited child must not read as a forced kill: {cause}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g4) The REAL escalation drill: a TERM-immune agent forces the stop ladder
+// through the graceful window, and the drain outcome folds into the forced
+// cause (review round 1, B7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drain_over_a_term_immune_agent_escalates_and_folds_the_outcome_into_the_forced_cause() {
+    // KILLER (g4, B7): the stop ladder's escalation path with a drain riding
+    // it. The agent ignores SIGTERM (`trap '' TERM`), so the graceful window
+    // (the engine default 30s — the drain passes no override) MUST elapse and
+    // escalate to the forced kill; the terminal cause is `stop-forced` (forced
+    // honesty outranks the drain bookkeeping) with the drain's timed-out
+    // outcome FOLDED INTO the detail — the composite's result stays durable
+    // through the escalation. The mutant that swaps the cause to
+    // drain-stopped on a forced stop fails the cause assert; the mutant that
+    // drops the folded outcome fails the detail assert. Unix-only data-driven
+    // skip (the drill needs POSIX traps; the escalation path itself is
+    // cross-OS and covered structurally elsewhere).
+    if OsId::current() == OsId::Windows {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // Hand-rolled manifest: the subject is `sh` with a trapped TERM, not
+    // fake_agent (which dies on TERM like any unhandled default).
+    let body = r#"
+contract_version = "1.1.0"
+
+[adapter]
+kind = "svc"
+
+[lifecycle.start]
+exec = "sh"
+args = ["-c", "trap '' TERM; sleep 60"]
+
+[lifecycle.pause]
+exec = "sh"
+args = ["-c", "touch pause.sentinel"]
+
+[lifecycle.resume]
+exec = "sh"
+args = ["-c", "touch resume.sentinel"]
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[drain]
+timeout_ms = 500
+idle_file = "never.sentinel"
+"#;
+    std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let report = facade.drain("svc", None).unwrap();
+    assert_eq!(
+        report.instance.state,
+        LifecycleState::Stopped,
+        "the escalated drain still lands stopped"
+    );
+    assert!(
+        !report.outcome.completed,
+        "the bounded wait timed out (nobody touches the idle file): {:?}",
+        report.outcome
+    );
+    assert!(
+        report.outcome.waited_ms < 2000,
+        "waited_ms measures the BOUNDED PHASE (pause command + wait), not the \
+         stop ladder's 30s window (waited {}ms)",
+        report.outcome.waited_ms
+    );
+    // The drain's own pause command ran (the drill's pause is a real `sh`).
+    assert!(
+        sentinel(state.path(), "svc", "pause.sentinel").exists(),
+        "the drain's pause command ran before the wait"
+    );
+
+    // The terminal cause is stop-forced WITH the folded drain outcome.
+    let events = facade.transition_events("svc").unwrap();
+    let last = events.last().expect("a stopped edge");
+    assert_eq!(last.new_state, LifecycleState::Stopped);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("stop-forced"),
+        "a TERM-immune agent escalates — the forced cause outranks the drain \
+         bookkeeping: {cause}"
+    );
+    assert!(
+        cause.contains("the drain's bounded wait timed out after")
+            && cause.contains("recorded here because the stop escalated"),
+        "the forced cause folds the drain's timed-out outcome into its detail: {cause}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (g5) A STALE idle file is NOT an idle signal (freshness, not existence)
+// (review round 1, B11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drain_reads_a_stale_idle_file_as_not_idle_and_burns_the_bound() {
+    // KILLER (g5, B11): the idle signal is FRESHNESS, not existence — a file
+    // that predates the drain's wait by more than the engine's freshness
+    // slack (2s) reads NOT idle, and the drain must burn its bound and record
+    // the honest `completed: false`. The existence-reading mutant completes
+    // immediately (the file is right there), faking a drained agent that
+    // never drained.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        Some(&["--touch", "pause.sentinel"]),
+        Some(&["--touch", "resume.sentinel"]),
+        Some("timeout_ms = 1200\nidle_file = \"idle.sentinel\""),
+        Some("guaranteed"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    // The idle file exists — but it was written NOW, and the drain enters
+    // more than the freshness slack (2s) later, so it reads STALE.
+    let idle = sentinel(state.path(), "svc", "idle.sentinel");
+    std::fs::write(&idle, b"stale").unwrap();
+    std::thread::sleep(Duration::from_millis(3000));
+
+    let report = facade.drain("svc", None).unwrap();
+    assert_eq!(report.instance.state, LifecycleState::Stopped);
+    assert!(
+        !report.outcome.completed,
+        "a stale idle file is NOT an idle signal: {:?}",
+        report.outcome
+    );
+    assert!(
+        report.outcome.waited_ms >= 1100,
+        "the drain burned (at least) its declared bound over the stale file: \
+         waited {}ms",
+        report.outcome.waited_ms
+    );
+    assert!(
+        report.outcome.waited_ms <= 3200,
+        "the wait is BOUNDED by the declared bound (+slop): waited {}ms",
+        report.outcome.waited_ms
+    );
+
+    // The terminal edge carries the honest false.
+    let events = facade.transition_events("svc").unwrap();
+    let last = events.last().expect("a stopped edge");
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("drain-stopped") && cause.contains("\"completed\":false"),
+        "the terminal cause records the stale-idle timeout: {cause}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (h) The degenerate drain — no command, no signal: stop directly, and SAY so
 // ---------------------------------------------------------------------------
 
@@ -969,11 +1407,17 @@ fn pair_without_drain_section_drains_under_the_default_bound() {
 
     // The ladder's honest cooperative-skip note: the drain's own pause made
     // the instance cooperatively paused, so the stop skipped the OS resume
-    // signal — and said so.
+    // signal — and said so. Review round 1 (B10): and it must NOT fire the
+    // signal-path note — no resume was attempted, so claiming one would be
+    // the lie the skip exists to prevent.
     let captured = sink_text(&shared);
     assert!(
         captured.contains("paused COOPERATIVELY"),
         "the stop ladder must say it skipped the OS resume signal (sink: {captured})"
+    );
+    assert!(
+        !captured.contains("resumed the paused process before the stop ladder"),
+        "a cooperative pause's stop must not claim a signal resume (sink: {captured})"
     );
 }
 
@@ -1124,4 +1568,56 @@ fn drain_refuses_non_running_instances_and_out_of_range_bounds() {
     assert_eq!(refused_state, "paused");
 
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+
+    // STOPPED (review round 1, B6): a cleanly stopped instance refuses too —
+    // the drain is a running-instance composite, not a re-stop.
+    let result = facade.drain("svc", None);
+    let Err(EngineError::DrainRefused {
+        state: refused_state,
+        ..
+    }) = &result
+    else {
+        panic!("drain on a stopped instance must refuse: {result:?}");
+    };
+    assert_eq!(refused_state, "stopped");
+
+    // FAILED (review round 1, B6): a crashed instance (immediate exit under a
+    // `never` restart policy) refuses the drain with the failed state named —
+    // a drain must never resurrect or re-stop a dead row.
+    let failed_manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        failed_manifest.path(),
+        "mortal",
+        &["--exit-fast", "3"],
+        None,
+        None,
+        None,
+        Some("guaranteed"),
+    );
+    facade
+        .register_with_adapter(
+            "mortal",
+            &AdapterRef::Manifest(failed_manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("mortal", RestartPolicy::Never)
+        .expect("set restart policy");
+    let _ = facade.start("mortal");
+    wait_for(POLL_BUDGET, "the mortal instance to land failed", || {
+        facade
+            .instance_status("mortal")
+            .map(|s| s.instance.state)
+            .ok()
+            == Some(LifecycleState::Failed)
+    });
+    let result = facade.drain("mortal", None);
+    let Err(EngineError::DrainRefused {
+        state: refused_state,
+        ..
+    }) = &result
+    else {
+        panic!("drain on a failed instance must refuse: {result:?}");
+    };
+    assert_eq!(refused_state, "failed");
 }

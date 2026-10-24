@@ -738,7 +738,28 @@ impl Supervisor {
         // pre-18-4 dispatch runs verbatim for it. A manifest without a
         // declared command falls through too — byte-identical to the
         // pre-18-4 behavior.
-        if cause_override.is_none() {
+        //
+        // Review round 1 (A1): the RESUME direction is PAUSE-KIND-GATED. The
+        // cooperative arm here is verb-scoped, not pause-kind-blind — a
+        // BREACH-paused (or operator signal-paused) instance whose manifest
+        // declares the pair has a FROZEN process: running the declared
+        // resume command instead of SIGCONT would commit `paused → running`
+        // while the process stays suspended (a lying edge AND a frozen
+        // agent). So the Resume direction takes the cooperative arm ONLY
+        // when the pause WAS cooperative — the same `classify_pause_kind`
+        // re-derivation from the durable record the stop ladder's
+        // cooperative skip, the release pass, and the stop-only re-acquire
+        // already consult (cross-lifetime: an adopted row classifies from
+        // its committed pause edge, not from memory). The PAUSE direction is
+        // unaffected — any running row may pause cooperatively.
+        let cooperative_direction = match command {
+            LifecycleCommand::Pause => true,
+            LifecycleCommand::Resume => {
+                classify_pause_kind(registry, &name) == PauseKind::Cooperative
+            }
+            _ => false,
+        };
+        if cause_override.is_none() && cooperative_direction {
             if let Some(handled) = self.run_cooperative_lifecycle_command(
                 registry,
                 &name,
@@ -1005,7 +1026,13 @@ impl Supervisor {
                     detail,
                 });
             }
-            BoundedCommandOutcome::Overran => {
+            BoundedCommandOutcome::Overran { unreaped_note } => {
+                // A5 (review round 1): the kill's reap is bounded — surface
+                // the unkillable-corpse note if the reap never confirmed,
+                // then reject the verb as before.
+                if let Some(note) = unreaped_note {
+                    self.emit_diagnostic(&note);
+                }
                 return Err(EngineError::PauseCommandFailed {
                     name: name.as_str().to_string(),
                     direction,

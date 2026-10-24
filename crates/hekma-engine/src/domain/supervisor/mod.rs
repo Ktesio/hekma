@@ -132,7 +132,23 @@ pub(crate) const DRAIN_DEFAULT_BOUND: Duration = Duration::from_secs(30);
 /// agent performs WHEN ITS WORK DRAINS observable: the wait's poll sees the
 /// fresh mtime within this window of the touch. Shared with
 /// `probe_kinds::file_fresh`, the same evaluator readiness/liveness use.
-pub(crate) const DRAIN_IDLE_FRESH_SLACK: Duration = Duration::from_millis(2_000);
+///
+/// Review round 1 (C5): the plain-ms constant is the one the wait loop
+/// actually passes to `file_fresh` (whose parameter is `u64`), and the
+/// `Duration` is BUILT from it — the old conversion
+/// (`try_from(..).unwrap_or(.. as u64)`) was self-defeating (its fallback was
+/// exactly the truncating cast `try_from` rejects), so the number now has ONE
+/// spelling.
+pub(crate) const DRAIN_IDLE_FRESH_SLACK_MS: u64 = 2_000;
+
+/// How long the bounded lifecycle-command runner waits for a KILLED child's
+/// reap before proceeding anyway (story 18-4 review round 1, A5): a plain
+/// `wait()` after the kill can block forever on an unkillable (D-state)
+/// child, wedging the verb — and the supervisor mutex with it — past its
+/// bound. At this bound the runner emits ONE diagnostic naming the stuck
+/// child and proceeds; never blocks past it. Engine-owned, beside the other
+/// cadence constants; pinned by unit test.
+pub(crate) const KILL_REAP_BOUND: Duration = Duration::from_secs(5);
 
 /// How often the bounded pause-command runner polls the child (story 18-4):
 /// both the standalone cap and the drain-composite deadline are DEADLINE-based

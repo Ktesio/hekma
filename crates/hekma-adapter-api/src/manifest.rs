@@ -1191,6 +1191,28 @@ impl Drain {
                         ),
                     });
                 }
+                // A Windows DRIVE-RELATIVE path (`C:foo` — a `Component::
+                // Prefix` without a root) is not `is_absolute()`, but it
+                // resolves against the CURRENT DRIVE's working directory —
+                // outside the Agent Home the engine joins the path onto
+                // (review round 1, A8-ii). Refused wherever the prefix
+                // component appears; a no-op compile on Unix (where the
+                // spelling is an ordinary relative name).
+                if std::path::Path::new(path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::Prefix(_)))
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' carries a Windows drive prefix (a drive-relative \
+                             or drive-qualified path) — the idle_file is resolved against \
+                             the instance's Agent Home and must be a plain relative path \
+                             (a drive-relative path would resolve OUTSIDE the Agent Home \
+                             the engine has authority over)"
+                        ),
+                    });
+                }
                 if std::path::Path::new(path)
                     .components()
                     .any(|c| c == std::path::Component::ParentDir)
@@ -1543,6 +1565,45 @@ impl Manifest {
                     ),
                 });
             }
+
+            // The EXECUTED pair's exec/args are free of control characters
+            // (story 18-4 review round 1, A8-iii — the control-char family
+            // every rendered field obeys): since 18-4 the templates RENDER
+            // VERBATIM into the `pause-cooperative`/`resume-cooperative`
+            // causes and the operator diagnostics, so a control character
+            // would corrupt every surface that quotes the command. Scoped to
+            // the executed pair (start/stop are not rendered into causes;
+            // their argv passes straight to the OS spawn).
+            for (op, template) in [
+                ("pause", lifecycle.pause.as_ref()),
+                ("resume", lifecycle.resume.as_ref()),
+            ] {
+                let Some(template) = template else {
+                    continue;
+                };
+                if contains_control_char(&template.exec) {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("`exec` field in the `[lifecycle.{op}]` op template"),
+                        detail: "the exec contains a control character (NUL and the rest \
+                                  of the C0/C1 control bytes are forbidden — the command \
+                                  renders into transition causes and diagnostics)"
+                            .to_string(),
+                    });
+                }
+                for (index, arg) in template.args.iter().enumerate() {
+                    if contains_control_char(arg) {
+                        return Err(ManifestError::InvalidField {
+                            field: format!(
+                                "`args[{index}]` element in the `[lifecycle.{op}]` op template"
+                            ),
+                            detail: "the argument contains a control character (NUL and the \
+                                      rest of the C0/C1 control bytes are forbidden — the \
+                                      command renders into transition causes and diagnostics)"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         // [capabilities] declares real support (AD-4). Not merely non-empty: a
@@ -1623,7 +1684,49 @@ impl Manifest {
         if let Some(drain) = &self.drain {
             drain.spec()?;
         }
+        // The drain/liveness DISJOINT rule (review round 1, A8-i): the
+        // idle_file may not name the liveness heartbeat's own file (a
+        // collision makes the drain's wait vacuously complete — see the
+        // helper).
+        self.validate_drain_liveness_disjoint()?;
 
+        Ok(())
+    }
+
+    /// The drain/liveness DISJOINT rule (story 18-4 review round 1, A8-i): a
+    /// `[drain].idle_file` naming the SAME path as the declared
+    /// `[liveness.heartbeat_file].path` is refused, BOTH fields named. The
+    /// heartbeat beats exactly while the agent is alive, so the drain's
+    /// freshness wait on that very file would read "idle" within one beat of
+    /// the drain entering — vacuously complete regardless of in-flight work,
+    /// and the signal the operator thinks proves "work drained" would prove
+    /// only "process alive". Run by [`Self::validate`] and re-checked by the
+    /// engine's drain resolver (the same drift gate the pair rule rides).
+    pub fn validate_drain_liveness_disjoint(&self) -> Result<(), ManifestError> {
+        let Some(drain) = &self.drain else {
+            return Ok(());
+        };
+        let Some(idle) = &drain.idle_file else {
+            return Ok(());
+        };
+        let Some(heartbeat) = self
+            .liveness
+            .as_ref()
+            .and_then(|l| l.heartbeat_file.as_ref())
+        else {
+            return Ok(());
+        };
+        if idle == &heartbeat.path {
+            return Err(ManifestError::InvalidField {
+                field: "`idle_file` field in the `[drain]` section".to_string(),
+                detail: format!(
+                    "'{idle}' is ALSO the declared `[liveness.heartbeat_file].path` — the \
+                     drain idle_file and the liveness heartbeat must be DIFFERENT files (the \
+                     heartbeat beats while the agent is ALIVE, so the drain's freshness \
+                     wait on it would complete vacuously regardless of in-flight work)"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -3383,5 +3486,144 @@ channel = "stdio"
         );
         let m = Manifest::from_toml_str(&pair).expect("parse");
         m.validate().expect("the declared pair is valid");
+    }
+
+    #[test]
+    fn drain_idle_file_naming_the_liveness_heartbeat_is_refused_naming_both() {
+        // The A8-i disjoint rule: the idle_file may not name the liveness
+        // heartbeat's own file. The heartbeat beats while the agent is
+        // ALIVE, so the drain's freshness wait on that very file would read
+        // "idle" within one beat of the drain entering — vacuously complete
+        // regardless of in-flight work, and the signal the operator thinks
+        // proves "work drained" would prove only "process alive". Refused
+        // naming BOTH files.
+        let collide = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"alive.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&collide).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`idle_file` field in the `[drain]` section"
+                    && detail.contains("alive.marker")
+                    && detail.contains("DIFFERENT files")),
+            "got {err}"
+        );
+
+        // Different paths coexist legally (the intended shape: the heartbeat
+        // proves liveness, the idle_file proves drained work).
+        let distinct = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&distinct).expect("parse");
+        m.validate().expect("distinct paths are accepted");
+
+        // The rule is silent when either side is absent (no drain section, no
+        // idle_file, no heartbeat — the liveness http_get twin instead): every
+        // pre-review shape stays valid.
+        for body in [
+            VALID.to_string(),
+            format!("{VALID}\n[drain]\ntimeout_ms = 100\n"),
+            format!(
+                "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+                 [liveness]\n[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\n\
+                 expected_status = 200\nmax_age_ms = 5000\n"
+            ),
+        ] {
+            let m = Manifest::from_toml_str(&body).expect("parse");
+            m.validate().expect("rule is silent when a side is absent");
+        }
+    }
+
+    #[test]
+    fn drain_idle_file_windows_drive_prefix_is_refused_where_it_parses_as_one() {
+        // A8-ii: `C:foo` is a `Component::Prefix` (drive-RELATIVE) on Windows
+        // — not `is_absolute()`, yet it resolves against the current drive's
+        // working directory, outside the Agent Home the engine joins the path
+        // onto. Refused wherever the prefix component exists; on Unix the
+        // spelling is an ordinary relative name, so the same manifest is
+        // accepted (the check is a structural no-op there).
+        let m = Manifest::from_toml_str(&with_drain(
+            "timeout_ms = 100\nidle_file = \"C:foo.marker\"",
+        ))
+        .expect("parse");
+        if cfg!(windows) {
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == "`idle_file` field in the `[drain]` section"
+                        && detail.contains("drive")),
+                "got {err}"
+            );
+        } else {
+            m.validate()
+                .expect("no prefix component parses on Unix — accepted");
+        }
+    }
+
+    #[test]
+    fn lifecycle_pair_exec_and_args_are_control_char_free() {
+        // A8-iii: since 18-4 the pair's templates render VERBATIM into the
+        // pause-cooperative/resume-cooperative causes and operator
+        // diagnostics, so a control character in the executed pair's
+        // exec/args corrupts every surface that quotes the command. Scoped to
+        // the executed pair (start/stop pass straight to the OS spawn and are
+        // not rendered into causes). Both pair members are declared in every
+        // splice so the PAIR rule never fires first.
+        let pair_with = |op: &str, body: &str| -> String {
+            let (pause_body, resume_body) = if op == "pause" {
+                (body.to_string(), "exec = \"/bin/resume\"".to_string())
+            } else {
+                ("exec = \"/bin/pause\"".to_string(), body.to_string())
+            };
+            VALID.replacen(
+                "[lifecycle.stop]",
+                &format!(
+                    "[lifecycle.pause]\n{pause_body}\n\n\
+                     [lifecycle.resume]\n{resume_body}\n\n[lifecycle.stop]"
+                ),
+                1,
+            )
+        };
+        // exec refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(op, "exec = \"/bin/true\\u0001\""))
+                .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`exec` field in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // args[i] refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(
+                op,
+                "exec = \"/bin/true\"\nargs = [\"--mode\", \"x\\u0007y\"]",
+            ))
+            .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`args[1]` element in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // The clean pair passes (the intended shape rides the same splice).
+        let m =
+            Manifest::from_toml_str(&pair_with("pause", "exec = \"/bin/pause\"")).expect("parse");
+        m.validate().expect("a control-char-free pair is valid");
+        // Scoped exclusion: the SAME control byte in START (never rendered
+        // into causes; its argv goes straight to the OS spawn) is out of
+        // A8-iii's scope and still validates.
+        let start_body = VALID.replacen("exec = \"demo-agent\"", "exec = \"/bin/true\\u0001\"", 1);
+        let m = Manifest::from_toml_str(&start_body).expect("parse");
+        m.validate()
+            .expect("start is out of the A8-iii scope — not refused here");
     }
 }
