@@ -1,0 +1,51 @@
+# The Aider entry of the Hekma adapter gallery (docs/adapters/aider.md).
+#
+# The launch exec is a BARE program name, resolved on the operator's PATH at
+# start (the Adapter Contract's own resolution rule) — Hekma does not bundle,
+# install, or pin the Aider binary. A start whose `aider` cannot resolve
+# fails with the engine's launch-failure diagnostic naming the executable.
+#
+# Metering is engine-observed: at start the engine injects its loopback
+# listener address into the environment variable below, which Aider honors
+# as its OpenAI-compatible base-URL override. The real provider endpoint is
+# named separately with `metering.upstream_base_url` (`hekma agent config
+# set`). Until that override is wired, no billing-grade tokens flow: the
+# Fleet shows the honest `—` with the tiers-attempted notice, never a
+# fabricated figure.
+#
+# This manifest is validated by the workspace gallery test against the
+# bundled conformance fake (the exec word is PATH-shadowed) — never against
+# the real binary.
+
+contract_version = "1.0.0"
+
+[adapter]
+kind = "aider"
+name = "Aider"
+
+[lifecycle.start]
+exec = "aider"
+# No launch args are pinned: add the flags your Aider setup needs. The
+# engine-observed channel rides the config mapping below, not argv.
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "best-effort"
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "engine-observed"
+
+[interaction]
+channel = "stdio"
+
+# The engine-observed wiring: the reserved `metering.base_url` key is
+# delivered as this environment variable (no {env:...} substitution exists
+# anywhere in a manifest — values stay literal).
+[config."metering.base_url"]
+env = "OPENAI_API_BASE"

@@ -16,6 +16,12 @@ DOC_PATHS = [
     *ROOT.glob("*.md"),
     *ROOT.glob("docs/*.md"),
     *ROOT.glob("docs/design/*.md"),
+    # The adapter gallery (docs/adapters.md + docs/adapters/<agent>.md): the
+    # gallery's public claims ride every gate below (provenance ban, links,
+    # fences). The machine-validated manifests under docs/adapters/manifests/
+    # are TOML, not prose — they are validated by the workspace gallery test
+    # (crates/hekma-conformance/tests/gallery_manifests.rs), not here.
+    *ROOT.glob("docs/adapters/*.md"),
 ]
 # docs/proposals/ is deliberately NOT gated (and therefore not scrubbed): it
 # holds point-in-time ratified ops records (the v0.8.0 ktesio→hekma migration
