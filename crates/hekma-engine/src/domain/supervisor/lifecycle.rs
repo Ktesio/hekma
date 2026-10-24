@@ -289,6 +289,7 @@ impl Supervisor {
                                 // window to open and nothing to probe.
                                 liveness_check: None,
                                 liveness_failing_since: None,
+                                liveness_reopens: 0,
                             },
                         );
                     }
@@ -728,6 +729,13 @@ impl Supervisor {
                 // `paused` around a suspension that did not happen — nor the
                 // reverse), THEN signal the held process.
                 self.transition(registry, &name, instance.state, new_state, cause)?;
+                // Review round 1 (P1): the paused→running edge just COMMITTED —
+                // the open liveness window's pre-pause elapsed time is no longer
+                // evidence (see `clear_liveness_window_after_resume`); clear it
+                // so the failure cannot land on stale pre-pause milliseconds.
+                if matches!(command, LifecycleCommand::Resume) {
+                    self.clear_liveness_window_after_resume(&name);
+                }
                 // AI-9 (loop 1): the transition COMMITTED — if the signal now
                 // fails, the ledger and the live process DIVERGE (the row says
                 // paused/running while the process did not transition). The
@@ -805,8 +813,31 @@ impl Supervisor {
                     }
                 });
                 self.transition(registry, &name, instance.state, new_state, cause)?;
+                // Review round 1 (P1): same committed paused→running edge as the
+                // Guaranteed arm — the stale pre-pause window is cleared here too
+                // (the best-effort qualifier is the honesty about the SIGNAL, not
+                // a license to keep stale evidence on the clock).
+                if matches!(command, LifecycleCommand::Resume) {
+                    self.clear_liveness_window_after_resume(&name);
+                }
                 registry.lookup(&name).map_err(registry_to_engine)
             }
+        }
+    }
+
+    /// Review round 1 (P1): a committed `paused → running` edge CLEARS the
+    /// instance's open liveness failure window. The elapsed time the window
+    /// measured BEFORE the pause is not evidence about a different process
+    /// instance — the pre-pause milliseconds say nothing about how long the
+    /// (possibly re-delivered) process has been failing SINCE the resume, and
+    /// a stop→start would grant a whole fresh window; leaving the stale
+    /// window armed let a resumed instance fail the instant it resumed
+    /// (the insta-fail defect the review demonstrated). Best-effort: no
+    /// handle held → nothing to clear (an adopted/no-handle resume has no
+    /// in-memory window at all).
+    fn clear_liveness_window_after_resume(&mut self, name: &InstanceName) {
+        if let Some(supervised) = self.running.get_mut(name) {
+            supervised.liveness_failing_since = None;
         }
     }
 
@@ -979,12 +1010,19 @@ impl Supervisor {
                         LifecycleState::Running,
                         cause,
                     ) {
-                        Ok(_) => self.emit_diagnostic(&format!(
-                            "{}: paused detached child resumed at engine release (SIGCONT before \
-                             the handle was released) — a detached instance is only paused while \
-                             an engine session holds it; the row is now 'running'",
-                            name.as_str(),
-                        )),
+                        Ok(_) => {
+                            // Review round 1 (P1): the committed paused→running
+                            // edge clears the stale pre-pause liveness window,
+                            // same as an operator `resume` (the instance is now
+                            // running with a fresh clock).
+                            self.clear_liveness_window_after_resume(&name);
+                            self.emit_diagnostic(&format!(
+                                "{}: paused detached child resumed at engine release (SIGCONT before \
+                                 the handle was released) — a detached instance is only paused while \
+                                 an engine session holds it; the row is now 'running'",
+                                name.as_str(),
+                            ));
+                        }
                         Err(err) => {
                             // The child IS resumed but the row still says
                             // paused — surfaced, never silent (AI-18);

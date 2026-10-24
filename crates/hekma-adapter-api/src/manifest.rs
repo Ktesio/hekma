@@ -469,8 +469,14 @@ impl Readiness {
                 // The authority (host[:port]) must be present: `http://` alone
                 // or `http:///path` has nowhere to connect and would only
                 // fail obscurely at probe time.
+                // Strict single-strip: `strip_prefix` removes AT MOST one
+                // `http://`, so `http://http://...` keeps its inner scheme in
+                // the authority and is rejected by the loopback-literal rule
+                // below. (`trim_start_matches` would strip every repetition,
+                // silently laundering a double-scheme URL into a valid one.)
                 let authority = url
-                    .trim_start_matches("http://")
+                    .strip_prefix("http://")
+                    .unwrap_or(url)
                     .split(['/', '?'])
                     .next()
                     .unwrap_or("");
@@ -618,7 +624,7 @@ pub struct HeartbeatFileCheck {
     /// the mtime. A missing file is failing — absent ≡ stale (an agent that
     /// never wrote its heartbeat has never proven liveness).
     pub path: String,
-    /// The freshness window, in milliseconds (`1..=600_000`): how long the
+    /// The freshness window, in milliseconds (`250..=600_000`): how long the
     /// file's mtime may lag before the heartbeat counts as stopped. This ONE
     /// number is the window for the unifying semantic — the signal failing
     /// CONTINUOUSLY for `max_age_ms` fails the instance.
@@ -704,7 +710,7 @@ impl LivenessCheck {
 ///
 /// Validation is [`Liveness::check`] (consumed by [`Manifest::validate`]):
 /// exactly ONE sub-table may be present (both or neither is a named error),
-/// and the value rules hold: `max_age_ms` in `1..=600_000`; `path` non-empty
+/// and the value rules hold: `max_age_ms` in `250..=600_000`; `path` non-empty
 /// and free of control characters; `http_get.url` an `http://` URL targeting
 /// a LITERAL loopback address (`127.0.0.0/8` or `::1`, optional port — no
 /// hostnames, no DNS, no fragment, the SAME shared rule the readiness probe
@@ -729,9 +735,10 @@ impl Liveness {
     ///
     /// Rules, in stable diagnostic order:
     /// * exactly ONE sub-table present (both, or neither, names the section);
-    /// * `max_age_ms` in `1..=600_000` (below 1 no signal can ever be
-    ///   fresh/alive; above the cap a wedged agent would hold supervision
-    ///   unboundedly);
+    /// * `max_age_ms` in `250..=600_000` (below 250 the window is smaller
+    ///   than one reaper tick — ~250 ms — so a window that short could expire
+    ///   without the engine ever observing the failure; above the cap a
+    ///   wedged agent would hold supervision unboundedly);
     /// * `heartbeat_file.path` non-empty, no control characters;
     /// * `http_get` takes the SAME loopback-literal URL family the
     ///   `[readiness]` probe enforces (one shared helper — the two sections
@@ -761,12 +768,16 @@ impl Liveness {
             _ => {}
         }
         let max_age_ok = |max_age_ms: u64| -> Result<(), ManifestError> {
-            if max_age_ms == 0 {
+            if max_age_ms < 250 {
                 return Err(ManifestError::InvalidField {
                     field: "`max_age_ms` field in the `[liveness]` section".to_string(),
-                    detail: "0 is not a liveness window — the signal could never count as \
-                             alive; the minimum is 1 millisecond"
-                        .to_string(),
+                    detail: format!(
+                        "{max_age_ms} is below the liveness floor — the window must be between \
+                         250 and 600000 milliseconds. The reaper polls the declared signal on a \
+                         ~250 ms tick, so a window shorter than one tick could expire without \
+                         the engine ever observing the failure; 250 ms is the smallest \
+                         observable window"
+                    ),
                 });
             }
             if max_age_ms > 600_000 {
@@ -774,7 +785,7 @@ impl Liveness {
                     field: "`max_age_ms` field in the `[liveness]` section".to_string(),
                     detail: format!(
                         "{max_age_ms} is out of range — the liveness window must be between \
-                         1 and 600000 milliseconds"
+                         250 and 600000 milliseconds"
                     ),
                 });
             }
@@ -836,8 +847,12 @@ impl Liveness {
                 ),
             });
         }
+        // Strict single-strip, mirroring the `[readiness]` URL rule above:
+        // at most one `http://` is removed, so `http://http://...` keeps its
+        // inner scheme in the authority and is rejected by the loopback rule.
         let authority = url
-            .trim_start_matches("http://")
+            .strip_prefix("http://")
+            .unwrap_or(url)
             .split(['/', '?'])
             .next()
             .unwrap_or("");
@@ -2435,13 +2450,16 @@ channel = "stdio"
 
     #[test]
     fn liveness_max_age_bounds_are_enforced() {
-        // The shared window range `1..=600_000`, for BOTH kinds: below 1 no
-        // signal can ever count as alive; above the cap a wedged agent would
+        // The shared window range `250..=600_000`, for BOTH kinds: below the
+        // 250 ms floor the window is smaller than one reaper tick (~250 ms),
+        // so expiry could go unobserved; above the cap a wedged agent would
         // hold supervision unboundedly. Both name the field.
         for body in [
             "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 0",
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 249",
             "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 600_001",
             "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 0",
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 249",
             "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 600_001",
         ] {
             let m = Manifest::from_toml_str(&with_liveness(body)).expect("parse");
@@ -2452,6 +2470,53 @@ channel = "stdio"
                 "body `{body}`: got {err}"
             );
         }
+    }
+
+    #[test]
+    fn liveness_min_window_is_accepted_at_the_floor() {
+        // Exactly 250 is legal (the floor is inclusive) for both kinds.
+        let toml =
+            with_liveness("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 250");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("250 ms is the inclusive floor");
+
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 250",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("250 ms is the inclusive floor");
+    }
+
+    #[test]
+    fn double_scheme_urls_are_rejected_in_both_sections() {
+        // The strict single-strip rule: `strip_prefix` removes AT MOST one
+        // `http://`, so a double-scheme URL keeps its inner scheme in the
+        // authority and is rejected by the loopback-literal rule (an inner
+        // scheme is not a literal loopback IP). `trim_start_matches` (the
+        // pre-review shape) stripped every repetition and would have
+        // LAUNDERED this URL into `127.0.0.1:8080/health`. Pinned for BOTH
+        // sections — the shared posture cannot drift.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[liveness.http_get]` sub-table"),
+            "got {err}"
+        );
+
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://http://127.0.0.1:8080/health\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[readiness]` section"),
+            "got {err}"
+        );
     }
 
     #[test]

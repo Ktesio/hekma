@@ -26,6 +26,18 @@
 //!   semantic;
 //! * the Restart Policy applies VERBATIM (an `on-failure` instance restarts
 //!   through the unresponsive failures until the crash-loop threshold);
+//! * a FLAPPING signal (each blip recovering inside the window) is bounded:
+//!   three open/recover diagnostic pairs, ONE flap note, silence after —
+//!   while the window itself keeps never expiring (review round 1, P6);
+//! * an expired DETACHED wedge is force-killed before the failure commits,
+//!   and the `on-failure` restart re-binds the freed port (review round 1,
+//!   P4);
+//! * the expiry verdict honestly names pre-existing staleness ("already ~Nms
+//!   stale at first observation") in BOTH the terminal diagnostic and the
+//!   cause's optional `detail` (review round 1, P7/P8);
+//! * an ADOPTED instance whose adapter snapshot or manifest became unreadable
+//!   degrades to PROCESS-liveness supervision with ONE surfaced diagnostic —
+//!   never a failed adoption (review round 1, V3);
 //! * a manifest WITHOUT the section keeps the pre-1.1.0 reaper behavior
 //!   byte-identical (same transitions, same causes, several ticks);
 //! * an ADOPTED instance re-derives its window fresh (the honest
@@ -180,9 +192,9 @@ fn absent_heartbeat_expires_the_window_and_fails_unresponsive() {
         .unwrap();
     // Pin the TERMINAL path: `never` (not the AD-15 `on-failure` default, which
     // would restart into a crash loop here). The policy conclusion — "not
-    // restarting" — rides the reaper's ONE terminal diagnostic (the frozen
-    // `unresponsive` cause shape carries no detail field), so the sink
-    // captures it.
+    // restarting" — rides the reaper's ONE terminal diagnostic (the
+    // `unresponsive` cause's verdict detail, when present, rides the cause
+    // itself and this diagnostic), so the sink captures it.
     facade
         .set_restart_policy("silent-hb", RestartPolicy::Never)
         .unwrap();
@@ -207,9 +219,30 @@ fn absent_heartbeat_expires_the_window_and_fails_unresponsive() {
         elapsed >= Duration::from_millis(max_age_ms),
         "the expiry must respect the declared window (failed after {elapsed:?})"
     );
+    // And it is PROMPT: one tick to observe the onset, one to detect the
+    // expiry, plus scheduler slop — not a blanket ceiling (V1's upper bound;
+    // a 5s blanket could hide a window running 4x slow).
     assert!(
-        elapsed < Duration::from_secs(5),
-        "the expiry is prompt, not a restart loop (took {elapsed:?})"
+        elapsed < Duration::from_millis(max_age_ms + 500 + 750),
+        "the expiry lands within the window plus two ticks of slop (failed after {elapsed:?})"
+    );
+
+    // The first-failure diagnostic announced the DECLARED window verbatim —
+    // the operator plans against what was announced (V1).
+    let captured = String::from_utf8(shared.lock().unwrap().clone()).expect("utf-8 sink");
+    let first_failure = captured
+        .lines()
+        .find(|l| l.contains("declared liveness check failing"))
+        .expect("the first-failure diagnostic announced the window");
+    let announced: u64 = first_failure
+        .split("failing continuously for ")
+        .nth(1)
+        .and_then(|rest| rest.split("ms fails the instance").next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the announcement carries the window in ms: {first_failure}"));
+    assert_eq!(
+        announced, max_age_ms,
+        "the announcement names the DECLARED window: {first_failure}"
     );
 
     let events = facade.transition_events("silent-hb").unwrap();
@@ -220,6 +253,7 @@ fn absent_heartbeat_expires_the_window_and_fails_unresponsive() {
         TransitionCause::Unresponsive {
             check,
             failing_for_ms,
+            detail,
         } => {
             assert!(
                 check.contains("heartbeat-file") && check.contains("hb.marker"),
@@ -228,6 +262,21 @@ fn absent_heartbeat_expires_the_window_and_fails_unresponsive() {
             assert!(
                 *failing_for_ms >= max_age_ms,
                 "the failing streak reached the window: {failing_for_ms}ms"
+            );
+            assert!(
+                *failing_for_ms < max_age_ms + 1000,
+                "the streak is the observed window plus tick slop, not a runaway: \
+                 {failing_for_ms}ms"
+            );
+            // A plain silence expiry (no pre-existing staleness) carries no
+            // ONSET note — but under the `never` policy this expiry is
+            // TERMINAL, so the policy verdict rides the cause's detail (P8):
+            // the event log carries the "will never restart" conclusion, not
+            // just the reaper's one console diagnostic.
+            assert_eq!(
+                detail.as_deref(),
+                Some("restart policy is 'never' — not restarting"),
+                "the terminal policy verdict rides the cause: {detail:?}"
             );
         }
         other => panic!("expected an unresponsive cause, got {other:?}"),
@@ -408,11 +457,17 @@ fn heartbeat_blip_recovers_inside_the_window_without_failing() {
 fn paused_instance_is_never_probed_even_with_a_stale_signal() {
     // THE PAUSED PIN (mutation-proof): a PAUSED instance is never probed —
     // a suspended process cannot heartbeat, and probing it would fail it
-    // for being paused. The heartbeat is absent from the very start
-    // (`--heartbeat-stop-after 0`), the window (500ms) is LONG past, and
-    // after several seconds of reaper ticks the instance is STILL `paused`.
+    // for being paused. The RESUME side is pinned just as hard (review
+    // round 1, P1): resuming CLEARS the open failure window, so the check
+    // re-arms from ZERO — a window that was already partly elapsed before
+    // the pause may not survive the suspension and insta-fail the resumed
+    // agent. The heartbeat is absent from the very start
+    // (`--heartbeat-stop-after 0`), so the window is genuinely OPEN before
+    // the pause (the diagnostic below proves supervision saw it) — the
+    // carry-over mutation has a real window to steal.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
+    let max_age_ms = 1000u64;
     write_manifest(
         manifest.path(),
         "frozen-hb",
@@ -424,11 +479,16 @@ fn paused_instance_is_never_probed_even_with_a_stale_signal() {
             "--linger-ms",
             "600000",
         ],
-        Some("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 500"),
+        Some(&format!(
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = {max_age_ms}"
+        )),
         true,
     );
 
-    let engine = open(&state);
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).expect("open");
     let facade = engine.blocking();
     facade
         .register_with_adapter(
@@ -439,11 +499,23 @@ fn paused_instance_is_never_probed_even_with_a_stale_signal() {
 
     let started = facade.start("frozen-hb").unwrap();
     assert_eq!(started.state, LifecycleState::Running);
+
+    // The first reaper tick opens the window (the absent heartbeat is seen
+    // stale) — the pre-pause staleness the resume must NOT inherit.
+    wait_for_diagnostic(
+        &shared,
+        "declared liveness check failing",
+        Duration::from_secs(6),
+        "the pre-pause first-failure diagnostic",
+    );
+    // Part of the window elapses while running...
+    std::thread::sleep(Duration::from_millis(300));
     let paused = facade.pause("frozen-hb").unwrap();
     assert_eq!(paused.state, LifecycleState::Paused);
 
-    // Several windows' worth of ticks while suspended: the paused pin holds.
-    std::thread::sleep(Duration::from_millis(2500));
+    // More than a full window's worth of ticks while suspended: the paused
+    // pin holds, and a surviving window would be LONG past expiry.
+    std::thread::sleep(Duration::from_millis(1500));
     let status = facade.instance_status("frozen-hb").unwrap();
     assert_eq!(
         status.instance.state,
@@ -452,18 +524,28 @@ fn paused_instance_is_never_probed_even_with_a_stale_signal() {
     );
     assert_eq!(status.restart_count, 0);
 
-    // And resuming re-arms the check: the (still absent) heartbeat now
-    // expires the window normally — the guard is the PAUSE, not a blanket
-    // amnesty for the instance.
+    // Resuming re-arms the check from zero (P1): the failure cannot land
+    // until a FULL window has elapsed AFTER the resume. (The carry-over
+    // mutation — resume keeps the pre-pause `failing_since` — insta-fails
+    // within one tick of the resume, far under this bound. The guard is the
+    // PAUSE, not a blanket amnesty: the still-absent heartbeat still fails
+    // the instance, on the resumed window's schedule.)
     facade.resume("frozen-hb").unwrap();
+    let resumed_at = Instant::now();
     let final_state = wait_until_state(
         &facade,
         "frozen-hb",
         |s| s == LifecycleState::Failed,
         Duration::from_secs(10),
-        "the resumed instance's window to expire",
+        "the resumed instance's FRESH window to expire",
     );
     assert_eq!(final_state, LifecycleState::Failed);
+    let after_resume = resumed_at.elapsed();
+    assert!(
+        after_resume >= Duration::from_millis(max_age_ms),
+        "the resume re-armed the window from zero (failed {after_resume:?} after the \
+         resume; the declared window is {max_age_ms}ms)"
+    );
 }
 
 #[test]
@@ -588,10 +670,15 @@ fn http_health_silence_expires_the_window_and_fails_unresponsive() {
     );
     assert_eq!(final_state, LifecycleState::Failed);
     let elapsed = began.elapsed();
-    // The silence began ~600ms in; the expiry cannot precede onset + window.
+    // The silence began ~600ms in; the expiry cannot precede onset + window,
+    // and it is PROMPT: the window plus two ticks of slop (V1's upper bound).
     assert!(
         elapsed >= Duration::from_millis(600 + max_age_ms - 150),
         "the HTTP expiry respects onset + window (failed after {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600 + max_age_ms + 1250),
+        "the HTTP expiry is prompt, not a stalled reaper (failed after {elapsed:?})"
     );
 
     let events = facade.transition_events("dead-http").unwrap();
@@ -683,21 +770,54 @@ fn unresponsive_failures_restart_under_on_failure_until_the_crash_loop() {
     );
 
     // The remaining cycles ride the production backoff to the crash loop:
-    // eventually the terminal conclusion — the frozen `unresponsive` cause
-    // carries no detail field, so the crash-loop verdict reaches the surface
-    // as the reaper's ONE terminal diagnostic.
+    // eventually the terminal conclusion — the crash-loop verdict folds
+    // into the PERSISTED cause's `detail` (so the event log and `show`'s
+    // failed-cause fold carry it), and the reaper's ONE diagnostic remains
+    // the immediate-console surface.
     wait_for_diagnostic(
         &shared,
         "crash-loop: 5 consecutive failures",
         Duration::from_secs(60),
         "the crash-loop conclusion diagnostic",
     );
+    // P8: the terminal verdict rides the PERSISTED cause. The terminal
+    // `running → failed` transition's `Unresponsive` cause carries the
+    // crash-loop conclusion in its `detail` — the event log is the durable
+    // surface, byte-distinguishable from a mid-loop failure.
+    let events = facade.transition_events("loop-hb").unwrap();
+    let terminal = events
+        .iter()
+        .rev()
+        .find(|e| e.prior_state == LifecycleState::Running && e.new_state == LifecycleState::Failed)
+        .expect("a terminal running → failed transition event");
+    match &terminal.cause {
+        TransitionCause::Unresponsive { detail, .. } => {
+            let detail = detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("crash-loop: 5 consecutive failures"),
+                "the terminal cause's detail carries the crash-loop verdict: {detail:?}"
+            );
+        }
+        other => panic!("expected an Unresponsive terminal cause, got {other:?}"),
+    }
     let status = facade.instance_status("loop-hb").unwrap();
     assert_eq!(status.instance.state, LifecycleState::Failed);
+    // The `show` surface is pinned too: `failed_cause` folds the last
+    // failure event's cause (the terminal settle cleared the record's own
+    // cause), so the verdict must survive the fold.
+    assert!(
+        status
+            .failed_cause
+            .as_deref()
+            .is_some_and(|cause| cause.contains("crash-loop: 5 consecutive failures")),
+        "`show`'s failed-cause fold carries the verdict: {:?}",
+        status.failed_cause
+    );
     // The terminal settle (F-Low-2) DELETES the record — the live count dies
     // with it (the honest state: nothing will restart). The count the drill
-    // REACHED was asserted mid-run above; the crash-loop conclusion itself
-    // lives in the event log + the ONE diagnostic.
+    // REACHED was asserted mid-run above; the crash-loop conclusion lives in
+    // the persisted cause (asserted above: event log + `show`'s fold) plus
+    // the ONE immediate-console diagnostic.
     assert_eq!(
         status.restart_count, 0,
         "the terminal settle cleared the record"
@@ -811,11 +931,16 @@ fn adopted_instance_rederives_a_fresh_window() {
         std::thread::sleep(Duration::from_millis(1000));
     } // engine A drops; the DETACHED agent survives (disarmed handles).
 
+    // (V4) The clock starts BEFORE the open: the fresh window's origin is the
+    // ADOPTION (engine B's open re-acquires and stamps a new `Supervised`),
+    // and the open itself takes time — the bound below credits that honestly
+    // instead of the old fudge (`>= 2300` hardcoded), which would let a
+    // 200ms-shorter window pass.
+    let open_started = Instant::now();
     let engine_b = open(&state);
     let facade_b = engine_b.blocking();
-    // The fresh window's origin is the ADOPTION (engine B's open re-acquires
-    // and stamps a new `Supervised`).
     let adopted_at = Instant::now();
+    let adoption_epsilon = adopted_at.saturating_duration_since(open_started);
     let status = facade_b.instance_status("adopted-hb").unwrap();
     assert_eq!(
         status.instance.state,
@@ -849,9 +974,16 @@ fn adopted_instance_rederives_a_fresh_window() {
         "the adopted instance's fresh window to expire",
     );
     assert_eq!(final_state, LifecycleState::Failed);
+    // The adopted expiry waited out B's OWN (fresh) 2500ms window: the
+    // earliest honest bound is (window − the open time already spent before
+    // `adopted_at` was stamped − one tick of slop), saturating at zero (V4).
     assert!(
-        adopted_at.elapsed() >= Duration::from_millis(2300),
-        "the adopted expiry waited out B's own (fresh) window: {:?}",
+        adopted_at.elapsed()
+            >= Duration::from_millis(2500)
+                .saturating_sub(adoption_epsilon)
+                .saturating_sub(Duration::from_millis(250)),
+        "the adopted expiry waited out B's own (fresh) window: {:?} (open took \
+         {adoption_epsilon:?})",
         adopted_at.elapsed()
     );
     let events = facade_b.transition_events("adopted-hb").unwrap();
@@ -861,6 +993,528 @@ fn adopted_instance_rederives_a_fresh_window() {
             .any(|e| matches!(e.cause, TransitionCause::Unresponsive { .. })),
         "the adopted expiry is the same unresponsive edge: {events:#?}"
     );
+}
+
+#[test]
+fn flapping_signal_bounds_its_diagnostic_pairs_and_notes_the_flap() {
+    // Review round 1 (P6): a signal that keeps recovering INSIDE its window
+    // never expires — contract-correct (persistence is the window's job) —
+    // but an open/recover diagnostic PAIR per flap is per-tick spam in slow
+    // motion. The pair is BOUNDED: the first three cycles emit normally, the
+    // third recovery adds ONE flap note, and every later cycle is SILENT
+    // while the window keeps working. The subject beats every 400ms against
+    // a 300ms window: each inter-beat gap is stale for ~100ms, so the
+    // ~250ms reaper tick alternately sees stale then fresh — a continuous
+    // flap cadence the drill rides (and a ~100ms stale band can never hold
+    // the consecutive stale ticks a 300ms expiry would need).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "flutter-hb",
+        &["--heartbeat-file", "hb.marker:400", "--linger-ms", "600000"],
+        Some("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 300"),
+        false,
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).expect("open");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "flutter-hb",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    // Terminal policy: if the window ever DID expire (a cadence pathology),
+    // the instance must stay visibly failed — the Running pins below would
+    // catch it — instead of silently restarting into a new Run's budget.
+    facade
+        .set_restart_policy("flutter-hb", RestartPolicy::Never)
+        .unwrap();
+
+    let started = facade.start("flutter-hb").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Ride the flaps until the budget note lands (roughly one flap per
+    // ~500ms of wall clock, plus generous scheduler slop).
+    let flap_note = wait_for_diagnostic(
+        &shared,
+        "further liveness-window reopen diagnostics suppressed",
+        Duration::from_secs(20),
+        "the ONE flap-budget note",
+    );
+    assert!(
+        flap_note.contains("flutter-hb"),
+        "the note names the instance: {flap_note}"
+    );
+    // At note time the budget is EXACTLY spent: three announced opens, three
+    // announced recoveries, ONE note.
+    assert_eq!(
+        diagnostic_count(&shared, "declared liveness check failing"),
+        3,
+        "the three in-budget cycles each announced their window"
+    );
+    assert_eq!(
+        diagnostic_count(&shared, "declared liveness check recovered"),
+        3,
+        "the three in-budget cycles each announced their recovery"
+    );
+    assert_eq!(
+        diagnostic_count(
+            &shared,
+            "further liveness-window reopen diagnostics suppressed"
+        ),
+        1,
+        "exactly ONE flap note"
+    );
+
+    // Several MORE flaps' worth of ticks: silence — the budget holds — while
+    // the window itself keeps never expiring (the instance is still running).
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        diagnostic_count(&shared, "declared liveness check failing"),
+        3,
+        "later flaps are silent — the budget holds"
+    );
+    assert_eq!(
+        diagnostic_count(&shared, "declared liveness check recovered"),
+        3,
+        "later recoveries are silent — the budget holds"
+    );
+    assert_eq!(
+        diagnostic_count(
+            &shared,
+            "further liveness-window reopen diagnostics suppressed"
+        ),
+        1,
+        "the flap note is once-ever, never re-emitted"
+    );
+    let status = facade.instance_status("flutter-hb").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "a flapping-but-recovering signal never expires the window"
+    );
+
+    facade
+        .stop("flutter-hb", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn expiry_verdict_names_pre_existing_staleness_in_diagnostic_and_cause() {
+    // Review round 1 (P7/P8): `failing_for_ms` counts from the first
+    // OBSERVED failure — but for a heartbeat file the engine CAN say how
+    // much staler the file already was at that observation. The drill
+    // backdates a heartbeat file ~5s (the never-beating agent leaves it
+    // absent; the test plants it), lets the 600ms window expire, and pins
+    // the onset note in BOTH surfaces: the terminal diagnostic AND the
+    // cause's optional `detail` — the verdict survives everywhere the cause
+    // does (`show`, the transition line), not only in one diagnostic.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let max_age_ms = 600u64;
+    write_manifest(
+        manifest.path(),
+        "ancient-hb",
+        &[
+            "--heartbeat-file",
+            "hb.marker:100",
+            "--heartbeat-stop-after",
+            "0",
+            "--linger-ms",
+            "600000",
+        ],
+        Some(&format!(
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = {max_age_ms}"
+        )),
+        false,
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink).expect("open");
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter(
+            "ancient-hb",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    facade
+        .set_restart_policy("ancient-hb", RestartPolicy::Never)
+        .unwrap();
+
+    let started = facade.start("ancient-hb").unwrap();
+    assert_eq!(started.state, LifecycleState::Running);
+
+    // Plant the heartbeat file OURSELVES with an mtime backdated ~5s: at the
+    // reaper's first observation the file is already ~5s stale — staleness
+    // the 600ms observed window cannot see and must now confess.
+    let status = facade.instance_status("ancient-hb").unwrap();
+    let stale_marker = Path::new(&status.instance.agent_home).join("hb.marker");
+    let planted = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&stale_marker)
+        .expect("plant the pre-staled heartbeat file");
+    let backdated = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(5))
+        .expect("a now minus 5s");
+    planted
+        .set_times(std::fs::FileTimes::new().set_modified(backdated))
+        .expect("backdate the heartbeat mtime");
+    drop(planted);
+
+    wait_until_state(
+        &facade,
+        "ancient-hb",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(10),
+        "the pre-staled window to expire",
+    );
+
+    // The terminal diagnostic carries the onset note...
+    let terminal = wait_for_diagnostic(
+        &shared,
+        "already ~",
+        Duration::from_secs(5),
+        "the onset note in the terminal diagnostic",
+    );
+    assert!(
+        terminal.contains("ms stale at first observation"),
+        "the note names the first observation: {terminal}"
+    );
+    // ...and names ~5s of PRE-EXISTING staleness — far more than the 600ms
+    // the window itself observed (a fabricated 0ms or a window-sized number
+    // fails this bound).
+    let stale_delta_ms: u64 = terminal
+        .split("already ~")
+        .nth(1)
+        .and_then(|rest| rest.split("ms stale").next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("the note carries the stale delta in ms: {terminal}"));
+    assert!(
+        (4000..=7000).contains(&stale_delta_ms),
+        "the note names ~5s of pre-existing staleness, got {stale_delta_ms}ms: {terminal}"
+    );
+
+    // The onset note rides the cause's optional detail (bounded in the
+    // diagnostic by "; " on both sides) — and, P8, the TERMINAL verdict
+    // folds in AFTER it: under `never` this first expiry is already
+    // terminal, so the cause carries both the onset honesty and the
+    // not-restarting conclusion.
+    let note_start = terminal
+        .find("the heartbeat file was already ~")
+        .expect("the note text in the diagnostic");
+    let note_end = note_start
+        + terminal[note_start..]
+            .find("ms stale at first observation")
+            .expect("the note end")
+        + "ms stale at first observation".len();
+    let note = &terminal[note_start..note_end];
+    let events = facade.transition_events("ancient-hb").unwrap();
+    let last = events.last().unwrap();
+    match &last.cause {
+        TransitionCause::Unresponsive { detail, .. } => {
+            let detail = detail.as_deref().expect("the cause carries expiry detail");
+            assert!(
+                detail.starts_with(note),
+                "the onset note leads the cause detail: {detail:?}"
+            );
+            assert!(
+                detail.contains("restart policy is 'never' — not restarting"),
+                "the terminal verdict rides the cause after the onset note: {detail:?}"
+            );
+        }
+        other => panic!("expected an unresponsive cause, got {other:?}"),
+    }
+}
+
+#[test]
+fn expired_detached_wedge_is_force_killed_and_the_restart_rebinds_its_port() {
+    // Review round 1 (P4): a DETACHED handle has NO kill-on-drop — an
+    // unresponsive expiry that merely dropped it would leave the wedged
+    // process RUNNING (holding its port) while the policy restarted a
+    // replacement that could never bind. The drill: an http-get instance
+    // whose endpoint is silent from birth (`--http-health-fail-after 0`)
+    // while the PROCESS stays alive (the silent endpoint still accepts
+    // connections — a wedged, unresponsive agent). Engine A detaches and
+    // drops; engine B adopts, expires the wedge, and must FORCE-KILL it:
+    // at the failure the port REFUSES connections (the mutation leaves the
+    // wedge accepting), and the on-failure restart then RE-BINDS the same
+    // port (connect succeeds — service actually resumed).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let port = free_port();
+    let max_age_ms = 1000u64;
+    write_manifest(
+        manifest.path(),
+        "wedged-hb",
+        &[
+            "--http-health",
+            &format!("{port}:200"),
+            "--http-health-fail-after",
+            "0",
+            "--linger-ms",
+            "600000",
+        ],
+        Some(&format!(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:{port}/health\"\nexpected_status = 200\nmax_age_ms = {max_age_ms}"
+        )),
+        false,
+    );
+
+    {
+        let engine_a = open(&state);
+        let facade_a = engine_a.blocking();
+        facade_a
+            .register_with_adapter(
+                "wedged-hb",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        facade_a
+            .set_restart_policy("wedged-hb", RestartPolicy::OnFailure)
+            .unwrap();
+        let started = facade_a.start_detached("wedged-hb").unwrap();
+        assert_eq!(started.state, LifecycleState::Running);
+    } // engine A drops; the DETACHED wedge survives (disarmed handles).
+
+    let engine_b = open(&state);
+    let facade_b = engine_b.blocking();
+    let status = facade_b.instance_status("wedged-hb").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "the adopted wedge is re-held running"
+    );
+
+    // The endpoint has been silent since birth: B's fresh window expires it.
+    wait_until_state(
+        &facade_b,
+        "wedged-hb",
+        |s| s == LifecycleState::Failed,
+        Duration::from_secs(15),
+        "the adopted wedge's window to expire",
+    );
+
+    // THE P4 PIN: at the failure the wedge is DEAD — the port REFUSES (the
+    // silent endpoint accepted connections while alive, so a surviving wedge
+    // would connect). The force-kill runs BEFORE the failure commits, so
+    // Failed already implies the teardown happened.
+    let wedge_gone =
+        std::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .map(|_| false)
+            .unwrap_or_else(|err| err.kind() == std::io::ErrorKind::ConnectionRefused);
+    assert!(
+        wedge_gone,
+        "the detached wedge was force-killed at expiry — the port must refuse"
+    );
+
+    // The on-failure restart re-binds the SAME port: wait Running, then
+    // connect (bounded retries — the restart's own launch takes a beat).
+    wait_until_state(
+        &facade_b,
+        "wedged-hb",
+        |s| s == LifecycleState::Running,
+        Duration::from_secs(20),
+        "the policy restart to land running on the freed port",
+    );
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut rebound = false;
+    for _ in 0..40 {
+        match std::net::TcpStream::connect(addr) {
+            // The silent endpoint accepts then drops without answering, so a
+            // success is connect-only (never a read).
+            Ok(_) => {
+                rebound = true;
+                break;
+            }
+            // A refusal during the re-bind beat is retried (bounded).
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => panic!("unexpected connect error probing the re-bound port: {err}"),
+        }
+    }
+    assert!(rebound, "the restart re-bound the freed port");
+
+    facade_b
+        .stop("wedged-hb", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopted_instance_with_a_corrupt_adapter_snapshot_supervises_process_liveness_only() {
+    // Review round 1 (V3), outer arm: an adopted instance whose adapter
+    // SNAPSHOT became unreadable cannot re-derive its declared liveness
+    // check — the degradation is SURFACED as ONE diagnostic and the adoption
+    // still succeeds (the agent is running and owned either way): the
+    // instance is re-held with PROCESS liveness only and, with no declared
+    // check supervised, stays Running past where its original window would
+    // have expired. Never a failed adoption.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "hollow-hb",
+        &[
+            "--heartbeat-file",
+            "hb.marker:100",
+            "--heartbeat-stop-after",
+            "0",
+            "--linger-ms",
+            "600000",
+        ],
+        Some("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 2500"),
+        false,
+    );
+
+    let began = Instant::now();
+    let home: String = {
+        let engine_a = open(&state);
+        let facade_a = engine_a.blocking();
+        facade_a
+            .register_with_adapter(
+                "hollow-hb",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        let started = facade_a.start_detached("hollow-hb").unwrap();
+        assert_eq!(started.state, LifecycleState::Running);
+        facade_a
+            .instance_status("hollow-hb")
+            .unwrap()
+            .instance
+            .agent_home
+    }; // engine A drops; the DETACHED agent survives.
+
+    // Corrupt the snapshot AFTER A is gone (the adoption is the first reader).
+    std::fs::write(Path::new(&home).join("adapter.json"), b"this is not json")
+        .expect("corrupt the adapter snapshot");
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine_b = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink)
+        .expect("open engine B");
+    let facade_b = engine_b.blocking();
+
+    wait_for_diagnostic(
+        &shared,
+        "adapter snapshot could not be read",
+        Duration::from_secs(10),
+        "the degraded-adoption diagnostic",
+    );
+    assert_eq!(
+        diagnostic_count(&shared, "adapter snapshot could not be read"),
+        1,
+        "exactly ONE degraded-adoption diagnostic (surfaced, not spammed)"
+    );
+
+    // Past the ORIGINAL window's expiry (A's start + 2500ms): still Running —
+    // with no declared check supervised, nothing expires the instance.
+    let deadline = began + Duration::from_millis(2500 + 1500);
+    let now = Instant::now();
+    if now < deadline {
+        std::thread::sleep(deadline - now);
+    }
+    let status = facade_b.instance_status("hollow-hb").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "the degraded adoption supervises PROCESS liveness only — no declared check \
+         may fail the instance"
+    );
+
+    facade_b
+        .stop("hollow-hb", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopted_instance_with_an_unreadable_manifest_keeps_process_liveness() {
+    // Review round 1 (V3), inner arm: the snapshot READS, but the manifest it
+    // points at was deleted since registration — the liveness re-resolution
+    // fails, and the same ONE-diagnostic degradation applies: the adoption
+    // succeeds, the instance is re-held with PROCESS liveness only, and it
+    // stays Running past its original window (nothing declared to expire it).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_manifest(
+        manifest.path(),
+        "hollow2-hb",
+        &[
+            "--heartbeat-file",
+            "hb.marker:100",
+            "--heartbeat-stop-after",
+            "0",
+            "--linger-ms",
+            "600000",
+        ],
+        Some("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 2500"),
+        false,
+    );
+
+    let began = Instant::now();
+    {
+        let engine_a = open(&state);
+        let facade_a = engine_a.blocking();
+        facade_a
+            .register_with_adapter(
+                "hollow2-hb",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        let started = facade_a.start_detached("hollow2-hb").unwrap();
+        assert_eq!(started.state, LifecycleState::Running);
+    } // engine A drops; the DETACHED agent survives.
+
+    // Delete the manifest the snapshot points at (A is gone — the adoption's
+    // re-resolution is the next reader).
+    std::fs::remove_file(manifest.path().join("adapter.toml"))
+        .expect("delete the registered adapter manifest");
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(&shared)))));
+    let engine_b = Engine::open_with_diagnostics(Some(state.path().to_path_buf()), sink)
+        .expect("open engine B");
+    let facade_b = engine_b.blocking();
+
+    wait_for_diagnostic(
+        &shared,
+        "declared liveness check could not be resolved",
+        Duration::from_secs(10),
+        "the degraded-resolution diagnostic",
+    );
+    assert_eq!(
+        diagnostic_count(&shared, "declared liveness check could not be resolved"),
+        1,
+        "exactly ONE degraded-resolution diagnostic"
+    );
+
+    // Past the ORIGINAL window's expiry: still Running (process liveness only).
+    let deadline = began + Duration::from_millis(2500 + 1500);
+    let now = Instant::now();
+    if now < deadline {
+        std::thread::sleep(deadline - now);
+    }
+    let status = facade_b.instance_status("hollow2-hb").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "the degraded adoption supervises PROCESS liveness only — no declared check \
+         may fail the instance"
+    );
+
+    facade_b
+        .stop("hollow2-hb", Some(Duration::from_secs(5)))
+        .unwrap();
 }
 
 /// A `Write` adapter delegating into a shared buffer (the

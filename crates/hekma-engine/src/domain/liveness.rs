@@ -32,9 +32,11 @@
 //!   on without touching the clock — the unit tests pin every arm and the
 //!   exact `elapsed >= max_age_ms` expiry boundary.
 //! * **The HTTP attempt is capped inline.** The reaper passes
-//!   `Instant::now() + HTTP_ATTEMPT_CAP` as the deadline, so ONE hung
-//!   check stretches its tick by at most ~1s (N hung checks, ~Ns — named
-//!   in the reaper's poll docs; only FAILING checks pay it).
+//!   `Instant::now() + attempt_cap(max_age_ms)` as the deadline — the shared
+//!   1s cap bounded by the declared window itself — so ONE hung check
+//!   stretches its tick by at most one attempt cap (never past the window it
+//!   serves; a 250ms window's attempt is capped at 250ms). Only FAILING
+//!   checks pay any of it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -67,13 +69,25 @@ pub(crate) enum LivenessSignal {
     Failing,
 }
 
+/// The per-attempt HTTP deadline for a check whose window is `max_age_ms`
+/// (review round 1, P5b): the shared [`HTTP_ATTEMPT_CAP`] bounded by the
+/// window itself. ONE attempt can never outlive the window it serves — under
+/// the old `now + HTTP_ATTEMPT_CAP` shape, a 250ms window's attempt could
+/// legally hold for a full second, running the tick PAST the moment the
+/// window should have expired. Pure (no clock reads), so the unit tests pin
+/// both ends.
+pub(crate) fn attempt_cap(max_age_ms: u64) -> Duration {
+    HTTP_ATTEMPT_CAP.min(Duration::from_millis(max_age_ms))
+}
+
 /// Evaluate ONE liveness attempt against the running agent.
 ///
 /// * `heartbeat_file` — the path, resolved against `home` (the Agent Home)
 ///   when relative, then handed to the shared freshness evaluator.
 /// * `http_get` — ONE bounded attempt: the deadline is
-///   `Instant::now() + HTTP_ATTEMPT_CAP`, so the reaper's tick stretches by
-///   at most the cap per hung check (never the declared window — the
+///   `Instant::now() + attempt_cap(max_age_ms)` — the shared cap bounded by
+///   the declared window (see [`attempt_cap`]), so the reaper's tick
+///   stretches by at most one attempt cap and never past the window (the
 ///   window is the reaper's patience, not a per-attempt budget).
 pub(crate) fn evaluate(check: &LivenessCheck, home: &Path) -> LivenessSignal {
     match check {
@@ -90,7 +104,7 @@ pub(crate) fn evaluate(check: &LivenessCheck, home: &Path) -> LivenessSignal {
             }
         }
         LivenessCheck::HttpGet(h) => {
-            let deadline = Instant::now() + HTTP_ATTEMPT_CAP;
+            let deadline = Instant::now() + attempt_cap(h.max_age_ms);
             if HTTP_GET_ATTEMPT(&h.url, h.expected_status, deadline) {
                 LivenessSignal::Fresh
             } else {
@@ -104,14 +118,19 @@ pub(crate) fn evaluate(check: &LivenessCheck, home: &Path) -> LivenessSignal {
 /// watched and what counts as alive. One line, greppable, no timestamps
 /// (the event log adds them). Used in the unresponsive transition cause and
 /// the diagnostics the reaper emits around the window.
+///
+/// Both the display name (`heartbeat-file` / `http-get`) and the WIRE TAG
+/// (`heartbeat_file` / `http_get` — the serde tag a `--json` consumer sees)
+/// appear, so an operator can grep the line and a script can match the exact
+/// wire kind off the same string (review round 1, D3).
 pub(crate) fn describe(check: &LivenessCheck) -> String {
     match check {
         LivenessCheck::HeartbeatFile(h) => format!(
-            "liveness check heartbeat-file {} (stale after {}ms)",
+            "liveness check heartbeat-file (heartbeat_file) {} (stale after {}ms)",
             h.path, h.max_age_ms
         ),
         LivenessCheck::HttpGet(h) => format!(
-            "liveness check http-get {} (expected {})",
+            "liveness check http-get (http_get) {} (expected {})",
             h.url, h.expected_status
         ),
     }
@@ -146,10 +165,17 @@ pub(crate) enum WindowDecision {
     Recovered,
     /// The signal fails and the open window has reached `max_age_ms`
     /// (`elapsed >= max_age_ms`, the exact boundary): the instance is
-    /// UNRESPONSIVE. The reaper drives the `running → failed` transition
-    /// (cause `unresponsive`) and the Restart Policy applies.
+    /// UNRESPONSIVE. `failing_for_ms` counts from the FIRST OBSERVED
+    /// failure (the tick the engine saw the signal down), not from whenever
+    /// the signal actually began failing — the engine cannot see the past,
+    /// so this is a lower bound on true staleness (a heartbeat file may have
+    /// gone stale long before the first failing tick; the reaper names that
+    /// gap in its expiry detail when it can). The reaper drives the
+    /// `running → failed` transition (cause `unresponsive`) and the Restart
+    /// Policy applies.
     Expired {
-        /// How long the signal had been failing continuously at expiry.
+        /// How long the signal had been failing when the window expired,
+        /// measured since first OBSERVED failure.
         failing_for_ms: u64,
     },
 }
@@ -184,12 +210,15 @@ mod tests {
 
     #[test]
     fn describe_renders_each_kind_one_line_greppable() {
+        // D3 (review round 1): BOTH the display name and the WIRE TAG appear,
+        // so an operator greps the line and a script matches the wire kind
+        // off the same string.
         assert_eq!(
             describe(&LivenessCheck::HeartbeatFile(HeartbeatFileCheck {
                 path: "heartbeat.marker".to_string(),
                 max_age_ms: 5000,
             })),
-            "liveness check heartbeat-file heartbeat.marker (stale after 5000ms)"
+            "liveness check heartbeat-file (heartbeat_file) heartbeat.marker (stale after 5000ms)"
         );
         assert_eq!(
             describe(&LivenessCheck::HttpGet(HttpGetCheck {
@@ -197,8 +226,23 @@ mod tests {
                 expected_status: 200,
                 max_age_ms: 5000,
             })),
-            "liveness check http-get http://127.0.0.1:8080/health (expected 200)"
+            "liveness check http-get (http_get) http://127.0.0.1:8080/health (expected 200)"
         );
+    }
+
+    // -- the per-attempt HTTP cap (P5b) --------------------------------------
+
+    #[test]
+    fn attempt_cap_is_the_shared_cap_bounded_by_the_window() {
+        // The two ends, pinned: a floor-sized window (250 ms — the manifest
+        // validation minimum) caps the attempt AT the window (an attempt can
+        // never outlive the window it serves), and a generous window caps at
+        // the shared 1s HTTP_ATTEMPT_CAP. Pure — no clock reads.
+        assert_eq!(attempt_cap(250), Duration::from_millis(250));
+        assert_eq!(attempt_cap(60_000), Duration::from_secs(1));
+        // Exactly at the cap boundary, both orderings agree.
+        assert_eq!(attempt_cap(1_000), Duration::from_secs(1));
+        assert_eq!(attempt_cap(1_001), Duration::from_secs(1));
     }
 
     // -- the pure window decision -------------------------------------------

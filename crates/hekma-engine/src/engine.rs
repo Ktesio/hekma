@@ -115,11 +115,19 @@ fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
         }
         // The declared signal died: name the check + how long it had been
         // failing, so `show` explains the unresponsive failure the same way
-        // (story 18-2 — no new verb, the same fallback shape).
+        // (story 18-2 — no new verb, the same fallback shape). When the
+        // reaper recorded expiry-verdict detail (18-2 review round 1 — e.g.
+        // the heartbeat file's pre-existing staleness at first observation),
+        // it rides along here so `show` carries the whole verdict, not just
+        // the streak.
         TransitionCause::Unresponsive {
             check,
             failing_for_ms,
-        } => Some(format!("{check} failing for {failing_for_ms}ms")),
+            detail,
+        } => Some(match detail {
+            Some(detail) => format!("{check} failing for {failing_for_ms}ms ({detail})"),
+            None => format!("{check} failing for {failing_for_ms}ms"),
+        }),
         _ => None,
     }
 }

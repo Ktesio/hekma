@@ -1143,9 +1143,11 @@ impl Supervisor {
                 // Story 18-2: the declared liveness check (resolved in the
                 // (2b-liveness) block above) + its FRESH failure window — a
                 // new Run grants the agent a whole new window, the restart
-                // resets the streak by construction.
+                // resets the streak by construction. The reopen counter is
+                // fresh per Run too (P6).
                 liveness_check,
                 liveness_failing_since: None,
+                liveness_reopens: 0,
             },
         );
 

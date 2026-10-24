@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
+use crate::ports::StoreError;
 
 impl Supervisor {
     /// Clear one instance's consecutive poll-error streak (AI-12). Called at
@@ -543,9 +544,47 @@ impl Supervisor {
             // pause that was a no-op: neither may fail the agent), and a
             // `stopping`/terminal row is somebody else's transition. SILENT
             // skip by design — a pause is a normal state, not a degradation.
+            //
+            // Review round 1 (P2): a store-read ERROR is its own arm — the
+            // state is UNREADABLE, which is not evidence the instance is not
+            // running, so the check is PAUSED for this tick (never fail an
+            // instance on an unreadable state) and the degradation is
+            // SURFACED once per episode: the first Err for a name emits ONE
+            // diagnostic; further Errs stay silent (no per-tick spam while
+            // the store is down) until a read recovers — an Ok clears the
+            // episode silently and checks resume.
+            #[cfg(test)]
+            if self.liveness_lookup_fault_names.contains(&name) {
+                // cfg(test) seam (P2's driver): behave exactly like a store
+                // read failure, deterministically (a real outage cannot be
+                // staged in-process). The SAME episode bookkeeping as the
+                // real Err arm — the seam exercises the whole arm, not just
+                // the diagnostic.
+                if self.liveness_lookup_err_names.insert(name.clone()) {
+                    self.emit_liveness_lookup_degraded(
+                        &name,
+                        "injected cfg(test) liveness-lookup fault (store read failed)",
+                    );
+                }
+                continue;
+            }
             match registry.lookup(&name) {
-                Ok(instance) if instance.state == LifecycleState::Running => {}
-                _ => continue,
+                Ok(instance) => {
+                    // A successful read ends the degraded-read episode (if
+                    // one was open) — silently; recovery is not news, the
+                    // ONE degradation diagnostic already covered it.
+                    self.liveness_lookup_err_names.remove(&name);
+                    if instance.state != LifecycleState::Running {
+                        continue;
+                    }
+                }
+                Err(lookup_err) => {
+                    if self.liveness_lookup_err_names.insert(name.clone()) {
+                        // First Err THIS episode: the ONE diagnostic.
+                        self.emit_liveness_lookup_degraded(&name, &lookup_err.to_string());
+                    }
+                    continue;
+                }
             }
             let max_age_ms = check.max_age_ms();
             let failing_now =
@@ -561,37 +600,76 @@ impl Supervisor {
                     // first-failure diagnostic (surfaced, not silent — the
                     // operator sees the window open while there is still time
                     // to care).
-                    if let Some(supervised) = self.running.get_mut(&name) {
+                    //
+                    // Review round 1 (P6): the pair is BOUNDED. Once this Run
+                    // has flapped through the diagnostic budget (3 full
+                    // open→recover cycles), further window-opens open
+                    // SILENTLY — the ONE suppression note (emitted at the
+                    // third recovery) already said the signal is flapping.
+                    // The window itself always opens and always still
+                    // expires; only the chatter is bounded.
+                    let suppressed = {
+                        let Some(supervised) = self.running.get_mut(&name) else {
+                            continue;
+                        };
                         supervised.liveness_failing_since = Some(std::time::Instant::now());
+                        supervised.liveness_reopens >= LIVENESS_REOPEN_DIAGNOSTIC_BUDGET
+                    };
+                    if !suppressed {
+                        self.emit_diagnostic(&format!(
+                            "{}: declared liveness check failing ({}) — the window is open; \
+                             failing continuously for {}ms fails the instance",
+                            name.as_str(),
+                            liveness::describe(&check),
+                            max_age_ms,
+                        ));
                     }
-                    self.emit_diagnostic(&format!(
-                        "{}: declared liveness check failing ({}) — the window is open; \
-                         failing continuously for {}ms fails the instance",
-                        name.as_str(),
-                        liveness::describe(&check),
-                        max_age_ms,
-                    ));
                 }
                 WindowDecision::Recovered => {
                     // The signal came back inside the window: close the
                     // window, emit the ONE recovery diagnostic (a failing
                     // agent that came back is exactly what an operator wants
                     // to know about).
-                    if let Some(supervised) = self.running.get_mut(&name) {
+                    //
+                    // Review round 1 (P6): count the completed flap cycle.
+                    // Recoveries inside the diagnostic budget (the first 3)
+                    // each emit; AT the third, ONE flap note explains that
+                    // further reopen diagnostics are suppressed; later
+                    // recoveries are silent (the operator has been told).
+                    let reopens = {
+                        let Some(supervised) = self.running.get_mut(&name) else {
+                            continue;
+                        };
                         supervised.liveness_failing_since = None;
+                        supervised.liveness_reopens = supervised.liveness_reopens.saturating_add(1);
+                        supervised.liveness_reopens
+                    };
+                    if reopens <= LIVENESS_REOPEN_DIAGNOSTIC_BUDGET {
+                        self.emit_diagnostic(&format!(
+                            "{}: declared liveness check recovered ({}) — the failure window \
+                             closed before expiring",
+                            name.as_str(),
+                            liveness::describe(&check),
+                        ));
                     }
-                    self.emit_diagnostic(&format!(
-                        "{}: declared liveness check recovered ({}) — the failure window \
-                         closed before expiring",
-                        name.as_str(),
-                        liveness::describe(&check),
-                    ));
+                    if reopens == LIVENESS_REOPEN_DIAGNOSTIC_BUDGET {
+                        // Exactly once (the count never revisits this value).
+                        self.emit_diagnostic(&format!(
+                            "{}: further liveness-window reopen diagnostics suppressed \
+                             (the signal is flapping; the window still never expires while \
+                             it recovers)",
+                            name.as_str()
+                        ));
+                    }
                 }
                 WindowDecision::Expired { failing_for_ms } => {
                     // UNRESPONSIVE. The crash-path sequence verbatim (phase 3's
                     // terminal drains → capture → notices → remove → policy
                     // consult → transition), with the `unresponsive` cause and
-                    // the guaranteed-Running prior state.
+                    // the guaranteed-Running prior state — plus the review
+                    // round 1 hardenings: the detached-handle force-kill (P4),
+                    // the onset honesty (P7), the detail-carrying cause (P8),
+                    // and the GUARDED commit (P3).
                     let check_desc = liveness::describe(&check);
                     self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
                     self.drain_observed_for(registry, &name, DrainMode::Terminal);
@@ -607,41 +685,172 @@ impl Supervisor {
                         .and_then(|s| self.backend.log_capture(&s.handle));
                     self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
+                    // P4 (review round 1): a DETACHED handle has NO
+                    // kill-on-drop — dropping it below would release the
+                    // handle and leave the wedged process RUNNING (holding
+                    // its ports, still unresponsive — the "failure" would be
+                    // bookkeeping, not teardown). The disarm flag's single
+                    // source is the spawn record (spawn and adopt both pass
+                    // it); when it says detached and the process is still
+                    // ALIVE, escalate to the stop ladder's final leg (a
+                    // zero-window stop is SIGKILL + confirm on unix) BEFORE
+                    // the removal — the same escalation shape the
+                    // readiness-timeout teardown uses (18-1 review E2). A
+                    // non-detached (owned) handle keeps the kill-on-drop
+                    // drop, unchanged.
+                    let detached = registry
+                        .spawn_record(&name)
+                        .ok()
+                        .flatten()
+                        .map(|record| record.detach)
+                        .unwrap_or(false);
+                    if detached {
+                        if let Some(supervised) = self.running.get_mut(&name) {
+                            if matches!(
+                                self.backend.poll(&mut supervised.handle),
+                                Ok(ProcessStatus::Alive)
+                            ) {
+                                if let Err(kill_err) =
+                                    self.backend.stop(&mut supervised.handle, Duration::ZERO)
+                                {
+                                    // Surfaced (AI-18): the kill failed — the
+                                    // operator must know the teardown was not
+                                    // completed, not silently drop a live
+                                    // handle.
+                                    self.emit_diagnostic(&format!(
+                                        "{}: liveness-expiry teardown could not force-kill \
+                                         the detached, unresponsive process: {kill_err}",
+                                        name.as_str()
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     self.running.remove(&name);
-                    let detail = format!(
+                    // P7 (review round 1): the honest onset note.
+                    // `failing_for_ms` counts from the FIRST OBSERVED
+                    // failure; for a heartbeat file the engine CAN say how
+                    // much staler the file already was at that observation
+                    // (stat the file now, compare its age to the observed
+                    // streak) — the true staleness is at least their sum,
+                    // and the observation is the lower bound, not the whole
+                    // truth. An http-get has no statable onset (a refused
+                    // connection leaves no artifact) — the note is
+                    // heartbeat-file-only.
+                    let onset_note = liveness_expiry_onset_note(
+                        &check,
+                        &registry.agent_home(&name),
+                        failing_for_ms,
+                    );
+                    let mut detail = format!(
                         "declared liveness check unresponsive: {check_desc} failing for \
                          {failing_for_ms}ms (window {max_age_ms}ms)"
                     );
+                    if let Some(note) = &onset_note {
+                        detail.push_str("; ");
+                        detail.push_str(note);
+                    }
+                    // P8 (review round 1): the policy consult happens BEFORE
+                    // the commit — the phase-3 order. On a TERMINAL outcome
+                    // (policy `never`, or the crash-loop threshold) the
+                    // verdict folds into the PERSISTED cause's `detail`
+                    // (combined with the onset note when both exist), so the
+                    // event log and `show`'s failed-cause fold carry the
+                    // "will never restart" conclusion — not only the one
+                    // console diagnostic this arm keeps below.
                     let decision = self.plan_restart(registry, &name, &detail);
+                    let terminal_verdict = if decision.plan.is_none() {
+                        // `plan_restart` prefixes the verdict with the base
+                        // detail it was handed; strip that back off so the
+                        // cause's `detail` field carries JUST the verdict —
+                        // the cause already renders the check + streak, and
+                        // re-duplicating them would garble `show`.
+                        Some(
+                            decision
+                                .crash_cause
+                                .strip_prefix(&format!("{detail}; "))
+                                .unwrap_or(&decision.crash_cause)
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    let cause = match (&onset_note, terminal_verdict) {
+                        (Some(note), Some(verdict)) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            format!("{note}; {verdict}"),
+                        ),
+                        (Some(note), None) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            note.clone(),
+                        ),
+                        (None, Some(verdict)) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            verdict,
+                        ),
+                        (None, None) => {
+                            TransitionCause::unresponsive(check_desc.clone(), failing_for_ms)
+                        }
+                    };
                     if self.ensure_log_dir(registry, &name).is_err() {
                         // Same posture as the crash path: the state persists
                         // even if the log dir cannot be prepared; the event
                         // append below stays best-effort.
                     }
-                    if self
-                        .transition_with_log_capture(
-                            registry,
-                            &name,
-                            LifecycleState::Running,
-                            LifecycleState::Failed,
-                            TransitionCause::unresponsive(check_desc, failing_for_ms),
-                            liveness_log_capture,
-                        )
-                        .is_err()
-                    {
-                        // Persisting the transition failed; leave the record
-                        // for a later reconcile and move on (never panic the
-                        // reaper).
+                    // P3 (review round 1): the GUARDED commit. The phase-4
+                    // lookup read `running` a moment ago, but a concurrent
+                    // command (another CLI engine on the same state root)
+                    // may have legitimately moved the row since — the write
+                    // commits ONLY when the row is still `running`. A
+                    // refusal is the ONE skip-diagnostic with no failure and
+                    // NO restart plan: the state moved, so whoever drove
+                    // that transition owns this instance's lifecycle now.
+                    // HONEST ORDER NOTE (P8): the consult above has ALREADY
+                    // charged the counter / settled the record by the time
+                    // this commit runs — the same consult-then-persist order
+                    // the crash path uses — so a `StateConflict` refusal
+                    // leaves that charge in place. The failure was real,
+                    // whoever drove the concurrent transition owns the row,
+                    // and the charge stands.
+                    if let Err(err) = self.transition_if_prior(
+                        registry,
+                        &name,
+                        LifecycleState::Running,
+                        LifecycleState::Failed,
+                        cause,
+                        liveness_log_capture,
+                    ) {
+                        match err {
+                            EngineError::Store(StoreError::StateConflict { .. }) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: liveness expiry skipped — the instance state \
+                                     moved before the failure committed; the instance is \
+                                     left to whoever drove that transition",
+                                    name.as_str()
+                                ));
+                            }
+                            _ => {
+                                // Persisting the transition failed (event
+                                // append / compensation); leave the record
+                                // for a later reconcile and move on (never
+                                // panic the reaper).
+                            }
+                        }
                         continue;
                     }
                     match decision.plan {
                         Some(plan) => plans.push(plan),
                         None => {
                             // Terminal (policy `never`, or the crash-loop
-                            // threshold): no restart cadence will make this
-                            // visible, so the reaper's own surface carries
-                            // the conclusion ONCE (surfaced, not silent — the
-                            // full cause also lives in the event log).
+                            // threshold): keep the ONE immediate-console
+                            // diagnostic — the verdict ALSO rides the
+                            // persisted cause above (P8), so the event log
+                            // and `show` carry it durably; this is the
+                            // operator-console surface, emitted exactly once
+                            // (surfaced, not silent).
                             self.emit_diagnostic(&format!(
                                 "{}: {}",
                                 name.as_str(),
@@ -1245,9 +1454,12 @@ impl Supervisor {
                             // the previous engine's failure streak is not
                             // observable, so adoption grants a whole new
                             // window (the honest ≤-one-extra-window grace,
-                            // documented in the manifest docs).
+                            // documented in the manifest docs). The reopen
+                            // counter starts fresh too (P6): this engine has
+                            // seen zero flaps.
                             liveness_check: adopted_liveness_check,
                             liveness_failing_since: None,
+                            liveness_reopens: 0,
                         },
                     );
                     adopted += 1;
@@ -1445,5 +1657,69 @@ impl Supervisor {
         let _ = registry.settle_spawn_record(name);
     }
 
+    /// The ONE degraded-read diagnostic of the phase-4 liveness lookup
+    /// (review round 1, P2) — shared by the real store-error path and the
+    /// cfg(test) seam so both emit byte-identically.
+    fn emit_liveness_lookup_degraded(&self, name: &InstanceName, reason: &str) {
+        self.emit_diagnostic(&format!(
+            "{}: declared liveness check could not consult the instance state \
+             (store read failed): {reason} — checks paused until reads recover",
+            name.as_str(),
+        ));
+    }
+
     // ---- internals ----
+}
+
+/// How many complete liveness flap cycles (window open → recovery) emit
+/// their first-failure/recovery diagnostic PAIRS within one Run before the
+/// pairs go silent (review round 1, P6). A flapping signal that never
+/// expires is contract-correct — persistence is the window's job — but an
+/// unbounded diagnostic pair per flap is per-tick spam in slow motion: three
+/// pairs tell the operator everything, then ONE suppression note says the
+/// quiet part, and the window keeps expiring on schedule regardless.
+const LIVENESS_REOPEN_DIAGNOSTIC_BUDGET: u32 = 3;
+
+/// The expiry-verdict onset note (review round 1, P7): for a HEARTBEAT-FILE
+/// check, how much staler the file already was at the first OBSERVED failure
+/// than the observed streak itself — the engine can stat the file at expiry
+/// and subtract what the window measured, surfacing the pre-existing
+/// staleness the observation could not see. `None` for an http-get check (a
+/// refused connection leaves no statable artifact), for a file that cannot
+/// be stat'ed honestly, and when the file's current age does not exceed the
+/// observed streak (nothing pre-existing to name). Best-effort by design:
+/// a note is additive honesty, never a gate on the failure itself.
+fn liveness_expiry_onset_note(
+    check: &LivenessCheck,
+    home: &std::path::Path,
+    failing_for_ms: u64,
+) -> Option<String> {
+    let LivenessCheck::HeartbeatFile(h) = check else {
+        return None;
+    };
+    // The SAME home-relative resolution the evaluator uses (evaluate's
+    // HeartbeatFile arm), so the note stats the exact file that was judged
+    // stale.
+    let path = if std::path::Path::new(&h.path).is_absolute() {
+        std::path::PathBuf::from(&h.path)
+    } else {
+        home.join(&h.path)
+    };
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
+    let age_now_ms = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_millis() as u64;
+    if age_now_ms > failing_for_ms {
+        Some(format!(
+            "the heartbeat file was already ~{}ms stale at first observation",
+            age_now_ms - failing_for_ms
+        ))
+    } else {
+        None
+    }
 }

@@ -224,6 +224,8 @@ pub(crate) fn file_fresh(path: &Path, max_age_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::liveness::LivenessSignal;
+    use hekma_adapter_api::{HeartbeatFileCheck, LivenessCheck};
     use std::time::Duration as _Duration;
 
     // -- http url splitting + status parse ---------------------------------
@@ -348,5 +350,120 @@ mod tests {
             std::ptr::fn_addr_eq(crate::domain::liveness::HTTP_GET_ATTEMPT, http_ptr),
             "liveness must alias the shared http_get_attempt, not a copy"
         );
+    }
+
+    #[test]
+    fn readiness_file_fresh_and_liveness_heartbeat_answer_identically() {
+        // The behavioral-equivalence canary (review round 1, V2): the same
+        // on-disk fixture, fed through each surface's EXACT call shape, must
+        // answer identically — the two sections share one evaluator, so a
+        // heartbeat that is fresh to liveness is fresh to readiness and vice
+        // versa. The readiness side replicates `run_probe`'s file-fresh arm
+        // verbatim (relative resolves against the home; the readiness alias
+        // evaluates), the liveness side goes through
+        // `liveness::evaluate(HeartbeatFile)`. The alias pin above proves
+        // identity; this proves BEHAVIOR through the real call shapes (a
+        // changed call shape on either surface — a different resolution, a
+        // flipped comparison — flips this canary).
+        let dir = std::env::temp_dir().join(format!(
+            "hekma-probe-kinds-canary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let home = &dir;
+
+        // Helper: one fixture's answer through BOTH call shapes.
+        let both_answers = |declared_path: &str, max_age_ms: u64| -> (bool, bool) {
+            // READINESS's exact shape (run_probe's file-fresh arm).
+            let readiness = {
+                let probe = hekma_adapter_api::FileFreshProbe {
+                    path: declared_path.to_string(),
+                    max_age_ms,
+                };
+                let path = if Path::new(&probe.path).is_absolute() {
+                    std::path::PathBuf::from(&probe.path)
+                } else {
+                    home.join(&probe.path)
+                };
+                crate::domain::readiness::FILE_FRESH(&path, probe.max_age_ms)
+            };
+            // LIVENESS's exact shape (evaluate's HeartbeatFile arm).
+            let liveness = {
+                let check = LivenessCheck::HeartbeatFile(HeartbeatFileCheck {
+                    path: declared_path.to_string(),
+                    max_age_ms,
+                });
+                crate::domain::liveness::evaluate(&check, home) == LivenessSignal::Fresh
+            };
+            (readiness, liveness)
+        };
+
+        // 1. FRESH (just written): both true.
+        let fresh = dir.join("fresh.marker");
+        std::fs::write(&fresh, b"beat").expect("write marker");
+        let (r, l) = both_answers("fresh.marker", 60_000);
+        assert_eq!((r, l), (true, true), "fresh file: both surfaces say fresh");
+
+        // 2. ABSENT: both false (absent ≡ stale, for BOTH sections).
+        let (r, l) = both_answers("absent.marker", 60_000);
+        assert_eq!(
+            (r, l),
+            (false, false),
+            "absent file: both surfaces say stale"
+        );
+
+        // 3. DIRECTORY: both false (B6 — only a regular file proves
+        //    freshness; the home itself is never a heartbeat).
+        let (r, l) = both_answers(".", 60_000);
+        assert_eq!((r, l), (false, false), "directory: both surfaces refuse");
+
+        // 4. FUTURE MTIME (clock skew): both true — age clamps to zero, the
+        //    freshly-written posture.
+        let future = dir.join("future.marker");
+        std::fs::write(&future, b"beat").expect("write marker");
+        let future_mtime = std::time::SystemTime::now()
+            .checked_add(_Duration::from_secs(10))
+            .expect("+10s");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&future)
+            .expect("reopen");
+        file.set_times(std::fs::FileTimes::new().set_modified(future_mtime))
+            .expect("set future mtime");
+        drop(file);
+        let (r, l) = both_answers("future.marker", 60_000);
+        assert_eq!(
+            (r, l),
+            (true, true),
+            "future mtime: both surfaces clamp to fresh"
+        );
+
+        // Backdate one file for the stale cases (10s old).
+        let stale = dir.join("stale.marker");
+        std::fs::write(&stale, b"beat").expect("write marker");
+        let old_mtime = std::time::SystemTime::now()
+            .checked_sub(_Duration::from_secs(10))
+            .expect("-10s");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("reopen");
+        file.set_times(std::fs::FileTimes::new().set_modified(old_mtime))
+            .expect("set old mtime");
+        drop(file);
+
+        // 5. OLD vs 5s window: both false (10s > 5s — stale).
+        let (r, l) = both_answers("stale.marker", 5_000);
+        assert_eq!((r, l), (false, false), "10s-old file vs 5s window: stale");
+
+        // 6. OLD vs 60s window: both true (10s <= 60s — still fresh).
+        let (r, l) = both_answers("stale.marker", 60_000);
+        assert_eq!((r, l), (true, true), "10s-old file vs 60s window: fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
