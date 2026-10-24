@@ -64,6 +64,9 @@ FR-42: Service-grade lifecycle — readiness and liveness probes, exit-code clas
 FR-43: Governance at the wire and per unit of work — Task-scoped budgets, the `block` fence, content-free per-call records (added 2026-09-30)
 FR-44: Portable governance semantics — versioned Governance Vectors verified against the evaluator (added 2026-09-30)
 FR-45: Reconciliation with confirmed actuals — the `reconciled` label's first producer (added 2026-09-30)
+FR-46: OTLP telemetry export — opt-in, operator-configured collector; labeled metrics only, never content (added 2026-10-23)
+FR-47: Agents-in-CI recipe — budget-capped, wall-clock-bounded, exit-code-honest GitHub Actions lanes with usage in $GITHUB_STEP_SUMMARY (added 2026-10-23)
+FR-48: Adapter gallery — docs-curated agents validated by hekma-conformance in CI, with per-capability honesty tables (added 2026-10-23)
 
 ### NonFunctional Requirements
 
@@ -151,6 +154,9 @@ FR-42: Epic 18 — Service-grade lifecycle
 FR-43: Epic 19 (19.2–19.4) — Governance at the wire and per unit of work
 FR-44: Epic 19 (19.1) — Portable governance semantics
 FR-45: Epic 19 (19.5) — Reconciliation with confirmed actuals
+FR-46: Epic 20 (20.1) — OTLP telemetry export
+FR-47: Epic 20 (20.2) — Agents-in-CI recipe
+FR-48: Epic 20 (20.3) — Adapter gallery
 
 NFR mapping (cross-cutting unless noted): NFR-1 → Epic 1 (resilience core) + all DoDs; NFR-2 → Epic 1 (per-OS backends) + every OS-touching story; NFR-3 → every story's DoD (coverage gate); NFR-4 → Epic 7 (benchmark story); NFR-5 → Epic 4; NFR-6 → Epic 2 (secrets) + docs; NFR-7 → every story's DoD + Epic 8 (migration docs); NFR-8 → Epic 1 (tokio/rusqlite adoption stories).
 
@@ -183,6 +189,9 @@ An Operator runs the real NousResearch Hermes Agent end-to-end under Ktesio (UJ-
 ### Epic 7: Embed the Engine (Hosts)
 A Host embeds the engine library, drives every capability without a TTY, subscribes to state/usage/breach events with stable schemas, and depends on crates.io-published ktesio-engine + ktesio-adapter-api. kt consuming only the public API is proven in CI, and the NFR-4 performance budgets are benchmarked. UJ-3 lands here.
 **FRs covered:** FR-31..FR-34
+
+### Epic 20: Adoptability *(opened 2026-10-23 via correct-course)*
+Opt-in OTLP metrics export into existing observability stacks, a budget-capped agents-in-CI recipe dogfooded in this repository's CI, and a conformance-validated adapter gallery with honesty tables. **FRs covered:** FR-46, FR-47, FR-48.
 
 ### Epic 19: Wire Governance for Hosts *(opened 2026-09-30 via correct-course)*
 A Host shares the Engine's decision rules as portable vectors, scopes budgets to its own units of
@@ -1243,3 +1252,64 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 - A Host submits confirmed usage for a Run or Task.
 - Reconciled figures sit beside estimated rows and never overwrite them.
 - Drift is reported, and every surface labels which figure it shows.
+
+## Epic 20: Adoptability
+
+> **(2026-10-23 — opened via correct-course: `sprint-change-proposal-2026-10-23-adoptability.md`.)**
+> The brainstorm trigger: Hekma runs agents well, but a newcomer's first hour lacks the artifacts
+> adoption runs on — governance metrics do not feed an existing Grafana/Datadog stack, there is no
+> recipe for running a governed bot in CI, and no validated index of which agents run under Hekma
+> today. Islam approved the epic 2026-10-23 (standard OTLP; gallery in docs; the ten-agent seed
+> list; D1 = the hand-rolled OTLP/HTTP+JSON exporter per AD-21; D2 = the PRD §6 amendment; D3 =
+> in-repo CI recipe). Realizes FR-46, FR-47 and FR-48. Purely additive: this epic does not disturb
+> Epics 18 or 19 — no story touches the lifecycle declarations, the fence, Task scope, the vectors,
+> or reconciliation beyond reading their outputs. Batch-epic shape (the 10–14 precedent): full ACs
+> are derived at the spec stage. 20.1 is a public-exposition + privacy-surface story: AI-55
+> two-pass review applies.
+
+### Story 20.1: OTLP telemetry export (FR-46, AD-21)
+- Opt-in, off by default: a configured collector endpoint turns export on and nothing else does —
+  no configuration, no egress, asserted by test (the §6 amendment's default).
+- Hand-rolled OTLP/HTTP+JSON exporter in `hekma-host` (`src/otlp/`), zero new runtime deps (NFR-8);
+  reads the public event bus read-only; derives metrics from the AD-14 payloads; never blocks
+  supervision (bounded POSTs, surfaced drops, `hekma.otlp.dropped`).
+- Semconv-first naming (`gen_ai.client.token_usage`, `gen_ai.client.operation_duration` once 19.4
+  exists) with `hekma.*` only where no semconv exists; every currency metric carries
+  `estimate_state: estimated|reconciled` (AD-8 extension).
+- Config on one surface (`--otlp-endpoint`, `--otlp-headers` with `secret:NAME`, bounded flush
+  interval); versioned exposition documented in `docs/telemetry.md` (`otlp-metrics v1`).
+- No content, no secrets: the FR-14/FR-43 no-leak matrix extends to the export path.
+- Grafana/Datadog ingest proven in CI against a collector fixture, not asserted from spec
+  compliance.
+
+### Story 20.2: Agents in CI — the GitHub Actions recipe (FR-47)
+- A docs recipe page: a budget-capped agent lane (Token Budget + Cost Cap, Breach Action
+  configured) driving a review-style task under `hekma`, on the static musl artifact (x86_64
+  runners pinned).
+- Wall-clock bounded (`timeout-minutes`); a lane that ends on a bound says which one — budget or
+  clock — in the job output.
+- Usage into `$GITHUB_STEP_SUMMARY`, rendered from `--json`: tokens and derived dollars, labeled
+  estimated (FR-22/FR-23).
+- Exit-code honesty (FR-26): success, breach and agent failure are distinguishable; no path masks
+  a breach as success.
+- Secret plumbing is first-class in the recipe (auth-gated handshakes refuse at `-32000` when
+  logged out — the recipe must show `secret:` wiring, not footnote it).
+- Dogfood proof: a Ktesio bot lane runs in this repository's own CI under the recipe — the lane is
+  the recipe's test.
+- The composite marketplace Action is deferred (trigger: a third-party user asks).
+
+### Story 20.3: The adapter gallery (FR-48)
+- Ten seed entries — Copilot CLI, Hermes, OpenCode, Claude Code, Codex, Gemini CLI, goose, Crush,
+  Aider, Cursor CLI — each a validated manifest or an honestly named gap, under `docs/adapters/`.
+- The honesty table per entry, in the Capability Declaration vocabulary (guaranteed / best-effort /
+  unsupported) with explicit absence tokens — never a fabricated pass or implied zero (AI-18);
+  tables carry upstream stability status and the re-validation duty (the docs/agents.md
+  discipline, generalized).
+- A CI validation lane runs `hekma-conformance` over every gallery manifest against bundled
+  fake/shim execs (the `hermes_shim` precedent) — CI never launches real agents; a failing
+  manifest, or an entry claiming more than its validation proves, fails the build.
+- Metering honesty: where no tier yields usage, the entry shows the not-available marker naming
+  the tier (the FR-40 precedent), never a blank.
+- Public pages carry no planning-provenance wording — enforced by the `check_docs` gate; the
+  authoring guide cites `docs/adapter-contract.md` (the conformance crate has no README).
+- Additions respect SM-C1: an entry ships only when its controls behave uniformly.
