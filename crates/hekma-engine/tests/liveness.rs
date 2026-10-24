@@ -1304,17 +1304,24 @@ fn expired_detached_wedge_is_force_killed_and_the_restart_rebinds_its_port() {
         "the adopted wedge's window to expire",
     );
 
-    // THE P4 PIN: at the failure the wedge is DEAD — the port REFUSES (the
-    // silent endpoint accepted connections while alive, so a surviving wedge
-    // would connect). The force-kill runs BEFORE the failure commits, so
-    // Failed already implies the teardown happened.
-    let wedge_gone =
-        std::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
-            .map(|_| false)
-            .unwrap_or_else(|err| err.kind() == std::io::ErrorKind::ConnectionRefused);
+    // THE P4 PIN: at the failure the wedge is DEAD — nobody serves the port.
+    // The wedge's endpoint, while alive, still ACCEPTS connections by design
+    // (that is the wedge), so an ESTABLISHED connect is the one refuting
+    // outcome. A refused connection is the Unix shape for "no listener"; a
+    // just-terminated listener can surface as a different error kind on
+    // Windows, so the pin is "the connect must not ESTABLISH", with the full
+    // outcome in the message when it does (windows-latest triage 2026-10-24 —
+    // the bare assert could not distinguish a surviving wedge from a
+    // non-refused dead-listener error kind).
+    // The force-kill runs BEFORE the failure commits, so Failed already
+    // implies the teardown happened.
+    let wedge_connect =
+        std::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    let wedge_gone = wedge_connect.is_err();
     assert!(
         wedge_gone,
-        "the detached wedge was force-killed at expiry — the port must refuse"
+        "the detached wedge was force-killed at expiry — the port must refuse \
+         (connect outcome: {wedge_connect:?})"
     );
 
     // The on-failure restart re-binds the SAME port: wait Running, then
