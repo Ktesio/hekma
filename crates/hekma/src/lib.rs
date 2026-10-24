@@ -242,6 +242,19 @@ enum AgentCommands {
         /// Name of the Agent Instance to resume
         name: String,
     },
+    /// Drain a running Agent Instance: pause it via its adapter's declared
+    /// `[lifecycle.pause]` COMMAND (cooperative — no OS signal), wait —
+    /// bounded — for the declared idle signal, then stop it. A drain that
+    /// outlives its bound STILL stops (the outcome is reported honestly).
+    Drain {
+        /// Name of the Agent Instance to drain
+        name: String,
+        /// Drain bound in milliseconds (1..=600000). Overrides the manifest's
+        /// `[drain].timeout_ms`; when both are absent the engine default
+        /// (30s) applies.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+        timeout_ms: Option<u64>,
+    },
     /// Send text input to a running Agent Instance's native input channel
     ///
     /// Text that looks like a flag, such as "-5 degrees" or "--help", is sent
@@ -438,6 +451,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
+            AgentCommands::Drain { name, timeout_ms } => cli::agent::drain(&name, timeout_ms),
             AgentCommands::Send { name, text } => cli::agent::send(&name, &text),
             AgentCommands::Logs { name, follow, json } => cli::agent::logs(&name, follow, json),
             AgentCommands::Usage { name, json } => cli::agent::usage(name.as_deref(), json),

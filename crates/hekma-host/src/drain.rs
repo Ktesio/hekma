@@ -14,8 +14,19 @@
 //! host never signals a process itself.
 //!
 //! "Drain" here is the bounded stop ladder only; the AD-15 drain composite
-//! (in-flight request draining) arrives with Epic 18 (16-4) and is
-//! deliberately NOT this.
+//! (in-flight request draining) landed as story 18-4 —
+//! `POST /v0/instances/{name}/drain` (control API) and `hekma agent drain`
+//! (CLI) — and remains a DIFFERENT act from this shutdown path: the
+//! composite pauses ONE agent through its adapter's declared pause command,
+//! waits (bounded) for its declared idle signal, then stops it; THIS module
+//! still stops the whole live fleet on SIGTERM. The split stands.
+//!
+//! One crossover to name honestly (story 18-4): a COOPERATIVELY paused
+//! instance (its adapter's declared pause command, not an OS suspension) in
+//! this shutdown fleet is resumed-then-stopped by the SAME ladder, but the
+//! "resume" step skips the OS signal for it (the engine's stop ladder knows
+//! the pause is cooperative) — no OS resume exists to send, and the
+//! graceful signal reaches the agent directly.
 //!
 //! Review findings, in this module:
 //!

@@ -102,6 +102,42 @@
 //!   the file at all — the absent-heartbeat subject (absent ≡ stale). Pure
 //!   `std`, NO OS-cfg.
 //!
+//! * `--touch <PATH>`  (story 18-4, the lifecycle-command fixture)  create
+//!   `<PATH>` (parents created) and EXIT 0 immediately — a `--touch`
+//!   invocation's WHOLE job is the file: it runs as a plain engine lifecycle
+//!   command (`[lifecycle.pause]`/`[lifecycle.resume]`), never as a
+//!   supervised agent, so the readiness/heartbeat machinery is meaningless
+//!   for it and lingering would only overrun the command's bound. The
+//!   observable side effect the engine's cooperative pause/resume records.
+//!   Paths are AGENT-HOME-relative in practice (both the supervised agent
+//!   and the lifecycle commands run with the Agent Home as their working
+//!   directory). Pure `std`, NO OS-cfg.
+//! * `--hang-before <MS>`  (story 18-4)  sleep `<MS>` BEFORE the `--touch`
+//!   write — the cap-overrun subject: a lifecycle command that outlives its
+//!   bound is killed by the engine's bounded runner before the file lands.
+//!   Requires `--touch` (refused with exit 2 otherwise — a hang with no
+//!   touch would be a silent no-op). Pure `std`, NO OS-cfg.
+//! * `--watch-sentinel <PAUSE>:<RESUME>:<WORK>`  (story 18-4)  spawn a
+//!   thread that appends one `work <n>` line to `<WORK>` every 25 ms UNLESS
+//!   paused — paused means `<PAUSE>` exists AND `<RESUME>` does not (both
+//!   lifecycle commands are `--touch` fixtures; the RESUME file's arrival
+//!   un-pauses). The cooperative-work subject: a test reads `<WORK>`'s tail
+//!   to prove the agent's work actually STOPPED while paused and RESUMED
+//!   after — the thing a signal suspension fakes by freezing the whole
+//!   process. Parsing note: the value splits on the LAST two colons
+//!   (`rsplit_once` twice), so a PAUSE path may not contain a colon
+//!   (RESUME/WORK may not either — keep the fixtures colon-free). Pure
+//!   `std`, NO OS-cfg.
+//!
+//! * `--idle-after-ms <DELAY_MS>:<PATH>`  (story 18-4)  create `<PATH>` after
+//!   `<DELAY_MS>` FROM PROCESS START — the drain-idle subject: a supervised
+//!   agent that "finishes" its work WHILE an engine drain is still waiting,
+//!   so the drain's `[drain] idle_file` wait observes the file ARRIVE (fresh
+//!   mtime) and completes early instead of timing out — the proof the wait
+//!   loop genuinely waited rather than skipped or spun on a file that was
+//!   already there. The drain-side mirror of `--ready-file` (which gates a
+//!   readiness probe the same way). Pure `std`, NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -346,6 +382,26 @@ struct Opts {
     /// exit whose classification the engine's `[exit_codes]` machinery
     /// decides. `None` = never (the linger loop governs exit).
     exit_with: Option<(i32, Duration)>,
+    /// Create this file and EXIT 0 (story 18-4): the lifecycle-command
+    /// fixture — the whole job of a `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// command process. `None` = not a touch invocation (the supervised-agent
+    /// path below).
+    touch: Option<PathBuf>,
+    /// Sleep this long BEFORE the `--touch` write (story 18-4): the
+    /// cap-overrun subject — a lifecycle command that outlives its bound is
+    /// killed before the file lands. `None` = touch immediately. Only
+    /// meaningful with `--touch` (cross-flag refusal otherwise).
+    hang_before: Option<Duration>,
+    /// `PAUSE:RESUME:WORK` (story 18-4): the cooperative-work thread — append
+    /// one `work <n>` line to `WORK` every 25 ms unless paused (PAUSE exists
+    /// AND RESUME missing). `None` = no thread (the default; existing tests
+    /// unaffected).
+    watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)>,
+    /// Create this file after `<delay_ms>` FROM PROCESS START (story 18-4):
+    /// the drain-idle subject — the `[drain] idle_file` a drain's fresh-file
+    /// wait observes ARRIVING mid-drain, proving the wait loop genuinely
+    /// waited rather than skipped. `None` = no idle file.
+    idle_after: Option<(PathBuf, u64)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -414,6 +470,10 @@ fn parse() -> Opts {
     let mut ready_line: Option<(String, u64)> = None;
     let mut never_ready: Option<Duration> = None;
     let mut exit_with: Option<(i32, Duration)> = None;
+    let mut touch: Option<PathBuf> = None;
+    let mut hang_before: Option<Duration> = None;
+    let mut watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)> = None;
+    let mut idle_after: Option<(PathBuf, u64)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -695,6 +755,82 @@ fn parse() -> Opts {
                     marker = Some(PathBuf::from(path));
                 }
             }
+            "--touch" => {
+                if let Some(path) = args.next() {
+                    touch = Some(PathBuf::from(path));
+                }
+            }
+            "--hang-before" => {
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => hang_before = Some(Duration::from_millis(ms)),
+                    None => {
+                        // Fail fast (the observed-stream-calls posture): a
+                        // silently-ignored hang would make a cap-overrun
+                        // drill measure a command that exits 0 immediately
+                        // instead of the behavior under test.
+                        eprintln!(
+                            "fake_agent: --hang-before requires a non-negative millisecond \
+                             argument (got missing or non-numeric value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--watch-sentinel" => {
+                // PAUSE:RESUME:WORK — split on the LAST two colons
+                // (`rsplit_once` twice, the `parse_colon_pair` discipline);
+                // the fixture paths must be colon-free (documented). FAIL
+                // FAST on a malformed value: a silently-ignored watcher
+                // would make a cooperative-work drill read an empty log and
+                // assert "work stopped" for the wrong reason.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (left, work) = v.rsplit_once(':')?;
+                    let (pause, resume) = left.rsplit_once(':')?;
+                    if pause.is_empty() || resume.is_empty() || work.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        PathBuf::from(pause),
+                        PathBuf::from(resume),
+                        PathBuf::from(work),
+                    ))
+                });
+                match parsed {
+                    Some(triple) => watch_sentinel = Some(triple),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --watch-sentinel requires PAUSE:RESUME:WORK (three \
+                             colon-free paths, colon-separated; got a missing or malformed \
+                             value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--idle-after-ms" => {
+                // DELAY_MS:PATH — split on the FIRST colon (`split_once`) so
+                // the PATH tail may itself contain colons (a Windows drive
+                // path). FAIL FAST (the ready-file posture): a
+                // silently-ignored idle signal would make a drain drill wait
+                // out its whole bound and read "timed out" instead of the
+                // "completed on arrival" behavior under test.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(|v| v.split_once(':'))
+                    .and_then(|(ms, path)| {
+                        ms.parse::<u64>().ok().map(|ms| (PathBuf::from(path), ms))
+                    }) {
+                    Some((path, ms)) => idle_after = Some((path, ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --idle-after-ms requires DELAY_MS:PATH (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--dump" => {
                 if let Some(path) = args.next() {
                     dump = Some(PathBuf::from(path));
@@ -733,6 +869,14 @@ fn parse() -> Opts {
             "fake_agent: --http-health-fail-after requires --http-health PORT:STATUS \
              (there is no health endpoint to fail)"
         );
+        std::process::exit(2);
+    }
+    // Story 18-4 (the D5 posture): a hang with no touch is a silent no-op —
+    // a cap-overrun drill built on the pair would measure a command that
+    // exits 0 immediately instead of the behavior under test. Name BOTH
+    // flags in the refusal.
+    if hang_before.is_some() && touch.is_none() {
+        eprintln!("fake_agent: --hang-before requires --touch PATH (there is no touch to delay)");
         std::process::exit(2);
     }
 
@@ -807,6 +951,10 @@ fn parse() -> Opts {
         http_health,
         http_health_fail_after,
         exit_with,
+        touch,
+        hang_before,
+        watch_sentinel,
+        idle_after,
     }
 }
 
@@ -854,6 +1002,44 @@ fn main() {
     if let Some(hang) = opts.never_ready {
         sleep(hang);
         std::process::exit(0);
+    }
+
+    // Story 18-4 lifecycle-command fixtures: a `--touch` invocation's WHOLE
+    // job is to create the file (the pause/resume command's observable side
+    // effect) and EXIT 0 — it runs as a plain engine lifecycle command, never
+    // as a supervised agent, so the readiness/heartbeat machinery below is
+    // meaningless for it and lingering would only overrun the command's
+    // bound. `--hang-before` delays the write (the cap-overrun subject: the
+    // engine's bounded runner kills the command before the file lands).
+    if let Some(path) = opts.touch {
+        if let Some(hang) = opts.hang_before {
+            sleep(hang);
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, b"touched");
+        std::process::exit(0);
+    }
+
+    // Story 18-4: the cooperative-work thread — same EARLY-start posture as
+    // the readiness/liveness fixtures (the work log is being appended before
+    // the engine's start watch could possibly look). The thread appends one
+    // `work <n>` line every 25 ms UNLESS paused (PAUSE exists AND RESUME
+    // missing) — the observable "the agent's own work stopped while paused"
+    // the cooperative model promises. Pure `std`, NO OS-cfg.
+    if let Some((pause, resume, work)) = opts.watch_sentinel.clone() {
+        thread::spawn(move || watch_sentinel(pause, resume, work));
+    }
+
+    // Story 18-4: the drain-idle fixture — same EARLY-start posture as the
+    // readiness/liveness fixtures above; the DELAY (measured from process
+    // start, the `beat_heartbeat` discipline) gates when the idle file lands,
+    // which is how a drain drill proves the engine's `[drain]` wait observed
+    // the file ARRIVE mid-drain rather than pre-existing. Pure `std`, NO
+    // OS-cfg.
+    if let Some((path, ms)) = opts.idle_after.clone() {
+        thread::spawn(move || touch_idle_file(path, Duration::from_millis(ms), process_start));
     }
 
     // Readiness-probe fixtures: each thread starts EARLY (before the ready
@@ -1258,6 +1444,62 @@ fn touch_ready_file(path: PathBuf, delay: Duration) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, b"ready");
+}
+
+/// The `--watch-sentinel` fixture (story 18-4): the cooperative-work thread.
+/// Appends one `work <n>` line to `<work>` every 25 ms UNLESS paused — paused
+/// means the `<pause>` file exists AND the `<resume>` file does not (both
+/// lifecycle commands are `--touch` fixtures; the resume file's arrival
+/// un-pauses). The appended lines are the observable "the agent's own work
+/// stopped while paused and resumed after" — the thing a signal suspension
+/// fakes by freezing the whole process. A write failure is announced to
+/// stderr once and the thread gives up (an honest degradation, never a fake
+/// work log). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn watch_sentinel(pause: PathBuf, resume: PathBuf, work: PathBuf) {
+    let mut n: u64 = 0;
+    loop {
+        let paused = std::fs::metadata(&pause).is_ok() && std::fs::metadata(&resume).is_err();
+        if !paused {
+            if let Some(parent) = work.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let line = format!("work {n}\n");
+            let written = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&work)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+            if let Err(err) = written {
+                eprintln!(
+                    "fake_agent: --watch-sentinel could not append to {} ({err}) — the work \
+                     log stops here",
+                    work.display()
+                );
+                return;
+            }
+            n += 1;
+        }
+        sleep(Duration::from_millis(25));
+    }
+}
+
+/// The `--idle-after-ms` fixture (story 18-4): create the idle file after the
+/// declared delay FROM PROCESS START — the `[drain] idle_file` signal the
+/// engine's drain wait loop watches for. Measured against `process_start`
+/// (the same discipline as `beat_heartbeat`'s stop budget): the delay is the
+/// AGENT's "time to finish its work", not the drain's, so the two clocks must
+/// not drift. A write failure is silently skipped (best-effort, like
+/// `touch_ready_file` — the engine's drain then honestly times out instead of
+/// faking a completion). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn touch_idle_file(path: PathBuf, delay: Duration, process_start: Instant) {
+    let due = process_start + delay;
+    sleep(due.saturating_duration_since(Instant::now()));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"idle");
 }
 
 /// The `--ready-line` fixture: after the declared delay, print the readiness

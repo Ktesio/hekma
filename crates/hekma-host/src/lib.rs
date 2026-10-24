@@ -547,6 +547,10 @@ where
                 // Story 18-3: the host never overrides the engine's pinned
                 // stable-run window (the test-only seam stays `None`).
                 stable_run_window_override: None,
+                // Story 18-4: the host never overrides the engine's pinned
+                // standalone pause-command cap (the test-only seam stays
+                // `None`).
+                pause_command_cap_override: None,
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.

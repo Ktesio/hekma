@@ -1801,6 +1801,20 @@ impl Supervisor {
                             // exactly like a spawned one).
                             exit_codes: adopted_exit_codes,
                             running_since: std::time::Instant::now(),
+                            // Story 18-4: the adopted instance's
+                            // cooperative posture is RE-DERIVED from the
+                            // durable record (the same classifier the
+                            // release pass uses) — a handle adopted while a
+                            // command-pause edge is the latest truth keeps
+                            // its cooperative pause honestly (the stop
+                            // ladder's cooperative skip and the release
+                            // pass's Cooperative arm then apply to it,
+                            // exactly as if this engine had run the command
+                            // itself). Cross-lifetime honesty per the 18-4
+                            // spec: never persisted, always re-derived.
+                            cooperatively_paused: super::lifecycle::classify_pause_kind(
+                                registry, &name,
+                            ) == super::lifecycle::PauseKind::Cooperative,
                         },
                     );
                     adopted += 1;

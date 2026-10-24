@@ -108,6 +108,44 @@ const STARTUP_SURVIVAL_WINDOW: Duration = Duration::from_millis(300);
 /// How often the readiness watch polls the freshly spawned process.
 const READINESS_POLL: Duration = Duration::from_millis(10);
 
+/// The bound a STANDALONE cooperative pause/resume command (`kt agent pause` /
+/// `kt agent resume` on an adapter declaring the lifecycle pair) may run for
+/// before the engine KILLS it and rejects the transition (story 18-4). A bare
+/// verb should not hang a CLI for minutes; a drain's wait may legitimately
+/// span in-flight work, so the DRAIN bound governs the command there instead
+/// (the two-tier rule the spec fixes — two named constants, both documented).
+/// Engine-owned, beside the other cadence constants; pinned by unit test.
+pub(crate) const PAUSE_COMMAND_CAP: Duration = Duration::from_secs(30);
+
+/// The DRAIN composite's DEFAULT bound (story 18-4): the middle tier of the
+/// three-tier rule (CLI `--timeout-ms` > `[drain].timeout_ms` > this default),
+/// applied when an adapter declares a `[lifecycle.pause]` command but NO
+/// `[drain]` section — the verb must work, so the composite needs a bound.
+/// Engine-owned, beside the other cadence constants; pinned by unit test.
+pub(crate) const DRAIN_DEFAULT_BOUND: Duration = Duration::from_secs(30);
+
+/// How RECENT an idle file's mtime must be for the drain composite to read it
+/// as the idle signal (story 18-4): the small engine-owned freshness slack the
+/// spec sanctions (freshness, not existence — a file touched once at startup
+/// must not read idle forever, and an absent file reads NOT idle, 18-2's
+/// absent ≡ stale precedent). The slack is what makes a one-shot touch the
+/// agent performs WHEN ITS WORK DRAINS observable: the wait's poll sees the
+/// fresh mtime within this window of the touch. Shared with
+/// `probe_kinds::file_fresh`, the same evaluator readiness/liveness use.
+pub(crate) const DRAIN_IDLE_FRESH_SLACK: Duration = Duration::from_millis(2_000);
+
+/// How often the bounded pause-command runner polls the child (story 18-4):
+/// both the standalone cap and the drain-composite deadline are DEADLINE-based
+/// (an `Instant` bound, never a measured-duration comparison), so this interval
+/// only bounds detection latency and kill overshoot.
+pub(crate) const BOUNDED_COMMAND_POLL: Duration = Duration::from_millis(20);
+
+/// How often the drain composite's bounded wait polls its conditions (story
+/// 18-4): the pause command's completion and the idle file's freshness. Like
+/// [`BOUNDED_COMMAND_POLL`] it only bounds latency — the composite's bound is
+/// a single `Instant` deadline fixed at the drain's start.
+pub(crate) const DRAIN_WAIT_POLL: Duration = Duration::from_millis(25);
+
 /// AI-12: how many CONSECUTIVE `backend.poll` errors on one held handle the
 /// crash reaper tolerates as "transient, treat as still-alive" before it stops
 /// trusting that reading and treats the handle as a crash signal. At the engine
@@ -723,6 +761,22 @@ struct Supervised {
     /// (e.g. `paused`) passes `None` — never a reset. Lives on
     /// `Supervised`, so a restart re-anchors it fresh with the new Run.
     running_since: std::time::Instant,
+    /// Story 18-4: whether THIS Run is currently cooperatively paused — the
+    /// pause was (or is to be) delivered by RUNNING the manifest's declared
+    /// `[lifecycle.pause]` COMMAND, not by an OS signal. The stop ladder
+    /// consults it (a cooperatively paused instance must not receive the OS
+    /// resume signal — there is no signal suspension to undo; the command
+    /// owns the suspension), the enforcement release pass consults it (its
+    /// Cooperative arm emits an honest note instead of a signal), and
+    /// `note_committed_resume_edge` clears it on EVERY committed
+    /// paused → running edge so the flag can never outlive its pause.
+    /// Initialized `false` at spawn, from `classify_pause_kind` at adoption
+    /// and stop-only re-acquire (a handle re-acquired while paused under a
+    /// command-declaring manifest resumes its cooperative posture honestly),
+    /// set `true` in the cooperative pause arm after its transition commits,
+    /// and never persisted (an engine restart re-derives it the same way the
+    /// adoption path does — cross-lifetime honesty per the 18-4 spec).
+    cooperatively_paused: bool,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -934,6 +988,18 @@ pub struct Supervisor {
     /// `EngineOptions` threads for the integration tests; NOT an operator
     /// config surface (that is deferred with a trigger, per the spec).
     stable_run_window: Duration,
+    /// Story 18-4 — the STANDALONE pause-command cap: the wall-clock bound a
+    /// `[lifecycle.pause]` command gets when it runs OUTSIDE a drain (the
+    /// plain `pause` verb). PRODUCTION is exactly [`PAUSE_COMMAND_CAP`]
+    /// (30 s, pinned by unit test); tests scale it through this field the
+    /// way `stable_run_window` scales the window (the constant itself is
+    /// never weakened). INSIDE a drain the command shares the drain's own
+    /// bound instead (the three-tier bound, `drain.rs`), so this cap never
+    /// applies there. Set at construction and via
+    /// [`Supervisor::override_pause_command_cap`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface.
+    pause_command_cap: Duration,
     /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
     /// restart-requested relaunches THIS supervisor has scheduled for the
     /// instance since its last fresh start / adoption / clean exit. It
@@ -1074,6 +1140,7 @@ impl Supervisor {
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1121,6 +1188,7 @@ impl Supervisor {
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1168,6 +1236,7 @@ impl Supervisor {
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
             requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
@@ -1307,6 +1376,35 @@ impl Supervisor {
             return;
         }
         self.stable_run_window = window;
+    }
+
+    /// Override the STANDALONE pause-command cap (story 18-4's TEST SCALING
+    /// SEAM) — the `pub(crate)` twin of
+    /// [`Supervisor::override_stable_run_window`]: the PRODUCTION cap is
+    /// exactly [`PAUSE_COMMAND_CAP`] (30 s, pinned by unit test) and no
+    /// production caller ever calls this; the engine's open path threads
+    /// [`EngineOptions`]' doc-hidden override through so the integration
+    /// tests can drive the standalone-cap overrun refusal in milliseconds.
+    /// NOT an operator config surface. Like the stable-run window, open-time
+    /// only: refused once supervision has begun. A ZERO cap is IGNORED
+    /// (surfaced, not silent, AI-18): a zero-duration bound would kill every
+    /// pause command before it could start (the bounded runner would time it
+    /// out at its first poll), refusing every pause a manifest declares —
+    /// so a zero lands as the production cap, with a diagnostic saying why.
+    pub(crate) fn override_pause_command_cap(&mut self, cap: Duration) {
+        debug_assert!(
+            self.running.is_empty(),
+            "the pause-command cap is open-time only"
+        );
+        if cap.is_zero() {
+            self.emit_diagnostic(
+                "ignoring a zero pause-command cap override — a zero bound would refuse \
+                 every declared pause command before it could start; keeping the \
+                 production cap",
+            );
+            return;
+        }
+        self.pause_command_cap = cap;
     }
 
     /// The engine's log-capture posture (story 17-4). `Copy` — a snapshot,
@@ -2172,6 +2270,31 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         // code named — the lifecycle log records WHY the instance went
         // `stopped` without claiming an operator stop.
         TransitionCause::CleanExit { code } => format!(" (clean-exit: exit code {code})"),
+        // Cooperative pause/resume (story 18-4): spell the WIRE TAG + the
+        // rendered command — same greppability rule as `detached-resumed`
+        // above. The command is what the engine actually executed, so the
+        // lifecycle line names it (the cooperative cause IS the honesty that
+        // this was a command-driven posture change, never an OS suspension).
+        TransitionCause::PauseCooperative { command } => {
+            format!(" (pause-cooperative: {command})")
+        }
+        TransitionCause::ResumeCooperative { command } => {
+            format!(" (resume-cooperative: {command})")
+        }
+        // Drain stopped (story 18-4): the wire tag + the durable OUTCOME —
+        // completed (and how long the wait took) or timed out (and that the
+        // stop still happened). One greppable line, same rule as the
+        // neighbors above.
+        TransitionCause::DrainStopped {
+            completed,
+            waited_ms,
+        } => {
+            if *completed {
+                format!(" (drain-stopped: completed in {waited_ms}ms)")
+            } else {
+                format!(" (drain-stopped: timed out after {waited_ms}ms; stopped anyway)")
+            }
+        }
     }
 }
 
@@ -2395,8 +2518,14 @@ fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> Engi
 mod tests;
 
 // Family modules — story 13-3 (ratified Option B): pure impl-block moves.
+/// The DRAIN composite (story 18-4): `Supervisor::drain` — pause-command →
+/// idle-wait → bounded stop — with its bounded-command runner, idle-freshness
+/// probe, and the pure deadline decision.
+mod drain;
 mod interaction;
 mod lifecycle;
+
+pub use drain::DrainOutcome;
 mod reaper;
 mod spawn;
 mod usage;

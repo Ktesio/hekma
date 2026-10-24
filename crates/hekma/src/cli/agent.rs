@@ -1407,6 +1407,49 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `hekma agent drain <name> [--timeout-ms <ms>]` — the DRAIN composite
+/// (story 18-4): pause the running agent via its adapter's declared
+/// `[lifecycle.pause]` COMMAND (cooperative — no OS signal), wait — bounded —
+/// for the declared idle signal, then stop it through the ordinary ladder.
+///
+/// BOTH outcomes exit `0` — the drain's last step (the stop) is unconditional,
+/// so a drain that outlives its bound still stopped the agent honestly. A
+/// completed drain prints the final state (`stopped`) to stdout; a TIMED-OUT
+/// drain additionally emits a VISIBLE note to stderr (`ui::note`, AD-12:
+/// results → stdout, notes → stderr) naming the honest `completed: false`
+/// outcome the engine recorded on the instance's final transition. The bound
+/// is the three-tier rule: `--timeout-ms` > the manifest's
+/// `[drain].timeout_ms` > the engine default (30s).
+pub fn drain(name: &str, timeout_ms: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let bound = timeout_ms.map(Duration::from_millis);
+    match engine.blocking().drain(name, bound) {
+        Ok(report) => {
+            ui::success(format!(
+                "Drained Agent Instance {}",
+                ui::skill_name(report.instance.name.as_str())
+            ));
+            // Command result to stdout: the final Lifecycle State.
+            println!("{}", report.instance.state);
+            if !report.outcome.completed {
+                // Timed-out honesty (surfaced, not silent — AI-18): the
+                // bound burned before the declared wait completed. The
+                // instance WAS stopped anyway, and the engine recorded the
+                // outcome on its final transition — this note makes sure the
+                // operator sees it, never a silent success.
+                ui::note(format!(
+                    "the drain's bounded wait did NOT complete within {}ms (timed out); the \
+                     instance was stopped anyway and the outcome is recorded on its final \
+                     transition",
+                    report.outcome.waited_ms
+                ));
+            }
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
 /// `hekma agent send <name> <text>` — send text input to a running Agent
 /// Instance's native input channel (story 4.1, FR-24).
 ///
@@ -3031,6 +3074,49 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
                  instance state is unchanged — only the inert pre-start config snapshot and \
                  log directories remain, and the next start rewrites them. Retry: \
                  hekma agent start {name}"
+            ),
+        }
+        .into(),
+        // Story 18-4: the adapter's declared lifecycle COMMAND failed (nonzero
+        // exit, spawn failure, or bound overrun) — the pause/resume was NOT
+        // applied and the instance's durable state is untouched (never a fake
+        // pause). The engine's message carries the rendered command line (no
+        // environment) + the failure mode; the remediation is the adapter's
+        // to fix, so point at its manifest.
+        EngineError::PauseCommandFailed {
+            name,
+            direction,
+            command,
+            detail,
+        } => crate::error::AgentPauseCommandFailed {
+            message: format!(
+                "the {direction} command for Agent Instance '{name}' failed — the lifecycle \
+                 change was NOT applied: {detail} (command: {command}). Fix the command in \
+                 the adapter's manifest and retry: hekma agent show {name}"
+            ),
+        }
+        .into(),
+        // Story 18-4: `drain` targeted an instance that is not `running` —
+        // the same invalid-state class as `send`'s gate (the instance exists,
+        // the timing is wrong). The engine's message names drain's own
+        // remediation (start it, or plain stop for a paused one).
+        EngineError::DrainRefused { name, state } => AgentNotRunning {
+            message: format!(
+                "Agent Instance '{name}' is not running (current state: {state}); drain stops \
+                 a running agent — start it first with: hekma agent start {name}, or use \
+                 plain stop for a paused one with: hekma agent stop {name}. List the Fleet \
+                 with: hekma agent list"
+            ),
+        }
+        .into(),
+        // Story 18-4: a drain bound outside 1..=600000 was requested
+        // programmatically (the CLI's clap range refuses it at parse time).
+        // Usage class — the value, not the environment, is at fault.
+        EngineError::DrainBoundInvalid { bound_ms } => crate::error::AgentDrainBoundInvalid {
+            message: format!(
+                "invalid drain bound {bound_ms}ms: it must be between 1 and 600000 (the \
+                 adapter-contract maximum); a zero bound could never let a drain's pause \
+                 command start"
             ),
         }
         .into(),
