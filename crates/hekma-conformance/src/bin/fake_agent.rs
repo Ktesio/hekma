@@ -193,6 +193,16 @@
 //!   nothing ever closes, this call would hang forever — the regression this
 //!   flag exists to prove does NOT happen once piping is gated on the
 //!   declared Capability. Pure `std`, NO OS-cfg.
+//! * `--exit-with <CODE>:<AFTER_MS>` (story 18-3)  run normally (announcing
+//!   readiness, heartbeating if asked) for `<AFTER_MS>`, THEN exit with
+//!   `<CODE>` — but unlike `--crash-after-ms`, the POINT is the declared
+//!   MEANING the engine attaches to the code: a manifest's `[exit_codes]`
+//!   section may declare `<CODE>` as `restart_requested` or `clean`, and the
+//!   test then asserts the engine classifies the exit accordingly (a planned
+//!   restart vs a clean `running → stopped` settle). `--exit-with 75:200` asks
+//!   the supervisor for a restart; `--exit-with 0:200` finishes on purpose.
+//!   Malformed values are refused at startup with a stderr note and exit 2.
+//!   Pure `std`, NO OS-cfg.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -327,6 +337,15 @@ struct Opts {
     /// (the hung-health subject — connect succeeds, no response ever comes).
     /// `None` = answer forever.
     http_health_fail_after: Option<Duration>,
+    /// Exit with `CODE` after `AFTER_MS` of run (story 18-3): the DECLARED
+    /// exit-code fixture. `--exit-with 75:200` asks the supervisor for a
+    /// relaunch (the exit-75 pattern) when the manifest declares
+    /// `restart_requested = [75]`; `--exit-with 0:200` finishes on purpose
+    /// when the manifest declares `clean = [0]`. Unlike `--crash-after-ms`
+    /// (whose exit is BY DEFINITION unrequested), this is the run-finishing
+    /// exit whose classification the engine's `[exit_codes]` machinery
+    /// decides. `None` = never (the linger loop governs exit).
+    exit_with: Option<(i32, Duration)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -394,6 +413,7 @@ fn parse() -> Opts {
     let mut ready_file: Option<(PathBuf, u64)> = None;
     let mut ready_line: Option<(String, u64)> = None;
     let mut never_ready: Option<Duration> = None;
+    let mut exit_with: Option<(i32, Duration)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -636,6 +656,40 @@ fn parse() -> Opts {
                     crash_state = Some(PathBuf::from(path));
                 }
             }
+            "--exit-with" => {
+                // Story 18-3's fixture: `--exit-with CODE:AFTER_MS`. FAIL FAST
+                // (stderr + exit 2) on a malformed value — the exact posture
+                // the 18-1/18-2 flags took: a silently-ignored fixture would
+                // make a drill assert "still running" for the wrong reason
+                // (the agent never exited) instead of the behavior under
+                // test. 18-3 review round 1 (C5): the CODE is fail-fast too —
+                // a code outside the portable `0..=255` domain could never
+                // survive a real exit status (unix carries the low 8 bits), so
+                // a drill built on one would assert a code the engine could
+                // never observe.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(parse_colon_pair)
+                    .and_then(|(code, ms)| {
+                        let code = code.parse::<i32>().ok()?;
+                        if !(0..=255).contains(&code) {
+                            return None;
+                        }
+                        Some((code, ms.parse::<u64>().ok()?))
+                    }) {
+                    Some((code, ms)) => exit_with = Some((code, Duration::from_millis(ms))),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --exit-with requires CODE:AFTER_MS (a code in \
+                             0..=255 — the portable exit-code domain — and a non-negative \
+                             millisecond delay, colon-separated; got a missing, malformed, \
+                             or out-of-range value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--marker" => {
                 if let Some(path) = args.next() {
                     marker = Some(PathBuf::from(path));
@@ -682,6 +736,44 @@ fn parse() -> Opts {
         std::process::exit(2);
     }
 
+    // 18-3 review round 1 (C5): the exit fixture's deadline peers. A
+    // declared exit a peer deadline would beat NEVER fires — a drill built
+    // on it would measure the peer's exit (or hang) instead of the
+    // behavior under test — so refuse at startup, naming both flags.
+    if let Some((code, delay)) = exit_with {
+        if delay >= linger {
+            eprintln!(
+                "fake_agent: --exit-with {code}:{} can never fire — the linger \
+                 window ({}ms) elapses first and the process exits 0 silently; shorten \
+                 the delay below --linger-ms",
+                delay.as_millis(),
+                linger.as_millis()
+            );
+            std::process::exit(2);
+        }
+        // An UNBOUNDED crash (no --crash-times + --crash-state pair) fires on
+        // EVERY launch and — at an equal-or-earlier deadline — wins the
+        // loop's check order over the declared exit. A BOUNDED crash
+        // (crash-times + crash-state) stays legal at any deadline: the
+        // bound's later launches are disarmed and legitimately reach the
+        // declared exit (the 18-3 review's own 7,7,75,75 drill depends on
+        // it).
+        if let Some(crash_after) = crash_after {
+            let bounded = crash_times.is_some() && crash_state.is_some();
+            if !bounded && crash_after <= delay {
+                eprintln!(
+                    "fake_agent: --exit-with {code}:{} can never fire under an \
+                     UNBOUNDED --crash-after-ms ({}ms) — the crash deadline wins the \
+                     loop's check order at an equal-or-earlier deadline; bound the crash \
+                     with --crash-times + --crash-state, or separate the deadlines",
+                    delay.as_millis(),
+                    crash_after.as_millis()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     Opts {
         exit_fast,
         spawn_child,
@@ -714,6 +806,7 @@ fn parse() -> Opts {
         heartbeat_stop_after,
         http_health,
         http_health_fail_after,
+        exit_with,
     }
 }
 
@@ -987,6 +1080,12 @@ fn main() {
     let start = Instant::now();
     let deadline = start + opts.linger;
     let crash_deadline = effective_crash_after.map(|d| start + d);
+    // Story 18-3: the declared exit's deadline — when it elapses, the agent
+    // exits with ITS OWN declared code (a run-finishing exit whose
+    // classification the engine's `[exit_codes]` machinery decides). Checked
+    // in the same loop as the crash deadline, after readiness, so the
+    // instance is `running` first.
+    let exit_with_deadline = opts.exit_with.map(|(code, d)| (code, start + d));
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     // Story 4-2: an INDEPENDENT stderr counter/interval (own `beats`, own
@@ -1007,6 +1106,16 @@ fn main() {
                 let _ = writeln!(stdout, "crashing with code {}", opts.crash_with);
                 let _ = stdout.flush();
                 std::process::exit(opts.crash_with);
+            }
+        }
+        // Story 18-3: the declared exit — announce + flush, then exit with
+        // the fixture code (0 for the clean subject; e.g. 75 for the
+        // restart-requested subject).
+        if let Some((code, due)) = exit_with_deadline {
+            if Instant::now() >= due {
+                let _ = writeln!(stdout, "exiting with declared code {code}");
+                let _ = stdout.flush();
+                std::process::exit(code);
             }
         }
         if let (Some(interval), Some(due)) = (opts.heartbeat, next_beat) {

@@ -239,6 +239,53 @@ pub enum TransitionCause {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+    /// The agent exited with an ADAPTER-DECLARED `restart_requested` code
+    /// (story 18-3): the `running → failed` edge the reaper drives when the
+    /// manifest's `[exit_codes]` section lists the observed code under
+    /// `restart_requested` — the conventional exit-75 "please relaunch me"
+    /// contract. NOT terminal and NOT a crash charge: the ordinary restart
+    /// plan runs (backoff verbatim, `RestartPolicy::Never` still outranks
+    /// the adapter's ask), but the consecutive-failure counter is NOT
+    /// charged — a restart-requested loop can NEVER trip the crash-loop
+    /// terminal, because the operator declared the class. Wire tag
+    /// `restart-requested`. DISTINCT from [`TransitionCause::Crashed`] —
+    /// the process exited as its contract planned, so it proves neither
+    /// stability nor failure. Exits during `starting` are LAUNCH failures
+    /// and never classified (the classes are service-run semantics).
+    ///
+    /// DIMENSION (the `Unresponsive` template, additive): [`detail`]
+    /// (Self::RestartRequested) carries the classification verdict beyond
+    /// the code — the declared-class naming. Absent (JSON omitted) when the
+    /// verdict has nothing more to say. Backward-ADDITIVE: an OLD reader
+    /// that predates this variant cannot parse the cause at all (a NEW wire
+    /// tag) — the release notes announce that serde break like every
+    /// 1.1.0-section announcement.
+    RestartRequested {
+        /// The observed process exit code that matched the manifest's
+        /// declared `restart_requested` list.
+        code: u16,
+        /// Optional classification detail (the declared-class naming).
+        /// Absent on the wire when `None` — an additive, optional field
+        /// (no version bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// The agent exited with an ADAPTER-DECLARED `clean` code (story 18-3):
+    /// the `running → stopped` edge the reaper drives when the manifest's
+    /// `[exit_codes]` section lists the observed code under `clean` — the
+    /// agent FINISHED ON PURPOSE. The requested-stop shape: the spawn
+    /// record settles (an established ACP session id is retained for the
+    /// next start), NO restart plan, NO counter action — the operator's
+    /// next fresh start is the counter reset, exactly as it has always
+    /// been. Wire tag `clean-exit`. DISTINCT from
+    /// [`TransitionCause::Crashed`] and from
+    /// [`TransitionCause::Command`] (`"stop"`) — the lifecycle log never
+    /// claims an operator stop that never happened.
+    CleanExit {
+        /// The observed process exit code that matched the manifest's
+        /// declared `clean` list (e.g. `0`).
+        code: u16,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -411,6 +458,25 @@ impl TransitionCause {
             failing_for_ms,
             detail: Some(detail.into()),
         }
+    }
+
+    /// A RESTART-REQUESTED cause that ALSO carries the classification
+    /// `detail` (the declared-class naming) — the `Unresponsive` twin.
+    /// 18-3 review: the detail-less `restart_requested(code)` shape is
+    /// GONE — the reaper always records the declared-class detail (plus
+    /// the requested-recycle depth, or the `never`-policy verdict), so
+    /// this is the only constructor the cause has.
+    pub fn restart_requested_with_detail(code: u16, detail: impl Into<String>) -> Self {
+        TransitionCause::RestartRequested {
+            code,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// A CLEAN-EXIT cause recording the declared `code` the agent finished
+    /// with (story 18-3).
+    pub fn clean_exit(code: u16) -> Self {
+        TransitionCause::CleanExit { code }
     }
 
     /// A TOKEN BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
@@ -813,6 +879,25 @@ mod tests {
                 ),
                 "unresponsive",
             ),
+            (
+                TransitionCause::unresponsive_with_detail(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                    "the file was already stale when first observed",
+                ),
+                "unresponsive",
+            ),
+            // 18-3 review round 1: the detail-less `restart_requested(code)`
+            // constructor is gone — `restart_requested_with_detail` is the
+            // only shape, and its wire tag is pinned here.
+            (
+                TransitionCause::restart_requested_with_detail(
+                    75,
+                    "declared class `restart_requested`; requested-recycle 2",
+                ),
+                "restart-requested",
+            ),
+            (TransitionCause::clean_exit(0), "clean-exit"),
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
                 "budget-exceeded",

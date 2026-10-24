@@ -123,6 +123,16 @@ use thiserror::Error;
 /// fails continuously for the whole window. Same additive posture: absent
 /// means byte-identical supervision, and the `1.0.0`-engine rejection is
 /// pinned by `contract_v1_0_0_engine_rejects_the_liveness_section`.
+///
+/// **The same `1.1.0` minor also carries `[exit_codes]` (story 18-3):** the
+/// schema gains an OPTIONAL `[exit_codes]` section declaring the two
+/// ADAPTER-DECLARED exit-code classes (`restart_requested = [codes]` — the
+/// agent asked for a relaunch: the restart plan runs but the
+/// consecutive-failure counter is not charged; `clean = [codes]` — the agent
+/// finished on purpose: `running → stopped`, settled, no plan). Same additive
+/// posture: absent means every unrequested exit is a crash exactly as before,
+/// and the `1.0.0`-engine rejection is pinned by
+/// `contract_v1_0_0_engine_rejects_the_exit_codes_section`.
 pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The Adapter Contract compatibility rule the engine enforces at registration
@@ -228,9 +238,10 @@ pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, FileFreshProbe, HeartbeatFileCheck, HttpGetCheck, HttpGetProbe, Interaction,
-    InteractionChannelKind, Lifecycle, Liveness, LivenessCheck, LogContainsProbe, Manifest,
-    ManifestError, Metering, OpTemplate, Readiness, ReadinessGate, ReadinessKind, ReadinessProbe,
+    AdapterIdentity, ExitClass, ExitCodeClasses, ExitCodes, FileFreshProbe, HeartbeatFileCheck,
+    HttpGetCheck, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle, Liveness,
+    LivenessCheck, LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate, Readiness,
+    ReadinessGate, ReadinessKind, ReadinessProbe,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;
