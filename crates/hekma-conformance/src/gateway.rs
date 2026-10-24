@@ -93,6 +93,27 @@ pub const GATEWAY_DRAIN_BOUND_MS: u64 = 10000;
 /// the signal cannot predate the drain.
 pub const GATEWAY_IDLE_DELAY_MS: u64 = 800;
 
+/// How long after the PAUSE sentinel appears the gateway fixture ends itself
+/// (the `--exit-on-pause` delay, CANCELLED by the resume sentinel) — the
+/// Windows graceful-stop fixture applied to the reference subject itself.
+/// The engine's Windows stop ladder has no deliverable graceful signal: its
+/// graceful step is a pure exit-watch, so a never-ending subject escalates to
+/// `stop-forced` after the whole default window — a terminal cause the drain
+/// section's contract rightly rejects (it must record `drain-stopped`). The
+/// anchored self-exit ends the subject on its own inside the graceful window
+/// on every OS, without touching the wait's truth: the idle signal still
+/// lands at anchor+800ms, the drain's bounded wait completes exactly as
+/// before, and only the stop's exit-watch concludes early. The delay sits
+/// well past the idle signal (the wait's proof is untouched) and well inside
+/// the stop ladder's default graceful window; the CANCEL anchor (the resume
+/// sentinel) stands the self-exit down in every section that pauses and
+/// RESUMES the subject (the pause section), and a stale anchor at a later
+/// section's process start disarms immediately against the stale resume
+/// sentinel — only the drain's never-resumed pause ends the process. On
+/// Unix the drain's stop is a delivered signal long before this delay, so
+/// nothing changes there.
+pub const GATEWAY_EXIT_ON_PAUSE_MS: u64 = 6000;
+
 /// The Agent-Home-relative files the gateway fixture's signals live at (the
 /// manifest declares the same names the start command's flags write).
 pub const GATEWAY_HEARTBEAT_FILE: &str = "gateway.heartbeat";
@@ -123,9 +144,11 @@ pub const GATEWAY_MEMORY_DIR_ENV: &str = "GATEWAY_MEMORY_DIR";
 /// (`--http-ready-after` — the hold the readiness leg observes), the
 /// models-endpoint server (`--http-ready`), the heartbeat
 /// (`--heartbeat-file`), the cooperative work loop (`--watch-sentinel`), the
-/// pause-anchored idle signal (`--idle-on-pause`), the config/memory
-/// delivery-evidence seam (`--dump`), and a linger longer than anything the
-/// TCK drives. No fixture flag conflicts
+/// pause-anchored idle signal (`--idle-on-pause`), the pause-anchored
+/// self-exit with its resume-cancel (`--exit-on-pause` — the Windows
+/// graceful-stop fixture, see [`GATEWAY_EXIT_ON_PAUSE_MS`]), the
+/// config/memory delivery-evidence seam (`--dump`), and a linger longer than
+/// anything the TCK drives. No fixture flag conflicts
 /// with another: each arms its own thread at startup (verified — story 18-5's
 /// composition check), so no unifying flag was needed.
 pub fn gateway_manifest_text(port: u16) -> String {
@@ -153,6 +176,7 @@ args = [
   "--heartbeat-file", "{GATEWAY_HEARTBEAT_FILE}:{GATEWAY_HEARTBEAT_INTERVAL_MS}",
   "--watch-sentinel", "{GATEWAY_PAUSE_SENTINEL}:{GATEWAY_RESUME_SENTINEL}:{GATEWAY_WORK_LOG}",
   "--idle-on-pause", "{GATEWAY_IDLE_DELAY_MS}:{GATEWAY_PAUSE_SENTINEL}:{GATEWAY_IDLE_FILE}",
+  "--exit-on-pause", "{GATEWAY_EXIT_ON_PAUSE_MS}:{GATEWAY_PAUSE_SENTINEL}:{GATEWAY_RESUME_SENTINEL}",
   "--dump", "{GATEWAY_DUMP_FILE}",
   "--linger-ms", "600000",
 ]
