@@ -677,9 +677,23 @@ struct Supervised {
     /// against `liveness_check`'s window; a Fresh attempt clears it (one
     /// recovery diagnostic when it was open). Lives on `Supervised`, so it
     /// RESETS with the Run (restart = fresh window) and PAUSES with the
-    /// instance (a paused instance is never probed, so the window neither
-    /// grows nor expires while suspended).
+    /// instance — and a RESUME also CLEARS it (review round 1, P1): the
+    /// elapsed time measured BEFORE the pause is not evidence about a
+    /// different process instance (resume may land a fresh or resumed
+    /// process), so the clock restarts at resume — the failure cannot land
+    /// before a full fresh window has elapsed after the instance is running
+    /// again.
     liveness_failing_since: Option<std::time::Instant>,
+    /// How many times this Run's liveness window has REOPENED after a
+    /// recovery (review round 1, P6): `0` for a fresh spawn, reset per Run,
+    /// fresh (0) after adoption. Bounds the first-failure/recovery diagnostic
+    /// PAIR spam for a flapping signal: the first 3 reopen cycles emit their
+    /// pairs; from the 4th window-open onward the reaper stays silent except
+    /// for ONE suppression note at reopen #3 (the signal is flapping — the
+    /// operator was told three times; persistence, not chatter, is the
+    /// contract). The window itself NEVER stops expiring: a suppressed
+    /// diagnosis still fails the instance when the window crosses.
+    liveness_reopens: u32,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -934,6 +948,33 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     totals_read_fault_names: std::collections::HashSet<InstanceName>,
+    /// Liveness (story 18-2, review round 1 P2) — PER-EPISODE bookkeeping for
+    /// the phase-4 registry lookup: an instance whose `lookup` ERRORS once
+    /// gets its ONE diagnostic ("checks paused until reads recover"); every
+    /// further Err for the SAME name stays silent (no per-tick spam while the
+    /// store is down); a lookup that returns Ok clears the name (a RECOVERED
+    /// read resumes checks — and their diagnostics — silently). "Episode" =
+    /// this in-memory supervisor's lifetime (the same lifetime as the
+    /// in-memory handle map; a new engine re-arms the diagnostic, which is
+    /// correct — a new operator session deserves to hear about a degraded
+    /// read again).
+    liveness_lookup_err_names: std::collections::HashSet<InstanceName>,
+    /// cfg(test) FAULT-INJECTION SEAM (review round 1 P2's test driver): an
+    /// instance name listed here makes the phase-4 liveness lookup behave
+    /// EXACTLY like a store-read failure (the ONE diagnostic + the silent
+    /// skip), deterministically, without staging a real store outage. Same
+    /// placement rationale as `totals_read_fault_names`. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    liveness_lookup_fault_names: std::collections::HashSet<InstanceName>,
+    /// cfg(test) FAULT-INJECTION SEAM (review round 1 P3's test driver): an
+    /// instance name listed here makes [`Self::transition_if_prior`] refuse
+    /// with the typed `StateConflict` — the concurrent-transition race — so
+    /// the reaper's skip arm (ONE diagnostic, no restart plan) runs
+    /// deterministically in-process. Same placement rationale. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    liveness_commit_fault_names: std::collections::HashSet<InstanceName>,
     /// Readiness probes (Epic 18) — restart plans QUEUED by the start path when
     /// the declared probe observes the process EXIT mid-wait. The start path
     /// has already driven the `starting → failed` crash transition, but it
@@ -986,6 +1027,11 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1026,6 +1072,11 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1066,6 +1117,11 @@ impl Supervisor {
             compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1573,6 +1629,50 @@ impl Supervisor {
         Ok(snapshot)
     }
 
+    /// The CONDITIONAL transition (story 18-2 review round 1, P3): the
+    /// state persist goes through the guarded
+    /// [`Registry::set_state_if_prior`] — it commits only when the persisted
+    /// state still equals `prior` — and ONLY a committed write records the
+    /// event (the durable log never leads a state that did not happen).
+    /// The `engine`-attributed [`LogCapture`] is supplied EXPLICITLY (the
+    /// same reason as [`Self::transition_with_log_capture`]: the liveness
+    /// expiry removes the handle from `self.running` BEFORE committing, so
+    /// the lookup form would find nothing).
+    ///
+    /// The liveness expiry uses this instead of [`Self::transition`] to close
+    /// the race the review found: between the phase-4 lookup (which read
+    /// `running`) and the failure commit, ANOTHER command (an explicit stop,
+    /// a pause, a concurrent engine) may have legitimately moved the state.
+    /// A refusal surfaces typed (`Err`) and the CALLER (the reaper) emits its
+    /// ONE skip-diagnostic and declines the failure + the restart plan — the
+    /// state moved, so someone else is driving this instance's lifecycle.
+    fn transition_if_prior(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        log_capture: Option<LogCapture>,
+    ) -> Result<TransitionEvent, EngineError> {
+        // cfg(test) fault seam (P3's test driver): the typed refusal the
+        // concurrent-transition race produces, injected deterministically.
+        #[cfg(test)]
+        if self.liveness_commit_fault_names.contains(name) {
+            return Err(EngineError::Store(
+                crate::ports::StoreError::StateConflict {
+                    name: name.as_str().to_string(),
+                    expected: prior.as_str().to_string(),
+                    found: LifecycleState::Paused.as_str().to_string(),
+                },
+            ));
+        }
+        registry
+            .set_state_if_prior(name, prior, new)
+            .map_err(registry_to_engine)?;
+        self.record_transition(registry, name, prior, new, cause, log_capture)
+    }
+
     /// Everything a transition records AFTER the state persist: the durable
     /// `instance.log` append, the bus publish, and the attributed-capture
     /// engine line. Shared by [`Supervisor::transition_with_log_capture`] and
@@ -1951,11 +2051,20 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         // (same rule as `readiness-timeout` above). The check description is
         // also in the cause payload / `show` detail; the suffix names both
         // numbers so an operator scanning `instance.log` sees the window that
-        // was crossed without opening anything.
+        // was crossed without opening anything. When the cause carries the
+        // optional expiry-verdict `detail` (18-2 review round 1 — e.g. the
+        // heartbeat file's pre-existing staleness at first observation), it
+        // appends after the streak so the verdict rides the same line.
         TransitionCause::Unresponsive {
             check,
             failing_for_ms,
-        } => format!(" (unresponsive: {check}, failing for {failing_for_ms}ms)"),
+            detail,
+        } => match detail {
+            Some(detail) => {
+                format!(" (unresponsive: {check}, failing for {failing_for_ms}ms — {detail})")
+            }
+            None => format!(" (unresponsive: {check}, failing for {failing_for_ms}ms)"),
+        },
     }
 }
 

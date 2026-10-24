@@ -1460,18 +1460,67 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
         start.stderr
     );
 
-    // Let the start command's engine fully exit before the follow opens its
-    // own (the follow then adopts the child as a dead owner's record).
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
-        .args(["agent", "logs", "fading", "--follow"])
-        .current_dir(&ctx.project_dir)
-        .env("KTESIO_NO_UPDATE_CHECK", "1")
-        .env("KTESIO_STATE_DIR", state_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn hekma agent logs --follow");
+    // Spawn the follow and RETRY until it adopts (V4, review round 1): the
+    // follow's engine can only adopt the child once the start command's
+    // engine has fully exited, and a blind sleep raced that teardown. A
+    // too-early follow refuses ("supervised by another live engine") and
+    // exits fast; the retry loop drains its stderr, checks the refusal
+    // marker, and spawns again — bounded, so a wedged start-engine fails
+    // the test loudly instead of the drift passing silently. The beat is
+    // 500ms: a refusal exits well inside it, while a LEGITIMATE follow exit
+    // (it observed the failure) needs adoption + a 600ms window + ticks —
+    // never under ~900ms — so the two are cleanly separable.
+    let adopt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut child = loop {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+            .args(["agent", "logs", "fading", "--follow"])
+            .current_dir(&ctx.project_dir)
+            .env("KTESIO_NO_UPDATE_CHECK", "1")
+            .env("KTESIO_STATE_DIR", state_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hekma agent logs --follow");
+        // Poll the beat: still running at 500ms ⇒ it adopted; exited inside
+        // the beat ⇒ a refusal (or something unexpected — named loudly).
+        let beat_end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut exited_early = false;
+        loop {
+            match child.try_wait().expect("poll the follow child") {
+                None => {
+                    if std::time::Instant::now() >= beat_end {
+                        break; // adopted — keep this child.
+                    }
+                }
+                Some(_) => {
+                    exited_early = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !exited_early {
+            break child;
+        }
+        let mut early_stderr = String::new();
+        {
+            use std::io::Read;
+            let _ = child
+                .stderr
+                .take()
+                .expect("the follow's stderr pipe")
+                .read_to_string(&mut early_stderr);
+        }
+        assert!(
+            early_stderr.contains("supervised by another live engine"),
+            "the follow exited before adopting for an unexpected reason; \
+             stderr={early_stderr}"
+        );
+        assert!(
+            std::time::Instant::now() < adopt_deadline,
+            "the start engine never released the instance for adoption"
+        );
+    };
 
     // The failure needs the follow's adoption + a fresh window (600ms) +
     // reaper ticks. Poll `list` until the unresponsive edge has landed.
@@ -1490,15 +1539,19 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
     }
 
     // `show` names the check + the failing streak (no new verb — the same
-    // failed-cause projection the readiness timeout rides).
+    // failed-cause projection the readiness timeout rides). Under the seeded
+    // `never` policy the FIRST expiry is already terminal, and the verdict
+    // rides the persisted cause's detail (P8) — so the failed-cause fold
+    // carries the not-restarting conclusion too.
     let show = run_hekma_agent(&["agent", "show", "fading"], &ctx.project_dir, state_dir);
     let shown = format!("{}{}", show.stdout, show.stderr);
     assert!(
         shown.contains("Failed cause")
             && shown.contains("liveness check heartbeat-file")
             && shown.contains("hb.marker")
-            && shown.contains("failing for"),
-        "show must name the unresponsive check: out={} err={}",
+            && shown.contains("failing for")
+            && shown.contains("restart policy is 'never'"),
+        "show must name the unresponsive check + the never verdict: out={} err={}",
         show.stdout,
         show.stderr
     );
@@ -1547,8 +1600,9 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
     );
     // SINGLE-SHOT pins (surfaced, not silent — and never per-tick spam):
     // exactly ONE first-failure note when the window opened, and exactly ONE
-    // terminal policy conclusion (the frozen `unresponsive` cause carries no
-    // detail field, so the reaper's surface carries the `never` verdict).
+    // terminal policy conclusion on the immediate-console surface. (The
+    // verdict ALSO rides the persisted cause's detail — the `show` assert
+    // above pins that durable surface; these pins stay console-only.)
     assert_eq!(
         stderr.matches("declared liveness check failing").count(),
         1,
