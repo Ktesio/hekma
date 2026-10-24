@@ -78,6 +78,30 @@
 //!   long before the hang ends, and this process must never be declared
 //!   `running`. Pure `std`, NO OS-cfg.
 //!
+//! * `--http-health <PORT>:<STATUS>`  (the liveness check)  the liveness twin of
+//!   `--http-ready`: a persistent HTTP/1.1 endpoint on `127.0.0.1:<PORT>`
+//!   answering every connection with `<STATUS>` — the signal a manifest's
+//!   `[liveness.http_get]` check polls. A separate flag from `--http-ready` so
+//!   one process can serve DIFFERENT endpoints to a readiness probe and a
+//!   liveness check. Pure `std`, NO OS-cfg.
+//! * `--http-health-fail-after <MS>`  after `<MS>` from server start the
+//!   `--http-health` endpoint goes SILENT: connections are still ACCEPTED but
+//!   dropped without any answer — the hung-health subject (the engine's attempt
+//!   must see the MISSING ANSWER, not a refusal). Requires `--http-health`
+//!   (refused with exit 2 otherwise — there is no endpoint to fail). Pure
+//!   `std`, NO OS-cfg.
+//! * `--heartbeat-file <PATH>:<INTERVAL_MS>`  rewrite `<PATH>` every
+//!   `<INTERVAL_MS>` (first beat immediate; `<INTERVAL_MS`> must be >= 1 — a
+//!   `PATH:0` subject would busy-loop and is refused with exit 2) — the
+//!   mtime signal a manifest's `[liveness.heartbeat_file]` check reads.
+//!   Pure `std`, NO OS-cfg.
+//! * `--heartbeat-stop-after <MS>`  stop beating after `<MS>` from PROCESS
+//!   START (the heart STOPS; the file goes stale on its own). Requires
+//!   `--heartbeat-file` (refused with exit 2 otherwise — there is no
+//!   heartbeat to stop). `<MS>` of `0` = never touch
+//!   the file at all — the absent-heartbeat subject (absent ≡ stale). Pure
+//!   `std`, NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -280,6 +304,29 @@ struct Opts {
     /// observe the exit (crash path) long before this sleep ends. `None` =
     /// announce readiness normally (the default).
     never_ready: Option<Duration>,
+    /// Beat a heartbeat file every `<interval_ms>` (the liveness story, 18-2):
+    /// rewrite the file (its MTIME is the liveness signal a manifest's
+    /// `[liveness.heartbeat_file]` check reads) on a loop until
+    /// `--heartbeat-stop-after` (if set) elapses. Combined with
+    /// `--heartbeat-stop-after 0` this yields the NEVER-beating subject
+    /// (absent file ≡ stale). `None` = no heartbeat file.
+    heartbeat_file: Option<(PathBuf, u64)>,
+    /// Stop beating the `--heartbeat-file` after this many ms from process
+    /// start (the heart STOPS — the file goes stale on its own, no kill
+    /// needed). `Some(0)` = never touch the file at all (the absent-heartbeat
+    /// subject). `None` = beat for the process's lifetime.
+    heartbeat_stop_after: Option<u64>,
+    /// Serve a persistent HTTP health endpoint on `127.0.0.1:<port>` answering
+    /// `<status>` (the liveness story, 18-2): the signal a manifest's
+    /// `[liveness.http_get]` check polls. The liveness twin of `--http-ready`
+    /// (same responder, a different flag so a readiness probe and a liveness
+    /// check can watch DIFFERENT endpoints in one test). `None` = none.
+    http_health: Option<(u16, u16)>,
+    /// After this many ms FROM SERVER START, the `--http-health` endpoint goes
+    /// SILENT: connections are still ACCEPTED but dropped WITHOUT any answer
+    /// (the hung-health subject — connect succeeds, no response ever comes).
+    /// `None` = answer forever.
+    http_health_fail_after: Option<Duration>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -340,6 +387,10 @@ fn parse() -> Opts {
     let mut sniff_stdin_at_startup = false;
     let mut drop_env: Vec<String> = Vec::new();
     let mut http_ready: Option<(u16, u16)> = None;
+    let mut http_health: Option<(u16, u16)> = None;
+    let mut http_health_fail_after: Option<Duration> = None;
+    let mut heartbeat_file: Option<(PathBuf, u64)> = None;
+    let mut heartbeat_stop_after: Option<u64> = None;
     let mut ready_file: Option<(PathBuf, u64)> = None;
     let mut ready_line: Option<(String, u64)> = None;
     let mut never_ready: Option<Duration> = None;
@@ -468,6 +519,80 @@ fn parse() -> Opts {
                     }
                 }
             }
+            "--heartbeat-file" => {
+                // Review round 1 (D5): an interval below 1ms is refused — a
+                // `PATH:0` subject would busy-loop rewriting the file (sleep(0)
+                // spins), which is no liveness subject at all.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(parse_colon_pair)
+                    .and_then(|(path, ms)| {
+                        ms.parse::<u64>().ok().map(|ms| (PathBuf::from(path), ms))
+                    }) {
+                    Some((path, ms)) if ms >= 1 => heartbeat_file = Some((path, ms)),
+                    Some((_, 0)) => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-file interval must be >= 1ms (PATH:0 would \
+                             busy-loop rewriting the file — no usable liveness subject)"
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-file requires PATH:INTERVAL_MS (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                    Some((_, _)) => unreachable!("ms >= 1 matched above"),
+                }
+            }
+            "--heartbeat-stop-after" => {
+                // Fail FAST (mirror `--never-ready`): a silently-ignored value
+                // would leave the heart beating and any staleness drill
+                // measuring nothing but a pass. `0` is LEGAL here (never beat
+                // at all — the absent-heartbeat subject).
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => heartbeat_stop_after = Some(ms),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-stop-after requires a DELAY_MS value (0 \
+                             = never beat; got missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--http-health" => {
+                match args.next().as_deref().and_then(parse_colon_pair).and_then(
+                    |(port, status)| port.parse::<u16>().ok().zip(status.parse::<u16>().ok()),
+                ) {
+                    Some((port, status)) => http_health = Some((port, status)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-health requires PORT:STATUS (got missing or \
+                         malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--http-health-fail-after" => {
+                // Fail FAST (mirror `--never-ready`): a silently-ignored value
+                // would leave the endpoint answering and any unresponsiveness
+                // drill measuring nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => http_health_fail_after = Some(Duration::from_millis(ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-health-fail-after requires a DELAY_MS value \
+                             (got missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             // A lying-subject mode: omit the named env var from the `--dump`
             // artifact (see `write_dump`). Repeatable, one name per flag.
             "--drop-env" => {
@@ -538,6 +663,25 @@ fn parse() -> Opts {
         observed_auth = Some(env_auth);
     }
 
+    // Review round 1 (D5): CROSS-FLAG validation, fail-fast (exit 2) — a
+    // flag that pairs only with another flag is a silent no-op when that
+    // flag is missing, and a drill built on the pair would measure nothing
+    // but a pass. Name BOTH flags in the refusal.
+    if heartbeat_stop_after.is_some() && heartbeat_file.is_none() {
+        eprintln!(
+            "fake_agent: --heartbeat-stop-after requires --heartbeat-file PATH:INTERVAL_MS \
+             (there is no heartbeat to stop)"
+        );
+        std::process::exit(2);
+    }
+    if http_health_fail_after.is_some() && http_health.is_none() {
+        eprintln!(
+            "fake_agent: --http-health-fail-after requires --http-health PORT:STATUS \
+             (there is no health endpoint to fail)"
+        );
+        std::process::exit(2);
+    }
+
     Opts {
         exit_fast,
         spawn_child,
@@ -566,12 +710,24 @@ fn parse() -> Opts {
         ready_file,
         ready_line,
         never_ready,
+        heartbeat_file,
+        heartbeat_stop_after,
+        http_health,
+        http_health_fail_after,
     }
 }
 
 #[cfg(not(tarpaulin_include))]
 fn main() {
     let opts = parse();
+
+    // Review round 1 (D5): the PROCESS-START clock. The heartbeat
+    // `--heartbeat-stop-after` budget is documented as "from process start",
+    // so it is captured HERE (before the fixtures arm) and handed to
+    // `beat_heartbeat` — the old thread-local `Instant::now()` measured from
+    // the beat thread's own start, which could drift from the process start
+    // the flag's doc promises.
+    let process_start = Instant::now();
 
     // Story 4-1 fix pass (HIGH finding, review of #79): BEFORE anything else
     // (before the exit-fast path, before announcing readiness), mimic a
@@ -623,6 +779,26 @@ fn main() {
     }
     if let Some((line, ms)) = opts.ready_line.clone() {
         thread::spawn(move || print_ready_line(line, Duration::from_millis(ms)));
+    }
+
+    // Liveness fixtures (story 18-2): same EARLY-start posture as the
+    // readiness ones above — the signal (a beating heartbeat, an answering
+    // health endpoint) is armed before the engine's reaper could possibly
+    // look. Each fixture's OWN delay gates when the signal degrades, which is
+    // how a test proves the window genuinely elapsed. Pure `std`, NO OS-cfg.
+    if let Some((port, status)) = opts.http_health {
+        thread::spawn(move || serve_http_health(port, status, opts.http_health_fail_after));
+    }
+    if let Some((path, interval_ms)) = opts.heartbeat_file.clone() {
+        let stop_after = opts.heartbeat_stop_after.map(Duration::from_millis);
+        thread::spawn(move || {
+            beat_heartbeat(
+                path,
+                Duration::from_millis(interval_ms),
+                stop_after,
+                process_start,
+            )
+        });
     }
 
     // Resolve whether THIS launch should self-crash. Default: honor
@@ -873,23 +1049,93 @@ fn parse_colon_pair(arg: &str) -> Option<(&str, &str)> {
 /// NO OS-cfg.
 #[cfg(not(tarpaulin_include))]
 fn serve_http_ready(port: u16, status: u16) {
+    serve_http_health(port, status, None);
+}
+
+/// Serve the `--http-health` LIVENESS endpoint (the `serve_http_ready`
+/// generalization, story 18-2): bind `127.0.0.1:<port>` and answer every
+/// connection with the declared status — UNLESS `fail_after` has elapsed
+/// since server start, after which connections are still ACCEPTED but
+/// dropped WITHOUT any answer (the hung-health subject: the engine's attempt
+/// connects, reads EOF/nothing, and counts one failing attempt — the
+/// declared signal went silent while the process itself lives on). A bind
+/// failure is announced to stderr and the thread gives up (the engine's
+/// check then counts refused connections — an honest failure, never a fake
+/// pass). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn serve_http_health(port: u16, status: u16, fail_after: Option<Duration>) {
     let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("fake_agent: --http-ready could not bind 127.0.0.1:{port}: {err}");
+            eprintln!("fake_agent: --http-health could not bind 127.0.0.1:{port}: {err}");
             return;
         }
     };
     let response =
         format!("HTTP/1.1 {status} ready\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let started = Instant::now();
     for mut stream in listener.incoming().flatten() {
-        // Drain a bounded slice of the request (the engine's probe sends
+        // Post-deadline: accept then drop WITHOUT answering — the health
+        // endpoint went silent (a hung agent's listener may still accept at
+        // the OS level while the application never responds; the engine must
+        // see the MISSING ANSWER, not a connection refusal).
+        if fail_after.is_some_and(|d| started.elapsed() >= d) {
+            // Let the probe's request ARRIVE before the drop: closing a
+            // socket with UNREAD data sends RST — no server-side TIME_WAIT —
+            // so a kill-and-restart drill can re-bind this port immediately.
+            // A bare instant-drop races the request in flight and may
+            // FIN-close instead, parking a TIME_WAIT that (absent
+            // SO_REUSEADDR on Windows) blocks the re-bind.
+            std::thread::sleep(Duration::from_millis(50));
+            drop(stream);
+            continue;
+        }
+        // Drain a bounded slice of the request (the engine's check sends
         // one small GET), answer, and drop — `Connection: close` plus the
         // drop gives the client a clean EOF.
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+    }
+}
+
+/// The `--heartbeat-file` fixture: rewrite the heartbeat file every
+/// `interval` (its MTIME is the liveness signal a
+/// `[liveness.heartbeat_file]` check reads) until `stop_after` (if set)
+/// elapses since `process_start` — the heart STOPS, and the file goes stale on
+/// its own with no kill needed. `stop_after == Some(ZERO)` means never touch
+/// the file at all (the absent-heartbeat subject: absent ≡ stale). The clock
+/// is the PROCESS-START instant captured in `main` (review round 1, D5 — the
+/// flag's doc says "from process start", so the measurement must not depend
+/// on when the beat thread happened to start). The FIRST
+/// beat is immediate (an agent alive at start has a fresh heartbeat); a
+/// write failure is announced once and the beating stops (an honest signal —
+/// the engine will see the file go stale). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn beat_heartbeat(
+    path: PathBuf,
+    interval: Duration,
+    stop_after: Option<Duration>,
+    process_start: Instant,
+) {
+    loop {
+        if let Some(stop) = stop_after {
+            if stop.is_zero() || process_start.elapsed() >= stop {
+                return;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, b"beat").is_err() {
+            eprintln!(
+                "fake_agent: --heartbeat-file could not write {} — the heartbeat stops here",
+                path.display()
+            );
+            return;
+        }
+        sleep(interval);
     }
 }
 

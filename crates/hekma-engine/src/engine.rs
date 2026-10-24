@@ -99,9 +99,10 @@ pub struct InstanceStatus {
 
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
-/// for the failure-bearing causes (a launch error, a crash, or a readiness-probe
-/// timeout — the timeout names the probe + the honest wait), or `None` for a
-/// cause that does not describe a failure.
+/// for the failure-bearing causes (a launch error, a crash, a readiness-probe
+/// timeout — the timeout names the probe + the honest wait — or an unresponsive
+/// declared liveness check — naming the check + its failing streak), or `None` for
+/// a cause that does not describe a failure.
 fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
     match cause {
         TransitionCause::LaunchError { detail } => Some(detail.clone()),
@@ -112,6 +113,21 @@ fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
         TransitionCause::ReadinessTimeout { probe, waited_ms } => {
             Some(format!("{probe} did not pass within {waited_ms}ms"))
         }
+        // The declared signal died: name the check + how long it had been
+        // failing, so `show` explains the unresponsive failure the same way
+        // (story 18-2 — no new verb, the same fallback shape). When the
+        // reaper recorded expiry-verdict detail (18-2 review round 1 — e.g.
+        // the heartbeat file's pre-existing staleness at first observation),
+        // it rides along here so `show` carries the whole verdict, not just
+        // the streak.
+        TransitionCause::Unresponsive {
+            check,
+            failing_for_ms,
+            detail,
+        } => Some(match detail {
+            Some(detail) => format!("{check} failing for {failing_for_ms}ms ({detail})"),
+            None => format!("{check} failing for {failing_for_ms}ms"),
+        }),
         _ => None,
     }
 }
