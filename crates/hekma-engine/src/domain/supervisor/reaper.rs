@@ -864,23 +864,54 @@ impl Supervisor {
                         .unwrap_or(false);
                     if detached {
                         if let Some(supervised) = self.running.get_mut(&name) {
-                            if matches!(
-                                self.backend.poll(&mut supervised.handle),
-                                Ok(ProcessStatus::Alive)
-                            ) {
-                                if let Err(kill_err) =
-                                    self.backend.stop(&mut supervised.handle, Duration::ZERO)
-                                {
-                                    // Surfaced (AI-18): the kill failed — the
-                                    // operator must know the teardown was not
-                                    // completed, not silently drop a live
-                                    // handle.
-                                    self.emit_diagnostic(&format!(
-                                        "{}: liveness-expiry teardown could not force-kill \
-                                         the detached, unresponsive process: {kill_err}",
-                                        name.as_str()
-                                    ));
+                            // AI-18 honesty (windows-latest triage 2026-10-24):
+                            // every path here that does NOT kill a live wedge
+                            // must SAY so — a silent skip leaves the wedged
+                            // process running (holding its ports) while the
+                            // failure commit says teardown happened. The two
+                            // silent shapes below each get a named diagnostic:
+                            // a poll that did not answer `Alive`, and a
+                            // zero-window stop that reports a GRACEFUL outcome
+                            // (the backend reaped an exit on the way in — for
+                            // a process that just polled alive, that is the
+                            // silent-skip signature).
+                            let poll = self.backend.poll(&mut supervised.handle);
+                            if matches!(poll, Ok(ProcessStatus::Alive)) {
+                                match self.backend.stop(&mut supervised.handle, Duration::ZERO) {
+                                    Ok(outcome) if !outcome.forced => {
+                                        self.emit_diagnostic(&format!(
+                                            "{}: liveness-expiry teardown stop returned a \
+                                             graceful (not forced) outcome for a detached \
+                                             process that just polled alive — the wedge may \
+                                             still be running",
+                                            name.as_str()
+                                        ));
+                                    }
+                                    Err(kill_err) => {
+                                        // Surfaced (AI-18): the kill failed — the
+                                        // operator must know the teardown was not
+                                        // completed, not silently drop a live
+                                        // handle.
+                                        self.emit_diagnostic(&format!(
+                                            "{}: liveness-expiry teardown could not force-kill \
+                                             the detached, unresponsive process: {kill_err}",
+                                            name.as_str()
+                                        ));
+                                    }
+                                    Ok(_) => {}
                                 }
+                            } else {
+                                // Informational, not a failure: the wedge may
+                                // legitimately have exited on its own between
+                                // the window opening and this teardown (then
+                                // there is nothing to kill). Any OTHER status
+                                // is the silent-skip signature — the outcome
+                                // rides the diagnostic for the operator.
+                                self.emit_diagnostic(&format!(
+                                    "{}: liveness-expiry teardown skipped the force-kill — \
+                                     the detached process did not poll alive ({poll:?})",
+                                    name.as_str()
+                                ));
                             }
                         }
                     }
