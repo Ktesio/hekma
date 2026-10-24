@@ -249,6 +249,15 @@ fn rendered_command(args: &[&str]) -> String {
     rendered
 }
 
+/// The wire form of a command needle. The serialized cause escapes the
+/// backslashes of a Windows bin path (`D:\a\…` → `D:\\a\\…`), so a raw-text
+/// `contains` with unescaped separators can never match there. The
+/// JSON-encoded string literal (quotes included) is byte-identical to the
+/// wire segment on every platform.
+fn wire_command(cmd: &str) -> String {
+    serde_json::to_string(cmd).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // (a) The cooperative-FIRST dispatch — the command outranks the signal path
 // ---------------------------------------------------------------------------
@@ -328,7 +337,7 @@ fn cooperative_pause_runs_the_declared_command_not_the_signal() {
     );
     let expected = rendered_command(&["--touch", "pause.sentinel"]);
     assert!(
-        cause.contains(&expected),
+        cause.contains(&wire_command(&expected)),
         "the cause must name the rendered command `{expected}` (cause: {cause})"
     );
 
@@ -414,7 +423,10 @@ fn cooperative_pause_stops_the_work_and_resume_runs_the_command() {
     let pause_cause = serde_json::to_string(&pause_evt.cause).unwrap();
     assert!(
         pause_cause.contains("pause-cooperative")
-            && pause_cause.contains(&rendered_command(&["--touch", "pause.sentinel"])),
+            && pause_cause.contains(&wire_command(&rendered_command(&[
+                "--touch",
+                "pause.sentinel"
+            ]))),
         "pause cause: {pause_cause}"
     );
     let resume_evt = events
@@ -424,7 +436,10 @@ fn cooperative_pause_stops_the_work_and_resume_runs_the_command() {
     let resume_cause = serde_json::to_string(&resume_evt.cause).unwrap();
     assert!(
         resume_cause.contains("resume-cooperative")
-            && resume_cause.contains(&rendered_command(&["--touch", "resume.sentinel"])),
+            && resume_cause.contains(&wire_command(&rendered_command(&[
+                "--touch",
+                "resume.sentinel"
+            ]))),
         "resume cause: {resume_cause}"
     );
 
