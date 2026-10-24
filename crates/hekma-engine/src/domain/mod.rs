@@ -16,10 +16,23 @@ mod cost;
 mod error;
 mod event;
 mod fleet;
+mod governance;
 mod instance;
 mod lifecycle;
+/// The liveness-check evaluator (contract `1.1.0`): engine-side evaluation of
+/// a manifest's declared `[liveness]` check. Private to the crate — the
+/// reaper's poll is the only caller.
+pub(crate) mod liveness;
 mod name;
 mod outbox;
+/// The shared per-attempt probe evaluators (contract `1.1.0`): the exact
+/// `http-get` / file-fresh code BOTH declared polls run — the readiness gate
+/// and the liveness check. Private to the crate.
+pub(crate) mod probe_kinds;
+/// The readiness-probe runner (contract `1.1.0`): engine-side evaluation of a
+/// manifest's declared `[readiness]` gate. Private to the crate — the
+/// supervisor's start path is the only caller.
+pub(crate) mod readiness;
 mod registry;
 mod restart;
 mod resync;
@@ -55,6 +68,14 @@ pub use fleet::{
     AcpContextCostView, AcpContextUsageView, BudgetView, FleetEntry, FleetListing, FleetTotals,
     Supervision, UsageGapNotice, UsageView,
 };
+pub use governance::{
+    canonical_json, checksum_file_content, decide, generate, governance_vectors_checksum,
+    run_derivation, Case, CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, GOVERNANCE_VECTORS_ARTIFACT_ID,
+    GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
+    GOVERNANCE_VECTORS_VERSION,
+};
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
 pub use name::{InstanceName, NameError};
@@ -71,7 +92,7 @@ pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE
 pub(crate) use resync::read_committed;
 pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
-pub use supervisor::{DiagnosticSink, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
+pub use supervisor::{DiagnosticSink, DrainOutcome, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
 pub use transition::{next_state, LifecycleCommand, LifecycleError};
 pub use usage::{
     RecordOutcome, RunId, UsageEvent, UsageTotals, UsageUpdateEvent, USAGE_SCHEMA_VERSION,

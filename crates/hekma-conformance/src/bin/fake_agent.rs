@@ -60,6 +60,109 @@
 //!   the self-crash is UNBOUNDED (every launch crashes) — the existing crash-loop
 //!   behavior is unchanged. Pure `std`, NO OS-cfg (a plain file read/write).
 //!
+//! * `--http-ready <PORT>:<STATUS>`  (the readiness probes)  serve a tiny
+//!   HTTP/1.1 endpoint on `127.0.0.1:<PORT>` that answers EVERY connection with
+//!   `<STATUS>` for the process's whole lifetime — a persistent accept loop,
+//!   NOT a one-shot server: the engine's readiness probe opens a fresh
+//!   connection on every poll and each one is answered. The target a manifest's
+//!   `http-get` readiness probe polls. Pure `std`, NO OS-cfg.
+//! * `--ready-file <PATH>:<DELAY_MS>`  create `<PATH>` after `<DELAY_MS>` — the
+//!   signal a manifest's `file-fresh` readiness probe waits for; the delay
+//!   proves the probe genuinely waited. Pure `std`, NO OS-cfg.
+//! * `--ready-line <LINE>:<DELAY_MS>`  print `<LINE>` to stdout after
+//!   `<DELAY_MS>` — the signal a manifest's `log-contains` readiness probe scans
+//!   the captured agent log for. Pure `std`, NO OS-cfg.
+//! * `--never-ready <HANG_MS>`  announce NOTHING (no ready line, no marker) and
+//!   hang for `<HANG_MS>`, then exit 0 — the timeout subject: the engine's
+//!   readiness probe must time out (or observe the exit through the crash path)
+//!   long before the hang ends, and this process must never be declared
+//!   `running`. Pure `std`, NO OS-cfg.
+//!
+//! * `--http-health <PORT>:<STATUS>`  (the liveness check)  the liveness twin of
+//!   `--http-ready`: a persistent HTTP/1.1 endpoint on `127.0.0.1:<PORT>`
+//!   answering every connection with `<STATUS>` — the signal a manifest's
+//!   `[liveness.http_get]` check polls. A separate flag from `--http-ready` so
+//!   one process can serve DIFFERENT endpoints to a readiness probe and a
+//!   liveness check. Pure `std`, NO OS-cfg.
+//! * `--http-health-fail-after <MS>`  after `<MS>` from server start the
+//!   `--http-health` endpoint goes SILENT: connections are still ACCEPTED but
+//!   dropped without any answer — the hung-health subject (the engine's attempt
+//!   must see the MISSING ANSWER, not a refusal). Requires `--http-health`
+//!   (refused with exit 2 otherwise — there is no endpoint to fail). Pure
+//!   `std`, NO OS-cfg.
+//! * `--heartbeat-file <PATH>:<INTERVAL_MS>`  rewrite `<PATH>` every
+//!   `<INTERVAL_MS>` (first beat immediate; `<INTERVAL_MS`> must be >= 1 — a
+//!   `PATH:0` subject would busy-loop and is refused with exit 2) — the
+//!   mtime signal a manifest's `[liveness.heartbeat_file]` check reads.
+//!   Pure `std`, NO OS-cfg.
+//! * `--heartbeat-stop-after <MS>`  stop beating after `<MS>` from PROCESS
+//!   START (the heart STOPS; the file goes stale on its own). Requires
+//!   `--heartbeat-file` (refused with exit 2 otherwise — there is no
+//!   heartbeat to stop). `<MS>` of `0` = never touch
+//!   the file at all — the absent-heartbeat subject (absent ≡ stale). Pure
+//!   `std`, NO OS-cfg.
+//!
+//! * `--touch <PATH>`  (story 18-4, the lifecycle-command fixture)  create
+//!   `<PATH>` (parents created) and EXIT 0 immediately — a `--touch`
+//!   invocation's WHOLE job is the file: it runs as a plain engine lifecycle
+//!   command (`[lifecycle.pause]`/`[lifecycle.resume]`), never as a
+//!   supervised agent, so the readiness/heartbeat machinery is meaningless
+//!   for it and lingering would only overrun the command's bound. The
+//!   observable side effect the engine's cooperative pause/resume records.
+//!   Paths are AGENT-HOME-relative in practice (both the supervised agent
+//!   and the lifecycle commands run with the Agent Home as their working
+//!   directory). Pure `std`, NO OS-cfg.
+//! * `--hang-before <MS>`  (story 18-4)  sleep `<MS>` BEFORE the `--touch`
+//!   write — the cap-overrun subject: a lifecycle command that outlives its
+//!   bound is killed by the engine's bounded runner before the file lands.
+//!   Requires `--touch` (refused with exit 2 otherwise — a hang with no
+//!   touch would be a silent no-op). Pure `std`, NO OS-cfg.
+//! * `--watch-sentinel <PAUSE>:<RESUME>:<WORK>`  (story 18-4)  spawn a
+//!   thread that appends one `work <n>` line to `<WORK>` every 25 ms UNLESS
+//!   paused — paused means `<PAUSE>` exists AND `<RESUME>` does not (both
+//!   lifecycle commands are `--touch` fixtures; the RESUME file's arrival
+//!   un-pauses). The cooperative-work subject: a test reads `<WORK>`'s tail
+//!   to prove the agent's work actually STOPPED while paused and RESUMED
+//!   after — the thing a signal suspension fakes by freezing the whole
+//!   process. Parsing note: the value splits on the LAST two colons
+//!   (`rsplit_once` twice), so a PAUSE path may not contain a colon
+//!   (RESUME/WORK may not either — keep the fixtures colon-free). Pure
+//!   `std`, NO OS-cfg.
+//!
+//! * `--idle-after-ms <DELAY_MS>:<PATH>`  (story 18-4)  create `<PATH>` after
+//!   `<DELAY_MS>` FROM PROCESS START — the drain-idle subject: a supervised
+//!   agent that "finishes" its work WHILE an engine drain is still waiting,
+//!   so the drain's `[drain] idle_file` wait observes the file ARRIVE (fresh
+//!   mtime) and completes early instead of timing out — the proof the wait
+//!   loop genuinely waited rather than skipped or spun on a file that was
+//!   already there. The drain-side mirror of `--ready-file` (which gates a
+//!   readiness probe the same way). Pure `std`, NO OS-cfg.
+//!
+//! * `--idle-on-pause <DELAY_MS>:<PAUSE>:<IDLE>`  (18-4 review round 1)  wait
+//!   until `<PAUSE>` EXISTS (polling every 25 ms), sleep `<DELAY_MS>`, then
+//!   create `<IDLE>` — the RE-ANCHOR twin of `--idle-after-ms`: the delay
+//!   counts from the pause sentinel's arrival (the file the drain's own pause
+//!   command writes), not from process start, so a drill proves the idle file
+//!   lands DURING the drain's wait rather than predating the drain entry. The
+//!   value splits on the FIRST colon for the delay and the FIRST colon of the
+//!   remainder for `<PAUSE>` (the `--idle-after-ms` discipline — the IDLE
+//!   tail may itself contain colons, a Windows drive path). A write failure
+//!   is announced to stderr and skipped (best-effort — the engine's drain
+//!   then honestly times out instead of faking a completion). Pure `std`,
+//!   NO OS-cfg.
+//!
+//! * `--exit-on-pause <DELAY_MS>:<ANCHOR>`  (18-4 follow-up)  wait until
+//!   `<ANCHOR>` EXISTS (polling every 25 ms), sleep `<DELAY_MS>`, then EXIT 0
+//!   — the self-exit twin of `--idle-on-pause`: the delay counts from the
+//!   pause sentinel's arrival (the file the drain's own pause command
+//!   writes), not from process start, so a drain drill's agent provably dies
+//!   ON ITS OWN a fixed distance into the drain regardless of when the drain
+//!   began. This is what keeps a drain drill fast on platforms whose graceful
+//!   stop is a pure exit-watch (Windows has no deliverable graceful signal,
+//!   so the stop ladder would otherwise poll its whole default window before
+//!   the forced kill). The value splits on the FIRST colon (`<ANCHOR>` may
+//!   itself contain colons, a Windows drive path). Pure `std`, NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -151,8 +254,18 @@
 //!   nothing ever closes, this call would hang forever — the regression this
 //!   flag exists to prove does NOT happen once piping is gated on the
 //!   declared Capability. Pure `std`, NO OS-cfg.
+//! * `--exit-with <CODE>:<AFTER_MS>` (story 18-3)  run normally (announcing
+//!   readiness, heartbeating if asked) for `<AFTER_MS>`, THEN exit with
+//!   `<CODE>` — but unlike `--crash-after-ms`, the POINT is the declared
+//!   MEANING the engine attaches to the code: a manifest's `[exit_codes]`
+//!   section may declare `<CODE>` as `restart_requested` or `clean`, and the
+//!   test then asserts the engine classifies the exit accordingly (a planned
+//!   restart vs a clean `running → stopped` settle). `--exit-with 75:200` asks
+//!   the supervisor for a restart; `--exit-with 0:200` finishes on purpose.
+//!   Malformed values are refused at startup with a stderr note and exit 2.
+//!   Pure `std`, NO OS-cfg.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::{self, sleep};
@@ -241,6 +354,92 @@ struct Opts {
     /// for the conformance kit's declared-but-failing row; see `write_dump`).
     /// Empty = dump the full environment (the default).
     drop_env: Vec<String>,
+    /// Serve ONE declared-ready HTTP endpoint on `127.0.0.1:<port>` (the
+    /// readiness-gate story): a tiny std-only HTTP/1.1 responder that answers
+    /// every connection with the given status. Lets a manifest's `http-get`
+    /// readiness probe pass against THIS process. `None` = no endpoint.
+    http_ready: Option<(u16, u16)>,
+    /// Create this file after `<delay_ms>` (the readiness-gate story): the
+    /// readiness signal a manifest's `file-fresh` probe watches for. The delay
+    /// gates WHEN the file appears (so a test can prove the probe genuinely
+    /// waited). `None` = no file.
+    ready_file: Option<(PathBuf, u64)>,
+    /// Print this line to stdout after `<delay_ms>` (the readiness-gate
+    /// story): the readiness signal a manifest's `log-contains` probe scans
+    /// the captured agent log for. The delay gates WHEN the line appears.
+    /// `None` = no extra line.
+    ready_line: Option<(String, u64)>,
+    /// NEVER announce readiness (the readiness-gate story's timeout subject):
+    /// skip the ready line + marker entirely, sleep the given duration, then
+    /// exit 0. The engine's probe should time out (terminal, no restart) or
+    /// observe the exit (crash path) long before this sleep ends. `None` =
+    /// announce readiness normally (the default).
+    never_ready: Option<Duration>,
+    /// Beat a heartbeat file every `<interval_ms>` (the liveness story, 18-2):
+    /// rewrite the file (its MTIME is the liveness signal a manifest's
+    /// `[liveness.heartbeat_file]` check reads) on a loop until
+    /// `--heartbeat-stop-after` (if set) elapses. Combined with
+    /// `--heartbeat-stop-after 0` this yields the NEVER-beating subject
+    /// (absent file ≡ stale). `None` = no heartbeat file.
+    heartbeat_file: Option<(PathBuf, u64)>,
+    /// Stop beating the `--heartbeat-file` after this many ms from process
+    /// start (the heart STOPS — the file goes stale on its own, no kill
+    /// needed). `Some(0)` = never touch the file at all (the absent-heartbeat
+    /// subject). `None` = beat for the process's lifetime.
+    heartbeat_stop_after: Option<u64>,
+    /// Serve a persistent HTTP health endpoint on `127.0.0.1:<port>` answering
+    /// `<status>` (the liveness story, 18-2): the signal a manifest's
+    /// `[liveness.http_get]` check polls. The liveness twin of `--http-ready`
+    /// (same responder, a different flag so a readiness probe and a liveness
+    /// check can watch DIFFERENT endpoints in one test). `None` = none.
+    http_health: Option<(u16, u16)>,
+    /// After this many ms FROM SERVER START, the `--http-health` endpoint goes
+    /// SILENT: connections are still ACCEPTED but dropped WITHOUT any answer
+    /// (the hung-health subject — connect succeeds, no response ever comes).
+    /// `None` = answer forever.
+    http_health_fail_after: Option<Duration>,
+    /// Exit with `CODE` after `AFTER_MS` of run (story 18-3): the DECLARED
+    /// exit-code fixture. `--exit-with 75:200` asks the supervisor for a
+    /// relaunch (the exit-75 pattern) when the manifest declares
+    /// `restart_requested = [75]`; `--exit-with 0:200` finishes on purpose
+    /// when the manifest declares `clean = [0]`. Unlike `--crash-after-ms`
+    /// (whose exit is BY DEFINITION unrequested), this is the run-finishing
+    /// exit whose classification the engine's `[exit_codes]` machinery
+    /// decides. `None` = never (the linger loop governs exit).
+    exit_with: Option<(i32, Duration)>,
+    /// Create this file and EXIT 0 (story 18-4): the lifecycle-command
+    /// fixture — the whole job of a `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// command process. `None` = not a touch invocation (the supervised-agent
+    /// path below).
+    touch: Option<PathBuf>,
+    /// Sleep this long BEFORE the `--touch` write (story 18-4): the
+    /// cap-overrun subject — a lifecycle command that outlives its bound is
+    /// killed before the file lands. `None` = touch immediately. Only
+    /// meaningful with `--touch` (cross-flag refusal otherwise).
+    hang_before: Option<Duration>,
+    /// `PAUSE:RESUME:WORK` (story 18-4): the cooperative-work thread — append
+    /// one `work <n>` line to `WORK` every 25 ms unless paused (PAUSE exists
+    /// AND RESUME missing). `None` = no thread (the default; existing tests
+    /// unaffected).
+    watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)>,
+    /// Create this file after `<delay_ms>` FROM PROCESS START (story 18-4):
+    /// the drain-idle subject — the `[drain] idle_file` a drain's fresh-file
+    /// wait observes ARRIVING mid-drain, proving the wait loop genuinely
+    /// waited rather than skipped. `None` = no idle file.
+    idle_after: Option<(PathBuf, u64)>,
+    /// Create this file `<delay_ms>` after the PAUSE anchor first EXISTS
+    /// (18-4 review round 1, B13): the re-anchored idle fixture — the delay
+    /// counts from the pause sentinel's arrival, not process start, so a
+    /// drain drill proves the idle file lands DURING the drain's wait.
+    /// `None` = no anchored idle file.
+    idle_on_pause: Option<(u64, PathBuf, PathBuf)>,
+    /// Exit 0 `<delay_ms>` after the PAUSE anchor first EXISTS (the
+    /// `--idle-on-pause` self-exit twin): the delay counts from the pause
+    /// sentinel's arrival, not process start, so the agent provably dies on
+    /// its own a fixed distance into the drain — the Windows-graceful-stop
+    /// fixture (the stop ladder's exit-watch needs the process to end).
+    /// `None` = no anchored self-exit.
+    exit_on_pause: Option<(u64, PathBuf)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -300,6 +499,21 @@ fn parse() -> Opts {
     let mut echo_stdin = false;
     let mut sniff_stdin_at_startup = false;
     let mut drop_env: Vec<String> = Vec::new();
+    let mut http_ready: Option<(u16, u16)> = None;
+    let mut http_health: Option<(u16, u16)> = None;
+    let mut http_health_fail_after: Option<Duration> = None;
+    let mut heartbeat_file: Option<(PathBuf, u64)> = None;
+    let mut heartbeat_stop_after: Option<u64> = None;
+    let mut ready_file: Option<(PathBuf, u64)> = None;
+    let mut ready_line: Option<(String, u64)> = None;
+    let mut never_ready: Option<Duration> = None;
+    let mut exit_with: Option<(i32, Duration)> = None;
+    let mut touch: Option<PathBuf> = None;
+    let mut hang_before: Option<Duration> = None;
+    let mut watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)> = None;
+    let mut idle_after: Option<(PathBuf, u64)> = None;
+    let mut idle_on_pause: Option<(u64, PathBuf, PathBuf)> = None;
+    let mut exit_on_pause: Option<(u64, PathBuf)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -359,6 +573,146 @@ fn parse() -> Opts {
             }
             "--echo-stdin" => echo_stdin = true,
             "--sniff-stdin-at-startup" => sniff_stdin_at_startup = true,
+            // Readiness-probe fixtures (the readiness-gate story). The paired
+            // values FAIL FAST on a missing/malformed pair (the
+            // `--observed-stream-calls` convention): a mistyped fixture must
+            // never silently become "no readiness signal", or a probe-timeout
+            // test would pass for the wrong reason.
+            "--http-ready" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(port, status)| port.parse::<u16>().ok().zip(status.parse::<u16>().ok()))
+            {
+                Some(pair) => http_ready = Some(pair),
+                None => {
+                    eprintln!(
+                        "fake_agent: --http-ready requires PORT:STATUS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--ready-file" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(path, ms)| ms.parse::<u64>().ok().map(|ms| (path, ms)))
+            {
+                Some((path, ms)) => ready_file = Some((PathBuf::from(path), ms)),
+                None => {
+                    eprintln!(
+                        "fake_agent: --ready-file requires PATH:DELAY_MS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--ready-line" => match args
+                .next()
+                .as_deref()
+                .and_then(|v| parse_colon_pair(v))
+                .and_then(|(line, ms)| ms.parse::<u64>().ok().map(|ms| (line, ms)))
+            {
+                Some((line, ms)) => ready_line = Some((line.to_string(), ms)),
+                None => {
+                    eprintln!(
+                        "fake_agent: --ready-line requires LINE:DELAY_MS (got missing or \
+                         malformed value)"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            "--never-ready" => {
+                // Fail FAST on a missing/malformed value (mirror
+                // `--ready-line`): a silently-ignored `--never-ready` would
+                // leave the agent READY and any probe drill measuring
+                // nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => never_ready = Some(Duration::from_millis(ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --never-ready requires a DELAY_MS value (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--heartbeat-file" => {
+                // Review round 1 (D5): an interval below 1ms is refused — a
+                // `PATH:0` subject would busy-loop rewriting the file (sleep(0)
+                // spins), which is no liveness subject at all.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(parse_colon_pair)
+                    .and_then(|(path, ms)| {
+                        ms.parse::<u64>().ok().map(|ms| (PathBuf::from(path), ms))
+                    }) {
+                    Some((path, ms)) if ms >= 1 => heartbeat_file = Some((path, ms)),
+                    Some((_, 0)) => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-file interval must be >= 1ms (PATH:0 would \
+                             busy-loop rewriting the file — no usable liveness subject)"
+                        );
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-file requires PATH:INTERVAL_MS (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                    Some((_, _)) => unreachable!("ms >= 1 matched above"),
+                }
+            }
+            "--heartbeat-stop-after" => {
+                // Fail FAST (mirror `--never-ready`): a silently-ignored value
+                // would leave the heart beating and any staleness drill
+                // measuring nothing but a pass. `0` is LEGAL here (never beat
+                // at all — the absent-heartbeat subject).
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => heartbeat_stop_after = Some(ms),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-stop-after requires a DELAY_MS value (0 \
+                             = never beat; got missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--http-health" => {
+                match args.next().as_deref().and_then(parse_colon_pair).and_then(
+                    |(port, status)| port.parse::<u16>().ok().zip(status.parse::<u16>().ok()),
+                ) {
+                    Some((port, status)) => http_health = Some((port, status)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-health requires PORT:STATUS (got missing or \
+                         malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--http-health-fail-after" => {
+                // Fail FAST (mirror `--never-ready`): a silently-ignored value
+                // would leave the endpoint answering and any unresponsiveness
+                // drill measuring nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => http_health_fail_after = Some(Duration::from_millis(ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-health-fail-after requires a DELAY_MS value \
+                             (got missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             // A lying-subject mode: omit the named env var from the `--dump`
             // artifact (see `write_dump`). Repeatable, one name per flag.
             "--drop-env" => {
@@ -402,9 +756,186 @@ fn parse() -> Opts {
                     crash_state = Some(PathBuf::from(path));
                 }
             }
+            "--exit-with" => {
+                // Story 18-3's fixture: `--exit-with CODE:AFTER_MS`. FAIL FAST
+                // (stderr + exit 2) on a malformed value — the exact posture
+                // the 18-1/18-2 flags took: a silently-ignored fixture would
+                // make a drill assert "still running" for the wrong reason
+                // (the agent never exited) instead of the behavior under
+                // test. 18-3 review round 1 (C5): the CODE is fail-fast too —
+                // a code outside the portable `0..=255` domain could never
+                // survive a real exit status (unix carries the low 8 bits), so
+                // a drill built on one would assert a code the engine could
+                // never observe.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(parse_colon_pair)
+                    .and_then(|(code, ms)| {
+                        let code = code.parse::<i32>().ok()?;
+                        if !(0..=255).contains(&code) {
+                            return None;
+                        }
+                        Some((code, ms.parse::<u64>().ok()?))
+                    }) {
+                    Some((code, ms)) => exit_with = Some((code, Duration::from_millis(ms))),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --exit-with requires CODE:AFTER_MS (a code in \
+                             0..=255 — the portable exit-code domain — and a non-negative \
+                             millisecond delay, colon-separated; got a missing, malformed, \
+                             or out-of-range value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--marker" => {
                 if let Some(path) = args.next() {
                     marker = Some(PathBuf::from(path));
+                }
+            }
+            "--touch" => {
+                // Fail fast (the hang-before posture): a silently-ignored
+                // touch would turn the lifecycle command into a plain
+                // lingering agent, and a drill would read the engine's
+                // command-timeout path instead of the touch side effect it
+                // means to observe.
+                match args.next() {
+                    Some(path) => touch = Some(PathBuf::from(path)),
+                    None => {
+                        eprintln!("fake_agent: --touch requires PATH (got a missing value)");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--hang-before" => {
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => hang_before = Some(Duration::from_millis(ms)),
+                    None => {
+                        // Fail fast (the observed-stream-calls posture): a
+                        // silently-ignored hang would make a cap-overrun
+                        // drill measure a command that exits 0 immediately
+                        // instead of the behavior under test.
+                        eprintln!(
+                            "fake_agent: --hang-before requires a non-negative millisecond \
+                             argument (got missing or non-numeric value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--watch-sentinel" => {
+                // PAUSE:RESUME:WORK — split on the LAST two colons
+                // (`rsplit_once` twice, the `parse_colon_pair` discipline);
+                // the fixture paths must be colon-free (documented). FAIL
+                // FAST on a malformed value: a silently-ignored watcher
+                // would make a cooperative-work drill read an empty log and
+                // assert "work stopped" for the wrong reason.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (left, work) = v.rsplit_once(':')?;
+                    let (pause, resume) = left.rsplit_once(':')?;
+                    if pause.is_empty() || resume.is_empty() || work.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        PathBuf::from(pause),
+                        PathBuf::from(resume),
+                        PathBuf::from(work),
+                    ))
+                });
+                match parsed {
+                    Some(triple) => watch_sentinel = Some(triple),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --watch-sentinel requires PAUSE:RESUME:WORK (three \
+                             colon-free paths, colon-separated; got a missing or malformed \
+                             value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--idle-after-ms" => {
+                // DELAY_MS:PATH — split on the FIRST colon (`split_once`) so
+                // the PATH tail may itself contain colons (a Windows drive
+                // path). FAIL FAST (the ready-file posture): a
+                // silently-ignored idle signal would make a drain drill wait
+                // out its whole bound and read "timed out" instead of the
+                // "completed on arrival" behavior under test.
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(|v| v.split_once(':'))
+                    .and_then(|(ms, path)| {
+                        ms.parse::<u64>().ok().map(|ms| (PathBuf::from(path), ms))
+                    }) {
+                    Some((path, ms)) => idle_after = Some((path, ms)),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --idle-after-ms requires DELAY_MS:PATH (got missing \
+                             or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--idle-on-pause" => {
+                // DELAY_MS:PAUSE:IDLE — split on the FIRST colon for the delay
+                // (a number never contains one), then the FIRST colon of the
+                // remainder for the pause anchor (the `--idle-after-ms`
+                // discipline: the IDLE tail may itself contain colons — a
+                // Windows drive path). FAIL FAST (the ready-file posture): a
+                // silently-ignored anchored idle signal would make a drain
+                // re-anchor drill read "timed out" instead of the
+                // "completed after the pause" behavior under test.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (ms, rest) = v.split_once(':')?;
+                    let (anchor, idle) = rest.split_once(':')?;
+                    let ms = ms.parse::<u64>().ok()?;
+                    if anchor.is_empty() || idle.is_empty() {
+                        return None;
+                    }
+                    Some((ms, PathBuf::from(anchor), PathBuf::from(idle)))
+                });
+                match parsed {
+                    Some(triple) => idle_on_pause = Some(triple),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --idle-on-pause requires DELAY_MS:PAUSE:IDLE (a \
+                             non-negative millisecond delay and two paths, colon-separated; \
+                             got a missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--exit-on-pause" => {
+                // DELAY_MS:ANCHOR — split on the FIRST colon (a number never
+                // contains one; the ANCHOR tail may itself contain colons, a
+                // Windows drive path — the `--idle-on-pause` discipline).
+                // FAIL FAST (the ready-file posture): a silently-ignored
+                // anchored self-exit would make a Windows drain drill burn
+                // the stop ladder's whole graceful window instead of the
+                // anchored exit the drill is built on.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (ms, anchor) = v.split_once(':')?;
+                    let ms = ms.parse::<u64>().ok()?;
+                    if anchor.is_empty() {
+                        return None;
+                    }
+                    Some((ms, PathBuf::from(anchor)))
+                });
+                match parsed {
+                    Some(pair) => exit_on_pause = Some(pair),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --exit-on-pause requires DELAY_MS:ANCHOR (a \
+                             non-negative millisecond delay and a path, colon-separated; \
+                             got a missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
             "--dump" => {
@@ -427,6 +958,71 @@ fn parse() -> Opts {
     // arg).
     if let Ok(env_auth) = std::env::var("FAKE_AGENT_OBSERVED_AUTH") {
         observed_auth = Some(env_auth);
+    }
+
+    // Review round 1 (D5): CROSS-FLAG validation, fail-fast (exit 2) — a
+    // flag that pairs only with another flag is a silent no-op when that
+    // flag is missing, and a drill built on the pair would measure nothing
+    // but a pass. Name BOTH flags in the refusal.
+    if heartbeat_stop_after.is_some() && heartbeat_file.is_none() {
+        eprintln!(
+            "fake_agent: --heartbeat-stop-after requires --heartbeat-file PATH:INTERVAL_MS \
+             (there is no heartbeat to stop)"
+        );
+        std::process::exit(2);
+    }
+    if http_health_fail_after.is_some() && http_health.is_none() {
+        eprintln!(
+            "fake_agent: --http-health-fail-after requires --http-health PORT:STATUS \
+             (there is no health endpoint to fail)"
+        );
+        std::process::exit(2);
+    }
+    // Story 18-4 (the D5 posture): a hang with no touch is a silent no-op —
+    // a cap-overrun drill built on the pair would measure a command that
+    // exits 0 immediately instead of the behavior under test. Name BOTH
+    // flags in the refusal.
+    if hang_before.is_some() && touch.is_none() {
+        eprintln!("fake_agent: --hang-before requires --touch PATH (there is no touch to delay)");
+        std::process::exit(2);
+    }
+
+    // 18-3 review round 1 (C5): the exit fixture's deadline peers. A
+    // declared exit a peer deadline would beat NEVER fires — a drill built
+    // on it would measure the peer's exit (or hang) instead of the
+    // behavior under test — so refuse at startup, naming both flags.
+    if let Some((code, delay)) = exit_with {
+        if delay >= linger {
+            eprintln!(
+                "fake_agent: --exit-with {code}:{} can never fire — the linger \
+                 window ({}ms) elapses first and the process exits 0 silently; shorten \
+                 the delay below --linger-ms",
+                delay.as_millis(),
+                linger.as_millis()
+            );
+            std::process::exit(2);
+        }
+        // An UNBOUNDED crash (no --crash-times + --crash-state pair) fires on
+        // EVERY launch and — at an equal-or-earlier deadline — wins the
+        // loop's check order over the declared exit. A BOUNDED crash
+        // (crash-times + crash-state) stays legal at any deadline: the
+        // bound's later launches are disarmed and legitimately reach the
+        // declared exit (the 18-3 review's own 7,7,75,75 drill depends on
+        // it).
+        if let Some(crash_after) = crash_after {
+            let bounded = crash_times.is_some() && crash_state.is_some();
+            if !bounded && crash_after <= delay {
+                eprintln!(
+                    "fake_agent: --exit-with {code}:{} can never fire under an \
+                     UNBOUNDED --crash-after-ms ({}ms) — the crash deadline wins the \
+                     loop's check order at an equal-or-earlier deadline; bound the crash \
+                     with --crash-times + --crash-state, or separate the deadlines",
+                    delay.as_millis(),
+                    crash_after.as_millis()
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     Opts {
@@ -453,12 +1049,35 @@ fn parse() -> Opts {
         echo_stdin,
         sniff_stdin_at_startup,
         drop_env,
+        http_ready,
+        ready_file,
+        ready_line,
+        never_ready,
+        heartbeat_file,
+        heartbeat_stop_after,
+        http_health,
+        http_health_fail_after,
+        exit_with,
+        touch,
+        hang_before,
+        watch_sentinel,
+        idle_after,
+        idle_on_pause,
+        exit_on_pause,
     }
 }
 
 #[cfg(not(tarpaulin_include))]
 fn main() {
     let opts = parse();
+
+    // Review round 1 (D5): the PROCESS-START clock. The heartbeat
+    // `--heartbeat-stop-after` budget is documented as "from process start",
+    // so it is captured HERE (before the fixtures arm) and handed to
+    // `beat_heartbeat` — the old thread-local `Instant::now()` measured from
+    // the beat thread's own start, which could drift from the process start
+    // the flag's doc promises.
+    let process_start = Instant::now();
 
     // Story 4-1 fix pass (HIGH finding, review of #79): BEFORE anything else
     // (before the exit-fast path, before announcing readiness), mimic a
@@ -480,6 +1099,128 @@ fn main() {
         // Still drop a marker if asked, so a test can prove it launched at all.
         write_marker(&opts.marker, "exit-fast");
         std::process::exit(code);
+    }
+
+    // NEVER-READY (the readiness-gate story's timeout subject): announce
+    // NOTHING (no ready line, no marker) and just hang. The engine's
+    // readiness probe should time out against this process (terminal) — or,
+    // if the hang is SHORTER than the probe budget, observe the clean exit
+    // through the crash path. Either way this process must never be declared
+    // `running`. Placed BEFORE the crash machinery: the readiness story has
+    // no crash schedule of its own.
+    if let Some(hang) = opts.never_ready {
+        sleep(hang);
+        std::process::exit(0);
+    }
+
+    // Story 18-4 lifecycle-command fixtures: a `--touch` invocation's WHOLE
+    // job is to create the file (the pause/resume command's observable side
+    // effect) and EXIT 0 — it runs as a plain engine lifecycle command, never
+    // as a supervised agent, so the readiness/heartbeat machinery below is
+    // meaningless for it and lingering would only overrun the command's
+    // bound. `--hang-before` delays the write (the cap-overrun subject: the
+    // engine's bounded runner kills the command before the file lands).
+    if let Some(path) = opts.touch {
+        if let Some(hang) = opts.hang_before {
+            sleep(hang);
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Review round 1 (A9): a failed write must not read as success — the
+        // touch IS the lifecycle command's observable side effect, so a
+        // failure exits 1 (the engine records the command as failed) and
+        // names the path on stderr (surfaced, never a silent exit-0 with no
+        // file).
+        if let Err(err) = std::fs::write(&path, b"touched") {
+            eprintln!(
+                "fake_agent: --touch could not write {} ({err})",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    // Story 18-4: the cooperative-work thread — same EARLY-start posture as
+    // the readiness/liveness fixtures (the work log is being appended before
+    // the engine's start watch could possibly look). The thread appends one
+    // `work <n>` line every 25 ms UNLESS paused (PAUSE exists AND RESUME
+    // missing) — the observable "the agent's own work stopped while paused"
+    // the cooperative model promises. Pure `std`, NO OS-cfg.
+    if let Some((pause, resume, work)) = opts.watch_sentinel.clone() {
+        thread::spawn(move || watch_sentinel(pause, resume, work));
+    }
+
+    // Story 18-4: the drain-idle fixture — same EARLY-start posture as the
+    // readiness/liveness fixtures above; the DELAY (measured from process
+    // start, the `beat_heartbeat` discipline) gates when the idle file lands,
+    // which is how a drain drill proves the engine's `[drain]` wait observed
+    // the file ARRIVE mid-drain rather than pre-existing. Pure `std`, NO
+    // OS-cfg.
+    if let Some((path, ms)) = opts.idle_after.clone() {
+        thread::spawn(move || touch_idle_file(path, Duration::from_millis(ms), process_start));
+    }
+
+    // 18-4 review round 1 (B13): the PAUSE-anchored idle fixture — the same
+    // EARLY-start posture as `--idle-after-ms` above, but the delay counts
+    // from the pause sentinel's ARRIVAL (the file the drain's own pause
+    // command writes), so a drain drill proves the idle file lands DURING
+    // the drain's wait rather than predating the drain entry. Pure `std`,
+    // NO OS-cfg.
+    if let Some((ms, anchor, idle)) = opts.idle_on_pause.clone() {
+        thread::spawn(move || touch_idle_on_pause(Duration::from_millis(ms), anchor, idle));
+    }
+
+    // The `--idle-on-pause` self-exit twin (18-4 follow-up): same EARLY-start
+    // posture, same PAUSE-anchored clock — but the observed effect is the
+    // agent's own EXIT, not a file. The Windows graceful-stop fixture: the
+    // Windows stop ladder's graceful step is a pure exit-watch (no signal
+    // exists to deliver), so a drill whose agent never ends would poll the
+    // ladder's whole default window before the forced kill; anchored to the
+    // pause sentinel, the agent provably dies on its own a fixed distance
+    // into the drain, whatever the platform's graceful mechanism is. Pure
+    // `std`, NO OS-cfg.
+    if let Some((ms, anchor)) = opts.exit_on_pause.clone() {
+        thread::spawn(move || exit_on_pause_after(Duration::from_millis(ms), anchor));
+    }
+
+    // Readiness-probe fixtures: each thread starts EARLY (before the ready
+    // line below), so the SIGNAL is armed as soon as the engine's probe (which
+    // runs after the startup watch + ACP handshake) looks for it; each
+    // fixture's OWN delay gates when the signal actually appears, which is
+    // how a test proves the probe genuinely waited. Pure `std`, NO OS-cfg.
+    if let Some((port, status)) = opts.http_ready {
+        // Persistent for this process's lifetime (NOT one-shot): the
+        // engine's readiness probe reconnects on every poll and every
+        // connection is answered.
+        thread::spawn(move || serve_http_ready(port, status));
+    }
+    if let Some((path, ms)) = opts.ready_file.clone() {
+        thread::spawn(move || touch_ready_file(path, Duration::from_millis(ms)));
+    }
+    if let Some((line, ms)) = opts.ready_line.clone() {
+        thread::spawn(move || print_ready_line(line, Duration::from_millis(ms)));
+    }
+
+    // Liveness fixtures (story 18-2): same EARLY-start posture as the
+    // readiness ones above — the signal (a beating heartbeat, an answering
+    // health endpoint) is armed before the engine's reaper could possibly
+    // look. Each fixture's OWN delay gates when the signal degrades, which is
+    // how a test proves the window genuinely elapsed. Pure `std`, NO OS-cfg.
+    if let Some((port, status)) = opts.http_health {
+        thread::spawn(move || serve_http_health(port, status, opts.http_health_fail_after));
+    }
+    if let Some((path, interval_ms)) = opts.heartbeat_file.clone() {
+        let stop_after = opts.heartbeat_stop_after.map(Duration::from_millis);
+        thread::spawn(move || {
+            beat_heartbeat(
+                path,
+                Duration::from_millis(interval_ms),
+                stop_after,
+                process_start,
+            )
+        });
     }
 
     // Resolve whether THIS launch should self-crash. Default: honor
@@ -668,6 +1409,12 @@ fn main() {
     let start = Instant::now();
     let deadline = start + opts.linger;
     let crash_deadline = effective_crash_after.map(|d| start + d);
+    // Story 18-3: the declared exit's deadline — when it elapses, the agent
+    // exits with ITS OWN declared code (a run-finishing exit whose
+    // classification the engine's `[exit_codes]` machinery decides). Checked
+    // in the same loop as the crash deadline, after readiness, so the
+    // instance is `running` first.
+    let exit_with_deadline = opts.exit_with.map(|(code, d)| (code, start + d));
     let mut beats: u64 = 0;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     // Story 4-2: an INDEPENDENT stderr counter/interval (own `beats`, own
@@ -690,6 +1437,16 @@ fn main() {
                 std::process::exit(opts.crash_with);
             }
         }
+        // Story 18-3: the declared exit — announce + flush, then exit with
+        // the fixture code (0 for the clean subject; e.g. 75 for the
+        // restart-requested subject).
+        if let Some((code, due)) = exit_with_deadline {
+            if Instant::now() >= due {
+                let _ = writeln!(stdout, "exiting with declared code {code}");
+                let _ = stdout.flush();
+                std::process::exit(code);
+            }
+        }
         if let (Some(interval), Some(due)) = (opts.heartbeat, next_beat) {
             if Instant::now() >= due {
                 let _ = writeln!(stdout, "heartbeat {beats}");
@@ -710,6 +1467,240 @@ fn main() {
     }
     // Lingered the whole window without being killed: exit cleanly.
     std::process::exit(0);
+}
+
+/// Split a `VALUE:DELAY_MS` fixture argument at its LAST colon, so a VALUE
+/// that itself contains colons (a URL, a Windows drive path) survives intact.
+/// Returns `(value, delay)` or `None` when the colon is missing.
+#[cfg(not(tarpaulin_include))]
+fn parse_colon_pair(arg: &str) -> Option<(&str, &str)> {
+    arg.rsplit_once(':')
+}
+
+/// Serve the `--http-ready` readiness endpoint: bind `127.0.0.1:<port>` and
+/// answer EVERY connection with the declared status (HTTP/1.1, `Connection:
+/// close`, a two-byte body), then close. Loops until the process exits — the
+/// engine's probe may attempt repeatedly before the listener is needed, and a
+/// test may GET it independently. A bind failure is announced to stderr and
+/// the thread gives up (the engine's probe then times out against a port
+/// nothing listens on — an honest failure, never a fake pass). Pure `std`,
+/// NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn serve_http_ready(port: u16, status: u16) {
+    serve_http_health(port, status, None);
+}
+
+/// Serve the `--http-health` LIVENESS endpoint (the `serve_http_ready`
+/// generalization, story 18-2): bind `127.0.0.1:<port>` and answer every
+/// connection with the declared status — UNLESS `fail_after` has elapsed
+/// since server start, after which connections are still ACCEPTED but
+/// dropped WITHOUT any answer (the hung-health subject: the engine's attempt
+/// connects, reads EOF/nothing, and counts one failing attempt — the
+/// declared signal went silent while the process itself lives on). A bind
+/// failure is announced to stderr and the thread gives up (the engine's
+/// check then counts refused connections — an honest failure, never a fake
+/// pass). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn serve_http_health(port: u16, status: u16, fail_after: Option<Duration>) {
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(err) => {
+            eprintln!("fake_agent: --http-health could not bind 127.0.0.1:{port}: {err}");
+            return;
+        }
+    };
+    let response =
+        format!("HTTP/1.1 {status} ready\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let started = Instant::now();
+    for mut stream in listener.incoming().flatten() {
+        // Post-deadline: accept then drop WITHOUT answering — the health
+        // endpoint went silent (a hung agent's listener may still accept at
+        // the OS level while the application never responds; the engine must
+        // see the MISSING ANSWER, not a connection refusal).
+        if fail_after.is_some_and(|d| started.elapsed() >= d) {
+            // Let the probe's request ARRIVE before the drop: closing a
+            // socket with UNREAD data sends RST — no server-side TIME_WAIT —
+            // so a kill-and-restart drill can re-bind this port immediately.
+            // A bare instant-drop races the request in flight and may
+            // FIN-close instead, parking a TIME_WAIT that (absent
+            // SO_REUSEADDR on Windows) blocks the re-bind.
+            std::thread::sleep(Duration::from_millis(50));
+            drop(stream);
+            continue;
+        }
+        // Drain a bounded slice of the request (the engine's check sends
+        // one small GET), answer, and drop — `Connection: close` plus the
+        // drop gives the client a clean EOF.
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+/// The `--heartbeat-file` fixture: rewrite the heartbeat file every
+/// `interval` (its MTIME is the liveness signal a
+/// `[liveness.heartbeat_file]` check reads) until `stop_after` (if set)
+/// elapses since `process_start` — the heart STOPS, and the file goes stale on
+/// its own with no kill needed. `stop_after == Some(ZERO)` means never touch
+/// the file at all (the absent-heartbeat subject: absent ≡ stale). The clock
+/// is the PROCESS-START instant captured in `main` (review round 1, D5 — the
+/// flag's doc says "from process start", so the measurement must not depend
+/// on when the beat thread happened to start). The FIRST
+/// beat is immediate (an agent alive at start has a fresh heartbeat); a
+/// write failure is announced once and the beating stops (an honest signal —
+/// the engine will see the file go stale). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn beat_heartbeat(
+    path: PathBuf,
+    interval: Duration,
+    stop_after: Option<Duration>,
+    process_start: Instant,
+) {
+    loop {
+        if let Some(stop) = stop_after {
+            if stop.is_zero() || process_start.elapsed() >= stop {
+                return;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, b"beat").is_err() {
+            eprintln!(
+                "fake_agent: --heartbeat-file could not write {} — the heartbeat stops here",
+                path.display()
+            );
+            return;
+        }
+        sleep(interval);
+    }
+}
+
+/// The `--ready-file` fixture: after the declared delay, create the readiness
+/// file (parents best-effort created). The WRITE is the readiness signal a
+/// `file-fresh` probe's mtime check sees.
+#[cfg(not(tarpaulin_include))]
+fn touch_ready_file(path: PathBuf, delay: Duration) {
+    sleep(delay);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"ready");
+}
+
+/// The `--watch-sentinel` fixture (story 18-4): the cooperative-work thread.
+/// Appends one `work <n>` line to `<work>` every 25 ms UNLESS paused — paused
+/// means the `<pause>` file exists AND the `<resume>` file does not (both
+/// lifecycle commands are `--touch` fixtures; the resume file's arrival
+/// un-pauses). The appended lines are the observable "the agent's own work
+/// stopped while paused and resumed after" — the thing a signal suspension
+/// fakes by freezing the whole process. A write failure is announced to
+/// stderr once and the thread gives up (an honest degradation, never a fake
+/// work log). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn watch_sentinel(pause: PathBuf, resume: PathBuf, work: PathBuf) {
+    let mut n: u64 = 0;
+    loop {
+        let paused = std::fs::metadata(&pause).is_ok() && std::fs::metadata(&resume).is_err();
+        if !paused {
+            if let Some(parent) = work.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let line = format!("work {n}\n");
+            let written = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&work)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+            if let Err(err) = written {
+                eprintln!(
+                    "fake_agent: --watch-sentinel could not append to {} ({err}) — the work \
+                     log stops here",
+                    work.display()
+                );
+                return;
+            }
+            n += 1;
+        }
+        sleep(Duration::from_millis(25));
+    }
+}
+
+/// The `--idle-after-ms` fixture (story 18-4): create the idle file after the
+/// declared delay FROM PROCESS START — the `[drain] idle_file` signal the
+/// engine's drain wait loop watches for. Measured against `process_start`
+/// (the same discipline as `beat_heartbeat`'s stop budget): the delay is the
+/// AGENT's "time to finish its work", not the drain's, so the two clocks must
+/// not drift. A write failure is silently skipped (best-effort, like
+/// `touch_ready_file` — the engine's drain then honestly times out instead of
+/// faking a completion). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn touch_idle_file(path: PathBuf, delay: Duration, process_start: Instant) {
+    let due = process_start + delay;
+    sleep(due.saturating_duration_since(Instant::now()));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"idle");
+}
+
+/// The `--idle-on-pause` fixture (18-4 review round 1, B13): create the idle
+/// file `delay` ms after the pause anchor first EXISTS, polling for it every
+/// 25 ms. The RE-ANCHOR twin of `touch_idle_file`: that fixture's delay counts
+/// from PROCESS START, so a drain that pauses LATE can observe an
+/// already-stale idle file and "complete" for the wrong reason; anchored to
+/// the pause sentinel (the file the drain's own pause command writes), the
+/// idle file provably lands DURING the drain's wait. A write failure is
+/// announced to stderr and skipped (best-effort, the `--watch-sentinel`
+/// honesty posture — the engine's drain then honestly times out instead of
+/// faking a completion). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn touch_idle_on_pause(delay: Duration, anchor: PathBuf, idle: PathBuf) {
+    while std::fs::metadata(&anchor).is_err() {
+        sleep(Duration::from_millis(25));
+    }
+    sleep(delay);
+    if let Some(parent) = idle.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&idle, b"idle") {
+        eprintln!(
+            "fake_agent: --idle-on-pause could not write {} ({err}) — no idle signal",
+            idle.display()
+        );
+    }
+}
+
+/// The `--exit-on-pause` fixture (18-4 follow-up): exit 0 `delay` ms after
+/// the pause anchor first EXISTS, polling for it every 25 ms — the SELF-EXIT
+/// twin of [`touch_idle_on_pause`] on the very same anchored clock. A drain
+/// drill's agent therefore provably ends on its own a fixed distance INTO the
+/// drain (never before it — the anchor is the file the drain's own pause
+/// command writes), which is what the Windows stop ladder's graceful
+/// exit-watch step needs to conclude quickly: that platform has no
+/// deliverable graceful signal, so a never-ending agent would otherwise burn
+/// the ladder's whole default window before the forced kill. Exiting is
+/// unconditional once armed (no failure mode — the process just ends, the
+/// honest observable). Pure `std`, NO OS-cfg.
+#[cfg(not(tarpaulin_include))]
+fn exit_on_pause_after(delay: Duration, anchor: PathBuf) {
+    while std::fs::metadata(&anchor).is_err() {
+        sleep(Duration::from_millis(25));
+    }
+    sleep(delay);
+    std::process::exit(0);
+}
+
+/// The `--ready-line` fixture: after the declared delay, print the readiness
+/// line to stdout and flush — the bytes a `log-contains` probe scans the
+/// captured agent log for.
+#[cfg(not(tarpaulin_include))]
+fn print_ready_line(line: String, delay: Duration) {
+    sleep(delay);
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
 }
 
 /// Read the cross-restart launch-crash counter (see `--crash-times`). A missing,

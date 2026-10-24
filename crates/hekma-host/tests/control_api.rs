@@ -721,6 +721,214 @@ fn the_lifecycle_verbs_drive_a_real_agent_and_stop_honors_window_secs() {
 }
 
 // ---------------------------------------------------------------------------
+// The drain route (story 18-4): the DRAIN composite driven over REAL HTTP.
+// BOTH outcomes are a `200` — the composite's last step (the stop) is
+// unconditional — with the outcome carried honestly in the body; an
+// out-of-bounds bound is a rejected REQUEST (400), never a zero-millisecond
+// drain. The manifest is HAND-WRITTEN (`ManifestFixture` carries no
+// `[lifecycle.pause]`/`[drain]` sections) pointed at the COMPILED
+// `fake_agent` binary — the engine drain suite's shape — so unlike the
+// `sh`-shaped lifecycle fixture above this test runs on ALL THREE OSes
+// (no skip, no `#[cfg]`).
+// ---------------------------------------------------------------------------
+
+/// Write the story-18-4 drain manifest into a fresh dir and register it under
+/// `name` (the registering engine is DROPPED — serve opens the same root
+/// fresh, exactly like [`registered_fake_agent`]). `agent_args` are the start
+/// template's extra args; `drain_body` is the raw `[drain]` table body. The
+/// `[capabilities.pause]` table is deliberately ABSENT: the cooperative
+/// command path is OS-independent and needs no capability row (the capability
+/// table governs ONLY the signal path).
+fn registered_drain_fake_agent(
+    base: &Path,
+    name: &str,
+    agent_args: &[&str],
+    drain_body: &str,
+) -> tempfile::TempDir {
+    let manifest_dir = tempfile::tempdir().unwrap();
+    let bin = hekma_conformance::fake_agent_bin();
+    let args_toml = |args: &[&str]| {
+        args.iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let body = format!(
+        "\ncontract_version = \"1.1.0\"\n\n[adapter]\nkind = \"{name}\"\n\n\
+         [lifecycle.start]\nexec = {bin:?}\nargs = [{agent_toml}]\n\n\
+         [lifecycle.pause]\nexec = {bin:?}\nargs = [\"--touch\", \"pause.sentinel\"]\n\n\
+         [lifecycle.resume]\nexec = {bin:?}\nargs = [\"--touch\", \"resume.sentinel\"]\n\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [drain]\n{drain_body}\n\n[metering]\nsource = \"self-reported\"\n",
+        bin = bin.to_string_lossy(),
+        agent_toml = args_toml(agent_args),
+    );
+    std::fs::write(manifest_dir.path().join("adapter.toml"), body).unwrap();
+    let engine = Engine::open(Some(base.to_path_buf())).expect("engine open");
+    engine
+        .blocking()
+        .register_with_adapter(
+            name,
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .expect("register");
+    drop(engine);
+    manifest_dir
+}
+
+#[test]
+fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // Completed shape: the idle signal lands 800ms after the PAUSE SENTINEL —
+    // the file this drain's own pause command writes — so it provably
+    // arrives during the drain's wait (review round 1, B13's re-anchored
+    // fixture; the old process-start clock could let the file predate the
+    // drain entry and complete for the wrong reason). The agent also EXITS
+    // 1500ms after the same anchor: on Windows the stop ladder's graceful
+    // step is a pure exit-watch (no signal to deliver), so a never-ending
+    // agent would burn the ladder's whole default 30s window — far past
+    // this suite's 10s response client — before the forced kill; the
+    // anchored self-exit keeps the ladder GRACEFUL and fast on every OS,
+    // with the drain's own wait (not the ladder) still the thing measured.
+    // The 2000ms exit distance leaves a wide window (idle lands at 800ms,
+    // the file reads fresh for the engine's 2s slack) in which the wait
+    // loop observes the idle signal while the agent is provably alive.
+    let _idle = registered_drain_fake_agent(
+        &base,
+        "drainer",
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    // Timed-out shape: the declared idle file is NEVER touched, so the
+    // manifest's 800ms bound burns and the stop happens anyway. Same
+    // anchored self-exit (1200ms — comfortably past the 800ms bound, so
+    // the wait genuinely times out first): the Windows ladder sees the
+    // agent end on its own instead of polling its whole default window.
+    let _stalled = registered_drain_fake_agent(
+        &base,
+        "stalled",
+        &[
+            "--linger-ms",
+            "600000",
+            "--exit-on-pause",
+            "1200:pause.sentinel",
+        ],
+        "timeout_ms = 800\nidle_file = \"never.sentinel\"",
+    );
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let drainer = format!("http://{}/v0/instances/drainer", server.addr);
+    let stalled = format!("http://{}/v0/instances/stalled", server.addr);
+
+    // Both start → running (the read-back is the read-back of TRUTH).
+    for url in [&drainer, &stalled] {
+        let mut response = client
+            .post(format!("{url}/start"))
+            .header("Authorization", &auth)
+            .send("")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{url}");
+        assert_eq!(json_body(&mut response)["instance"]["state"], "running");
+    }
+
+    // An out-of-range bound is a rejected REQUEST (400) — the route refuses
+    // the bound BEFORE the engine gate, the same shape as stop's window_secs.
+    for ms in [0u64, 600_001] {
+        let mut response = client
+            .post(format!("{drainer}/drain"))
+            .header("Authorization", &auth)
+            .send_json(serde_json::json!({"timeout_ms": ms}))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "ms={ms}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "ms={ms}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1 to 600000"),
+            "ms={ms}: the refusal names the rule"
+        );
+    }
+
+    // COMPLETED: an EMPTY body drains on the MANIFEST tier (10s) — the
+    // three-tier rule's middle step. The idle signal arrives mid-wait, so
+    // `completed: true` and the instance ends `stopped`.
+    let mut response = client
+        .post(format!("{drainer}/drain"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["completed"], true, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    // The floor (review round 1, B9): the re-anchored idle fixture lands the
+    // file ~800ms AFTER the drain's pause sentinel — so a genuinely waiting
+    // drain always exceeds 500ms; a skip-the-wait mutant (or an idle file
+    // that predated the drain) reads ~0 and fails here.
+    assert!(
+        waited >= 500,
+        "the wait genuinely waited for the anchored idle signal (waited {waited}ms)"
+    );
+    assert!(
+        waited < 9000,
+        "the completed drain finished inside its manifest bound (waited {waited}ms)"
+    );
+
+    // A drained (stopped) instance refuses a second drain: 409, the plain
+    // conflict shape (drain's running-only gate, over the wire).
+    let mut response = client
+        .post(format!("{drainer}/drain"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["kind"], "conflict");
+
+    // TIMED-OUT: the manifest tier is 800ms, the idle file never lands, the
+    // bound burns — and the drain STILL stops the instance. That is a `200`
+    // (the stop happened) with `completed: false` and a waited_ms that
+    // brackets the bound (honest, not fabricated).
+    let mut response = client
+        .post(format!("{stalled}/drain"))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a timed-out drain is still a 200 — the stop is unconditional"
+    );
+    let json = json_body(&mut response);
+    assert_eq!(json["completed"], false, "{json}");
+    assert_eq!(json["instance"]["state"], "stopped");
+    let waited = json["waited_ms"].as_u64().unwrap();
+    assert!(
+        waited >= 700,
+        "the wait genuinely burned toward its 800ms bound (waited {waited}ms)"
+    );
+    assert!(
+        waited < 5000,
+        "the stop happened right after the bound expired (waited {waited}ms)"
+    );
+
+    server.stop().unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // The shutdown drain's paused-agent leg (the reported serve bug: a PAUSED
 // attached agent was handed to the engine Drop's raw kill-on-drop teardown —
 // killed without a graceful stop — because the drain plan enumerated only

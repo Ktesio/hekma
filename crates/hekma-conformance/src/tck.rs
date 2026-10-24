@@ -5829,7 +5829,7 @@ env = "TCK_SUBJECT_MEMORY"
         assert!(json.contains("\"schema_version\":1"), "{json}");
         // The negotiated contract version rides on every report (retro #163,
         // finding B8) — pinned as the verbatim wire value.
-        assert!(json.contains("\"contract_version\":\"1.0.0\""), "{json}");
+        assert!(json.contains("\"contract_version\":\"1.1.0\""), "{json}");
         let back: ConformanceReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, report);
         assert_eq!(back.schema_version, REPORT_SCHEMA_VERSION);

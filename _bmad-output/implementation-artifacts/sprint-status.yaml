@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-23-2026 22:50"  # epic-20 opened by sprint-change-proposal-2026-10-23-adoptability.md (correct-course, Batch; ratified by Islam 2026-10-23)
+last_updated: "10-24-2026 17:40"  # stack-base #334 merged main in (post-#332/#333/#337); epic-18 squash-merged onto #334, epic-20 open on main
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -184,15 +184,15 @@ development_status:
   17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: done  # implemented + 26-finding review hardening + CI round (stable-clippy as_chunks, data-driven OS skips, Windows env-floor HOME, outbox-failure pin); PR #313 merged 2026-10-20
   17-5-static-linux-release-and-the-container-recipe: done  # implemented + 17-finding review round (release-blocking static-pie gate caught + fixed); PR #314 merged 2026-10-20; first live musl proof lands at the next v* tag
   epic-17-retrospective: skipped  # maintainer decision 2026-10-22 — the epic closes without a retro; the epic's process lessons live in the story specs' change logs and the deferred-work record
-  epic-18: backlog  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber)
-  18-1-readiness-probes: backlog
-  18-2-liveness-and-the-unresponsive-failure: backlog
-  18-3-exit-code-classes-and-the-stable-window-reset: backlog
-  18-4-cooperative-pause-commands-and-the-drain-verb: backlog
+  epic-18: in-progress  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber); started 2026-10-23 after 19-1 (which runs first overall), stacked on feat/epic-19-1-governance-vectors
+  18-1-readiness-probes: in-progress  # PR #335 open (round 1 applied, gates 1810/0); awaiting maintainer squash-merge after #334
+  18-2-liveness-and-the-unresponsive-failure: in-progress  # PR #336 open (round 1 + orchestrator P8 correction applied, gates 1854/0); awaiting merge after #335
+  18-3-exit-code-classes-and-the-stable-window-reset: in-progress  # PR #338 open (round 1 applied, gates 1891/0); awaiting merge after #336
+  18-4-cooperative-pause-commands-and-the-drain-verb: in-progress  # impl 45d5840 (gates green 1921/0); 4-layer review round 1 done 2026-10-24 (3 surviving mutations, resume misdispatch, overrun-pause lying edge), patch round underway
   18-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
   epic-18-retrospective: optional
-  epic-19: backlog  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber)
-  19-1-governance-conformance-vectors: backlog  # FOUNDATION — runs first; an external Host consumer waits on it
+  epic-19: in-progress  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber); started 2026-10-23 — 19-1 runs FIRST overall per the ratified handoff, then Epic 18's stack, then 19-2..19-5
+  19-1-governance-conformance-vectors: in-progress  # FOUNDATION — runs first; an external Host consumer waits on it. Spec 2026-10-23 (autonomous mode per Islam's cadence ruling); implementation underway on feat/epic-19-1-governance-vectors
   19-2-the-wire-fence-block-breach-action: backlog
   19-3-task-scope-host-units-of-work: backlog
   19-4-per-call-records-for-hosts: backlog

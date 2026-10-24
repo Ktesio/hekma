@@ -846,6 +846,24 @@ impl Registry {
         Ok(())
     }
 
+    /// Persist a Lifecycle State change CONDITIONALLY (story 18-2 review
+    /// round 1, P3): the guarded liveness expiry's commit. The write commits
+    /// only when the persisted state still equals `expected_prior`; a
+    /// concurrent transition refuses typed
+    /// ([`StoreError::StateConflict`] → [`RegistryError::Store`]) with
+    /// nothing persisted. The reaper declines to fail the instance on that
+    /// refusal (the state moved — someone else is driving).
+    pub(crate) fn set_state_if_prior(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+    ) -> Result<(), RegistryError> {
+        self.store
+            .set_state_if_prior(name, expected_prior, new_state)?;
+        Ok(())
+    }
+
     /// The persisted adapter facts the supervisor needs to launch an instance:
     /// its kind, (for a manifest adapter) the manifest path 1-3 recorded, and the
     /// `start` launch (exec + args + env) SNAPSHOTTED at registration.
