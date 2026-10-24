@@ -784,7 +784,16 @@ fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
     // the file this drain's own pause command writes — so it provably
     // arrives during the drain's wait (review round 1, B13's re-anchored
     // fixture; the old process-start clock could let the file predate the
-    // drain entry and complete for the wrong reason).
+    // drain entry and complete for the wrong reason). The agent also EXITS
+    // 1500ms after the same anchor: on Windows the stop ladder's graceful
+    // step is a pure exit-watch (no signal to deliver), so a never-ending
+    // agent would burn the ladder's whole default 30s window — far past
+    // this suite's 10s response client — before the forced kill; the
+    // anchored self-exit keeps the ladder GRACEFUL and fast on every OS,
+    // with the drain's own wait (not the ladder) still the thing measured.
+    // The 2000ms exit distance leaves a wide window (idle lands at 800ms,
+    // the file reads fresh for the engine's 2s slack) in which the wait
+    // loop observes the idle signal while the agent is provably alive.
     let _idle = registered_drain_fake_agent(
         &base,
         "drainer",
@@ -793,15 +802,25 @@ fn the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound() {
             "600000",
             "--idle-on-pause",
             "800:pause.sentinel:idle.sentinel",
+            "--exit-on-pause",
+            "2000:pause.sentinel",
         ],
         "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
     );
     // Timed-out shape: the declared idle file is NEVER touched, so the
-    // manifest's 800ms bound burns and the stop happens anyway.
+    // manifest's 800ms bound burns and the stop happens anyway. Same
+    // anchored self-exit (1200ms — comfortably past the 800ms bound, so
+    // the wait genuinely times out first): the Windows ladder sees the
+    // agent end on its own instead of polling its whole default window.
     let _stalled = registered_drain_fake_agent(
         &base,
         "stalled",
-        &["--linger-ms", "600000"],
+        &[
+            "--linger-ms",
+            "600000",
+            "--exit-on-pause",
+            "1200:pause.sentinel",
+        ],
         "timeout_ms = 800\nidle_file = \"never.sentinel\"",
     );
     let (sink_handle, _diagnostics) = SharedSink::new();
