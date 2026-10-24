@@ -14,9 +14,11 @@
 //! `fake_agent` invocation whose existing fixture flags already behave like
 //! every part of a gateway — composition over construction), and
 //! [`write_gateway_manifest`] materializes it as a TCK subject. The doc
-//! example in `docs/manifest.md` shows the SAME shape (the section-set pin
-//! below plus the kit's end-to-end run keep the two honest — the docs show
-//! the kit's shape, not a parallel dialect).
+//! example in `docs/manifest.md` shows the SAME shape (the docs pin below
+//! parses that example with the real manifest parser and pins its section
+//! set against the kit's; the end-to-end run lives in the crate's
+//! `tests/gateway_e2e.rs` — the 18-5 review's C7 split: the src pins are
+//! the cheap static truth, the integration proof runs as a test target).
 //!
 //! The five declarations, each the 18-x story it closes:
 //!
@@ -45,6 +47,21 @@ use std::path::{Path, PathBuf};
 /// The gateway subject's `[adapter].kind` — the name the TCK's end-to-end run
 /// labels the report with.
 pub const GATEWAY_KIND: &str = "tck-gateway";
+
+/// The Adapter Contract version the reference manifest targets (18-5 review
+/// round 1, C1) — the ONE constant the composed text's `contract_version`
+/// line names. A contract bump that forgets the reference breaks the pins
+/// that read the version back through the parsed manifest.
+pub const GATEWAY_CONTRACT_VERSION: &str = "1.1.0";
+
+/// The gateway fixture's late-binding readiness delay (milliseconds — the
+/// fake agent's `--http-ready-after`, 18-5 review round 1, A2): the models
+/// endpoint binds only after this delay, so the declared hold is REAL — the
+/// start sits in `starting` until the endpoint answers — and the readiness
+/// section's healthy leg can OBSERVE the hold instead of asserting only the
+/// final adapter-ready edge. `docs/manifest.md`'s hand-written example does
+/// NOT carry the flag: it is fixture-convention, not contract.
+pub const GATEWAY_READY_AFTER_MS: u64 = 900;
 
 /// The gateway fixture's HTTP status on its models endpoint (the ONE status
 /// the declared readiness probe counts as ready).
@@ -102,11 +119,13 @@ pub const GATEWAY_MEMORY_DIR_ENV: &str = "GATEWAY_MEMORY_DIR";
 /// test-practice TOCTOU window — see [`free_loopback_port`]).
 ///
 /// The composed start command is ONE `fake_agent` process carrying every
-/// gateway behavior at once: the models-endpoint server (`--http-ready`), the
-/// heartbeat (`--heartbeat-file`), the cooperative work loop
-/// (`--watch-sentinel`), the pause-anchored idle signal (`--idle-on-pause`),
-/// the config/memory delivery-evidence seam (`--dump`), and a linger longer
-/// than anything the TCK drives. No fixture flag conflicts
+/// gateway behavior at once: the late-binding readiness delay
+/// (`--http-ready-after` — the hold the readiness leg observes), the
+/// models-endpoint server (`--http-ready`), the heartbeat
+/// (`--heartbeat-file`), the cooperative work loop (`--watch-sentinel`), the
+/// pause-anchored idle signal (`--idle-on-pause`), the config/memory
+/// delivery-evidence seam (`--dump`), and a linger longer than anything the
+/// TCK drives. No fixture flag conflicts
 /// with another: each arms its own thread at startup (verified — story 18-5's
 /// composition check), so no unifying flag was needed.
 pub fn gateway_manifest_text(port: u16) -> String {
@@ -121,7 +140,7 @@ pub fn gateway_manifest_text(port: u16) -> String {
     });
     let exec = exec.replace('\\', "/");
     format!(
-        r#"contract_version = "1.1.0"
+        r#"contract_version = "{GATEWAY_CONTRACT_VERSION}"
 
 [adapter]
 kind = "{GATEWAY_KIND}"
@@ -129,6 +148,7 @@ kind = "{GATEWAY_KIND}"
 [lifecycle.start]
 exec = "{exec}"
 args = [
+  "--http-ready-after", "{GATEWAY_READY_AFTER_MS}",
   "--http-ready", "{port}:{GATEWAY_READY_STATUS}",
   "--heartbeat-file", "{GATEWAY_HEARTBEAT_FILE}:{GATEWAY_HEARTBEAT_INTERVAL_MS}",
   "--watch-sentinel", "{GATEWAY_PAUSE_SENTINEL}:{GATEWAY_RESUME_SENTINEL}:{GATEWAY_WORK_LOG}",
@@ -287,6 +307,37 @@ mod tests {
             lifecycle.pause.is_some() && lifecycle.resume.is_some(),
             "the reference declares the cooperative pause/resume PAIR"
         );
+        // C3 (18-5 review round 1): the reference declares NO [lifecycle.stop]
+        // template — the engine's stop ladder is the contract; a manifest
+        // stop command would put the reference's stops outside it.
+        assert!(
+            lifecycle.stop.is_none(),
+            "the reference declares no [lifecycle.stop] override"
+        );
+        // C3: the capability table declares EXACTLY the two capabilities the
+        // TCK's sections demonstrate — pause + interaction — on every modeled
+        // OS (no third capability sneaks in, none is dropped).
+        for os in ::hekma_adapter_api::OsId::MODELED {
+            let mut keys: Vec<::hekma_adapter_api::Capability> = manifest
+                .capabilities
+                .as_ref()
+                .expect("the [capabilities] block")
+                .effective(os)
+                .entries
+                .into_iter()
+                .map(|(capability, _)| capability)
+                .collect();
+            keys.sort();
+            keys.dedup();
+            assert_eq!(
+                keys,
+                vec![
+                    ::hekma_adapter_api::Capability::Pause,
+                    ::hekma_adapter_api::Capability::Interaction,
+                ],
+                "the capability table on {os:?} is exactly interaction + pause"
+            );
+        }
         // And NOTHING beyond the five + the delivery pair: no [interaction]
         // channel override; the [config] block carries EXACTLY the two keys
         // the config/memory sections prove (an operator key + the reserved
@@ -314,6 +365,101 @@ mod tests {
         manifest
             .validate()
             .expect("the reference gateway manifest must pass Manifest::validate");
+        // C1: the composed text's contract line IS the constant (a drift
+        // between the two is a silently mis-targeted contract).
+        assert_eq!(
+            gateway_manifest_text(48081)
+                .lines()
+                .next()
+                .expect("the manifest text is non-empty"),
+            format!("contract_version = \"{GATEWAY_CONTRACT_VERSION}\""),
+            "the first line names the contract-version constant"
+        );
+    }
+
+    /// THE DOCS PIN (18-5 review round 1, C2): `docs/manifest.md`'s Complete
+    /// Example is the SAME section set the kit's reference declares — parsed
+    /// with the REAL manifest parser and pinned against the same set the kit
+    /// pin above asserts. The docs example is hand-shaped for readability
+    /// (its exec is a bare `my-gateway`, its port a fixed 8080, its args the
+    /// generic story flags), so the equality is the SECTION SET, never the
+    /// bytes: the docs show the kit's shape, not a parallel dialect.
+    #[test]
+    fn the_docs_example_declares_the_reference_section_set() {
+        let docs_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/manifest.md");
+        let docs = std::fs::read_to_string(&docs_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", docs_path.display()));
+        // The Complete Example's ```toml fence — the doc's FIRST toml fence.
+        let fence = docs
+            .split("```toml")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("docs/manifest.md carries a ```toml fence (the Complete Example)");
+        let manifest = Manifest::from_toml_str(fence)
+            .expect("the docs example parses with the REAL manifest parser");
+        manifest
+            .validate()
+            .expect("the docs example validates against the real schema");
+
+        // The same section set the kit pin pins (each assert mirrors its
+        // kit-pin counterpart):
+        assert!(
+            manifest
+                .readiness_probe()
+                .expect("readiness resolves")
+                .is_some(),
+            "the docs example declares [readiness]"
+        );
+        assert!(
+            matches!(
+                manifest.liveness_check().expect("liveness resolves"),
+                Some(::hekma_adapter_api::LivenessCheck::HeartbeatFile(_))
+            ),
+            "the docs example declares the heartbeat-file liveness"
+        );
+        let exit_codes = manifest
+            .exit_codes()
+            .expect("exit codes resolve")
+            .expect("the docs example declares [exit_codes]");
+        assert_eq!(exit_codes.restart_requested, vec![75]);
+        assert!(exit_codes.clean.is_empty());
+        assert!(manifest.drain().expect("drain resolves").is_some());
+        let lifecycle = manifest.lifecycle.as_ref().expect("the [lifecycle] block");
+        assert!(lifecycle.start.is_some());
+        assert!(lifecycle.pause.is_some() && lifecycle.resume.is_some());
+        assert!(
+            lifecycle.stop.is_none(),
+            "the docs example, like the reference, overrides no stop template"
+        );
+        assert!(
+            manifest.interaction.is_none(),
+            "the docs example declares no [interaction] channel override"
+        );
+        let config = manifest.config.as_ref().expect("the [config] block");
+        let keys: Vec<&str> = config.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["memory.dir", "model"]);
+        for os in ::hekma_adapter_api::OsId::MODELED {
+            let mut capability_keys: Vec<::hekma_adapter_api::Capability> = manifest
+                .capabilities
+                .as_ref()
+                .expect("the [capabilities] block")
+                .effective(os)
+                .entries
+                .into_iter()
+                .map(|(capability, _)| capability)
+                .collect();
+            capability_keys.sort();
+            capability_keys.dedup();
+            assert_eq!(
+                capability_keys,
+                vec![
+                    ::hekma_adapter_api::Capability::Pause,
+                    ::hekma_adapter_api::Capability::Interaction,
+                ],
+                "the docs example's capability table on {os:?} is exactly interaction + pause"
+            );
+        }
     }
 
     /// The write helper materializes EXACTLY the canonical text (the helper
@@ -373,85 +519,5 @@ mod tests {
             .validate()
             .expect("the reference validates before the set pins read it");
         manifest
-    }
-
-    /// THE EPIC'S INTEGRATION PROOF: the reference gateway subject, driven by
-    /// the real harness (`run_conformance`), comes out conformant with every
-    /// APPLICABLE section passing — including all FOUR new service sections,
-    /// each demonstrated end-to-end on the declared subject. The ONE skip is
-    /// the declaration-justified metering one (a SelfReported subject never
-    /// owes EngineObserved proof — CP-d; the two metering sections are
-    /// mutually exclusive by declaration). Any section FAILING here names its
-    /// first reason through the assertion.
-    #[test]
-    fn the_reference_gateway_passes_the_whole_conformance_suite() {
-        let dir = tempfile::Builder::new()
-            .prefix("ktesio-gateway-e2e-")
-            .tempdir()
-            .expect("tempdir");
-        let port = free_loopback_port();
-        let manifest_dir = write_gateway_manifest(dir.path(), port);
-
-        let report = crate::run_conformance(&crate::TckAdapter::Manifest(manifest_dir));
-
-        assert_eq!(
-            report.adapter_kind, GATEWAY_KIND,
-            "the report labels the reference subject"
-        );
-        assert_eq!(
-            report.sections.len(),
-            12,
-            "the complete fixed section set ran (a failure never truncates the suite)"
-        );
-        assert!(
-            report.is_conformant(),
-            "the reference gateway must conform: failures = {:?}",
-            report.failures()
-        );
-
-        // THE four new sections: each PASSES on the declaring subject — the
-        // epic's readiness gate, liveness watch, exit classes, and drain
-        // composite, proven end-to-end in one run.
-        for id in [
-            crate::section_ids::DRAIN,
-            crate::section_ids::READINESS,
-            crate::section_ids::LIVENESS,
-            crate::section_ids::EXIT_CLASSES,
-        ] {
-            assert_eq!(
-                report.section(id),
-                Some(&crate::SectionResult::Pass),
-                "{id} must PASS for the fully-declaring reference subject"
-            );
-        }
-
-        // The pre-existing sections the delivery pair + capabilities earn:
-        // every one applicable to the reference runs and passes too.
-        for id in [
-            crate::section_ids::CAPABILITY_EDGES,
-            crate::section_ids::LIFECYCLE,
-            crate::section_ids::PAUSE,
-            crate::section_ids::CONFIG_MAPPING,
-            crate::section_ids::METERING_SELF_REPORTED,
-            crate::section_ids::MEMORY,
-            crate::section_ids::INTERACTION,
-        ] {
-            assert_eq!(
-                report.section(id),
-                Some(&crate::SectionResult::Pass),
-                "{id} must PASS for the reference subject (its declaration earns the demo)"
-            );
-        }
-
-        // The ONE declaration-justified skip, pinned with its exact reason
-        // (the mirror image of the engine-observed subject's pin).
-        assert_eq!(
-            report.section(crate::section_ids::METERING_ENGINE_OBSERVED),
-            Some(&crate::SectionResult::NotApplicable {
-                reason: "the declaration declares self-reported metering, so the \
-                         engine-observed section does not apply"
-                    .to_string()
-            })
-        );
     }
 }
