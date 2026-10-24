@@ -36,8 +36,8 @@ mod builtin;
 use std::path::{Path, PathBuf};
 
 use hekma_adapter_api::{
-    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, LivenessCheck,
-    Manifest, ManifestError, MeteringSource, OsId, ReadinessGate,
+    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, ExitCodeClasses,
+    LivenessCheck, Manifest, ManifestError, MeteringSource, OsId, ReadinessGate,
 };
 
 use crate::domain::{pass_through_tail, EffectiveConfig};
@@ -321,6 +321,23 @@ pub enum LaunchResolveError {
         /// [`hekma_adapter_api::Liveness::check`], verbatim).
         detail: String,
     },
+
+    /// The adapter's `[exit_codes]` section is invalid (contract `1.1.0`,
+    /// story 18-3) — a code above the portable 0..=255 domain, a duplicate
+    /// within one list, or an overlap between the two lists. The exact twin
+    /// of [`LaunchResolveError::InvalidLivenessCheck`]: manifest sections
+    /// are validated at registration, but re-checked at spawn/adoption (the
+    /// same symmetric re-read) — a manifest can drift after registration,
+    /// and the spawn — not the registry — is the last gate before the
+    /// reaper classifies with the classes. Names the section + why.
+    #[error("adapter '{adapter}' has an invalid [exit_codes] section: {detail}")]
+    InvalidExitCodes {
+        /// The adapter kind/identity whose exit-code classes are invalid.
+        adapter: String,
+        /// Why the section is invalid (from
+        /// [`hekma_adapter_api::ExitCodes::classes`], verbatim).
+        detail: String,
+    },
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
@@ -557,6 +574,42 @@ pub fn resolve_liveness_check(
     manifest
         .liveness_check()
         .map_err(|e| LaunchResolveError::InvalidLivenessCheck {
+            adapter: kind.to_string(),
+            detail: e.to_string(),
+        })
+}
+
+/// Resolve the adapter's optional declared exit-code classes
+/// ([`hekma_adapter_api::ExitCodeClasses`] — the two validated lists) for a
+/// spawn or an adoption (contract `1.1.0`, story 18-3): a MANIFEST adapter's
+/// classes come from its parsed `[exit_codes]` section; a NATIVE adapter
+/// declares NO exit-code section (its codes are code — `None`). The exact
+/// twin of [`resolve_liveness_check`]: parse, validate the section via
+/// [`hekma_adapter_api::ExitCodes::classes`] (the SAME validation
+/// registration ran), and refuse the spawn on any drift rather than
+/// supervising an agent whose exit codes the engine would classify with
+/// stale lists. No re-negotiation here: the launch resolution's version
+/// gate already covered this file read.
+pub fn resolve_exit_codes(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<Option<ExitCodeClasses>, LaunchResolveError> {
+    let Some(path) = manifest_path else {
+        return Ok(None);
+    };
+    let text =
+        std::fs::read_to_string(path).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    let manifest =
+        Manifest::from_toml_str(&text).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    manifest
+        .exit_codes()
+        .map_err(|e| LaunchResolveError::InvalidExitCodes {
             adapter: kind.to_string(),
             detail: e.to_string(),
         })
@@ -2134,6 +2187,87 @@ max_age_ms = 5000
                 assert!(detail.contains("BOTH checks"), "{detail}");
             }
             other => panic!("expected InvalidLivenessCheck, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_exit_codes_reads_the_manifest_exit_codes_section() {
+        // The manifest adapter's exit-code classes come from its parsed
+        // `[exit_codes]` section, re-checked at spawn/adoption (the liveness
+        // resolver's twin).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[exit_codes]
+restart_requested = [75]
+clean = [0]
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let classes = resolve_exit_codes("demo", Some(&path)).unwrap();
+        assert_eq!(
+            classes,
+            Some(hekma_adapter_api::ExitCodeClasses {
+                restart_requested: vec![75],
+                clean: vec![0],
+            })
+        );
+        assert_eq!(
+            classes.and_then(|c| c.class_of(75)),
+            Some(hekma_adapter_api::ExitClass::RestartRequested)
+        );
+    }
+
+    #[test]
+    fn resolve_exit_codes_native_adapter_declares_none() {
+        // A native adapter declares NO exit-code section — its codes are
+        // code — so `Ok(None)`, never an error (an unknown native kind too:
+        // the launch resolution already rejected it).
+        assert_eq!(resolve_exit_codes("mock", None).unwrap(), None);
+        assert_eq!(resolve_exit_codes("nope", None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_exit_codes_drifted_section_is_invalid_naming_field_and_section() {
+        // The drift gate: if the `[exit_codes]` section drifted invalid
+        // after registration (here the two lists overlap), the spawn
+        // refuses with InvalidExitCodes — the engine never supervises with
+        // classes it cannot legally apply. The detail names BOTH the fields
+        // and the section (the manifest error, verbatim).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[exit_codes]
+restart_requested = [75, 9]
+clean = [0, 9]
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_exit_codes("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidExitCodes { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("[exit_codes]"), "{detail}");
+                assert!(
+                    detail.contains("BOTH `restart_requested` and `clean`"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected InvalidExitCodes, got {other}"),
         }
     }
 

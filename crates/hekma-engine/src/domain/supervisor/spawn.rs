@@ -265,6 +265,18 @@ impl Supervisor {
         let liveness_check = adapter::resolve_liveness_check(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
 
+        // (2b-exit-codes) Resolve the adapter's optional declared exit-code
+        // classes (contract `1.1.0`, story 18-3): the `[exit_codes]` section's
+        // two validated lists. Pre-transition like every fallible resolution
+        // above — an invalid (or drifted-since-registration) section rejects
+        // the start with NO state change. A manifest without the section (or
+        // a native adapter) resolves `None` — the pre-classification behavior,
+        // byte-identical. The classes are carried on the `Supervised` record
+        // below, where the reaper's crash classifier consults them for a
+        // coded exit out of `running`.
+        let exit_codes = adapter::resolve_exit_codes(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+
         // (2b-memory) MANAGED MEMORY BACKING (story 5-1, spine AD-11). Read the
         // attached backing (one DB read) and — for a `filesystem` kind — ensure
         // the managed directory exists: ONE idempotent `create_dir_all`, no
@@ -1012,7 +1024,11 @@ impl Supervisor {
                                  signal)"
                             .to_string(),
                     };
-                    let decision = self.plan_restart(registry, &name, &base_detail);
+                    // Story 18-3: `running_for: None` — a LAUNCH-phase exit is
+                    // never a run (the classes classify runs, and so does the
+                    // stable-window reset); the charged crash path applies
+                    // verbatim with no anchor to measure.
+                    let decision = self.plan_restart(registry, &name, &base_detail, None);
                     let crash_log_capture = self.backend.log_capture(&handle);
                     if self
                         .transition_with_log_capture(
@@ -1099,6 +1115,21 @@ impl Supervisor {
         // A fresh Run starts from a ZERO poll-error streak (AI-12): a stale entry
         // from this name's PRIOR handle must never pre-load the new one.
         self.clear_poll_error_streak(&name);
+        // Story 18-3: a FRESH OPERATOR start clears the restart-requested
+        // streak — the operator's new Run has no recycle chain to pace, so
+        // the first restart-requested relaunch of the new Run waits the BASE
+        // backoff again (the durable crash counter was untouched by that
+        // chain and is not consulted here either). A POLICY RELAUNCH
+        // (`restart: Some(..)`) deliberately KEEPS the streak: the recycle
+        // chain continues across its own relaunches, and the growing delay
+        // index (`current + streak + 1`, clamped by `BackoffSchedule`) is
+        // what bounds the loop's RATE — the cap still arrives, exactly as
+        // the reaper's `plan_requested_restart` documents. Clearing here
+        // unconditionally would reset the pace every relaunch and strand
+        // that contract (the growth machinery could never engage).
+        if restart.is_none() {
+            self.requested_restart_streaks.remove(&name);
+        }
         self.running.insert(
             name.clone(),
             Supervised {
@@ -1148,6 +1179,16 @@ impl Supervisor {
                 liveness_check,
                 liveness_failing_since: None,
                 liveness_reopens: 0,
+                // Story 18-3: the declared exit-code classes (resolved in
+                // the (2b-exit-codes) block above) — the crash classifier's
+                // per-Run lens. `None` classifies nothing (byte-identical).
+                exit_codes,
+                // Story 18-3: the stability anchor — stamped at THIS
+                // `starting → running` transition (and at every later
+                // `paused → running` resume). The just-committed transition
+                // is the anchor; the crash classifier reads it through the
+                // state gate (only a crash out of EXACTLY `running`).
+                running_since: std::time::Instant::now(),
             },
         );
 
