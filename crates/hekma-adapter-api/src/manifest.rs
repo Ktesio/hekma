@@ -930,15 +930,21 @@ impl ExitCodeClasses {
     /// this code": the engine treats the exit exactly as it did before this
     /// section existed (a crash under the Restart Policy).
     pub fn class_of(&self, code: u16) -> Option<ExitClass> {
-        if self.restart_requested.contains(&code) {
-            // Disjointness is validated, so the ordered check cannot mask a
-            // `clean` hit: a code in both lists never reaches here.
-            return Some(ExitClass::RestartRequested);
+        // 18-3 review: defense in depth. `ExitCodes::classes` refuses an
+        // overlap, but this resolver is `pub` — a hand-built
+        // `ExitCodeClasses` (or a future construction path that skips the
+        // validation) could carry a code in BOTH lists. Classification must
+        // stay DETERMINISTIC and single-answer: an ambiguous code classifies
+        // as nothing (a crash), never "whatever the ordered check hit
+        // first".
+        let in_restart = self.restart_requested.contains(&code);
+        let in_clean = self.clean.contains(&code);
+        match (in_restart, in_clean) {
+            (true, false) => Some(ExitClass::RestartRequested),
+            (false, true) => Some(ExitClass::Clean),
+            // An overlap (unvalidated construction) or a miss: no class.
+            _ => None,
         }
-        if self.clean.contains(&code) {
-            return Some(ExitClass::Clean);
-        }
-        None
     }
 }
 
@@ -2971,5 +2977,23 @@ channel = "stdio"
         // Toml error), like every other typed field.
         let err = Manifest::from_toml_str(&with_exit_codes("clean = [-1]")).unwrap_err();
         assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    #[test]
+    fn class_of_refuses_a_code_in_both_lists_even_when_hand_built() {
+        // 18-3 review: `ExitCodeClasses` is `pub` with `pub` fields, so a
+        // construction path that skips `ExitCodes::classes` validation can
+        // carry an OVERLAP. The classifier must stay deterministic and
+        // single-answer: an ambiguous code classifies as NOTHING (a crash),
+        // never "whatever the ordered check hit first" — while unambiguous
+        // codes still classify normally.
+        let ambiguous = ExitCodeClasses {
+            restart_requested: vec![75, 9],
+            clean: vec![0, 9],
+        };
+        assert_eq!(ambiguous.class_of(9), None, "an overlap classifies nothing");
+        assert_eq!(ambiguous.class_of(75), Some(ExitClass::RestartRequested));
+        assert_eq!(ambiguous.class_of(0), Some(ExitClass::Clean));
+        assert_eq!(ambiguous.class_of(1), None, "a miss stays None");
     }
 }

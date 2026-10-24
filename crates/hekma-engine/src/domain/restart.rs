@@ -221,7 +221,10 @@ pub fn next_consecutive_failures(
 ) -> (u32, bool) {
     match stable_run {
         Some(run) if run >= window => (1, true),
-        _ => (current + 1, false),
+        // Saturating, never wrapping: a `u32::MAX` streak that somehow
+        // keeps charging must not panic (debug builds) or wrap to 0 —
+        // 0 would masquerade as a fresh streak.
+        _ => (current.saturating_add(1), false),
     }
 }
 
@@ -399,6 +402,22 @@ mod tests {
             assert_eq!(next, current + 1);
             assert!(!reset);
         }
+    }
+
+    #[test]
+    fn saturated_counter_never_panics_or_wraps() {
+        // A `u32::MAX` streak keeps charging as `u32::MAX` — no debug-overflow
+        // panic, no wrap to 0 (0 would masquerade as a fresh streak). The
+        // reset arm still wins first, so saturation is invisible to stable
+        // runs either way.
+        assert_eq!(
+            next_consecutive_failures(u32::MAX, None, STABLE_RUN_WINDOW),
+            (u32::MAX, false)
+        );
+        assert_eq!(
+            next_consecutive_failures(u32::MAX, Some(STABLE_RUN_WINDOW), STABLE_RUN_WINDOW),
+            (1, true)
+        );
     }
 
     #[test]

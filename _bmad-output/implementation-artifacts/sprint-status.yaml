@@ -187,7 +187,7 @@ development_status:
   epic-18: in-progress  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber); started 2026-10-23 after 19-1 (which runs first overall), stacked on feat/epic-19-1-governance-vectors
   18-1-readiness-probes: in-progress  # PR #335 open (round 1 applied, gates 1810/0); awaiting maintainer squash-merge after #334
   18-2-liveness-and-the-unresponsive-failure: in-progress  # PR #336 open (round 1 + orchestrator P8 correction applied, gates 1854/0); awaiting merge after #335
-  18-3-exit-code-classes-and-the-stable-window-reset: in-progress  # spec 2026-10-24 (re-anchored to 2b29074); implementation underway on feat/epic-18-3-exit-code-classes
+  18-3-exit-code-classes-and-the-stable-window-reset: in-progress  # impl 34cf247 (gates green 1885/0); 4-layer review round 1 done 2026-10-24 (3 mutation-invisible holes + racy killer found), patch round underway
   18-4-cooperative-pause-commands-and-the-drain-verb: backlog
   18-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
   epic-18-retrospective: optional

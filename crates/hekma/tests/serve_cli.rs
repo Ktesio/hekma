@@ -1231,4 +1231,22 @@ fn served_clean_exit_lands_stopped_and_show_reports_it() {
         show.stdout,
         show.stderr
     );
+
+    // 18-3 review round 1 (B8): `agent logs` renders the transition as the
+    // human line with the WIRE TAG — the lifecycle log records WHY the
+    // instance went stopped, greppable against the cause kinds a --json
+    // consumer sees.
+    let logs = run_hekma_agent(
+        ["agent", "logs", "finisher"].as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+    let logged = format!("{}{}", logs.stdout, logs.stderr);
+    assert!(
+        logged.contains("clean-exit: exit code 0"),
+        "the lifecycle log must carry the clean-exit line with the wire tag: \
+         out={} err={}",
+        logs.stdout,
+        logs.stderr
+    );
 }

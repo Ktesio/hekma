@@ -50,6 +50,15 @@ A standalone `hekma agent start` supervises the process only for that command's 
 
 This is expected for the plain start. If you want the agent to keep running across commands, start it with `hekma agent start --detach`: the agent survives the command's exit and the next `hekma` command re-adopts it. Between commands a detached agent is *not* supervised — no crash detection, no budget enforcement, no usage/event delivery — so if the agent dies in that window, the next command reconciles the row honestly to `failed` instead of restarting it. If the engine crashes with a surviving process, the next engine open re-adopts it, detects crashes, and applies the Restart Policy. (An `acp` instance cannot start detached at all — its transport is a pair of pipes to the starting command — see the ACP section below.)
 
+## Crashes, the Failure Counter, and the Stable-Window Reset
+
+Every unrequested exit of a `running` agent lands `failed` and — under the default `on-failure` Restart Policy — is charged to a per-instance **consecutive-failure counter** (read it with `hekma agent show <name>`; the count is the "restarts" figure). The crash cause in `show`/`logs` tells the whole story:
+
+- **`consecutive-failure count reset` in the crash cause** — this is the engine telling you the run had been STABLE before the crash: it held `running` continuously for ≥ 30 s (the engine's own supervision window — not a manifest knob), so the counter was reset FIRST and this crash charged as failure #1 of a fresh streak. It is not a malfunction of the counter — it is the engine refusing to let one bad crash pay for a good history. A pause interval never counts toward that window (the clock restarts at every resume), and an adopted instance's clock starts at adoption.
+- **`crash-loop: 5 consecutive failures reached — not restarting, inspect the agent and start it manually`** — the counter hit its terminal. The instance stays `failed` until you act: fix the underlying cause (read `hekma agent logs <name>` for the agent's own output) and `hekma agent start <name>` again (a fresh start resets the counter).
+- **A declared `restart-requested` exit (exit codes your adapter declares in `[exit_codes]`)** — the agent asked to be relaunched (the conventional exit-75 pattern). The counter is NOT charged for these: a recycle chain can never reach the crash-loop terminal, though the relaunch delay still grows toward its 60 s cap (`requested-recycle N` in the cause shows how deep the chain has paced). A declared `clean` exit (commonly `0`) lands `stopped` instead of `failed` — the agent finished on purpose, no restart, no counter action.
+- **`exit codes are NOT classified this Run` on stderr after an engine restart** — the re-adopted instance's manifest could not be read (or drifted invalid), so its declared exit-code classes are unsupervised until the next stop and start: every exit is treated as an ordinary crash meanwhile. The instance itself keeps running.
+
 ## ACP Agents (`--kind acp`): Failure Modes
 
 The `acp` kind supervises an Agent Client Protocol v1 agent over its stdio; these are the failure surfaces specific to it.
