@@ -856,6 +856,18 @@ fn drain_completes_when_the_idle_signal_arrives_mid_wait() {
             // the idle file cannot predate the drain entry.
             "--idle-on-pause",
             "800:pause.sentinel:idle.sentinel",
+            // The Windows graceful-stop fixture (the control_api drain
+            // convention): that platform's graceful step is a pure
+            // exit-watch, so a parked agent would burn the stop ladder's
+            // whole default window before the forced kill — rewriting the
+            // terminal cause this test pins (drain-stopped) into
+            // stop-forced. The anchored self-exit ends the agent on its
+            // own well past the idle signal (the wait's proof is
+            // untouched) and well inside the window; a Unix drain stop is
+            // a delivered signal long before the 2000ms delay, so nothing
+            // changes there.
+            "--exit-on-pause",
+            "2000:pause.sentinel",
         ],
         Some(&["--touch", "pause.sentinel"]),
         Some(&["--touch", "resume.sentinel"]),
@@ -939,7 +951,20 @@ fn drain_that_outlives_its_bound_still_stops() {
         manifest.path(),
         "svc",
         // No `--idle-after-ms`: the declared idle file is NEVER touched.
-        &["--linger-ms", "600000"],
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture: the stop after the burnt
+            // bound lands on a lingering agent, and that platform's
+            // graceful step is a pure exit-watch — without a self-exit it
+            // polls the whole default window and escalates to stop-forced,
+            // failing this test's drain-stopped pin. The anchored exit
+            // (2000ms, past the 1200ms bound so the wait genuinely times
+            // out first, inside the window) ends the agent on its own; a
+            // Unix drain stop is a delivered signal long before it.
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
         Some(&["--touch", "pause.sentinel"]),
         Some(&["--touch", "resume.sentinel"]),
         Some("timeout_ms = 1200\nidle_file = \"never.sentinel\""),
@@ -1005,7 +1030,23 @@ fn drain_overrunning_pause_command_commits_no_pause_edge_and_stops_honestly() {
     write_drain_manifest(
         manifest.path(),
         "svc",
-        &["--linger-ms", "600000"],
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture, start-anchored form: this
+            // fixture has NO pause anchor to hang an --exit-on-pause on —
+            // the overrunning pause command is killed BEFORE its side
+            // effect, so no sentinel it would write ever exists. The
+            // self-exit counts from process start instead (2500ms: past
+            // the 1200ms bound + the kill/reap slop the waited_ms pin
+            // allows, inside the stop window). Both landings stay honest —
+            // dying mid-wait is the agent-ended early edge, dying under
+            // the exit-watch is a graceful stop — and both record
+            // drain-stopped{false}; a Unix drain stop is a delivered
+            // signal long before the delay.
+            "--exit-with",
+            "0:2500",
+        ],
         // Touch then hang: the touch only lands if the kill FAILED to
         // precede the side effect.
         Some(&["--touch", "late.sentinel", "--hang-before", "60000"]),
@@ -1283,7 +1324,20 @@ fn drain_reads_a_stale_idle_file_as_not_idle_and_burns_the_bound() {
     write_drain_manifest(
         manifest.path(),
         "svc",
-        &["--linger-ms", "600000"],
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture: the stop after the burnt
+            // bound lands on a lingering agent, and that platform's
+            // graceful step is a pure exit-watch — without a self-exit it
+            // polls the whole default window and escalates to stop-forced,
+            // failing this test's drain-stopped pin. 2000ms is past the
+            // 1200ms bound (the wait genuinely burns first) and inside the
+            // window; the 3000ms freshness sleep above happens BEFORE the
+            // drain, so it never delays the anchor the delay counts from.
+            "--exit-on-pause",
+            "2000:pause.sentinel",
+        ],
         Some(&["--touch", "pause.sentinel"]),
         Some(&["--touch", "resume.sentinel"]),
         Some("timeout_ms = 1200\nidle_file = \"idle.sentinel\""),
