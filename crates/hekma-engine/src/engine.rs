@@ -128,6 +128,18 @@ fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
             Some(detail) => format!("{check} failing for {failing_for_ms}ms ({detail})"),
             None => format!("{check} failing for {failing_for_ms}ms"),
         }),
+        // The agent asked for a relaunch on a declared code (story 18-3):
+        // name the code + the verdict so `show` explains the `failed`
+        // landing without a log dig. The declared-class detail (when the
+        // reaper recorded one) rides along; otherwise the class is named
+        // directly. (The `CleanExit` twin never lands here — `stopped` is
+        // not a failure, so the fallback stays `None` for it.)
+        TransitionCause::RestartRequested { code, detail } => Some(match detail {
+            Some(detail) => format!("exit code {code} requested a restart ({detail})"),
+            None => {
+                format!("exit code {code} requested a restart (declared `restart_requested`)")
+            }
+        }),
         _ => None,
     }
 }
@@ -252,6 +264,18 @@ pub struct EngineOptions {
     /// and the crash-detection reaper start — identical semantics to
     /// [`Engine::open_with_diagnostics`]'s `sink` parameter.
     pub diagnostics: Option<DiagnosticSink>,
+    /// Story 18-3's TEST SCALING SEAM for the ENGINE-OWNED stable-run
+    /// window: `Some(window)` overrides [`STABLE_RUN_WINDOW`] (30 s) on this
+    /// engine's supervisor, so integration tests can drive the
+    /// resets-then-charges semantics in milliseconds — the same injection
+    /// posture [`BackoffSchedule::with_base_and_cap`] gives the in-module
+    /// tests, which production callers never take. `None` (the default) is
+    /// byte-identical production behavior. NOT an operator config surface —
+    /// the tuning knob is deferred with a trigger (an operator asks to tune
+    /// it), per the 18-3 spec; this field stays `#[doc(hidden)]` so it
+    /// never reads as one.
+    #[doc(hidden)]
+    pub stable_run_window_override: Option<Duration>,
 }
 
 impl std::fmt::Debug for EngineOptions {
@@ -263,6 +287,10 @@ impl std::fmt::Debug for EngineOptions {
             .field("child_env_allowlist", &self.child_env_allowlist)
             .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
+            .field(
+                "stable_run_window_override",
+                &self.stable_run_window_override,
+            )
             .finish()
     }
 }
@@ -400,6 +428,7 @@ impl Engine {
             child_env_allowlist,
             log_capture,
             diagnostics,
+            stable_run_window_override,
         } = options;
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
@@ -425,6 +454,11 @@ impl Engine {
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
+        // Story 18-3: thread the TEST SCALING SEAM through — `None` (every
+        // production caller) leaves the pinned 30 s window untouched.
+        if let Some(window) = stable_run_window_override {
+            supervisor.override_stable_run_window(window);
+        }
         // Story 17-4: continue the outbox seq sequence from whatever a prior
         // engine lifetime committed (BEFORE the registry moves under the
         // mutex, so the journal read and the counter write are serialized

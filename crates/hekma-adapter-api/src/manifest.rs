@@ -104,6 +104,14 @@ pub struct Manifest {
     /// the intermediate engine never exists — the pin stays as the policy's
     /// free guarantee.)
     pub liveness: Option<Liveness>,
+    /// The declared exit-code classes (joins the contract `1.1.0` minor).
+    /// OPTIONAL: a manifest without it classifies nothing — every unrequested
+    /// exit is a crash exactly as before (byte-identical). Validated by
+    /// [`Manifest::validate`] when present — a v1.1.0 engine names the
+    /// section's first invalid field; a v1.0.0 engine (whose schema has no
+    /// `exit_codes` field at all) rejects the section at PARSE time via
+    /// `deny_unknown_fields`, exactly as the versioning policy states.
+    pub exit_codes: Option<ExitCodes>,
 }
 
 /// The `[adapter]` identity block.
@@ -889,6 +897,175 @@ impl Liveness {
     }
 }
 
+/// Which declared class an exit code belongs to, RESOLVED (built only by
+/// [`ExitCodes::classes`] after validation, so the engine's classifier
+/// consumes this without re-checking anything).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitClass {
+    /// The agent exited with this code to REQUEST a relaunch: the engine
+    /// runs the ordinary restart plan (backoff verbatim) but the
+    /// consecutive-failure counter is NOT charged.
+    RestartRequested,
+    /// The agent finished ON PURPOSE with this code: the instance lands
+    /// `stopped` (settled like a requested stop), no restart plan, no
+    /// counter action.
+    Clean,
+}
+
+/// The declared exit-code classes, RESOLVED and validated (every code in the
+/// portable `0..=255` domain, the two lists disjoint, no duplicates within a
+/// list). Built only by [`ExitCodes::classes`] after validation; the engine
+/// classifies an observed exit with [`Self::class_of`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitCodeClasses {
+    /// The codes that request a relaunch (the exit-75 pattern).
+    pub restart_requested: Vec<u16>,
+    /// The codes that mean a deliberate, clean finish.
+    pub clean: Vec<u16>,
+}
+
+impl ExitCodeClasses {
+    /// Classify one observed exit code against the declared classes.
+    /// `None` — the overwhelmingly common answer — means "no class contains
+    /// this code": the engine treats the exit exactly as it did before this
+    /// section existed (a crash under the Restart Policy).
+    pub fn class_of(&self, code: u16) -> Option<ExitClass> {
+        if self.restart_requested.contains(&code) {
+            // Disjointness is validated, so the ordered check cannot mask a
+            // `clean` hit: a code in both lists never reaches here.
+            return Some(ExitClass::RestartRequested);
+        }
+        if self.clean.contains(&code) {
+            return Some(ExitClass::Clean);
+        }
+        None
+    }
+}
+
+/// The optional `[exit_codes]` section (joins the contract `1.1.0` minor):
+/// the two ADAPTER-DECLARED exit-code classes —
+///
+/// ```toml
+/// [exit_codes]
+/// restart_requested = [75]
+/// clean = [0]
+/// ```
+///
+/// Both lists are OPTIONAL (default empty); an absent section — or one
+/// declaring nothing — leaves supervision byte-identical to before. The
+/// classes classify RUNS, not launches: an exit during `starting` (survival
+/// window, readiness probe, ACP handshake) is a launch failure and is never
+/// classified, and a signal exit carries no code to classify.
+///
+/// Semantics (the engine enforces these; this section only declares them):
+///
+/// * `restart_requested` — the agent asked its supervisor for a relaunch.
+///   The exit takes the ordinary crash-path dance (`running → failed` + a
+///   restart plan on the standard backoff) but under the
+///   `restart-requested` cause, and the consecutive-failure counter is NOT
+///   charged. A restart-requested loop therefore NEVER trips the crash-loop
+///   terminal — the operator asked — while the backoff still grows to its
+///   cap, bounding the rate.
+/// * `clean` — the agent finished on purpose. The instance lands `stopped`
+///   (settled like a requested stop), no restart plan, no counter action.
+///
+/// The operator's `RestartPolicy` stays the operator's: `never` outranks
+/// `restart_requested` (terminal failure, no plan).
+///
+/// Validation is [`ExitCodes::classes`] (consumed by [`Manifest::validate`]):
+/// every code in `0..=255` (the portable exit-code domain — unix exit
+/// status carries the low 8 bits, so a Windows code above 255 could never be
+/// observed there; declare the portable form), the two lists DISJOINT (an
+/// overlap names both fields), and no duplicates within one list. The
+/// section is `deny_unknown_fields` like every section struct, so an engine
+/// built at contract 1.0.0 rejects it at parse time (the policy's
+/// older-engine rule, for free).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitCodes {
+    /// Exit codes with which the agent requests a relaunch (e.g. `[75]` for
+    /// the conventional `EX_TEMPFAIL`-style contract restart).
+    #[serde(default)]
+    pub restart_requested: Vec<u16>,
+    /// Exit codes with which the agent finishes deliberately (commonly
+    /// `[0]`).
+    #[serde(default)]
+    pub clean: Vec<u16>,
+}
+
+impl ExitCodes {
+    /// Resolve this section into its [`ExitCodeClasses`], enforcing the
+    /// whole value matrix and naming the first failing field (the section's
+    /// validation — run at registration via [`Manifest::validate`] and
+    /// re-checked at start and adoption like the `[config]` mapping and the
+    /// `[readiness]`/`[liveness]` sections).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * every code in `restart_requested` and `clean` is `0..=255` (the
+    ///   portable exit-code domain);
+    /// * no duplicates within ONE list (a repeated code is a declaration
+    ///   typo, not a semantic);
+    /// * the two lists are DISJOINT — an overlap is refused naming BOTH
+    ///   fields, because one exit cannot be both a relaunch request and a
+    ///   clean finish.
+    pub fn classes(&self) -> Result<ExitCodeClasses, ManifestError> {
+        for (field, codes) in [
+            ("`restart_requested`", &self.restart_requested),
+            ("`clean`", &self.clean),
+        ] {
+            for code in codes {
+                if *code > 255 {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("{field} list in the `[exit_codes]` section"),
+                        detail: format!(
+                            "{code} is out of range — exit codes must be 0..=255, the \
+                             portable exit-code domain (unix exit status carries the low \
+                             8 bits, so a wider code could never be observed there)"
+                        ),
+                    });
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for code in codes {
+                if !seen.insert(*code) {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("{field} list in the `[exit_codes]` section"),
+                        detail: format!(
+                            "{code} appears more than once — declare each code at most \
+                             once per list"
+                        ),
+                    });
+                }
+            }
+        }
+        let overlap: Vec<u16> = self
+            .restart_requested
+            .iter()
+            .filter(|c| self.clean.contains(c))
+            .copied()
+            .collect();
+        if !overlap.is_empty() {
+            let names = overlap
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ManifestError::InvalidField {
+                field: "`[exit_codes]` section".to_string(),
+                detail: format!(
+                    "code(s) {names} appear in BOTH `restart_requested` and `clean` — a \
+                     code can belong to only ONE class (an exit is either a relaunch \
+                     request or a clean finish, never both); remove it from one list"
+                ),
+            });
+        }
+        Ok(ExitCodeClasses {
+            restart_requested: self.restart_requested.clone(),
+            clean: self.clean.clone(),
+        })
+    }
+}
+
 /// Convenience constructor naming a required-but-absent `[readiness]` field
 /// (the `missing` phrasing the other section validators use).
 fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, ManifestError> {
@@ -1246,6 +1423,17 @@ impl Manifest {
             liveness.check()?;
         }
 
+        // [exit_codes] classes (added at contract 1.1.0 alongside [readiness]
+        // and [liveness]), IF present. Absent is valid (the pre-classification
+        // behavior — every unrequested exit is a crash — and the common
+        // case). A present-but-invalid section names its first failing field
+        // (`ExitCodes::classes` enforces the portable 0..=255 code domain, the
+        // no-duplicates rule, and the DISJOINT-lists rule that names both
+        // fields on an overlap).
+        if let Some(exit_codes) = &self.exit_codes {
+            exit_codes.classes()?;
+        }
+
         Ok(())
     }
 
@@ -1307,6 +1495,24 @@ impl Manifest {
     pub fn liveness_check(&self) -> Result<Option<LivenessCheck>, ManifestError> {
         match &self.liveness {
             Some(section) => section.check().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The declared exit-code [`ExitCodeClasses`] (added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[exit_codes]` section —
+    /// the engine's crash classifier treats that as "classify nothing" (the
+    /// pre-classification behavior, byte-identical: every unrequested exit is
+    /// a crash under the Restart Policy). The `Result` is defensive depth,
+    /// mirroring [`Self::readiness_probe`] / [`Self::liveness_check`]: a
+    /// validated manifest's section already resolved cleanly, but the engine
+    /// calls THIS accessor, so it re-states the failure honestly rather than
+    /// panicking.
+    pub fn exit_codes(&self) -> Result<Option<ExitCodeClasses>, ManifestError> {
+        match &self.exit_codes {
+            Some(section) => section.classes().map(Some),
             None => Ok(None),
         }
     }
@@ -2610,5 +2816,160 @@ channel = "stdio"
                 "status {status}: got {err}"
             );
         }
+    }
+
+    // -- [exit_codes] (added at contract 1.1.0) ------------------------------
+
+    /// Append an `[exit_codes]` section carrying exactly `body` to [`VALID`].
+    fn with_exit_codes(body: &str) -> String {
+        format!("{VALID}\n[exit_codes]\n{body}\n")
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_exit_codes_section() {
+        // The v1.0.0-rejection PIN, exit-codes twin of the readiness/liveness
+        // ones: an engine built at contract 1.0.0 has a `Manifest` schema
+        // WITHOUT the `exit_codes` field, and `deny_unknown_fields` refuses
+        // the unknown section at PARSE time. Simulated with the exact
+        // pre-18-3 shape — the same section list, minus the three 1.1.0
+        // sections — against a 1.1.0 manifest that declares the section. The
+        // diagnostic must NAME it (`exit_codes`).
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_exit_codes("restart_requested = [75]\nclean = [0]");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("exit_codes"), "got {err}");
+    }
+
+    #[test]
+    fn no_exit_codes_section_is_valid_and_resolves_to_none() {
+        // The pre-18-3 shape: no section, no classes — every unrequested exit
+        // is a crash; the engine's behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.exit_codes().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn exit_codes_parse_and_resolve_both_lists() {
+        let toml = with_exit_codes("restart_requested = [75, 71]\nclean = [0]");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        let classes = m.exit_codes().expect("resolve").expect("declared");
+        assert_eq!(
+            classes,
+            ExitCodeClasses {
+                restart_requested: vec![75, 71],
+                clean: vec![0],
+            }
+        );
+        assert_eq!(classes.class_of(75), Some(ExitClass::RestartRequested));
+        assert_eq!(classes.class_of(71), Some(ExitClass::RestartRequested));
+        assert_eq!(classes.class_of(0), Some(ExitClass::Clean));
+        assert_eq!(classes.class_of(99), None, "unclassified exits stay None");
+    }
+
+    #[test]
+    fn exit_codes_lists_are_optional_and_default_empty() {
+        // Both lists optional (serde defaults), and an entirely empty section
+        // is legal: it declares nothing and classifies nothing — exactly like
+        // an absent section (never a half-declared contradiction).
+        let empty = Manifest::from_toml_str(&with_exit_codes("")).expect("parse");
+        empty.validate().expect("validate");
+        let resolved = empty.exit_codes().expect("resolve").expect("declared");
+        assert_eq!(resolved, ExitCodeClasses::default());
+        assert_eq!(resolved.class_of(0), None);
+
+        let one_list = Manifest::from_toml_str(&with_exit_codes("clean = [0]")).expect("parse");
+        one_list.validate().expect("validate");
+        let resolved = one_list.exit_codes().expect("resolve").expect("declared");
+        assert!(resolved.restart_requested.is_empty());
+        assert_eq!(resolved.class_of(0), Some(ExitClass::Clean));
+    }
+
+    #[test]
+    fn exit_codes_above_the_portable_domain_are_refused() {
+        // 0..=255 is the portable exit-code domain: unix exit status carries
+        // the low 8 bits, so a code above 255 could never be observed there.
+        // 256 is the first refusal; 0 and 255 are the accepted edges.
+        for body in [
+            "restart_requested = [256]",
+            "clean = [1000]",
+            "restart_requested = [0, 65535]",
+        ] {
+            let m = Manifest::from_toml_str(&with_exit_codes(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains("list in the `[exit_codes]` section")
+                        && detail.contains("0..=255")),
+                "{body}: got {err}"
+            );
+        }
+        let edges = Manifest::from_toml_str(&with_exit_codes(
+            "restart_requested = [0, 255]\nclean = [128]",
+        ))
+        .expect("parse");
+        edges.validate().expect("the 0..=255 edges are accepted");
+    }
+
+    #[test]
+    fn exit_codes_duplicates_within_one_list_are_refused() {
+        for body in ["restart_requested = [75, 75]", "clean = [0, 0, 0]"] {
+            let m = Manifest::from_toml_str(&with_exit_codes(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains("list in the `[exit_codes]` section")
+                        && detail.contains("more than once")),
+                "{body}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_codes_overlapping_lists_are_refused_naming_both_fields() {
+        let m = Manifest::from_toml_str(&with_exit_codes(
+            "restart_requested = [75, 9]\nclean = [0, 9]",
+        ))
+        .expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`[exit_codes]` section"
+                    && detail.contains("BOTH `restart_requested` and `clean`")
+                    && detail.contains('9')),
+            "the overlap must name both fields and the offending code: {err}"
+        );
+        // And the same overlap in the other declaration order.
+        let m = Manifest::from_toml_str(&with_exit_codes("clean = [3]\nrestart_requested = [3]"))
+            .expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("BOTH"), "got {err}");
+    }
+
+    #[test]
+    fn exit_codes_negative_values_fail_at_parse() {
+        // A negative code is not a process exit status at all — the `u16`
+        // field type refuses it at PARSE time (surfaced as the section-naming
+        // Toml error), like every other typed field.
+        let err = Manifest::from_toml_str(&with_exit_codes("clean = [-1]")).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
     }
 }

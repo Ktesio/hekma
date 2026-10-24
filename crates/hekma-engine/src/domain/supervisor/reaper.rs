@@ -6,6 +6,45 @@ use super::*;
 use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
 use crate::ports::StoreError;
 
+/// The portable classification domain (story 18-3): only a code in
+/// `0..=255` can match a declared class — the `[exit_codes]` lists are
+/// validated to exactly that domain (the portable exit-code domain: unix
+/// exit status carries the low 8 bits), so a Windows code above 255 simply
+/// never matches, exactly as the manifest docs state. `None` (a signal
+/// exit, a poll failure, an out-of-domain code) never classifies.
+fn portable_code(c: i32) -> Option<u16> {
+    u16::try_from(c).ok().filter(|code| *code <= 255)
+}
+
+/// The exit-code CLASSIFIER (story 18-3): what class — if any — this crash
+/// input belongs to. Pure; the reaper's crash path consumes the verdict.
+///
+/// A classification needs ALL of:
+/// * a CODED exit (`CrashInput::Exited(Some(c))`) — signals (`None`), poll
+///   failures, and adopted-code-unavailable exits carry no code to classify;
+/// * the code in the portable `0..=255` domain (the lists' validated domain);
+/// * the manifest's resolved `[exit_codes]` declaring the code (`None`
+///   classes — the no-section case, byte-identical — classify nothing);
+/// * the prior state EXACTLY `running` (the state gate): classes classify
+///   RUNS, not launches — an exit during `starting` is a launch failure on
+///   a different path entirely — and a crash out of `paused` rides today's
+///   crash path verbatim (the CleanExit edge is `running → stopped`).
+fn classify_exit(
+    exit_codes: &Option<ExitCodeClasses>,
+    crash: &CrashInput,
+    state: LifecycleState,
+) -> Option<(ExitClass, u16)> {
+    if state != LifecycleState::Running {
+        return None;
+    }
+    let CrashInput::Exited(Some(raw)) = crash else {
+        return None;
+    };
+    let code = portable_code(*raw)?;
+    let classes = exit_codes.as_ref()?;
+    classes.class_of(code).map(|class| (class, code))
+}
+
 impl Supervisor {
     /// Clear one instance's consecutive poll-error streak (AI-12). Called at
     /// EVERY [`Supervisor::poll_once`] `running.remove` site and on every fresh
@@ -426,11 +465,60 @@ impl Supervisor {
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
             let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            // Story 18-3: read the CLASSIFICATION inputs BEFORE the remove
+            // below — the declared classes (the per-Run lens), the prior
+            // state, and the stability anchor. The state gate: the classes
+            // classify RUNS, so ONLY a coded exit out of EXACTLY `running`
+            // classifies (a crash out of `paused` stays today's crash path
+            // verbatim — the CleanExit edge is `running → stopped`, and a
+            // pause-interval never counts toward stability), and the anchor
+            // is measured only on that same gate.
+            let (exit_codes, running_for) = match self.running.get(&name) {
+                Some(supervised) => {
+                    let running_for = (state == LifecycleState::Running)
+                        .then(|| supervised.running_since.elapsed());
+                    (supervised.exit_codes.clone(), running_for)
+                }
+                None => (None, None),
+            };
+            let classified = classify_exit(&exit_codes, &crash, state);
             // Story 14-1: surface any queued acp notices before the crashed
             // instance's connection drops with the handle (the reader's EOF /
             // malformed-line / permission facts must not die silently with it).
             self.drain_acp_notices_for(&name);
             self.clear_poll_error_streak(&name);
+            if let Some((ExitClass::Clean, code)) = classified {
+                // CLEAN EXIT (story 18-3): the agent finished ON PURPOSE on a
+                // declared code — the requested-stop shape. The streak of
+                // restart-requested recycles ends here too (the Run ended in
+                // a declared-clean place; the next relaunch chain starts at
+                // the base). Settle the record like a requested stop (an
+                // established acp session id is retained for the next
+                // start), transition `running → stopped` with the CleanExit
+                // cause, NO plan, NO counter action — the operator's next
+                // fresh start is the counter reset, exactly as it has always
+                // been.
+                self.requested_restart_streaks.remove(&name);
+                self.running.remove(&name);
+                // Story 14-2: the settle retains an acp session id (see the
+                // ordinary stop path); identical to a clear otherwise. A
+                // store hiccup degrades to the pre-18-3 silence — the record
+                // fails to settle, and a later open's reconcile finds no live
+                // PID (honest).
+                let _ = registry.settle_spawn_record(&name);
+                if self.ensure_log_dir(registry, &name).is_err() {
+                    // Mirror the crash path: the durable state still leads.
+                }
+                let _ = self.transition_with_log_capture(
+                    registry,
+                    &name,
+                    LifecycleState::Running,
+                    LifecycleState::Stopped,
+                    TransitionCause::clean_exit(code),
+                    crash_log_capture,
+                );
+                continue;
+            }
             self.running.remove(&name);
             let base_detail = match crash {
                 // AI-12: the handle went permanently un-pollable — the recorded
@@ -480,7 +568,47 @@ impl Supervisor {
                     "process exited unexpectedly (terminated by signal)".to_string()
                 }
             };
-            let decision = self.plan_restart(registry, &name, &base_detail);
+            // Story 18-3: the classified branches pick the cause + the policy
+            // consult; the unclassified majority takes the verbatim crash path.
+            let (transition_cause, plan) = match classified {
+                Some((ExitClass::RestartRequested, code)) => {
+                    // The agent ASKED for a relaunch on a declared code: the
+                    // crash-path dance (terminal transition + plan, backoff
+                    // VERBATIM arithmetic) with the `restart-requested` cause
+                    // — but the consecutive-failure counter is NOT charged
+                    // and `is_crash_loop` is never consulted (a declared
+                    // recycle chain can NEVER trip the terminal; docs state
+                    // the operator contract honestly). `Never` still
+                    // outranks the adapter's ask (terminal `failed`, no
+                    // plan). The classification detail names the declared
+                    // class — and on a `never` outcome the policy verdict
+                    // rides the same detail so the failed landing explains
+                    // itself.
+                    let plan = self.plan_requested_restart(registry, &name, code);
+                    let detail = match &plan {
+                        Some(_) => "declared class `restart_requested`".to_string(),
+                        None => "declared class `restart_requested`; restart policy is \
+                                 'never' — not restarting (the operator's policy outranks \
+                                 the adapter's ask)"
+                            .to_string(),
+                    };
+                    (
+                        TransitionCause::restart_requested_with_detail(code, detail),
+                        plan,
+                    )
+                }
+                _ => {
+                    // Unclassified: today's charged crash path verbatim —
+                    // the stable-window reset (when the just-ended run had
+                    // held `running` ≥ the engine's window) joins the plan
+                    // inside.
+                    let decision = self.plan_restart(registry, &name, &base_detail, running_for);
+                    (
+                        TransitionCause::crashed(decision.crash_cause.clone()),
+                        decision.plan,
+                    )
+                }
+            };
             if self.ensure_log_dir(registry, &name).is_err() {
                 // If we cannot even prepare the log dir, still persist the state
                 // so the durable state leads; skip the event append best-effort.
@@ -489,14 +617,16 @@ impl Supervisor {
             // plus (on a terminal outcome) the policy conclusion (crash-loop, or
             // "policy is never — not restarting"). This is what `instance_status`
             // falls back to for the failed cause once the terminal record is
-            // cleared (AC9).
+            // cleared (AC9). Story 18-3: a classified exit carries its OWN
+            // cause (`restart-requested`) instead of `crashed` — the class is
+            // the story.
             if self
                 .transition_with_log_capture(
                     registry,
                     &name,
                     state,
                     LifecycleState::Failed,
-                    TransitionCause::crashed(decision.crash_cause.clone()),
+                    transition_cause,
                     crash_log_capture,
                 )
                 .is_err()
@@ -506,7 +636,7 @@ impl Supervisor {
                 continue;
             }
 
-            if let Some(plan) = decision.plan {
+            if let Some(plan) = plan {
                 plans.push(plan);
             }
         }
@@ -674,6 +804,14 @@ impl Supervisor {
                     self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
                     self.drain_observed_for(registry, &name, DrainMode::Terminal);
                     self.unlink_raw_logs_if_metadata(registry, &name);
+                    // Story 18-3: capture the stability anchor BEFORE the
+                    // remove below — the unresponsive expiry is a CHARGED
+                    // class, so a run that had held `running` ≥ the engine's
+                    // stable window resets the counter first (this failure
+                    // charges as #1). The phase-4 gate guarantees the
+                    // persisted state is EXACTLY `running`, so the anchor
+                    // always measures here.
+                    let running_for = self.running.get(&name).map(|s| s.running_since.elapsed());
                     // Capture BEFORE the remove — the drop of the (possibly
                     // hung) handle is the sanctioned teardown (kill-on-drop,
                     // the AI-12 PersistentPollFailure precedent: a wedged
@@ -758,7 +896,7 @@ impl Supervisor {
                     // event log and `show`'s failed-cause fold carry the
                     // "will never restart" conclusion — not only the one
                     // console diagnostic this arm keeps below.
-                    let decision = self.plan_restart(registry, &name, &detail);
+                    let decision = self.plan_restart(registry, &name, &detail, running_for);
                     let terminal_verdict = if decision.plan.is_none() {
                         // `plan_restart` prefixes the verdict with the base
                         // detail it was handed; strip that back off so the
@@ -880,14 +1018,28 @@ impl Supervisor {
     /// * `never` → TERMINAL: clear the write-ahead record and note the policy in
     ///   the crash cause; no plan.
     ///
+    /// Story 18-3 — `running_for` (how long the just-ended run had held
+    /// `running` continuously, `None` when there is no anchor: a crash out of
+    /// `paused`, or an adopted instance whose run began before this engine
+    /// watched it) joins the CHARGED path: a run of ≥
+    /// [`STABLE_RUN_WINDOW`] (the engine's window, test-scaled on the
+    /// supervisor) proves stability, so the counter RESETS to 0 first — its
+    /// own store line — and this crash then charges as failure #1, with the
+    /// reset NAMED in the crash detail. The arithmetic is the pure
+    /// [`next_consecutive_failures`]; a terminal outcome (`never`) never
+    /// charges, so it never resets either.
+    ///
     /// Also called by the START path (spawn.rs) when the readiness probe
     /// observes the process EXIT mid-wait: the write-ahead record exists by
     /// then (committed before the probe), so the policy consult is identical.
+    /// The start path passes `running_for: None` — a launch-phase exit is
+    /// never a run (the classes classify runs; so does the reset).
     pub(super) fn plan_restart(
         &self,
         registry: &Registry,
         name: &InstanceName,
         crash_detail: &str,
+        running_for: Option<Duration>,
     ) -> RestartDecision {
         let record = registry.spawn_record(name).ok().flatten();
         let policy = record
@@ -899,6 +1051,7 @@ impl Supervisor {
         if !policy.restarts_on_crash() {
             // `never`: TERMINAL. Settle the record so a later open does not
             // adopt-attempt a dead PID; the crash cause names the policy.
+            // Nothing charges, so the stable window never applies here.
             self.settle_terminal_record(registry, name, policy);
             return RestartDecision {
                 crash_cause: format!("{crash_detail}; restart policy is 'never' — not restarting"),
@@ -906,7 +1059,25 @@ impl Supervisor {
             };
         }
 
-        let next = current.saturating_add(1);
+        // Story 18-3: the stable-window reset joins the charged path — reset
+        // FIRST (its own store line), then this crash charges as failure #1,
+        // and the reset is NAMED in the crash detail (surfaced, not silent).
+        let (next, reset) = next_consecutive_failures(current, running_for, self.stable_run_window);
+        let crash_detail = match (reset, running_for) {
+            (true, Some(run)) => format!(
+                "{crash_detail}; the previous run was stable for {}s — consecutive-failure \
+                 count reset",
+                run.as_secs()
+            ),
+            _ => crash_detail.to_string(),
+        };
+        if reset {
+            // The reset is one line in the store: the streak goes to 0
+            // before the charge below re-persists it at 1. Best-effort (a
+            // store hiccup must not panic the reaper); the charge write
+            // below still lands the final value.
+            let _ = registry.set_restart_count(name, 0, None);
+        }
         if is_crash_loop(next) {
             // Crash loop: TERMINAL. Settle the record (F-Low-2), leave `failed`
             // with the reason STATED in the crash cause.
@@ -923,16 +1094,85 @@ impl Supervisor {
 
         // Schedule a restart: persist the incremented count + the crash cause,
         // and return the plan with the backoff delay for this attempt.
-        let _ = registry.set_restart_count(name, next, Some(crash_detail));
+        let _ = registry.set_restart_count(name, next, Some(&crash_detail));
         let delay = self.backoff.delay_for(next);
         RestartDecision {
-            crash_cause: crash_detail.to_string(),
+            crash_cause: crash_detail,
             plan: Some(RestartPlan {
                 name: name.clone(),
                 attempt: next,
                 delay,
             }),
         }
+    }
+
+    /// Decide the restart for a RESTART-REQUESTED exit (story 18-3): the
+    /// crash-path dance — a restart plan on the VERBATIM backoff arithmetic —
+    /// WITHOUT charging the consecutive-failure counter. The agent asked for a
+    /// relaunch on a declared code, which proves neither stability nor
+    /// failure; the counter simply holds. Returns `None` on the terminal
+    /// outcome (the caller renders the cause's policy verdict).
+    ///
+    /// The persisted counter is NEVER written on this path — including
+    /// transitively: the plan's `attempt` carries the UNCHANGED current
+    /// count, because the relaunch executor writes
+    /// `restart_count = attempt` into the fresh spawn record (`start_inner`
+    /// step (7)); carrying `current + 1` would charge through that write.
+    /// The backoff DELAY instead grows with the in-memory
+    /// `requested_restart_streaks` streak (delay index =
+    /// `current + streak + 1`, clamped to the cap by [`BackoffSchedule`]),
+    /// so a restart-requested loop still backs off to its cap — the RATE is
+    /// bounded even though the crash-loop terminal can never trip (the
+    /// operator asked; the docs state that contract honestly).
+    ///
+    /// `is_crash_loop` is NEVER consulted here: the persisted count is
+    /// unchanged by construction, and while an instance is alive its
+    /// persisted count is always below the threshold anyway (a trip would
+    /// have terminal-settled the run; a fresh start resets to 0) — a
+    /// restart-requested plan can never be the straw that breaks it.
+    /// `RestartPolicy::Never` outranks the adapter's ask (the operator's
+    /// instrument wins): terminal — settle the record, no plan, no counter
+    /// action. The streak clears at every fresh OPERATOR start, adoption,
+    /// and clean exit (a policy relaunch KEEPS it — it IS the chain being
+    /// paced); an engine restart forgets it (the next relaunch waits the base
+    /// again — the DURABLE counter, untouched by this path, stays the
+    /// operator's signal).
+    fn plan_requested_restart(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        _code: u16,
+    ) -> Option<RestartPlan> {
+        let record = registry.spawn_record(name).ok().flatten();
+        let policy = record
+            .as_ref()
+            .map(|r| r.restart_policy)
+            .unwrap_or_default();
+        if !policy.restarts_on_crash() {
+            // `never` outranks the adapter's ask: TERMINAL, no plan, no
+            // counter action (the transition to `failed` + the cause's
+            // policy verdict are the caller's).
+            self.settle_terminal_record(registry, name, policy);
+            return None;
+        }
+        let current = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
+        // The uncharged streak grows the delay: the FIRST requested relaunch
+        // of a chain waits the base, each later one doubles, the cap clamps.
+        let streak = self
+            .requested_restart_streaks
+            .get(name)
+            .copied()
+            .unwrap_or(0);
+        let delay = self.backoff.delay_for(current + streak + 1);
+        self.requested_restart_streaks
+            .insert(name.clone(), streak + 1);
+        Some(RestartPlan {
+            name: name.clone(),
+            // The UNCHANGED count: the relaunch's fresh record must read the
+            // same number the operator saw before the recycle (see the doc).
+            attempt: current,
+            delay,
+        })
     }
 
     /// Settle the write-ahead record on a TERMINAL `failed` outcome (F-Low-2).
@@ -1366,7 +1606,53 @@ impl Supervisor {
                             None
                         }
                     };
+                    // Story 18-3: re-resolve the adopted instance's declared
+                    // exit-code classes from ITS adapter manifest — the exact
+                    // twin of the liveness re-resolution above, with the same
+                    // posture: a resolution failure (manifest drifted invalid,
+                    // or unreadable since registration) is SURFACED (AI-18) as
+                    // ONE diagnostic and the adopted instance is re-held with
+                    // NO declared classes — every unrequested exit is a crash,
+                    // the pre-classification behavior — never a failed
+                    // adoption. (An adopted instance ALSO never gets the
+                    // stable-window reset: its anchor starts at adoption, so a
+                    // run must prove stability under THIS engine's watch.)
+                    let adopted_exit_codes = match registry.adapter_launch_facts(&name) {
+                        Ok((kind, manifest_path, _launch)) => {
+                            match crate::adapter::resolve_exit_codes(
+                                &kind,
+                                manifest_path.as_deref(),
+                            ) {
+                                Ok(classes) => classes,
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the adopted instance's declared exit-code classes \
+                                         could not be resolved ({err}); exit codes are NOT \
+                                         classified this Run — stop and start the instance to \
+                                         restore the declared classes",
+                                        name.as_str(),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // The snapshot is already known-unreadable (the
+                            // liveness resolution above emitted ITS
+                            // diagnostic for exactly this read); do not spam
+                            // the same degradation twice — the classes are
+                            // simply not supervised, same posture.
+                            None
+                        }
+                    };
                     self.clear_poll_error_streak(&name);
+                    // Story 18-3: adoption begins a FRESH restart-requested
+                    // chain (the previous engine's streak is not observable —
+                    // the in-memory map died with it), so the first
+                    // restart-requested relaunch under THIS engine waits the
+                    // base backoff again. The durable crash counter was
+                    // never touched by that chain and rides as-is.
+                    self.requested_restart_streaks.remove(&name);
                     self.running.insert(
                         name.clone(),
                         Supervised {
@@ -1460,6 +1746,15 @@ impl Supervisor {
                             liveness_check: adopted_liveness_check,
                             liveness_failing_since: None,
                             liveness_reopens: 0,
+                            // Story 18-3: the adopted instance's RE-RESOLVED
+                            // exit-code classes (above) — `None` classifies
+                            // nothing (byte-identical). The stability anchor
+                            // starts at ADOPTION: the pre-adoption run time
+                            // is not observable, so a crash can only reset
+                            // after THIS engine has watched the run for the
+                            // whole window (the honest no-reset, documented).
+                            exit_codes: adopted_exit_codes,
+                            running_since: std::time::Instant::now(),
                         },
                     );
                     adopted += 1;
@@ -1721,5 +2016,118 @@ fn liveness_expiry_onset_note(
         ))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    //! Story 18-3's pure classifier (`portable_code` + `classify_exit`) —
+    //! unit-tested beside their module (the restart.rs precedent: these are
+    //! pure decision fns, no Supervisor needed; the integration matrix lives
+    //! in `tests/exit_codes.rs`).
+
+    use super::*;
+    use hekma_adapter_api::ExitCodeClasses;
+
+    fn classes(rr: &[u16], clean: &[u16]) -> Option<ExitCodeClasses> {
+        Some(ExitCodeClasses {
+            restart_requested: rr.to_vec(),
+            clean: clean.to_vec(),
+        })
+    }
+
+    #[test]
+    fn portable_code_accepts_only_the_portable_domain() {
+        // The validated manifest domain is 0..=255; anything outside (a
+        // wide Windows code, a negative) is None — never classified.
+        assert_eq!(portable_code(0), Some(0));
+        assert_eq!(portable_code(75), Some(75));
+        assert_eq!(portable_code(255), Some(255));
+        assert_eq!(portable_code(256), None, "above the portable domain");
+        assert_eq!(portable_code(-1), None, "negative is out of domain");
+        assert_eq!(portable_code(i32::MAX), None);
+    }
+
+    #[test]
+    fn classify_requires_coded_exit_running_state_and_declared_class() {
+        let codes = classes(&[75], &[0]);
+        // The happy path: a coded exit out of running on a declared code.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Running
+            ),
+            Some((ExitClass::RestartRequested, 75))
+        );
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(0)),
+                LifecycleState::Running
+            ),
+            Some((ExitClass::Clean, 0))
+        );
+        // Signal termination (no code): never classified.
+        assert_eq!(
+            classify_exit(&codes, &CrashInput::Exited(None), LifecycleState::Running),
+            None
+        );
+        // A poll-failure "crash" carries no exit: never classified.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::PersistentPollFailure { sole_handle: true },
+                LifecycleState::Running
+            ),
+            None
+        );
+        // The state gate: the classes classify RUNS — a crash out of
+        // `paused` (or any non-running state) rides the plain crash path.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Paused
+            ),
+            None
+        );
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(0)),
+                LifecycleState::Starting
+            ),
+            None,
+            "a launch-phase exit is a launch failure, never classified"
+        );
+        // No declared section (the byte-identical majority): nothing classifies.
+        assert_eq!(
+            classify_exit(
+                &None,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Running
+            ),
+            None
+        );
+        // Declared section, UNDECLARED code: the plain crash path.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(99)),
+                LifecycleState::Running
+            ),
+            None
+        );
+        // Out-of-domain codes never match a declared list (the validated
+        // lists are 0..=255, so a wide Windows code simply never matches).
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(331)),
+                LifecycleState::Running
+            ),
+            None
+        );
     }
 }

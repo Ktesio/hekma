@@ -49,7 +49,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hekma_adapter_api::{Capability, ConfigMapping, LivenessCheck, OsId, SupportLevel};
+use hekma_adapter_api::{
+    Capability, ConfigMapping, ExitClass, ExitCodeClasses, LivenessCheck, OsId, SupportLevel,
+};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
@@ -78,7 +80,10 @@ use super::outbox::{
     OUTBOX_SCHEMA_VERSION,
 };
 use super::registry::Registry;
-use super::restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
+use super::restart::{
+    is_crash_loop, next_consecutive_failures, BackoffSchedule, RestartPolicy,
+    MAX_CONSECUTIVE_FAILURES, STABLE_RUN_WINDOW,
+};
 use super::transition::{next_state, LifecycleCommand};
 use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 
@@ -694,6 +699,28 @@ struct Supervised {
     /// contract). The window itself NEVER stops expiring: a suppressed
     /// diagnosis still fails the instance when the window crosses.
     liveness_reopens: u32,
+    /// The declared `[exit_codes]` classes (story 18-3), RESOLVED at
+    /// spawn/adoption — `None` for a manifest without the section (no
+    /// classification: every unrequested exit is a crash, byte-identical)
+    /// or an adopted instance whose adapter manifest could not be resolved
+    /// (ONE honest degradation diagnostic at adoption, then this stays
+    /// `None` — the reaper classifies nothing, exactly like a manifest that
+    /// declares no classes). The crash classifier consults it ONLY for a
+    /// `CrashInput::Exited(Some(code))` out of `running` (launch-phase
+    /// exits and signal exits never classify).
+    exit_codes: Option<ExitCodeClasses>,
+    /// Story 18-3: when THIS engine last saw the instance ENTER `running` —
+    /// the stability anchor. Stamped at EVERY transition INTO `running`
+    /// (the `starting → running` commit, every `paused → running` resume —
+    /// a pause-interval never counts toward stability; the resumed run
+    /// re-proves it) and at ADOPTION (an adopted instance's pre-adoption
+    /// history is unknown, so its run proves stability only under THIS
+    /// engine's watch — the honest no-reset). A crash classification reads
+    /// it THROUGH THE STATE GATE: only a crash out of EXACTLY `running`
+    /// measures `running_since.elapsed()`; a crash out of any other state
+    /// (e.g. `paused`) passes `None` — never a reset. Lives on
+    /// `Supervised`, so a restart re-anchors it fresh with the new Run.
+    running_since: std::time::Instant,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -894,6 +921,30 @@ pub struct Supervisor {
     /// handle's removal) clears the entry; a singleton error streak restarts
     /// from zero.
     poll_error_streaks: HashMap<InstanceName, u32>,
+    /// Story 18-3 — the stable-run window the counter reset reads: a run
+    /// that held `running` continuously for ≥ this resets the
+    /// consecutive-failure counter BEFORE the crash charges. PRODUCTION is
+    /// exactly [`STABLE_RUN_WINDOW`] (30 s, restart.rs — production-pinned
+    /// by unit test); tests scale it through this field the way
+    /// [`BackoffSchedule`] scales its base (the constant itself is never
+    /// weakened). Set at construction and via
+    /// [`Supervisor::override_stable_run_window`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface (that is deferred with a trigger, per the spec).
+    stable_run_window: Duration,
+    /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
+    /// restart-requested relaunches THIS supervisor has scheduled for the
+    /// instance since its last fresh start / adoption / clean exit. It
+    /// grows the restart-requested plan's backoff DELAY (delay index =
+    /// the UNCHARGED counter + this streak) so a restart-requested loop
+    /// still backs off to its cap while the persisted counter stays
+    /// byte-unchanged (the charging write must never see a bigger number).
+    /// IN-MEMORY ONLY — an engine restart forgets it, honestly: the next
+    /// relaunch waits the base again (the crash counter, which PERSISTS,
+    /// is the operator's durable signal). Cleared at the fresh-start
+    /// insert, the adoption insert, and a clean exit; mirrors
+    /// `poll_error_streaks`' per-instance shape.
+    requested_restart_streaks: HashMap<InstanceName, u32>,
     /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
     /// [`POLL_ERROR_CAUSE_MAX_CHARS`]), so the persistent-poll-failure crash
     /// cause can carry the actual why — not just the bare count. Updated on
@@ -1017,6 +1068,8 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -1062,6 +1115,8 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -1107,6 +1162,8 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -1214,6 +1271,23 @@ impl Supervisor {
         self.child_env_allowlist = child_env_allowlist;
         self.log_capture_mode = log_capture_mode;
         Ok(())
+    }
+
+    /// Override the stable-run window (story 18-3's TEST SCALING SEAM) — the
+    /// `pub(crate)` twin of [`BackoffSchedule::with_base_and_cap`]'s
+    /// injection: the PRODUCTION window is exactly [`STABLE_RUN_WINDOW`]
+    /// (30 s, pinned by unit test) and no production caller ever calls this;
+    /// the engine's open path threads [`EngineOptions`]' doc-hidden
+    /// override through so the integration tests can drive the reset
+    /// semantics in milliseconds. NOT an operator config surface (that is
+    /// deferred with a trigger, per the 18-3 spec). Like the serve options,
+    /// open-time only: refused once supervision has begun.
+    pub(crate) fn override_stable_run_window(&mut self, window: Duration) {
+        debug_assert!(
+            self.running.is_empty(),
+            "the stable-run window is open-time only"
+        );
+        self.stable_run_window = window;
     }
 
     /// The engine's log-capture posture (story 17-4). `Copy` — a snapshot,
@@ -2065,6 +2139,18 @@ fn cause_suffix(cause: &TransitionCause) -> String {
             }
             None => format!(" (unresponsive: {check}, failing for {failing_for_ms}ms)"),
         },
+        // Restart-requested (story 18-3): spell the WIRE TAG + the code — same
+        // greppability rule as `detached-resumed`/`unresponsive` above. The
+        // declared-class detail (when the reaper recorded one) appends so the
+        // verdict rides the same line.
+        TransitionCause::RestartRequested { code, detail } => match detail {
+            Some(detail) => format!(" (restart-requested: exit code {code} — {detail})"),
+            None => format!(" (restart-requested: exit code {code})"),
+        },
+        // Clean exit (story 18-3): the requested-stop shape with the declared
+        // code named — the lifecycle log records WHY the instance went
+        // `stopped` without claiming an operator stop.
+        TransitionCause::CleanExit { code } => format!(" (clean-exit: exit code {code})"),
     }
 }
 

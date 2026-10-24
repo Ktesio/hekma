@@ -57,6 +57,10 @@ expected_status = 200
 path = "heartbeat.marker"
 max_age_ms = 5000
 
+[exit_codes]
+restart_requested = [75]
+clean = [0]
+
 [config.model]
 env = "MODEL"
 ```
@@ -248,6 +252,32 @@ Rules that keep the check honest:
 - **The window lives in supervision, not in the record.** A restart spawns a fresh window; an instance adopted from a previous command's engine re-derives its window fresh at adoption; a resume re-derives it fresh too — pausing clears any open failure window, so a suspension never counts against the agent. The honest consequence: after a crash-restart, an adoption, or a resume, an agent gets up to ONE extra window of grace before a persistently-failing signal fails it again.
 - **Between commands a detached instance is not evaluated** (supervision is command-scoped — the same enforcement-window honesty `--detach` states at start). The declared check is evaluated by whichever command's engine holds the instance.
 - **A contract 1.0.0 engine rejects the section** at parse time, naming it (the older-same-major-engine rule, for free — see [the Adapter Contract](adapter-contract.md#versioning)).
+
+### `[exit_codes]` — the declared exit-code classes (added at contract 1.1.0)
+
+Two optional lists giving the agent's own exit codes DECLARED MEANING. Optional: a manifest without this section behaves exactly as before — every unrequested exit is a crash. With it, the engine classifies a coded exit out of `running` against the declared classes and acts on the MEANING, not just the fact:
+
+```toml
+[exit_codes]
+restart_requested = [75]
+clean = [0]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `restart_requested` | Exit codes by which the agent ASKS its supervisor for a relaunch (the conventional exit-75 pattern). The exit takes the crash-path dance — the instance lands `failed` with the `restart-requested` cause naming the declared class, and the Restart Policy's backoff paces the relaunch — but the consecutive-failure counter is **NOT charged**: the agent's own recycle proves neither stability nor failure, so the counter simply holds. |
+| `clean` | Exit codes by which the agent FINISHES ON PURPOSE. The instance lands `stopped` (never `failed`) with the `clean-exit` cause, the record settles exactly like a requested stop, and NO restart follows — the operator's next fresh start is the counter reset, exactly as it has always been. |
+
+Each list is optional (an empty section declares nothing and classifies nothing). Validation: every code must be in `0..=255` (the portable exit-code domain — unix exit status carries the low 8 bits, so a Windows code above 255 simply never matches a declared code); a code appearing in BOTH lists is refused at registration (both fields named); duplicates within one list are refused.
+
+Rules that keep the classes honest:
+
+- **The classes classify RUNS, not launches.** Only a CODED exit out of exactly `running` is classified. An exit during `starting` (the survival window, a readiness probe, the ACP handshake) is a launch failure on its own path — never classified, even when the code is declared. A signal termination carries no code and is never classified. A crash out of `paused` rides the plain crash path.
+- **`never` outranks the ask.** Under `Restart Policy: never` a `restart_requested` exit still lands terminal `failed` with NO restart — the cause names both the declared class and the policy verdict ("the operator's policy outranks the adapter's ask").
+- **A restart-requested loop NEVER trips the crash-loop terminal.** This is the point of the class and the stated operator contract: the operator DECLARED the code a relaunch request, so charging the crash loop toward a 5-failure terminal would punish exactly the behavior they blessed. The relaunches keep coming — but the backoff still grows with the recycle streak to its cap (60 s), so the RATE is bounded even though the terminal is unreachable. (The durable crash counter is never touched by the chain; the streak paces only the delay.)
+- **The stability anchor.** The engine separately tracks how long a run has held `running` continuously: a run that crashes after ≥ 30 s of stable running resets the consecutive-failure counter first, so the crash charges as failure #1 (the reset is named in the crash cause: "the previous run was stable for Ns — consecutive-failure count reset"). The window is ENGINE-owned (30 s — not adapter surface), a pause interval never counts toward it (the anchor restamps at every resume — the resumed run re-proves the whole window), and an adopted instance's anchor starts at ADOPTION: its pre-adoption run time is not observable, so its crash resets only after the adopting engine has itself watched the run for the whole window. A fresh operator start resets the counter too, exactly as it always has.
+- **Adopted instances classify nothing on unix.** An adopted process is not the engine's child, so its exit code is unrecoverable on unix (the crash cause says so) — the classes apply again after a stop and a fresh start.
+- **A contract 1.0.0 engine rejects the section** at parse time, naming it (see [the Adapter Contract](adapter-contract.md#versioning)).
 
 ## See Also
 

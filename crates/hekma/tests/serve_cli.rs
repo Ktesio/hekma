@@ -975,3 +975,260 @@ fn serve_control_api_flag_pair_resolves_the_bearer_and_answers_over_the_wire() {
         "a loopback bind never warns:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Story 18-3: declared exit-code classes at the CLI, end-to-end.
+//
+// The classification needs the SPAWNING engine's exit code: on unix an
+// ADOPTED process's exit code is unrecoverable (AI-13 — only a parent gets
+// an ExitStatus), so a detached start + `logs --follow` drill can never see
+// a classified exit. The honest CLI shape is the HOST: `hekma serve` is the
+// long-lived parent that SPAWNS the agent (through the Control API's
+// start route), its reaper classifies the exit with the real code in hand,
+// and — after the bounded SIGTERM drain releases the state-dir lock —
+// `hekma agent show` names the class through the existing projection.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn served_exit_75_request_lands_failed_and_show_names_the_declared_class() {
+    if is_windows() {
+        return; // POSIX `kill`-based SIGTERM (the file's standing note).
+    }
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let m = ctx.project_dir.join("exit75-adapter");
+    ManifestFixture::new("fake", &["--exit-with", "75:2500", "--linger-ms", "600000"])
+        .capability_on_os("interaction", current_os_key(), "guaranteed")
+        .exit_codes("restart_requested = [75]")
+        .write(&m);
+    run_hekma_agent(
+        [
+            "agent",
+            "register",
+            "polite",
+            "--manifest",
+            m.to_str().unwrap(),
+        ]
+        .as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+    // The `never` policy seed (pid 0 — the set_restart_policy-before-start
+    // shape), written BEFORE serve locks the state dir: the operator's
+    // policy outranks the adapter's ask, so the landing is terminal and
+    // `show`'s failed-cause fold carries BOTH the class and the verdict.
+    {
+        let conn = rusqlite::Connection::open(state_dir.join("state.db")).expect("open state db");
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = ?1",
+                ["polite"],
+                |r| r.get(0),
+            )
+            .expect("instance id");
+        conn.execute(
+            "INSERT INTO agent_runtime \
+             (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+             VALUES (?1, 0, 0, 'never', 0, NULL)",
+            rusqlite::params![id],
+        )
+        .expect("insert the never policy seed");
+    }
+
+    // The bearer + the host (the 17-3 secrets-file leg).
+    let secrets = state_dir.join(hekma_engine::paths::SECRETS_FILE);
+    std::fs::write(
+        &secrets,
+        format!("{CONTROL_API_BEARER_NAME} = \"{CONTROL_API_BEARER_VALUE}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let (mut serve, drainer) = spawn_serve_with(
+        &state_dir,
+        &[
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--bearer-secret",
+            CONTROL_API_BEARER_NAME,
+        ],
+    );
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match raw_request(&addr, "GET", "/v0/version", None) {
+            Some((200, _)) => break,
+            Some((status, _)) => panic!("the version probe answered {status}"),
+            None => assert!(Instant::now() < deadline, "the control api never answered"),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // START through the HOST — serve is the SPAWNING parent, so the exit
+    // code survives to the reaper (the adoption-shaped drills lose it).
+    let (status, _) = raw_request(&addr, "POST", "/v0/instances/polite/start", None)
+        .expect("the start route answered");
+    assert_eq!(status, 200, "the host-mode start must succeed");
+
+    // The exit-75 lands ~2.5s in; the reaper classifies it (≤ one tick
+    // later) and — the operator's `never` outranking the ask — leaves the
+    // instance TERMINAL failed. Poll the status route until it lands.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match raw_request(&addr, "GET", "/v0/instances/polite/status", None) {
+            Some((200, body)) if body.contains("\"state\":\"failed\"") => break,
+            Some((200, _)) => {}
+            other => panic!("the status route never answered 200: {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restart-requested failure never landed under the host"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The bounded drain releases the state-dir lock (exit 0 — a failed
+    // instance holds no process to stop).
+    let exit = signal_and_wait(&mut serve, "the exit-75 e2e shutdown");
+    assert_eq!(exit.code(), Some(0));
+    let _stderr = drainer.join().unwrap();
+
+    // `show` names the declared class + code (and the never verdict) through
+    // the EXISTING failed-cause projection — no new verb.
+    let show = run_hekma_agent(
+        ["agent", "show", "polite"].as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+    let shown = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        shown.contains("Failed cause")
+            && shown.contains("exit code 75")
+            && shown.contains("restart_requested"),
+        "show must name the declared class + code: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+}
+
+#[test]
+fn served_clean_exit_lands_stopped_and_show_reports_it() {
+    if is_windows() {
+        return; // POSIX `kill`-based SIGTERM (the file's standing note).
+    }
+    let ctx = TestContext::new();
+    let state_dir = ctx.project_dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let m = ctx.project_dir.join("clean-exit-adapter");
+    ManifestFixture::new("fake", &["--exit-with", "0:2500", "--linger-ms", "600000"])
+        .capability_on_os("interaction", current_os_key(), "guaranteed")
+        .exit_codes("clean = [0]")
+        .write(&m);
+    run_hekma_agent(
+        [
+            "agent",
+            "register",
+            "finisher",
+            "--manifest",
+            m.to_str().unwrap(),
+        ]
+        .as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+    // No policy seed: the shipped `on-failure` default is the SHARP subject
+    // — a policy that restarts failures must still not restart a
+    // declared-clean exit.
+
+    let secrets = state_dir.join(hekma_engine::paths::SECRETS_FILE);
+    std::fs::write(
+        &secrets,
+        format!("{CONTROL_API_BEARER_NAME} = \"{CONTROL_API_BEARER_VALUE}\"\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let (mut serve, drainer) = spawn_serve_with(
+        &state_dir,
+        &[
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+            "--bearer-secret",
+            CONTROL_API_BEARER_NAME,
+        ],
+    );
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match raw_request(&addr, "GET", "/v0/version", None) {
+            Some((200, _)) => break,
+            Some((status, _)) => panic!("the version probe answered {status}"),
+            None => assert!(Instant::now() < deadline, "the control api never answered"),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let (status, _) = raw_request(&addr, "POST", "/v0/instances/finisher/start", None)
+        .expect("the start route answered");
+    assert_eq!(status, 200, "the host-mode start must succeed");
+
+    // The declared exit-0 lands ~2.5s in: `running → stopped` with the
+    // CleanExit cause, settled like a requested stop — NEVER `failed`.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match raw_request(&addr, "GET", "/v0/instances/finisher/status", None) {
+            Some((200, body)) if body.contains("\"state\":\"stopped\"") => break,
+            Some((200, body)) => {
+                assert!(
+                    !body.contains("\"state\":\"failed\""),
+                    "a declared-clean exit must never land failed: {body}"
+                );
+            }
+            other => panic!("the status route never answered 200: {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the clean landing never surfaced under the host"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let exit = signal_and_wait(&mut serve, "the clean-exit e2e shutdown");
+    assert_eq!(exit.code(), Some(0));
+    let _stderr = drainer.join().unwrap();
+
+    // `show` reports the stopped state, with NO failed cause.
+    let show = run_hekma_agent(
+        ["agent", "show", "finisher"].as_slice(),
+        &ctx.project_dir,
+        &state_dir,
+    );
+    let shown = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        shown.contains("stopped"),
+        "show must report the stopped state: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+    assert!(
+        !shown.contains("Failed cause"),
+        "a clean exit never carries a failed cause: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+}
