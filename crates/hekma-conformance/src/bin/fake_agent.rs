@@ -66,6 +66,13 @@
 //!   NOT a one-shot server: the engine's readiness probe opens a fresh
 //!   connection on every poll and each one is answered. The target a manifest's
 //!   `http-get` readiness probe polls. Pure `std`, NO OS-cfg.
+//! * `--http-ready-after <MS>`  DELAY the `--http-ready` endpoint: nothing is
+//!   bound on the port until `<MS>` after PROCESS START (then the ordinary
+//!   persistent responder takes over for the process's whole lifetime). The
+//!   late-binding subject: a drill can PROVE the engine's gate actually held —
+//!   before `<MS>` the probe cannot pass, so a start that lands `running`
+//!   early skipped the wait. Requires `--http-ready` (refused with exit 2
+//!   otherwise — there is no endpoint to delay). Pure `std`, NO OS-cfg.
 //! * `--ready-file <PATH>:<DELAY_MS>`  create `<PATH>` after `<DELAY_MS>` — the
 //!   signal a manifest's `file-fresh` readiness probe waits for; the delay
 //!   proves the probe genuinely waited. Pure `std`, NO OS-cfg.
@@ -347,6 +354,13 @@ struct Opts {
     /// every connection with the given status. Lets a manifest's `http-get`
     /// readiness probe pass against THIS process. `None` = no endpoint.
     http_ready: Option<(u16, u16)>,
+    /// Delay the `--http-ready` endpoint by this many ms FROM PROCESS START
+    /// (18-5 review round 1, A2): nothing is bound on the port until the
+    /// delay elapses, so a start declared `running` before it provably
+    /// skipped the readiness wait — the late-binding subject a gate-hold
+    /// drill observes. `None` = bind immediately (the default; existing
+    /// tests unaffected).
+    http_ready_after: Option<u64>,
     /// Create this file after `<delay_ms>` (the readiness-gate story): the
     /// readiness signal a manifest's `file-fresh` probe watches for. The delay
     /// gates WHEN the file appears (so a test can prove the probe genuinely
@@ -481,6 +495,7 @@ fn parse() -> Opts {
     let mut sniff_stdin_at_startup = false;
     let mut drop_env: Vec<String> = Vec::new();
     let mut http_ready: Option<(u16, u16)> = None;
+    let mut http_ready_after: Option<u64> = None;
     let mut http_health: Option<(u16, u16)> = None;
     let mut http_health_fail_after: Option<Duration> = None;
     let mut heartbeat_file: Option<(PathBuf, u64)> = None;
@@ -573,6 +588,22 @@ fn parse() -> Opts {
                     std::process::exit(2);
                 }
             },
+            "--http-ready-after" => {
+                // Fail FAST on a missing/malformed value (the `--http-ready`
+                // convention): a silently-ignored delay would leave the
+                // endpoint binding immediately and any hold drill measuring
+                // nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => http_ready_after = Some(ms),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-ready-after requires a DELAY_MS value (got \
+                             missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--ready-file" => match args
                 .next()
                 .as_deref()
@@ -930,6 +961,17 @@ fn parse() -> Opts {
         );
         std::process::exit(2);
     }
+    // 18-5 review round 1 (A2): a delay with no endpoint is a silent no-op —
+    // a hold drill built on the pair would measure an immediately-answering
+    // responder instead of the behavior under test. Name BOTH flags in the
+    // refusal.
+    if http_ready_after.is_some() && http_ready.is_none() {
+        eprintln!(
+            "fake_agent: --http-ready-after requires --http-ready PORT:STATUS \
+             (there is no endpoint to delay)"
+        );
+        std::process::exit(2);
+    }
     // Story 18-4 (the D5 posture): a hang with no touch is a silent no-op —
     // a cap-overrun drill built on the pair would measure a command that
     // exits 0 immediately instead of the behavior under test. Name BOTH
@@ -1002,6 +1044,7 @@ fn parse() -> Opts {
         sniff_stdin_at_startup,
         drop_env,
         http_ready,
+        http_ready_after,
         ready_file,
         ready_line,
         never_ready,
@@ -1131,8 +1174,17 @@ fn main() {
     if let Some((port, status)) = opts.http_ready {
         // Persistent for this process's lifetime (NOT one-shot): the
         // engine's readiness probe reconnects on every poll and every
-        // connection is answered.
-        thread::spawn(move || serve_http_ready(port, status));
+        // connection is answered. The A2 delay (when armed) sleeps INSIDE
+        // the thread — same EARLY-start posture, but nothing is bound on
+        // the port until the delay elapses, which is how a drill proves
+        // the engine's gate genuinely held.
+        let delay = opts.http_ready_after.map(Duration::from_millis);
+        thread::spawn(move || {
+            if let Some(delay) = delay {
+                sleep(delay);
+            }
+            serve_http_ready(port, status);
+        });
     }
     if let Some((path, ms)) = opts.ready_file.clone() {
         thread::spawn(move || touch_ready_file(path, Duration::from_millis(ms)));
