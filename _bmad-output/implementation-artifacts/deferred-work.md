@@ -288,3 +288,24 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
   summary: The Linux installer keeps handing out the glibc archive; making it PREFER the static musl archive on Linux (so plain-installed binaries also run on scratch/distroless and musl systems) is DEFERRED — the static archive stays a manual release-page download for containers/scratch.
   evidence: supervisor ruling 2026-10-20 (spec change log, Ask First ruling 2): switching the Linux default is a real behavioral change — `scripts/public/install.sh` `detect_release_target` (`:282-295`, the target detection with no musl arm; `:406`, the asset name) and its pinned installer tests (`scripts/test_automation.py`, the `install prebuilt x86_64-unknown-linux-gnu (hekma + hkm)` contract) would all move. Trigger: a Host asks for it.
 
+
+## Deferred from: sprint-change-proposal-2026-10-23-adoptability (correct-course, Batch, 2026-10-23)
+
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (composite marketplace GitHub Action)
+  summary: The agents-in-CI recipe ships as workflow YAML + a docs page; the wrapped, marketplace-publishable composite Action is deferred out of v1 scope (D3, ratified 2026-10-23 — in-repo recipe).
+  evidence: FR-47's consequences name the recipe + dogfood lane only; the epic section's 20.2 bullet "The composite marketplace Action is deferred". Trigger: a third-party user asks for it.
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (full otel SDK / gRPC transport)
+  summary: AD-21 option (b) — the opentelemetry + opentelemetry-otlp crate family — stays rejected for v1 and recorded as the standing alternative behind the hand-rolled OTLP/HTTP+JSON exporter.
+  evidence: AD-21's alternatives paragraph (ARCHITECTURE-SPINE.md). Trigger: a real traces consumer (post-19.4) or a vendor must-have the hand-rolled path cannot meet.
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (Prometheus native scrape endpoint)
+  summary: A `/metrics` pull reader on the Control API is deferred; the OTel-Collector bridge covers the Prometheus need (option (c), rejected by Islam 2026-10-23, kept reachable).
+  evidence: AD-21 alternatives paragraph. Trigger: a pull-model minority asks after the collector bridge is documented.
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (per-agent collector routing)
+  summary: Per-instance collector endpoints / tenant headers are deferred; v1 exports one fleet-wide stream to one configured endpoint.
+  evidence: AD-21's config surface (one `--otlp-endpoint`). Trigger: a multi-tenant Host needs per-agent routing.
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (ledger-sourced exporter re-derivation)
+  summary: Exact cumulative accuracy after a bus lag/crash — re-deriving counters from the Usage Ledger instead of bus accumulation — is deferred; v1 surfaces drops honestly (`hekma.otlp.dropped`, restart note) per AI-18.
+  evidence: the bus contract's at-most-once crash-window semantics (`crates/hekma-engine/src/domain/bus.rs:50-68`); AD-21's "No durable telemetry persistence" rule. Trigger: a metrics consumer requires lossless-grade figures despite the surfaced-drop honesty.
+- source_spec: `sprint-change-proposal-2026-10-23-adoptability.md` §4.6 (gallery install UX)
+  summary: `hekma adapter add <name>` fetching checksummed gallery manifests is deferred; the gallery is a read-only docs catalog validated in CI for v1.
+  evidence: FR-48's consequences (curated docs page + CI validation only). Trigger: gallery traffic justifies a submission + install flow.
