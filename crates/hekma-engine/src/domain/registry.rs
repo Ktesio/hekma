@@ -971,6 +971,23 @@ impl Registry {
         Ok(())
     }
 
+    /// Take the ADOPTION LEASE on an instance's spawn record (schema v11,
+    /// issue #328) — a compare-and-set guarded by the lease value the caller
+    /// read, arbitrating the concurrent-open race over a dead-owner record.
+    /// `Ok(false)` = another engine adopted it (or the record is gone): the
+    /// caller must SKIP the record, holding no handle. See
+    /// [`crate::ports::StateStore::try_acquire_adoption_lease`].
+    pub(crate) fn try_acquire_adoption_lease(
+        &self,
+        name: &InstanceName,
+        expected: Option<crate::ports::ProcessFingerprint>,
+        leaseholder: crate::ports::ProcessFingerprint,
+    ) -> Result<bool, RegistryError> {
+        Ok(self
+            .store
+            .try_acquire_adoption_lease(name, expected, leaseholder)?)
+    }
+
     /// Settle the write-ahead spawn record (story 14-2): clear it while
     /// RETAINING an established acp session id on a pid-0 seed row, so the
     /// next start can offer it back via `session/load`. Returns whether an id
@@ -2268,6 +2285,7 @@ mod tests {
             acp_session_id: None,
             run_id: None,
             owner: None,
+            lease: None,
         };
         reg.write_spawn_record(&record).unwrap();
         assert_eq!(reg.spawn_record(&name).unwrap(), Some(record));

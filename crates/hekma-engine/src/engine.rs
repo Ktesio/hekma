@@ -72,6 +72,7 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
+use crate::shutdown::DrainOutcome;
 
 /// How often the crash-detection reaper polls supervised processes (story 1-6,
 /// `[ASSUMPTION]`). Small enough that a crash is detected promptly, large enough
@@ -1220,6 +1221,47 @@ impl Engine {
         .await
     }
 
+    /// Stop EVERY live agent through the bounded stop ladder — the shutdown
+    /// drain (issue #328 item 3's embedder facade).
+    ///
+    /// This is the graceful half of the embedder contract: dropping an
+    /// [`Engine`] kills its attached agents outright (the kill-on-drop
+    /// teardown), so an embedder that wants graceful stops calls this FIRST
+    /// and drops the engine only after it settles. [`Engine::stop`] is the
+    /// per-agent ladder; this runs it for the whole fleet:
+    ///
+    /// * every `running` AND `paused` row is stopped through the same
+    ///   bounded ladder (a paused row is resumed first so the graceful
+    ///   signal can be delivered — never the raw kill-on-drop teardown),
+    ///   one agent at a time in fleet order (the ladders serialize under
+    ///   the supervision lock regardless — worst case Σ(window) over the
+    ///   fleet);
+    /// * the fleet is re-enumerated once afterwards and any newcomer (a
+    ///   concurrent `start`, a restart policy firing mid-drain) gets the
+    ///   ladder too — capped at one extra pass;
+    /// * anything still alive after both passes is surfaced honestly: it
+    ///   will be terminated by the engine `Drop` teardown WITHOUT the
+    ///   bounded ladder, and the roll-up says exactly that.
+    ///
+    /// The drain never aborts on a per-instance failure — one un-stoppable
+    /// agent must not strand the others' stops — and every per-instance
+    /// outcome ([`DrainOutcome`]) is returned. When `notes` carries a
+    /// [`DiagnosticSink`], each step and outcome is ALSO emitted as a
+    /// `[hekma] `-prefixed notice line — exactly the stream `hekma serve`
+    /// prints at shutdown (the host's drain delegates here); pass `None` for
+    /// return-values-only. A drain stops every live row this engine can see
+    /// (adopted detached rows included — the same rows `serve` drains); the
+    /// detached-survival contract governs what happens when an engine dies
+    /// WITHOUT a drain (a crash — the next engine adopts the survivors).
+    pub async fn shutdown(
+        &self,
+        window: Duration,
+        notes: Option<&DiagnosticSink>,
+    ) -> Vec<DrainOutcome> {
+        let notes = crate::shutdown::Notes::over(notes);
+        crate::shutdown::drain_and_stop(self, window, &notes).await
+    }
+
     /// Pause a running Agent Instance with honest, per-OS semantics (story 1-5,
     /// AC1/AC2/AC3). Drives the supervisor's three-level dispatch on the effective
     /// (current-OS) pause `SupportLevel`: guaranteed → real SIGSTOP suspension +
@@ -2001,6 +2043,12 @@ impl Blocking<'_> {
     /// Blocking [`Engine::stop`].
     pub fn stop(&self, name: &str, window: Option<Duration>) -> Result<AgentInstance, EngineError> {
         self.engine.rt.block_on(self.engine.stop(name, window))
+    }
+
+    /// Blocking [`Engine::shutdown`] — the fleet-wide stop ladder for
+    /// embedders (stop every live agent gracefully, then drop the engine).
+    pub fn shutdown(&self, window: Duration, notes: Option<&DiagnosticSink>) -> Vec<DrainOutcome> {
+        self.engine.rt.block_on(self.engine.shutdown(window, notes))
     }
 
     /// Blocking [`Engine::pause`].

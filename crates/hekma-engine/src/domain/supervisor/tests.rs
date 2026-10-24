@@ -1423,14 +1423,17 @@ fn crash_engine_leaving_record(
 
 /// Best-effort cleanup of a live-but-unsupervised child left by a boundary
 /// test: rewrite its record as a plain attached orphan under a DEAD owner
-/// (an unreachable pid), let a fresh supervisor adopt it, and stop it
-/// through the real ladder (the child's detached-reaper thread reaps the
-/// exit, so the death confirmation succeeds).
+/// (an unreachable pid) with NO lease (the boundary tests that leave a
+/// leased record behind must not have their lease block the cleanup
+/// adoption), let a fresh supervisor adopt it, and stop it through the real
+/// ladder (the child's detached-reaper thread reaps the exit, so the death
+/// confirmation succeeds).
 fn adopt_and_stop_orphan(registry: &Registry, name: &str) {
     let name = InstanceName::new(name).unwrap();
     let mut record = registry.spawn_record(&name).unwrap().unwrap();
     record.detach = false;
     record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    record.lease = None;
     registry.write_spawn_record(&record).unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     assert_eq!(
@@ -1504,6 +1507,132 @@ fn adopt_orphans_adopts_a_dead_owner_record() {
     assert!(sup2.running.contains_key(&name), "the handle is re-held");
     sup2.stop(&registry, "orphan", Some(Duration::from_secs(5)))
         .unwrap();
+}
+
+#[test]
+fn adopt_orphans_skips_a_record_whose_lease_is_held_by_a_live_engine_elsewhere() {
+    // The lease-side twin of the live-owner boundary (issue #328): a record
+    // whose ADOPTION LEASE names a LIVE engine that is not this one has
+    // already been adopted — that engine holds THE armed handle, so a second
+    // engine here would arm the exact double-kill race the lease closes.
+    // Adoption skips wholesale: nothing held, nothing adopted, the record
+    // byte-unchanged.
+    let (_state, _manifest, registry) = setup_fake("leased", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let record = crash_engine_leaving_record(&mut sup1, &registry, "leased");
+    let name = InstanceName::new("leased").unwrap();
+    // Dead owner (the record is adoptable in principle) + a lease pointing
+    // at a LIVE non-self process: the surviving child itself.
+    let mut leased_elsewhere = record.clone();
+    leased_elsewhere.detach = false; // the attached shape the lease guards
+    leased_elsewhere.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    leased_elsewhere.lease = Some(record.fingerprint);
+    registry.write_spawn_record(&leased_elsewhere).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        0,
+        "a record leased to a live engine elsewhere must NOT be adopted"
+    );
+    assert!(sup2.running.is_empty(), "no handle may be re-held");
+    assert_eq!(
+        state_of(&registry, "leased"),
+        LifecycleState::Running,
+        "the row is the leaseholder's truth, untouched"
+    );
+    let after = registry.spawn_record(&name).unwrap().unwrap();
+    assert_eq!(
+        after, leased_elsewhere,
+        "the record is byte-unchanged (no lease write, no reconcile, no clear)"
+    );
+    drop(sup2);
+    adopt_and_stop_orphan(&registry, "leased");
+}
+
+#[test]
+fn adopt_orphans_takes_the_lease_when_adopting_a_dead_owners_record() {
+    // The winning adopter: over a DEAD lease (or no lease at all) the adoption
+    // compare-and-sets BEFORE re-holding the handle, so the durable record
+    // afterwards names THIS engine as the leaseholder — the identity the NEXT
+    // concurrent open arbitrates against. The owner column stays untouched
+    // (the adoption site's deliberate no-re-stamp note).
+    let (_state, _manifest, registry) = setup_fake("takeover", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "takeover");
+    let name = InstanceName::new("takeover").unwrap();
+    record.detach = false;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    // A dead leaseholder: an unreachable pid — the stale lease of an engine
+    // that adopted and then died itself.
+    record.lease = Some(crate::ports::ProcessFingerprint::new(999_999_997, 1));
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "the dead lease turns over"
+    );
+    assert!(sup2.running.contains_key(&name), "the handle is re-held");
+    let self_fp = sup2.backend.self_fingerprint().unwrap();
+    let after = registry.spawn_record(&name).unwrap().unwrap();
+    assert_eq!(
+        after.lease,
+        Some(self_fp),
+        "the winner stamped itself as the leaseholder"
+    );
+    assert_eq!(
+        after.owner,
+        Some(crate::ports::ProcessFingerprint::new(999_999_998, 1)),
+        "the owner column is NOT re-stamped by adoption (the boundary stays \
+         scoped to the original spawning owner)"
+    );
+    sup2.stop(&registry, "takeover", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adopt_orphans_re_adopts_without_a_new_cas_when_the_lease_already_names_this_process() {
+    // The self fast-path: a lease already naming THIS process (the process's
+    // own records are always adoptable by it, mirroring the owner
+    // self-check) re-adopts WITHOUT a fresh compare-and-set — observable
+    // here because the live-lease skip would otherwise refuse the process's
+    // OWN fingerprint (probe_alive(self) is Some(true)). Two supervisors in
+    // one test process share the self fingerprint.
+    let (_state, _manifest, registry) = setup_fake("revisit", &["--linger-ms", "600000"]);
+    let mut sup1 = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup1, &registry, "revisit");
+    let name = InstanceName::new("revisit").unwrap();
+    record.detach = false;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_998, 1));
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "the first adoption takes the lease"
+    );
+    let self_fp = sup2.backend.self_fingerprint().unwrap();
+    assert_eq!(
+        registry.spawn_record(&name).unwrap().unwrap().lease,
+        Some(self_fp)
+    );
+
+    // A SECOND supervisor in the SAME process (same self fingerprint): the
+    // lease names this process, so adoption proceeds — 0 here would mean the
+    // self fast-path is missing and the live-lease skip ate our own lease.
+    let mut sup3 = Supervisor::with_backoff(fast_backoff());
+    assert_eq!(
+        sup3.adopt_orphans(&registry),
+        1,
+        "this process's own lease does not block its own adoption"
+    );
+    assert!(sup3.running.contains_key(&name));
+    sup3.stop(&registry, "revisit", Some(Duration::from_secs(5)))
+        .unwrap();
+    drop(sup2); // its adopted handle's teardown on the dead pid is a no-op
 }
 
 #[test]
@@ -6361,9 +6490,11 @@ fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
     );
     // The process itself unfroze: the work log (frozen while SIGSTOPped)
     // grows again past its suspended count. Unix-only — the SIGSTOP freeze
-    // the growth proves is a Unix mechanism.
-    #[cfg(unix)]
-    {
+    // the growth proves is a Unix mechanism. Data-driven OS gate (NOT `#[cfg]` —
+    // the boundary CI job forbids OS-conditional cfg outside the enumerated
+    // allowlist; the line-3331 precedent in this file): the block's APIs are
+    // all portable, only the SIGSTOP mechanism it observes is Unix's.
+    if matches!(OsId::current(), OsId::Linux | OsId::Macos) {
         let work = registry.agent_home(&name).join("work.log");
         let frozen = work_lines(&work);
         let deadline = Instant::now() + Duration::from_secs(5);

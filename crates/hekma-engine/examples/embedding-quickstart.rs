@@ -158,6 +158,8 @@ fn main() {
     // 8. Stop: graceful shutdown with a 5-second escalation window. The whole
     //    process group/job dies — no orphan survives the host. Then clean up
     //    the scratch root (best-effort: a still-dying handle just leaves it).
+    //    (With a whole fleet, `shutdown(window, notes)` runs this ladder for
+    //    every live agent in one call — docs/embedding.md's shutdown contract.)
     host.stop(INSTANCE, Some(Duration::from_secs(5)))
         .expect("stop the agent");
     let _ = std::fs::remove_dir_all(&root);

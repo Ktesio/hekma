@@ -2,7 +2,7 @@
 title: "PRD: Ktesio — Unified Personal-Agent Runtime Engine"
 status: review
 created: 2026-07-02
-updated: 2026-09-30
+updated: 2026-10-23
 ---
 
 # PRD: Ktesio — Unified Personal-Agent Runtime Engine
@@ -81,6 +81,8 @@ The bet is that consistency itself is the product. Agents become interchangeable
 - **Drain** — stop new work, wait for in-flight work up to a bounded window, then stop (FR-42).
 - **Readiness / Liveness Probe** — Adapter-declared checks that an Agent can serve, and is still alive, beyond its process existing (FR-42).
 - **Governance Vectors** — the versioned, portable test cases that state the Engine's budget and cost decision rules (FR-44).
+- **OTLP / Telemetry Export** — the opt-in path by which the Service Host pushes engine metrics (never content) to an operator-configured OTLP collector endpoint (FR-46).
+- **Adapter Gallery** — the docs page of curated Agents that run under Hekma, each validated by the conformance kit in CI with a per-capability honesty table (FR-48).
 
 ## 4. Features
 
@@ -435,6 +437,59 @@ A Host can submit provider- or Host-confirmed usage for a Run or Task, and the E
 - Surfaces label each figure `estimated` or `reconciled` (AD-8), and totals state which label they
   carry.
 
+### 4.13 Adoptability *(added 2026-10-23 — v1.x; sprint-change-proposal-2026-10-23-adoptability.md)*
+
+#### FR-46: OTLP telemetry export
+The Operator (or Host) can configure the Service Host to export engine metrics over OTLP to a
+collector endpoint they choose. Export is opt-in and disabled by default; payloads carry counters
+and gauges derived from the Usage Ledger and supervision state — never request, response, or agent
+content, never secrets.
+**Consequences (testable):**
+- With no collector endpoint configured, no export path exists: no dial, no payload, nothing leaves
+  the machine (§6 default preserved) — enforced by test.
+- Every exported dollar figure carries its estimate/reconciled label (FR-23, FR-45) as an
+  attribute; no code path exports an unlabeled dollar amount.
+- The exposition is versioned: metric names, types and attributes are a documented, semver'd
+  surface; breaking changes follow the §7 deprecation path.
+- Payloads contain no secrets and no request/response content — the FR-14/FR-43 sentinel no-leak
+  matrix is extended to the export path.
+- A failed or undeliverable export degrades visibly (diagnostic and counter) and never delays
+  supervision or enforcement (NFR-1).
+
+#### FR-47: Agents-in-CI recipe
+The docs ship a recipe for running a budget-capped agent as a GitHub Actions step: the recipe
+starts the agent under Hekma with a Token Budget and Cost Cap, drives a review-style task, writes
+usage into `$GITHUB_STEP_SUMMARY`, and the job's outcome is honest about what ended it.
+**Consequences (testable):**
+- Spend is capped per run: a breach executes the configured Breach Action within the FR-21 latency
+  bound, and the job ends in a state that names the breach — no path masks a breach as success.
+- Every lane is wall-clock bounded (`timeout-minutes`); a lane that ends on a bound reports which
+  one — budget or clock — not a generic failure.
+- Usage lands in `$GITHUB_STEP_SUMMARY` rendered from `--json` output: tokens and derived dollars,
+  labeled estimated (FR-22/FR-23).
+- Exit codes are the stable documented surface (FR-26): success, breach, and agent failure are
+  distinguishable by a workflow consumer.
+- The recipe is exercised as a dogfood lane in this repository's own CI — a real Ktesio bot run,
+  budget-capped — not merely documented.
+
+#### FR-48: Adapter gallery
+The docs ship an adapter gallery: a curated page of Agents that run under Hekma, each entry backed
+by a manifest validated against the conformance kit in CI, with a per-capability honesty table.
+**Consequences (testable):**
+- The gallery opens with ten seed entries — Copilot CLI, Hermes, OpenCode, Claude Code, Codex,
+  Gemini CLI, goose, Crush, Aider, Cursor CLI — each a validated manifest or an honestly named gap.
+- The honesty table uses the Capability Declaration vocabulary (guaranteed / best-effort /
+  unsupported) with an explicit absence token where a capability or its metering is untested —
+  never a fabricated pass or an implied zero (AI-18).
+- Every gallery manifest is validated in CI by `hekma-conformance`; a manifest that fails, or an
+  entry claiming more than its validation proves, fails the build.
+- Where no metering tier yields usage, the entry shows the honest not-available marker naming the
+  tier (the FR-40 precedent), never a blank.
+- Public gallery pages carry no planning-provenance wording (epic/story/proposal references) —
+  enforced by the `check_docs` gate.
+- Additions respect SM-C1: an entry ships only when its controls behave uniformly; breadth is not
+  the metric.
+
 ## 5. Cross-Cutting NFRs
 
 - **NFR-1 Resilience.** An Agent crashing never crashes the Engine or `kt`; the Engine cleans up or adopts orphaned Agent processes after its own crash on next start. Partial failures across the Fleet degrade gracefully with per-instance reasons and remediations (durable gate).
@@ -451,6 +506,14 @@ A Host can submit provider- or Host-confirmed usage for a Run or Task, and the E
 - **Cost.** The product's own promise applies to itself: governance features must not depend on paid third-party services; cost enforcement runs entirely locally. Dollar figures are estimates unless reconciled (FR-23) — the Engine must never present estimate as actual.
 - **Safety.** Breach Actions act on lifecycle (pause/stop) — the Engine never silently drops an Agent's in-flight work without recording that it did (FR-6/FR-21 events). Crash-loop bounds (FR-9) prevent restart storms.
 - **Privacy.** Usage Ledgers, config, memory, and logs stay local in the Agent Home / Engine state dir; no telemetry leaves the machine. `[ASSUMPTION: zero remote telemetry in v1 — flag any exception to Islam explicitly.]`
+
+  > *(Amended 2026-10-23.)* The default stands: nothing leaves the machine unless the Operator or
+  > Host configures it to. One sanctioned exception — FR-46's OTLP metrics export: disabled unless
+  > a collector endpoint is explicitly configured; metrics only (counters and gauges derived from
+  > the Usage Ledger and supervision state); never request or response content, never secrets
+  > (FR-14). Ratified with `sprint-change-proposal-2026-10-23-adoptability.md`. §14 #18 resolves
+  > as: *zero remote telemetry by default; one opt-in, metrics-only, operator-endpointed
+  > exception.*
 
 ## 7. Public Surface, Versioning & Deprecation
 
@@ -499,7 +562,7 @@ Carried from the brief (confirmed direction, list awaiting Islam's re-confirmati
 
 ### 9.3 v1.x additions
 
-FR-40 (shipped in Epic 14) and FR-41..FR-45 (Epics 17–19, added 2026-09-30; renumbered from 15–17 on 2026-10-19 — main's autonomous Fibery-backlog tranches had consumed epic numbers 15/16 while the correct-course output sat uncommitted) are v1.x additions, not the v1 MVP.
+FR-40 (shipped in Epic 14) and FR-41..FR-45 (Epics 17–19, added 2026-09-30; renumbered from 15–17 on 2026-10-19 — main's autonomous Fibery-backlog tranches had consumed epic numbers 15/16 while the correct-course output sat uncommitted) are v1.x additions, not the v1 MVP. FR-46..FR-48 (Epic 20, added 2026-10-23 via correct-course — the Adoptability proposal) are likewise v1.x additions, not the v1 MVP.
 
 ## 10. Why Now
 
@@ -561,7 +624,7 @@ Every inline `[ASSUMPTION]`, indexed:
 15. §4.9 — FR-35 native-skills mapping is the Adapter's job; ~~FR-37 notice mechanics~~ RESOLVED 2026-07-14: moot — the legacy surface was removed outright at v0.6.0, so there are no notice mechanics to specify.
 16. §4.10 — ~~FR-38 window (≥90 days / one minor cycle)~~ RESOLVED 2026-07-14: no notice window — announce and removal both land at v0.6.0; skills.sh search dropped (Q7).
 17. §5 — NFR-4 all performance numbers placeholders; NFR-8 dependency policy.
-18. §6 — zero remote telemetry in v1.
+18. §6 — ~~zero remote telemetry in v1~~ RESOLVED 2026-10-23: zero by default; FR-46's opt-in, metrics-only, operator-endpointed OTLP export is the one sanctioned exception (the §6 amendment, ratified with `sprint-change-proposal-2026-10-23-adoptability.md`).
 19. §7 — deprecation policy mechanics.
 20. ~~§9.2/§11 — SM-1 interim measurement basis~~ RESOLVED 2026-07-02: option (a) ruled; opencode named as Adapter #2 / second Agent.
 21. §12 — epic sequencing is advisory.

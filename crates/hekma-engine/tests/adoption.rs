@@ -1461,10 +1461,44 @@ fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused()
         )
         .unwrap()
     };
+    // While the breach pause holds — frozen straight through adoption — the
+    // ledger must be FROZEN too: the adopting engine never resumed the agent
+    // and never metered anything new. Poll a short window; any growth HERE is
+    // the strand/runaway this story exists to forbid.
+    let frozen_window = Instant::now() + Duration::from_millis(750);
+    loop {
+        let count = {
+            let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_events e \
+                 JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = 'napbud'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count, committed,
+            "the ledger grew while the agent was suspended — the adopted row \
+             must stay paused, never resumed"
+        );
+        if Instant::now() >= frozen_window {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     facade.stop("napbud", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the adopted paused process");
-    // No further usage: a suspended agent emits nothing, and the ledger count
-    // is unchanged by the adoption + stop cycle.
+    // No runaway: a suspended agent emits nothing on its own. The stop ladder,
+    // though, DELIBERATELY resumes a signal-frozen process first (a suspended
+    // process cannot receive the graceful stop signal) — and in that
+    // resume→death window the agent may flush the REST of its `--emit-usage 5`
+    // batch, which the engine's terminal drain-on-reap honestly records. So
+    // the post-stop ledger may exceed the frozen count by at most the unflushed
+    // batch remainder — bounded by the batch total — never by a LIVE agent
+    // (the process is gone by this assert). The old `after == committed` pin
+    // overclaimed: it went red on the slower macos/windows runners exactly
+    // when one in-flight line landed in that window.
     let after = {
         let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
         conn.query_row(
@@ -1475,9 +1509,10 @@ fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused()
         )
         .unwrap()
     };
-    assert_eq!(
-        after, committed,
-        "no further usage may land after the breach (the agent was suspended)"
+    assert!(
+        (committed..=5).contains(&after),
+        "post-stop ledger = frozen count plus at most the resumed batch's \
+         flush (frozen {committed}, after {after}, batch total 5)"
     );
 }
 
