@@ -87,7 +87,7 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetHandleInformation, SetHandleInformation, FILETIME, HANDLE, HANDLE_FLAG_INHERIT,
-    WAIT_OBJECT_0,
+    WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -967,8 +967,21 @@ impl WindowsProcess {
             // Adopted: liveness via the opened process handle. The PRIMARY
             // signal is the wait (valid when the handle holds SYNCHRONIZE —
             // see `adopt`); the exit-code probe below is the fallback for a
-            // handle that answers WAIT_FAILED (no SYNCHRONIZE), so death
-            // confirmation never depends on the wait right alone.
+            // BLIND handle only — one that answers WAIT_FAILED (no
+            // SYNCHRONIZE), so death confirmation never depends on the wait
+            // right alone. It must NOT run for WAIT_TIMEOUT: a process whose
+            // termination is only INITIATED still answers WAIT_TIMEOUT (the
+            // object signals when teardown COMPLETES) while GetExitCodeProcess
+            // already reports the exit code TerminateProcess recorded at
+            // initiation — probing there reports a false `Exited` for a
+            // process that still exists (windows-latest triage 2026-10-24,
+            // layer 8 of the detached-wedge drill: `stop`'s `confirm_death`
+            // passed on its first poll while the wedged listener still
+            // accepted connections, so the forced-stop "succeeded" with the
+            // port still bound — deterministic on a loaded runner where
+            // teardown always outlives the immediately-following probe, and
+            // impossible on Unix, where the SIGKILL ladder confirms via
+            // waitpid before returning).
             None => {
                 if self.adopted.is_null() {
                     // No handle at all — treat as gone (defensive; not normally
@@ -976,7 +989,10 @@ impl WindowsProcess {
                     return Ok(ProcessStatus::Exited { code: None });
                 }
                 let waited = unsafe { WaitForSingleObject(self.adopted, 0) };
-                if waited != WAIT_OBJECT_0 {
+                if waited == WAIT_FAILED {
+                    // BLIND handle (no SYNCHRONIZE — `adopt` always opens the
+                    // right, so this is the defensive arm): the exit-code probe
+                    // is the only available signal.
                     let mut code: u32 = 0;
                     let ok = unsafe { GetExitCodeProcess(self.adopted, &mut code) };
                     if ok != 0 && code != STILL_ACTIVE {
@@ -984,6 +1000,12 @@ impl WindowsProcess {
                             code: Some(code as i32),
                         });
                     }
+                    return Ok(ProcessStatus::Alive);
+                }
+                if waited != WAIT_OBJECT_0 {
+                    // WAIT_TIMEOUT: the process exists but is not signaled —
+                    // alive, including the termination-initiated-but-not-yet-
+                    // complete window (see the branch comment above).
                     return Ok(ProcessStatus::Alive);
                 }
                 let mut code: u32 = 0;
