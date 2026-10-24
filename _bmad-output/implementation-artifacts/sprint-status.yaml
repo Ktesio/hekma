@@ -188,8 +188,8 @@ development_status:
   18-1-readiness-probes: in-progress  # PR #335 open (round 1 applied, gates 1810/0); awaiting maintainer squash-merge after #334
   18-2-liveness-and-the-unresponsive-failure: in-progress  # PR #336 open (round 1 + orchestrator P8 correction applied, gates 1854/0); awaiting merge after #335
   18-3-exit-code-classes-and-the-stable-window-reset: in-progress  # PR #338 open (round 1 applied, gates 1891/0); awaiting merge after #336
-  18-4-cooperative-pause-commands-and-the-drain-verb: in-progress  # impl 45d5840 (gates green 1921/0); 4-layer review round 1 done 2026-10-24 (3 surviving mutations, resume misdispatch, overrun-pause lying edge), patch round underway
-  18-5-a-service-mode-gateway-as-a-manifest-adapter: backlog
+  18-4-cooperative-pause-commands-and-the-drain-verb: in-progress  # PR #339 open (round 1 applied, gates 1936/0); awaiting merge after #338
+  18-5-a-service-mode-gateway-as-a-manifest-adapter: in-progress  # impl 641bc1b (gates green 1952/0); 4-layer review round 1 done 2026-10-24 (5 wiring mutations passed the suite — proof wiring unpinned), patch round underway
   epic-18-retrospective: optional
   epic-19: in-progress  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber); started 2026-10-23 — 19-1 runs FIRST overall per the ratified handoff, then Epic 18's stack, then 19-2..19-5
   19-1-governance-conformance-vectors: in-progress  # FOUNDATION — runs first; an external Host consumer waits on it. Spec 2026-10-23 (autonomous mode per Islam's cadence ruling); implementation underway on feat/epic-19-1-governance-vectors

@@ -20,22 +20,36 @@
 //!
 //! ## Who is under test in each section (subject vs probe twins)
 //!
-//! Plainly: **four sections demonstrate the CALLER'S adapter itself**, and
-//! **four prove the engine seam through TCK-authored probe twins**. Nothing
-//! mutates the caller's adapter.
+//! Plainly: **the sections demonstrate the CALLER'S adapter itself where its
+//! declaration names behavior, and prove the engine seams through TCK-authored
+//! probe twins** — the failing legs ALWAYS run on twins, so nothing mutates
+//! or deliberately kills the caller's adapter.
 //!
 //! * Caller's adapter (registered as `tck-subject`): `capability_edges`
 //!   (its persisted projection), `lifecycle` (its start/stop transitions; the
 //!   crash leg uses a TCK-authored twin so the caller's process is never
 //!   deliberately killed), `pause` (its process is paused/resumed; the
-//!   real-suspension freeze proof uses a TCK heartbeat probe), and
-//!   `config_mapping` for manifest subjects (its OWN declared rules are set
-//!   on it and proven through its dump artifact).
+//!   real-suspension freeze proof uses a TCK heartbeat probe), `config_mapping`
+//!   for manifest subjects (its OWN declared rules are set on it and proven
+//!   through its dump artifact), and — where its declaration names them — the
+//!   service sections' healthy legs: `drain` (the composite runs on the
+//!   subject's own declared pair + idle signal), `readiness` (its start is
+//!   gated by its own probe), and `liveness` (a healthy run holds `running`
+//!   past its declared window).
 //! * TCK-authored probe twins (fresh registered instances in the same
 //!   engine, each proving the SAME engine seam under the probe's own
 //!   declaration): `metering_self_reported`, `metering_engine_observed`,
 //!   `memory` (attach/deliver/detach on a twin declaring the reserved key),
-//!   and `interaction` (echo on a twin declaring the level under test).
+//!   `interaction` (echo on a twin declaring the level under test), the
+//!   service sections' FAILING legs (a never-ready readiness twin, a
+//!   dead-heart liveness twin, and a never-idle drain twin), and ALL of
+//!   `exit_classes` — its applicability is decided from the subject's
+//!   declaration, but the demonstration runs on an exit-75 relauncher twin
+//!   (a declared-class recycle must not touch the consecutive-failure
+//!   counter), an unclassified-exit charger twin (its crash MUST charge the
+//!   counter 0→1 — A4: the relaunch leg's all-zeros shape alone cannot
+//!   prove the counter is read), and a clean-exit-0 finisher twin (a
+//!   subject is never deliberately exited).
 //!
 //! A native (non-manifest) subject's config section reads not_applicable —
 //! its code-declared launch offers no `--dump <path>` seam to observe
@@ -45,7 +59,7 @@
 //!
 //! [`run_conformance_with`] takes a [`TckConfig`]: a per-poll section
 //! timeout (default 30s), a caller-owned state root (default: a fresh
-//! hermetic tempdir), and a section subset (default: all eight —
+//! hermetic tempdir), and a section subset (default: all twelve —
 //! [`run_conformance`] delegates to the default config byte-for-byte). A
 //! subset yields FEWER report entries in the same fixed order and the same
 //! shape; completeness is "complete for the selected set". A caller-owned
@@ -74,7 +88,50 @@
 //!   qualifier causes; Unsupported checks the level BEFORE starting the
 //!   subject and reports `not_applicable` with a reason naming the
 //!   declaration (the engine's fail-fast `CapabilityUnsupported` is honest
-//!   behavior — the DECLARATION is the input the harness tests).
+//!   behavior — the DECLARATION is the input the harness tests). A subject
+//!   that declares the `[lifecycle.pause]`/`[lifecycle.resume]` COMMAND pair
+//!   demonstrates the COOPERATIVE path instead (the engine's declared-command
+//!   dispatch outranks the capability table on every OS and level), with the
+//!   `pause-cooperative` / `resume-cooperative` causes — and a Guaranteed
+//!   level still proves the real-suspension seam on the TCK's own signal-path
+//!   probe.
+//! * `drain` (18-5) — declared `[drain]`: the drain composite on the SUBJECT
+//!   itself (its declared pause command + idle signal completing inside its
+//!   declared bound: `completed: true`, the honest waited_ms) plus a
+//!   never-idle TWIN whose drain burns its bound and STILL stops
+//!   (`completed: false`). Undeclared → `not_applicable` naming the absence.
+//! * `readiness` (18-5) — declared `[readiness]`: the subject's start is
+//!   gated (start → running lands only through the declared probe, the
+//!   `adapter-ready` edge) and a never-ready TWIN's start times out terminal
+//!   (`readiness-timeout` naming the probe, no restart under a
+//!   restart-allowing policy). Undeclared → `not_applicable`.
+//! * `liveness` (18-5) — declared `[liveness]`: a healthy run holds `running`
+//!   past the declared window (no `unresponsive` edge) and a dead-heart TWIN
+//!   lands `failed` with the `unresponsive` cause (check + failing streak
+//!   bracketing the declared window) under a Never policy. Undeclared →
+//!   `not_applicable`.
+//! * `exit_classes` (18-5) — declared `[exit_codes]` WITH classes, the
+//!   demonstration run on twins (the subject's declaration decides
+//!   applicability; a subject is never deliberately exited): an exit-75
+//!   TWIN relaunches (the `restart-requested` cause, the consecutive-failure
+//!   counter observed UNCHANGED across the recycle), an UNCLASSIFIED-exit
+//!   TWIN charges the counter 0→1 (A4 — the relaunch leg's all-zeros shape
+//!   is indistinguishable at run level from a deleted check; the charge is
+//!   not), and a clean-exit-0 TWIN lands `stopped` (the `clean-exit` cause,
+//!   settled, no plan). A declared-but-EMPTY `[exit_codes]` (both lists
+//!   absent) is an honest declaration of nothing to prove → `not_applicable`
+//!   NAMING the emptiness. Undeclared → `not_applicable`.
+//!
+//! ## Run evidence (18-5 review round 1, A1)
+//!
+//! [`run_conformance_with_evidence`] pairs the report with a
+//! [`ServiceRunEvidence`] receipt: each section's validators return their
+//! verified observables (the rendered cooperative commands, the observed
+//! hold flags, the honest waits, the counter readings) and the pipeline
+//! threads them into the receipt. A deleted validator call can no longer
+//! pass silently — its evidence fields stay at their `None` defaults, and
+//! the harness's own integration tests assert them non-default on real
+//! declaring subjects.
 //! * `config_mapping` — the SUBJECT's own declared `[config]` env rules are
 //!   set on the subject before start and proven delivered through the
 //!   subject's own `--dump <path>` artifact; the `agent.*` pass-through key
@@ -121,7 +178,9 @@ use serde::{Deserialize, Serialize};
 use hekma_adapter_api::{Capability, MeteringSource, OsId, SupportLevel};
 use hekma_engine::domain::InstanceName;
 use hekma_engine::paths::EnginePaths;
-use hekma_engine::{AdapterRef, Engine, LifecycleState, MemoryBackingKind, RestartPolicy};
+use hekma_engine::{
+    AdapterRef, Engine, EngineEvent, LifecycleState, MemoryBackingKind, RestartPolicy,
+};
 
 /// How long any single section's poll may run by DEFAULT before it fails the
 /// section (never the harness) with a timeout reason. Generous: this covers a
@@ -162,6 +221,70 @@ const MEMORY_PROBE_ENV_VAR: &str = "AGENT_MEMORY_DIR";
 const CRASH_AFTER_MS: u64 = 450;
 /// The exit code the crash twin exits with (asserted in the failed cause).
 const CRASH_WITH: i32 = 7;
+
+// --- The 18-5 service sections' twin-arming constants (each a DECLARED
+// --- manifest shape the twin legs register; never a live-subject edit) ---
+
+/// The never-ready readiness twin's declared probe budget — the honest wait
+/// its start burns before landing `failed`. Short enough to keep the suite
+/// quick, long enough that the waited bracket below proves a REAL wait.
+const READINESS_TWIN_TIMEOUT_MS: u64 = 1000;
+/// The readiness twin's waited bracket slack: the timeout plus the runner's
+/// poll overshoot (the engine's own readiness drill uses the same shape).
+const READINESS_TWIN_SLACK_MS: u64 = 1500;
+/// The dead-heart liveness twin's declared `max_age_ms` — above the 250ms
+/// observability floor, below a second, so the expiry is quick and provable.
+const LIVENESS_TWIN_WINDOW_MS: u64 = 600;
+/// How long the dead-heart twin's heartbeat BEATS before stopping (A6): a
+/// LIVE signal that dies — the leg proves the fresh→stale re-evaluation the
+/// spec's letter names ("kill the declared signal"), never merely the
+/// absent-file arm. Comfortably above two beats at the 50ms interval.
+const LIVENESS_TWIN_BEAT_STOP_MS: u64 = 200;
+/// The liveness twin's failing-streak bracket slack above the window (the
+/// engine's own liveness drill bracket: window + one tick of slop).
+const LIVENESS_TWIN_STREAK_SLACK_MS: u64 = 1000;
+/// How long after an exit-class twin's process starts the DECLARED exit
+/// fires (`--exit-with CODE:DELAY`) — comfortably past `running`, well under
+/// a second, so the recycle is quick.
+const EXIT_DELAY_MS: u64 = 600;
+/// How long the clean-exit leg watches for a restart plan that must not
+/// come (a restart-planning mutant relaunches within the base backoff).
+const CLEAN_EXIT_NO_PLAN_WATCH_MS: u64 = 2500;
+/// The never-idle drain twin's declared bound — long enough to prove the
+/// wait genuinely burned, short enough to keep the suite quick.
+const DRAIN_TWIN_BOUND_MS: u64 = 1200;
+/// The drain twin's waited-bracket slack above the bound it actually used
+/// (the engine's own timed-out drain drill brackets).
+const DRAIN_TWIN_CEILING_MS: u64 = 3200;
+/// The completed drain's waited-bracket floor FALLBACK (A3): when the idle
+/// file's own arrival instant cannot be observed (unreadable, or the file
+/// predates the drain), the floor falls back to the lesser of this and half
+/// the effective bound — still a real floor, always satisfiable.
+const DRAIN_COMPLETED_FLOOR_MS: u64 = 500;
+/// The A3 observed-arrival floor's scheduling slack: the idle file's mtime
+/// minus the drain's start, minus this — wall-clock stamps and the drain's
+/// t0 never agree to the millisecond, and the floor must never fail-false on
+/// a sub-slack skew.
+const DRAIN_ARRIVAL_SLACK_MS: u64 = 150;
+/// The timed-out twin's floor slack under the bound it actually used: the
+/// wait must have genuinely burned the bound (minus this much scheduling
+/// slop), never skipped.
+const DRAIN_TIMEDOUT_FLOOR_SLACK_MS: u64 = 200;
+/// How long the healthy liveness leg holds the subject past its declared
+/// window before asserting no unresponsive edge: the window plus two reaper
+/// ticks of slop (the engine's expiry bracket).
+const LIVENESS_HEALTHY_HOLD_SLACK_MS: u64 = 750;
+/// How long the relaunch leg's stop loop waits for a recycled run to settle
+/// between stop attempts (a recycled run exits 75 again on ITS OWN schedule;
+/// a stop racing that exit lands Failed and the loop tries once more).
+const RELAUNCH_STOP_ROUNDS: u32 = 3;
+/// The kill rounds AFTER the polite rounds (18-5 review round 1, B1): a twin
+/// whose recycle keeps beating the polite window gets stops with an
+/// escalation-forcing window — the engine's forced kill still lands.
+const RELAUNCH_KILL_ROUNDS: u32 = 6;
+/// The kill round's stop window: short enough that the engine's graceful
+/// window elapses and the escalation (forced kill) fires.
+const RELAUNCH_KILL_WINDOW_MS: u64 = 50;
 
 // ---------------------------------------------------------------------
 // Report types (the machine-readable contract)
@@ -275,6 +398,138 @@ impl ConformanceReport {
     }
 }
 
+/// The service sections' RUN-LEVEL EVIDENCE (18-5 review round 1, A1): the
+/// observables each section's assertions verified, recorded BY the validators
+/// on success and left at the `None` defaults whenever the check did not run.
+/// A `pass` whose evidence stayed default did NOT prove anything at run
+/// level — a consumer gate asserts the evidence is populated next to the
+/// pass, so a deleted assertion cannot degrade the report silently. All
+/// fields are additive `Option`s under the report schema's additivity
+/// policy; `Default` is the "nothing was proven" shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceRunEvidence {
+    /// The readiness section's receipt.
+    #[serde(default)]
+    pub readiness: ReadinessEvidence,
+    /// The liveness section's receipt.
+    #[serde(default)]
+    pub liveness: LivenessEvidence,
+    /// The exit_classes section's receipt.
+    #[serde(default)]
+    pub exit_classes: ExitClassesEvidence,
+    /// The drain section's receipt.
+    #[serde(default)]
+    pub drain: DrainEvidence,
+    /// The pause section's receipt (the cooperative pair's rendered
+    /// commands — the drain-then-pause ordering means the pause section's
+    /// lookup must survive the drain leg's earlier events).
+    #[serde(default)]
+    pub pause: PauseEvidence,
+}
+
+/// The readiness section's receipt (A1/A2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessEvidence {
+    /// The healthy leg held the start open past the declared hold: `start`
+    /// was still unfinished past the bus-anchored threshold (A2 — the gate
+    /// PROVED it held; `None` = no hold was observable or the leg never ran).
+    #[serde(default)]
+    pub hold_proven: Option<bool>,
+    /// The bus carried the subject's `starting` commitment (the anchor — the
+    /// transition had not committed before the hold began).
+    #[serde(default)]
+    pub mid_hold_saw_starting: Option<bool>,
+    /// Evidence-only: the bus carried the subject's `running` edge during
+    /// the hold (a benign race between the transition commit and the start
+    /// call's return — recorded, never failed on).
+    #[serde(default)]
+    pub mid_hold_saw_running: Option<bool>,
+    /// The final edge was `starting→running` under the adapter-ready cause
+    /// (the gate opened through the declared probe).
+    #[serde(default)]
+    pub ready_edge_adapter_ready: Option<bool>,
+    /// The never-ready twin's observed probe wait in ms (the honest bracket's
+    /// measured value).
+    #[serde(default)]
+    pub timeout_waited_ms: Option<u64>,
+}
+
+/// The liveness section's receipt (A1/A6).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivenessEvidence {
+    /// The healthy leg held the run `running` for this many ms past the
+    /// declared window with no unresponsive edge.
+    #[serde(default)]
+    pub healthy_held_ms: Option<u64>,
+    /// The dead-heart twin's observed failing streak in ms (bracketed the
+    /// declared window).
+    #[serde(default)]
+    pub failing_streak_ms: Option<u64>,
+}
+
+/// The exit_classes section's receipt (A1/A4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitClassesEvidence {
+    /// The relaunch leg verified the consecutive-failure counter untouched.
+    #[serde(default)]
+    pub relaunch_counter_unchanged: Option<bool>,
+    /// The charger leg's counter BEFORE the unclassified exit (A4 — the
+    /// charge the relaunch leg's all-zeros shape cannot distinguish).
+    #[serde(default)]
+    pub charger_counter_before: Option<u32>,
+    /// The charger leg's counter AFTER the unclassified exit (> before).
+    #[serde(default)]
+    pub charger_counter_after: Option<u32>,
+    /// The clean-exit leg settled stopped with no restart plan.
+    #[serde(default)]
+    pub clean_settled: Option<bool>,
+}
+
+/// The drain section's receipt (A1/A3).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainEvidence {
+    /// The subject leg's `completed` truth.
+    #[serde(default)]
+    pub subject_completed: Option<bool>,
+    /// The subject leg's honest waited_ms.
+    #[serde(default)]
+    pub subject_waited_ms: Option<u64>,
+    /// The observed-arrival floor the subject leg APPLIED (A3 — derived from
+    /// the idle file's own mtime, not a constant; `None` = no floor applied,
+    /// i.e. no declared idle signal).
+    #[serde(default)]
+    pub subject_floor_ms: Option<u64>,
+    /// The never-idle twin's `completed: false`.
+    #[serde(default)]
+    pub twin_completed: Option<bool>,
+    /// The never-idle twin's waited_ms (burned its bound).
+    #[serde(default)]
+    pub twin_waited_ms: Option<u64>,
+}
+
+/// The pause section's receipt (A1/A5): the rendered cooperative commands
+/// the typed cause match verified (reverse-looked-up past the drain leg's
+/// earlier events).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseEvidence {
+    /// The rendered pause command the `pause-cooperative` cause named.
+    #[serde(default)]
+    pub pause_command: Option<String>,
+    /// The rendered resume command the `resume-cooperative` cause named.
+    #[serde(default)]
+    pub resume_command: Option<String>,
+}
+
+/// One drain leg's verified observables — the piece [`drain_outcome_defect`]
+/// returns on `Ok` (A1): the call site threads it into
+/// [`DrainEvidence`], so a deleted validator call leaves that receipt at
+/// its `None` defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrainLegEvidence {
+    completed: bool,
+    waited_ms: u64,
+}
+
 /// The adapter under test: a manifest directory (the third-party shape) or a
 /// native builtin registered by kind (the hermes pass).
 #[derive(Clone, Debug)]
@@ -364,6 +619,290 @@ impl TckAdapter {
             .memory_dir_target()?
             .and_then(|target| target.env_var().map(str::to_string)))
     }
+
+    /// The 18-5 service sections' single-read view of the subject's
+    /// DECLARATION — the ONE parsed read serving the four new sections'
+    /// applicability gates AND the pause section's command-pair awareness
+    /// (the memory section's TOCTOU fix applied to the whole service family:
+    /// a section's gate and its proof can never disagree between reads).
+    /// The text is THREADED in by the pipeline (one read after registration —
+    /// 18-5 review round 1, B3): the gates decide from the same bytes the
+    /// engine registered against, never from an independent re-read that
+    /// could race a caller-side file change. `text` is `None` only for a
+    /// native builtin (whose compiled-in table carries NONE of the
+    /// manifest-declared service sections). A parse/validation failure of
+    /// the threaded text is `Err` — never a collapsed "declares nothing",
+    /// which would fabricate honest-looking not_applicable verdicts about a
+    /// declaration the harness could not read.
+    fn service_declaration(&self, text: Option<&str>) -> Result<ServiceDeclaration, String> {
+        match self {
+            TckAdapter::Manifest(_) => {
+                let text = text.ok_or(
+                    "a manifest adapter reached the service declaration read without its \
+                     threaded manifest text (a pipeline bug: the text is read once after \
+                     registration)",
+                )?;
+                let manifest = ::hekma_adapter_api::Manifest::from_toml_str(text)
+                    .map_err(|e| format!("could not re-parse the registered manifest: {e}"))?;
+                // The resolved sections ride `validate`'s work; a section that
+                // resolves to an error after a clean parse is a declaration
+                // defect — surfaced as the Err, never silently undeclared.
+                manifest.validate().map_err(|e| e.to_string())?;
+                let readiness = manifest
+                    .readiness_probe()
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                let liveness = manifest
+                    .liveness_check()
+                    .map_err(|e| e.to_string())?
+                    .map(|check| match check {
+                        ::hekma_adapter_api::LivenessCheck::HeartbeatFile(hb) => hb.max_age_ms,
+                        ::hekma_adapter_api::LivenessCheck::HttpGet(http) => http.max_age_ms,
+                    });
+                let exit_codes = match manifest.exit_codes().map_err(|e| e.to_string())? {
+                    // A declared-but-empty `[exit_codes]` (both lists absent)
+                    // parses and resolves clean — it is an honest declaration
+                    // OF NOTHING: no class to prove, no failure to expose
+                    // (18-5 review round 1, A4). The section reports
+                    // not_applicable NAMING the emptiness instead of running
+                    // twins against classes that do not exist.
+                    None => ExitClassesDeclaration::Undeclared,
+                    Some(classes)
+                        if classes.restart_requested.is_empty() && classes.clean.is_empty() =>
+                    {
+                        ExitClassesDeclaration::Empty
+                    }
+                    Some(_) => ExitClassesDeclaration::Classes,
+                };
+                let drain =
+                    manifest
+                        .drain()
+                        .map_err(|e| e.to_string())?
+                        .map(|spec| DrainDeclaration {
+                            timeout_ms: spec.timeout_ms,
+                            idle_file: spec.idle_file.clone(),
+                        });
+                let lifecycle_pair = manifest
+                    .lifecycle
+                    .as_ref()
+                    .is_some_and(|l| l.pause.is_some() && l.resume.is_some());
+                // The A2 readiness-hold input: the DECLARED start args name
+                // the fixture's own late-binding delay (`--http-ready-after
+                // <MS>`), which is the earliest instant the probe can
+                // possibly pass — the hold the healthy leg observes. A
+                // subject whose args carry no such flag simply has no
+                // observable hold (the leg keeps today's weaker proof — no
+                // false-fail for third-party subjects).
+                let readiness_hold_ms = manifest
+                    .lifecycle
+                    .as_ref()
+                    .and_then(|l| l.start.as_ref())
+                    .and_then(|launch| readiness_hold_from_args(&launch.args));
+                Ok(ServiceDeclaration {
+                    readiness,
+                    readiness_hold_ms,
+                    liveness,
+                    exit_codes,
+                    drain,
+                    lifecycle_pair,
+                })
+            }
+            TckAdapter::Native(_) => Ok(ServiceDeclaration::NONE),
+        }
+    }
+
+    /// The manifest text read ONCE (the pipeline's single declaration read —
+    /// B3): `Some(text)` for a manifest adapter (a read failure is `Err`,
+    /// never a collapsed empty), `None` for a native builtin.
+    fn manifest_text(&self) -> Result<Option<String>, String> {
+        match self {
+            TckAdapter::Manifest(dir) => {
+                let path = dir.join("adapter.toml");
+                std::fs::read_to_string(&path)
+                    .map(Some)
+                    .map_err(|e| format!("could not re-read {}: {e}", path.display()))
+            }
+            TckAdapter::Native(_) => Ok(None),
+        }
+    }
+}
+
+/// The A2 readiness-hold derivation (pure): scan declared start args for
+/// `--http-ready-after <MS>` — the fixture's own late-binding delay, the
+/// earliest instant its readiness endpoint can possibly answer. Absent →
+/// `None` (no observable hold; the healthy leg keeps today's weaker proof).
+/// A malformed value (a non-numeric pair) is `None` too: the flag pair is a
+/// FIXTURE convention, not a contract — a third-party subject passing a
+/// lookalike token must not fail the section for it.
+fn readiness_hold_from_args(args: &[String]) -> Option<u64> {
+    args.iter()
+        .position(|a| a == "--http-ready-after")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// The B3 drift decision (pure, unit-pinned): the launch args the ENGINE
+/// registered (its own registration-time snapshot) against the start args the
+/// threaded manifest text now declares. A mismatch means the manifest file
+/// changed under the run — the gates would decide from a declaration the
+/// engine is no longer running, so every service section's verdict would be
+/// about a subject that no longer exists. `Err` names both sides.
+fn manifest_drift_defect(
+    registered_args: &[String],
+    declared_args: &[String],
+) -> Result<(), String> {
+    if registered_args == declared_args {
+        return Ok(());
+    }
+    Err(format!(
+        "the manifest drifted under the run: the registered start args are {registered_args:?} \
+         but the manifest now declares {declared_args:?} — the service sections' applicability \
+         was decided from a declaration the engine is no longer running; re-register and re-run"
+    ))
+}
+
+/// The five service-family dispatch arms' contexts (18-5 review round 1,
+/// B4): ONE const table so every "could not re-read" reason is single-sourced
+/// and unit-pinned per row — a section id added to the family without a row
+/// falls back to a generic context, and the pin catches the missing row.
+const SERVICE_DECLARATION_CONTEXTS: [(&str, &str); 5] = [
+    (section_ids::DRAIN, "the drain section's applicability"),
+    (section_ids::PAUSE, "the pause section's dispatch"),
+    (
+        section_ids::READINESS,
+        "the readiness section's applicability",
+    ),
+    (
+        section_ids::LIVENESS,
+        "the liveness section's applicability",
+    ),
+    (
+        section_ids::EXIT_CLASSES,
+        "the exit_classes section's applicability",
+    ),
+];
+
+/// The pure failure renderer every service-family dispatch arm shares (B4):
+/// one wording for "the declaration could not be read honestly", with the
+/// section's own context from [`SERVICE_DECLARATION_CONTEXTS`] and the
+/// underlying detail riding verbatim.
+fn declaration_read_failed(section_id: &str, detail: &str) -> SectionResult {
+    let context = SERVICE_DECLARATION_CONTEXTS
+        .iter()
+        .find(|(id, _)| *id == section_id)
+        .map(|(_, context)| *context)
+        .unwrap_or("the section's applicability");
+    SectionResult::fail(format!(
+        "the declaration could not be re-read to decide {context}: {detail}"
+    ))
+}
+
+/// The pipeline's ONE honest service-declaration decision (B3): the threaded
+/// single text read feeds the parse, and a launch-args drift between the
+/// engine's registration-time snapshot and the file's current text fails the
+/// decision (the gates must never decide from a declaration the engine is no
+/// longer running). Native builtins read [`ServiceDeclaration::NONE`] (no
+/// manifest, no drift surface).
+fn decide_service_declaration(
+    adapter: &TckAdapter,
+    state_root: &Path,
+    name: &str,
+) -> Result<ServiceDeclaration, String> {
+    let text = adapter.manifest_text()?;
+    let declaration = adapter.service_declaration(text.as_deref())?;
+    if let TckAdapter::Manifest(_) = adapter {
+        let text = text.as_deref().expect("a manifest adapter carries text");
+        let registered = registered_launch_args(state_root, name)?;
+        let declared = declared_start_args(text)?;
+        manifest_drift_defect(&registered, &declared)?;
+    }
+    Ok(declaration)
+}
+
+/// The start args the THREADED manifest text declares (the drift check's
+/// declared half). A launch-less manifest reads empty (matching the empty
+/// registered view a launch-less snapshot produces).
+fn declared_start_args(text: &str) -> Result<Vec<String>, String> {
+    let manifest = ::hekma_adapter_api::Manifest::from_toml_str(text)
+        .map_err(|e| format!("could not re-parse the registered manifest: {e}"))?;
+    Ok(manifest
+        .lifecycle
+        .as_ref()
+        .and_then(|l| l.start.as_ref())
+        .map(|launch| launch.args.clone())
+        .unwrap_or_default())
+}
+
+/// The four service sections' applicability input, read ONCE per run (see
+/// [`TckAdapter::service_declaration`]). Field-per-declaration: each section's
+/// gate consults only its own field, so an honest "undeclared" for one section
+/// says nothing about the others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceDeclaration {
+    /// A `[readiness]` section is declared (any kind).
+    readiness: bool,
+    /// The declared start args' own late-binding readiness delay
+    /// (`--http-ready-after <MS>` — 18-5 review round 1, A2): the earliest
+    /// instant the subject's endpoint can answer, i.e. the hold a healthy
+    /// start must observe. `None` = no observable hold (the flag is a
+    /// fixture convention third-party subjects need not carry).
+    readiness_hold_ms: Option<u64>,
+    /// A `[liveness]` section is declared, carrying its `max_age_ms` (the
+    /// healthy leg's no-failure observation window).
+    liveness: Option<u64>,
+    /// The `[exit_codes]` declaration's class (18-5 review round 1, A4):
+    /// undeclared, declared-but-EMPTY (both lists absent — nothing to prove),
+    /// or actually carrying classes.
+    exit_codes: ExitClassesDeclaration,
+    /// A `[drain]` section is declared, carrying its bound (`timeout_ms`)
+    /// and the idle signal's path when one is named (the completed leg's
+    /// observed-arrival floor applies only when the subject PROMISES an
+    /// external signal to wait for — 18-5 review round 1, A3).
+    drain: Option<DrainDeclaration>,
+    /// The `[lifecycle.pause]`/`[lifecycle.resume]` COMMAND pair is declared:
+    /// the pause section's dispatch-awareness input (the engine runs the
+    /// declared commands — cooperative-first — instead of the capability
+    /// dispatch, on every OS and level).
+    lifecycle_pair: bool,
+}
+
+/// The `[drain]` declaration's resolved shape (A3): the bound plus the idle
+/// signal's declared PATH — the subject leg stats that path's mtime to derive
+/// the observed-arrival floor, so the path itself must survive the read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DrainDeclaration {
+    /// The declared wait bound (`[drain].timeout_ms`).
+    timeout_ms: u64,
+    /// The declared idle marker's path (`[drain].idle_file`), if any.
+    idle_file: Option<String>,
+}
+
+/// The `[exit_codes]` declaration's resolved class (A4): the bool lost the
+/// declared-but-empty case, which is a real shape a manifest can carry (a
+/// bare `[exit_codes]` parses with both lists empty) — and its honest verdict
+/// is `not_applicable` naming the emptiness, not twins proving nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExitClassesDeclaration {
+    /// No `[exit_codes]` section at all.
+    Undeclared,
+    /// A `[exit_codes]` section declared with BOTH lists empty — an honest
+    /// declaration of nothing to prove.
+    Empty,
+    /// At least one class list carries codes.
+    Classes,
+}
+
+impl ServiceDeclaration {
+    /// The native builtin's view: a compiled-in table carries none of the
+    /// manifest-declared service sections (and no command pair).
+    const NONE: ServiceDeclaration = ServiceDeclaration {
+        readiness: false,
+        readiness_hold_ms: None,
+        liveness: None,
+        exit_codes: ExitClassesDeclaration::Undeclared,
+        drain: None,
+        lifecycle_pair: false,
+    };
 }
 
 /// The sections' stable ids (the report's machine-readable contract).
@@ -374,6 +913,18 @@ pub mod section_ids {
     pub const LIFECYCLE: &str = "lifecycle";
     /// Pause/resume per the declared support level.
     pub const PAUSE: &str = "pause";
+    /// The declared `[drain]` composite, end-to-end on the subject + the
+    /// never-idle twin (story 18-5).
+    pub const DRAIN: &str = "drain";
+    /// The declared `[readiness]` gate, healthy + never-ready twins (story
+    /// 18-5).
+    pub const READINESS: &str = "readiness";
+    /// The declared `[liveness]` watch, healthy + dead-heart twins (story
+    /// 18-5).
+    pub const LIVENESS: &str = "liveness";
+    /// The declared `[exit_codes]` classes, exit-75 + clean-exit twins
+    /// (story 18-5).
+    pub const EXIT_CLASSES: &str = "exit_classes";
     /// Unified config keys reach the agent's native mechanism.
     pub const CONFIG_MAPPING: &str = "config_mapping";
     /// Self-reported usage batches + replay dedup.
@@ -401,8 +952,16 @@ pub enum TckSection {
     CapabilityEdges,
     /// See [`section_ids::LIFECYCLE`].
     Lifecycle,
+    /// See [`section_ids::DRAIN`].
+    Drain,
     /// See [`section_ids::PAUSE`].
     Pause,
+    /// See [`section_ids::READINESS`].
+    Readiness,
+    /// See [`section_ids::LIVENESS`].
+    Liveness,
+    /// See [`section_ids::EXIT_CLASSES`].
+    ExitClasses,
     /// See [`section_ids::CONFIG_MAPPING`].
     ConfigMapping,
     /// See [`section_ids::METERING_SELF_REPORTED`].
@@ -417,11 +976,19 @@ pub enum TckSection {
 
 impl TckSection {
     /// Every section, in the fixed pipeline order (the report's documented
-    /// entry order — selection never reorders).
-    pub const ALL: [TckSection; 8] = [
+    /// entry order — selection never reorders). `drain` runs BEFORE `pause`:
+    /// the drain leg's pause command is what first writes the subject's pause
+    /// sentinel, and the idle signal anchors on its FIRST appearance — a
+    /// pause section that ran first would leave the sentinel behind and the
+    /// drain's anchored signal would predate the drain (the 18-5 finding).
+    pub const ALL: [TckSection; 12] = [
         TckSection::CapabilityEdges,
         TckSection::Lifecycle,
+        TckSection::Drain,
         TckSection::Pause,
+        TckSection::Readiness,
+        TckSection::Liveness,
+        TckSection::ExitClasses,
         TckSection::ConfigMapping,
         TckSection::MeteringSelfReported,
         TckSection::MeteringEngineObserved,
@@ -434,7 +1001,11 @@ impl TckSection {
         match self {
             TckSection::CapabilityEdges => section_ids::CAPABILITY_EDGES,
             TckSection::Lifecycle => section_ids::LIFECYCLE,
+            TckSection::Drain => section_ids::DRAIN,
             TckSection::Pause => section_ids::PAUSE,
+            TckSection::Readiness => section_ids::READINESS,
+            TckSection::Liveness => section_ids::LIVENESS,
+            TckSection::ExitClasses => section_ids::EXIT_CLASSES,
             TckSection::ConfigMapping => section_ids::CONFIG_MAPPING,
             TckSection::MeteringSelfReported => section_ids::METERING_SELF_REPORTED,
             TckSection::MeteringEngineObserved => section_ids::METERING_ENGINE_OBSERVED,
@@ -579,6 +1150,29 @@ pub fn run_conformance_with(adapter: &TckAdapter, config: &TckConfig) -> Conform
             .map_err(|(stage, detail)| stage_failure_report(adapter, config, stage.render(&detail)))
             .unwrap_or_else(|report| report)
     })
+}
+
+/// [`run_conformance_with`] plus the service sections' RUN-LEVEL EVIDENCE
+/// (18-5 review round 1, A1): the observables each section's assertions
+/// verified — the readiness hold actually observed, the drain wait's honest
+/// bracket, the counter before/after — recorded BY the validators on success
+/// and left at their `None` defaults whenever a check did not run. A section
+/// that reports `pass` without recording its evidence (a deleted validator
+/// call, an unconditional `Pass`) is detectable by the caller: a
+/// third-party CI gate can assert the evidence is POPULATED next to the
+/// `pass`, so the report cannot silently degrade into a vacuous one. The
+/// report entry stays the conformance verdict; this is the receipt.
+pub fn run_conformance_with_evidence(
+    adapter: &TckAdapter,
+    config: &TckConfig,
+) -> (ConformanceReport, ServiceRunEvidence) {
+    let mut evidence = ServiceRunEvidence::default();
+    let report = catch_report(adapter, config, || {
+        conformance_inner_evidence(adapter, config, &mut evidence)
+            .map_err(|(stage, detail)| stage_failure_report(adapter, config, stage.render(&detail)))
+            .unwrap_or_else(|report| report)
+    });
+    (report, evidence)
 }
 
 /// Which pre-section pipeline stage failed (spec 15-3: stage-differentiated
@@ -766,6 +1360,17 @@ fn conformance_inner(
     adapter: &TckAdapter,
     config: &TckConfig,
 ) -> Result<ConformanceReport, (Stage, String)> {
+    conformance_inner_evidence(adapter, config, &mut ServiceRunEvidence::default())
+}
+
+/// The evidence-collecting pipeline body (A1): identical behavior to the
+/// historical [`conformance_inner`], with the service sections recording
+/// their run-level evidence into `evidence` as their validators verify it.
+fn conformance_inner_evidence(
+    adapter: &TckAdapter,
+    config: &TckConfig,
+    evidence: &mut ServiceRunEvidence,
+) -> Result<ConformanceReport, (Stage, String)> {
     let state = prepare_state_root(config).map_err(|e| stage_err(Stage::StateRoot, e))?;
     let engine = Engine::open(Some(state.path().to_path_buf()))
         .map_err(|e| stage_err(Stage::EngineOpen, e.to_string()))?;
@@ -832,6 +1437,15 @@ fn conformance_inner(
         .find(|(c, _)| *c == Capability::Interaction)
         .map(|(_, level)| *level);
 
+    // The 18-5 service sections' single-read declaration read (the memory
+    // section's TOCTOU fix applied to the whole service family): read ONCE
+    // here (B3 — the threaded text, not an independent re-read), thread the
+    // answer down, so a section's gate and its proof can never disagree
+    // between re-reads. A read failure — or a registered-vs-declared DRIFT —
+    // is carried as `Err` and FAILS each service section naming the cause —
+    // never a fabricated "declares nothing".
+    let service_declaration = decide_service_declaration(adapter, state.path(), "tck-subject");
+
     // Section selection (spec 15-3): a FILTER over the fixed pipeline order.
     // A section not in the selected set is neither run nor reported — the
     // report is complete FOR THE SELECTED SET (fewer entries, same shape).
@@ -862,10 +1476,94 @@ fn conformance_inner(
         });
     }
 
+    // The 18-5 service family. Order note: `drain` runs BEFORE `pause` — the
+    // drain's pause command is what first writes the subject's pause
+    // sentinel, and its idle signal anchors on that sentinel's FIRST
+    // appearance (a pause section run first would leave the sentinel behind
+    // and the anchored signal would predate the drain).
+    if selected(section_ids::DRAIN) {
+        sections.push(SectionReport {
+            section: section_ids::DRAIN.to_string(),
+            result: match &service_declaration {
+                Err(detail) => declaration_read_failed(section_ids::DRAIN, detail),
+                Ok(decl) => run_drain_section(
+                    &facade,
+                    "tck-subject",
+                    state.path(),
+                    launchable,
+                    decl,
+                    timeout,
+                    &mut evidence.drain,
+                ),
+            },
+        });
+    }
+
     if selected(section_ids::PAUSE) {
         sections.push(SectionReport {
             section: section_ids::PAUSE.to_string(),
-            result: run_pause_section(&facade, "tck-subject", launchable, pause_level, timeout),
+            result: match &service_declaration {
+                Err(detail) => declaration_read_failed(section_ids::PAUSE, detail),
+                Ok(decl) => run_pause_section(
+                    &facade,
+                    "tck-subject",
+                    launchable,
+                    pause_level,
+                    decl.lifecycle_pair,
+                    timeout,
+                    &mut evidence.pause,
+                ),
+            },
+        });
+    }
+
+    if selected(section_ids::READINESS) {
+        sections.push(SectionReport {
+            section: section_ids::READINESS.to_string(),
+            result: match &service_declaration {
+                Err(detail) => declaration_read_failed(section_ids::READINESS, detail),
+                Ok(decl) => run_readiness_section(
+                    &facade,
+                    "tck-subject",
+                    launchable,
+                    decl,
+                    timeout,
+                    &mut evidence.readiness,
+                ),
+            },
+        });
+    }
+
+    if selected(section_ids::LIVENESS) {
+        sections.push(SectionReport {
+            section: section_ids::LIVENESS.to_string(),
+            result: match &service_declaration {
+                Err(detail) => declaration_read_failed(section_ids::LIVENESS, detail),
+                Ok(decl) => run_liveness_section(
+                    &facade,
+                    "tck-subject",
+                    launchable,
+                    decl.liveness,
+                    timeout,
+                    &mut evidence.liveness,
+                ),
+            },
+        });
+    }
+
+    if selected(section_ids::EXIT_CLASSES) {
+        sections.push(SectionReport {
+            section: section_ids::EXIT_CLASSES.to_string(),
+            result: match &service_declaration {
+                Err(detail) => declaration_read_failed(section_ids::EXIT_CLASSES, detail),
+                Ok(decl) => run_exit_classes_section(
+                    &facade,
+                    launchable,
+                    &decl.exit_codes,
+                    timeout,
+                    &mut evidence.exit_classes,
+                ),
+            },
         });
     }
 
@@ -1085,6 +1783,29 @@ fn registered_launch_present(state_root: &Path, name: &str) -> Result<bool, Stri
     let value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("parse adapter snapshot: {e}"))?;
     Ok(value.get("launch").map(|l| !l.is_null()).unwrap_or(false))
+}
+
+/// The start args the engine's registration-time snapshot captured (the B3
+/// drift check's registered half) — the launch the supervisor ACTUALLY runs.
+/// A launch-less (or native) registration reads empty; a snapshot whose
+/// `launch` is present but shape-corrupt is `Err` (never a silent empty that
+/// would read as "drifted" against a launching manifest).
+fn registered_launch_args(state_root: &Path, name: &str) -> Result<Vec<String>, String> {
+    let home = engine_home(state_root, name)?;
+    let text = std::fs::read_to_string(home.join(REGISTERED_SNAPSHOT_FILE))
+        .map_err(|e| format!("read adapter snapshot: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse adapter snapshot: {e}"))?;
+    match value.get("launch") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(launch) => {
+            let args = launch
+                .get("args")
+                .ok_or("the registered launch snapshot carries no args key")?;
+            serde_json::from_value::<Vec<String>>(args.clone())
+                .map_err(|e| format!("the registered launch args are not a string list: {e}"))
+        }
+    }
 }
 
 /// The subject's Agent Home through the engine's PUBLIC path layout
@@ -1691,7 +2412,9 @@ fn run_pause_section(
     name: &str,
     launchable: bool,
     level: Option<SupportLevel>,
+    pair_declared: bool,
     timeout: Duration,
+    evidence: &mut PauseEvidence,
 ) -> SectionResult {
     // A launch-less registration has no process to suspend — the section does
     // not apply (derived from the registration shape, never a per-adapter
@@ -1702,6 +2425,25 @@ fn run_pause_section(
                      live process whose pause semantics could be demonstrated"
                 .to_string(),
         };
+    }
+    // A declared `[lifecycle.pause]`/`[lifecycle.resume]` COMMAND pair
+    // changes the demonstration, not its applicability: the engine's
+    // cooperative-first dispatch runs the DECLARED COMMANDS on every OS and
+    // level — `unsupported` included — so the capability level no longer
+    // decides the subject's arm. The section demonstrates the cooperative
+    // path (the `pause-cooperative`/`resume-cooperative` causes naming the
+    // rendered commands), and a Guaranteed level still proves the
+    // real-suspension SEAM on the TCK's own signal-path probe (the probe
+    // declares no pair, so it takes the signal path the subject's own level
+    // would have taken).
+    if pair_declared {
+        return into_section_result(pause_cooperative_inner(
+            facade,
+            name,
+            level.unwrap_or(SupportLevel::Unsupported),
+            timeout,
+            evidence,
+        ));
     }
     let level = match level {
         Some(level) => level,
@@ -1798,6 +2540,187 @@ fn pause_applicable_inner(
         .map(|_| ())
         .map_err(|e| format!("stop failed: {e}"));
     result.and(stop)
+}
+
+/// [`run_pause_section`]'s pipeline for a PAIR-DECLARING subject (the
+/// cooperative dispatch): start the subject, drive pause/resume through the
+/// declared commands, prove the cooperative causes, and — for a Guaranteed
+/// level on an OS where a real suspension is provable — still prove the
+/// signal-path SEAM on the TCK's own probe (which declares no pair, so it
+/// takes the signal path). Stops exactly once at the end.
+fn pause_cooperative_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    level: SupportLevel,
+    timeout: Duration,
+    evidence: &mut PauseEvidence,
+) -> Result<(), String> {
+    facade
+        .start(name)
+        .map_err(|e| format!("start failed: {e}"))?;
+    wait_for_state(facade, name, LifecycleState::Running, timeout)?;
+
+    // The proof itself, isolated so the SINGLE STOP below runs on EVERY exit
+    // (the next section must be able to start the subject — a leaked
+    // `running` row would fail it with "cannot start ... while it is
+    // 'running'").
+    let result = (|| -> Result<(), String> {
+        // The SUBJECT's own pause/resume: the declared commands run (cooperative
+        // first), the row reaches paused and back to running.
+        let paused = facade
+            .pause(name)
+            .map_err(|e| format!("pause failed: {e}"))?;
+        if paused.state != LifecycleState::Paused {
+            return Err(format!(
+                "the declared pause command must reach paused, got {:?}",
+                paused.state
+            ));
+        }
+        facade
+            .resume(name)
+            .map_err(|e| format!("resume failed: {e}"))?;
+        wait_for_state(facade, name, LifecycleState::Running, timeout)?;
+
+        // The real-suspension SEAM proof (Guaranteed on a suspension-capable OS
+        // only — the same honest ceiling the plain Guaranteed arm applies): the
+        // TCK's own probe declares guaranteed with NO pair, so its pause takes
+        // the signal path and its freeze is provable. The subject's cooperative
+        // pause claims no suspension; this proves the seam its LEVEL names.
+        if matches!(
+            pause_demo(level, OsId::current()),
+            PauseDemo::RealSuspension
+        ) {
+            let probe_kind = "tck-pause-probe";
+            let dir = tempfile::Builder::new()
+                .prefix("ktesio-tck-pause-")
+                .tempdir()
+                .map_err(|e| format!("probe tempdir: {e}"))?;
+            write_probe_manifest(
+                dir.path(),
+                probe_kind,
+                &["--heartbeat-ms", "50", "--linger-ms", "600000"],
+                Some("guaranteed"),
+                "guaranteed",
+                "self-reported",
+                "1.0.0",
+                None,
+            )
+            .map_err(|e| format!("pause probe manifest: {e}"))?;
+            facade
+                .register_with_adapter(probe_kind, &AdapterRef::Manifest(dir.path().to_path_buf()))
+                .map_err(|e| format!("pause probe register failed: {e}"))?;
+            // The probe's proof in a closure whose tail ALWAYS stops the probe
+            // (B1): the `wait_for_state` `?` below used to bail OUT of the
+            // section with the probe still live, leaking a `running` row that
+            // fails the next section's start.
+            let probe_proof = (|| -> Result<(), String> {
+                facade
+                    .start(probe_kind)
+                    .map_err(|e| format!("pause probe start failed: {e}"))?;
+                wait_for_state(facade, probe_kind, LifecycleState::Running, timeout)?;
+                prove_heartbeat_freeze(facade, probe_kind, timeout).map_or(Ok(()), Err)
+            })();
+            let _ = facade.stop(probe_kind, Some(Duration::from_secs(5)));
+            probe_proof?;
+        }
+
+        // The SUBJECT's causes are the COOPERATIVE tags naming the rendered
+        // commands (the engine ran them — never the capability dispatch). The
+        // commands the typed match verifies ARE the evidence (A1): a deleted
+        // validator call leaves the receipt's commands `None`.
+        let events = facade
+            .transition_events(name)
+            .map_err(|e| format!("event read failed: {e}"))?;
+        *evidence = cooperative_cause_defect(&events)?;
+        Ok(())
+    })();
+
+    // Teardown: exactly ONE stop at section end (the same discipline the
+    // applicable arm applies — the finishers leave the instance RUNNING on
+    // both success and failure, and the section boundary owns the stop).
+    let stop = facade
+        .stop(name, Some(Duration::from_secs(5)))
+        .map(|_| ())
+        .map_err(|e| format!("stop failed: {e}"));
+    result.and(stop)
+}
+
+/// The cooperative-pause cause contract as a PURE decision over the committed
+/// transition events: the paused and resumed edges must exist (looked up in
+/// REVERSE — the drain leg runs first and its declared pause command appended
+/// its own `paused` event, so the LAST edges are this section's), carry the
+/// typed `PauseCooperative` / `ResumeCooperative` causes naming a rendered
+/// command — the engine ran the DECLARED commands, never the capability
+/// dispatch — and no best-effort qualifier cause may stand in for them (a
+/// cooperative pause is not a signal-path fallback). Returns the rendered
+/// command pair as the section's evidence (A1): a deleted validator call
+/// leaves [`PauseEvidence`] at its `None` defaults. Unit-tested directly so
+/// the detection itself is pinned.
+fn cooperative_cause_defect(
+    events: &[::hekma_engine::TransitionEvent],
+) -> Result<PauseEvidence, String> {
+    let pause_evt = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .ok_or("the declared pause command reported success but appended NO paused event")?;
+    let pause_command = match &pause_evt.cause {
+        ::hekma_engine::TransitionCause::PauseCooperative { command } => {
+            if command.is_empty() {
+                return Err(
+                    "the pause-cooperative cause must name the rendered command the engine ran \
+                     (got an empty command string)"
+                        .to_string(),
+                );
+            }
+            command.clone()
+        }
+        ::hekma_engine::TransitionCause::PauseBestEffort { detail } => {
+            return Err(format!(
+                "a declared pause command must commit the pause-cooperative cause, got the \
+                 best-effort signal qualifier instead ({detail})"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "a declared pause command must commit the pause-cooperative cause, got {}",
+                serde_json::to_string(other).map_err(|e| format!("cause serialization: {e}"))?
+            ));
+        }
+    };
+    let resume_evt = events
+        .iter()
+        .rev()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .ok_or("the declared resume command reported success but appended NO resumed event")?;
+    let resume_command = match &resume_evt.cause {
+        ::hekma_engine::TransitionCause::ResumeCooperative { command } => {
+            if command.is_empty() {
+                return Err(
+                    "the resume-cooperative cause must name the rendered command the engine ran \
+                     (got an empty command string)"
+                        .to_string(),
+                );
+            }
+            command.clone()
+        }
+        ::hekma_engine::TransitionCause::ResumeBestEffort { detail } => {
+            return Err(format!(
+                "a declared resume command must commit the resume-cooperative cause, got the \
+                 best-effort signal qualifier instead ({detail})"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "a declared resume command must commit the resume-cooperative cause, got {}",
+                serde_json::to_string(other).map_err(|e| format!("cause serialization: {e}"))?
+            ));
+        }
+    };
+    Ok(PauseEvidence {
+        pause_command: Some(pause_command),
+        resume_command: Some(resume_command),
+    })
 }
 
 /// The Guaranteed arm: a real suspension + clean resume with PLAIN causes,
@@ -2046,8 +2969,1476 @@ fn best_effort_cause_defect(events: &[::hekma_engine::TransitionEvent]) -> Resul
 }
 
 // ---------------------------------------------------------------------
-// Probe-driven sections (config, metering, memory, interaction)
+// The 18-5 service sections (readiness, liveness, exit classes, drain)
 // ---------------------------------------------------------------------
+
+/// The service sections' shared applicability gate (pure, unit-tested): a
+/// launch-less registration has no live process to drive, and an undeclared
+/// section has nothing to prove — an honest `not_applicable` naming the
+/// absence, never a fabricated pass and never a penalized absence (the pause
+/// section's degradation template). `None` means the section runs.
+fn service_gate(
+    launchable: bool,
+    declared: bool,
+    no_launch_reason: &str,
+    undeclared_reason: &str,
+) -> Option<SectionResult> {
+    if !launchable {
+        return Some(SectionResult::NotApplicable {
+            reason: no_launch_reason.to_string(),
+        });
+    }
+    if !declared {
+        return Some(SectionResult::NotApplicable {
+            reason: undeclared_reason.to_string(),
+        });
+    }
+    None
+}
+
+/// Drain (story 18-5): the declared `[drain]` composite, end-to-end. Two
+/// legs, both PASSES of the section:
+/// * the SUBJECT itself — its declared pause command runs, its declared idle
+///   signal arrives, the drain completes inside its declared bound
+///   (`completed: true`, the honest waited_ms, the terminal `drain-stopped`
+///   cause). With a declared `idle_file` the completed floor is OBSERVED
+///   (A3): derived from the idle file's own mtime against the drain's start
+///   instant, so the wait provably covered the signal's ARRIVAL — a constant
+///   floor would assert the fixture's timing, not the subject's wait.
+/// * a never-idle TWIN — its drain burns its declared bound and STILL stops
+///   (`completed: false` — the stop is unconditional, the record honest).
+///
+/// A declared `idle_file` WITHOUT the pause/resume command pair expects
+/// `completed: false` even when the file arrives: the engine's documented
+/// outcome is the CONJUNCTION (pause exit-0 AND idle fresh), and a pair-less
+/// subject can never satisfy the pause half — the leg asserts the truth the
+/// engine records, not the one a partial declaration suggests.
+fn run_drain_section(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    state_root: &Path,
+    launchable: bool,
+    decl: &ServiceDeclaration,
+    timeout: Duration,
+    evidence: &mut DrainEvidence,
+) -> SectionResult {
+    if let Some(na) = service_gate(
+        launchable,
+        decl.drain.is_some(),
+        "the registered adapter declares no launch command, so there is no live \
+         process whose drain could be demonstrated",
+        "the declaration declares no [drain] section, so there is no drain composite \
+         to demonstrate",
+    ) {
+        return na;
+    }
+    into_section_result(drain_inner(
+        facade, name, state_root, decl, timeout, evidence,
+    ))
+}
+
+/// [`run_drain_section`]'s pipeline.
+fn drain_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    state_root: &Path,
+    decl: &ServiceDeclaration,
+    timeout: Duration,
+    evidence: &mut DrainEvidence,
+) -> Result<(), String> {
+    let drain = decl
+        .drain
+        .as_ref()
+        .expect("the gate ensured the drain is declared");
+    drain_subject_leg(
+        facade,
+        name,
+        state_root,
+        drain,
+        decl.lifecycle_pair,
+        timeout,
+        evidence,
+    )?;
+    drain_timeout_twin_leg(facade, timeout, evidence)
+}
+
+/// The subject leg's honest `completed` expectation (A3): an idle-less
+/// declaration completes through the pause command's exit-0 (or the
+/// degenerate direct stop); an idle declaration completes only with the
+/// pair, because the engine's outcome is the CONJUNCTION of both conditions.
+fn drain_want_completed(drain: &DrainDeclaration, lifecycle_pair: bool) -> bool {
+    drain.idle_file.is_none() || lifecycle_pair
+}
+
+/// The subject leg's observed-arrival floor derivation, PURE core (A3,
+/// unit-pinned): the idle file's mtime minus the drain's start instant,
+/// minus a 150ms scheduling slack — the wait must have covered the signal's
+/// arrival. A file that predates the drain (or an unreadable/zero mtime, the
+/// caller's `None`) falls back to `min(DRAIN_COMPLETED_FLOOR_MS, bound/2)`:
+/// still a REAL floor, but one the declaration's own bound can always
+/// satisfy.
+fn observed_floor_from(mtime_ms: u64, t0_ms: u64, effective_bound_ms: u64) -> u64 {
+    if mtime_ms > t0_ms {
+        (mtime_ms - t0_ms).saturating_sub(DRAIN_ARRIVAL_SLACK_MS)
+    } else {
+        DRAIN_COMPLETED_FLOOR_MS.min(effective_bound_ms / 2)
+    }
+}
+
+/// The wall-clock read around [`observed_floor_from`]: stat the idle file
+/// through the subject's Agent Home; any unreadable/epoch-less shape is
+/// `None` (the fallback floor applies).
+fn observed_idle_floor_ms(
+    idle_path: &Path,
+    t0: std::time::SystemTime,
+    effective_bound_ms: u64,
+) -> Option<u64> {
+    let mtime_ms = std::fs::metadata(idle_path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let t0_ms = t0.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    Some(observed_floor_from(mtime_ms, t0_ms, effective_bound_ms))
+}
+
+/// The SUBJECT leg: start the subject and drain it through ITS OWN declared
+/// wait. Closure-then-stop (B1): a failed assertion must not leak a live
+/// subject into the next section — the drain's last step IS the stop on
+/// success, and the tail stop is a no-op on a `Stopped` row.
+fn drain_subject_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    state_root: &Path,
+    drain: &DrainDeclaration,
+    lifecycle_pair: bool,
+    timeout: Duration,
+    evidence: &mut DrainEvidence,
+) -> Result<(), String> {
+    // The B2 clamp: the drain call's override can never exceed half the
+    // section budget — a configured tight timeout must bound the leg, not
+    // the subject's generous declaration.
+    let effective_bound_ms = drain.timeout_ms.min(timeout.as_millis() as u64 / 2).max(1);
+    let want_completed = drain_want_completed(drain, lifecycle_pair);
+    let result = (|| -> Result<(), String> {
+        facade
+            .start(name)
+            .map_err(|e| format!("start failed: {e}"))?;
+        wait_for_state(facade, name, LifecycleState::Running, timeout)?;
+
+        let t0 = std::time::SystemTime::now();
+        let report = facade
+            .drain(name, Some(Duration::from_millis(effective_bound_ms)))
+            .map_err(|e| format!("drain failed: {e}"))?;
+        let events = facade
+            .transition_events(name)
+            .map_err(|e| format!("transition_events failed: {e}"))?;
+        let terminal = events
+            .last()
+            .ok_or("the drain committed no terminal transition event")?;
+        // The OBSERVED floor (A3): when the declaration promises an idle
+        // signal, the floor is the signal's own arrival instant — a ~0ms
+        // completion would be the skip-the-wait lie, and a constant floor
+        // would pin the FIXTURE's timing instead of the subject's wait.
+        // Without a declared signal there is nothing to observe: the
+        // completion is the command's exit-0 (or the degenerate direct
+        // stop) — any waited_ms is honest.
+        let floor = drain.idle_file.as_ref().and_then(|idle| {
+            let idle_path = engine_home(state_root, name).ok()?.join(idle);
+            observed_idle_floor_ms(&idle_path, t0, effective_bound_ms)
+        });
+        evidence.subject_floor_ms = floor;
+        let leg =
+            drain_outcome_defect(&report, terminal, want_completed, floor, effective_bound_ms)?;
+        evidence.subject_completed = Some(leg.completed);
+        evidence.subject_waited_ms = Some(leg.waited_ms);
+        Ok(())
+    })();
+    // The drain's last step IS the stop on success; this tail stop covers
+    // the failure paths (a start/wait error left the row live) and is a
+    // no-op against a `Stopped` row.
+    //
+    // C6 note: the subject's declared drain pause command touched its
+    // `pause.sentinel`, and this leg leaves it in place — the LATER pause
+    // section tolerates that by construction (its cooperative receipt is
+    // the typed cause of the pause section's OWN pause/resume edges,
+    // reverse-scoped over the event log, never the sentinel file's
+    // existence or mtime).
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    result
+}
+
+/// The never-idle TWIN leg: the declared idle file is never touched by
+/// anyone, so the twin's drain burns its bound and STILL stops — recording
+/// the honest `completed: false`. The same B2 clamp applies (A3): the
+/// bracket derives from the bound the drain call ACTUALLY used.
+fn drain_timeout_twin_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut DrainEvidence,
+) -> Result<(), String> {
+    let twin = "tck-drain-never-idle";
+    let effective_bound_ms = DRAIN_TWIN_BOUND_MS
+        .min(timeout.as_millis() as u64 / 2)
+        .max(1);
+    let dir = tempfile::Builder::new()
+        .prefix("ktesio-tck-drain-")
+        .tempdir()
+        .map_err(|e| format!("drain twin tempdir: {e}"))?;
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture (the subject leg's twin):
+            // the twin's contract needs the terminal `drain-stopped` cause
+            // with `completed:false` — a GRACEFUL stop — but on Windows the
+            // ladder's graceful step is a pure exit-watch, so a
+            // never-ending twin would escalate to `stop-forced` after the
+            // whole default window. The anchored self-exit (2500ms —
+            // comfortably past the 1200ms bound the leg clamps to, so the
+            // wait genuinely burns and records `completed:false` first)
+            // ends the twin on its own inside the graceful window on
+            // every OS.
+            "--exit-on-pause",
+            "2500:pause.sentinel",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    .touch_pair("pause.sentinel", "resume.sentinel")
+    .drain(&format!(
+        "timeout_ms = {DRAIN_TWIN_BOUND_MS}\nidle_file = \"never.sentinel\""
+    ))
+    .write(dir.path());
+    facade
+        .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .map_err(|e| format!("drain twin register failed: {e}"))?;
+    facade
+        .start(twin)
+        .map_err(|e| format!("drain twin start failed: {e}"))?;
+    wait_for_state(facade, twin, LifecycleState::Running, timeout)?;
+
+    let report = facade
+        .drain(twin, Some(Duration::from_millis(effective_bound_ms)))
+        .map_err(|e| format!("drain twin failed: {e}"))?;
+    let events = facade
+        .transition_events(twin)
+        .map_err(|e| format!("drain twin event read failed: {e}"))?;
+    let terminal = events
+        .last()
+        .ok_or("the drain twin committed no terminal transition event")?;
+    // The timed-out bracket: the wait must have genuinely burned its bound
+    // (floor = the bound the call used, minus a little scheduling slack)
+    // and stayed bounded (ceiling = the bound + slack).
+    let leg = drain_outcome_defect(
+        &report,
+        terminal,
+        false,
+        Some(effective_bound_ms.saturating_sub(DRAIN_TIMEDOUT_FLOOR_SLACK_MS)),
+        effective_bound_ms + DRAIN_TWIN_CEILING_MS,
+    )?;
+    evidence.twin_completed = Some(leg.completed);
+    evidence.twin_waited_ms = Some(leg.waited_ms);
+    Ok(())
+}
+
+/// The drain outcome contract as a PURE decision over the committed
+/// evidence: the instance lands `stopped`, the outcome's `completed` flag is
+/// the TRUTH (never a fabricated completion, never a fabricated timeout),
+/// the waited_ms brackets what the declaration promises (a completed drain
+/// with a declared idle signal must have genuinely waited; a timed-out drain
+/// must have burned its bound and no more), and the terminal event carries
+/// the `drain-stopped` cause recording that same truth. Evidence-returning
+/// (A1): the verified observables ride the `Ok` — a deleted call leaves the
+/// section's evidence at its `None` defaults and the run-level gate dies.
+/// Unit-tested directly so the detection itself is pinned.
+fn drain_outcome_defect(
+    report: &::hekma_engine::DrainReport,
+    terminal: &::hekma_engine::TransitionEvent,
+    want_completed: bool,
+    floor_ms: Option<u64>,
+    ceiling_ms: u64,
+) -> Result<DrainLegEvidence, String> {
+    if report.instance.state != LifecycleState::Stopped {
+        return Err(format!(
+            "the drain must land stopped, got {:?}",
+            report.instance.state
+        ));
+    }
+    if report.outcome.completed != want_completed {
+        return Err(format!(
+            "the drain outcome must record completed:{} (the wait's truth), got {}",
+            want_completed, report.outcome.completed
+        ));
+    }
+    if let Some(floor) = floor_ms {
+        if report.outcome.waited_ms < floor {
+            return Err(format!(
+                "the drain must have genuinely waited (waited {}ms, floor {floor}ms — a \
+                 shorter wait is the skip-the-wait lie)",
+                report.outcome.waited_ms
+            ));
+        }
+    }
+    if report.outcome.waited_ms > ceiling_ms {
+        return Err(format!(
+            "the drain wait must be BOUNDED (waited {}ms, ceiling {ceiling_ms}ms — the \
+             declared bound is real)",
+            report.outcome.waited_ms
+        ));
+    }
+    if terminal.new_state != LifecycleState::Stopped {
+        return Err(format!(
+            "the terminal event must commit stopped, got {:?}",
+            terminal.new_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&terminal.cause)
+        .map_err(|e| format!("drain cause serialization failed: {e}"))?;
+    let want_flag = if want_completed { "true" } else { "false" };
+    if !cause_json.contains("drain-stopped")
+        || !cause_json.contains(&format!("\"completed\":{want_flag}"))
+    {
+        return Err(format!(
+            "the terminal cause must record drain-stopped with completed:{want_flag}, got \
+             {cause_json}"
+        ));
+    }
+    Ok(DrainLegEvidence {
+        completed: report.outcome.completed,
+        waited_ms: report.outcome.waited_ms,
+    })
+}
+
+/// Readiness (story 18-5): the declared `[readiness]` gate, end-to-end. Two
+/// legs:
+/// * the SUBJECT — its start lands `running` ONLY through its declared probe
+///   (the final `starting → running` edge carries the engine's adapter-ready
+///   cause). When the subject's own start args name a late-binding readiness
+///   delay (`--http-ready-after <MS>` — the fixture convention A2), the leg
+///   OBSERVES the hold: the start is spawned on a scoped thread and must
+///   still be unfinished when the delay elapses — before that instant the
+///   endpoint cannot possibly answer, so an early `running` is a gate that
+///   did not hold.
+/// * a never-ready TWIN — its start times out TERMINAL: `failed` with the
+///   `readiness-timeout` cause naming the probe + the honest wait, and NO
+///   restart even under a restart-allowing policy (a broken deployment is a
+///   restart would replay).
+fn run_readiness_section(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    launchable: bool,
+    decl: &ServiceDeclaration,
+    timeout: Duration,
+    evidence: &mut ReadinessEvidence,
+) -> SectionResult {
+    if let Some(na) = service_gate(
+        launchable,
+        decl.readiness,
+        "the registered adapter declares no launch command, so there is no start whose \
+         readiness gate could be demonstrated",
+        "the declaration declares no [readiness] section, so there is no startup gate to \
+         demonstrate",
+    ) {
+        return na;
+    }
+    into_section_result(readiness_inner(
+        facade,
+        name,
+        decl.readiness_hold_ms,
+        timeout,
+        evidence,
+    ))
+}
+
+/// [`run_readiness_section`]'s pipeline. The healthy leg's hold wait is
+/// bounded by the DECLARED delay (B2: clamped to a quarter of the section
+/// budget); every other wait here is bounded by the ENGINE (the gated
+/// `start` honors the declared probe budget on both legs).
+fn readiness_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    hold_ms: Option<u64>,
+    timeout: Duration,
+    evidence: &mut ReadinessEvidence,
+) -> Result<(), String> {
+    readiness_healthy_leg(facade, name, hold_ms, timeout, evidence)?;
+    readiness_failing_leg(facade, evidence)
+}
+
+/// The B2 hold clamp (pure): the leg may only observe a hold that fits the
+/// run's budget — a quarter of it — so a configured tight timeout bounds the
+/// leg no matter how long the subject's fixture delay is. `None` passes
+/// through (no observable hold).
+fn clamped_hold_ms(declared_ms: Option<u64>, timeout: Duration) -> Option<u64> {
+    declared_ms.map(|ms| ms.min(timeout.as_millis() as u64 / 4).max(1))
+}
+
+/// One hold measurement's sighting (A2, event-bus anchored).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HoldObservation {
+    /// The start was still unfinished past the anchored hold threshold.
+    hold_proven: bool,
+    /// The bus carried the subject's `starting` commitment (the anchor — the
+    /// transition had not committed before the hold began).
+    mid_hold_saw_starting: bool,
+    /// Evidence-only: the bus carried the subject's `running` edge during
+    /// the hold (a benign race between the transition commit and the start
+    /// call's return — recorded, never failed on).
+    mid_hold_saw_running: bool,
+}
+
+/// The A2 hold measurement's slack (ms): the declared hold counts from the
+/// AGENT's process start (its own `--http-ready-after` flag), while the
+/// observable anchor — the row's `starting` commitment — lands a few ms
+/// later, and the engine's readiness-probe poll adds its own granularity on
+/// the success side. The measured gap is therefore the hold MINUS this
+/// slack: comfortably above the ~0ms a gate-less start measures, without
+/// false-failing an honest gate on poll jitter.
+const HOLD_MEASURE_SLACK_MS: u64 = 150;
+
+/// The A2 phase-2 measure budget (ms): past `hold_ms` + this, a still-running
+/// start is provably inside its probe wait — the gate held. Generous against
+/// poll jitter; a broken gate instead fails its own start (the engine's
+/// readiness timeout) and the joined verdict carries that failure.
+const HOLD_MEASURE_BUDGET_MS: u64 = 2000;
+
+/// The A2 hold observation, anchored on the ENGINE EVENT BUS (not row
+/// polls): the supervisor mutex serializes every facade call behind a
+/// running `start`, so mid-hold `instance_status` polls cannot observe the
+/// row's `Starting` state at all — the lock-free bus is the only mid-start
+/// observable, and a `Transition` event is published the instant its append
+/// commits.
+///
+/// The measurement: subscribe FIRST (a broadcast receiver only sees events
+/// published after it subscribed, so the anchor must never race the
+/// starter), spawn the gated `start` on a scoped thread (the facade borrows
+/// into the scope — `Blocking` is `Sync`), then anchor on the subject's
+/// `starting` commitment — the row's clock zero, ≈ the agent process start
+/// its declared delay counts from (never this function's t0: the spawn cost
+/// between the two is exactly what a t0-anchored threshold would misread).
+/// The start finishing BEFORE the anchored threshold is the failed
+/// observation: before the subject's declared delay the endpoint cannot
+/// answer, so an early return means the gate never held. A `running` edge
+/// mid-hold is evidence-only (the commit can land marginally before the
+/// start call's own return) — recorded, never failed on. Both loops run on
+/// THIS thread INSIDE the scope: `thread::scope` blocks on exit until every
+/// spawned thread finishes, so the starter's handle cannot outlive the
+/// closure — the racing and the joining both happen within it.
+fn observe_readiness_hold(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    hold_ms: u64,
+    timeout: Duration,
+) -> Result<
+    (
+        HoldObservation,
+        Result<::hekma_engine::AgentInstance, String>,
+    ),
+    String,
+> {
+    let threshold_ms = hold_ms.saturating_sub(HOLD_MEASURE_SLACK_MS).max(1);
+    let outcome = std::thread::scope(
+        |scope| -> Result<
+            (
+                HoldObservation,
+                Result<::hekma_engine::AgentInstance, String>,
+            ),
+            String,
+        > {
+            // Subscribe BEFORE spawning the starter: a bus receiver only
+            // sees events published after it subscribed, so subscribing
+            // first is what makes the anchor unmissable.
+            let mut events = facade.subscribe();
+            let starter = scope.spawn(move || facade.start(name).map_err(|e| e.to_string()));
+            let mut observation = HoldObservation {
+                hold_proven: false,
+                mid_hold_saw_starting: false,
+                mid_hold_saw_running: false,
+            };
+            let watch_start = std::time::Instant::now();
+            // PHASE 1 — anchor: the subject's `starting` commitment is the
+            // agent's clock zero (the engine spawns, then commits the
+            // transition onto the bus). Any OTHER event is evidence at
+            // most: a start that dies before the anchor (a launch failure)
+            // is carried honestly by the joined starter's own verdict.
+            let anchored = loop {
+                if starter.is_finished() {
+                    let started = starter
+                        .join()
+                        .map_err(|e| format!("start thread panicked: {e:?}"))?;
+                    return Ok((observation, started));
+                }
+                match events.try_recv() {
+                    Ok(EngineEvent::Transition(t)) if t.instance == name => match t.new_state {
+                        LifecycleState::Starting => {
+                            observation.mid_hold_saw_starting = true;
+                            break std::time::Instant::now();
+                        }
+                        LifecycleState::Running => observation.mid_hold_saw_running = true,
+                        _ => {}
+                    },
+                    Ok(_) => {}
+                    Err(::hekma_engine::domain::broadcast::error::TryRecvError::Lagged(n)) => {
+                        return Err(format!(
+                            "the engine event bus dropped {n} mid-hold events — the \
+                             hold's clock anchor cannot be trusted at this event rate"
+                        ))
+                    }
+                    Err(_) => {}
+                }
+                if watch_start.elapsed() > timeout {
+                    return Err(
+                        "the gated start never committed its `starting` transition within the \
+                         section budget — the hold has no row-clock anchor to measure against"
+                            .to_string(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // PHASE 2 — measure: how long did the start call run past the
+            // anchor? A held gate returns only through the probe's success,
+            // which needs the endpoint the declared delay binds; a gate-less
+            // start returns within moments of the anchor.
+            let budget = Duration::from_millis(hold_ms + HOLD_MEASURE_BUDGET_MS);
+            observation.hold_proven = loop {
+                if starter.is_finished() {
+                    break anchored.elapsed().as_millis() as u64 >= threshold_ms;
+                }
+                match events.try_recv() {
+                    Ok(EngineEvent::Transition(t))
+                        if t.instance == name && t.new_state == LifecycleState::Running =>
+                    {
+                        observation.mid_hold_saw_running = true;
+                    }
+                    Ok(_) => {}
+                    Err(::hekma_engine::domain::broadcast::error::TryRecvError::Lagged(n)) => {
+                        return Err(format!(
+                            "the engine event bus dropped {n} mid-hold events — the \
+                             hold's clock anchor cannot be trusted at this event rate"
+                        ))
+                    }
+                    Err(_) => {}
+                }
+                if anchored.elapsed() > budget {
+                    // Still unfinished well past the hold: the start is
+                    // inside its probe wait — the gate demonstrably held.
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // Final drain (evidence-only): any subject transition committed
+            // between the last poll and the join — typically the `running`
+            // edge itself, which can land marginally before the start call
+            // returns.
+            loop {
+                match events.try_recv() {
+                    Ok(EngineEvent::Transition(t))
+                        if t.instance == name && t.new_state == LifecycleState::Running =>
+                    {
+                        observation.mid_hold_saw_running = true;
+                    }
+                    Ok(_) => {}
+                    Err(::hekma_engine::domain::broadcast::error::TryRecvError::Lagged(n)) => {
+                        return Err(format!(
+                            "the engine event bus dropped {n} events before the hold \
+                             verdict's transitions could all be recorded"
+                        ))
+                    }
+                    Err(_) => break,
+                }
+            }
+            let started = starter
+                .join()
+                .map_err(|e| format!("start thread panicked: {e:?}"))?;
+            Ok((observation, started))
+        },
+    )?;
+    Ok(outcome)
+}
+
+/// The SUBJECT leg: the declared probe opens the gate. `start` returns the
+/// instance only once the probe passed; the terminal edge is the ordinary
+/// adapter-ready one (no failure edge anywhere). Closure-then-stop (B1): a
+/// failed assertion must not leak a live subject into the next section.
+fn readiness_healthy_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    hold_ms: Option<u64>,
+    timeout: Duration,
+    evidence: &mut ReadinessEvidence,
+) -> Result<(), String> {
+    let result = (|| -> Result<(), String> {
+        let started = if let Some(hold_ms) = clamped_hold_ms(hold_ms, timeout) {
+            let (observation, started) = observe_readiness_hold(facade, name, hold_ms, timeout)?;
+            evidence.hold_proven = Some(observation.hold_proven);
+            evidence.mid_hold_saw_starting = Some(observation.mid_hold_saw_starting);
+            evidence.mid_hold_saw_running = Some(observation.mid_hold_saw_running);
+            if !observation.hold_proven {
+                // The start call's OWN verdict rides the reason (surfaced,
+                // never silent): an early return that is also an Err (a
+                // launch failure) must say so, not masquerade as a failed
+                // hold.
+                let start_verdict = match started {
+                    Err(reason) => format!("; the start itself failed: {reason}"),
+                    Ok(_) => String::new(),
+                };
+                return Err(format!(
+                    "the gated start finished before the subject's declared readiness \
+                     delay elapsed — the endpoint cannot answer that early, so the gate \
+                     did not hold the transition{start_verdict}"
+                ));
+            }
+            started?
+        } else {
+            facade
+                .start(name)
+                .map_err(|e| format!("start failed: {e}"))?
+        };
+        if started.state != LifecycleState::Running {
+            return Err(format!(
+                "the gated start must land running once the declared probe passes, got {:?}",
+                started.state
+            ));
+        }
+        let events = facade
+            .transition_events(name)
+            .map_err(|e| format!("transition_events failed: {e}"))?;
+        let last = events
+            .last()
+            .ok_or("the gated start committed no transition events")?;
+        let adapter_ready = readiness_ready_edge_defect(last)?;
+        evidence.ready_edge_adapter_ready = Some(adapter_ready);
+        Ok(())
+    })();
+    // Closure-then-stop (B1): the success path stops here too (the leg owns
+    // its teardown), and a failure path never leaks a live subject.
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    result
+}
+
+/// The healthy leg's PURE edge decision: the final edge is `starting →
+/// running` carrying the adapter-ready cause — the gate OPENED (the probe
+/// passed), it never lied. Evidence-returning (A1): `Ok(true)` is the
+/// adapter-ready receipt the run-level gate asserts.
+fn readiness_ready_edge_defect(last: &::hekma_engine::TransitionEvent) -> Result<bool, String> {
+    if last.prior_state != LifecycleState::Starting || last.new_state != LifecycleState::Running {
+        return Err(format!(
+            "the gated start's final edge must be starting→running, got {:?}→{:?}",
+            last.prior_state, last.new_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&last.cause)
+        .map_err(|e| format!("readiness cause serialization failed: {e}"))?;
+    if !cause_json.contains("\"kind\":\"adapter-ready\"") {
+        return Err(format!(
+            "the gated start's final edge must carry the adapter-ready cause, got \
+             {cause_json}"
+        ));
+    }
+    Ok(true)
+}
+
+/// The never-ready TWIN leg: a held-but-silent loopback port (nothing ever
+/// answers), the twin's OWN manifest declaring an http-get probe against it.
+/// The held listener stays alive for the whole leg so the port can never be
+/// accidentally served.
+fn readiness_failing_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    evidence: &mut ReadinessEvidence,
+) -> Result<(), String> {
+    let twin = "tck-readiness-never-ready";
+    // Bind + HOLD a port nothing serves: the probe's connects queue unread
+    // and the budget burns (the engine's own readiness drill shape).
+    let held = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("readiness twin port bind failed: {e}"))?;
+    let port = held
+        .local_addr()
+        .map_err(|e| format!("readiness twin port read failed: {e}"))?
+        .port();
+    let leg = (|| -> Result<(), String> {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-ready-")
+            .tempdir()
+            .map_err(|e| format!("readiness twin tempdir: {e}"))?;
+        crate::test_support::ManifestFixture::new(twin, &["--linger-ms", "600000"])
+            .guaranteed_on_all_oses("pause")
+            .readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = {READINESS_TWIN_TIMEOUT_MS}\nurl = \
+                 \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+            ))
+            .write(dir.path());
+        facade
+            .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+            .map_err(|e| format!("readiness twin register failed: {e}"))?;
+        // A restart-allowing policy makes the TERMINAL verdict the sharp
+        // assertion: a readiness timeout must not restart even so.
+        facade
+            .set_restart_policy(twin, RestartPolicy::OnFailure)
+            .map_err(|e| format!("readiness twin set_restart_policy failed: {e}"))?;
+
+        // The start FAILS, naming the probe.
+        let err = facade
+            .start(twin)
+            .err()
+            .ok_or("the never-ready twin's start must FAIL (the probe cannot pass)")?;
+        let msg = err.to_string();
+        if !msg.contains("readiness probe") {
+            return Err(format!(
+                "the failed start must name the readiness probe, got: {msg}"
+            ));
+        }
+
+        let status = facade
+            .instance_status(twin)
+            .map_err(|e| format!("readiness twin status read failed: {e}"))?;
+        // Terminal: a restart-allowing policy does NOT restart a readiness
+        // timeout (a broken deployment a restart would replay).
+        std::thread::sleep(Duration::from_millis(500));
+        let status_again = facade
+            .instance_status(twin)
+            .map_err(|e| format!("readiness twin status re-read failed: {e}"))?;
+        let events = facade
+            .transition_events(twin)
+            .map_err(|e| format!("readiness twin event read failed: {e}"))?;
+        let waited = readiness_timeout_leg_defect(
+            status.restart_count,
+            status_again.restart_count,
+            status_again.instance.state,
+            &events,
+            READINESS_TWIN_TIMEOUT_MS,
+            READINESS_TWIN_SLACK_MS,
+        )?;
+        evidence.timeout_waited_ms = Some(waited);
+        Ok(())
+    })();
+    drop(held);
+    leg
+}
+
+/// The readiness-timeout leg's PURE decision: `failed` with restart_count 0
+/// that STAYS 0 under a restart-allowing policy (terminal), the final edge
+/// `starting → failed`, and the `readiness-timeout` cause naming the probe
+/// with an honest wait bracketing the declared budget. Evidence-returning
+/// (A1): the observed wait rides the `Ok`. Unit-tested directly.
+fn readiness_timeout_leg_defect(
+    restart_count: u32,
+    restart_count_again: u32,
+    final_state: LifecycleState,
+    events: &[::hekma_engine::TransitionEvent],
+    timeout_ms: u64,
+    slack_ms: u64,
+) -> Result<u64, String> {
+    if restart_count != 0 || restart_count_again != 0 {
+        return Err(format!(
+            "a readiness timeout is terminal: the counter must never charge (got \
+             {restart_count}, then {restart_count_again})"
+        ));
+    }
+    if final_state != LifecycleState::Failed {
+        return Err(format!(
+            "the timed-out probe must land failed (got {final_state:?}) — and STAY failed \
+             under a restart-allowing policy"
+        ));
+    }
+    let last = events
+        .last()
+        .ok_or("the readiness twin committed no transition events")?;
+    if last.prior_state != LifecycleState::Starting || last.new_state != LifecycleState::Failed {
+        return Err(format!(
+            "the readiness timeout's final edge must be starting→failed, got {:?}→{:?}",
+            last.prior_state, last.new_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&last.cause)
+        .map_err(|e| format!("readiness cause serialization failed: {e}"))?;
+    if !cause_json.contains("\"kind\":\"readiness-timeout\"") || !cause_json.contains("http-get") {
+        return Err(format!(
+            "the readiness-timeout cause must name the probe (http-get), got {cause_json}"
+        ));
+    }
+    let waited = match &last.cause {
+        ::hekma_engine::TransitionCause::ReadinessTimeout { waited_ms, .. } => *waited_ms,
+        other => {
+            return Err(format!(
+                "the final edge must carry the readiness-timeout cause, got {other:?}"
+            ))
+        }
+    };
+    if waited < timeout_ms || waited > timeout_ms + slack_ms {
+        return Err(format!(
+            "the probe's wait must bracket the declared budget (waited {waited}ms, budget \
+             {timeout_ms}ms + {slack_ms}ms slack)"
+        ));
+    }
+    Ok(waited)
+}
+
+/// Liveness (story 18-5): the declared `[liveness]` watch, end-to-end. Two
+/// legs:
+/// * the SUBJECT — a healthy run holds `running` past its declared window
+///   (the beating signal never opens a failure window);
+/// * a dead-heart TWIN — its declared heartbeat beats and then STOPS
+///   (`--heartbeat-stop-after 200` — a LIVE signal that dies, the spec's
+///   letter: the leg proves a beating signal going stale fails the run, not
+///   merely that an absent file is stale), so the window expires and the
+///   reaper lands `failed` with the `unresponsive` cause (the check named,
+///   the failing streak bracketing the declared window), under a Never
+///   policy for a deterministic terminal.
+fn run_liveness_section(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    launchable: bool,
+    declared_window: Option<u64>,
+    timeout: Duration,
+    evidence: &mut LivenessEvidence,
+) -> SectionResult {
+    if let Some(na) = service_gate(
+        launchable,
+        declared_window.is_some(),
+        "the registered adapter declares no launch command, so there is no live process \
+         whose liveness could be demonstrated",
+        "the declaration declares no [liveness] section, so there is no declared liveness \
+         check to demonstrate",
+    ) {
+        return na;
+    }
+    into_section_result(liveness_inner(
+        facade,
+        name,
+        declared_window.expect("the gate ensured the window is declared"),
+        timeout,
+        evidence,
+    ))
+}
+
+/// [`run_liveness_section`]'s pipeline.
+fn liveness_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    window_ms: u64,
+    timeout: Duration,
+    evidence: &mut LivenessEvidence,
+) -> Result<(), String> {
+    liveness_healthy_leg(facade, name, window_ms, evidence)?;
+    liveness_failing_leg(facade, timeout, evidence)
+}
+
+/// The SUBJECT leg: start, hold past the declared window plus two reaper
+/// ticks, and prove NO unresponsive edge ever fired — the beating signal
+/// keeps the window closed. Closure-then-stop (B1): a failed assertion must
+/// not leak a live subject into the next section.
+fn liveness_healthy_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    window_ms: u64,
+    evidence: &mut LivenessEvidence,
+) -> Result<(), String> {
+    let result = (|| -> Result<(), String> {
+        let started = facade
+            .start(name)
+            .map_err(|e| format!("start failed: {e}"))?;
+        if started.state != LifecycleState::Running {
+            return Err(format!(
+                "the healthy liveness run must land running, got {:?}",
+                started.state
+            ));
+        }
+        let held_ms = window_ms + LIVENESS_HEALTHY_HOLD_SLACK_MS;
+        std::thread::sleep(Duration::from_millis(held_ms));
+        let status = facade
+            .instance_status(name)
+            .map_err(|e| format!("status read failed: {e}"))?;
+        if status.instance.state != LifecycleState::Running {
+            return Err(format!(
+                "a beating signal must hold the run alive past its declared window (got \
+                 {:?} — a healthy run failed the section)",
+                status.instance.state
+            ));
+        }
+        let events = facade
+            .transition_events(name)
+            .map_err(|e| format!("transition_events failed: {e}"))?;
+        let held = liveness_healthy_defect(&events, held_ms)?;
+        evidence.healthy_held_ms = Some(held);
+        Ok(())
+    })();
+    // Closure-then-stop (B1): the leg owns its teardown on every path.
+    let _ = facade.stop(name, Some(Duration::from_secs(5)));
+    result
+}
+
+/// The healthy leg's PURE decision: no `failed` edge and no `unresponsive`
+/// cause anywhere — a healthy signal never opens the window.
+/// Evidence-returning (A1): the observed hold rides the `Ok`.
+fn liveness_healthy_defect(
+    events: &[::hekma_engine::TransitionEvent],
+    held_ms: u64,
+) -> Result<u64, String> {
+    for event in events {
+        if event.new_state == LifecycleState::Failed {
+            return Err("a healthy run must commit NO failed edge".to_string());
+        }
+        let cause_json = serde_json::to_string(&event.cause)
+            .map_err(|e| format!("liveness cause serialization failed: {e}"))?;
+        if cause_json.contains("unresponsive") {
+            return Err(format!(
+                "a healthy run must commit NO unresponsive cause, got {cause_json}"
+            ));
+        }
+    }
+    Ok(held_ms)
+}
+
+/// The dead-heart TWIN leg: the declared heartbeat beats for 200ms and then
+/// STOPS (A6 — a live signal that dies, so the leg proves the fresh→stale
+/// re-evaluation, not merely the absent-file arm), the window expires, the
+/// reaper lands `failed` with the `unresponsive` cause. A Never policy keeps
+/// the terminal deterministic.
+fn liveness_failing_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut LivenessEvidence,
+) -> Result<(), String> {
+    let twin = "tck-liveness-dead-heart";
+    let dir = tempfile::Builder::new()
+        .prefix("ktesio-tck-live-")
+        .tempdir()
+        .map_err(|e| format!("liveness twin tempdir: {e}"))?;
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--heartbeat-file",
+            "hb.marker:50",
+            "--heartbeat-stop-after",
+            &LIVENESS_TWIN_BEAT_STOP_MS.to_string(),
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    .liveness(&format!(
+        "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = \
+         {LIVENESS_TWIN_WINDOW_MS}"
+    ))
+    .write(dir.path());
+    facade
+        .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .map_err(|e| format!("liveness twin register failed: {e}"))?;
+    facade
+        .set_restart_policy(twin, RestartPolicy::Never)
+        .map_err(|e| format!("liveness twin set_restart_policy failed: {e}"))?;
+    facade
+        .start(twin)
+        .map_err(|e| format!("liveness twin start failed: {e}"))?;
+
+    // The window is ENFORCED, not observed: the expiry cannot land before
+    // the declared window elapsed (the cause's streak bracket pins it
+    // below; the wait itself is bounded by the section timeout).
+    wait_for_state(facade, twin, LifecycleState::Failed, timeout)
+        .map_err(|e| format!("the dead heart never landed failed: {e}"))?;
+    let status = facade
+        .instance_status(twin)
+        .map_err(|e| format!("liveness twin status read failed: {e}"))?;
+    let events = facade
+        .transition_events(twin)
+        .map_err(|e| format!("liveness twin event read failed: {e}"))?;
+    let failing_for = unresponsive_leg_defect(
+        &events,
+        status.restart_count,
+        LIVENESS_TWIN_WINDOW_MS,
+        LIVENESS_TWIN_STREAK_SLACK_MS,
+        "hb.marker",
+    )?;
+    evidence.failing_streak_ms = Some(failing_for);
+    Ok(())
+}
+
+/// The unresponsive leg's PURE decision: the final edge `running → failed`
+/// carrying the `unresponsive` cause — the check NAMED and the failing
+/// streak bracketing the declared window (≥ the window: enforced, never
+/// observed; < window + slack: observed promptly, never a runaway) — and
+/// restart_count 0 under the Never policy. Evidence-returning (A1): the
+/// observed streak rides the `Ok`. Unit-tested directly.
+fn unresponsive_leg_defect(
+    events: &[::hekma_engine::TransitionEvent],
+    restart_count: u32,
+    window_ms: u64,
+    streak_slack_ms: u64,
+    path_fragment: &str,
+) -> Result<u64, String> {
+    if restart_count != 0 {
+        return Err(format!(
+            "the Never policy must not restart an unresponsive failure (count \
+             {restart_count})"
+        ));
+    }
+    let last = events
+        .last()
+        .ok_or("the liveness twin committed no transition events")?;
+    if last.prior_state != LifecycleState::Running || last.new_state != LifecycleState::Failed {
+        return Err(format!(
+            "the unresponsive expiry's final edge must be running→failed, got {:?}→{:?}",
+            last.prior_state, last.new_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&last.cause)
+        .map_err(|e| format!("liveness cause serialization failed: {e}"))?;
+    if !cause_json.contains("\"kind\":\"unresponsive\"") {
+        return Err(format!(
+            "the expiry must carry the unresponsive cause, got {cause_json}"
+        ));
+    }
+    if !cause_json.contains("heartbeat-file") || !cause_json.contains(path_fragment) {
+        return Err(format!(
+            "the unresponsive cause must name the declared check ({path_fragment}), got \
+             {cause_json}"
+        ));
+    }
+    let failing_for = match &last.cause {
+        ::hekma_engine::TransitionCause::Unresponsive { failing_for_ms, .. } => *failing_for_ms,
+        other => {
+            return Err(format!(
+                "the final edge must carry the unresponsive cause, got {other:?}"
+            ))
+        }
+    };
+    if failing_for < window_ms || failing_for >= window_ms + streak_slack_ms {
+        return Err(format!(
+            "the failing streak must bracket the declared window (streak {failing_for}ms, \
+             window {window_ms}ms + {streak_slack_ms}ms slack)"
+        ));
+    }
+    Ok(failing_for)
+}
+
+/// Exit classes (story 18-5): the declared `[exit_codes]` classes, proven on
+/// THREE twins (a subject is never deliberately exited):
+/// * an exit-75 TWIN — the conventional relaunch ask: `running → failed`
+///   under the `restart-requested` cause, the relaunch lands `running`
+///   again, and the consecutive-failure counter is NOT charged (read before
+///   and after);
+/// * an UNCLASSIFIED exit-7 TWIN (A4, the charger) — a code the declaration
+///   does NOT classify is an ordinary crash: under the same restart-allowing
+///   policy the counter CHARGES 0→1, the charge the relaunch leg's all-zeros
+///   shape can never distinguish from a deleted check;
+/// * a clean-exit-0 TWIN — finished on purpose: `running → stopped` under
+///   the `clean-exit` cause, the record settled, NO restart plan.
+///
+/// A declared-but-EMPTY `[exit_codes]` (both lists absent) reads
+/// `not_applicable` naming the emptiness (A4): an honest declaration of
+/// nothing is not a failure and not a pass — there is no class to prove.
+fn run_exit_classes_section(
+    facade: &::hekma_engine::Blocking<'_>,
+    launchable: bool,
+    declared: &ExitClassesDeclaration,
+    timeout: Duration,
+    evidence: &mut ExitClassesEvidence,
+) -> SectionResult {
+    if !launchable {
+        return SectionResult::NotApplicable {
+            reason: "the registered adapter declares no launch command, so there is no run \
+                     whose exit classes could be demonstrated"
+                .to_string(),
+        };
+    }
+    match declared {
+        ExitClassesDeclaration::Undeclared => {
+            return SectionResult::NotApplicable {
+                reason: "the declaration declares no [exit_codes] section, so there are no \
+                         declared exit classes to demonstrate"
+                    .to_string(),
+            }
+        }
+        ExitClassesDeclaration::Empty => {
+            return SectionResult::NotApplicable {
+                reason: "the declaration declares an [exit_codes] section with BOTH class \
+                         lists empty — nothing is classified, so there is no declared exit \
+                         class to demonstrate"
+                    .to_string(),
+            }
+        }
+        ExitClassesDeclaration::Classes => {}
+    }
+    into_section_result(exit_classes_inner(facade, timeout, evidence))
+}
+
+/// [`run_exit_classes_section`]'s pipeline.
+fn exit_classes_inner(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut ExitClassesEvidence,
+) -> Result<(), String> {
+    exit_relaunch_leg(facade, timeout, evidence)?;
+    exit_charger_leg(facade, timeout, evidence)?;
+    exit_clean_leg(facade, timeout, evidence)
+}
+
+/// Await the exit-75 TWIN's relaunch. Unlike [`wait_for_state`] — which
+/// fail-fasts on a terminal state — this twin is SUPPOSED to sit in `failed`
+/// between recycles (each relaunched process exits 75 again on ITS OWN
+/// schedule), so the poll tolerates the terminal way stations and watches for
+/// the relaunch's `running`, bounded by the budget.
+fn wait_for_relaunch(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    budget: Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let state = facade
+            .instance_status(name)
+            .map_err(|e| format!("instance_status read failed: {e}"))?
+            .instance
+            .state;
+        if state == LifecycleState::Running {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for the exit-75 relaunch (last state {state:?})"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Settle a recycling twin to `stopped` (B1): three polite stop rounds (the
+/// twin may exit its declared code mid-stop; the loop waits out the relaunch
+/// and retries), then KILL rounds whose stop window is short enough that the
+/// engine's escalation fires — a twin that keeps recycling faster than a
+/// polite window can catch still dies. The failure reason NAMES the twin
+/// still cycling (surfaced, never a silent leak into the next section).
+fn settle_recycling_twin(
+    facade: &::hekma_engine::Blocking<'_>,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    for _ in 0..RELAUNCH_STOP_ROUNDS {
+        let _ = facade.stop(name, Some(Duration::from_secs(5)));
+        if wait_for_state(facade, name, LifecycleState::Stopped, timeout).is_ok() {
+            return Ok(());
+        }
+        // The recycle raced the stop: wait out the next relaunch and retry
+        // (the backoff grows, so the polite rounds converge).
+        if wait_for_relaunch(facade, name, timeout).is_err() {
+            break;
+        }
+    }
+    for _ in 0..RELAUNCH_KILL_ROUNDS {
+        let _ = facade.stop(name, Some(Duration::from_millis(RELAUNCH_KILL_WINDOW_MS)));
+        if wait_for_state(facade, name, LifecycleState::Stopped, timeout).is_ok() {
+            return Ok(());
+        }
+        let _ = wait_for_relaunch(facade, name, timeout);
+    }
+    Err(format!(
+        "the {name} twin could not be settled to stopped: a recycle kept racing every stop, \
+         and the twin is STILL live (running or cycling) in the harness engine"
+    ))
+}
+
+/// The exit-75 TWIN leg: declare `restart_requested = [75]`, arm a
+/// restart-ALLOWING policy (the sharp test — the counter must not move even
+/// so), start, and prove the full recycle.
+fn exit_relaunch_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut ExitClassesEvidence,
+) -> Result<(), String> {
+    let twin = "tck-exit-relauncher";
+    let dir = tempfile::Builder::new()
+        .prefix("ktesio-tck-relaunch-")
+        .tempdir()
+        .map_err(|e| format!("relaunch twin tempdir: {e}"))?;
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--exit-with",
+            &format!("75:{EXIT_DELAY_MS}"),
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    .exit_codes("restart_requested = [75]")
+    .write(dir.path());
+    facade
+        .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .map_err(|e| format!("relaunch twin register failed: {e}"))?;
+    facade
+        .set_restart_policy(twin, RestartPolicy::OnFailure)
+        .map_err(|e| format!("relaunch twin set_restart_policy failed: {e}"))?;
+    facade
+        .start(twin)
+        .map_err(|e| format!("relaunch twin start failed: {e}"))?;
+
+    let count_before = facade
+        .instance_status(twin)
+        .map_err(|e| format!("relaunch twin status read failed: {e}"))?
+        .restart_count;
+
+    // The declared exit: `failed` under restart-requested, then the relaunch
+    // (the wait tolerates the failed way station — see `wait_for_relaunch`).
+    wait_for_state(facade, twin, LifecycleState::Failed, timeout)
+        .map_err(|e| format!("the declared exit-75 never landed failed: {e}"))?;
+    wait_for_relaunch(facade, twin, timeout)
+        .map_err(|e| format!("the exit-75 relaunch never landed running: {e}"))?;
+    let count_after = facade
+        .instance_status(twin)
+        .map_err(|e| format!("relaunch twin status re-read failed: {e}"))?
+        .restart_count;
+    let events = facade
+        .transition_events(twin)
+        .map_err(|e| format!("relaunch twin event read failed: {e}"))?;
+    let untouched = restart_requested_leg_defect(&events, count_before, count_after)?;
+    evidence.relaunch_counter_unchanged = Some(untouched);
+
+    // Settle: stop the relaunched run (B1 kill rounds cover a twin whose
+    // recycle keeps beating the polite window; the counter assertions above
+    // already hold).
+    settle_recycling_twin(facade, twin, timeout)
+}
+
+/// The CHARGER leg (A4): an exit code the declaration does NOT classify is
+/// an ordinary crash — under the same restart-ALLOWING policy the
+/// consecutive-failure counter CHARGES. The relaunch leg's all-zeros shape
+/// (counter 0 before AND after) is indistinguishable at run level from a
+/// deleted check; this leg's 0→1 is not. A mutated un-charge (or a validator
+/// call that never runs) leaves the counter at 0 and dies here.
+fn exit_charger_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut ExitClassesEvidence,
+) -> Result<(), String> {
+    let twin = "tck-exit-charger";
+    let dir = tempfile::Builder::new()
+        .prefix("ktesio-tck-charger-")
+        .tempdir()
+        .map_err(|e| format!("charger twin tempdir: {e}"))?;
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--exit-with",
+            &format!("7:{EXIT_DELAY_MS}"),
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    // The twin DECLARES classes — but 7 is not one of them (the honest
+    // unclassified shape a real subject's lookalike exit takes).
+    .exit_codes("restart_requested = [75]")
+    .write(dir.path());
+    facade
+        .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .map_err(|e| format!("charger twin register failed: {e}"))?;
+    facade
+        .set_restart_policy(twin, RestartPolicy::OnFailure)
+        .map_err(|e| format!("charger twin set_restart_policy failed: {e}"))?;
+    facade
+        .start(twin)
+        .map_err(|e| format!("charger twin start failed: {e}"))?;
+
+    let count_before = facade
+        .instance_status(twin)
+        .map_err(|e| format!("charger twin status read failed: {e}"))?
+        .restart_count;
+
+    // The unclassified exit charges: poll the counter past 0 (the crash
+    // lands on the twin's own schedule, the charge with the restart plan).
+    let deadline = std::time::Instant::now() + timeout;
+    let count_after = loop {
+        let count = facade
+            .instance_status(twin)
+            .map_err(|e| format!("charger twin status read failed: {e}"))?
+            .restart_count;
+        if count > count_before {
+            break count;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the unclassified exit-7 never charged the counter (stuck at {count_before} — \
+                 a declared-class code must not charge, an unclassified one must)"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if count_before != 0 {
+        return Err(format!(
+            "the charger twin must START at counter 0 (got {count_before}) — the charge \
+             must be THIS leg's own 0→1"
+        ));
+    }
+    evidence.charger_counter_before = Some(count_before);
+    evidence.charger_counter_after = Some(count_after);
+
+    // Settle: stop the charged twin (same recycling shape as the relaunch
+    // leg — each relaunched process exits 7 again on its own schedule).
+    settle_recycling_twin(facade, twin, timeout)
+}
+
+/// The restart-requested leg's PURE decision: the recycle committed
+/// `running → failed` under the `restart-requested` cause naming the code
+/// (75) and the declared class, a relaunch landed `running` AFTER it, the
+/// consecutive-failure counter is UNTOUCHED (neither charged nor reset), and
+/// no clean-exit appears. Evidence-returning (A1): `Ok(true)` is the
+/// untouched-counter receipt. Unit-tested directly.
+fn restart_requested_leg_defect(
+    events: &[::hekma_engine::TransitionEvent],
+    count_before: u32,
+    count_after: u32,
+) -> Result<bool, String> {
+    if count_after != count_before {
+        return Err(format!(
+            "a restart-requested recycle must NOT touch the counter (before \
+             {count_before}, after {count_after} — neither charge nor reset)"
+        ));
+    }
+    let failed_pos = events
+        .iter()
+        .rposition(|e| e.new_state == LifecycleState::Failed)
+        .ok_or("the declared exit-75 committed no failed edge")?;
+    let failed = &events[failed_pos];
+    if failed.prior_state != LifecycleState::Running {
+        return Err(format!(
+            "the restart-requested edge must exit a RUNNING run, got prior {:?}",
+            failed.prior_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&failed.cause)
+        .map_err(|e| format!("exit cause serialization failed: {e}"))?;
+    if !cause_json.contains("\"kind\":\"restart-requested\"")
+        || !cause_json.contains("\"code\":75")
+        || !cause_json.contains("restart_requested")
+    {
+        return Err(format!(
+            "the restart-requested cause must name the code (75) and the declared class, \
+             got {cause_json}"
+        ));
+    }
+    if !events[failed_pos + 1..]
+        .iter()
+        .any(|e| e.new_state == LifecycleState::Running)
+    {
+        return Err("the relaunch must land running AFTER the restart-requested edge".to_string());
+    }
+    if events
+        .iter()
+        .any(|e| serde_json_to_cause_contains(&e.cause, "clean-exit"))
+    {
+        return Err("an exit-75 recycle must never read as a clean exit".to_string());
+    }
+    Ok(true)
+}
+
+/// The clean-exit TWIN leg: declare `clean = [0]`, arm a restart-ALLOWING
+/// policy (a clean exit must settle even so), start, and prove the
+/// requested-stop shape.
+fn exit_clean_leg(
+    facade: &::hekma_engine::Blocking<'_>,
+    timeout: Duration,
+    evidence: &mut ExitClassesEvidence,
+) -> Result<(), String> {
+    let twin = "tck-exit-finisher";
+    let dir = tempfile::Builder::new()
+        .prefix("ktesio-tck-finish-")
+        .tempdir()
+        .map_err(|e| format!("finisher twin tempdir: {e}"))?;
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--exit-with",
+            &format!("0:{EXIT_DELAY_MS}"),
+            "--linger-ms",
+            "600000",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    .exit_codes("clean = [0]")
+    .write(dir.path());
+    facade
+        .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
+        .map_err(|e| format!("finisher twin register failed: {e}"))?;
+    facade
+        .set_restart_policy(twin, RestartPolicy::OnFailure)
+        .map_err(|e| format!("finisher twin set_restart_policy failed: {e}"))?;
+    facade
+        .start(twin)
+        .map_err(|e| format!("finisher twin start failed: {e}"))?;
+
+    wait_for_state(facade, twin, LifecycleState::Stopped, timeout)
+        .map_err(|e| format!("the declared exit-0 never landed stopped: {e}"))?;
+    let status = facade
+        .instance_status(twin)
+        .map_err(|e| format!("finisher twin status read failed: {e}"))?;
+    let events = facade
+        .transition_events(twin)
+        .map_err(|e| format!("finisher twin event read failed: {e}"))?;
+    let proven = clean_exit_leg_defect(&events, status.restart_count)?;
+
+    // No plan: the instance STAYS stopped (a restart-planning mutant
+    // relaunches within the base backoff — the watch catches it).
+    std::thread::sleep(Duration::from_millis(CLEAN_EXIT_NO_PLAN_WATCH_MS));
+    let status = facade
+        .instance_status(twin)
+        .map_err(|e| format!("finisher twin status re-read failed: {e}"))?;
+    if status.instance.state != LifecycleState::Stopped {
+        return Err(format!(
+            "a clean exit plans NO restart (the row moved to {:?})",
+            status.instance.state
+        ));
+    }
+    evidence.clean_settled = Some(proven);
+    Ok(())
+}
+
+/// The clean-exit leg's PURE decision: the terminal `running → stopped` edge
+/// carries the `clean-exit` cause naming the code (0), NO failed edge exists
+/// anywhere, and the counter is untouched. Evidence-returning (A1):
+/// `Ok(true)` is the settled-clean receipt. Unit-tested directly.
+fn clean_exit_leg_defect(
+    events: &[::hekma_engine::TransitionEvent],
+    restart_count: u32,
+) -> Result<bool, String> {
+    if restart_count != 0 {
+        return Err(format!(
+            "a clean exit takes NO counter action (count {restart_count})"
+        ));
+    }
+    let stopped = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Stopped)
+        .ok_or("the declared exit-0 committed no stopped edge")?;
+    if stopped.prior_state != LifecycleState::Running {
+        return Err(format!(
+            "the clean-exit edge must exit a RUNNING run, got prior {:?}",
+            stopped.prior_state
+        ));
+    }
+    let cause_json = serde_json::to_string(&stopped.cause)
+        .map_err(|e| format!("exit cause serialization failed: {e}"))?;
+    if !cause_json.contains("\"kind\":\"clean-exit\"") || !cause_json.contains("\"code\":0") {
+        return Err(format!(
+            "the clean-exit cause must name the code (0), got {cause_json}"
+        ));
+    }
+    if events.iter().any(|e| e.new_state == LifecycleState::Failed) {
+        return Err("a clean exit is never a failure".to_string());
+    }
+    Ok(true)
+}
+
+/// The one cause-JSON probe the validators share (a substring check over the
+/// serialized cause, the file's cause-assertion style).
+fn serde_json_to_cause_contains(cause: &::hekma_engine::TransitionCause, needle: &str) -> bool {
+    serde_json::to_string(cause)
+        .map(|json| json.contains(needle))
+        .unwrap_or(false)
+}
 
 /// Config mapping: the SUBJECT's declared `[config]` rules (unified key →
 /// native mechanism) are read from the registered adapter's manifest, set on
@@ -3196,6 +5587,253 @@ mod tests {
         );
     }
 
+    /// THE EVIDENCE KILL MECHANISM (18-5 review round 1, A1 — one
+    /// integration test per service section): a real declaring subject, a
+    /// `SectionSelection::Only` run, and the section's evidence asserted
+    /// POPULATED next to its `pass`. A validator call deleted anywhere in a
+    /// section's pipeline leaves that section's receipt at its `None`
+    /// defaults and dies HERE — the pass can no longer be vacuous.
+    #[test]
+    fn drain_evidence_is_populated_next_to_the_pass() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-evd-drain-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-drain-subject",
+            &[
+                "--idle-on-pause",
+                "300:pause.sentinel:idle.marker",
+                // The Windows graceful-stop fixture: the Windows ladder's
+                // graceful step is a pure exit-watch (no signal to
+                // deliver), so a never-ending subject escalates to
+                // stop-forced — a terminal cause the drain section's
+                // contract rightly rejects. The anchored self-exit (the
+                // same pause-anchor clock as the idle marker, 1200ms after
+                // it) ends the subject on its own inside the graceful
+                // window, on every OS, without touching the wait's truth:
+                // the idle signal still lands at anchor+300ms and the
+                // subject is provably alive through its observation.
+                "--exit-on-pause",
+                "1500:pause.sentinel",
+                "--linger-ms",
+                "600000",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .drain("timeout_ms = 9000\nidle_file = \"idle.marker\"")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(dir.path());
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![TckSection::Drain]),
+            ..TckConfig::default()
+        };
+        let (report, evidence) =
+            run_conformance_with_evidence(&TckAdapter::Manifest(dir.path().to_path_buf()), &config);
+        assert_eq!(
+            report.section(section_ids::DRAIN),
+            Some(&SectionResult::Pass),
+            "the declaring subject's drain passes: {:?}",
+            report.failures()
+        );
+        assert_eq!(
+            evidence.drain.subject_completed,
+            Some(true),
+            "the subject leg recorded its outcome (a deleted validator call leaves None)"
+        );
+        assert!(
+            evidence.drain.subject_waited_ms.is_some(),
+            "the honest wait"
+        );
+        assert!(
+            evidence.drain.subject_floor_ms.is_some(),
+            "the observed-arrival floor was derived and applied (an idle signal was declared)"
+        );
+        assert_eq!(
+            evidence.drain.twin_completed,
+            Some(false),
+            "the never-idle twin recorded the burned bound"
+        );
+        assert!(evidence.drain.twin_waited_ms.is_some(), "the twin's wait");
+    }
+
+    #[test]
+    fn readiness_evidence_is_populated_next_to_the_pass() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-evd-ready-")
+            .tempdir()
+            .expect("tempdir");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("read the port")
+            .port();
+        crate::test_support::ManifestFixture::new(
+            "tck-readiness-subject",
+            &[
+                "--http-ready-after",
+                "250",
+                "--http-ready",
+                &format!("{port}:200"),
+                "--linger-ms",
+                "600000",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .readiness(&format!(
+            "kind = \"http-get\"\ntimeout_ms = 8000\nurl = \
+             \"http://127.0.0.1:{port}/health\"\nexpected_status = 200"
+        ))
+        .write(dir.path());
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![TckSection::Readiness]),
+            ..TckConfig::default()
+        };
+        let (report, evidence) =
+            run_conformance_with_evidence(&TckAdapter::Manifest(dir.path().to_path_buf()), &config);
+        assert_eq!(
+            report.section(section_ids::READINESS),
+            Some(&SectionResult::Pass),
+            "the declaring subject's readiness passes: {:?}",
+            report.failures()
+        );
+        assert_eq!(
+            evidence.readiness.hold_proven,
+            Some(true),
+            "the healthy leg OBSERVED the declared --http-ready-after hold (A2)"
+        );
+        assert!(
+            evidence.readiness.mid_hold_saw_starting.is_some(),
+            "the mid-hold polls recorded what they saw"
+        );
+        assert!(
+            evidence.readiness.mid_hold_saw_running.is_some(),
+            "the evidence-only Running sighting was recorded (either way)"
+        );
+        assert_eq!(
+            evidence.readiness.ready_edge_adapter_ready,
+            Some(true),
+            "the final edge's cause receipt"
+        );
+        assert!(
+            evidence.readiness.timeout_waited_ms.is_some(),
+            "the never-ready twin's honest bracket"
+        );
+    }
+
+    #[test]
+    fn liveness_evidence_is_populated_next_to_the_pass() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-evd-live-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-liveness-subject",
+            &["--heartbeat-file", "hb.marker:100", "--linger-ms", "600000"],
+        )
+        .guaranteed_on_all_oses("pause")
+        .liveness("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 1500")
+        .write(dir.path());
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![TckSection::Liveness]),
+            ..TckConfig::default()
+        };
+        let (report, evidence) =
+            run_conformance_with_evidence(&TckAdapter::Manifest(dir.path().to_path_buf()), &config);
+        assert_eq!(
+            report.section(section_ids::LIVENESS),
+            Some(&SectionResult::Pass),
+            "the declaring subject's liveness passes: {:?}",
+            report.failures()
+        );
+        assert!(
+            evidence.liveness.healthy_held_ms.is_some(),
+            "the healthy leg's hold receipt (a deleted validator call leaves None)"
+        );
+        assert!(
+            evidence.liveness.failing_streak_ms.is_some(),
+            "the dead-heart twin's streak receipt"
+        );
+    }
+
+    #[test]
+    fn exit_classes_evidence_is_populated_next_to_the_pass() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-evd-exit-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new("tck-exit-subject", &["--linger-ms", "600000"])
+            .guaranteed_on_all_oses("pause")
+            .exit_codes("restart_requested = [75]")
+            .write(dir.path());
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![TckSection::ExitClasses]),
+            ..TckConfig::default()
+        };
+        let (report, evidence) =
+            run_conformance_with_evidence(&TckAdapter::Manifest(dir.path().to_path_buf()), &config);
+        assert_eq!(
+            report.section(section_ids::EXIT_CLASSES),
+            Some(&SectionResult::Pass),
+            "the declaring subject's exit classes pass: {:?}",
+            report.failures()
+        );
+        assert_eq!(
+            evidence.exit_classes.relaunch_counter_unchanged,
+            Some(true),
+            "the exit-75 leg's counter receipt"
+        );
+        assert_eq!(
+            evidence.exit_classes.charger_counter_before,
+            Some(0),
+            "the charger leg STARTED from zero (A4)"
+        );
+        assert!(
+            matches!(evidence.exit_classes.charger_counter_after, Some(n) if n >= 1),
+            "the unclassified exit CHARGED (0→1 — the shape the relaunch leg's \
+             all-zeros cannot fake)"
+        );
+        assert_eq!(
+            evidence.exit_classes.clean_settled,
+            Some(true),
+            "the clean-exit leg's settled receipt"
+        );
+    }
+
+    #[test]
+    fn pause_evidence_is_populated_next_to_the_pass() {
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-evd-pause-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new("tck-pair-subject", &["--linger-ms", "600000"])
+            .guaranteed_on_all_oses("pause")
+            .touch_pair("pause.sentinel", "resume.sentinel")
+            .write(dir.path());
+        let config = TckConfig {
+            sections: SectionSelection::Only(vec![TckSection::Pause]),
+            ..TckConfig::default()
+        };
+        let (report, evidence) =
+            run_conformance_with_evidence(&TckAdapter::Manifest(dir.path().to_path_buf()), &config);
+        assert_eq!(
+            report.section(section_ids::PAUSE),
+            Some(&SectionResult::Pass),
+            "the pair-declaring subject's pause passes: {:?}",
+            report.failures()
+        );
+        assert!(
+            matches!(&evidence.pause.pause_command, Some(cmd) if cmd.contains("pause.sentinel")),
+            "the cooperative pause cause's rendered command: {:?}",
+            evidence.pause.pause_command
+        );
+        assert!(
+            matches!(&evidence.pause.resume_command, Some(cmd) if cmd.contains("resume.sentinel")),
+            "the cooperative resume cause's rendered command: {:?}",
+            evidence.pause.resume_command
+        );
+    }
+
     /// A declared-but-failing adapter still yields a COMPLETE report: the
     /// failing sections carry reasons, the suite never aborts, and the
     /// verdict is false.
@@ -3220,7 +5858,9 @@ mod tests {
         //   its OWN healthy echo probe, not the broken subject.
         // * `pause` n/a (unsupported declared), `memory` n/a (no
         //   `memory.dir` mapping), `metering_engine_observed` n/a
-        //   (self-reported); the metering/memory/interaction PROBES are the
+        //   (self-reported), and all four service sections n/a (the manifest
+        //   declares no readiness/liveness/exit_codes/drain); the
+        //   metering/memory/interaction PROBES are the
         //   harness's own healthy fixtures and still pass their sections.
         // * The suite still completes every section — never aborts mid-suite.
         let manifest_body = format!(
@@ -3265,15 +5905,19 @@ mod tests {
             "interaction demonstrates delivery via its own healthy probe"
         );
 
-        // The suite still ran every section (complete report, 8 entries);
+        // The suite still ran every section (complete report, 12 entries);
         // only the declaration-justified sections read not_applicable.
-        assert_eq!(report.sections.len(), 8, "the report must be complete");
+        assert_eq!(report.sections.len(), 12, "the report must be complete");
         for section in report.sections.iter() {
             assert!(
                 !matches!(section.result, SectionResult::NotApplicable { .. })
                     || section.section == section_ids::METERING_ENGINE_OBSERVED
                     || section.section == section_ids::PAUSE
-                    || section.section == section_ids::MEMORY,
+                    || section.section == section_ids::MEMORY
+                    || section.section == section_ids::DRAIN
+                    || section.section == section_ids::READINESS
+                    || section.section == section_ids::LIVENESS
+                    || section.section == section_ids::EXIT_CLASSES,
                 "unexpected not_applicable for {}: {:?}",
                 section.section,
                 section.result
@@ -3301,7 +5945,7 @@ mod tests {
         );
     }
 
-    /// The registration-failure report is complete and honest: 8 fail entries
+    /// The registration-failure report is complete and honest: 12 fail entries
     /// carrying the REGISTRATION stage's rendered prefix (the pre-15-3 string,
     /// kept verbatim for consumers that pinned it) INCLUDING the `register: `
     /// detail infix — the default-path failure renders byte-identical to
@@ -3315,7 +5959,7 @@ mod tests {
         )));
         assert!(!report.is_conformant());
         assert_eq!(report.adapter_kind, "does-not-exist");
-        assert_eq!(report.sections.len(), 8);
+        assert_eq!(report.sections.len(), 12);
         for entry in report.sections.iter() {
             match &entry.result {
                 SectionResult::Fail { reason } => {
@@ -3720,8 +6364,8 @@ source = "self-reported"
             }
             other => panic!("expected NotApplicable for unsupported pause, got {other:?}"),
         }
-        // The suite still completed (8 sections, the rest of the sections ran).
-        assert_eq!(report.sections.len(), 8);
+        // The suite still completed (12 sections, the rest of the sections ran).
+        assert_eq!(report.sections.len(), 12);
     }
 
     /// An ENGINE-OBSERVED manifest adapter exercises the observed half of the
@@ -3789,7 +6433,7 @@ source = "self-reported"
     fn native_inert_mock_reports_not_applicable_sections() {
         let report = run_conformance(&TckAdapter::Native("mock".to_string()));
         assert_eq!(report.adapter_kind, "mock");
-        assert_eq!(report.sections.len(), 8);
+        assert_eq!(report.sections.len(), 12);
         assert!(
             report.is_conformant(),
             "an inert registration is conformant (nothing failed): failures = {:?}",
@@ -3803,7 +6447,11 @@ source = "self-reported"
         // Every live section is not_applicable WITH a reason naming the gap.
         for id in [
             section_ids::LIFECYCLE,
+            section_ids::DRAIN,
             section_ids::PAUSE,
+            section_ids::READINESS,
+            section_ids::LIVENESS,
+            section_ids::EXIT_CLASSES,
             section_ids::CONFIG_MAPPING,
             section_ids::METERING_SELF_REPORTED,
             section_ids::METERING_ENGINE_OBSERVED,
@@ -4351,7 +6999,15 @@ source = "self-reported"
             (true, None, "no pause capability"),
             (true, Some(SupportLevel::Unsupported), "unsupported"),
         ] {
-            match run_pause_section(&facade, "tck-fast", launchable, level, SECTION_TIMEOUT) {
+            match run_pause_section(
+                &facade,
+                "tck-fast",
+                launchable,
+                level,
+                false,
+                SECTION_TIMEOUT,
+                &mut PauseEvidence::default(),
+            ) {
                 SectionResult::NotApplicable { reason } => {
                     assert!(reason.contains(needle), "needle {needle:?} in {reason}");
                 }
@@ -4673,14 +7329,19 @@ env = "MODEL"
         );
 
         // The typed section maps onto the stable ids, and ALL carries the
-        // fixed pipeline order.
+        // fixed pipeline order (drain BEFORE pause — its pause sentinel must
+        // anchor the idle signal's first appearance).
         let all_ids: Vec<&str> = TckSection::ALL.iter().map(|s| s.id()).collect();
         assert_eq!(
             all_ids,
             vec![
                 section_ids::CAPABILITY_EDGES,
                 section_ids::LIFECYCLE,
+                section_ids::DRAIN,
                 section_ids::PAUSE,
+                section_ids::READINESS,
+                section_ids::LIVENESS,
+                section_ids::EXIT_CLASSES,
                 section_ids::CONFIG_MAPPING,
                 section_ids::METERING_SELF_REPORTED,
                 section_ids::METERING_ENGINE_OBSERVED,
@@ -5525,6 +8186,1031 @@ env = "TCK_SUBJECT_MEMORY"
         assert!(err.contains("want (30, 60)"), "{err}");
     }
 
+    // -----------------------------------------------------------------
+    // 18-5 service sections: the pure validators, each arm pinned so a
+    // deleted check CANNOT go green (the per-section mutation-minded pin).
+    // -----------------------------------------------------------------
+
+    /// `service_gate`: the launch gap outranks the undeclared gap (a
+    /// launch-less adapter demonstrates nothing live, declared or not), the
+    /// undeclared gap is named, and a clear gate returns None (the section
+    /// runs).
+    #[test]
+    fn service_gate_names_each_gap_and_runs_when_clear() {
+        const NO_LAUNCH: &str = "no launch here";
+        const UNDECLARED: &str = "nothing declared here";
+        for (launchable, declared) in [(false, true), (false, false)] {
+            match service_gate(launchable, declared, NO_LAUNCH, UNDECLARED) {
+                Some(SectionResult::NotApplicable { reason }) => assert_eq!(reason, NO_LAUNCH),
+                other => panic!("expected the launch gap, got {other:?}"),
+            }
+        }
+        match service_gate(true, false, NO_LAUNCH, UNDECLARED) {
+            Some(SectionResult::NotApplicable { reason }) => assert_eq!(reason, UNDECLARED),
+            other => panic!("expected the undeclared gap, got {other:?}"),
+        }
+        assert!(
+            service_gate(true, true, NO_LAUNCH, UNDECLARED).is_none(),
+            "a launchable, declaring adapter RUNS the section"
+        );
+    }
+
+    /// `ServiceDeclaration`'s two reads: the native builtin reads NONE (its
+    /// compiled-in table carries no manifest service sections), a missing
+    /// manifest text is Err (NEVER a fabricated "declares nothing"), a
+    /// manifest adapter without its threaded text is refused (the pipeline
+    /// bug guard), a declaring manifest populates every field, and a bare
+    /// manifest reads NONE-shaped.
+    #[test]
+    fn service_declaration_reads_manifest_fields_and_native_none() {
+        // Native: the compiled-in table (text is None; NONE of the sections ride).
+        assert_eq!(
+            TckAdapter::Native("mock".to_string()).service_declaration(None),
+            Ok(ServiceDeclaration::NONE),
+            "a native builtin declares none of the manifest service sections"
+        );
+        // A manifest dir that does not exist: the threaded read is Err —
+        // never a collapsed "declares nothing".
+        let ghost = TckAdapter::Manifest(PathBuf::from("/nonexistent/tck-18-5"));
+        assert!(
+            ghost.manifest_text().is_err(),
+            "an unreadable declaration must be Err"
+        );
+        // A manifest adapter WITHOUT its threaded text is a pipeline bug —
+        // the one-read contract refuses it (B3).
+        assert!(
+            ghost.service_declaration(None).is_err(),
+            "a manifest adapter's declaration read without threaded text must be Err"
+        );
+
+        // A declaring manifest: every field reads its declaration.
+        let dir = tempfile::Builder::new()
+            .prefix("ktesio-tck-decl-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "declaring",
+            &["--linger-ms", "600000", "--http-ready-after", "900"],
+        )
+        .guaranteed_on_all_oses("pause")
+        .readiness(
+            "kind = \"http-get\"\ntimeout_ms = 2000\nurl = \
+             \"http://127.0.0.1:9/health\"\nexpected_status = 200",
+        )
+        .liveness("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 1500")
+        .exit_codes("restart_requested = [75]")
+        .drain("timeout_ms = 9000\nidle_file = \"idle.marker\"")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(dir.path());
+        let text = TckAdapter::Manifest(dir.path().to_path_buf())
+            .manifest_text()
+            .expect("a written manifest reads")
+            .expect("a manifest adapter carries text");
+        let decl = TckAdapter::Manifest(dir.path().to_path_buf())
+            .service_declaration(Some(&text))
+            .expect("a valid declaring manifest reads Ok");
+        assert!(decl.readiness, "the readiness section is declared");
+        assert_eq!(
+            decl.readiness_hold_ms,
+            Some(900),
+            "the declared start args' late-binding delay rides (A2)"
+        );
+        assert_eq!(decl.liveness, Some(1500), "the declared window rides");
+        assert_eq!(
+            decl.exit_codes,
+            ExitClassesDeclaration::Classes,
+            "a restart_requested list is a CLASSES declaration"
+        );
+        assert_eq!(
+            decl.drain,
+            Some(DrainDeclaration {
+                timeout_ms: 9000,
+                idle_file: Some("idle.marker".to_string()),
+            }),
+            "the bound AND the idle signal both ride"
+        );
+        assert!(decl.lifecycle_pair, "the pause/resume PAIR rides");
+
+        // A bare manifest: every absence honest (NONE-shaped).
+        let bare = tempfile::Builder::new()
+            .prefix("ktesio-tck-bare-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new("bare", &["--linger-ms", "600000"])
+            .guaranteed_on_all_oses("pause")
+            .write(bare.path());
+        let bare_text = TckAdapter::Manifest(bare.path().to_path_buf())
+            .manifest_text()
+            .expect("a written manifest reads")
+            .expect("a manifest adapter carries text");
+        let decl = TckAdapter::Manifest(bare.path().to_path_buf())
+            .service_declaration(Some(&bare_text))
+            .expect("a valid minimal manifest reads Ok");
+        assert_eq!(decl, ServiceDeclaration::NONE, "absences read honestly");
+    }
+
+    /// `readiness_hold_from_args` (A2, pure): the flag pair's value rides,
+    /// an absent flag is `None`, and a malformed pair is honestly `None` too
+    /// (a FIXTURE convention must never fail a third-party subject).
+    #[test]
+    fn readiness_hold_from_args_pins_each_shape() {
+        let args = |rest: &[&str]| -> Vec<String> { rest.iter().map(|s| s.to_string()).collect() };
+        // The flag pair present and numeric.
+        assert_eq!(
+            readiness_hold_from_args(&args(&["--http-ready-after", "900"])),
+            Some(900)
+        );
+        // The flag among other args (position-independent).
+        assert_eq!(
+            readiness_hold_from_args(&args(&[
+                "--linger-ms",
+                "600000",
+                "--http-ready-after",
+                "250"
+            ])),
+            Some(250)
+        );
+        // No flag at all.
+        assert_eq!(
+            readiness_hold_from_args(&args(&["--linger-ms", "600000"])),
+            None
+        );
+        // Empty args.
+        assert_eq!(readiness_hold_from_args(&[]), None);
+        // The flag WITHOUT a value pair (dangling).
+        assert_eq!(
+            readiness_hold_from_args(&args(&["--http-ready-after"])),
+            None
+        );
+        // A malformed value (the lookalike-token guard).
+        assert_eq!(
+            readiness_hold_from_args(&args(&["--http-ready-after", "soon"])),
+            None
+        );
+    }
+
+    /// `clamped_hold_ms` (B2, pure): the observed hold may only take a
+    /// quarter of the run's budget (never below 1), and `None` passes through.
+    #[test]
+    fn clamped_hold_ms_pins_the_budget_clamp() {
+        let budget = Duration::from_millis(8000);
+        // A generous declared hold clamps to budget/4.
+        assert_eq!(clamped_hold_ms(Some(9000), budget), Some(2000));
+        // A modest hold rides unchanged (still under the quarter).
+        assert_eq!(clamped_hold_ms(Some(1500), budget), Some(1500));
+        // Exactly the quarter rides.
+        assert_eq!(clamped_hold_ms(Some(2000), budget), Some(2000));
+        // The 1ms floor: a tiny budget cannot produce a zero hold.
+        assert_eq!(
+            clamped_hold_ms(Some(5000), Duration::from_millis(4)),
+            Some(1)
+        );
+        // No declared hold: nothing to clamp.
+        assert_eq!(clamped_hold_ms(None, budget), None);
+    }
+
+    /// `manifest_drift_defect` (B3, pure): equal args pass; a mismatch names
+    /// BOTH sides (the registered snapshot and the file's current text).
+    #[test]
+    fn manifest_drift_defect_pins_drift_and_match() {
+        let registered = vec!["--linger-ms".to_string(), "600000".to_string()];
+        // The honest match.
+        assert_eq!(manifest_drift_defect(&registered, &registered), Ok(()));
+        // Both empty (a launch-less snapshot against a launch-less text).
+        assert_eq!(manifest_drift_defect(&[], &[]), Ok(()));
+        // A drift: the Err names both sides and says what it means.
+        let err =
+            manifest_drift_defect(&registered, &["--linger-ms".to_string(), "60".to_string()])
+                .unwrap_err();
+        assert!(err.contains("drifted under the run"), "{err}");
+        assert!(err.contains("--linger-ms"), "{err}");
+        assert!(err.contains("re-register and re-run"), "{err}");
+    }
+
+    /// `declaration_read_failed` (B4): every `SERVICE_DECLARATION_CONTEXTS`
+    /// row renders its OWN context (single-sourced wording, the detail riding
+    /// verbatim) — and the table's section ids stay aligned with the
+    /// pipeline's actual dispatch (a 15th-section add without a row falls
+    /// back to the generic context).
+    #[test]
+    fn declaration_read_failed_renders_each_context_row() {
+        for (id, context) in SERVICE_DECLARATION_CONTEXTS {
+            let reason = match declaration_read_failed(id, "the detail") {
+                SectionResult::Fail { reason } => reason,
+                other => panic!("expected a fail for {id}, got {other:?}"),
+            };
+            assert!(
+                reason.contains(&format!(
+                    "the declaration could not be re-read to decide \
+                                          {context}"
+                )),
+                "row {id}: {reason}"
+            );
+            assert!(reason.ends_with("the detail"), "row {id}: {reason}");
+        }
+        // The generic fallback for an unknown section id.
+        let reason = match declaration_read_failed("not-a-service-section", "boom") {
+            SectionResult::Fail { reason } => reason,
+            other => panic!("expected a fail, got {other:?}"),
+        };
+        assert!(reason.contains("the section's applicability"), "{reason}");
+        assert!(reason.ends_with("boom"), "{reason}");
+        // Every row's context is DISTINCT (a copy-paste row would read the
+        // wrong section's name on failure).
+        let mut contexts: Vec<_> = SERVICE_DECLARATION_CONTEXTS
+            .iter()
+            .map(|(_, c)| *c)
+            .collect();
+        contexts.sort_unstable();
+        contexts.dedup();
+        assert_eq!(
+            contexts.len(),
+            SERVICE_DECLARATION_CONTEXTS.len(),
+            "each service section must name its own context"
+        );
+    }
+
+    /// `cooperative_cause_defect`: each lie is caught — no paused event, a
+    /// wrong pause tag, an unnamed command, a missing resume, a wrong resume
+    /// tag, a best-effort QUALIFIER CAUSE (pause and resume sides) — and the
+    /// honest pair passes, its rendered commands riding back as evidence.
+    /// The typed cause match (A5) reads the VARIANT, never cause bytes: a
+    /// cooperative command whose text merely embeds qualifier wording is
+    /// honest (Ok), and the reverse lookup survives an earlier leg's paused
+    /// event (the drain runs first and pauses the subject too).
+    #[test]
+    fn cooperative_cause_defect_pins_each_arm() {
+        // No paused event at all.
+        assert!(cooperative_cause_defect(&[]).is_err());
+
+        let honest = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::PauseCooperative {
+                    command: "touch pause.sentinel".to_string(),
+                },
+            ),
+            evt(
+                LifecycleState::Paused,
+                LifecycleState::Running,
+                TransitionCause::ResumeCooperative {
+                    command: "touch resume.sentinel".to_string(),
+                },
+            ),
+        ];
+        assert_eq!(
+            cooperative_cause_defect(&honest),
+            Ok(PauseEvidence {
+                pause_command: Some("touch pause.sentinel".to_string()),
+                resume_command: Some("touch resume.sentinel".to_string()),
+            }),
+            "the honest pair passes with its rendered commands as the receipt"
+        );
+
+        // A plain Command cause where the cooperative tag belongs (the
+        // capability dispatch ran instead of the declared commands).
+        let wrong_tag = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::command("pause"),
+            ),
+            honest[1].clone(),
+        ];
+        let err = cooperative_cause_defect(&wrong_tag).unwrap_err();
+        assert!(err.contains("pause-cooperative"), "{err}");
+
+        // The tag without the rendered command (an anonymous command — the
+        // log cannot say what ran).
+        let anon = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::PauseCooperative {
+                    command: String::new(),
+                },
+            ),
+            honest[1].clone(),
+        ];
+        let err = cooperative_cause_defect(&anon).unwrap_err();
+        assert!(err.contains("rendered command"), "{err}");
+
+        // The pause without its resume.
+        let err = cooperative_cause_defect(&honest[..1]).unwrap_err();
+        assert!(err.contains("NO resumed event"), "{err}");
+
+        // A wrong resume tag.
+        let wrong_resume = vec![
+            honest[0].clone(),
+            evt(
+                LifecycleState::Paused,
+                LifecycleState::Running,
+                TransitionCause::command("resume"),
+            ),
+        ];
+        let err = cooperative_cause_defect(&wrong_resume).unwrap_err();
+        assert!(err.contains("resume-cooperative"), "{err}");
+
+        // The subtle lie the BYTE scan got wrong: a cooperative EDGE whose
+        // rendered command embeds the qualifier wording. The typed match
+        // reads the VARIANT — the command text is not scanned, so this is
+        // an honest Ok carrying that command verbatim.
+        let qualified = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::PauseCooperative {
+                    command: "pause --best-effort-mode".to_string(),
+                },
+            ),
+            honest[1].clone(),
+        ];
+        assert_eq!(
+            cooperative_cause_defect(&qualified),
+            Ok(PauseEvidence {
+                pause_command: Some("pause --best-effort-mode".to_string()),
+                resume_command: Some("touch resume.sentinel".to_string()),
+            }),
+            "the typed match judges the cause KIND, not command bytes"
+        );
+
+        // The REAL best-effort lie on the pause side: the signal path ran
+        // (the qualifier cause committed) where the declared command was
+        // supposed to.
+        let qualified_cause = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::PauseBestEffort {
+                    detail: "linux: declared best_effort".to_string(),
+                },
+            ),
+            evt(
+                LifecycleState::Paused,
+                LifecycleState::Running,
+                TransitionCause::ResumeBestEffort {
+                    detail: "linux: declared best_effort".to_string(),
+                },
+            ),
+        ];
+        let err = cooperative_cause_defect(&qualified_cause).unwrap_err();
+        assert!(err.contains("best-effort signal qualifier"), "{err}");
+
+        // The resume side's qualifier lie.
+        let resume_qualified = vec![
+            honest[0].clone(),
+            evt(
+                LifecycleState::Paused,
+                LifecycleState::Running,
+                TransitionCause::ResumeBestEffort {
+                    detail: "linux: declared best_effort".to_string(),
+                },
+            ),
+        ];
+        let err = cooperative_cause_defect(&resume_qualified).unwrap_err();
+        assert!(err.contains("best-effort signal qualifier"), "{err}");
+
+        // The A5 reverse lookup: the drain leg runs FIRST and its declared
+        // pause command appended its own paused edge — the LAST edges are
+        // this section's, and the detection must read those.
+        let mut polluted = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Paused,
+                TransitionCause::PauseCooperative {
+                    command: "touch drain-pause.sentinel".to_string(),
+                },
+            ),
+            evt(
+                LifecycleState::Paused,
+                LifecycleState::Running,
+                TransitionCause::ResumeCooperative {
+                    command: "touch drain-resume.sentinel".to_string(),
+                },
+            ),
+        ];
+        polluted.extend(honest.clone());
+        assert_eq!(
+            cooperative_cause_defect(&polluted),
+            Ok(PauseEvidence {
+                pause_command: Some("touch pause.sentinel".to_string()),
+                resume_command: Some("touch resume.sentinel".to_string()),
+            }),
+            "the reverse lookup reads THIS section's pair past the drain leg's"
+        );
+    }
+
+    /// `readiness_ready_edge_defect`: the healthy leg's pin — the final edge
+    /// must be starting→running under the adapter-ready cause; a wrong edge
+    /// or a wrong cause is caught.
+    #[test]
+    fn readiness_ready_edge_defect_pins_edge_and_cause() {
+        // The honest edge.
+        let ready = evt(
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            TransitionCause::AdapterReady,
+        );
+        assert_eq!(
+            readiness_ready_edge_defect(&ready),
+            Ok(true),
+            "the gate opening is the adapter-ready starting→running edge"
+        );
+        // A wrong edge (already running — the probe proved nothing).
+        let wrong_edge = evt(
+            LifecycleState::Running,
+            LifecycleState::Running,
+            TransitionCause::AdapterReady,
+        );
+        let err = readiness_ready_edge_defect(&wrong_edge).unwrap_err();
+        assert!(err.contains("starting→running"), "{err}");
+        // The right edge under the wrong cause (a failed gate replayed as
+        // ready).
+        let wrong_cause = evt(
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            TransitionCause::crashed("lied"),
+        );
+        let err = readiness_ready_edge_defect(&wrong_cause).unwrap_err();
+        assert!(err.contains("adapter-ready"), "{err}");
+    }
+
+    /// `readiness_timeout_leg_defect`: every arm — a charged counter, a
+    /// non-failed verdict, a wrong edge, a wrong cause kind, a wait BELOW the
+    /// budget (the engine skipped waiting), a wait ABOVE the budget + slack
+    /// (a runaway) — and the honest bracket passes.
+    #[test]
+    fn readiness_timeout_leg_defect_pins_each_arm() {
+        let honest_event = evt(
+            LifecycleState::Starting,
+            LifecycleState::Failed,
+            TransitionCause::ReadinessTimeout {
+                probe: "readiness probe http-get http://127.0.0.1:9/health (expected 200)"
+                    .to_string(),
+                waited_ms: 1000,
+            },
+        );
+        let events = vec![honest_event];
+        // The honest verdict: terminal at the declared budget, inside slack —
+        // the observed wait rides the Ok (A1).
+        assert_eq!(
+            readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &events, 1000, 500),
+            Ok(1000)
+        );
+
+        // A charged counter (either read) — a restart would replay the
+        // broken deployment.
+        let err = readiness_timeout_leg_defect(0, 1, LifecycleState::Failed, &events, 1000, 500)
+            .unwrap_err();
+        assert!(err.contains("must never charge"), "{err}");
+
+        // A non-failed final state.
+        let err = readiness_timeout_leg_defect(0, 0, LifecycleState::Starting, &events, 1000, 500)
+            .unwrap_err();
+        assert!(err.contains("must land failed"), "{err}");
+
+        // A wrong final edge.
+        let wrong_edge = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::ReadinessTimeout {
+                probe: "probe".to_string(),
+                waited_ms: 1000,
+            },
+        )];
+        let err =
+            readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &wrong_edge, 1000, 500)
+                .unwrap_err();
+        assert!(err.contains("starting→failed"), "{err}");
+
+        // A wrong cause kind (a crash wearing the timeout's clothes).
+        let wrong_cause = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Failed,
+            TransitionCause::crashed("exited with code 1"),
+        )];
+        let err =
+            readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &wrong_cause, 1000, 500)
+                .unwrap_err();
+        assert!(err.contains("readiness-timeout"), "{err}");
+
+        // A wait BELOW the budget — the engine did not really wait.
+        let short = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Failed,
+            TransitionCause::ReadinessTimeout {
+                probe: "readiness probe http-get http://127.0.0.1:9/health".to_string(),
+                waited_ms: 999,
+            },
+        )];
+        let err = readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &short, 1000, 500)
+            .unwrap_err();
+        assert!(err.contains("must bracket the declared budget"), "{err}");
+
+        // A wait ABOVE budget + slack — the bound is not real.
+        let long = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Failed,
+            TransitionCause::ReadinessTimeout {
+                probe: "readiness probe http-get http://127.0.0.1:9/health".to_string(),
+                waited_ms: 1501,
+            },
+        )];
+        let err = readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &long, 1000, 500)
+            .unwrap_err();
+        assert!(err.contains("must bracket the declared budget"), "{err}");
+
+        // No events at all.
+        assert!(
+            readiness_timeout_leg_defect(0, 0, LifecycleState::Failed, &[], 1000, 500).is_err()
+        );
+    }
+
+    /// `liveness_healthy_defect`: a healthy history passes; a failed edge or
+    /// an unresponsive cause anywhere is caught.
+    #[test]
+    fn liveness_healthy_defect_pins_each_arm() {
+        // The honest history.
+        let healthy = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            TransitionCause::AdapterReady,
+        )];
+        assert_eq!(liveness_healthy_defect(&healthy, 1200), Ok(1200));
+
+        // A failed edge.
+        let failed = vec![
+            healthy[0].clone(),
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Failed,
+                TransitionCause::crashed("exited with code 1"),
+            ),
+        ];
+        let err = liveness_healthy_defect(&failed, 1200).unwrap_err();
+        assert!(err.contains("NO failed edge"), "{err}");
+
+        // An unresponsive cause on an event that is not even a failed edge
+        // (the detection must not hinge on the state alone).
+        let unresponsive = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Stopped,
+            TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker".to_string(),
+                failing_for_ms: 5000,
+                detail: None,
+            },
+        )];
+        let err = liveness_healthy_defect(&unresponsive, 1200).unwrap_err();
+        assert!(err.contains("NO unresponsive cause"), "{err}");
+    }
+
+    /// `unresponsive_leg_defect`: every arm — a charged counter, a wrong
+    /// edge, a wrong cause kind, a streak BELOW the window (the window was
+    /// not enforced), a streak at/above window + slack (a runaway reaper) —
+    /// and the honest bracket passes.
+    #[test]
+    fn unresponsive_leg_defect_pins_each_arm() {
+        let honest = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker (stale after 5000ms)".to_string(),
+                failing_for_ms: 5000,
+                detail: None,
+            },
+        )];
+        assert_eq!(
+            unresponsive_leg_defect(&honest, 0, 5000, 1000, "hb.marker"),
+            Ok(5000)
+        );
+
+        // A charged counter under the Never policy.
+        let err = unresponsive_leg_defect(&honest, 1, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("must not restart"), "{err}");
+
+        // A wrong final edge.
+        let wrong_edge = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Failed,
+            TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker (stale after 5000ms)".to_string(),
+                failing_for_ms: 5000,
+                detail: None,
+            },
+        )];
+        let err = unresponsive_leg_defect(&wrong_edge, 0, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("running→failed"), "{err}");
+
+        // A wrong cause kind.
+        let wrong_cause = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::crashed("exited with code 1"),
+        )];
+        let err = unresponsive_leg_defect(&wrong_cause, 0, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("unresponsive"), "{err}");
+
+        // The check's own name missing from the cause.
+        let unnamed = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::Unresponsive {
+                check: "liveness check http-get /health".to_string(),
+                failing_for_ms: 5000,
+                detail: None,
+            },
+        )];
+        let err = unresponsive_leg_defect(&unnamed, 0, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("must name the declared check"), "{err}");
+
+        // A streak BELOW the window — the expiry was observed, not enforced.
+        let early = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker".to_string(),
+                failing_for_ms: 4999,
+                detail: None,
+            },
+        )];
+        let err = unresponsive_leg_defect(&early, 0, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("must bracket the declared window"), "{err}");
+
+        // A streak AT window + slack — a runaway.
+        let late = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Failed,
+            TransitionCause::Unresponsive {
+                check: "liveness check heartbeat-file hb.marker".to_string(),
+                failing_for_ms: 6000,
+                detail: None,
+            },
+        )];
+        let err = unresponsive_leg_defect(&late, 0, 5000, 1000, "hb.marker").unwrap_err();
+        assert!(err.contains("must bracket the declared window"), "{err}");
+
+        // No events at all.
+        assert!(unresponsive_leg_defect(&[], 0, 5000, 1000, "hb.marker").is_err());
+    }
+
+    /// `restart_requested_leg_defect`: every arm — a moved counter, no failed
+    /// edge, a non-running prior, a wrong cause, a missing relaunch, a
+    /// clean-exit in the log — and the honest recycle passes.
+    #[test]
+    fn restart_requested_leg_defect_pins_each_arm() {
+        let honest = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Failed,
+                TransitionCause::RestartRequested {
+                    code: 75,
+                    detail: Some("declared class `restart_requested`".to_string()),
+                },
+            ),
+            evt(
+                LifecycleState::Failed,
+                LifecycleState::Running,
+                TransitionCause::AdapterReady,
+            ),
+        ];
+        assert_eq!(restart_requested_leg_defect(&honest, 3, 3), Ok(true));
+
+        // A moved counter (either direction — neither charge nor reset).
+        let err = restart_requested_leg_defect(&honest, 3, 4).unwrap_err();
+        assert!(err.contains("must NOT touch the counter"), "{err}");
+
+        // No failed edge.
+        let no_fail = vec![honest[1].clone()];
+        let err = restart_requested_leg_defect(&no_fail, 0, 0).unwrap_err();
+        assert!(err.contains("no failed edge"), "{err}");
+
+        // The failed edge exiting a non-running prior.
+        let wrong_prior = vec![
+            evt(
+                LifecycleState::Starting,
+                LifecycleState::Failed,
+                TransitionCause::RestartRequested {
+                    code: 75,
+                    detail: None,
+                },
+            ),
+            honest[1].clone(),
+        ];
+        let err = restart_requested_leg_defect(&wrong_prior, 0, 0).unwrap_err();
+        assert!(err.contains("must exit a RUNNING run"), "{err}");
+
+        // The wrong cause (a crash misread as a relaunch ask).
+        let wrong_cause = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Failed,
+                TransitionCause::crashed("exited with code 75"),
+            ),
+            honest[1].clone(),
+        ];
+        let err = restart_requested_leg_defect(&wrong_cause, 0, 0).unwrap_err();
+        assert!(err.contains("must name the code (75)"), "{err}");
+
+        // The relaunch missing (failed and STAYED failed).
+        let no_relaunch = vec![honest[0].clone()];
+        let err = restart_requested_leg_defect(&no_relaunch, 0, 0).unwrap_err();
+        assert!(err.contains("must land running AFTER"), "{err}");
+
+        // A clean-exit anywhere in the log (the classes blurred together).
+        let blurred = vec![
+            honest[0].clone(),
+            honest[1].clone(),
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Stopped,
+                TransitionCause::CleanExit { code: 0 },
+            ),
+        ];
+        let err = restart_requested_leg_defect(&blurred, 0, 0).unwrap_err();
+        assert!(err.contains("must never read as a clean exit"), "{err}");
+    }
+
+    /// `clean_exit_leg_defect`: every arm — a charged counter, no stopped
+    /// edge, a non-running prior, a wrong cause, a failed edge in the log —
+    /// and the honest finish passes.
+    #[test]
+    fn clean_exit_leg_defect_pins_each_arm() {
+        let honest = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Stopped,
+            TransitionCause::CleanExit { code: 0 },
+        )];
+        assert_eq!(clean_exit_leg_defect(&honest, 0), Ok(true));
+
+        // A charged counter.
+        let err = clean_exit_leg_defect(&honest, 1).unwrap_err();
+        assert!(err.contains("takes NO counter action"), "{err}");
+
+        // No stopped edge.
+        let err = clean_exit_leg_defect(&[], 0).unwrap_err();
+        assert!(err.contains("no stopped edge"), "{err}");
+
+        // The stopped edge exiting a non-running prior.
+        let wrong_prior = vec![evt(
+            LifecycleState::Starting,
+            LifecycleState::Stopped,
+            TransitionCause::CleanExit { code: 0 },
+        )];
+        let err = clean_exit_leg_defect(&wrong_prior, 0).unwrap_err();
+        assert!(err.contains("must exit a RUNNING run"), "{err}");
+
+        // The wrong cause (an operator stop misread as the agent finishing).
+        let wrong_cause = vec![evt(
+            LifecycleState::Running,
+            LifecycleState::Stopped,
+            TransitionCause::command("stop"),
+        )];
+        let err = clean_exit_leg_defect(&wrong_cause, 0).unwrap_err();
+        assert!(err.contains("must name the code (0)"), "{err}");
+
+        // A failed edge anywhere (a finish is never a failure).
+        let failed = vec![
+            evt(
+                LifecycleState::Running,
+                LifecycleState::Failed,
+                TransitionCause::crashed("exited with code 1"),
+            ),
+            evt(
+                LifecycleState::Failed,
+                LifecycleState::Running,
+                TransitionCause::AdapterReady,
+            ),
+            honest[0].clone(),
+        ];
+        let err = clean_exit_leg_defect(&failed, 0).unwrap_err();
+        assert!(err.contains("never a failure"), "{err}");
+    }
+
+    /// `drain_outcome_defect`: every arm — a non-stopped row, a lying
+    /// completed flag, a sub-floor wait, an over-ceiling wait, a non-stopped
+    /// terminal edge, a wrong cause, a lying cause flag — and both honest
+    /// outcomes (completed with a floor; timed-out with no floor) pass.
+    #[test]
+    fn drain_outcome_defect_pins_each_arm() {
+        let report = |state, completed, waited_ms| ::hekma_engine::DrainReport {
+            instance: ::hekma_engine::AgentInstance {
+                name: InstanceName::new("tck").expect("valid name"),
+                kind: "tck-gateway".to_string(),
+                state,
+                agent_home: "/x/agents/tck".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            // The drain-verb outcome — the 18-4 type from `domain`, reached by
+            // path: the crate-ROOT `DrainOutcome` name belongs to the shutdown
+            // drain's per-instance outcome (post-#332 merge disambiguation).
+            outcome: ::hekma_engine::domain::DrainOutcome {
+                completed,
+                waited_ms,
+            },
+        };
+        let terminal = |completed, waited_ms| {
+            evt(
+                LifecycleState::Stopping,
+                LifecycleState::Stopped,
+                TransitionCause::DrainStopped {
+                    completed,
+                    waited_ms,
+                },
+            )
+        };
+
+        // The honest COMPLETED drain (an idle signal was promised → floor).
+        assert_eq!(
+            drain_outcome_defect(
+                &report(LifecycleState::Stopped, true, 800),
+                &terminal(true, 800),
+                true,
+                Some(500),
+                10_000,
+            ),
+            Ok(DrainLegEvidence {
+                completed: true,
+                waited_ms: 800,
+            })
+        );
+        // The honest TIMED-OUT drain (no signal promised → any wait honest).
+        assert_eq!(
+            drain_outcome_defect(
+                &report(LifecycleState::Stopped, false, 7),
+                &terminal(false, 7),
+                false,
+                None,
+                10_000,
+            ),
+            Ok(DrainLegEvidence {
+                completed: false,
+                waited_ms: 7,
+            })
+        );
+
+        // A non-stopped row.
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Running, true, 800),
+            &terminal(true, 800),
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("must land stopped"), "{err}");
+
+        // A lying completed flag on the record.
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, false, 800),
+            &terminal(true, 800),
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("must record completed:true"), "{err}");
+
+        // A sub-floor wait — the skip-the-wait lie.
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, true, 400),
+            &terminal(true, 400),
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("must have genuinely waited"), "{err}");
+
+        // An over-ceiling wait — the bound is not real.
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, false, 10_001),
+            &terminal(false, 10_001),
+            false,
+            None,
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("must be BOUNDED"), "{err}");
+
+        // A non-stopped terminal edge.
+        let wrong_terminal = evt(
+            LifecycleState::Stopping,
+            LifecycleState::Failed,
+            TransitionCause::DrainStopped {
+                completed: true,
+                waited_ms: 800,
+            },
+        );
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, true, 800),
+            &wrong_terminal,
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("must commit stopped"), "{err}");
+
+        // The wrong cause kind.
+        let wrong_cause = evt(
+            LifecycleState::Stopping,
+            LifecycleState::Stopped,
+            TransitionCause::command("stop"),
+        );
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, true, 800),
+            &wrong_cause,
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("drain-stopped"), "{err}");
+
+        // A lying cause flag (the record says completed, the event lies).
+        let lying_cause = terminal(false, 800);
+        let err = drain_outcome_defect(
+            &report(LifecycleState::Stopped, true, 800),
+            &lying_cause,
+            true,
+            Some(500),
+            10_000,
+        )
+        .unwrap_err();
+        assert!(err.contains("completed:true"), "{err}");
+    }
+
+    /// `drain_want_completed` (A3, pure): an idle-less declaration completes
+    /// through the pause command's exit-0 regardless of the pair; an idle
+    /// declaration needs the PAIR (the engine's outcome is the CONJUNCTION
+    /// of pause-exit-0 and idle-freshness).
+    #[test]
+    fn drain_want_completed_pins_each_shape() {
+        // No idle signal promised: the pause command alone can complete.
+        let idle_less = DrainDeclaration {
+            timeout_ms: 9000,
+            idle_file: None,
+        };
+        assert!(drain_want_completed(&idle_less, false));
+        assert!(drain_want_completed(&idle_less, true));
+        // An idle signal WITHOUT the pair: the idle condition can never hold.
+        let idle = DrainDeclaration {
+            timeout_ms: 9000,
+            idle_file: Some("idle.marker".to_string()),
+        };
+        assert!(!drain_want_completed(&idle, false));
+        // With the pair: the conjunction is provable.
+        assert!(drain_want_completed(&idle, true));
+    }
+
+    /// `observed_floor_from` (A3, pure): a post-drain mtime anchors the floor
+    /// at the observed arrival minus the 150ms slack (never negative); a
+    /// pre-drain (or equal) mtime falls back to the declaration-floor shape
+    /// — `min(DRAIN_COMPLETED_FLOOR_MS, bound/2)` — so the bound can always
+    /// satisfy it.
+    #[test]
+    fn observed_floor_from_pins_each_shape() {
+        // The idle file arrived 700ms into the drain: the wait must cover
+        // the arrival minus slack.
+        assert_eq!(observed_floor_from(1700, 1000, 10_000), 550);
+        // An arrival within the slack itself floors at zero (not negative).
+        assert_eq!(observed_floor_from(1100, 1000, 10_000), 0);
+        // Exactly AT the start instant is NOT an arrival (strictly after).
+        assert_eq!(
+            observed_floor_from(1000, 1000, 10_000),
+            DRAIN_COMPLETED_FLOOR_MS.min(10_000 / 2),
+            "an equal mtime predates the drain's evidence window"
+        );
+        // A pre-drain file (the stale-marker shape): the fallback floor.
+        assert_eq!(
+            observed_floor_from(500, 1000, 10_000),
+            DRAIN_COMPLETED_FLOOR_MS.min(10_000 / 2)
+        );
+        // A TIGHT bound clamps the fallback below the 500ms constant.
+        assert_eq!(observed_floor_from(500, 1000, 800), 400);
+    }
+
+    /// `serde_json_to_cause_contains`: the shared probe hits on the wire tag
+    /// and misses on an absent one (and never panics on any variant).
+    #[test]
+    fn serde_json_to_cause_contains_hits_and_misses() {
+        assert!(serde_json_to_cause_contains(
+            &TransitionCause::CleanExit { code: 0 },
+            "clean-exit"
+        ));
+        assert!(!serde_json_to_cause_contains(
+            &TransitionCause::CleanExit { code: 0 },
+            "drain-stopped"
+        ));
+        assert!(!serde_json_to_cause_contains(
+            &TransitionCause::AdapterReady,
+            "nonexistent-tag"
+        ));
+    }
+
     /// `pause_demo`: Guaranteed is a REAL suspension on Unix and an honest
     /// not_applicable naming the engine ceiling on Windows (never a silent
     /// best-effort pass); BestEffort is demonstrated everywhere.
@@ -5785,7 +9471,7 @@ env = "TCK_SUBJECT_MEMORY"
             panic!("deliberate tck panic")
         });
         assert!(!report.is_conformant());
-        assert_eq!(report.sections.len(), 8);
+        assert_eq!(report.sections.len(), 12);
         for entry in report.sections.iter() {
             match &entry.result {
                 SectionResult::Fail { reason } => {
