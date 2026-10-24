@@ -18,6 +18,7 @@ const files = [
   'lockfile.md',
   'architecture.md',
   'agents.md',
+  'agents-in-ci.md',
   'adapters.md',
   'adapters/hermes.md',
   'adapters/opencode.md',
