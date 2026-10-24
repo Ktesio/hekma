@@ -7,9 +7,10 @@
 
 mod helpers;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use hekma_conformance::test_support::{current_os_key, ManifestFixture};
+use hekma_conformance::test_support::{current_os_key, fake_agent_bin, ManifestFixture};
 use hekma_conformance::uj3;
 use hekma_engine::{Engine, FleetEntry, LifecycleState, UsageView};
 use helpers::{run_hekma_agent, run_hekma_agent_with_env, KtRun, TestContext};
@@ -2050,6 +2051,272 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     assert!(
         run.stderr.contains("cannot pause"),
         "uniform invalid-transition; stderr={}",
+        run.stderr
+    );
+}
+
+// ---- Story 18-4: `hekma agent drain <name> [--timeout-ms <ms>]` ----
+
+/// Write the story-18-4 drain manifest (the engine drain suite's shape — the
+/// COMPILED `fake_agent` binary, a `[lifecycle.pause]`/`[lifecycle.resume]`
+/// command pair, an optional raw `[drain]` body, NO `[capabilities.pause]`
+/// row: the cooperative command path is OS-independent and needs no
+/// capability entry). Returns the manifest dir for `--manifest`.
+fn write_drain_manifest_for_cli(dir: &Path, agent_args: &[&str], drain_body: &str) -> PathBuf {
+    let bin = fake_agent_bin();
+    let args_toml = |args: &[&str]| {
+        args.iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let body = format!(
+        "\ncontract_version = \"1.1.0\"\n\n[adapter]\nkind = \"drain-cli\"\n\n\
+         [lifecycle.start]\nexec = {bin:?}\nargs = [{agent_toml}]\n\n\
+         [lifecycle.pause]\nexec = {bin:?}\nargs = [\"--touch\", \"pause.sentinel\"]\n\n\
+         [lifecycle.resume]\nexec = {bin:?}\nargs = [\"--touch\", \"resume.sentinel\"]\n\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [drain]\n{drain_body}\n\n[metering]\nsource = \"self-reported\"\n",
+        bin = bin.to_string_lossy(),
+        agent_toml = args_toml(agent_args),
+    );
+    let manifest_dir = dir.join("drain-adapter");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(manifest_dir.join("adapter.toml"), body).unwrap();
+    manifest_dir
+}
+
+#[test]
+fn drain_completes_and_exits_zero_unix() {
+    // The COMPLETED drain outcome at the CLI (story 18-4): exit 0, the final
+    // `stopped` state on stdout, and NO timed-out note on stderr — the stderr
+    // leg that DISTINGUISHES the outcomes. Runtime-skip on Windows
+    // (`start_via_surviving_engine`'s cross-lifetime survival cannot be
+    // simulated there — the `_unix` convention, tested everywhere it can
+    // be); the cross-OS affirmative sibling is
+    // `drain_on_registered_refuses_with_invalid_state_cross_os`.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // The idle signal lands 800ms after the PAUSE SENTINEL — the file
+        // THIS drain's own pause command writes — so it provably arrives
+        // during the drain's wait at any machine speed (review round 1,
+        // B13's re-anchored fixture; the old process-start clock could let
+        // the file predate the drain entry).
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // The drain command must adopt a SURVIVING instance (a plain `hekma
+    // agent start` would kill the child on the command's clean engine drop —
+    // the single-lifetime boundary; the pause family's harness).
+    start_via_surviving_engine(state_dir, "svc");
+
+    let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a COMPLETED drain exits 0; stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("Drained"),
+        "the success line is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        !run.stderr.contains("did NOT complete"),
+        "a completed drain prints NO timed-out note; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_bound_override_reaches_the_engine_unix() {
+    // Review round 1 (B8): the CLI `--timeout-ms` override is the FIRST tier
+    // of the drain's three-tier bound — it must REACH the engine. The
+    // manifest declares a 600_000ms (ten-minute) bound over an idle file
+    // nobody touches; the 900ms override must govern instead. The
+    // override-is-advisory mutant burns the manifest bound (a ten-minute
+    // test); the elapsed wall-clock assert fails it fast.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // No idle fixture: the declared idle file is NEVER touched, so the
+        // drain can only end via its bound.
+        &["--linger-ms", "600000"],
+        "timeout_ms = 600000\nidle_file = \"never.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let started = std::time::Instant::now();
+    let run = run_hekma_agent(
+        &["agent", "drain", "svc", "--timeout-ms", "900"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the 900ms override must govern the drain (the manifest's ten-minute \
+         bound must not burn) — took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("did NOT complete"),
+        "the timed-out outcome is surfaced on stderr: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_that_times_out_still_exits_zero_and_says_so_unix() {
+    // The TIMED-OUT drain outcome at the CLI (story 18-4): the bound burns
+    // (the declared idle file is never touched), the drain STILL stops the
+    // instance — exit 0 BOTH ways — and the timed-out note is SURFACED on
+    // stderr (AI-18: the outcome difference lives on the surface the
+    // operator watches). Runtime-skip on Windows (the surviving-engine
+    // harness's convention); the cross-OS affirmative sibling is
+    // `drain_on_registered_refuses_with_invalid_state_cross_os`.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // No `--idle-after-ms`: the declared idle file is NEVER touched.
+        &["--linger-ms", "600000"],
+        "timeout_ms = 800\nidle_file = \"never.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout in BOTH outcomes: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("did NOT complete"),
+        "the timed-out outcome is surfaced on stderr: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_on_registered_refuses_with_invalid_state_cross_os() {
+    // The cross-OS AFFIRMATIVE drain CLI test (the `_unix` convention: the
+    // wire shape — refusal class, exit code, the state named — must also be
+    // pinned somewhere that RUNS on Windows). Drain's running-only gate
+    // refuses a registered (never started) instance naming the state, mapped
+    // to the uniform invalid-state exit code 4.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        &["--linger-ms", "600000"],
+        "timeout_ms = 1000\nidle_file = \"idle.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "nat",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_hekma_agent(&["agent", "drain", "nat"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(4),
+        "drain on a non-running instance exits invalid-state; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("not running"),
+        "the refusal names the gate; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("registered"),
+        "the refusal names the CURRENT state; stderr={}",
         run.stderr
     );
 }

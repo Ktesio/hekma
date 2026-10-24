@@ -286,6 +286,51 @@ pub enum TransitionCause {
         /// declared `clean` list (e.g. `0`).
         code: u16,
     },
+    /// A COOPERATIVE PAUSE (story 18-4): the `running → paused` edge driven by
+    /// RUNNING the adapter's declared `[lifecycle.pause]` op template (exit 0
+    /// within the engine's command cap) — the agent stops accepting new work
+    /// under its OWN program, never OS-suspended. Wire tag `pause-cooperative`.
+    /// DISTINCT from [`TransitionCause::Command`] — a plain command cause would
+    /// read as a guaranteed signal suspension, and the engine cannot verify the
+    /// agent actually stopped new work (the cause IS that honesty, inherently
+    /// best-effort-class); DISTINCT from [`TransitionCause::PauseBestEffort`]
+    /// (the signal-path qualifier). Carries the RENDERED exec string of the
+    /// command that ran, so the log names exactly what the engine executed.
+    /// The declared command outranks the signal path (OS-independent) and works
+    /// even where the capability table says `unsupported`.
+    PauseCooperative {
+        /// The rendered command (exec + args) the engine ran.
+        command: String,
+    },
+    /// A COOPERATIVE RESUME (story 18-4): the `paused → running` edge driven by
+    /// running the adapter's declared `[lifecycle.resume]` op template — the
+    /// symmetric counterpart of [`TransitionCause::PauseCooperative`]. Wire tag
+    /// `resume-cooperative`. Carries the rendered exec string of the command
+    /// that ran (the resume-side effect is the COMMAND's, never a bare SIGCONT).
+    ResumeCooperative {
+        /// The rendered command (exec + args) the engine ran.
+        command: String,
+    },
+    /// The DRAIN composite's terminal stop (story 18-4, spine AD-15's
+    /// stop-new-work → bounded-wait → stop): the `stopping → stopped` edge the
+    /// drain verb drives through the existing stop ladder, carrying the DURABLE
+    /// OUTCOME record. Wire tag `drain-stopped`. The stop happens EITHER WAY
+    /// (a timed-out drain still stops — the last step is unconditional); this
+    /// cause is what distinguishes the two outcomes in the event log.
+    /// `completed` is `true` when BOTH wait conditions held within the bound
+    /// (the pause command exited 0 AND the declared idle file was fresh); when
+    /// the bound expired, the drain STILL stops with `completed: false` —
+    /// surfaced, never a fake completion. `waited_ms` is the honest wall-clock
+    /// wait the composite actually spent (the whole bounded phase, including
+    /// the pause command's runtime).
+    DrainStopped {
+        /// Whether the bounded wait's conditions both held within the bound
+        /// (`true`) or the bound expired (`false` — the stop still happened).
+        completed: bool,
+        /// The wall-clock time the composite actually waited, in milliseconds —
+        /// measured, never assumed (≈ the declared bound on a timed-out drain).
+        waited_ms: u64,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -477,6 +522,33 @@ impl TransitionCause {
     /// with (story 18-3).
     pub fn clean_exit(code: u16) -> Self {
         TransitionCause::CleanExit { code }
+    }
+
+    /// A COOPERATIVE PAUSE cause recording the rendered `command` the engine
+    /// ran (story 18-4) — the `running → paused` edge of a declared
+    /// `[lifecycle.pause]` template.
+    pub fn pause_cooperative(command: impl Into<String>) -> Self {
+        TransitionCause::PauseCooperative {
+            command: command.into(),
+        }
+    }
+
+    /// A COOPERATIVE RESUME cause recording the rendered `command` the engine
+    /// ran (story 18-4) — the `paused → running` edge of a declared
+    /// `[lifecycle.resume]` template.
+    pub fn resume_cooperative(command: impl Into<String>) -> Self {
+        TransitionCause::ResumeCooperative {
+            command: command.into(),
+        }
+    }
+
+    /// A DRAIN-STOPPED cause recording the composite's durable outcome
+    /// (story 18-4) — `completed` + the honest `waited_ms`.
+    pub fn drain_stopped(completed: bool, waited_ms: u64) -> Self {
+        TransitionCause::DrainStopped {
+            completed,
+            waited_ms,
+        }
     }
 
     /// A TOKEN BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
@@ -901,6 +973,21 @@ mod tests {
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
                 "budget-exceeded",
+            ),
+            // 18-4: the cooperative + drain causes' wire tags are pinned —
+            // `--json`/log consumers match on these tokens.
+            (
+                TransitionCause::pause_cooperative("fake-agent --touch pause.sentinel"),
+                "pause-cooperative",
+            ),
+            (
+                TransitionCause::resume_cooperative("fake-agent --touch resume.sentinel"),
+                "resume-cooperative",
+            ),
+            (TransitionCause::drain_stopped(true, 1500), "drain-stopped"),
+            (
+                TransitionCause::drain_stopped(false, 30_000),
+                "drain-stopped",
             ),
         ];
         for (cause, tag) in cases {

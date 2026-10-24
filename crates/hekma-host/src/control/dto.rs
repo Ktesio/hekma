@@ -227,6 +227,39 @@ pub(crate) struct StopRequest {
     pub window_secs: Option<u64>,
 }
 
+/// `POST /v0/instances/{name}/drain` (story 18-4) — the DRAIN composite's
+/// body: the optional bound override in milliseconds (`None`/absent body =
+/// the manifest `[drain].timeout_ms` tier, else the engine's 30 s default —
+/// the three-tier rule). Bounds-checked in the route (`1..=600_000`, the
+/// same ceiling the adapter contract pins — out-of-bounds is a 400), the
+/// same shape as `window_secs` above.
+#[derive(Deserialize, Default)]
+pub(crate) struct DrainRequest {
+    /// The drain bound override in milliseconds (`None` = the manifest tier,
+    /// else the engine default).
+    pub timeout_ms: Option<u64>,
+}
+
+/// The `POST /v0/instances/{name}/drain` response (story 18-4): the
+/// post-drain read-back PLUS the composite's durable outcome. Both outcomes
+/// are a `200` — the drain's last step (the stop) is unconditional, so
+/// `completed: false` (the bound burned first) is STILL a stopped agent,
+/// reported honestly rather than as an error.
+#[derive(Serialize)]
+pub(crate) struct DrainDocument {
+    /// The Fleet document family's version — the same stamp the show read
+    /// carries for the same instance shape.
+    pub schema_version: u32,
+    /// The instance's post-drain Fleet row (`stopped` in both outcomes).
+    pub instance: hekma_engine::FleetEntry,
+    /// Whether the bounded wait COMPLETED before the bound (or no wait was
+    /// declared). `false` = the bound burned first; the stop still happened.
+    pub completed: bool,
+    /// The measured wall clock of the whole bounded phase (the pause
+    /// command included), in milliseconds — as-spent, honest.
+    pub waited_ms: u64,
+}
+
 /// `PUT /v0/instances/{name}/config` — the write body: one dotted key and
 /// its string value, the body-form of `config set <name> <key> <value>`.
 #[derive(Deserialize)]
@@ -418,6 +451,19 @@ mod tests {
     fn a_stop_body_that_is_not_an_object_is_rejected() {
         assert!(serde_json::from_str::<StopRequest>(r#"{"window_secs": "soon"}"#).is_err());
         assert!(serde_json::from_str::<StopRequest>(r#"{"window_secs": -1}"#).is_err());
+    }
+
+    #[test]
+    fn the_drain_body_defaults_to_the_lower_tier_when_absent() {
+        // Story 18-4: `{}` / no body / `{"timeout_ms":null}` all select the
+        // manifest tier (then the engine default); an explicit value rides
+        // as the override.
+        let empty: DrainRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.timeout_ms, None);
+        let explicit: DrainRequest = serde_json::from_str(r#"{"timeout_ms": 1500}"#).unwrap();
+        assert_eq!(explicit.timeout_ms, Some(1500));
+        assert!(serde_json::from_str::<DrainRequest>(r#"{"timeout_ms": "soon"}"#).is_err());
+        assert!(serde_json::from_str::<DrainRequest>(r#"{"timeout_ms": -1}"#).is_err());
     }
 
     /// A minimal registry row for the serialization pins (the wire shape is

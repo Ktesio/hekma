@@ -112,6 +112,17 @@ pub struct Manifest {
     /// `exit_codes` field at all) rejects the section at PARSE time via
     /// `deny_unknown_fields`, exactly as the versioning policy states.
     pub exit_codes: Option<ExitCodes>,
+    /// The declared drain wait (story 18-4, joins the contract `1.1.0` minor —
+    /// the story's ONLY new schema; the `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// templates it composes with are v1.0.0 seeds now executed). OPTIONAL: a
+    /// manifest without it drains with the engine's default posture (a declared
+    /// pause command gets the engine's default 30 s bound; nothing declared is a
+    /// degenerate direct stop). Validated by [`Manifest::validate`] when present
+    /// — a v1.1.0 engine names the section's first invalid field; a v1.0.0
+    /// engine (whose schema has no `drain` field at all) rejects the section at
+    /// PARSE time via `deny_unknown_fields`, exactly as the versioning policy
+    /// states.
+    pub drain: Option<Drain>,
 }
 
 /// The `[adapter]` identity block.
@@ -1072,6 +1083,159 @@ impl ExitCodes {
     }
 }
 
+/// The resolved `[drain]` section (story 18-4): the bounded-wait values the
+/// engine's drain composite consumes. Produced only by [`Drain::spec`] (the
+/// same validate-at-registration / re-check-at-use family as
+/// [`ReadinessGate`](crate::ReadinessGate) / [`LivenessCheck`](crate::LivenessCheck)
+/// / [`ExitCodeClasses`](crate::ExitCodeClasses)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainSpec {
+    /// The optional idle signal path, AGENT-HOME-RELATIVE (the agent touches it
+    /// when its in-flight work reaches zero; the engine reads its freshness).
+    /// `None` = no declared idle signal.
+    pub idle_file: Option<String>,
+    /// The declared drain bound, in milliseconds (`1..=600_000`).
+    pub timeout_ms: u64,
+}
+
+/// The `[drain]` section (story 18-4, added at contract `1.1.0`): the bounded
+/// wait the engine's DRAIN composite (`stop new work → wait, bounded → stop`)
+/// observes after running the declared `[lifecycle.pause]` command.
+///
+/// Fields:
+///
+/// * `timeout_ms` (REQUIRED) — the drain's wall-clock bound, `1..=600_000`
+///   (the same ten-minute ceiling the `[readiness]`/`[liveness]` windows use).
+///   A drain that outlives it still stops (the composite's last step is
+///   unconditional); the outcome is recorded honestly (`completed: false`).
+/// * `idle_file` (OPTIONAL) — an Agent-Home-RELATIVE path the agent TOUCHES
+///   when its in-flight work reaches zero. Freshness, not existence, is the
+///   signal (the engine's evaluator applies a small freshness slack — a file
+///   touched once at startup must not read idle forever), and an
+///   absent-or-stale file reads "not idle yet", never an error.
+///
+/// The section composes with the `[lifecycle.pause]`/`[lifecycle.resume]` op
+/// templates (v1.0.0 schema, EXECUTED since 18-4): the drain runs the declared
+/// pause command, waits (this section's bound) for the command's exit-0 AND the
+/// idle file's freshness, then stops. A `[lifecycle.pause]` WITHOUT this
+/// section still drains — with the engine's default 30 s bound (the verb must
+/// work; documented). Validation is [`Drain::spec`], run by
+/// [`Manifest::validate`]; the section is `deny_unknown_fields` like every
+/// section struct, so an engine built at contract 1.0.0 rejects it at parse
+/// time (the policy's older-engine rule, for free).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drain {
+    /// The optional idle signal path (Agent-Home-relative).
+    #[serde(default)]
+    pub idle_file: Option<String>,
+    /// The drain bound in milliseconds (required, `1..=600_000`).
+    pub timeout_ms: u64,
+}
+
+impl Drain {
+    /// Resolve this section into its [`DrainSpec`], enforcing the whole value
+    /// matrix and naming the first failing field (the section's validation —
+    /// run at registration via [`Manifest::validate`] and re-checked at pause/
+    /// resume/drain like the `[readiness]`/`[liveness]`/`[exit_codes]`
+    /// sections).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * `timeout_ms` is `1..=600_000` — `0` cannot bound a wait (it would
+    ///   time out before any poll), and anything above the ten-minute ceiling
+    ///   is a stalled fleet read, not a drain;
+    /// * `idle_file`, when present, is non-empty and free of control
+    ///   characters (the C0/C1 sweep — it is used as a filesystem path),
+    ///   RELATIVE (an absolute path would read a file outside the Agent Home
+    ///   the engine has authority over), and carries no `..` component (the
+    ///   same escape refusal the `[config]` file targets enforce — the idle
+    ///   signal lives inside the agent's home or nowhere).
+    pub fn spec(&self) -> Result<DrainSpec, ManifestError> {
+        if !(1..=600_000).contains(&self.timeout_ms) {
+            return Err(ManifestError::InvalidField {
+                field: "`timeout_ms` field in the `[drain]` section".to_string(),
+                detail: format!(
+                    "{} is out of range — the drain bound must be 1..=600_000 \
+                     milliseconds (zero cannot bound a wait; ten minutes is the \
+                     declared ceiling)",
+                    self.timeout_ms
+                ),
+            });
+        }
+        let idle_file = match &self.idle_file {
+            None => None,
+            Some(path) => {
+                if path.trim().is_empty() {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: "the value is empty".to_string(),
+                    });
+                }
+                if contains_control_char(path) {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: "the drain idle_file path contains a control character \
+                                 (NUL and the rest of the C0/C1 control bytes are \
+                                 forbidden — they would corrupt the path)"
+                            .to_string(),
+                    });
+                }
+                if std::path::Path::new(path).is_absolute() {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' is an ABSOLUTE path — the idle_file is resolved \
+                             against the instance's Agent Home and must be relative \
+                             (an absolute path would read a file outside the engine's \
+                             path authority)"
+                        ),
+                    });
+                }
+                // A Windows DRIVE-RELATIVE path (`C:foo` — a `Component::
+                // Prefix` without a root) is not `is_absolute()`, but it
+                // resolves against the CURRENT DRIVE's working directory —
+                // outside the Agent Home the engine joins the path onto
+                // (review round 1, A8-ii). Refused wherever the prefix
+                // component appears; a no-op compile on Unix (where the
+                // spelling is an ordinary relative name).
+                if std::path::Path::new(path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::Prefix(_)))
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' carries a Windows drive prefix (a drive-relative \
+                             or drive-qualified path) — the idle_file is resolved against \
+                             the instance's Agent Home and must be a plain relative path \
+                             (a drive-relative path would resolve OUTSIDE the Agent Home \
+                             the engine has authority over)"
+                        ),
+                    });
+                }
+                if std::path::Path::new(path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' contains a `..` component — the idle_file must \
+                             stay INSIDE the Agent Home (the same escape refusal the \
+                             `[config]` file targets enforce)"
+                        ),
+                    });
+                }
+                Some(path.clone())
+            }
+        };
+        Ok(DrainSpec {
+            idle_file,
+            timeout_ms: self.timeout_ms,
+        })
+    }
+}
+
 /// Convenience constructor naming a required-but-absent `[readiness]` field
 /// (the `missing` phrasing the other section validators use).
 fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, ManifestError> {
@@ -1371,6 +1535,77 @@ impl Manifest {
             None => return Err(ManifestError::missing("`[lifecycle]` section")),
         }
 
+        // The pause/resume PAIR rule (story 18-4): declaring exactly ONE of
+        // `[lifecycle.pause]` / `[lifecycle.resume]` is refused at registration,
+        // naming BOTH fields. Legal schema (both fields are optional seeds),
+        // new SEMANTIC rule: a pause without a resume is an unresumable trap —
+        // since 18-4 executes the pair, a cooperatively-paused instance could
+        // never be returned to `running` by its own adapter — and every other
+        // bad manifest dies at registration, so this one does too.
+        if let Some(lifecycle) = &self.lifecycle {
+            if lifecycle.pause.is_some() != lifecycle.resume.is_some() {
+                let declared = if lifecycle.pause.is_some() {
+                    "`pause`"
+                } else {
+                    "`resume`"
+                };
+                let missing = if lifecycle.pause.is_some() {
+                    "`resume`"
+                } else {
+                    "`pause`"
+                };
+                return Err(ManifestError::InvalidField {
+                    field: "`[lifecycle]` section".to_string(),
+                    detail: format!(
+                        "{declared} is declared WITHOUT {missing} — the lifecycle \
+                         pause/resume templates form a PAIR (a cooperative pause the \
+                         adapter cannot reverse would strand the instance paused \
+                         forever); declare both, or neither (an OS-signal pause needs \
+                         no templates)"
+                    ),
+                });
+            }
+
+            // The EXECUTED pair's exec/args are free of control characters
+            // (story 18-4 review round 1, A8-iii — the control-char family
+            // every rendered field obeys): since 18-4 the templates RENDER
+            // VERBATIM into the `pause-cooperative`/`resume-cooperative`
+            // causes and the operator diagnostics, so a control character
+            // would corrupt every surface that quotes the command. Scoped to
+            // the executed pair (start/stop are not rendered into causes;
+            // their argv passes straight to the OS spawn).
+            for (op, template) in [
+                ("pause", lifecycle.pause.as_ref()),
+                ("resume", lifecycle.resume.as_ref()),
+            ] {
+                let Some(template) = template else {
+                    continue;
+                };
+                if contains_control_char(&template.exec) {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("`exec` field in the `[lifecycle.{op}]` op template"),
+                        detail: "the exec contains a control character (NUL and the rest \
+                                  of the C0/C1 control bytes are forbidden — the command \
+                                  renders into transition causes and diagnostics)"
+                            .to_string(),
+                    });
+                }
+                for (index, arg) in template.args.iter().enumerate() {
+                    if contains_control_char(arg) {
+                        return Err(ManifestError::InvalidField {
+                            field: format!(
+                                "`args[{index}]` element in the `[lifecycle.{op}]` op template"
+                            ),
+                            detail: "the argument contains a control character (NUL and the \
+                                      rest of the C0/C1 control bytes are forbidden — the \
+                                      command renders into transition causes and diagnostics)"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         // [capabilities] declares real support (AD-4). Not merely non-empty: a
         // capability key with an empty per-OS map, or one whose every entry is
         // `unsupported`, promises support nowhere and is rejected — an adapter
@@ -1440,6 +1675,58 @@ impl Manifest {
             exit_codes.classes()?;
         }
 
+        // [drain] section (story 18-4, joins the contract 1.1.0 minor), IF
+        // present. Absent is valid (the engine's default drain posture — a
+        // declared pause command gets the default 30 s bound; nothing declared
+        // is a degenerate direct stop). A present-but-invalid section names its
+        // first failing field (`Drain::spec` enforces the 1..=600_000 bound and
+        // the idle_file's relative/in-home/control-char rules).
+        if let Some(drain) = &self.drain {
+            drain.spec()?;
+        }
+        // The drain/liveness DISJOINT rule (review round 1, A8-i): the
+        // idle_file may not name the liveness heartbeat's own file (a
+        // collision makes the drain's wait vacuously complete — see the
+        // helper).
+        self.validate_drain_liveness_disjoint()?;
+
+        Ok(())
+    }
+
+    /// The drain/liveness DISJOINT rule (story 18-4 review round 1, A8-i): a
+    /// `[drain].idle_file` naming the SAME path as the declared
+    /// `[liveness.heartbeat_file].path` is refused, BOTH fields named. The
+    /// heartbeat beats exactly while the agent is alive, so the drain's
+    /// freshness wait on that very file would read "idle" within one beat of
+    /// the drain entering — vacuously complete regardless of in-flight work,
+    /// and the signal the operator thinks proves "work drained" would prove
+    /// only "process alive". Run by [`Self::validate`] and re-checked by the
+    /// engine's drain resolver (the same drift gate the pair rule rides).
+    pub fn validate_drain_liveness_disjoint(&self) -> Result<(), ManifestError> {
+        let Some(drain) = &self.drain else {
+            return Ok(());
+        };
+        let Some(idle) = &drain.idle_file else {
+            return Ok(());
+        };
+        let Some(heartbeat) = self
+            .liveness
+            .as_ref()
+            .and_then(|l| l.heartbeat_file.as_ref())
+        else {
+            return Ok(());
+        };
+        if idle == &heartbeat.path {
+            return Err(ManifestError::InvalidField {
+                field: "`idle_file` field in the `[drain]` section".to_string(),
+                detail: format!(
+                    "'{idle}' is ALSO the declared `[liveness.heartbeat_file].path` — the \
+                     drain idle_file and the liveness heartbeat must be DIFFERENT files (the \
+                     heartbeat beats while the agent is ALIVE, so the drain's freshness \
+                     wait on it would complete vacuously regardless of in-flight work)"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -1519,6 +1806,24 @@ impl Manifest {
     pub fn exit_codes(&self) -> Result<Option<ExitCodeClasses>, ManifestError> {
         match &self.exit_codes {
             Some(section) => section.classes().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The declared drain [`DrainSpec`] (story 18-4, added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[drain]` section — the
+    /// engine's drain verb treats that as "no declared wait" (the engine's
+    /// default posture: a declared pause command drains under its own default
+    /// bound; nothing declared is a degenerate direct stop). The `Result` is
+    /// defensive depth, mirroring [`Self::readiness_probe`] /
+    /// [`Self::liveness_check`] / [`Self::exit_codes`]: a validated manifest's
+    /// section already resolved cleanly, but the engine calls THIS accessor, so
+    /// it re-states the failure honestly rather than panicking.
+    pub fn drain(&self) -> Result<Option<DrainSpec>, ManifestError> {
+        match &self.drain {
+            Some(section) => section.spec().map(Some),
             None => Ok(None),
         }
     }
@@ -2995,5 +3300,330 @@ channel = "stdio"
         assert_eq!(ambiguous.class_of(75), Some(ExitClass::RestartRequested));
         assert_eq!(ambiguous.class_of(0), Some(ExitClass::Clean));
         assert_eq!(ambiguous.class_of(1), None, "a miss stays None");
+    }
+
+    // -- [lifecycle] pair rule + [drain] (story 18-4) ------------------------
+
+    /// Append a `[drain]` section carrying exactly `body` to [`VALID`].
+    fn with_drain(body: &str) -> String {
+        format!("{VALID}\n[drain]\n{body}\n")
+    }
+
+    #[test]
+    fn drain_section_parses_and_resolves() {
+        let m = Manifest::from_toml_str(&with_drain(
+            "timeout_ms = 5000\nidle_file = \"work/idle.marker\"",
+        ))
+        .expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.drain().expect("resolve").expect("declared"),
+            DrainSpec {
+                idle_file: Some("work/idle.marker".to_string()),
+                timeout_ms: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn no_drain_section_is_valid_and_resolves_to_none() {
+        // The pre-18-4 shape: no section — the engine's default drain posture
+        // (a declared pause command gets its default bound; nothing declared
+        // drains degenerately). Behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.drain().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn drain_timeout_out_of_range_is_refused_naming_the_field() {
+        // 0 cannot bound a wait; >600_000 busts the declared ten-minute
+        // ceiling. The accepted edges are 1 and 600_000.
+        for body in [
+            "timeout_ms = 0",
+            "timeout_ms = 600_001",
+            "timeout_ms = 9_999_999",
+        ] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == "`timeout_ms` field in the `[drain]` section"
+                        && detail.contains("1..=600_000")),
+                "{body}: got {err}"
+            );
+        }
+        for body in ["timeout_ms = 1", "timeout_ms = 600_000"] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            m.validate().expect("the range edges are accepted");
+        }
+    }
+
+    #[test]
+    fn drain_missing_timeout_is_refused_naming_the_field() {
+        // `timeout_ms` is REQUIRED (not a serde default): an empty section is a
+        // declaration typo, refused at PARSE time naming the field (the same
+        // posture as every other required-by-deserialization field).
+        let err = Manifest::from_toml_str(&with_drain("")).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Toml { detail } if detail.contains("timeout_ms")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn drain_idle_file_value_matrix_is_enforced() {
+        // The idle_file rules: non-empty, control-char-free, RELATIVE, and
+        // without a `..` escape. A good relative path passes.
+        for (body, field_fragment, detail_fragment) in [
+            ("timeout_ms = 100\nidle_file = \"\"", "idle_file", "empty"),
+            (
+                "timeout_ms = 100\nidle_file = \"idle\\u0001.marker\"",
+                "idle_file",
+                "control character",
+            ),
+            (
+                "timeout_ms = 100\nidle_file = \"/etc/passwd\"",
+                "idle_file",
+                "ABSOLUTE",
+            ),
+            (
+                "timeout_ms = 100\nidle_file = \"../outside.marker\"",
+                "idle_file",
+                "`..`",
+            ),
+        ] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains(field_fragment) && detail.contains(detail_fragment)),
+                "{body}: got {err}"
+            );
+        }
+        let ok = Manifest::from_toml_str(&with_drain("timeout_ms = 100\nidle_file = \"a/b\""))
+            .expect("parse");
+        ok.validate().expect("a relative in-home path is accepted");
+    }
+
+    #[test]
+    fn drain_unknown_fields_fail_at_parse() {
+        // deny_unknown_fields (the manifest style) catches typos at parse.
+        let err = Manifest::from_toml_str(&with_drain("timeout_ms = 100\nbogus = 1")).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_drain_section() {
+        // The v1.0.0-rejection PIN, drain twin of the readiness/liveness/
+        // exit-codes ones: an engine built at contract 1.0.0 has a `Manifest`
+        // schema WITHOUT the `drain` field, and `deny_unknown_fields` refuses
+        // the unknown section at PARSE time. Simulated with the exact pre-18-4
+        // shape — the same section list, minus the 1.1.0 sections — against a
+        // 1.1.0 manifest that declares the section. The diagnostic must NAME
+        // it (`drain`).
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_drain("timeout_ms = 5000");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("drain"), "got {err}");
+    }
+
+    #[test]
+    fn pause_without_resume_is_refused_naming_both_fields() {
+        // The 18-4 PAIR rule: exactly ONE of pause/resume is a legal-schema
+        // declaration with a TRAP semantic (an unresumable cooperative pause),
+        // so registration refuses it naming BOTH fields. Both directions are
+        // pinned (pause-only and resume-only); declaring BOTH passes. The
+        // splice point is `[lifecycle.stop]` — a full table header — so the
+        // inserted tables never swallow `VALID`'s own fields.
+        let pause_only = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.pause]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&pause_only).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`[lifecycle]` section"
+                    && detail.contains("`pause`")
+                    && detail.contains("`resume`")),
+            "the refusal must name both fields: {err}"
+        );
+
+        let resume_only = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.resume]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&resume_only).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("`resume`"), "got {err}");
+
+        // The declared PAIR passes validation (the 18-4 target shape).
+        let pair = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.pause]\nexec = \"/bin/true\"\n\n\
+             [lifecycle.resume]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&pair).expect("parse");
+        m.validate().expect("the declared pair is valid");
+    }
+
+    #[test]
+    fn drain_idle_file_naming_the_liveness_heartbeat_is_refused_naming_both() {
+        // The A8-i disjoint rule: the idle_file may not name the liveness
+        // heartbeat's own file. The heartbeat beats while the agent is
+        // ALIVE, so the drain's freshness wait on that very file would read
+        // "idle" within one beat of the drain entering — vacuously complete
+        // regardless of in-flight work, and the signal the operator thinks
+        // proves "work drained" would prove only "process alive". Refused
+        // naming BOTH files.
+        let collide = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"alive.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&collide).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`idle_file` field in the `[drain]` section"
+                    && detail.contains("alive.marker")
+                    && detail.contains("DIFFERENT files")),
+            "got {err}"
+        );
+
+        // Different paths coexist legally (the intended shape: the heartbeat
+        // proves liveness, the idle_file proves drained work).
+        let distinct = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&distinct).expect("parse");
+        m.validate().expect("distinct paths are accepted");
+
+        // The rule is silent when either side is absent (no drain section, no
+        // idle_file, no heartbeat — the liveness http_get twin instead): every
+        // pre-review shape stays valid.
+        for body in [
+            VALID.to_string(),
+            format!("{VALID}\n[drain]\ntimeout_ms = 100\n"),
+            format!(
+                "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+                 [liveness]\n[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\n\
+                 expected_status = 200\nmax_age_ms = 5000\n"
+            ),
+        ] {
+            let m = Manifest::from_toml_str(&body).expect("parse");
+            m.validate().expect("rule is silent when a side is absent");
+        }
+    }
+
+    #[test]
+    fn drain_idle_file_windows_drive_prefix_is_refused_where_it_parses_as_one() {
+        // A8-ii: `C:foo` is a `Component::Prefix` (drive-RELATIVE) on Windows
+        // — not `is_absolute()`, yet it resolves against the current drive's
+        // working directory, outside the Agent Home the engine joins the path
+        // onto. Refused wherever the prefix component exists; on Unix the
+        // spelling is an ordinary relative name, so the same manifest is
+        // accepted (the check is a structural no-op there).
+        let m = Manifest::from_toml_str(&with_drain(
+            "timeout_ms = 100\nidle_file = \"C:foo.marker\"",
+        ))
+        .expect("parse");
+        if cfg!(windows) {
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == "`idle_file` field in the `[drain]` section"
+                        && detail.contains("drive")),
+                "got {err}"
+            );
+        } else {
+            m.validate()
+                .expect("no prefix component parses on Unix — accepted");
+        }
+    }
+
+    #[test]
+    fn lifecycle_pair_exec_and_args_are_control_char_free() {
+        // A8-iii: since 18-4 the pair's templates render VERBATIM into the
+        // pause-cooperative/resume-cooperative causes and operator
+        // diagnostics, so a control character in the executed pair's
+        // exec/args corrupts every surface that quotes the command. Scoped to
+        // the executed pair (start/stop pass straight to the OS spawn and are
+        // not rendered into causes). Both pair members are declared in every
+        // splice so the PAIR rule never fires first.
+        let pair_with = |op: &str, body: &str| -> String {
+            let (pause_body, resume_body) = if op == "pause" {
+                (body.to_string(), "exec = \"/bin/resume\"".to_string())
+            } else {
+                ("exec = \"/bin/pause\"".to_string(), body.to_string())
+            };
+            VALID.replacen(
+                "[lifecycle.stop]",
+                &format!(
+                    "[lifecycle.pause]\n{pause_body}\n\n\
+                     [lifecycle.resume]\n{resume_body}\n\n[lifecycle.stop]"
+                ),
+                1,
+            )
+        };
+        // exec refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(op, "exec = \"/bin/true\\u0001\""))
+                .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`exec` field in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // args[i] refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(
+                op,
+                "exec = \"/bin/true\"\nargs = [\"--mode\", \"x\\u0007y\"]",
+            ))
+            .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`args[1]` element in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // The clean pair passes (the intended shape rides the same splice).
+        let m =
+            Manifest::from_toml_str(&pair_with("pause", "exec = \"/bin/pause\"")).expect("parse");
+        m.validate().expect("a control-char-free pair is valid");
+        // Scoped exclusion: the SAME control byte in START (never rendered
+        // into causes; its argv goes straight to the OS spawn) is out of
+        // A8-iii's scope and still validates.
+        let start_body = VALID.replacen("exec = \"demo-agent\"", "exec = \"/bin/true\\u0001\"", 1);
+        let m = Manifest::from_toml_str(&start_body).expect("parse");
+        m.validate()
+            .expect("start is out of the A8-iii scope — not refused here");
     }
 }

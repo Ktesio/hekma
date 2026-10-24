@@ -1191,6 +1191,11 @@ impl Supervisor {
                 // is the anchor; the crash classifier reads it through the
                 // state gate (only a crash out of EXACTLY `running`).
                 running_since: std::time::Instant::now(),
+                // Story 18-4: a fresh Run starts UNPAUSED — the cooperative
+                // flag flips only when THIS engine commits a
+                // cooperative-pause edge (and re-derives from the record at
+                // adoption/re-acquire).
+                cooperatively_paused: false,
             },
         );
 

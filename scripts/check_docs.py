@@ -146,6 +146,7 @@ AGENT_COMMANDS = {
     "stop",
     "pause",
     "resume",
+    "drain",
     "send",
     "logs",
     "usage",

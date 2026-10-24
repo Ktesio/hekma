@@ -104,6 +104,13 @@ pub struct ManifestFixture {
     /// reason: the exit-codes tests are about the section's shape. E.g.
     /// `"restart_requested = [75]\nclean = [0]"`.
     exit_codes: Option<String>,
+    /// The 18-4 cooperative-pause PAIR paths (pause sentinel, resume
+    /// sentinel): when `Some`, the `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// op templates are written, each `fake_agent --touch <path>` (the
+    /// lifecycle-command fixture whose observable side effect is the
+    /// sentinel file, created in the Agent Home). The pair rule requires
+    /// BOTH or NEITHER, and this builder only writes both.
+    touch_pair: Option<(String, String)>,
 }
 
 /// One `[capabilities.<name>]` block: the per-OS `os = "level"` entries in
@@ -130,6 +137,7 @@ impl ManifestFixture {
             readiness: None,
             liveness: None,
             exit_codes: None,
+            touch_pair: None,
         }
     }
 
@@ -330,6 +338,16 @@ impl ManifestFixture {
         self
     }
 
+    /// Declare the 18-4 cooperative-pause PAIR: `[lifecycle.pause]` +
+    /// `[lifecycle.resume]`, each a `fake_agent --touch <path>` fixture (the
+    /// observable side effect is the sentinel file, created in the Agent
+    /// Home; the engine runs each as a bounded lifecycle command). The pair
+    /// rule requires BOTH or NEITHER — this builder only writes both.
+    pub fn touch_pair(mut self, pause_path: &str, resume_path: &str) -> Self {
+        self.touch_pair = Some((pause_path.to_string(), resume_path.to_string()));
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -389,14 +407,28 @@ impl ManifestFixture {
             .exit_codes
             .map(|body| format!("\n[exit_codes]\n{body}\n"))
             .unwrap_or_default();
+        let touch_pair = self
+            .touch_pair
+            .as_ref()
+            .map(|(pause, resume)| {
+                format!(
+                    "\n[lifecycle.pause]\nexec = {exec:?}\nargs = [\"--touch\", {pause:?}]\n\n\
+                     [lifecycle.resume]\nexec = {exec:?}\nargs = [\"--touch\", {resume:?}]",
+                    exec = exec,
+                    pause = pause,
+                    resume = resume,
+                )
+            })
+            .unwrap_or_default();
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
-             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{capabilities}\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{touch_pair}{capabilities}\n\n\
              [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}{exit_codes}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
             args_toml = args_toml,
+            touch_pair = touch_pair,
             capabilities = capabilities,
             metering = self.metering_source,
             config = config,
