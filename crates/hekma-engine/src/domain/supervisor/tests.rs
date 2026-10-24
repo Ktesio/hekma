@@ -6490,9 +6490,11 @@ fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
     );
     // The process itself unfroze: the work log (frozen while SIGSTOPped)
     // grows again past its suspended count. Unix-only — the SIGSTOP freeze
-    // the growth proves is a Unix mechanism.
-    #[cfg(unix)]
-    {
+    // the growth proves is a Unix mechanism. Data-driven OS gate (NOT `#[cfg]` —
+    // the boundary CI job forbids OS-conditional cfg outside the enumerated
+    // allowlist; the line-3331 precedent in this file): the block's APIs are
+    // all portable, only the SIGSTOP mechanism it observes is Unix's.
+    if matches!(OsId::current(), OsId::Linux | OsId::Macos) {
         let work = registry.agent_home(&name).join("work.log");
         let frozen = work_lines(&work);
         let deadline = Instant::now() + Duration::from_secs(5);
