@@ -102,6 +102,10 @@ jobs:
           }
           check "https://hekma.ktesio.dev/" "<title>Hekma: run AI agents like services</title>"
           check "https://hekma.ktesio.dev/docs/" "<title>Hekma docs</title>"
+          # The adapter gallery is a README-facing public URL (the README
+          # links it) — the probe pins it so a missing/lagged site port
+          # fails BY NAME instead of shipping dead README links green.
+          check "https://hekma.ktesio.dev/docs/adapters/" "<title>Adapter Gallery</title>"
           exit "$failed"
 
       - name: Check the legacy URLs still redirect
