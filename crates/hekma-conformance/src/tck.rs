@@ -3187,13 +3187,31 @@ fn drain_timeout_twin_leg(
         .prefix("ktesio-tck-drain-")
         .tempdir()
         .map_err(|e| format!("drain twin tempdir: {e}"))?;
-    crate::test_support::ManifestFixture::new(twin, &["--linger-ms", "600000"])
-        .guaranteed_on_all_oses("pause")
-        .touch_pair("pause.sentinel", "resume.sentinel")
-        .drain(&format!(
-            "timeout_ms = {DRAIN_TWIN_BOUND_MS}\nidle_file = \"never.sentinel\""
-        ))
-        .write(dir.path());
+    crate::test_support::ManifestFixture::new(
+        twin,
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture (the subject leg's twin):
+            // the twin's contract needs the terminal `drain-stopped` cause
+            // with `completed:false` — a GRACEFUL stop — but on Windows the
+            // ladder's graceful step is a pure exit-watch, so a
+            // never-ending twin would escalate to `stop-forced` after the
+            // whole default window. The anchored self-exit (2500ms —
+            // comfortably past the 1200ms bound the leg clamps to, so the
+            // wait genuinely burns and records `completed:false` first)
+            // ends the twin on its own inside the graceful window on
+            // every OS.
+            "--exit-on-pause",
+            "2500:pause.sentinel",
+        ],
+    )
+    .guaranteed_on_all_oses("pause")
+    .touch_pair("pause.sentinel", "resume.sentinel")
+    .drain(&format!(
+        "timeout_ms = {DRAIN_TWIN_BOUND_MS}\nidle_file = \"never.sentinel\""
+    ))
+    .write(dir.path());
     facade
         .register_with_adapter(twin, &AdapterRef::Manifest(dir.path().to_path_buf()))
         .map_err(|e| format!("drain twin register failed: {e}"))?;
@@ -5586,6 +5604,18 @@ mod tests {
             &[
                 "--idle-on-pause",
                 "300:pause.sentinel:idle.marker",
+                // The Windows graceful-stop fixture: the Windows ladder's
+                // graceful step is a pure exit-watch (no signal to
+                // deliver), so a never-ending subject escalates to
+                // stop-forced — a terminal cause the drain section's
+                // contract rightly rejects. The anchored self-exit (the
+                // same pause-anchor clock as the idle marker, 1200ms after
+                // it) ends the subject on its own inside the graceful
+                // window, on every OS, without touching the wait's truth:
+                // the idle signal still lands at anchor+300ms and the
+                // subject is provably alive through its observation.
+                "--exit-on-pause",
+                "1500:pause.sentinel",
                 "--linger-ms",
                 "600000",
             ],
