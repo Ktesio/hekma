@@ -170,8 +170,9 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
     }
 
     // The report carries the contract version the run was governed by
-    // (retro #163, finding B8) — the frozen v1 this engine negotiates.
-    assert_eq!(report.contract_version, "1.0.0");
+    // (retro #163, finding B8) — the frozen v1 this engine negotiates
+    // (rides the additive Adapter Contract minors).
+    assert_eq!(report.contract_version, "1.1.0");
 }
 
 /// The serialization lock for THIS binary's PATH-mutating tests. Plain

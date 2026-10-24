@@ -175,6 +175,29 @@ pub enum TransitionCause {
         /// The backoff waited before this restart, in milliseconds.
         waited_ms: u64,
     },
+    /// A READINESS PROBE timed out (the launch's final gate): the
+    /// `starting → failed` edge the start path drives when the declared probe
+    /// never reported ready inside its own `timeout_ms`. TERMINAL by design —
+    /// unlike [`TransitionCause::Crashed`] there is NO restart-policy consult:
+    /// an adapter that survives its survival window but never declares ready
+    /// is a broken deployment, and a restart would replay the same failure.
+    /// Wire tag `readiness-timeout`. DISTINCT from [`TransitionCause::LaunchError`]
+    /// (the launch itself failed) — here the launch SUCCEEDED and the adapter
+    /// failed to become ready. Carries the probe's rendered description (what
+    /// was watched) and the wall-clock wait, so log/`--json`/7-2 consumers can
+    /// match on it without re-parsing free text.
+    ReadinessTimeout {
+        /// The rendered probe description (e.g.
+        /// `"readiness probe http-get http://127.0.0.1:8080/health (expected 200)"`).
+        probe: String,
+        /// How long the probe was ACTUALLY waited, in milliseconds — the
+        /// real elapsed time from the wait's start to the deadline check,
+        /// which is at most the declared `timeout_ms` plus a little
+        /// scheduling slack (the runner's polls overshoot the deadline by
+        /// at most one poll interval, and the number reported is measured,
+        /// never assumed).
+        waited_ms: u64,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -308,6 +331,16 @@ impl TransitionCause {
     /// (story 1-6, AC4/AC9).
     pub fn restarted(count: u32, waited_ms: u64) -> Self {
         TransitionCause::Restarted { count, waited_ms }
+    }
+
+    /// A READINESS-TIMEOUT cause recording the probe's rendered `description` +
+    /// the honest `waited_ms`. Terminal — the start path never pairs this with
+    /// a restart.
+    pub fn readiness_timeout(probe: impl Into<String>, waited_ms: u64) -> Self {
+        TransitionCause::ReadinessTimeout {
+            probe: probe.into(),
+            waited_ms,
+        }
     }
 
     /// A TOKEN BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
@@ -696,6 +729,13 @@ mod tests {
             (TransitionCause::detached_resumed("x"), "detached-resumed"),
             (TransitionCause::crashed("x"), "crashed"),
             (TransitionCause::restarted(1, 1000), "restarted"),
+            (
+                TransitionCause::readiness_timeout(
+                    "readiness probe http-get http://x/health (expected 200)",
+                    5000,
+                ),
+                "readiness-timeout",
+            ),
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
                 "budget-exceeded",
