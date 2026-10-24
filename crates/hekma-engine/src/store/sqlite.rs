@@ -83,7 +83,7 @@ use crate::ports::{
 /// pre-v9 record (adoption mints + writes back + one-time note), or a
 /// policy/settle pid-0 seed row (no current Run). Not part of any key; no
 /// column renamed/removed.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -304,13 +304,50 @@ ALTER TABLE agent_runtime ADD COLUMN run_id TEXT;
 /// the kill-on-drop teardown of a re-adopted handle was stopping other
 /// processes' attached agents, e.g. `hekma agent list` killing an agent a
 /// running `hekma serve` was supervising). A dead owner adopts exactly as
-/// before (the story 1-6 crash-recovery contract is unchanged), and the
-/// adopter RE-STAMPS itself as the owner. Detached records ignore the owner
+/// before (the story 1-6 crash-recovery contract is unchanged); the adopter
+/// deliberately does NOT re-stamp the owner (see the note at the adoption
+/// site in `reaper.rs`) — concurrent adoption is arbitrated by the v11
+/// lease columns instead. Detached records ignore the owner
 /// (their adoption is disarmed by the detach flag regardless). No column
 /// renamed/removed, so v1..v9 → v10 preserves every row.
 const SCHEMA_V10: &str = "\
 ALTER TABLE agent_runtime ADD COLUMN owner_pid INTEGER;
 ALTER TABLE agent_runtime ADD COLUMN owner_start_time INTEGER;
+";
+
+/// Schema v11 DDL (the adoption lease, issue #328): the spawn record's
+/// ADOPTION-LEASE fingerprint — the durable answer to "which engine won the
+/// race to re-adopt this dead-owner record?".
+///
+/// ADDITIVE over the frozen `agent_runtime` columns, following the
+/// v6/v8/v9/v10 (nullable ALTERs on the same table) pattern exactly: TWO
+/// NULLABLE INTEGER columns.
+///
+/// * `lease_pid INTEGER` (NULLABLE) — the pid of the ENGINE PROCESS that won
+///   the compare-and-set to re-adopt the record (`try_acquire_adoption_
+///   lease`). NULL = no live lease (a fresh spawn — the lease is adoption-
+///   only — or a pre-v11 record).
+/// * `lease_start_time INTEGER` (NULLABLE) — the leaseholder's start-time
+///   token, the PID-reuse guard (a recycled leaseholder pid with a different
+///   start-time is NOT the recorded leaseholder — it is a dead lease the
+///   next adoption compare-and-sets over).
+///
+/// The lease arbitrates the CONCURRENT-OPEN race the live-owner boundary
+/// (v10) could not see: two engines opening over a crashed owner's record
+/// both passed the owner gate and both re-held armed kill-on-drop handles,
+/// so whichever engine exited first killed the group out from under the
+/// other (its own teardown then hit a no-op ESRCH). With the lease, the
+/// adoption pass compare-and-sets BEFORE re-holding a handle: exactly one
+/// engine adopts armed, the loser holds nothing and skips with a surfaced
+/// diagnostic. The OWNER columns are deliberately untouched by adoption (the
+/// v10 boundary stays scoped to the ORIGINAL spawning owner); a lease held
+/// by a live engine skips exactly like a live owner does, and a dead or
+/// stale lease is compare-and-set over (self-healing, no explicit release).
+/// Detached records ignore the lease (disarmed adoption cannot arm the
+/// race). No column renamed/removed, so v1..v10 → v11 preserves every row.
+const SCHEMA_V11: &str = "\
+ALTER TABLE agent_runtime ADD COLUMN lease_pid INTEGER;
+ALTER TABLE agent_runtime ADD COLUMN lease_start_time INTEGER;
 ";
 
 /// The AD-17 bounded-wait bound (story 15-6): how long a writer waits for
@@ -563,6 +600,9 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     }
     if version < 10 {
         migrate_step(conn, 10, SCHEMA_V10)?;
+    }
+    if version < 11 {
+        migrate_step(conn, 11, SCHEMA_V11)?;
     }
 
     Ok(())
@@ -1083,8 +1123,9 @@ impl StateStore for SqliteStore {
             .execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause, \
-                  detached, acp_session_id, run_id, owner_pid, owner_start_time) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                  detached, acp_session_id, run_id, owner_pid, owner_start_time, \
+                  lease_pid, lease_start_time) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                  ON CONFLICT(instance_id) DO UPDATE SET \
                  pid = excluded.pid, start_time = excluded.start_time, \
                  restart_policy = excluded.restart_policy, \
@@ -1094,7 +1135,9 @@ impl StateStore for SqliteStore {
                  acp_session_id = excluded.acp_session_id, \
                  run_id = excluded.run_id, \
                  owner_pid = excluded.owner_pid, \
-                 owner_start_time = excluded.owner_start_time",
+                 owner_start_time = excluded.owner_start_time, \
+                 lease_pid = excluded.lease_pid, \
+                 lease_start_time = excluded.lease_start_time",
                 rusqlite::params![
                     id,
                     record.fingerprint.pid as i64,
@@ -1107,6 +1150,15 @@ impl StateStore for SqliteStore {
                     record.run_id.as_ref().map(|run| run.as_str()),
                     record.owner.map(|owner| owner.pid as i64),
                     record.owner.map(|owner| owner.start_time as i64),
+                    // The lease is ADOPTION-ONLY (schema v11): every spawn
+                    // path constructs the record with `lease: None`, so this
+                    // column pair is NULL on a fresh spawn AND reset to NULL
+                    // on every genuine (re)spawn — a stale lease from a dead
+                    // supervised lifetime must never outlive the process it
+                    // arbitrated. The adoption path is the ONLY lease writer,
+                    // through the compare-and-set below.
+                    record.lease.map(|lease| lease.pid as i64),
+                    record.lease.map(|lease| lease.start_time as i64),
                 ],
             )
             .map_err(backend)?;
@@ -1210,6 +1262,51 @@ impl StateStore for SqliteStore {
         Ok(())
     }
 
+    fn try_acquire_adoption_lease(
+        &self,
+        name: &InstanceName,
+        expected: Option<ProcessFingerprint>,
+        leaseholder: ProcessFingerprint,
+    ) -> Result<bool, StoreError> {
+        // Schema v11 (issue #328): the CONCURRENT-ADOPTION arbiter. The
+        // UPDATE fires only when the row's lease still equals the value the
+        // caller READ (`expected`) — `IS` on both columns so a NULL expected
+        // matches only a NULL lease. A concurrent adopter's winning write
+        // leaves the guard stale, the UPDATE misses, and the caller reads
+        // `Ok(false)` — an EXPECTED race outcome (skip the record), never an
+        // error. Unlike `set_spawn_run_id` there is nothing to disambiguate
+        // on a miss: row gone, row re-spawned, and row leased-elsewhere all
+        // mean the same thing here — this engine must not re-hold the
+        // process — so they are uniformly `Ok(false)` and the caller's
+        // diagnostic names the lost race.
+        //
+        // One transaction per event (AD-6): a single UPDATE is atomic, and
+        // SQLite's serialized writes make the read-guard-write indivisible
+        // against other writers (the BUSY_TIMEOUT bounded wait covers a
+        // writer-write collision).
+        let Some(id) = self.instance_id(name)? else {
+            // A vanished record adopts nothing — not an error (the caller
+            // treats false as "skip", and the record's disappearance is its
+            // own truthful event).
+            return Ok(false);
+        };
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE agent_runtime SET lease_pid = ?1, lease_start_time = ?2 \
+                 WHERE instance_id = ?3 AND lease_pid IS ?4 AND lease_start_time IS ?5",
+                rusqlite::params![
+                    leaseholder.pid as i64,
+                    leaseholder.start_time as i64,
+                    id,
+                    expected.map(|fp| fp.pid as i64),
+                    expected.map(|fp| fp.start_time as i64),
+                ],
+            )
+            .map_err(backend)?;
+        Ok(rows == 1)
+    }
+
     fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, StoreError> {
         // The story-14-2 settle: clear the live record (a clean stop, a crash
         // reconcile, a terminal settle — the supervision facts die with the
@@ -1275,7 +1372,8 @@ impl StateStore for SqliteStore {
         self.conn
             .query_row(
                 "SELECT pid, start_time, restart_policy, restart_count, last_known_cause, \
-                 detached, acp_session_id, run_id, owner_pid, owner_start_time \
+                 detached, acp_session_id, run_id, owner_pid, owner_start_time, \
+                 lease_pid, lease_start_time \
                  FROM agent_runtime WHERE instance_id = ?1",
                 [id],
                 |row| Ok(row_to_spawn_record(name.clone(), row)),
@@ -1292,7 +1390,7 @@ impl StateStore for SqliteStore {
             .prepare(
                 "SELECT i.name, r.pid, r.start_time, r.restart_policy, r.restart_count, \
                  r.last_known_cause, r.detached, r.acp_session_id, r.run_id, \
-                 r.owner_pid, r.owner_start_time \
+                 r.owner_pid, r.owner_start_time, r.lease_pid, r.lease_start_time \
                  FROM agent_runtime r JOIN agent_instances i ON i.id = r.instance_id \
                  ORDER BY i.name",
             )
@@ -1752,6 +1850,21 @@ fn row_to_spawn_record(
         }
         _ => None,
     };
+    // The adoption lease (schema v11): same NULL-either-column semantics as
+    // the owner above — NULL in either column is a pre-v11 record or an
+    // un-leased (freshly spawned) record, a pid with a MISSING start-time
+    // degrades to None (an unverifiable leaseholder is no leaseholder), and
+    // zero/negative values read as None for the same honest-degradation
+    // reason. Both adopt exactly as pre-v11: no lease means no concurrent
+    // adoption to arbitrate.
+    let lease_pid: Option<i64> = row.get("lease_pid").map_err(backend)?;
+    let lease_start: Option<i64> = row.get("lease_start_time").map_err(backend)?;
+    let lease = match (lease_pid, lease_start) {
+        (Some(pid), Some(start)) if pid > 0 && start > 0 => {
+            Some(ProcessFingerprint::new(pid as u32, start as u64))
+        }
+        _ => None,
+    };
     let restart_policy =
         RestartPolicy::from_wire(&policy_raw).ok_or_else(|| StoreError::CorruptRow {
             name: name.as_str().to_string(),
@@ -1767,6 +1880,7 @@ fn row_to_spawn_record(
         acp_session_id,
         run_id,
         owner,
+        lease,
     })
 }
 
@@ -1989,10 +2103,10 @@ mod tests {
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): assert the actual
         // version — comparing to SCHEMA_VERSION would pass even if the
-        // stamp and the constant drifted together. (The v10 step, the
-        // live-owner adoption boundary's owner columns, is the current last
-        // step; bump this literal when the next additive step lands.)
-        assert_eq!(version, 10);
+        // stamp and the constant drifted together. (The v11 step, the
+        // adoption-lease columns, is the current last step; bump this
+        // literal when the next additive step lands.)
+        assert_eq!(version, 11);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -2125,6 +2239,7 @@ mod tests {
             acp_session_id: None,
             run_id: None,
             owner: None,
+            lease: None,
         }
     }
 
@@ -2570,8 +2685,9 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
-        // 9 (the v9 step, story 15-2, is the current last step).
-        assert_eq!(version, 10);
+        // 11 (the v11 step, the adoption-lease columns, is the current last
+        // step).
+        assert_eq!(version, 11);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");
@@ -2608,22 +2724,27 @@ mod tests {
             .unwrap();
         }
         // Reopen: the v10 ALTERs add the owner columns (NULL for the legacy
-        // row).
+        // row), the v11 ALTERs add the lease columns (NULL likewise).
         let store = SqliteStore::open(&db).unwrap();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
-        // 10 (the v10 step, the live-owner boundary's owner columns, is the
-        // current last step).
-        assert_eq!(version, 10);
+        // 11 (the v11 step, the adoption-lease columns, is the current last
+        // step).
+        assert_eq!(version, 11);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(!rec.detach, "the legacy attached flag survives");
         assert_eq!(
             rec.owner, None,
             "a pre-v10 record reads owner = None (the pre-boundary adopt posture)"
+        );
+        assert_eq!(
+            rec.lease, None,
+            "a pre-v11 record reads lease = None (the pre-lease adopt posture: no \
+             concurrent adoption to arbitrate)"
         );
         // A record written WITH an owner round-trips the exact fingerprint —
         // the identity a later engine's live-owner probe compares against.
@@ -2635,6 +2756,134 @@ mod tests {
             back.owner,
             Some(ProcessFingerprint::new(31337, 987_654_321)),
             "the owner fingerprint round-trips exactly"
+        );
+    }
+
+    #[test]
+    fn adoption_lease_round_trips_and_resets_on_a_genuine_respawn() {
+        // Schema v11: the lease is a first-class record field — it round-trips
+        // the exact fingerprint through the upsert, and a GENUINE (re)spawn
+        // (the spawn paths always construct `lease: None`) RESETS it: a stale
+        // lease from a dead supervised lifetime must never outlive the
+        // process it arbitrated.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let mut rec = record("demo", 4321, 987_654, 0);
+        rec.lease = Some(ProcessFingerprint::new(31337, 987_654_321));
+        store.upsert_spawn_record(&rec).unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(
+            back.lease,
+            Some(ProcessFingerprint::new(31337, 987_654_321)),
+            "the leaseholder fingerprint round-trips exactly"
+        );
+        // A genuine respawn rewrites the record (new process lifetime) with
+        // no lease — through the same upsert the spawn path uses.
+        let mut fresh = record("demo", 5555, 111_222, 0);
+        fresh.lease = None;
+        store.upsert_spawn_record(&fresh).unwrap();
+        let back = store.get_spawn_record(&name("demo")).unwrap().unwrap();
+        assert_eq!(back.fingerprint.pid, 5555, "the respawned record stands");
+        assert_eq!(back.lease, None, "the respawn reset the stale lease");
+    }
+
+    #[test]
+    fn adoption_lease_cas_wins_exactly_once_and_turns_over_a_dead_holder() {
+        // The concurrent-adoption arbiter (issue #328): the compare-and-set
+        // fires only under the lease value the caller READ — so the FIRST
+        // adopter from `None` wins, the SECOND (still expecting `None`)
+        // loses without an error, and a later engine turns the lease over a
+        // DEAD holder's stale fingerprint exactly once.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        store
+            .upsert_spawn_record(&record("demo", 4321, 987_654, 0))
+            .unwrap();
+
+        let engine_a = ProcessFingerprint::new(101, 1_001);
+        let engine_b = ProcessFingerprint::new(102, 1_002);
+        // Winner: None -> A (the un-leased record's first adopter).
+        assert!(
+            store
+                .try_acquire_adoption_lease(&name("demo"), None, engine_a)
+                .unwrap(),
+            "the first adopter from no lease wins"
+        );
+        assert_eq!(
+            store
+                .get_spawn_record(&name("demo"))
+                .unwrap()
+                .unwrap()
+                .lease,
+            Some(engine_a),
+            "the winner's fingerprint is persisted"
+        );
+        // Loser: B still expects None — the guard moved, so the UPDATE
+        // misses. Ok(false), never an error: the caller skips the record.
+        assert!(
+            !store
+                .try_acquire_adoption_lease(&name("demo"), None, engine_b)
+                .unwrap(),
+            "a concurrent second adopter loses the race with Ok(false)"
+        );
+        assert_eq!(
+            store
+                .get_spawn_record(&name("demo"))
+                .unwrap()
+                .unwrap()
+                .lease,
+            Some(engine_a),
+            "the loser's miss did not touch the lease"
+        );
+        // Turnover: after A dies, the next open reads Some(A) and
+        // compare-and-sets over the dead holder's exact fingerprint.
+        assert!(
+            store
+                .try_acquire_adoption_lease(&name("demo"), Some(engine_a), engine_b)
+                .unwrap(),
+            "a dead holder's lease turns over to the next adopter"
+        );
+        assert_eq!(
+            store
+                .get_spawn_record(&name("demo"))
+                .unwrap()
+                .unwrap()
+                .lease,
+            Some(engine_b),
+            "the turnover stands"
+        );
+        // And the turnover is itself exclusive: a stale Some(A) expectation
+        // now misses (B holds it).
+        assert!(
+            !store
+                .try_acquire_adoption_lease(&name("demo"), Some(engine_a), engine_a)
+                .unwrap(),
+            "a stale expectation cannot re-acquire a turned-over lease"
+        );
+    }
+
+    #[test]
+    fn adoption_lease_cas_on_an_absent_record_is_not_an_error() {
+        // A vanished record row adopts nothing: `Ok(false)`, never NotFound —
+        // the caller treats false as "skip", and the record's disappearance
+        // is its own truthful event.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("ghost", "mock", "/x/agents/ghost"))
+            .unwrap();
+        assert!(
+            !store
+                .try_acquire_adoption_lease(
+                    &name("ghost"),
+                    None,
+                    ProcessFingerprint::new(101, 1_001)
+                )
+                .unwrap(),
+            "an absent record row is Ok(false)"
         );
     }
 
@@ -3649,7 +3898,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -3793,7 +4042,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -3871,7 +4120,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()
