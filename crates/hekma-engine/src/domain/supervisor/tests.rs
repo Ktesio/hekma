@@ -6828,3 +6828,163 @@ fn agent_log_truncates_at_the_toy_cap_and_metering_stays_double_count_free() {
     );
     let _ = sup.stop(&registry, "trunc", Some(Duration::from_secs(5)));
 }
+
+// ---- story 18-2 review round 1: the phase-4 degradation arms (P2/P3) ------
+
+/// Register a `fake_agent`-backed instance whose manifest declares a
+/// `[liveness.heartbeat_file]` check on a path the agent NEVER writes
+/// (absent ≡ stale — the window opens on the first reaper tick). Returns
+/// the (state dir, manifest dir, registry).
+fn setup_fake_with_absent_liveness(
+    name: &str,
+    args: &[&str],
+) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+    use hekma_conformance::test_support::ManifestFixture;
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    let dir = manifest.path().join(name);
+    ManifestFixture::new(name, args)
+        .guaranteed_on_all_oses("interaction")
+        .liveness("[liveness.heartbeat_file]\npath = \"never-written/hb.marker\"\nmax_age_ms = 250")
+        .write(&dir);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(dir))
+        .unwrap();
+    (state, manifest, registry)
+}
+
+/// Poll until `pred(sink_text)` holds, bounded — the degraded-arm tests'
+/// diagnostic waiter (same shape as the integration tests').
+fn wait_for_sink_line(buffer: &Arc<Mutex<Vec<u8>>>, needle: &str, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = sink_text(buffer);
+        if let Some(line) = text.lines().find(|l| l.contains(needle)) {
+            return line.to_string();
+        }
+        // Keep the reaper ticking while waiting.
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn liveness_store_read_failure_is_surfaced_once_per_episode_then_silent() {
+    // Review round 1 (P2): a phase-4 registry lookup that ERRORS must (1)
+    // pause the check for the tick (never fail an instance on an unreadable
+    // state), (2) surface ONE degradation diagnostic for the episode, (3)
+    // stay silent on further Errs, and (4) re-arm after a recovered read.
+    // Driven through the cfg(test) lookup-fault seam (a real outage cannot
+    // be staged deterministically in-process).
+    let (_state, _manifest, registry) = setup_fake_with_absent_liveness("lvlook", &[]);
+    let name = InstanceName::new("lvlook").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "lvlook").unwrap();
+    assert_eq!(state_of(&registry, "lvlook"), LifecycleState::Running);
+
+    // Arm the seam: every phase-4 lookup behaves like a store-read failure.
+    sup.liveness_lookup_fault_names.insert(name.clone());
+    sup.poll_once(&registry);
+    let first = wait_for_sink_line(
+        &buffer,
+        "declared liveness check could not consult the instance state",
+        "the ONE degraded-read diagnostic",
+    );
+    assert!(
+        first.contains("checks paused until reads recover"),
+        "the diagnostic names the pause: {first}"
+    );
+
+    // Further Errs in the SAME episode stay silent (no per-tick spam).
+    sup.poll_once(&registry);
+    sup.poll_once(&registry);
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 1, "exactly ONE diagnostic per episode");
+
+    // A recovered read (seam disarmed) clears the episode SILENTLY.
+    sup.liveness_lookup_fault_names.remove(&name);
+    sup.poll_once(&registry);
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 1, "recovery is silent");
+
+    // The NEXT episode re-arms: the fault again produces a fresh diagnostic.
+    sup.liveness_lookup_fault_names.insert(name);
+    sup.poll_once(&registry);
+    wait_for_sink_line(
+        &buffer,
+        "could not consult the instance state",
+        "the re-armed episode's diagnostic",
+    );
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 2, "a new episode emits its own ONE diagnostic");
+
+    // The instance was never failed by an unreadable state.
+    assert_eq!(state_of(&registry, "lvlook"), LifecycleState::Running);
+}
+
+#[test]
+fn liveness_expiry_refused_by_a_moved_state_skips_failure_and_plan() {
+    // Review round 1 (P3): when the guarded running→failed commit is
+    // REFUSED (the row moved between the phase-4 lookup and the expiry —
+    // the concurrent-transition race), the reaper emits the ONE
+    // skip-diagnostic, the instance is NOT failed, and NO restart plan is
+    // produced. Driven through the cfg(test) commit-fault seam, which
+    // injects the typed StateConflict the race produces.
+    let (_state, _manifest, registry) = setup_fake_with_absent_liveness("lvskip", &[]);
+    let name = InstanceName::new("lvskip").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "lvskip").unwrap();
+    assert_eq!(state_of(&registry, "lvskip"), LifecycleState::Running);
+
+    // Arm the seam: the expiry's commit refuses with StateConflict.
+    sup.liveness_commit_fault_names.insert(name.clone());
+
+    // Drive the reaper past the 250ms window; the expiry arm runs and the
+    // commit is refused.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("liveness expiry skipped") {
+        assert!(
+            Instant::now() < deadline,
+            "the skip diagnostic never appeared"
+        );
+        sup.poll_once(&registry);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The refusal is the ONE skip-diagnostic; the instance stays Running;
+    // NO unresponsive failure ever landed; NO restart plan exists (nothing
+    // queued).
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("liveness expiry skipped"))
+        .count();
+    assert_eq!(count, 1, "exactly ONE skip diagnostic");
+    assert_eq!(
+        state_of(&registry, "lvskip"),
+        LifecycleState::Running,
+        "the refused expiry must not fail the instance"
+    );
+    let events = Supervisor::read_events(&registry, "lvskip").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.cause, TransitionCause::Unresponsive { .. })),
+        "no unresponsive event may exist"
+    );
+    assert!(
+        sup.pending_restarts.lock().unwrap().is_empty(),
+        "no restart plan may be queued by a refused expiry"
+    );
+}

@@ -127,6 +127,35 @@ pub trait StateStore {
     /// already exists (schema v1); no migration is needed.
     fn set_state(&self, name: &InstanceName, state: LifecycleState) -> Result<(), StoreError>;
 
+    /// Persist `new_state` CONDITIONALLY (story 18-2 review round 1, P3): the
+    /// write commits only when the persisted state still equals
+    /// `expected_prior` — a concurrent transition (another command, another
+    /// engine) between the caller's read and this write refuses typed with
+    /// [`StoreError::StateConflict`] and persists NOTHING. Mirrors the
+    /// unconditional [`StateStore::set_state`]'s persisted shape (state +
+    /// `updated_at` bump).
+    ///
+    /// DEFAULTED (compile-compatible for external implementors, per the
+    /// 15-2 `set_spawn_run_id` precedent): a store that has not implemented
+    /// the conditional write fails LOUD with [`StoreError::Backend`] naming
+    /// the operation — the liveness expiry caller surfaces that as the
+    /// skip-diagnostic and declines to fail the instance, never a silent
+    /// `Ok` that would pretend the guarded write happened.
+    fn set_state_if_prior(
+        &self,
+        _name: &InstanceName,
+        _expected_prior: LifecycleState,
+        _new_state: LifecycleState,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Backend(
+            "this StateStore implementation does not override set_state_if_prior \
+             (needed for the liveness expiry's guarded running→failed write): \
+             the engine surfaces this and declines to commit the unresponsive \
+             failure rather than writing it unguarded"
+                .to_string(),
+        ))
+    }
+
     /// Fetch an instance by name, or `None` if absent.
     fn get_instance(&self, name: &InstanceName) -> Result<Option<AgentInstance>, StoreError>;
 

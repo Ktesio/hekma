@@ -93,6 +93,12 @@ pub struct ManifestFixture {
     /// per-field chain methods) because the readiness tests are exactly about
     /// the SECTION's shape — valid and invalid — and the shapes are tiny.
     readiness: Option<String>,
+    /// The raw `[liveness]` section BODY (the lines under the header —
+    /// INCLUDING the chosen sub-table header), appended verbatim after the
+    /// `[readiness]` block. Raw for the same reason: the liveness tests are
+    /// about the section's shape. E.g.
+    /// `"[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000"`.
+    liveness: Option<String>,
 }
 
 /// One `[capabilities.<name>]` block: the per-OS `os = "level"` entries in
@@ -117,6 +123,7 @@ impl ManifestFixture {
             metering_source: MeteringSource::SelfReported.as_str().to_string(),
             config_env: Vec::new(),
             readiness: None,
+            liveness: None,
         }
     }
 
@@ -295,6 +302,18 @@ impl ManifestFixture {
         self
     }
 
+    /// A raw `[liveness]` section — `body` is the section's lines WITH the
+    /// chosen sub-table header (the `[liveness]` table itself is empty; the
+    /// shape is one of two sub-tables), appended verbatim AFTER the
+    /// `[readiness]` block, e.g.
+    /// `"[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000"`.
+    /// Raw because the liveness tests are exactly about the section's shape —
+    /// valid and invalid — and every shape is two to four short lines.
+    pub fn liveness(mut self, body: &str) -> Self {
+        self.liveness = Some(body.to_string());
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -346,10 +365,14 @@ impl ManifestFixture {
             .readiness
             .map(|body| format!("\n[readiness]\n{body}\n"))
             .unwrap_or_default();
+        let liveness = self
+            .liveness
+            .map(|body| format!("\n[liveness]\n{body}\n"))
+            .unwrap_or_default();
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{capabilities}\n\n\
-             [metering]\nsource = \"{metering}\"{config}{readiness}\n",
+             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
@@ -358,6 +381,7 @@ impl ManifestFixture {
             metering = self.metering_source,
             config = config,
             readiness = readiness,
+            liveness = liveness,
         );
         let path = dir.join("adapter.toml");
         std::fs::write(&path, body).expect("write the fixture manifest");

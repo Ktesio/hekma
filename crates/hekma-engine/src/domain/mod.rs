@@ -19,8 +19,16 @@ mod fleet;
 mod governance;
 mod instance;
 mod lifecycle;
+/// The liveness-check evaluator (contract `1.1.0`): engine-side evaluation of
+/// a manifest's declared `[liveness]` check. Private to the crate — the
+/// reaper's poll is the only caller.
+pub(crate) mod liveness;
 mod name;
 mod outbox;
+/// The shared per-attempt probe evaluators (contract `1.1.0`): the exact
+/// `http-get` / file-fresh code BOTH declared polls run — the readiness gate
+/// and the liveness check. Private to the crate.
+pub(crate) mod probe_kinds;
 /// The readiness-probe runner (contract `1.1.0`): engine-side evaluation of a
 /// manifest's declared `[readiness]` gate. Private to the crate — the
 /// supervisor's start path is the only caller.

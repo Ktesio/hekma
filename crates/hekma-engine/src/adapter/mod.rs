@@ -36,8 +36,8 @@ mod builtin;
 use std::path::{Path, PathBuf};
 
 use hekma_adapter_api::{
-    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, Manifest,
-    ManifestError, MeteringSource, OsId, ReadinessGate,
+    CapabilityDeclaration, ConfigMapping, ConfigTarget, EffectiveCapabilities, LivenessCheck,
+    Manifest, ManifestError, MeteringSource, OsId, ReadinessGate,
 };
 
 use crate::domain::{pass_through_tail, EffectiveConfig};
@@ -304,6 +304,23 @@ pub enum LaunchResolveError {
         /// [`hekma_adapter_api::Readiness::gate`], verbatim).
         detail: String,
     },
+
+    /// The adapter's `[liveness]` section is invalid (contract `1.1.0`, story
+    /// 18-2) — a value outside the section's rules, or both/neither
+    /// sub-table present. The exact twin of
+    /// [`LaunchResolveError::InvalidReadinessProbe`]: manifest sections are
+    /// validated at registration, but re-checked at spawn/adoption (the same
+    /// symmetric re-read) — a manifest can drift after registration, and the
+    /// spawn — not the registry — is the last gate before the reaper runs
+    /// the check. Names the section + why.
+    #[error("adapter '{adapter}' has an invalid [liveness] section: {detail}")]
+    InvalidLivenessCheck {
+        /// The adapter kind/identity whose liveness section is invalid.
+        adapter: String,
+        /// Why the section is invalid (from
+        /// [`hekma_adapter_api::Liveness::check`], verbatim).
+        detail: String,
+    },
 }
 
 /// Resolve the `start` launch for an adapter, given its persisted snapshot
@@ -504,6 +521,42 @@ pub fn resolve_readiness_probe(
     manifest
         .readiness_probe()
         .map_err(|e| LaunchResolveError::InvalidReadinessProbe {
+            adapter: kind.to_string(),
+            detail: e.to_string(),
+        })
+}
+
+/// Resolve the adapter's optional declared liveness check
+/// ([`hekma_adapter_api::LivenessCheck`] — the exactly-one resolved variant)
+/// for a spawn or an adoption (contract `1.1.0`, story 18-2): a MANIFEST
+/// adapter's check comes from its parsed `[liveness]` section; a NATIVE
+/// adapter declares NO liveness section (its liveness is the process —
+/// `None`). The exact twin of [`resolve_readiness_probe`]: parse, validate
+/// the section via [`hekma_adapter_api::Liveness::check`] (the SAME
+/// validation registration ran), and refuse the spawn on any drift rather
+/// than supervising an agent with a check the engine cannot legally run. No
+/// re-negotiation here: the launch resolution's version gate already covered
+/// this file read.
+pub fn resolve_liveness_check(
+    kind: &str,
+    manifest_path: Option<&Path>,
+) -> Result<Option<LivenessCheck>, LaunchResolveError> {
+    let Some(path) = manifest_path else {
+        return Ok(None);
+    };
+    let text =
+        std::fs::read_to_string(path).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    let manifest =
+        Manifest::from_toml_str(&text).map_err(|e| LaunchResolveError::ManifestUnreadable {
+            path: path.to_string_lossy().into_owned(),
+            detail: e.to_string(),
+        })?;
+    manifest
+        .liveness_check()
+        .map_err(|e| LaunchResolveError::InvalidLivenessCheck {
             adapter: kind.to_string(),
             detail: e.to_string(),
         })
@@ -905,7 +958,7 @@ impl From<AdapterResolveError> for crate::domain::RegistryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hekma_adapter_api::{HttpGetProbe, ReadinessProbe};
+    use hekma_adapter_api::{HeartbeatFileCheck, HttpGetProbe, LivenessCheck, ReadinessProbe};
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -2001,6 +2054,86 @@ line = "ready"
                 assert!(detail.contains("[readiness]"), "{detail}");
             }
             other => panic!("expected InvalidReadinessProbe, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_liveness_check_reads_the_manifest_liveness_section() {
+        // The manifest adapter's liveness check comes from its parsed
+        // `[liveness]` section, re-checked at spawn/adoption (the readiness
+        // resolver's twin).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[liveness]
+[liveness.heartbeat_file]
+path = "heartbeat.marker"
+max_age_ms = 5000
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let check = resolve_liveness_check("demo", Some(&path)).unwrap();
+        assert_eq!(
+            check,
+            Some(LivenessCheck::HeartbeatFile(HeartbeatFileCheck {
+                path: "heartbeat.marker".to_string(),
+                max_age_ms: 5000,
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_liveness_check_native_adapter_declares_none() {
+        // A native adapter declares NO liveness section — its liveness is
+        // the process — so `Ok(None)`, never an error (an unknown native
+        // kind too: the launch resolution already rejected it).
+        assert_eq!(resolve_liveness_check("mock", None).unwrap(), None);
+        assert_eq!(resolve_liveness_check("nope", None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_liveness_check_drifted_section_is_invalid_naming_field_and_section() {
+        // The drift gate: if the `[liveness]` section drifted invalid after
+        // registration (here both sub-tables, the exactly-one violation),
+        // the spawn refuses with InvalidLivenessCheck — the engine never
+        // supervises with a check it cannot legally run. The detail names
+        // BOTH the field and the section (the manifest error, verbatim).
+        let tmp = TempDir::new().unwrap();
+        let body = r#"
+contract_version = "1.0.0"
+[adapter]
+kind = "demo"
+[lifecycle.start]
+exec = "the-agent"
+[capabilities.interaction]
+linux = "guaranteed"
+[metering]
+source = "self-reported"
+[liveness]
+[liveness.heartbeat_file]
+path = "heartbeat.marker"
+max_age_ms = 5000
+[liveness.http_get]
+url = "http://127.0.0.1:8080/health"
+expected_status = 200
+max_age_ms = 5000
+"#;
+        let path = write_manifest(tmp.path(), body);
+        let err = resolve_liveness_check("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidLivenessCheck { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("[liveness]"), "{detail}");
+                assert!(detail.contains("BOTH checks"), "{detail}");
+            }
+            other => panic!("expected InvalidLivenessCheck, got {other}"),
         }
     }
 

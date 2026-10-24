@@ -198,6 +198,47 @@ pub enum TransitionCause {
         /// never assumed).
         waited_ms: u64,
     },
+    /// A DECLARED LIVENESS CHECK went UNRESPONSIVE (story 18-2): the
+    /// `running → failed` edge the reaper drives when the manifest's
+    /// `[liveness]` signal — a heartbeat file gone stale, an HTTP health
+    /// endpoint gone silent — has failed CONTINUOUSLY for the declared
+    /// `max_age_ms` window. NOT terminal — unlike
+    /// [`TransitionCause::ReadinessTimeout`] the Restart Policy applies
+    /// exactly as for a crash (a hung agent is the crash-shape a restart can
+    /// fix: the process is killed by the transition and respawned). Wire tag
+    /// `unresponsive`. DISTINCT from [`TransitionCause::Crashed`] — the
+    /// process may still be ALIVE (hung, wedged, deadlocked): the DECLARED
+    /// signal died, and the transition itself kills the process (the
+    /// handle-drop teardown). Carries the check's rendered description (what
+    /// was watched) and how long it had been failing, so log/`--json`/7-2
+    /// consumers can match on it without re-parsing free text.
+    ///
+    /// DIMENSION (18-2 review round 1, additive): [`detail`](Self::Unresponsive)
+    /// optionally carries the expiry-verdict DETAIL the reaper's `show`
+    /// projection surfaces alongside the cause — e.g. the heartbeat file's
+    /// pre-existing staleness at first observation. Present only when the
+    /// kind's expiry verdict has something to say beyond the two primary
+    /// fields; absent (JSON omitted) otherwise. Backward-ADDITIVE: an OLD
+    /// reader that predates this field parses the cause unchanged (the field
+    /// defaults to `None`, `skip_serializing_if` keeps it off the wire when
+    /// absent) — no schema-version bump.
+    Unresponsive {
+        /// The rendered check description (e.g.
+        /// `"liveness check heartbeat-file heartbeat.marker (stale after 5000ms)"`).
+        check: String,
+        /// How long the signal had been failing when the window expired, in
+        /// milliseconds — measured from the FIRST OBSERVED failure (the tick
+        /// the engine saw the signal down), not from whenever the signal
+        /// actually began failing (`>= max_age_ms`; for a heartbeat file the
+        /// signal may predate the observation, so this is a lower bound on
+        /// the true staleness).
+        failing_for_ms: u64,
+        /// Optional expiry-verdict detail (kind-specific): what the reaper
+        /// saw at expiry beyond the two numbers above. Absent on the wire
+        /// when `None` — an additive, optional field (no version bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -340,6 +381,35 @@ impl TransitionCause {
         TransitionCause::ReadinessTimeout {
             probe: probe.into(),
             waited_ms,
+        }
+    }
+
+    /// An UNRESPONSIVE cause recording the check's rendered `description` +
+    /// how long it had been failing (`failing_for_ms`, `>= max_age_ms`). NOT
+    /// terminal — the reaper pairs this with the ordinary Restart Policy.
+    /// No expiry detail (the optional field stays absent).
+    pub fn unresponsive(check: impl Into<String>, failing_for_ms: u64) -> Self {
+        TransitionCause::Unresponsive {
+            check: check.into(),
+            failing_for_ms,
+            detail: None,
+        }
+    }
+
+    /// An UNRESPONSIVE cause that ALSO carries kind-specific expiry-verdict
+    /// `detail` (18-2 review round 1) — e.g. the heartbeat file's
+    /// pre-existing staleness at first observation. The detail rides the
+    /// cause (and therefore `show`'s failed-cause projection), not just the
+    /// reaper's stderr diagnostic.
+    pub fn unresponsive_with_detail(
+        check: impl Into<String>,
+        failing_for_ms: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        TransitionCause::Unresponsive {
+            check: check.into(),
+            failing_for_ms,
+            detail: Some(detail.into()),
         }
     }
 
@@ -735,6 +805,13 @@ mod tests {
                     5000,
                 ),
                 "readiness-timeout",
+            ),
+            (
+                TransitionCause::unresponsive(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                ),
+                "unresponsive",
             ),
             (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
