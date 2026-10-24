@@ -53,6 +53,10 @@ timeout_ms = 5000
 url = "http://127.0.0.1:8080/health"
 expected_status = 200
 
+[liveness.heartbeat_file]
+path = "heartbeat.marker"
+max_age_ms = 5000
+
 [config.model]
 env = "MODEL"
 ```
@@ -207,6 +211,43 @@ Exactly ONE probe per manifest — the section is a single gate, not a pipeline.
 The gate sits at the END of the start sequence, after the process-level startup watch and (for ACP transports) the session handshake — the probe is the last word before `running`. The wait happens while the start command runs (bounded by `timeout_ms`, so it can never wedge supervision), including for `--detach` starts: a detached start returns ready-or-failed. The engine emits a diagnostic naming the probe when the wait begins, another when it passes (with the wait actually taken), and a failed start's recorded cause carries the probe description plus the wait actually elapsed — visible in `hekma agent show` (`Failed cause:`) and the transition log (`readiness-timeout`).
 
 Because the wait runs inside the engine's start path (under the supervision lock), OTHER instances' supervision pauses for up to the declared `timeout_ms` while one instance's probe waits — the same accepted bounded-wait posture as the ACP handshake. Multi-instance hosts should therefore declare SHORT probe budgets: a long `timeout_ms` delays crash detection and restarts for every co-hosted instance, not just the one being started.
+
+### `[liveness]` — the declared liveness check (added at contract 1.1.0)
+
+ONE declared liveness check the engine's reaper evaluates while the instance is `running`. Optional: a manifest without this section behaves exactly as before (the engine watches process liveness only). With it, the engine additionally watches the signal the adapter declares, under ONE unifying semantic: **the declared signal failing continuously for `max_age_ms` fails the instance** (`running → failed`, cause `unresponsive`, naming the check and its failing streak via `show`'s failed cause) — and the Restart Policy applies exactly as for a crash.
+
+```toml
+[liveness.heartbeat_file]
+path = "heartbeat.marker"
+max_age_ms = 5000
+```
+
+or
+
+```toml
+[liveness.http_get]
+url = "http://127.0.0.1:8080/health"
+expected_status = 200
+max_age_ms = 5000
+```
+
+Exactly ONE sub-table per manifest. The shape is a closed enum of two kinds, and fields belonging to the other kind are rejected (typo protection, the same `deny_unknown_fields` posture as every section).
+
+| Field | Kind | Meaning |
+|-------|------|---------|
+| `path` + `max_age_ms` | `heartbeat_file` | A file the agent (re)writes to prove it is alive, relative to the Agent Home; the engine only reads its modification age. **A missing file is failing — absent ≡ stale**: an agent that never wrote its heartbeat has never proven liveness. `max_age_ms` (`1..=600000`) is how long the mtime may lag before the heartbeat counts as stopped. |
+| `url` + `expected_status` + `max_age_ms` | `http_get` | The same loopback-literal URL family the `[readiness]` probe enforces (one shared rule): `http://` only, a literal `127.0.0.0/8` or `[::1]` address, no hostnames, no DNS, no fragment. `expected_status` (`100..=599`) is the ONE status that counts as alive; any other status — or a connect/read failure — is one failing attempt, retried on the engine's reaper cadence (never an error that aborts supervision). |
+
+`max_age_ms` (`1..=600000`, both kinds) is the failure window. A failure shorter than the window is a transient blip: the engine surfaces ONE first-failure diagnostic when the window opens (naming the check), stays silent while the blip lasts, and surfaces ONE recovery diagnostic if the signal comes back inside the window — per-tick spam is never emitted. Only a failure that persists the whole window lands the transition.
+
+The window is enforced, not observed: the failure cannot land before `max_age_ms` has actually elapsed since the signal started failing. The engine's poll cadence is its own (about a second); a manifest declares operator intent, never engine timing — declare windows comfortably above the agent's real heartbeat interval, and remember coarse-mtime filesystems (some Windows filesystems stamp at 1–2 s granularity) put a floor on honest `heartbeat_file` windows.
+
+Rules that keep the check honest:
+
+- **A paused instance is never probed.** Only an instance the store shows exactly `running` is evaluated — a suspended process cannot heartbeat (a POSIX pause holds its signals), so a pause can never fail the agent. The skip is silent by design: a pause is a normal state, not a degradation.
+- **The window lives in supervision, not in the record.** A restart spawns a fresh window; an instance adopted from a previous command's engine re-derives its window fresh at adoption. The honest consequence: after a crash-restart or across a command boundary, an agent gets up to ONE extra window of grace before a persistently-failing signal fails it again.
+- **Between commands a detached instance is not evaluated** (supervision is command-scoped — the same enforcement-window honesty `--detach` states at start). The declared check is evaluated by whichever command's engine holds the instance.
+- **A contract 1.0.0 engine rejects the section** at parse time, naming it (the older-same-major-engine rule, for free — see [the Adapter Contract](adapter-contract.md#versioning)).
 
 ## See Also
 
