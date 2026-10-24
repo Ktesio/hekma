@@ -101,7 +101,20 @@ use thiserror::Error;
 /// names both versions and fails to load. The `--json` memory wire surface
 /// (story 5-2's deferral) landed IN this freeze, so the frozen v1 surface is
 /// complete: adding it after the freeze would have been a breaking wire change.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+///
+/// **Bumped `1.0.0 → 1.1.0` (story 18-1, the AD-15 amendment):** the manifest
+/// schema gains an OPTIONAL `[readiness]` section declaring ONE readiness probe
+/// (`http-get` / `file-fresh` / `log-contains`, each with its own bounded
+/// `timeout_ms`) that gates the engine's `starting → running` transition. An
+/// ADDITIVE minor under the published policy: no existing section, field, or
+/// enum value changed, so every 1.0.0 manifest parses identically under 1.1.0.
+/// The policy's own rule still applies verbatim: negotiation matches MAJORS, so
+/// this build still accepts a `1.0.0` manifest — but an engine built at 1.0.0
+/// REJECTS a 1.1.0 manifest that declares `[readiness]` (its frozen
+/// `deny_unknown_fields` schema refuses the unknown section). Stated on the
+/// release surface; the schema change is pinned by
+/// `contract_v1_0_0_engine_rejects_the_readiness_section`.
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The Adapter Contract compatibility rule the engine enforces at registration
 /// (FR-30; ratified at the 6-6 checkpoint). Quoted VERBATIM by the negotiation
@@ -206,8 +219,9 @@ pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, Interaction, InteractionChannelKind, Lifecycle, Manifest, ManifestError,
-    Metering, OpTemplate,
+    AdapterIdentity, FileFreshProbe, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle,
+    LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate, Readiness, ReadinessGate,
+    ReadinessKind, ReadinessProbe,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;
@@ -217,13 +231,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_version_is_frozen_v1() {
-        // The v1 FREEZE (story 6-6): the contract tags 1.0.0 and the engine
-        // negotiates on its major. Pinning the exact triple makes an
-        // unannounced bump fail here first — the "announce" gate.
+    fn contract_version_is_v1_line_additive_minors_only() {
+        // The contract tags 1.0.0 at the v1 FREEZE (story 6-6) and moves within
+        // the 1.x line only by ADDITIVE minors (the published policy: within a
+        // major, changes are additive). 18-1's `[readiness]` section bumps
+        // 1.0.0 → 1.1.0. Pinning the exact triple makes an unannounced bump
+        // fail here first — the "announce" gate.
         let parsed = semver::Version::parse(CONTRACT_VERSION).expect("CONTRACT_VERSION is semver");
         assert_eq!(parsed.major, 1);
-        assert_eq!(parsed.minor, 0);
+        assert_eq!(parsed.minor, 1);
         assert_eq!(parsed.patch, 0);
     }
 

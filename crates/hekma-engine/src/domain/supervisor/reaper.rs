@@ -113,6 +113,14 @@ impl Supervisor {
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
 
+        // FIRST — drain restart plans QUEUED by the start path (Epic 18): an
+        // exit observed during a readiness-probe wait landed its crash
+        // transition inline and queued the plan; this pass hands it to the
+        // engine cadence, which times the backoff exactly as for
+        // reaper-detected crashes. Draining BEFORE phase 1 keeps the restart
+        // attempt nearest in time to the failure that scheduled it.
+        plans.append(&mut self.drain_pending_restarts());
+
         // PHASE 1 — poll EVERY held handle in the SAME tick (AI-12, loop 1).
         // Liveness reads happen up front, BEFORE any crash handling, so the pass
         // can CORROBORATE: a poll error that shows up on MULTIPLE handles in one
@@ -500,7 +508,11 @@ impl Supervisor {
     ///   crash-loop reason; no plan.
     /// * `never` → TERMINAL: clear the write-ahead record and note the policy in
     ///   the crash cause; no plan.
-    fn plan_restart(
+    ///
+    /// Also called by the START path (spawn.rs) when the readiness probe
+    /// observes the process EXIT mid-wait: the write-ahead record exists by
+    /// then (committed before the probe), so the policy consult is identical.
+    pub(super) fn plan_restart(
         &self,
         registry: &Registry,
         name: &InstanceName,
