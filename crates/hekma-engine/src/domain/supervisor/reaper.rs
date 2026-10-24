@@ -1309,6 +1309,75 @@ impl Supervisor {
                         continue;
                     }
                 }
+                // The ADOPTION LEASE (schema v11, issue #328): the owner gate
+                // above arbitrates against the ORIGINAL spawning owner, but a
+                // dead owner's record could still be ADOPTED by two engines
+                // whose opens interleave — both pass the gate, both re-hold
+                // ARMED kill-on-drop handles, and whichever engine exits
+                // first kills the group out from under the other (its own
+                // teardown then hits a no-op ESRCH). The lease compare-and-
+                // sets BEFORE any handle is re-held, so the losing engine
+                // never touches the process:
+                //   * a lease held by a LIVE engine that is not this process
+                //     skips the record (that engine supervises it now — the
+                //     same posture as a live owner);
+                //   * a lease already naming THIS process adopts without
+                //     re-acquiring (this process's records are always
+                //     adoptable by it, mirroring the owner self-check);
+                //   * a dead, reused, or absent lease is compare-and-set
+                //     under the value just read; a LOST compare-and-set
+                //     (another engine adopted between this engine's list
+                //     read and its write) skips the record the same way.
+                // `self_owner == None` (degraded start-time read) cannot
+                // stamp a lease — the record keeps the pre-v11 adopt posture
+                // for this pass, never a silent refusal. An `Err` is a real
+                // store failure: surfaced as the write-failure diagnostic
+                // and left for the next open (the pass is best-effort per
+                // record). `probe_alive == None` (indeterminate) attempts
+                // the compare-and-set — the fail-open posture that keeps
+                // NFR-1 intact on a flaky read; if the holder was actually
+                // alive, this pass degrades to exactly the pre-v11 behavior
+                // (the one window the lease cannot close).
+                if let Some(me) = self_owner {
+                    let lease_is_self = record.lease.is_some_and(|held| me.matches(&held));
+                    if !lease_is_self {
+                        if let Some(held) = record.lease {
+                            if self.backend.probe_alive(&held) == Some(true) {
+                                self.emit_diagnostic(&format!(
+                                    "{}: adopted by another live engine (pid {}) — its spawn \
+                                     record is left untouched and THIS engine holds no handle \
+                                     for it; an explicit stop re-acquires the process on \
+                                     demand, and every benign command leaves it alone",
+                                    name.as_str(),
+                                    held.pid,
+                                ));
+                                continue;
+                            }
+                        }
+                        match registry.try_acquire_adoption_lease(&name, record.lease, me) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: another engine adopted this instance concurrently \
+                                     (the adoption lease was lost) — THIS engine holds no \
+                                     handle for it; an explicit stop re-acquires the process \
+                                     on demand",
+                                    name.as_str(),
+                                ));
+                                continue;
+                            }
+                            Err(e) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: the adoption lease could not be persisted ({e}) — \
+                                     the record is left for the next open and THIS engine \
+                                     holds no handle for it",
+                                    name.as_str(),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
             // The record's detach flag (story 12-1 AMENDMENT) decides HOW the
             // handle is re-held: a detached spawn's handle comes back DISARMED
@@ -1827,7 +1896,11 @@ impl Supervisor {
                     // engines — the boundary's protection is scoped to the
                     // case it exists for: the ORIGINAL spawning owner being
                     // ALIVE (a running `serve`, an embedding). Dead-owner
-                    // records keep the pre-boundary semantics byte-for-byte.
+                    // records keep the pre-boundary OWNER semantics
+                    // byte-for-byte; the one column adoption now writes is
+                    // the ADOPTION LEASE (schema v11, taken in the gate
+                    // above before this match) — a dedicated arbiter for
+                    // CONCURRENT opens, never an ownership claim.
                     // Story 14-1 + 14-2: surface the acp adoption honesty —
                     // the instance is alive but this engine holds no live ACP
                     // connection for it (the pipe pair died with the previous
