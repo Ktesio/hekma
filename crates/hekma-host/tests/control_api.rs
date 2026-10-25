@@ -111,6 +111,7 @@ fn spawn_serve_with_api(base: PathBuf, sink: SharedSink) -> ServeHandle {
         stop_window: Some(2),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink)),
+        otlp: Default::default(),
     };
     let mut server = spawn_serve(options);
     // Wait for the listening notice, then parse the OS-chosen address —
@@ -1719,6 +1720,7 @@ fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host(
         stop_window: Some(2),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: None,
+        otlp: Default::default(),
     };
     let err = hekma_host::serve(options).expect_err("the second host must be refused");
     assert!(
@@ -1918,10 +1920,18 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
     );
     match result {
         Err(hekma_host::ServeError::InvalidOptions { message }) => {
-            assert!(message.contains("bearer"), "{message}");
+            // Plain-worded labels (the #319/#320 CodeQL remedy): embedding
+            // {message} carries the bearer-tainted startup text into the
+            // panic output, which the analyzer rightly flags as cleartext
+            // logging of a secret. The contains() conditions still pin the
+            // full wording.
+            assert!(
+                message.contains("bearer"),
+                "the refusal names the bearer requirement"
+            );
             assert!(
                 message.contains("never serves unauthenticated"),
-                "{message}"
+                "the refusal says the API never serves unauthenticated"
             );
         }
         other => panic!("a half-configured API must be InvalidOptions: {other:?}"),
@@ -1939,7 +1949,10 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
     );
     match result {
         Err(hekma_host::ServeError::InvalidOptions { message }) => {
-            assert!(message.contains("requires --listen"), "{message}");
+            assert!(
+                message.contains("requires --listen"),
+                "the orphan bearer name is refused with the --listen pair"
+            );
         }
         other => panic!("an orphan bearer name must be InvalidOptions: {other:?}"),
     }
@@ -2464,6 +2477,7 @@ fn a_non_loopback_bind_warns_loudly() {
         stop_window: Some(1),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+        otlp: Default::default(),
     };
     let server = spawn_serve(options);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

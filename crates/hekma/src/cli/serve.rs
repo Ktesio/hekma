@@ -39,6 +39,7 @@ use crate::error::{ServeOptionsInvalid, ServeStartupFailed, ServeStateDirBusy};
 /// requires-between-flags is ALSO enforced in the host (`ServeError::
 /// InvalidOptions`) so a library caller gets the same typed refusal a CLI
 /// user gets from clap.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     stop_window: Option<u64>,
     metering_listen: u16,
@@ -46,7 +47,19 @@ pub fn run(
     listen: Option<std::net::SocketAddr>,
     bearer_secret: Option<String>,
     log_capture: Option<hekma_engine::LogCaptureMode>,
+    otlp_endpoint: Option<String>,
+    otlp_headers: Option<&str>,
+    otlp_flush_interval: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The OTLP flags parse through the ONE site both surfaces share (the
+    // host bin's hand-rolled loop calls the same `OtlpOptions::from_flags`);
+    // a malformed combination (bad scheme, out-of-bounds interval, headers
+    // without an endpoint) is the Usage-class refusal, same as any bad flag
+    // value. Header VALUES never enter an error or a log (the redacting
+    // newtype holds them).
+    let otlp =
+        hekma_host::OtlpOptions::from_flags(otlp_endpoint, otlp_headers, otlp_flush_interval)
+            .map_err(|message| ServeOptionsInvalid { message })?;
     let options = hekma_host::ServeOptions {
         state_base: state_dir.map(PathBuf::from),
         stop_window,
@@ -61,6 +74,7 @@ pub fn run(
         // The stderr default: host + engine notices interleave on stderr,
         // byte-compatible with every other diagnostic surface.
         diagnostics: None,
+        otlp,
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text
@@ -100,6 +114,9 @@ mod tests {
             None, // the state base is never reached: validation fires first
             Some("127.0.0.1:18499".parse().unwrap()),
             None, // the bearer secret — deliberately absent
+            None,
+            None,
+            None,
             None,
         )
         .expect_err("a half-configured API refuses");

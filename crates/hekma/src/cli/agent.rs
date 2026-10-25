@@ -5214,4 +5214,55 @@ mod tests {
             "exactly one trailing newline"
         );
     }
+
+    #[test]
+    fn logs_follow_runs_in_process_through_the_final_drain_with_a_garbage_backlog_env() {
+        // Cover the follow loop in-process (the subprocess legs' coverage
+        // depends on exec-following; this one is tracked for certain):
+        // a stopped instance with a written log, a GARBAGE
+        // HEKMA_LOGS_BACKLOG_LINES value (the env resolution's fallback
+        // note fires before the loop), the first-poll status check that
+        // enters the bounded final drain, and the clean follow exit — the
+        // whole `logs(name, follow=true, _)` path returning Ok.
+        let _guard = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; set the state dir the CLI resolves.
+        unsafe {
+            std::env::set_var("KTESIO_STATE_DIR", tmp.path());
+        }
+        let manifest = tempfile::TempDir::new().unwrap();
+        hekma_conformance::test_support::ManifestFixture::new("fake", &["--linger-ms", "3000"])
+            .guaranteed_on_all_oses("interaction")
+            .write(manifest.path());
+        {
+            let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+            let facade = engine.blocking();
+            facade
+                .register_with_adapter(
+                    "logsy",
+                    &AdapterRef::Manifest(manifest.path().to_path_buf()),
+                )
+                .unwrap();
+            let started = facade.start("logsy").unwrap();
+            assert_eq!(started.state, LifecycleState::Running);
+            // A clean stop commits the log and the terminal row BEFORE the
+            // follow starts, so the follow's FIRST status check enters the
+            // bounded final drain — deterministically, no exit race.
+            facade
+                .stop("logsy", Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
+        // SAFETY: guarded by STATE_DIR_ENV_LOCK; the follow reads this env
+        // only at its backlog prime, and it is removed before the guard
+        // releases (no subprocess leg can inherit the garbage value).
+        unsafe {
+            std::env::set_var("HEKMA_LOGS_BACKLOG_LINES", "not-a-number");
+        }
+        let followed = logs("logsy", true, false);
+        unsafe {
+            std::env::remove_var("HEKMA_LOGS_BACKLOG_LINES");
+            std::env::remove_var("KTESIO_STATE_DIR");
+        }
+        followed.expect("the follow must end cleanly on the stopped instance");
+    }
 }

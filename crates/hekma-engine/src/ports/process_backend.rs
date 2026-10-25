@@ -2624,4 +2624,54 @@ mod tests {
             "the crossed generation was retained, not dropped"
         );
     }
+
+    #[test]
+    fn tail_new_lines_skips_an_unreadable_raw_file_silently() {
+        // The open-failure arm: a raw path that cannot be opened (a DIRECTORY
+        // sits there) is a silent skip — best-effort view, never fatal, no
+        // attribution, cursor untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        std::fs::create_dir(&raw).unwrap(); // a directory where the file must be
+        let attributed = dir.path().join("output.log");
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Full,
+        );
+        assert_eq!(cursor, 0, "the cursor never moves on an unreadable raw");
+        assert!(
+            !attributed.exists(),
+            "nothing was attributed from an unreadable raw"
+        );
+    }
+
+    #[test]
+    fn tail_new_lines_in_off_mode_writes_nothing_and_still_advances() {
+        // The defensive Off arm: Off never builds a LogCapture in production,
+        // but if one is ever constructed anyway, the mode's contract is
+        // NOTHING on disk — consume the bytes silently-forward.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("stdout.raw");
+        std::fs::write(&raw, b"one\ntwo\n").unwrap();
+        let attributed = dir.path().join("output.log");
+        let mut cursor = 0u64;
+        tail_new_lines(
+            &raw,
+            &mut cursor,
+            LogStream::AgentOut,
+            "svc",
+            &attributed,
+            LogCaptureMode::Off,
+        );
+        assert_eq!(cursor, 8, "the bytes are consumed silently-forward");
+        assert!(
+            !attributed.exists(),
+            "Off writes nothing, not even an empty file"
+        );
+    }
 }
