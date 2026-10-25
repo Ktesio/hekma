@@ -175,6 +175,162 @@ pub enum TransitionCause {
         /// The backoff waited before this restart, in milliseconds.
         waited_ms: u64,
     },
+    /// A READINESS PROBE timed out (the launch's final gate): the
+    /// `starting → failed` edge the start path drives when the declared probe
+    /// never reported ready inside its own `timeout_ms`. TERMINAL by design —
+    /// unlike [`TransitionCause::Crashed`] there is NO restart-policy consult:
+    /// an adapter that survives its survival window but never declares ready
+    /// is a broken deployment, and a restart would replay the same failure.
+    /// Wire tag `readiness-timeout`. DISTINCT from [`TransitionCause::LaunchError`]
+    /// (the launch itself failed) — here the launch SUCCEEDED and the adapter
+    /// failed to become ready. Carries the probe's rendered description (what
+    /// was watched) and the wall-clock wait, so log/`--json`/7-2 consumers can
+    /// match on it without re-parsing free text.
+    ReadinessTimeout {
+        /// The rendered probe description (e.g.
+        /// `"readiness probe http-get http://127.0.0.1:8080/health (expected 200)"`).
+        probe: String,
+        /// How long the probe was ACTUALLY waited, in milliseconds — the
+        /// real elapsed time from the wait's start to the deadline check,
+        /// which is at most the declared `timeout_ms` plus a little
+        /// scheduling slack (the runner's polls overshoot the deadline by
+        /// at most one poll interval, and the number reported is measured,
+        /// never assumed).
+        waited_ms: u64,
+    },
+    /// A DECLARED LIVENESS CHECK went UNRESPONSIVE (story 18-2): the
+    /// `running → failed` edge the reaper drives when the manifest's
+    /// `[liveness]` signal — a heartbeat file gone stale, an HTTP health
+    /// endpoint gone silent — has failed CONTINUOUSLY for the declared
+    /// `max_age_ms` window. NOT terminal — unlike
+    /// [`TransitionCause::ReadinessTimeout`] the Restart Policy applies
+    /// exactly as for a crash (a hung agent is the crash-shape a restart can
+    /// fix: the process is killed by the transition and respawned). Wire tag
+    /// `unresponsive`. DISTINCT from [`TransitionCause::Crashed`] — the
+    /// process may still be ALIVE (hung, wedged, deadlocked): the DECLARED
+    /// signal died, and the transition itself kills the process (the
+    /// handle-drop teardown). Carries the check's rendered description (what
+    /// was watched) and how long it had been failing, so log/`--json`/7-2
+    /// consumers can match on it without re-parsing free text.
+    ///
+    /// DIMENSION (18-2 review round 1, additive): [`detail`](Self::Unresponsive)
+    /// optionally carries the expiry-verdict DETAIL the reaper's `show`
+    /// projection surfaces alongside the cause — e.g. the heartbeat file's
+    /// pre-existing staleness at first observation. Present only when the
+    /// kind's expiry verdict has something to say beyond the two primary
+    /// fields; absent (JSON omitted) otherwise. Backward-ADDITIVE: an OLD
+    /// reader that predates this field parses the cause unchanged (the field
+    /// defaults to `None`, `skip_serializing_if` keeps it off the wire when
+    /// absent) — no schema-version bump.
+    Unresponsive {
+        /// The rendered check description (e.g.
+        /// `"liveness check heartbeat-file heartbeat.marker (stale after 5000ms)"`).
+        check: String,
+        /// How long the signal had been failing when the window expired, in
+        /// milliseconds — measured from the FIRST OBSERVED failure (the tick
+        /// the engine saw the signal down), not from whenever the signal
+        /// actually began failing (`>= max_age_ms`; for a heartbeat file the
+        /// signal may predate the observation, so this is a lower bound on
+        /// the true staleness).
+        failing_for_ms: u64,
+        /// Optional expiry-verdict detail (kind-specific): what the reaper
+        /// saw at expiry beyond the two numbers above. Absent on the wire
+        /// when `None` — an additive, optional field (no version bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// The agent exited with an ADAPTER-DECLARED `restart_requested` code
+    /// (story 18-3): the `running → failed` edge the reaper drives when the
+    /// manifest's `[exit_codes]` section lists the observed code under
+    /// `restart_requested` — the conventional exit-75 "please relaunch me"
+    /// contract. NOT terminal and NOT a crash charge: the ordinary restart
+    /// plan runs (backoff verbatim, `RestartPolicy::Never` still outranks
+    /// the adapter's ask), but the consecutive-failure counter is NOT
+    /// charged — a restart-requested loop can NEVER trip the crash-loop
+    /// terminal, because the operator declared the class. Wire tag
+    /// `restart-requested`. DISTINCT from [`TransitionCause::Crashed`] —
+    /// the process exited as its contract planned, so it proves neither
+    /// stability nor failure. Exits during `starting` are LAUNCH failures
+    /// and never classified (the classes are service-run semantics).
+    ///
+    /// DIMENSION (the `Unresponsive` template, additive): [`detail`]
+    /// (Self::RestartRequested) carries the classification verdict beyond
+    /// the code — the declared-class naming. Absent (JSON omitted) when the
+    /// verdict has nothing more to say. Backward-ADDITIVE: an OLD reader
+    /// that predates this variant cannot parse the cause at all (a NEW wire
+    /// tag) — the release notes announce that serde break like every
+    /// 1.1.0-section announcement.
+    RestartRequested {
+        /// The observed process exit code that matched the manifest's
+        /// declared `restart_requested` list.
+        code: u16,
+        /// Optional classification detail (the declared-class naming).
+        /// Absent on the wire when `None` — an additive, optional field
+        /// (no version bump).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// The agent exited with an ADAPTER-DECLARED `clean` code (story 18-3):
+    /// the `running → stopped` edge the reaper drives when the manifest's
+    /// `[exit_codes]` section lists the observed code under `clean` — the
+    /// agent FINISHED ON PURPOSE. The requested-stop shape: the spawn
+    /// record settles (an established ACP session id is retained for the
+    /// next start), NO restart plan, NO counter action — the operator's
+    /// next fresh start is the counter reset, exactly as it has always
+    /// been. Wire tag `clean-exit`. DISTINCT from
+    /// [`TransitionCause::Crashed`] and from
+    /// [`TransitionCause::Command`] (`"stop"`) — the lifecycle log never
+    /// claims an operator stop that never happened.
+    CleanExit {
+        /// The observed process exit code that matched the manifest's
+        /// declared `clean` list (e.g. `0`).
+        code: u16,
+    },
+    /// A COOPERATIVE PAUSE (story 18-4): the `running → paused` edge driven by
+    /// RUNNING the adapter's declared `[lifecycle.pause]` op template (exit 0
+    /// within the engine's command cap) — the agent stops accepting new work
+    /// under its OWN program, never OS-suspended. Wire tag `pause-cooperative`.
+    /// DISTINCT from [`TransitionCause::Command`] — a plain command cause would
+    /// read as a guaranteed signal suspension, and the engine cannot verify the
+    /// agent actually stopped new work (the cause IS that honesty, inherently
+    /// best-effort-class); DISTINCT from [`TransitionCause::PauseBestEffort`]
+    /// (the signal-path qualifier). Carries the RENDERED exec string of the
+    /// command that ran, so the log names exactly what the engine executed.
+    /// The declared command outranks the signal path (OS-independent) and works
+    /// even where the capability table says `unsupported`.
+    PauseCooperative {
+        /// The rendered command (exec + args) the engine ran.
+        command: String,
+    },
+    /// A COOPERATIVE RESUME (story 18-4): the `paused → running` edge driven by
+    /// running the adapter's declared `[lifecycle.resume]` op template — the
+    /// symmetric counterpart of [`TransitionCause::PauseCooperative`]. Wire tag
+    /// `resume-cooperative`. Carries the rendered exec string of the command
+    /// that ran (the resume-side effect is the COMMAND's, never a bare SIGCONT).
+    ResumeCooperative {
+        /// The rendered command (exec + args) the engine ran.
+        command: String,
+    },
+    /// The DRAIN composite's terminal stop (story 18-4, spine AD-15's
+    /// stop-new-work → bounded-wait → stop): the `stopping → stopped` edge the
+    /// drain verb drives through the existing stop ladder, carrying the DURABLE
+    /// OUTCOME record. Wire tag `drain-stopped`. The stop happens EITHER WAY
+    /// (a timed-out drain still stops — the last step is unconditional); this
+    /// cause is what distinguishes the two outcomes in the event log.
+    /// `completed` is `true` when BOTH wait conditions held within the bound
+    /// (the pause command exited 0 AND the declared idle file was fresh); when
+    /// the bound expired, the drain STILL stops with `completed: false` —
+    /// surfaced, never a fake completion. `waited_ms` is the honest wall-clock
+    /// wait the composite actually spent (the whole bounded phase, including
+    /// the pause command's runtime).
+    DrainStopped {
+        /// Whether the bounded wait's conditions both held within the bound
+        /// (`true`) or the bound expired (`false` — the stop still happened).
+        completed: bool,
+        /// The wall-clock time the composite actually waited, in milliseconds —
+        /// measured, never assumed (≈ the declared bound on a timed-out drain).
+        waited_ms: u64,
+    },
     /// A budget BREACH drove the transition (story 3-2 tokens / story 3-3 dollars,
     /// AD-7/AD-15): the Breach Action `pause`/`stop` pulled the EXISTING
     /// `running → paused` / `running → stopping` lever, so the lifecycle log itself
@@ -308,6 +464,91 @@ impl TransitionCause {
     /// (story 1-6, AC4/AC9).
     pub fn restarted(count: u32, waited_ms: u64) -> Self {
         TransitionCause::Restarted { count, waited_ms }
+    }
+
+    /// A READINESS-TIMEOUT cause recording the probe's rendered `description` +
+    /// the honest `waited_ms`. Terminal — the start path never pairs this with
+    /// a restart.
+    pub fn readiness_timeout(probe: impl Into<String>, waited_ms: u64) -> Self {
+        TransitionCause::ReadinessTimeout {
+            probe: probe.into(),
+            waited_ms,
+        }
+    }
+
+    /// An UNRESPONSIVE cause recording the check's rendered `description` +
+    /// how long it had been failing (`failing_for_ms`, `>= max_age_ms`). NOT
+    /// terminal — the reaper pairs this with the ordinary Restart Policy.
+    /// No expiry detail (the optional field stays absent).
+    pub fn unresponsive(check: impl Into<String>, failing_for_ms: u64) -> Self {
+        TransitionCause::Unresponsive {
+            check: check.into(),
+            failing_for_ms,
+            detail: None,
+        }
+    }
+
+    /// An UNRESPONSIVE cause that ALSO carries kind-specific expiry-verdict
+    /// `detail` (18-2 review round 1) — e.g. the heartbeat file's
+    /// pre-existing staleness at first observation. The detail rides the
+    /// cause (and therefore `show`'s failed-cause projection), not just the
+    /// reaper's stderr diagnostic.
+    pub fn unresponsive_with_detail(
+        check: impl Into<String>,
+        failing_for_ms: u64,
+        detail: impl Into<String>,
+    ) -> Self {
+        TransitionCause::Unresponsive {
+            check: check.into(),
+            failing_for_ms,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// A RESTART-REQUESTED cause that ALSO carries the classification
+    /// `detail` (the declared-class naming) — the `Unresponsive` twin.
+    /// 18-3 review: the detail-less `restart_requested(code)` shape is
+    /// GONE — the reaper always records the declared-class detail (plus
+    /// the requested-recycle depth, or the `never`-policy verdict), so
+    /// this is the only constructor the cause has.
+    pub fn restart_requested_with_detail(code: u16, detail: impl Into<String>) -> Self {
+        TransitionCause::RestartRequested {
+            code,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// A CLEAN-EXIT cause recording the declared `code` the agent finished
+    /// with (story 18-3).
+    pub fn clean_exit(code: u16) -> Self {
+        TransitionCause::CleanExit { code }
+    }
+
+    /// A COOPERATIVE PAUSE cause recording the rendered `command` the engine
+    /// ran (story 18-4) — the `running → paused` edge of a declared
+    /// `[lifecycle.pause]` template.
+    pub fn pause_cooperative(command: impl Into<String>) -> Self {
+        TransitionCause::PauseCooperative {
+            command: command.into(),
+        }
+    }
+
+    /// A COOPERATIVE RESUME cause recording the rendered `command` the engine
+    /// ran (story 18-4) — the `paused → running` edge of a declared
+    /// `[lifecycle.resume]` template.
+    pub fn resume_cooperative(command: impl Into<String>) -> Self {
+        TransitionCause::ResumeCooperative {
+            command: command.into(),
+        }
+    }
+
+    /// A DRAIN-STOPPED cause recording the composite's durable outcome
+    /// (story 18-4) — `completed` + the honest `waited_ms`.
+    pub fn drain_stopped(completed: bool, waited_ms: u64) -> Self {
+        TransitionCause::DrainStopped {
+            completed,
+            waited_ms,
+        }
     }
 
     /// A TOKEN BUDGET-EXCEEDED cause recording the breached `scope` + the `limit`
@@ -697,8 +938,56 @@ mod tests {
             (TransitionCause::crashed("x"), "crashed"),
             (TransitionCause::restarted(1, 1000), "restarted"),
             (
+                TransitionCause::readiness_timeout(
+                    "readiness probe http-get http://x/health (expected 200)",
+                    5000,
+                ),
+                "readiness-timeout",
+            ),
+            (
+                TransitionCause::unresponsive(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                ),
+                "unresponsive",
+            ),
+            (
+                TransitionCause::unresponsive_with_detail(
+                    "liveness check heartbeat-file hb.marker (stale after 5000ms)",
+                    5123,
+                    "the file was already stale when first observed",
+                ),
+                "unresponsive",
+            ),
+            // 18-3 review round 1: the detail-less `restart_requested(code)`
+            // constructor is gone — `restart_requested_with_detail` is the
+            // only shape, and its wire tag is pinned here.
+            (
+                TransitionCause::restart_requested_with_detail(
+                    75,
+                    "declared class `restart_requested`; requested-recycle 2",
+                ),
+                "restart-requested",
+            ),
+            (TransitionCause::clean_exit(0), "clean-exit"),
+            (
                 TransitionCause::budget_exceeded(BreachScope::PerRun, 100, 120),
                 "budget-exceeded",
+            ),
+            // 18-4: the cooperative + drain causes' wire tags are pinned —
+            // `--json`/log consumers match on these tokens.
+            (
+                TransitionCause::pause_cooperative("fake-agent --touch pause.sentinel"),
+                "pause-cooperative",
+            ),
+            (
+                TransitionCause::resume_cooperative("fake-agent --touch resume.sentinel"),
+                "resume-cooperative",
+            ),
+            (TransitionCause::drain_stopped(true, 1500), "drain-stopped"),
+            (
+                TransitionCause::drain_stopped(false, 30_000),
+                "drain-stopped",
             ),
         ];
         for (cause, tag) in cases {

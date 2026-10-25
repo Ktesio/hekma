@@ -3,6 +3,47 @@
 //! additional `impl Supervisor` block, no signature or behavior change.
 
 use super::*;
+use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
+use crate::ports::StoreError;
+
+/// The portable classification domain (story 18-3): only a code in
+/// `0..=255` can match a declared class — the `[exit_codes]` lists are
+/// validated to exactly that domain (the portable exit-code domain: unix
+/// exit status carries the low 8 bits), so a Windows code above 255 simply
+/// never matches, exactly as the manifest docs state. `None` (a signal
+/// exit, a poll failure, an out-of-domain code) never classifies.
+fn portable_code(c: i32) -> Option<u16> {
+    u16::try_from(c).ok().filter(|code| *code <= 255)
+}
+
+/// The exit-code CLASSIFIER (story 18-3): what class — if any — this crash
+/// input belongs to. Pure; the reaper's crash path consumes the verdict.
+///
+/// A classification needs ALL of:
+/// * a CODED exit (`CrashInput::Exited(Some(c))`) — signals (`None`), poll
+///   failures, and adopted-code-unavailable exits carry no code to classify;
+/// * the code in the portable `0..=255` domain (the lists' validated domain);
+/// * the manifest's resolved `[exit_codes]` declaring the code (`None`
+///   classes — the no-section case, byte-identical — classify nothing);
+/// * the prior state EXACTLY `running` (the state gate): classes classify
+///   RUNS, not launches — an exit during `starting` is a launch failure on
+///   a different path entirely — and a crash out of `paused` rides today's
+///   crash path verbatim (the CleanExit edge is `running → stopped`).
+fn classify_exit(
+    exit_codes: &Option<ExitCodeClasses>,
+    crash: &CrashInput,
+    state: LifecycleState,
+) -> Option<(ExitClass, u16)> {
+    if state != LifecycleState::Running {
+        return None;
+    }
+    let CrashInput::Exited(Some(raw)) = crash else {
+        return None;
+    };
+    let code = portable_code(*raw)?;
+    let classes = exit_codes.as_ref()?;
+    classes.class_of(code).map(|class| (class, code))
+}
 
 impl Supervisor {
     /// Clear one instance's consecutive poll-error streak (AI-12). Called at
@@ -87,6 +128,24 @@ impl Supervisor {
     /// increment, one diagnostic, handles stay alive — a fleet-wide poll outage
     /// must never mass-crash running agents through kill-on-drop. Only a handle
     /// erroring ALONE (its peers read fine) accumulates crash-input credit.
+    ///
+    /// **Declared liveness (story 18-2, PHASE 4):** after crash handling, every
+    /// still-held instance whose persisted state is EXACTLY `running` and whose
+    /// adapter declared a `[liveness]` check gets ONE attempt per pass (the
+    /// shared evaluators — heartbeat mtime read, or ONE `http-get` whose
+    /// deadline is `now + HTTP_ATTEMPT_CAP`). A HUNG check therefore stretches
+    /// its own pass by up to ~1s; N hung checks stretch it by up to ~Ns — the
+    /// attempts run sequentially under the supervisor lock, and ONLY failing
+    /// checks pay the cap (a fresh heartbeat costs one stat; an answering
+    /// endpoint costs one fast loopback connect). The unifying semantic — the
+    /// signal failing CONTINUOUSLY for the declared `max_age_ms` — is the PURE
+    /// [`crate::domain::liveness::window_decision`]; expiry drives the EXACT
+    /// crash-path sequence below with a [`TransitionCause::Unresponsive`] (the
+    /// handle drop kills the hung process — the sanctioned teardown, the AI-12
+    /// PersistentPollFailure precedent), and the Restart Policy applies
+    /// verbatim. A paused instance is NEVER probed (a suspended process cannot
+    /// heartbeat — the exact-`running` guard, silent by design), and an
+    /// instance with no declared check behaves byte-identically to before.
     pub fn poll_once(&mut self, registry: &Registry) -> Vec<RestartPlan> {
         // First, INGEST self-reported usage from every running instance's captured
         // output (story 3-1): the reaper is the natural cadence for draining the
@@ -112,6 +171,14 @@ impl Supervisor {
         // Snapshot the currently-held names (we mutate self.running as we react).
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         let mut plans = Vec::new();
+
+        // FIRST — drain restart plans QUEUED by the start path (Epic 18): an
+        // exit observed during a readiness-probe wait landed its crash
+        // transition inline and queued the plan; this pass hands it to the
+        // engine cadence, which times the backoff exactly as for
+        // reaper-detected crashes. Draining BEFORE phase 1 keeps the restart
+        // attempt nearest in time to the failure that scheduled it.
+        plans.append(&mut self.drain_pending_restarts());
 
         // PHASE 1 — poll EVERY held handle in the SAME tick (AI-12, loop 1).
         // Liveness reads happen up front, BEFORE any crash handling, so the pass
@@ -312,6 +379,9 @@ impl Supervisor {
                 // The row is gone (removed concurrently) — just drop the handle.
                 Err(_) => {
                     self.clear_poll_error_streak(&name);
+                    // 18-3 review: the row's chain is over with the row —
+                    // drop its requested-recycle streak too (no leak).
+                    self.requested_restart_streaks.remove(&name);
                     self.running.remove(&name);
                     continue;
                 }
@@ -349,6 +419,10 @@ impl Supervisor {
                     // connection drops with the handle.
                     self.drain_acp_notices_for(&name);
                     self.clear_poll_error_streak(&name);
+                    // 18-3 review: a stop ends any requested-recycle chain —
+                    // drop its streak too (no leak; the next start paces
+                    // from the base).
+                    self.requested_restart_streaks.remove(&name);
                     self.running.remove(&name);
                     // Story 14-2: the settle retains an acp session id (see
                     // the ordinary stop path); identical to a clear otherwise.
@@ -373,6 +447,10 @@ impl Supervisor {
                 // requested-stop handle drop (the reader's EOF notice).
                 self.drain_acp_notices_for(&name);
                 self.clear_poll_error_streak(&name);
+                // 18-3 review: a stop ends any requested-recycle chain —
+                // drop its streak too (no leak; the next start paces
+                // from the base).
+                self.requested_restart_streaks.remove(&name);
                 self.running.remove(&name);
                 continue;
             }
@@ -398,11 +476,65 @@ impl Supervisor {
             // AI-12b: capture the last poll error's text BEFORE the bookkeeping
             // clear below (the cause build needs it).
             let last_poll_error = self.poll_last_errors.get(&name).cloned();
+            // Story 18-3: read the CLASSIFICATION inputs BEFORE the remove
+            // below — the declared classes (the per-Run lens), the prior
+            // state, and the stability anchor. The state gate: the classes
+            // classify RUNS, so ONLY a coded exit out of EXACTLY `running`
+            // classifies (a crash out of `paused` stays today's crash path
+            // verbatim — the CleanExit edge is `running → stopped`, and a
+            // pause-interval never counts toward stability), and the anchor
+            // is measured only on that same gate.
+            let (exit_codes, running_for) = match self.running.get(&name) {
+                Some(supervised) => {
+                    let running_for = (state == LifecycleState::Running)
+                        .then(|| supervised.running_since.elapsed());
+                    (supervised.exit_codes.clone(), running_for)
+                }
+                None => (None, None),
+            };
+            let classified = classify_exit(&exit_codes, &crash, state);
             // Story 14-1: surface any queued acp notices before the crashed
             // instance's connection drops with the handle (the reader's EOF /
             // malformed-line / permission facts must not die silently with it).
             self.drain_acp_notices_for(&name);
             self.clear_poll_error_streak(&name);
+            if let Some((ExitClass::Clean, code)) = classified {
+                // CLEAN EXIT (story 18-3): the agent finished ON PURPOSE on a
+                // declared code — the requested-stop shape. The streak of
+                // restart-requested recycles ends here too (the Run ended in
+                // a declared-clean place; the next relaunch chain starts at
+                // the base). Settle the record like a requested stop (an
+                // established acp session id is retained for the next
+                // start), transition `running → stopped` with the CleanExit
+                // cause, NO plan, NO counter action — the operator's next
+                // fresh start is the counter reset, exactly as it has always
+                // been.
+                self.requested_restart_streaks.remove(&name);
+                self.running.remove(&name);
+                // Story 14-2: the settle retains an acp session id (see the
+                // ordinary stop path); identical to a clear otherwise. A
+                // store hiccup degrades to the pre-18-3 silence — the record
+                // fails to settle, and a later open's reconcile finds no live
+                // PID (honest).
+                let _ = registry.settle_spawn_record(&name);
+                // 18-3 review: the log-dir prep is BEST-EFFORT here (the
+                // same posture as the crash path below) — the durable
+                // state leads, so a failed prep degrades to a missing
+                // agent.log dir for THIS stop, never a blocked transition.
+                // A swallowed-`is_err()` empty block read as unhandled
+                // control flow; this says the `Err` is accepted, on
+                // purpose, right where it happens.
+                let _ = self.ensure_log_dir(registry, &name);
+                let _ = self.transition_with_log_capture(
+                    registry,
+                    &name,
+                    LifecycleState::Running,
+                    LifecycleState::Stopped,
+                    TransitionCause::clean_exit(code),
+                    crash_log_capture,
+                );
+                continue;
+            }
             self.running.remove(&name);
             let base_detail = match crash {
                 // AI-12: the handle went permanently un-pollable — the recorded
@@ -452,7 +584,51 @@ impl Supervisor {
                     "process exited unexpectedly (terminated by signal)".to_string()
                 }
             };
-            let decision = self.plan_restart(registry, &name, &base_detail);
+            // Story 18-3: the classified branches pick the cause + the policy
+            // consult; the unclassified majority takes the verbatim crash path.
+            let (transition_cause, plan) = match classified {
+                Some((ExitClass::RestartRequested, code)) => {
+                    // The agent ASKED for a relaunch on a declared code: the
+                    // crash-path dance (terminal transition + plan, backoff
+                    // VERBATIM arithmetic) with the `restart-requested` cause
+                    // — but the consecutive-failure counter is NOT charged
+                    // and `is_crash_loop` is never consulted (a declared
+                    // recycle chain can NEVER trip the terminal; docs state
+                    // the operator contract honestly). `Never` still
+                    // outranks the adapter's ask (terminal `failed`, no
+                    // plan). The classification detail names the declared
+                    // class — and on a `never` outcome the policy verdict
+                    // rides the same detail so the failed landing explains
+                    // itself.
+                    let plan = self.plan_requested_restart(registry, &name, code);
+                    let detail = match &plan {
+                        // 18-3 review: the recycle depth rides the cause —
+                        // the pacing is surfaced, not silent.
+                        Some((_, depth)) => {
+                            format!("declared class `restart_requested`; requested-recycle {depth}")
+                        }
+                        None => "declared class `restart_requested`; restart policy is \
+                                 'never' — not restarting (the operator's policy outranks \
+                                 the adapter's ask)"
+                            .to_string(),
+                    };
+                    (
+                        TransitionCause::restart_requested_with_detail(code, detail),
+                        plan.map(|(plan, _)| plan),
+                    )
+                }
+                _ => {
+                    // Unclassified: today's charged crash path verbatim —
+                    // the stable-window reset (when the just-ended run had
+                    // held `running` ≥ the engine's window) joins the plan
+                    // inside.
+                    let decision = self.plan_restart(registry, &name, &base_detail, running_for);
+                    (
+                        TransitionCause::crashed(decision.crash_cause.clone()),
+                        decision.plan,
+                    )
+                }
+            };
             if self.ensure_log_dir(registry, &name).is_err() {
                 // If we cannot even prepare the log dir, still persist the state
                 // so the durable state leads; skip the event append best-effort.
@@ -461,14 +637,16 @@ impl Supervisor {
             // plus (on a terminal outcome) the policy conclusion (crash-loop, or
             // "policy is never — not restarting"). This is what `instance_status`
             // falls back to for the failed cause once the terminal record is
-            // cleared (AC9).
+            // cleared (AC9). Story 18-3: a classified exit carries its OWN
+            // cause (`restart-requested`) instead of `crashed` — the class is
+            // the story.
             if self
                 .transition_with_log_capture(
                     registry,
                     &name,
                     state,
                     LifecycleState::Failed,
-                    TransitionCause::crashed(decision.crash_cause.clone()),
+                    transition_cause,
                     crash_log_capture,
                 )
                 .is_err()
@@ -478,8 +656,398 @@ impl Supervisor {
                 continue;
             }
 
-            if let Some(plan) = decision.plan {
+            if let Some(plan) = plan {
                 plans.push(plan);
+            }
+        }
+
+        // PHASE 4 — DECLARED LIVENESS (story 18-2). After crash handling: any
+        // handle phase 3 reaped is gone from `self.running`, so this snapshot
+        // holds only the SURVIVING instances. Each one whose adapter declared
+        // a `[liveness]` check and whose persisted state is EXACTLY `running`
+        // gets ONE attempt per pass (see the tick-stretch honesty in this
+        // fn's docs). The window bookkeeping is the PURE
+        // `WindowDecision`; expiry runs the crash-path sequence verbatim.
+        let surviving: Vec<InstanceName> = self.running.keys().cloned().collect();
+        for name in surviving {
+            // Read the declared check + the open window (if any) up front, so
+            // the mutable borrows below start clean.
+            let (check, failing_since) = {
+                let Some(supervised) = self.running.get(&name) else {
+                    continue;
+                };
+                match &supervised.liveness_check {
+                    Some(check) => (
+                        check.clone(),
+                        supervised.liveness_failing_since.map(|t| t.elapsed()),
+                    ),
+                    // No declared check: process liveness only — the
+                    // byte-identical pre-1.1.0 behavior (and the adopted
+                    // instance whose resolution failed: ONE diagnostic at
+                    // adoption already said so, silent thereafter).
+                    None => continue,
+                }
+            };
+            // The paused guard: ONLY an instance the store shows EXACTLY
+            // `running` is probed. A paused instance is never probed (a
+            // suspended process cannot heartbeat — SIGSTOP, or a Windows
+            // pause that was a no-op: neither may fail the agent), and a
+            // `stopping`/terminal row is somebody else's transition. SILENT
+            // skip by design — a pause is a normal state, not a degradation.
+            //
+            // Review round 1 (P2): a store-read ERROR is its own arm — the
+            // state is UNREADABLE, which is not evidence the instance is not
+            // running, so the check is PAUSED for this tick (never fail an
+            // instance on an unreadable state) and the degradation is
+            // SURFACED once per episode: the first Err for a name emits ONE
+            // diagnostic; further Errs stay silent (no per-tick spam while
+            // the store is down) until a read recovers — an Ok clears the
+            // episode silently and checks resume.
+            #[cfg(test)]
+            if self.liveness_lookup_fault_names.contains(&name) {
+                // cfg(test) seam (P2's driver): behave exactly like a store
+                // read failure, deterministically (a real outage cannot be
+                // staged in-process). The SAME episode bookkeeping as the
+                // real Err arm — the seam exercises the whole arm, not just
+                // the diagnostic.
+                if self.liveness_lookup_err_names.insert(name.clone()) {
+                    self.emit_liveness_lookup_degraded(
+                        &name,
+                        "injected cfg(test) liveness-lookup fault (store read failed)",
+                    );
+                }
+                continue;
+            }
+            match registry.lookup(&name) {
+                Ok(instance) => {
+                    // A successful read ends the degraded-read episode (if
+                    // one was open) — silently; recovery is not news, the
+                    // ONE degradation diagnostic already covered it.
+                    self.liveness_lookup_err_names.remove(&name);
+                    if instance.state != LifecycleState::Running {
+                        continue;
+                    }
+                }
+                Err(lookup_err) => {
+                    if self.liveness_lookup_err_names.insert(name.clone()) {
+                        // First Err THIS episode: the ONE diagnostic.
+                        self.emit_liveness_lookup_degraded(&name, &lookup_err.to_string());
+                    }
+                    continue;
+                }
+            }
+            let max_age_ms = check.max_age_ms();
+            let failing_now =
+                liveness::evaluate(&check, &registry.agent_home(&name)) == LivenessSignal::Failing;
+            match liveness::window_decision(failing_since, failing_now, max_age_ms) {
+                WindowDecision::Healthy => {}
+                WindowDecision::WithinWindow { .. } => {
+                    // A transient blip inside the window: silent — it is none
+                    // of the operator's business until it persists.
+                }
+                WindowDecision::StartWindow => {
+                    // FIRST failing attempt: open the window, emit the ONE
+                    // first-failure diagnostic (surfaced, not silent — the
+                    // operator sees the window open while there is still time
+                    // to care).
+                    //
+                    // Review round 1 (P6): the pair is BOUNDED. Once this Run
+                    // has flapped through the diagnostic budget (3 full
+                    // open→recover cycles), further window-opens open
+                    // SILENTLY — the ONE suppression note (emitted at the
+                    // third recovery) already said the signal is flapping.
+                    // The window itself always opens and always still
+                    // expires; only the chatter is bounded.
+                    let suppressed = {
+                        let Some(supervised) = self.running.get_mut(&name) else {
+                            continue;
+                        };
+                        supervised.liveness_failing_since = Some(std::time::Instant::now());
+                        supervised.liveness_reopens >= LIVENESS_REOPEN_DIAGNOSTIC_BUDGET
+                    };
+                    if !suppressed {
+                        self.emit_diagnostic(&format!(
+                            "{}: declared liveness check failing ({}) — the window is open; \
+                             failing continuously for {}ms fails the instance",
+                            name.as_str(),
+                            liveness::describe(&check),
+                            max_age_ms,
+                        ));
+                    }
+                }
+                WindowDecision::Recovered => {
+                    // The signal came back inside the window: close the
+                    // window, emit the ONE recovery diagnostic (a failing
+                    // agent that came back is exactly what an operator wants
+                    // to know about).
+                    //
+                    // Review round 1 (P6): count the completed flap cycle.
+                    // Recoveries inside the diagnostic budget (the first 3)
+                    // each emit; AT the third, ONE flap note explains that
+                    // further reopen diagnostics are suppressed; later
+                    // recoveries are silent (the operator has been told).
+                    let reopens = {
+                        let Some(supervised) = self.running.get_mut(&name) else {
+                            continue;
+                        };
+                        supervised.liveness_failing_since = None;
+                        supervised.liveness_reopens = supervised.liveness_reopens.saturating_add(1);
+                        supervised.liveness_reopens
+                    };
+                    if reopens <= LIVENESS_REOPEN_DIAGNOSTIC_BUDGET {
+                        self.emit_diagnostic(&format!(
+                            "{}: declared liveness check recovered ({}) — the failure window \
+                             closed before expiring",
+                            name.as_str(),
+                            liveness::describe(&check),
+                        ));
+                    }
+                    if reopens == LIVENESS_REOPEN_DIAGNOSTIC_BUDGET {
+                        // Exactly once (the count never revisits this value).
+                        self.emit_diagnostic(&format!(
+                            "{}: further liveness-window reopen diagnostics suppressed \
+                             (the signal is flapping; the window still never expires while \
+                             it recovers)",
+                            name.as_str()
+                        ));
+                    }
+                }
+                WindowDecision::Expired { failing_for_ms } => {
+                    // UNRESPONSIVE. The crash-path sequence verbatim (phase 3's
+                    // terminal drains → capture → notices → remove → policy
+                    // consult → transition), with the `unresponsive` cause and
+                    // the guaranteed-Running prior state — plus the review
+                    // round 1 hardenings: the detached-handle force-kill (P4),
+                    // the onset honesty (P7), the detail-carrying cause (P8),
+                    // and the GUARDED commit (P3).
+                    let check_desc = liveness::describe(&check);
+                    self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
+                    self.drain_observed_for(registry, &name, DrainMode::Terminal);
+                    self.unlink_raw_logs_if_metadata(registry, &name);
+                    // Story 18-3: capture the stability anchor BEFORE the
+                    // remove below — the unresponsive expiry is a CHARGED
+                    // class, so a run that had held `running` ≥ the engine's
+                    // stable window resets the counter first (this failure
+                    // charges as #1). The phase-4 gate guarantees the
+                    // persisted state is EXACTLY `running`, so the anchor
+                    // always measures here.
+                    let running_for = self.running.get(&name).map(|s| s.running_since.elapsed());
+                    // Capture BEFORE the remove — the drop of the (possibly
+                    // hung) handle is the sanctioned teardown (kill-on-drop,
+                    // the AI-12 PersistentPollFailure precedent: a wedged
+                    // agent will not stop on request, and a bounded-stop
+                    // ladder must not wedge the reaper).
+                    let liveness_log_capture = self
+                        .running
+                        .get(&name)
+                        .and_then(|s| self.backend.log_capture(&s.handle));
+                    self.drain_acp_notices_for(&name);
+                    self.clear_poll_error_streak(&name);
+                    // P4 (review round 1): a DETACHED handle has NO
+                    // kill-on-drop — dropping it below would release the
+                    // handle and leave the wedged process RUNNING (holding
+                    // its ports, still unresponsive — the "failure" would be
+                    // bookkeeping, not teardown). The disarm flag's single
+                    // source is the spawn record (spawn and adopt both pass
+                    // it); when it says detached and the process is still
+                    // ALIVE, escalate to the stop ladder's final leg (a
+                    // zero-window stop is SIGKILL + confirm on unix) BEFORE
+                    // the removal — the same escalation shape the
+                    // readiness-timeout teardown uses (18-1 review E2). A
+                    // non-detached (owned) handle keeps the kill-on-drop
+                    // drop, unchanged.
+                    let detached = registry
+                        .spawn_record(&name)
+                        .ok()
+                        .flatten()
+                        .map(|record| record.detach)
+                        .unwrap_or(false);
+                    if detached {
+                        if let Some(supervised) = self.running.get_mut(&name) {
+                            // AI-18 honesty (windows-latest triage 2026-10-24):
+                            // every path here that does NOT kill a live wedge
+                            // must SAY so — a silent skip leaves the wedged
+                            // process running (holding its ports) while the
+                            // failure commit says teardown happened. The two
+                            // silent shapes below each get a named diagnostic:
+                            // a poll that did not answer `Alive`, and a
+                            // zero-window stop that reports a GRACEFUL outcome
+                            // (the backend reaped an exit on the way in — for
+                            // a process that just polled alive, that is the
+                            // silent-skip signature).
+                            let poll = self.backend.poll(&mut supervised.handle);
+                            if matches!(poll, Ok(ProcessStatus::Alive)) {
+                                match self.backend.stop(&mut supervised.handle, Duration::ZERO) {
+                                    Ok(outcome) if !outcome.forced => {
+                                        self.emit_diagnostic(&format!(
+                                            "{}: liveness-expiry teardown stop returned a \
+                                             graceful (not forced) outcome for a detached \
+                                             process that just polled alive — the wedge may \
+                                             still be running",
+                                            name.as_str()
+                                        ));
+                                    }
+                                    Err(kill_err) => {
+                                        // Surfaced (AI-18): the kill failed — the
+                                        // operator must know the teardown was not
+                                        // completed, not silently drop a live
+                                        // handle.
+                                        self.emit_diagnostic(&format!(
+                                            "{}: liveness-expiry teardown could not force-kill \
+                                             the detached, unresponsive process: {kill_err}",
+                                            name.as_str()
+                                        ));
+                                    }
+                                    Ok(_) => {}
+                                }
+                            } else {
+                                // Informational, not a failure: the wedge may
+                                // legitimately have exited on its own between
+                                // the window opening and this teardown (then
+                                // there is nothing to kill). Any OTHER status
+                                // is the silent-skip signature — the outcome
+                                // rides the diagnostic for the operator.
+                                self.emit_diagnostic(&format!(
+                                    "{}: liveness-expiry teardown skipped the force-kill — \
+                                     the detached process did not poll alive ({poll:?})",
+                                    name.as_str()
+                                ));
+                            }
+                        }
+                    }
+                    self.running.remove(&name);
+                    // P7 (review round 1): the honest onset note.
+                    // `failing_for_ms` counts from the FIRST OBSERVED
+                    // failure; for a heartbeat file the engine CAN say how
+                    // much staler the file already was at that observation
+                    // (stat the file now, compare its age to the observed
+                    // streak) — the true staleness is at least their sum,
+                    // and the observation is the lower bound, not the whole
+                    // truth. An http-get has no statable onset (a refused
+                    // connection leaves no artifact) — the note is
+                    // heartbeat-file-only.
+                    let onset_note = liveness_expiry_onset_note(
+                        &check,
+                        &registry.agent_home(&name),
+                        failing_for_ms,
+                    );
+                    let mut detail = format!(
+                        "declared liveness check unresponsive: {check_desc} failing for \
+                         {failing_for_ms}ms (window {max_age_ms}ms)"
+                    );
+                    if let Some(note) = &onset_note {
+                        detail.push_str("; ");
+                        detail.push_str(note);
+                    }
+                    // P8 (review round 1): the policy consult happens BEFORE
+                    // the commit — the phase-3 order. On a TERMINAL outcome
+                    // (policy `never`, or the crash-loop threshold) the
+                    // verdict folds into the PERSISTED cause's `detail`
+                    // (combined with the onset note when both exist), so the
+                    // event log and `show`'s failed-cause fold carry the
+                    // "will never restart" conclusion — not only the one
+                    // console diagnostic this arm keeps below.
+                    let decision = self.plan_restart(registry, &name, &detail, running_for);
+                    let terminal_verdict = if decision.plan.is_none() {
+                        // `plan_restart` prefixes the verdict with the base
+                        // detail it was handed; strip that back off so the
+                        // cause's `detail` field carries JUST the verdict —
+                        // the cause already renders the check + streak, and
+                        // re-duplicating them would garble `show`.
+                        Some(
+                            decision
+                                .crash_cause
+                                .strip_prefix(&format!("{detail}; "))
+                                .unwrap_or(&decision.crash_cause)
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    let cause = match (&onset_note, terminal_verdict) {
+                        (Some(note), Some(verdict)) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            format!("{note}; {verdict}"),
+                        ),
+                        (Some(note), None) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            note.clone(),
+                        ),
+                        (None, Some(verdict)) => TransitionCause::unresponsive_with_detail(
+                            check_desc.clone(),
+                            failing_for_ms,
+                            verdict,
+                        ),
+                        (None, None) => {
+                            TransitionCause::unresponsive(check_desc.clone(), failing_for_ms)
+                        }
+                    };
+                    if self.ensure_log_dir(registry, &name).is_err() {
+                        // Same posture as the crash path: the state persists
+                        // even if the log dir cannot be prepared; the event
+                        // append below stays best-effort.
+                    }
+                    // P3 (review round 1): the GUARDED commit. The phase-4
+                    // lookup read `running` a moment ago, but a concurrent
+                    // command (another CLI engine on the same state root)
+                    // may have legitimately moved the row since — the write
+                    // commits ONLY when the row is still `running`. A
+                    // refusal is the ONE skip-diagnostic with no failure and
+                    // NO restart plan: the state moved, so whoever drove
+                    // that transition owns this instance's lifecycle now.
+                    // HONEST ORDER NOTE (P8): the consult above has ALREADY
+                    // charged the counter / settled the record by the time
+                    // this commit runs — the same consult-then-persist order
+                    // the crash path uses — so a `StateConflict` refusal
+                    // leaves that charge in place. The failure was real,
+                    // whoever drove the concurrent transition owns the row,
+                    // and the charge stands.
+                    if let Err(err) = self.transition_if_prior(
+                        registry,
+                        &name,
+                        LifecycleState::Running,
+                        LifecycleState::Failed,
+                        cause,
+                        liveness_log_capture,
+                    ) {
+                        match err {
+                            EngineError::Store(StoreError::StateConflict { .. }) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: liveness expiry skipped — the instance state \
+                                     moved before the failure committed; the instance is \
+                                     left to whoever drove that transition",
+                                    name.as_str()
+                                ));
+                            }
+                            _ => {
+                                // Persisting the transition failed (event
+                                // append / compensation); leave the record
+                                // for a later reconcile and move on (never
+                                // panic the reaper).
+                            }
+                        }
+                        continue;
+                    }
+                    match decision.plan {
+                        Some(plan) => plans.push(plan),
+                        None => {
+                            // Terminal (policy `never`, or the crash-loop
+                            // threshold): keep the ONE immediate-console
+                            // diagnostic — the verdict ALSO rides the
+                            // persisted cause above (P8), so the event log
+                            // and `show` carry it durably; this is the
+                            // operator-console surface, emitted exactly once
+                            // (surfaced, not silent).
+                            self.emit_diagnostic(&format!(
+                                "{}: {}",
+                                name.as_str(),
+                                decision.crash_cause
+                            ));
+                        }
+                    }
+                }
             }
         }
         plans
@@ -500,12 +1068,39 @@ impl Supervisor {
     ///   crash-loop reason; no plan.
     /// * `never` → TERMINAL: clear the write-ahead record and note the policy in
     ///   the crash cause; no plan.
-    fn plan_restart(
-        &self,
+    ///
+    /// Story 18-3 — `running_for` (how long the just-ended run had held
+    /// `running` continuously, `None` when there is no anchor: a crash out of
+    /// `paused`, or an adopted instance whose run began before this engine
+    /// watched it) joins the CHARGED path: a run of ≥
+    /// [`STABLE_RUN_WINDOW`] (the engine's window, test-scaled on the
+    /// supervisor) proves stability, so the counter RESETS to 0 first — its
+    /// own store line — and this crash then charges as failure #1, with the
+    /// reset NAMED in the crash detail. The arithmetic is the pure
+    /// [`next_consecutive_failures`]; a terminal outcome (`never`) never
+    /// charges, so it never resets either.
+    ///
+    /// Also called by the START path (spawn.rs) when the readiness probe
+    /// observes the process EXIT mid-wait: the write-ahead record exists by
+    /// then (committed before the probe), so the policy consult is identical.
+    /// The start path passes `running_for: None` — a launch-phase exit is
+    /// never a run (the classes classify runs; so does the reset).
+    pub(super) fn plan_restart(
+        &mut self,
         registry: &Registry,
         name: &InstanceName,
         crash_detail: &str,
+        running_for: Option<Duration>,
     ) -> RestartDecision {
+        // 18-3 review: EVERY outcome of this fn ends a requested-recycle
+        // chain — a charged crash (reset or plain increment) proves failure,
+        // and both terminal arms (`never`, crash-loop) end the Run — so the
+        // in-memory streak is dropped WITH the chain, right here. One
+        // removal covers the crash path, the liveness-expiry path (both
+        // funnel through this fn), and the stable-reset forgiveness: a run
+        // that proved stability forgives the pacing history, so the next
+        // requested chain paces from the base, not the old depth.
+        self.requested_restart_streaks.remove(name);
         let record = registry.spawn_record(name).ok().flatten();
         let policy = record
             .as_ref()
@@ -516,6 +1111,7 @@ impl Supervisor {
         if !policy.restarts_on_crash() {
             // `never`: TERMINAL. Settle the record so a later open does not
             // adopt-attempt a dead PID; the crash cause names the policy.
+            // Nothing charges, so the stable window never applies here.
             self.settle_terminal_record(registry, name, policy);
             return RestartDecision {
                 crash_cause: format!("{crash_detail}; restart policy is 'never' — not restarting"),
@@ -523,7 +1119,22 @@ impl Supervisor {
             };
         }
 
-        let next = current.saturating_add(1);
+        // Story 18-3: the stable-window reset joins the charged path — the
+        // ONE store write below persists the RESET-THEN-CHARGED value (1,
+        // never an interim 0) with the reset NAMED in the crash detail
+        // (surfaced, not silent). 18-3 review: the previous two-write shape
+        // (interim `set_restart_count(name, 0, None)`, then the charge) is
+        // GONE — a single write cannot strand a half-reset streak between
+        // the two lines if the engine dies in between.
+        let (next, reset) = next_consecutive_failures(current, running_for, self.stable_run_window);
+        let crash_detail = match (reset, running_for) {
+            (true, Some(run)) => format!(
+                "{crash_detail}; the previous run was stable for {}s — consecutive-failure \
+                 count reset",
+                run.as_secs()
+            ),
+            _ => crash_detail.to_string(),
+        };
         if is_crash_loop(next) {
             // Crash loop: TERMINAL. Settle the record (F-Low-2), leave `failed`
             // with the reason STATED in the crash cause.
@@ -540,16 +1151,98 @@ impl Supervisor {
 
         // Schedule a restart: persist the incremented count + the crash cause,
         // and return the plan with the backoff delay for this attempt.
-        let _ = registry.set_restart_count(name, next, Some(crash_detail));
+        let _ = registry.set_restart_count(name, next, Some(&crash_detail));
         let delay = self.backoff.delay_for(next);
         RestartDecision {
-            crash_cause: crash_detail.to_string(),
+            crash_cause: crash_detail,
             plan: Some(RestartPlan {
                 name: name.clone(),
                 attempt: next,
                 delay,
             }),
         }
+    }
+
+    /// Decide the restart for a RESTART-REQUESTED exit (story 18-3): the
+    /// crash-path dance — a restart plan on the VERBATIM backoff arithmetic —
+    /// WITHOUT charging the consecutive-failure counter. The agent asked for a
+    /// relaunch on a declared code, which proves neither stability nor
+    /// failure; the counter simply holds. Returns `None` on the terminal
+    /// outcome (the caller renders the cause's policy verdict).
+    ///
+    /// The persisted counter is NEVER written on this path — including
+    /// transitively: the plan's `attempt` carries the UNCHANGED current
+    /// count, because the relaunch executor writes
+    /// `restart_count = attempt` into the fresh spawn record (`start_inner`
+    /// step (7)); carrying `current + 1` would charge through that write.
+    /// The backoff DELAY instead grows with the in-memory
+    /// `requested_restart_streaks` streak (delay index =
+    /// `current + streak + 1`, clamped to the cap by [`BackoffSchedule`]),
+    /// so a restart-requested loop still backs off to its cap — the RATE is
+    /// bounded even though the crash-loop terminal can never trip (the
+    /// operator asked; the docs state that contract honestly).
+    ///
+    /// `is_crash_loop` is NEVER consulted here: the persisted count is
+    /// unchanged by construction, and while an instance is alive its
+    /// persisted count is always below the threshold anyway (a trip would
+    /// have terminal-settled the run; a fresh start resets to 0) — a
+    /// restart-requested plan can never be the straw that breaks it.
+    /// `RestartPolicy::Never` outranks the adapter's ask (the operator's
+    /// instrument wins): terminal — settle the record, no plan, no counter
+    /// action. The streak clears at every fresh OPERATOR start, adoption,
+    /// clean exit, operator stop, and CHARGED crash (`plan_restart` drops it
+    /// for every one of its outcomes — a stable-window reset FORGIVES the
+    /// pacing history along with the chain); a policy relaunch KEEPS it — it
+    /// IS the chain being paced. An engine restart forgets it (the next
+    /// relaunch waits the base
+    /// again — the DURABLE counter, untouched by this path, stays the
+    /// operator's signal).
+    fn plan_requested_restart(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        _code: u16,
+    ) -> Option<(RestartPlan, u32)> {
+        let record = registry.spawn_record(name).ok().flatten();
+        let policy = record
+            .as_ref()
+            .map(|r| r.restart_policy)
+            .unwrap_or_default();
+        if !policy.restarts_on_crash() {
+            // `never` outranks the adapter's ask: TERMINAL, no plan, no
+            // counter action (the transition to `failed` + the cause's
+            // policy verdict are the caller's). 18-3 review: terminal ends
+            // the chain — drop its streak (no leak).
+            self.requested_restart_streaks.remove(name);
+            self.settle_terminal_record(registry, name, policy);
+            return None;
+        }
+        let current = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
+        // The uncharged streak grows the delay: the delay index is
+        // `current + streak + 1` — NOT the base (a chain riding a charged
+        // count starts higher than the base) — and each later relaunch in
+        // the chain doubles it, the cap clamping.
+        let streak = self
+            .requested_restart_streaks
+            .get(name)
+            .copied()
+            .unwrap_or(0);
+        let delay = self.backoff.delay_for(current + streak + 1);
+        // The POST-increment depth rides back to the caller so the cause
+        // can surface `requested-recycle N` — the pacing is visible, not
+        // silent (18-3 review).
+        let depth = streak + 1;
+        self.requested_restart_streaks.insert(name.clone(), depth);
+        Some((
+            RestartPlan {
+                name: name.clone(),
+                // The UNCHANGED count: the relaunch's fresh record must read the
+                // same number the operator saw before the recycle (see the doc).
+                attempt: current,
+                delay,
+            },
+            depth,
+        ))
     }
 
     /// Settle the write-ahead record on a TERMINAL `failed` outcome (F-Low-2).
@@ -1009,7 +1702,100 @@ impl Supervisor {
                     // Read BEFORE the listener moves into `Supervised` (the
                     // strand note below must know whether a live listener landed).
                     let rebind_landed = adopted_listener.is_some();
+                    // Story 18-2: re-resolve the adopted instance's declared
+                    // liveness check from ITS adapter manifest (the same
+                    // resolution the start seam runs). The window itself does
+                    // NOT survive the previous engine — the prior failure
+                    // streak lived in the dead engine's `Supervised` — so an
+                    // adopted instance starts a FRESH window (the honest
+                    // degradation, documented: up to one extra window of
+                    // grace). A resolution failure (manifest drifted invalid,
+                    // or unreadable since registration) is SURFACED (AI-18)
+                    // as ONE diagnostic and the adopted instance is re-held
+                    // with NO declared check — process liveness only — never
+                    // a failed adoption (graceful degradation: the agent is
+                    // running and owned either way).
+                    let adopted_liveness_check = match registry.adapter_launch_facts(&name) {
+                        Ok((kind, manifest_path, _launch)) => {
+                            match crate::adapter::resolve_liveness_check(
+                                &kind,
+                                manifest_path.as_deref(),
+                            ) {
+                                Ok(check) => check,
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the adopted instance's declared liveness check \
+                                         could not be resolved ({err}); supervising PROCESS \
+                                         liveness only for this Run — stop and start the \
+                                         instance to restore the declared check",
+                                        name.as_str(),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.emit_diagnostic(&format!(
+                                "{}: the adopted instance's adapter snapshot could not be \
+                                 read ({err}); its declared liveness check (if any) is NOT \
+                                 supervised this Run — stop and start the instance to \
+                                 restore it",
+                                name.as_str(),
+                            ));
+                            None
+                        }
+                    };
+                    // Story 18-3: re-resolve the adopted instance's declared
+                    // exit-code classes from ITS adapter manifest — the exact
+                    // twin of the liveness re-resolution above, with the same
+                    // posture: a resolution failure (manifest drifted invalid,
+                    // or unreadable since registration) is SURFACED (AI-18) as
+                    // ONE diagnostic and the adopted instance is re-held with
+                    // NO declared classes — every unrequested exit is a crash,
+                    // the pre-classification behavior — never a failed
+                    // adoption. (An adopted instance ALSO never gets the
+                    // stable-window reset: its anchor starts at adoption, so a
+                    // run must prove stability under THIS engine's watch.)
+                    let adopted_exit_codes = match registry.adapter_launch_facts(&name) {
+                        Ok((kind, manifest_path, _launch)) => {
+                            match crate::adapter::resolve_exit_codes(
+                                &kind,
+                                manifest_path.as_deref(),
+                            ) {
+                                Ok(classes) => classes,
+                                Err(err) => {
+                                    self.emit_diagnostic(&format!(
+                                        "{}: the adopted instance's declared exit-code classes \
+                                         could not be resolved ({err}); exit codes are NOT \
+                                         classified this Run — stop and start the instance to \
+                                         restore the declared classes",
+                                        name.as_str(),
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // The snapshot is already known-unreadable (the
+                            // liveness resolution above emitted ITS
+                            // diagnostic for exactly this read); do not spam
+                            // the same degradation twice — the classes are
+                            // simply not supervised, same posture.
+                            None
+                        }
+                    };
                     self.clear_poll_error_streak(&name);
+                    // Story 18-3: adoption begins a FRESH restart-requested
+                    // chain (the previous engine's streak is not observable —
+                    // the in-memory map died with it). The durable crash
+                    // counter was never touched by that chain and rides
+                    // as-is — so the first requested relaunch under THIS
+                    // engine waits the delay index `current + 0 + 1`: the
+                    // base ONLY when that counter is 0, a higher rung when
+                    // a charged count survived (18-3 review: the old
+                    // "waits the base backoff again" wording misstated the
+                    // formula `plan_requested_restart` actually computes).
+                    self.requested_restart_streaks.remove(&name);
                     self.running.insert(
                         name.clone(),
                         Supervised {
@@ -1092,6 +1878,43 @@ impl Supervisor {
                             // note below says so; `session/load` resume is
                             // story 14-2).
                             acp: None,
+                            // Story 18-2: the adopted instance's RE-RESOLVED
+                            // liveness check (above) with a FRESH window —
+                            // the previous engine's failure streak is not
+                            // observable, so adoption grants a whole new
+                            // window (the honest ≤-one-extra-window grace,
+                            // documented in the manifest docs). The reopen
+                            // counter starts fresh too (P6): this engine has
+                            // seen zero flaps.
+                            liveness_check: adopted_liveness_check,
+                            liveness_failing_since: None,
+                            liveness_reopens: 0,
+                            // Story 18-3: the adopted instance's RE-RESOLVED
+                            // exit-code classes (above) — `None` classifies
+                            // nothing (byte-identical). The stability anchor
+                            // starts at ADOPTION: the pre-adoption run time
+                            // is not observable, so a reset requires a FULL
+                            // window of running under THIS engine's watch
+                            // first (an honest fresh anchor — the review
+                            // renamed this from "no-reset", which misread
+                            // the shape: a long-watched adopted run resets
+                            // exactly like a spawned one).
+                            exit_codes: adopted_exit_codes,
+                            running_since: std::time::Instant::now(),
+                            // Story 18-4: the adopted instance's
+                            // cooperative posture is RE-DERIVED from the
+                            // durable record (the same classifier the
+                            // release pass uses) — a handle adopted while a
+                            // command-pause edge is the latest truth keeps
+                            // its cooperative pause honestly (the stop
+                            // ladder's cooperative skip and the release
+                            // pass's Cooperative arm then apply to it,
+                            // exactly as if this engine had run the command
+                            // itself). Cross-lifetime honesty per the 18-4
+                            // spec: never persisted, always re-derived.
+                            cooperatively_paused: super::lifecycle::classify_pause_kind(
+                                registry, &name,
+                            ) == super::lifecycle::PauseKind::Cooperative,
                         },
                     );
                     adopted += 1;
@@ -1293,5 +2116,182 @@ impl Supervisor {
         let _ = registry.settle_spawn_record(name);
     }
 
+    /// The ONE degraded-read diagnostic of the phase-4 liveness lookup
+    /// (review round 1, P2) — shared by the real store-error path and the
+    /// cfg(test) seam so both emit byte-identically.
+    fn emit_liveness_lookup_degraded(&self, name: &InstanceName, reason: &str) {
+        self.emit_diagnostic(&format!(
+            "{}: declared liveness check could not consult the instance state \
+             (store read failed): {reason} — checks paused until reads recover",
+            name.as_str(),
+        ));
+    }
+
     // ---- internals ----
+}
+
+/// How many complete liveness flap cycles (window open → recovery) emit
+/// their first-failure/recovery diagnostic PAIRS within one Run before the
+/// pairs go silent (review round 1, P6). A flapping signal that never
+/// expires is contract-correct — persistence is the window's job — but an
+/// unbounded diagnostic pair per flap is per-tick spam in slow motion: three
+/// pairs tell the operator everything, then ONE suppression note says the
+/// quiet part, and the window keeps expiring on schedule regardless.
+const LIVENESS_REOPEN_DIAGNOSTIC_BUDGET: u32 = 3;
+
+/// The expiry-verdict onset note (review round 1, P7): for a HEARTBEAT-FILE
+/// check, how much staler the file already was at the first OBSERVED failure
+/// than the observed streak itself — the engine can stat the file at expiry
+/// and subtract what the window measured, surfacing the pre-existing
+/// staleness the observation could not see. `None` for an http-get check (a
+/// refused connection leaves no statable artifact), for a file that cannot
+/// be stat'ed honestly, and when the file's current age does not exceed the
+/// observed streak (nothing pre-existing to name). Best-effort by design:
+/// a note is additive honesty, never a gate on the failure itself.
+fn liveness_expiry_onset_note(
+    check: &LivenessCheck,
+    home: &std::path::Path,
+    failing_for_ms: u64,
+) -> Option<String> {
+    let LivenessCheck::HeartbeatFile(h) = check else {
+        return None;
+    };
+    // The SAME home-relative resolution the evaluator uses (evaluate's
+    // HeartbeatFile arm), so the note stats the exact file that was judged
+    // stale.
+    let path = if std::path::Path::new(&h.path).is_absolute() {
+        std::path::PathBuf::from(&h.path)
+    } else {
+        home.join(&h.path)
+    };
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
+    let age_now_ms = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_millis() as u64;
+    if age_now_ms > failing_for_ms {
+        Some(format!(
+            "the heartbeat file was already ~{}ms stale at first observation",
+            age_now_ms - failing_for_ms
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    //! Story 18-3's pure classifier (`portable_code` + `classify_exit`) —
+    //! unit-tested beside their module (the restart.rs precedent: these are
+    //! pure decision fns, no Supervisor needed; the integration matrix lives
+    //! in `tests/exit_codes.rs`).
+
+    use super::*;
+    use hekma_adapter_api::ExitCodeClasses;
+
+    fn classes(rr: &[u16], clean: &[u16]) -> Option<ExitCodeClasses> {
+        Some(ExitCodeClasses {
+            restart_requested: rr.to_vec(),
+            clean: clean.to_vec(),
+        })
+    }
+
+    #[test]
+    fn portable_code_accepts_only_the_portable_domain() {
+        // The validated manifest domain is 0..=255; anything outside (a
+        // wide Windows code, a negative) is None — never classified.
+        assert_eq!(portable_code(0), Some(0));
+        assert_eq!(portable_code(75), Some(75));
+        assert_eq!(portable_code(255), Some(255));
+        assert_eq!(portable_code(256), None, "above the portable domain");
+        assert_eq!(portable_code(-1), None, "negative is out of domain");
+        assert_eq!(portable_code(i32::MAX), None);
+    }
+
+    #[test]
+    fn classify_requires_coded_exit_running_state_and_declared_class() {
+        let codes = classes(&[75], &[0]);
+        // The happy path: a coded exit out of running on a declared code.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Running
+            ),
+            Some((ExitClass::RestartRequested, 75))
+        );
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(0)),
+                LifecycleState::Running
+            ),
+            Some((ExitClass::Clean, 0))
+        );
+        // Signal termination (no code): never classified.
+        assert_eq!(
+            classify_exit(&codes, &CrashInput::Exited(None), LifecycleState::Running),
+            None
+        );
+        // A poll-failure "crash" carries no exit: never classified.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::PersistentPollFailure { sole_handle: true },
+                LifecycleState::Running
+            ),
+            None
+        );
+        // The state gate: the classes classify RUNS — a crash out of
+        // `paused` (or any non-running state) rides the plain crash path.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Paused
+            ),
+            None
+        );
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(0)),
+                LifecycleState::Starting
+            ),
+            None,
+            "a launch-phase exit is a launch failure, never classified"
+        );
+        // No declared section (the byte-identical majority): nothing classifies.
+        assert_eq!(
+            classify_exit(
+                &None,
+                &CrashInput::Exited(Some(75)),
+                LifecycleState::Running
+            ),
+            None
+        );
+        // Declared section, UNDECLARED code: the plain crash path.
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(99)),
+                LifecycleState::Running
+            ),
+            None
+        );
+        // Out-of-domain codes never match a declared list (the validated
+        // lists are 0..=255, so a wide Windows code simply never matches).
+        assert_eq!(
+            classify_exit(
+                &codes,
+                &CrashInput::Exited(Some(331)),
+                LifecycleState::Running
+            ),
+            None
+        );
+    }
 }

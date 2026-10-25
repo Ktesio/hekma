@@ -242,6 +242,19 @@ enum AgentCommands {
         /// Name of the Agent Instance to resume
         name: String,
     },
+    /// Drain a running Agent Instance: pause it via its adapter's declared
+    /// `[lifecycle.pause]` COMMAND (cooperative — no OS signal), wait —
+    /// bounded — for the declared idle signal, then stop it. A drain that
+    /// outlives its bound STILL stops (the outcome is reported honestly).
+    Drain {
+        /// Name of the Agent Instance to drain
+        name: String,
+        /// Drain bound in milliseconds (1..=600000). Overrides the manifest's
+        /// `[drain].timeout_ms`; when both are absent the engine default
+        /// (30s) applies.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=600_000))]
+        timeout_ms: Option<u64>,
+    },
     /// Send text input to a running Agent Instance's native input channel
     ///
     /// Text that looks like a flag, such as "-5 degrees" or "--help", is sent
@@ -307,6 +320,15 @@ enum AgentCommands {
     Memory {
         #[command(subcommand)]
         command: MemoryCommands,
+    },
+    /// Print the governance conformance vectors — the versioned,
+    /// SHA-256-checksummed decision artifact a Host pins to prove its
+    /// external guard matches the engine's budget/cost rules
+    GovernanceVectors {
+        /// Emit the raw artifact bytes verbatim (byte-identical to the
+        /// released `vectors-v1.json` — the pin target for a checksum match)
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -429,6 +451,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             AgentCommands::Stop { name, timeout } => cli::agent::stop(&name, timeout),
             AgentCommands::Pause { name } => cli::agent::pause(&name),
             AgentCommands::Resume { name } => cli::agent::resume(&name),
+            AgentCommands::Drain { name, timeout_ms } => cli::agent::drain(&name, timeout_ms),
             AgentCommands::Send { name, text } => cli::agent::send(&name, &text),
             AgentCommands::Logs { name, follow, json } => cli::agent::logs(&name, follow, json),
             AgentCommands::Usage { name, json } => cli::agent::usage(name.as_deref(), json),
@@ -451,6 +474,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MemoryCommands::Detach { name, json } => cli::agent::memory_detach(&name, json),
             },
+            AgentCommands::GovernanceVectors { json } => cli::agent::governance_vectors(json),
         },
         None => {
             Cli::command().print_help()?;
@@ -570,6 +594,9 @@ mod tests {
         assert!(agent.get_subcommands().any(|c| c.get_name() == "show"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "config"));
         assert!(agent.get_subcommands().any(|c| c.get_name() == "memory"));
+        assert!(agent
+            .get_subcommands()
+            .any(|c| c.get_name() == "governance-vectors"));
     }
 
     #[test]
@@ -634,6 +661,19 @@ mod tests {
             "hekma", "agent", "memory", "attach", "demo", "--kind", "bogus"
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn test_agent_governance_vectors_parse() {
+        // Story 19-1: `governance-vectors` and `governance-vectors --json`
+        // parse; the verb takes no positional arguments.
+        assert!(Cli::try_parse_from(["hekma", "agent", "governance-vectors"]).is_ok());
+        assert!(Cli::try_parse_from(["hekma", "agent", "governance-vectors", "--json"]).is_ok());
+        // No positional arguments exist.
+        assert!(
+            Cli::try_parse_from(["hekma", "agent", "governance-vectors", "extra"]).is_err(),
+            "governance-vectors takes no positional argument"
+        );
     }
 
     #[test]

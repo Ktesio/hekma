@@ -219,7 +219,13 @@ class ReleaseDocsTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("needs: [fmt, clippy, test, build, docs, boundary, semver]", ci)
+        # The coverage job gates on EVERY primary gate — including the
+        # governance-vectors job story 19-1 added, so a vectors artifact that
+        # fails Host-side verification blocks coverage too.
+        self.assertIn(
+            "needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]",
+            ci,
+        )
         # Wedge forensics (2026-10-17, #292): the coverage job is pinned to
         # ubuntu-26.04 — the same class-2 runner-freeze mitigation as the
         # test matrix's linux leg. Both
@@ -314,8 +320,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # gate — is caught. The old `--workspace --fail-under 95` command must be
         # GONE (tarpaulin's own per-run fail-under is replaced by the merged gate).
         self.assertNotIn("--workspace --fail-under 95", ci)
-        # The per-crate tarpaulin invocation shape (llvm + skip-clean + timeout 180 +
-        # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
+        # The per-crate tarpaulin invocation shape (llvm + skip-clean + the
+        # per-crate --timeout budget + verbose preserved; -p "$pkg" + Lcov out
+        # into cov/$pkg replaces --workspace).
         # Whitespace-normalized (line-continuation backslashes and indentation
         # collapsed): the 2026-09-28 bounded retry loop (#239) wraps the
         # invocation in an `if`, which necessarily re-indents the continuation
@@ -323,12 +330,24 @@ class ReleaseDocsTests(unittest.TestCase):
         # not the column it starts at.
         ci_flat = " ".join(ci.replace("\\\n", " ").split())
         self.assertIn(
-            "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
+            'cargo +stable tarpaulin --engine llvm --skip-clean --timeout "$tarp_timeout" '
             "--verbose --exclude-files 'crates/hekma-conformance/src/bin/*' "
             "--exclude-files 'crates/hekma-engine/examples/*' "
             '-p "$pkg" --out Lcov --output-dir "cov/$pkg"',
             ci_flat,
         )
+        # Per-crate tarpaulin budget (#334): --timeout is tarpaulin's
+        # PER-TEST-BINARY cap, and the engine's wall-clock-bound integration
+        # suites (exit_codes/drain/liveness/readiness, serial under
+        # RUST_TEST_THREADS=1) outgrew the flat 180 s — killed at exactly
+        # 180 s mid-suite, deterministically, on 8/8 attempts across two
+        # stacked PRs. The case arm is the budget: the engine gets 420 s,
+        # every other crate keeps 180 s. Pin BOTH arms so a future edit
+        # cannot silently drop the engine budget (back to the deterministic
+        # overrun) or inflate the default for every crate.
+        self.assertIn('case "$pkg" in', ci)
+        self.assertIn("hekma-engine) tarp_timeout=420 ;;", ci)
+        self.assertIn("*) tarp_timeout=180 ;;", ci)
         # The exact six workspace crates, lightest → heaviest with hekma-engine
         # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers
         # logged). Story 17-2 added hekma-host before the engines.
@@ -363,8 +382,10 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         # --engine llvm: parity with the local macOS gate (ptrace is unavailable
         # there). llvm-tools-preview supplies the llvm-profdata/llvm-cov it shells
-        # out to. --timeout 180 lifts tarpaulin's 60 s per-test default so a heavy
-        # survival test under instrumentation is not killed spuriously.
+        # out to. --timeout "$tarp_timeout" lifts tarpaulin's 60 s per-test-binary
+        # default (per-crate budget: 180 s, 420 s for the engine — see the
+        # case-arm pin above) so a heavy survival suite under instrumentation is
+        # not killed spuriously.
         self.assertIn("rustup component add llvm-tools-preview", ci)
         # The coverage TIMEOUT fix (AI-23): a DEDICATED cache key so the instrumented
         # target — whose fingerprints differ from the other jobs' normal-profile
@@ -888,6 +909,61 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("test -x target/release/examples/embedding-quickstart", build_job)
         self.assertIn("target/release/examples/embedding-quickstart", build_job)
         self.assertTrue(example.is_file(), "the quickstart example must exist")
+
+    def test_ci_stand_in_host_lists_every_all_covers_tag(self) -> None:
+        # Story 19-1 review round 1: the governance-vectors job's stand-in-Host
+        # step re-lists the D5 rule tags as a python literal — a NINTH tag added
+        # to the Rust `ALL_COVERS` const would silently miss it and the CI
+        # check would under-verify. This pin greps the const from the engine
+        # source, resolves each variant to its exact kebab-case wire form via
+        # the `as_str` mapping (so the case conversion can never drift), and
+        # asserts every wire string appears in the ci.yml literal: the two
+        # lists cannot diverge.
+        governance_src = (
+            release_docs.ROOT
+            / "crates"
+            / "hekma-engine"
+            / "src"
+            / "domain"
+            / "governance.rs"
+        ).read_text(encoding="utf-8")
+
+        import re as _re
+
+        # The `ALL_COVERS` const's variant list …
+        const_body = governance_src.split("pub const ALL_COVERS", 1)[1].split("];", 1)[0]
+        variants = _re.findall(r"CoverTag::(\w+)", const_body)
+        self.assertTrue(variants, "the ALL_COVERS const must list CoverTag variants")
+        # … and the `as_str` mapping variant → exact wire string (single source
+        # of the kebab-case form; the test re-derives, never re-states it).
+        as_str_body = governance_src.split("pub fn as_str(&self)", 1)[1].split("}\n}", 1)[0]
+        wire_by_variant = dict(_re.findall(r"CoverTag::(\w+) => \"([\w-]+)\"", as_str_body))
+        missing_mappings = [v for v in variants if v not in wire_by_variant]
+        self.assertEqual(
+            [],
+            missing_mappings,
+            "every ALL_COVERS variant needs an as_str wire form",
+        )
+        tags = [wire_by_variant[v] for v in variants]
+
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        job_start = ci.index("  governance-vectors:")
+        next_job = _re.search(r"\n  [A-Za-z_-]", ci[job_start + 1 :])
+        job_end = job_start + 1 + next_job.start() if next_job else len(ci)
+        job = ci[job_start:job_end]
+        for tag in tags:
+            self.assertIn(
+                f'"{tag}"',
+                job,
+                f"the stand-in-Host literal must list the `{tag}` rule "
+                "(keep ci.yml in lockstep with the Rust ALL_COVERS const)",
+            )
+        # The job's header sanity-checks stay present: a Host pins the
+        # schema version + vectors version.
+        self.assertIn('document["schema_version"]', job)
+        self.assertIn('document["vectors_version"]', job)
 
     def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
         # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets

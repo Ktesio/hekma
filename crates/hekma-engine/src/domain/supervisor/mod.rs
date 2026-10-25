@@ -49,7 +49,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hekma_adapter_api::{Capability, ConfigMapping, OsId, SupportLevel};
+use hekma_adapter_api::{
+    Capability, ConfigMapping, ExitClass, ExitCodeClasses, LivenessCheck, OsId, SupportLevel,
+};
 
 use crate::adapter::{self, ConfigApplyError, LaunchResolveError};
 use crate::backends;
@@ -61,14 +63,15 @@ use crate::ports::{
 };
 use crate::time::now_rfc3339;
 
-use super::budget::{BreachAction, BreachDecision, BreachScope, BudgetEvaluator};
+use super::budget::{BreachAction, BreachScope};
 use super::bus::{EngineEvent, EventBus};
 use super::config::{self, ConfigLayer};
-use super::cost::{CostEvaluator, EstimateLabel, Micros};
+use super::cost::{EstimateLabel, Micros};
 use super::error::EngineError;
 use super::event::{
     BreachDimension, BudgetBreachEvent, LogLine, LogStream, TransitionCause, TransitionEvent,
 };
+use super::governance;
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
@@ -77,7 +80,10 @@ use super::outbox::{
     OUTBOX_SCHEMA_VERSION,
 };
 use super::registry::Registry;
-use super::restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
+use super::restart::{
+    is_crash_loop, next_consecutive_failures, BackoffSchedule, RestartPolicy,
+    MAX_CONSECUTIVE_FAILURES, STABLE_RUN_WINDOW,
+};
 use super::transition::{next_state, LifecycleCommand};
 use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 
@@ -87,17 +93,74 @@ use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
 pub const DEFAULT_STOP_WINDOW: Duration = Duration::from_secs(30);
 
 /// How long to watch a freshly spawned process for an immediate failure before
-/// declaring it `running` (the readiness definition, `[ASSUMPTION]`).
+/// declaring it `running` (the startup SURVIVAL definition, `[ASSUMPTION]`).
 ///
-/// "Adapter ready" this story = "the process spawned and did not die during this
-/// short startup window". A process that exits (especially non-zero) within it is
-/// treated as a launch failure (AC2 "immediate non-zero exit during startup").
-/// Kept small so `start` stays snappy; the fake test agent's `--exit-fast` path
-/// exits well inside it.
-const READINESS_WINDOW: Duration = Duration::from_millis(300);
+/// Renamed from `READINESS_WINDOW` when real readiness probes arrived (Epic 18):
+/// "adapter ready" is now the DECLARED probe passing (or, with none, this
+/// legacy spawn-and-survive heuristic). The name keeps the two notions from
+/// blurring — this window is only "the process spawned and did not die during
+/// this short startup window". A process that exits (especially non-zero) within
+/// it is treated as a launch failure (AC2 "immediate non-zero exit during
+/// startup"). Kept small so `start` stays snappy; the fake test agent's
+/// `--exit-fast` path exits well inside it.
+const STARTUP_SURVIVAL_WINDOW: Duration = Duration::from_millis(300);
 
 /// How often the readiness watch polls the freshly spawned process.
 const READINESS_POLL: Duration = Duration::from_millis(10);
+
+/// The bound a STANDALONE cooperative pause/resume command (`kt agent pause` /
+/// `kt agent resume` on an adapter declaring the lifecycle pair) may run for
+/// before the engine KILLS it and rejects the transition (story 18-4). A bare
+/// verb should not hang a CLI for minutes; a drain's wait may legitimately
+/// span in-flight work, so the DRAIN bound governs the command there instead
+/// (the two-tier rule the spec fixes — two named constants, both documented).
+/// Engine-owned, beside the other cadence constants; pinned by unit test.
+pub(crate) const PAUSE_COMMAND_CAP: Duration = Duration::from_secs(30);
+
+/// The DRAIN composite's DEFAULT bound (story 18-4): the middle tier of the
+/// three-tier rule (CLI `--timeout-ms` > `[drain].timeout_ms` > this default),
+/// applied when an adapter declares a `[lifecycle.pause]` command but NO
+/// `[drain]` section — the verb must work, so the composite needs a bound.
+/// Engine-owned, beside the other cadence constants; pinned by unit test.
+pub(crate) const DRAIN_DEFAULT_BOUND: Duration = Duration::from_secs(30);
+
+/// How RECENT an idle file's mtime must be for the drain composite to read it
+/// as the idle signal (story 18-4): the small engine-owned freshness slack the
+/// spec sanctions (freshness, not existence — a file touched once at startup
+/// must not read idle forever, and an absent file reads NOT idle, 18-2's
+/// absent ≡ stale precedent). The slack is what makes a one-shot touch the
+/// agent performs WHEN ITS WORK DRAINS observable: the wait's poll sees the
+/// fresh mtime within this window of the touch. Shared with
+/// `probe_kinds::file_fresh`, the same evaluator readiness/liveness use.
+///
+/// Review round 1 (C5): the plain-ms constant is the one the wait loop
+/// actually passes to `file_fresh` (whose parameter is `u64`), and the
+/// `Duration` is BUILT from it — the old conversion
+/// (`try_from(..).unwrap_or(.. as u64)`) was self-defeating (its fallback was
+/// exactly the truncating cast `try_from` rejects), so the number now has ONE
+/// spelling.
+pub(crate) const DRAIN_IDLE_FRESH_SLACK_MS: u64 = 2_000;
+
+/// How long the bounded lifecycle-command runner waits for a KILLED child's
+/// reap before proceeding anyway (story 18-4 review round 1, A5): a plain
+/// `wait()` after the kill can block forever on an unkillable (D-state)
+/// child, wedging the verb — and the supervisor mutex with it — past its
+/// bound. At this bound the runner emits ONE diagnostic naming the stuck
+/// child and proceeds; never blocks past it. Engine-owned, beside the other
+/// cadence constants; pinned by unit test.
+pub(crate) const KILL_REAP_BOUND: Duration = Duration::from_secs(5);
+
+/// How often the bounded pause-command runner polls the child (story 18-4):
+/// both the standalone cap and the drain-composite deadline are DEADLINE-based
+/// (an `Instant` bound, never a measured-duration comparison), so this interval
+/// only bounds detection latency and kill overshoot.
+pub(crate) const BOUNDED_COMMAND_POLL: Duration = Duration::from_millis(20);
+
+/// How often the drain composite's bounded wait polls its conditions (story
+/// 18-4): the pause command's completion and the idle file's freshness. Like
+/// [`BOUNDED_COMMAND_POLL`] it only bounds latency — the composite's bound is
+/// a single `Instant` deadline fixed at the drain's start.
+pub(crate) const DRAIN_WAIT_POLL: Duration = Duration::from_millis(25);
 
 /// AI-12: how many CONSECUTIVE `backend.poll` errors on one held handle the
 /// crash reaper tolerates as "transient, treat as still-alive" before it stops
@@ -658,6 +721,78 @@ struct Supervised {
     /// Dropping the `Supervised` drops the connection, which closes the
     /// child's stdin — the connection teardown on stop/drop/terminal-settle.
     acp: Option<crate::acp::AcpConnection>,
+    /// The declared `[liveness]` check (story 18-2), RESOLVED at spawn —
+    /// `None` for a manifest without the section (process liveness only,
+    /// byte-identical) or an adopted instance whose adapter manifest could
+    /// not be resolved (ONE honest degradation diagnostic at adoption, then
+    /// this stays `None` — the reaper skips it silently thereafter, exactly
+    /// like a manifest that declares no check). The reaper evaluates it ONE
+    /// attempt per tick while the persisted state is EXACTLY `running`.
+    liveness_check: Option<LivenessCheck>,
+    /// The OPEN liveness failure window (story 18-2): `Some(elapsed)` while
+    /// the declared signal has been failing CONTINUOUSLY (stamped at the
+    /// first failing attempt, `None` otherwise). The unifying semantic —
+    /// failing continuously for `max_age_ms` fails the instance — reads this
+    /// against `liveness_check`'s window; a Fresh attempt clears it (one
+    /// recovery diagnostic when it was open). Lives on `Supervised`, so it
+    /// RESETS with the Run (restart = fresh window) and PAUSES with the
+    /// instance — and a RESUME also CLEARS it (review round 1, P1): the
+    /// elapsed time measured BEFORE the pause is not evidence about a
+    /// different process instance (resume may land a fresh or resumed
+    /// process), so the clock restarts at resume — the failure cannot land
+    /// before a full fresh window has elapsed after the instance is running
+    /// again.
+    liveness_failing_since: Option<std::time::Instant>,
+    /// How many times this Run's liveness window has REOPENED after a
+    /// recovery (review round 1, P6): `0` for a fresh spawn, reset per Run,
+    /// fresh (0) after adoption. Bounds the first-failure/recovery diagnostic
+    /// PAIR spam for a flapping signal: the first 3 reopen cycles emit their
+    /// pairs; from the 4th window-open onward the reaper stays silent except
+    /// for ONE suppression note at reopen #3 (the signal is flapping — the
+    /// operator was told three times; persistence, not chatter, is the
+    /// contract). The window itself NEVER stops expiring: a suppressed
+    /// diagnosis still fails the instance when the window crosses.
+    liveness_reopens: u32,
+    /// The declared `[exit_codes]` classes (story 18-3), RESOLVED at
+    /// spawn/adoption — `None` for a manifest without the section (no
+    /// classification: every unrequested exit is a crash, byte-identical)
+    /// or an adopted instance whose adapter manifest could not be resolved
+    /// (ONE honest degradation diagnostic at adoption, then this stays
+    /// `None` — the reaper classifies nothing, exactly like a manifest that
+    /// declares no classes). The crash classifier consults it ONLY for a
+    /// `CrashInput::Exited(Some(code))` out of `running` (launch-phase
+    /// exits and signal exits never classify).
+    exit_codes: Option<ExitCodeClasses>,
+    /// Story 18-3: when THIS engine last saw the instance ENTER `running` —
+    /// the stability anchor. Stamped at EVERY transition INTO `running`
+    /// (the `starting → running` commit, every `paused → running` resume —
+    /// a pause-interval never counts toward stability; the resumed run
+    /// re-proves it) and at ADOPTION (an adopted instance's pre-adoption
+    /// history is unknown, so the anchor is FRESH: a reset requires a full
+    /// window of running under THIS engine's watch first — a long-watched
+    /// adopted run resets exactly like a spawned one). A crash classification
+    /// reads
+    /// it THROUGH THE STATE GATE: only a crash out of EXACTLY `running`
+    /// measures `running_since.elapsed()`; a crash out of any other state
+    /// (e.g. `paused`) passes `None` — never a reset. Lives on
+    /// `Supervised`, so a restart re-anchors it fresh with the new Run.
+    running_since: std::time::Instant,
+    /// Story 18-4: whether THIS Run is currently cooperatively paused — the
+    /// pause was (or is to be) delivered by RUNNING the manifest's declared
+    /// `[lifecycle.pause]` COMMAND, not by an OS signal. The stop ladder
+    /// consults it (a cooperatively paused instance must not receive the OS
+    /// resume signal — there is no signal suspension to undo; the command
+    /// owns the suspension), the enforcement release pass consults it (its
+    /// Cooperative arm emits an honest note instead of a signal), and
+    /// `note_committed_resume_edge` clears it on EVERY committed
+    /// paused → running edge so the flag can never outlive its pause.
+    /// Initialized `false` at spawn, from `classify_pause_kind` at adoption
+    /// and stop-only re-acquire (a handle re-acquired while paused under a
+    /// command-declaring manifest resumes its cooperative posture honestly),
+    /// set `true` in the cooperative pause arm after its transition commits,
+    /// and never persisted (an engine restart re-derives it the same way the
+    /// adoption path does — cross-lifetime honesty per the 18-4 spec).
+    cooperatively_paused: bool,
 }
 
 /// A host-provided diagnostic sink (story 10-2): the writer every engine
@@ -858,6 +993,45 @@ pub struct Supervisor {
     /// handle's removal) clears the entry; a singleton error streak restarts
     /// from zero.
     poll_error_streaks: HashMap<InstanceName, u32>,
+    /// Story 18-3 — the stable-run window the counter reset reads: a run
+    /// that held `running` continuously for ≥ this resets the
+    /// consecutive-failure counter BEFORE the crash charges. PRODUCTION is
+    /// exactly [`STABLE_RUN_WINDOW`] (30 s, restart.rs — production-pinned
+    /// by unit test); tests scale it through this field the way
+    /// [`BackoffSchedule`] scales its base (the constant itself is never
+    /// weakened). Set at construction and via
+    /// [`Supervisor::override_stable_run_window`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface (that is deferred with a trigger, per the spec).
+    stable_run_window: Duration,
+    /// Story 18-4 — the STANDALONE pause-command cap: the wall-clock bound a
+    /// `[lifecycle.pause]` command gets when it runs OUTSIDE a drain (the
+    /// plain `pause` verb). PRODUCTION is exactly [`PAUSE_COMMAND_CAP`]
+    /// (30 s, pinned by unit test); tests scale it through this field the
+    /// way `stable_run_window` scales the window (the constant itself is
+    /// never weakened). INSIDE a drain the command shares the drain's own
+    /// bound instead (the three-tier bound, `drain.rs`), so this cap never
+    /// applies there. Set at construction and via
+    /// [`Supervisor::override_pause_command_cap`] — the open-time seam
+    /// `EngineOptions` threads for the integration tests; NOT an operator
+    /// config surface.
+    pause_command_cap: Duration,
+    /// Story 18-3 — the per-instance RESTART-REQUESTED streak: how many
+    /// restart-requested relaunches THIS supervisor has scheduled for the
+    /// instance since its last fresh start / adoption / clean exit. It
+    /// grows the restart-requested plan's backoff DELAY (delay index =
+    /// the UNCHARGED counter + this streak + 1) so a restart-requested loop
+    /// still backs off to its cap while the persisted counter stays
+    /// byte-unchanged (the charging write must never see a bigger number).
+    /// IN-MEMORY ONLY — an engine restart forgets it, honestly: the next
+    /// relaunch waits the base again (the crash counter, which PERSISTS,
+    /// is the operator's durable signal). Cleared at the fresh-start
+    /// insert, the adoption insert, a clean exit, an operator stop, a
+    /// dropped/terminal record, and EVERY charged crash (`plan_restart`
+    /// drops it for all its outcomes — a stable-window reset forgives the
+    /// pacing history along with the chain, 18-3 review); mirrors
+    /// `poll_error_streaks`' per-instance shape.
+    requested_restart_streaks: HashMap<InstanceName, u32>,
     /// AI-12 (loop 1): the LAST poll error's text per handle (truncated at
     /// [`POLL_ERROR_CAUSE_MAX_CHARS`]), so the persistent-poll-failure crash
     /// cause can carry the actual why — not just the bare count. Updated on
@@ -903,6 +1077,54 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     compensation_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 19-1 review round 1 — cfg(test) FAULT-INJECTION SEAM at the
+    /// enforcement totals reads: an instance name listed here makes EVERY
+    /// totals/cost read in [`Supervisor::enforce_budget`] fail with an
+    /// injected error, driving the degraded-read diagnostic (surfaced, not
+    /// silent) deterministically without staging a real store outage. Same
+    /// placement rationale as `compensation_fault_names` above. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    totals_read_fault_names: std::collections::HashSet<InstanceName>,
+    /// Liveness (story 18-2, review round 1 P2) — PER-EPISODE bookkeeping for
+    /// the phase-4 registry lookup: an instance whose `lookup` ERRORS once
+    /// gets its ONE diagnostic ("checks paused until reads recover"); every
+    /// further Err for the SAME name stays silent (no per-tick spam while the
+    /// store is down); a lookup that returns Ok clears the name (a RECOVERED
+    /// read resumes checks — and their diagnostics — silently). "Episode" =
+    /// this in-memory supervisor's lifetime (the same lifetime as the
+    /// in-memory handle map; a new engine re-arms the diagnostic, which is
+    /// correct — a new operator session deserves to hear about a degraded
+    /// read again).
+    liveness_lookup_err_names: std::collections::HashSet<InstanceName>,
+    /// cfg(test) FAULT-INJECTION SEAM (review round 1 P2's test driver): an
+    /// instance name listed here makes the phase-4 liveness lookup behave
+    /// EXACTLY like a store-read failure (the ONE diagnostic + the silent
+    /// skip), deterministically, without staging a real store outage. Same
+    /// placement rationale as `totals_read_fault_names`. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    liveness_lookup_fault_names: std::collections::HashSet<InstanceName>,
+    /// cfg(test) FAULT-INJECTION SEAM (review round 1 P3's test driver): an
+    /// instance name listed here makes [`Self::transition_if_prior`] refuse
+    /// with the typed `StateConflict` — the concurrent-transition race — so
+    /// the reaper's skip arm (ONE diagnostic, no restart plan) runs
+    /// deterministically in-process. Same placement rationale. Never compiled
+    /// outside the lib's own test builds.
+    #[cfg(test)]
+    liveness_commit_fault_names: std::collections::HashSet<InstanceName>,
+    /// Readiness probes (Epic 18) — restart plans QUEUED by the start path when
+    /// the declared probe observes the process EXIT mid-wait. The start path
+    /// has already driven the `starting → failed` crash transition, but it
+    /// cannot time a backoff (it must return to its caller); so the plan rides
+    /// here and the VERY NEXT [`Supervisor::poll_once`] drains it (top of the
+    /// pass, before crash polling), letting the engine cadence execute the
+    /// restart with its normal backoff timing. Empty on every constructor.
+    /// A `Mutex` (not a plain `Vec`) because the queueing happens on the
+    /// start path's `&self` — the same interior-mutability reason as
+    /// `outbox_next_seq`'s atomic; a poisoned lock is RECOVERED (the guarded
+    /// Vec is always valid — queued plans must survive a panicking peer).
+    pending_restarts: std::sync::Mutex<Vec<RestartPlan>>,
 }
 
 impl Supervisor {
@@ -933,6 +1155,9 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -941,6 +1166,14 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -970,6 +1203,9 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -978,6 +1214,14 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1007,6 +1251,9 @@ impl Supervisor {
             agent_log_truncate_deferred: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
+            stable_run_window: STABLE_RUN_WINDOW,
+            pause_command_cap: PAUSE_COMMAND_CAP,
+            requested_restart_streaks: HashMap::new(),
             poll_last_errors: HashMap::new(),
             consecutive_environmental_ticks: 0,
             #[cfg(test)]
@@ -1015,6 +1262,14 @@ impl Supervisor {
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             compensation_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            totals_read_fault_names: std::collections::HashSet::new(),
+            liveness_lookup_err_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_lookup_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            liveness_commit_fault_names: std::collections::HashSet::new(),
+            pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1106,6 +1361,66 @@ impl Supervisor {
         self.child_env_allowlist = child_env_allowlist;
         self.log_capture_mode = log_capture_mode;
         Ok(())
+    }
+
+    /// Override the stable-run window (story 18-3's TEST SCALING SEAM) — the
+    /// `pub(crate)` twin of [`BackoffSchedule::with_base_and_cap`]'s
+    /// injection: the PRODUCTION window is exactly [`STABLE_RUN_WINDOW`]
+    /// (30 s, pinned by unit test) and no production caller ever calls this;
+    /// the engine's open path threads [`EngineOptions`]' doc-hidden
+    /// override through so the integration tests can drive the reset
+    /// semantics in milliseconds. NOT an operator config surface (that is
+    /// deferred with a trigger, per the 18-3 spec). Like the serve options,
+    /// open-time only: refused once supervision has begun. A ZERO window is
+    /// IGNORED (18-3 review): every run is trivially "stable" against it —
+    /// the reset would fire on every crash and the counter could never
+    /// climb — so a zero lands as today's production window instead of
+    /// silently breaking the arithmetic.
+    pub(crate) fn override_stable_run_window(&mut self, window: Duration) {
+        debug_assert!(
+            self.running.is_empty(),
+            "the stable-run window is open-time only"
+        );
+        if window.is_zero() {
+            // Surfaced, not silent (AI-18): keep the production window and
+            // say why on the diagnostic channel.
+            self.emit_diagnostic(
+                "ignoring a zero stable-run window override — every run would count as \
+                 stable and the consecutive-failure counter could never charge; keeping \
+                 the production window",
+            );
+            return;
+        }
+        self.stable_run_window = window;
+    }
+
+    /// Override the STANDALONE pause-command cap (story 18-4's TEST SCALING
+    /// SEAM) — the `pub(crate)` twin of
+    /// [`Supervisor::override_stable_run_window`]: the PRODUCTION cap is
+    /// exactly [`PAUSE_COMMAND_CAP`] (30 s, pinned by unit test) and no
+    /// production caller ever calls this; the engine's open path threads
+    /// [`EngineOptions`]' doc-hidden override through so the integration
+    /// tests can drive the standalone-cap overrun refusal in milliseconds.
+    /// NOT an operator config surface. Like the stable-run window, open-time
+    /// only: refused once supervision has begun. A ZERO cap is IGNORED
+    /// (surfaced, not silent, AI-18): a zero-duration bound would kill every
+    /// pause command before it could start (the bounded runner would time it
+    /// out at its first poll), refusing every pause a manifest declares —
+    /// so a zero lands as the production cap, with a diagnostic saying why.
+    pub(crate) fn override_pause_command_cap(&mut self, cap: Duration) {
+        debug_assert!(
+            self.running.is_empty(),
+            "the pause-command cap is open-time only"
+        );
+        if cap.is_zero() {
+            self.emit_diagnostic(
+                "ignoring a zero pause-command cap override — a zero bound would refuse \
+                 every declared pause command before it could start; keeping the \
+                 production cap",
+            );
+            return;
+        }
+        self.pause_command_cap = cap;
     }
 
     /// The engine's log-capture posture (story 17-4). `Copy` — a snapshot,
@@ -1521,6 +1836,50 @@ impl Supervisor {
         Ok(snapshot)
     }
 
+    /// The CONDITIONAL transition (story 18-2 review round 1, P3): the
+    /// state persist goes through the guarded
+    /// [`Registry::set_state_if_prior`] — it commits only when the persisted
+    /// state still equals `prior` — and ONLY a committed write records the
+    /// event (the durable log never leads a state that did not happen).
+    /// The `engine`-attributed [`LogCapture`] is supplied EXPLICITLY (the
+    /// same reason as [`Self::transition_with_log_capture`]: the liveness
+    /// expiry removes the handle from `self.running` BEFORE committing, so
+    /// the lookup form would find nothing).
+    ///
+    /// The liveness expiry uses this instead of [`Self::transition`] to close
+    /// the race the review found: between the phase-4 lookup (which read
+    /// `running`) and the failure commit, ANOTHER command (an explicit stop,
+    /// a pause, a concurrent engine) may have legitimately moved the state.
+    /// A refusal surfaces typed (`Err`) and the CALLER (the reaper) emits its
+    /// ONE skip-diagnostic and declines the failure + the restart plan — the
+    /// state moved, so someone else is driving this instance's lifecycle.
+    fn transition_if_prior(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        prior: LifecycleState,
+        new: LifecycleState,
+        cause: TransitionCause,
+        log_capture: Option<LogCapture>,
+    ) -> Result<TransitionEvent, EngineError> {
+        // cfg(test) fault seam (P3's test driver): the typed refusal the
+        // concurrent-transition race produces, injected deterministically.
+        #[cfg(test)]
+        if self.liveness_commit_fault_names.contains(name) {
+            return Err(EngineError::Store(
+                crate::ports::StoreError::StateConflict {
+                    name: name.as_str().to_string(),
+                    expected: prior.as_str().to_string(),
+                    found: LifecycleState::Paused.as_str().to_string(),
+                },
+            ));
+        }
+        registry
+            .set_state_if_prior(name, prior, new)
+            .map_err(registry_to_engine)?;
+        self.record_transition(registry, name, prior, new, cause, log_capture)
+    }
+
     /// Everything a transition records AFTER the state persist: the durable
     /// `instance.log` append, the bus publish, and the attributed-capture
     /// engine line. Shared by [`Supervisor::transition_with_log_capture`] and
@@ -1662,18 +2021,80 @@ impl Supervisor {
         name: &InstanceName,
         detail: String,
     ) -> EngineError {
+        self.fail_launch_with_cause(
+            registry,
+            name,
+            TransitionCause::launch_error(detail.clone()),
+            detail,
+        )
+    }
+
+    /// Land a launch failure in `failed` with an EXPLICIT cause + detail.
+    ///
+    /// The generalization of [`Self::fail_launch_detail`]: the readiness-probe
+    /// timeout (Epic 18) fails a launch whose process is ALIVE — the cause is
+    /// NOT `launch-error` but [`TransitionCause::ReadinessTimeout`], so the
+    /// lifecycle record distinguishes "the launch itself failed" from "the
+    /// launch succeeded and the adapter never became ready". Same shape as the
+    /// sibling: transition `starting → failed`, return
+    /// [`EngineError::LaunchFailed`]; a store error on the transition is
+    /// surfaced instead (it is the more fundamental problem).
+    fn fail_launch_with_cause(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+        detail: String,
+    ) -> EngineError {
         if let Err(e) = self.transition(
             registry,
             name,
             LifecycleState::Starting,
             LifecycleState::Failed,
-            TransitionCause::launch_error(detail.clone()),
+            cause,
         ) {
             return e;
         }
         EngineError::LaunchFailed {
             name: name.as_str().to_string(),
             detail,
+        }
+    }
+
+    /// Queue a restart plan the NEXT reaper pass should execute (Epic 18).
+    ///
+    /// The start path discovers an exit during its readiness-probe wait but
+    /// cannot time the backoff itself (it must return to its caller); it lands
+    /// the crash transition inline, queues the plan here, and the next
+    /// [`Supervisor::poll_once`] drains it at the TOP of the pass so the engine
+    /// cadence times the backoff exactly as it does for reaper-detected
+    /// crashes. FIFO (a start enqueues at most one).
+    ///
+    /// Poison recovery, at its HONEST scope (review round 1): the mutex guard
+    /// protects only the push/take itself, so recovery is sound exactly there
+    /// — a peer panicking BETWEEN taking the lock and finishing its Vec
+    /// mutation leaves the Vec valid (Vec mutation is all-or-nothing at the
+    /// panic boundary for push/`mem::take`), and a queued restart survives a
+    /// panicking peer rather than vanishing. What recovery does NOT cover: a
+    /// plan DRAINED but never executed is gone — if the engine runtime shuts
+    /// down after `drain_pending_restarts` and before the pass executes the
+    /// plans, they are lost (the start path's own queued-restart diagnostic
+    /// names this engine-cadence caveat to the operator). The defensive arms
+    /// remain because the guarantee they buy is real; they are not a promise
+    /// that queued restarts survive runtime death.
+    pub(crate) fn queue_pending_restart(&self, plan: RestartPlan) {
+        match self.pending_restarts.lock() {
+            Ok(mut queue) => queue.push(plan),
+            Err(poisoned) => poisoned.into_inner().push(plan),
+        }
+    }
+
+    /// Take every queued restart plan (the reaper pass's first act). Same
+    /// poison recovery as [`Self::queue_pending_restart`].
+    pub(crate) fn drain_pending_restarts(&self) -> Vec<RestartPlan> {
+        match self.pending_restarts.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(poisoned) => std::mem::take(&mut poisoned.into_inner()),
         }
     }
 }
@@ -1825,6 +2246,71 @@ fn cause_suffix(cause: &TransitionCause) -> String {
         TransitionCause::BudgetExceeded {
             scope, dimension, ..
         } => format!(" (breach: {scope} {dimension})"),
+        // Readiness timeout (Epic 18): spell the WIRE TAG + the honest wait, same
+        // greppability rule as `detached-resumed` above — the probe description
+        // itself is in the cause payload / `show` detail; the suffix keeps the line
+        // one line.
+        TransitionCause::ReadinessTimeout { waited_ms, .. } => {
+            format!(" (readiness-timeout: waited {waited_ms}ms)")
+        }
+        // Unresponsive (Epic 18): spell the WIRE TAG + the check and its
+        // failing streak — the transition's whole WHY in one greppable line
+        // (same rule as `readiness-timeout` above). The check description is
+        // also in the cause payload / `show` detail; the suffix names both
+        // numbers so an operator scanning `instance.log` sees the window that
+        // was crossed without opening anything. When the cause carries the
+        // optional expiry-verdict `detail` (18-2 review round 1 — e.g. the
+        // heartbeat file's pre-existing staleness at first observation), it
+        // appends after the streak so the verdict rides the same line.
+        TransitionCause::Unresponsive {
+            check,
+            failing_for_ms,
+            detail,
+        } => match detail {
+            Some(detail) => {
+                format!(" (unresponsive: {check}, failing for {failing_for_ms}ms — {detail})")
+            }
+            None => format!(" (unresponsive: {check}, failing for {failing_for_ms}ms)"),
+        },
+        // Restart-requested (story 18-3): spell the WIRE TAG + the code — same
+        // greppability rule as `detached-resumed`/`unresponsive` above. The
+        // reaper ALWAYS records the declared-class detail (plus the
+        // requested-recycle depth, or the `never`-policy verdict — 18-3
+        // review), so it always appends; the bare-code arm renders only for
+        // detail-less hand-built events.
+        TransitionCause::RestartRequested { code, detail } => match detail {
+            Some(detail) => format!(" (restart-requested: exit code {code} — {detail})"),
+            None => format!(" (restart-requested: exit code {code})"),
+        },
+        // Clean exit (story 18-3): the requested-stop shape with the declared
+        // code named — the lifecycle log records WHY the instance went
+        // `stopped` without claiming an operator stop.
+        TransitionCause::CleanExit { code } => format!(" (clean-exit: exit code {code})"),
+        // Cooperative pause/resume (story 18-4): spell the WIRE TAG + the
+        // rendered command — same greppability rule as `detached-resumed`
+        // above. The command is what the engine actually executed, so the
+        // lifecycle line names it (the cooperative cause IS the honesty that
+        // this was a command-driven posture change, never an OS suspension).
+        TransitionCause::PauseCooperative { command } => {
+            format!(" (pause-cooperative: {command})")
+        }
+        TransitionCause::ResumeCooperative { command } => {
+            format!(" (resume-cooperative: {command})")
+        }
+        // Drain stopped (story 18-4): the wire tag + the durable OUTCOME —
+        // completed (and how long the wait took) or timed out (and that the
+        // stop still happened). One greppable line, same rule as the
+        // neighbors above.
+        TransitionCause::DrainStopped {
+            completed,
+            waited_ms,
+        } => {
+            if *completed {
+                format!(" (drain-stopped: completed in {waited_ms}ms)")
+            } else {
+                format!(" (drain-stopped: timed out after {waited_ms}ms; stopped anyway)")
+            }
+        }
     }
 }
 
@@ -2048,8 +2534,14 @@ fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> Engi
 mod tests;
 
 // Family modules — story 13-3 (ratified Option B): pure impl-block moves.
+/// The DRAIN composite (story 18-4): `Supervisor::drain` — pause-command →
+/// idle-wait → bounded stop — with its bounded-command runner, idle-freshness
+/// probe, and the pure deadline decision.
+mod drain;
 mod interaction;
 mod lifecycle;
+
+pub use drain::DrainOutcome;
 mod reaper;
 mod spawn;
 mod usage;

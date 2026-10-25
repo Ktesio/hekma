@@ -98,14 +98,69 @@ pub struct InstanceStatus {
     pub failed_cause: Option<String>,
 }
 
+/// The `drain` verb's report (story 18-4): the STOPPED instance plus the
+/// composite's durable [`DrainOutcome`]. Both outcomes — completed and
+/// timed-out — are a SUCCESS at the type level (the drain's last step is
+/// unconditional; a timed-out drain still stopped the agent honestly), so
+/// the outcome fields — not the `Result` — carry the wait's truth, and the
+/// caller surfaces a timed-out drain as a note, never an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainReport {
+    /// The instance in its terminal `stopped` state (with the drain's
+    /// durable cause on its last transition edge).
+    pub instance: AgentInstance,
+    /// What the bounded wait actually did.
+    pub outcome: crate::domain::DrainOutcome,
+}
+
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
-/// for the failure-bearing causes (a launch error, or a crash), or `None` for a
-/// cause that does not describe a failure.
+/// for the failure-bearing causes (a launch error, a crash — the 18-3 charged
+/// detail may also carry the stable-window reset naming — a readiness-probe
+/// timeout — the timeout names the probe + the honest wait — an unresponsive
+/// declared liveness check — naming the check + its failing streak — or a
+/// declared restart-requested exit — naming the code + the recycle verdict), or
+/// `None` for a cause that does not describe a failure.
 fn failed_cause_detail(cause: &TransitionCause) -> Option<String> {
     match cause {
         TransitionCause::LaunchError { detail } => Some(detail.clone()),
         TransitionCause::Crashed { detail } => Some(detail.clone()),
+        // The readiness gate never opened: name the probe + how long it was
+        // honestly waited, so `show` explains the failed start without a log
+        // dig.
+        TransitionCause::ReadinessTimeout { probe, waited_ms } => {
+            Some(format!("{probe} did not pass within {waited_ms}ms"))
+        }
+        // The declared signal died: name the check + how long it had been
+        // failing, so `show` explains the unresponsive failure the same way
+        // (story 18-2 — no new verb, the same fallback shape). When the
+        // reaper recorded expiry-verdict detail (18-2 review round 1 — e.g.
+        // the heartbeat file's pre-existing staleness at first observation),
+        // it rides along here so `show` carries the whole verdict, not just
+        // the streak.
+        TransitionCause::Unresponsive {
+            check,
+            failing_for_ms,
+            detail,
+        } => Some(match detail {
+            Some(detail) => format!("{check} failing for {failing_for_ms}ms ({detail})"),
+            None => format!("{check} failing for {failing_for_ms}ms"),
+        }),
+        // The agent asked for a relaunch on a declared code (story 18-3):
+        // name the code + the verdict so `show` explains the `failed`
+        // landing without a log dig. The reaper ALWAYS records a detail for
+        // this cause — the declared class plus the requested-recycle depth
+        // (18-3 review: the pacing is surfaced), or the `never`-policy
+        // verdict when it outranked the ask — so the bare-class fallback
+        // below renders only for detail-less, hand-built events. (The
+        // `CleanExit` twin never lands here — `stopped` is
+        // not a failure, so the fallback stays `None` for it.)
+        TransitionCause::RestartRequested { code, detail } => Some(match detail {
+            Some(detail) => format!("exit code {code} requested a restart ({detail})"),
+            None => {
+                format!("exit code {code} requested a restart (declared `restart_requested`)")
+            }
+        }),
         _ => None,
     }
 }
@@ -230,6 +285,35 @@ pub struct EngineOptions {
     /// and the crash-detection reaper start — identical semantics to
     /// [`Engine::open_with_diagnostics`]'s `sink` parameter.
     pub diagnostics: Option<DiagnosticSink>,
+    /// Story 18-3's TEST SCALING SEAM for the ENGINE-OWNED stable-run
+    /// window: `Some(window)` overrides [`STABLE_RUN_WINDOW`] (30 s) on this
+    /// engine's supervisor, so integration tests can drive the
+    /// resets-then-charges semantics in milliseconds — the same injection
+    /// posture [`BackoffSchedule::with_base_and_cap`] gives the in-module
+    /// tests, which production callers never take. `None` (the default) is
+    /// byte-identical production behavior. A `Some` ZERO is IGNORED (18-3
+    /// review): every run is trivially "stable" against a zero window, so
+    /// the supervisor keeps the production window and emits a diagnostic —
+    /// a zero can never silently disable the counter's charging. NOT an
+    /// operator config surface —
+    /// the tuning knob is deferred with a trigger (an operator asks to tune
+    /// it), per the 18-3 spec; this field stays `#[doc(hidden)]` so it
+    /// never reads as one.
+    #[doc(hidden)]
+    pub stable_run_window_override: Option<Duration>,
+    /// Story 18-4's TEST SCALING SEAM for the ENGINE-OWNED standalone
+    /// pause-command cap: `Some(cap)` overrides [`PAUSE_COMMAND_CAP`] (30 s)
+    /// on this engine's supervisor, so integration tests can drive the
+    /// cap-overrun rejection in milliseconds — the same injection posture as
+    /// [`EngineOptions::stable_run_window_override`], which production
+    /// callers never take. `None` (the default) is byte-identical production
+    /// behavior. A `Some` ZERO is IGNORED: a zero bound would kill every
+    /// declared pause command before it could start, refusing every declared
+    /// pause, so the supervisor keeps the production cap and emits a
+    /// diagnostic. NOT an operator config surface; this field stays
+    /// `#[doc(hidden)]` so it never reads as one.
+    #[doc(hidden)]
+    pub pause_command_cap_override: Option<Duration>,
 }
 
 impl std::fmt::Debug for EngineOptions {
@@ -241,6 +325,14 @@ impl std::fmt::Debug for EngineOptions {
             .field("child_env_allowlist", &self.child_env_allowlist)
             .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
+            .field(
+                "stable_run_window_override",
+                &self.stable_run_window_override,
+            )
+            .field(
+                "pause_command_cap_override",
+                &self.pause_command_cap_override,
+            )
             .finish()
     }
 }
@@ -378,6 +470,8 @@ impl Engine {
             child_env_allowlist,
             log_capture,
             diagnostics,
+            stable_run_window_override,
+            pause_command_cap_override,
         } = options;
         let registry = Registry::open(base)?;
         let rt = Runtime::new().map_err(|e| RegistryError::Io {
@@ -403,6 +497,17 @@ impl Engine {
             .map_err(|err| RegistryError::ServeOptionsOpenTimeOnly {
                 detail: err.to_string(),
             })?;
+        // Story 18-3: thread the TEST SCALING SEAM through — `None` (every
+        // production caller) leaves the pinned 30 s window untouched.
+        if let Some(window) = stable_run_window_override {
+            supervisor.override_stable_run_window(window);
+        }
+        // Story 18-4: thread the pause-command cap's TEST SCALING SEAM
+        // through the same way — `None` (every production caller) leaves the
+        // pinned 30 s standalone cap untouched.
+        if let Some(cap) = pause_command_cap_override {
+            supervisor.override_pause_command_cap(cap);
+        }
         // Story 17-4: continue the outbox seq sequence from whatever a prior
         // engine lifetime committed (BEFORE the registry moves under the
         // mutex, so the journal read and the counter write are serialized
@@ -1189,6 +1294,33 @@ impl Engine {
         .await
     }
 
+    /// The DRAIN composite (story 18-4): pause the running agent via its
+    /// adapter's declared `[lifecycle.pause]` COMMAND (never a signal,
+    /// OS-independent), wait — BOUNDED — for the declared idle signal, then
+    /// stop through the ordinary ladder. A drain that outlives its bound
+    /// STILL stops: both outcomes are a success at the type level (see
+    /// [`DrainReport`]), and `outcome.completed == false` is the caller's
+    /// honest timed-out signal. The bound is the three-tier rule: the
+    /// caller's `timeout_override` (validated `1..=600_000ms` — zero/past-ceiling
+    /// refuses with [`EngineError::DrainBoundInvalid`]), else the manifest
+    /// `[drain].timeout_ms`, else the engine's 30 s default.
+    pub async fn drain(
+        &self,
+        name: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, EngineError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor
+                .drain(&registry, &name, timeout_override)
+                .map(|(instance, outcome)| DrainReport { instance, outcome })
+        })
+        .await
+    }
+
     /// Send text input to a running Agent Instance's native input channel
     /// (story 4.1, FR-24, spine AD-12). Drives
     /// [`Supervisor::send_input`](crate::domain::Supervisor::send_input)'s
@@ -1929,6 +2061,20 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.resume(name))
     }
 
+    /// Blocking [`Engine::drain`] (story 18-4): the composite returns the
+    /// STOPPED instance plus the durable [`DrainOutcome`] — both outcomes
+    /// (completed and timed-out) are successes here; check
+    /// `report.outcome.completed` for the wait's truth.
+    pub fn drain(
+        &self,
+        name: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, EngineError> {
+        self.engine
+            .rt
+            .block_on(self.engine.drain(name, timeout_override))
+    }
+
     /// Blocking [`Engine::send_input`].
     pub fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
         self.engine.rt.block_on(self.engine.send_input(name, text))
@@ -2254,6 +2400,41 @@ mod tests {
             failed_cause_detail(&TransitionCause::AdapterReady),
             None,
             "an adapter-ready transition is not a failure cause"
+        );
+        // 18-3 review pin: a CLEAN EXIT is `stopped`, not `failed` — the
+        // fallback must never dress a declared clean finish up as a
+        // failure detail (a mutant that routes CleanExit into the
+        // failure-bearing arms would fail here).
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::CleanExit { code: 0 }),
+            None,
+            "a declared clean exit is not a failure cause"
+        );
+        // 18-4 review pin (B12): the cooperative lifecycle causes are state
+        // transitions, not failures — a paused/resumed instance and a
+        // drain's honest stopped outcome (COMPLETED or NOT — even the
+        // overrun edge is a bounded stop, not a crash) must all render
+        // detail-free here. A mutant that routes any of them into the
+        // failure-bearing arms would invent failure text for a pause.
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::pause_cooperative("the-pause --graceful")),
+            None,
+            "a cooperative pause is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::resume_cooperative("the-resume")),
+            None,
+            "a cooperative resume is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::drain_stopped(true, 5_000)),
+            None,
+            "a completed drain is not a failure cause"
+        );
+        assert_eq!(
+            failed_cause_detail(&TransitionCause::drain_stopped(false, 5_000)),
+            None,
+            "an overran drain is a bounded stop, not a failure cause"
         );
     }
 

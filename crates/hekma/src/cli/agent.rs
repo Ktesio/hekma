@@ -1407,6 +1407,49 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `hekma agent drain <name> [--timeout-ms <ms>]` — the DRAIN composite
+/// (story 18-4): pause the running agent via its adapter's declared
+/// `[lifecycle.pause]` COMMAND (cooperative — no OS signal), wait — bounded —
+/// for the declared idle signal, then stop it through the ordinary ladder.
+///
+/// BOTH outcomes exit `0` — the drain's last step (the stop) is unconditional,
+/// so a drain that outlives its bound still stopped the agent honestly. A
+/// completed drain prints the final state (`stopped`) to stdout; a TIMED-OUT
+/// drain additionally emits a VISIBLE note to stderr (`ui::note`, AD-12:
+/// results → stdout, notes → stderr) naming the honest `completed: false`
+/// outcome the engine recorded on the instance's final transition. The bound
+/// is the three-tier rule: `--timeout-ms` > the manifest's
+/// `[drain].timeout_ms` > the engine default (30s).
+pub fn drain(name: &str, timeout_ms: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_engine()?;
+    let bound = timeout_ms.map(Duration::from_millis);
+    match engine.blocking().drain(name, bound) {
+        Ok(report) => {
+            ui::success(format!(
+                "Drained Agent Instance {}",
+                ui::skill_name(report.instance.name.as_str())
+            ));
+            // Command result to stdout: the final Lifecycle State.
+            println!("{}", report.instance.state);
+            if !report.outcome.completed {
+                // Timed-out honesty (surfaced, not silent — AI-18): the
+                // bound burned before the declared wait completed. The
+                // instance WAS stopped anyway, and the engine recorded the
+                // outcome on its final transition — this note makes sure the
+                // operator sees it, never a silent success.
+                ui::note(format!(
+                    "the drain's bounded wait did NOT complete within {}ms (timed out); the \
+                     instance was stopped anyway and the outcome is recorded on its final \
+                     transition",
+                    report.outcome.waited_ms
+                ));
+            }
+            Ok(())
+        }
+        Err(err) => Err(map_engine_error(err)),
+    }
+}
+
 /// `hekma agent send <name> <text>` — send text input to a running Agent
 /// Instance's native input channel (story 4.1, FR-24).
 ///
@@ -2450,6 +2493,105 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
     }
 }
 
+/// `governance-vectors` (story 19-1, AD-7/FR-44): print the governance
+/// conformance vectors — the versioned, SHA-256-checksummed decision artifact
+/// a non-Rust Host pins to prove its external guard matches the engine's
+/// budget/cost rules. `--json` prints the EMBEDDED artifact bytes VERBATIM
+/// (byte-for-byte the released `vectors-v1.json`, the checksum pin target);
+/// the human path prints a summary read from those same embedded bytes.
+pub fn governance_vectors(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let embedded = hekma_engine::governance_vectors_json();
+    if json {
+        // No added newline: the canonical document already ends with exactly
+        // one, so stdout IS the pin target (a `sha256sum` of this output
+        // matches the published `.sha256`).
+        return write_stdout_exactly(embedded);
+    }
+    let summary =
+        governance_vectors_summary(embedded, &hekma_engine::governance_vectors_checksum())?;
+    write_stdout_exactly(&summary)
+}
+
+/// Write the exact bytes to stdout with the broken-pipe discipline (the
+/// `emit_log_lines` shape, 19-1 review round 1): `print!` PANICS on a write
+/// error and Rust ignores `SIGPIPE`, so `hekma agent governance-vectors
+/// --json | head` used to abort with exit `101` panic noise. A broken pipe
+/// (the consumer went away — `| head`, a closed terminal) is a clean
+/// `Ok(())` (exit 0); any OTHER write failure is a real [`AgentIo`]
+/// diagnostic.
+fn write_stdout_exactly(bytes: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(err) => classify_governance_stdout_write(err),
+    }
+}
+
+/// Map a governance-vectors stdout write failure to either a clean `Ok(())`
+/// (the consumer went away — `| head`, a closed terminal) or a real
+/// [`AgentIo`] diagnostic (a genuine I/O failure, e.g. a full disk when
+/// stdout is a file). Mirrors the log path's `classify_stdout_write`
+/// discipline; separate because the diagnostic names THIS surface.
+fn classify_governance_stdout_write(err: std::io::Error) -> Result<(), Box<dyn std::error::Error>> {
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        Ok(())
+    } else {
+        Err(AgentIo {
+            message: format!("Failed to write the governance vectors output to stdout: {err}"),
+        }
+        .into())
+    }
+}
+
+/// The `governance-vectors` human summary — artifact id, vectors + schema
+/// versions, SHA-256 checksum, and the case mix — read from the embedded
+/// bytes (the binary cannot drift from its artifact). Parsed TYPED against
+/// the engine's own schema types (19-1 review round 1: the untyped-Value
+/// shape printed `"(missing)"` / `schema v0` / `0 cases` for a
+/// parseable-but-wrong document — a fabricated summary). `Err` if the
+/// embedded document fails to parse or misses a field: a build defect,
+/// reported honestly (surfaced, not silent; the error names the defect)
+/// rather than printed as a fabricated summary.
+fn governance_vectors_summary(
+    embedded: &str,
+    checksum: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let document: hekma_engine::VectorsDocument = match serde_json::from_str(embedded) {
+        Ok(document) => document,
+        Err(err) => {
+            return Err(AgentIo {
+                message: format!(
+                    "The embedded governance vectors artifact does not match its schema: {err}. \
+                     The artifact in this build is corrupt — please report it."
+                ),
+            }
+            .into())
+        }
+    };
+    let decision_cases = document
+        .cases
+        .iter()
+        .filter(|case| matches!(case, hekma_engine::Case::Decision(_)))
+        .count();
+    let derivation_cases = document.cases.len() - decision_cases;
+    Ok(format!(
+        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation)\n  \
+         artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
+         guard on any upgrade\n",
+        ui::success_text(format!(
+            "governance conformance vectors {} — artifact `{}`, schema v{}",
+            document.vectors_version, document.artifact, document.schema_version
+        )),
+        document.cases.len(),
+        decision_cases,
+        derivation_cases,
+        hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    ))
+}
+
 /// Open the engine using the default (or env-overridden) state dir.
 ///
 /// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
@@ -2932,6 +3074,49 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
                  instance state is unchanged — only the inert pre-start config snapshot and \
                  log directories remain, and the next start rewrites them. Retry: \
                  hekma agent start {name}"
+            ),
+        }
+        .into(),
+        // Story 18-4: the adapter's declared lifecycle COMMAND failed (nonzero
+        // exit, spawn failure, or bound overrun) — the pause/resume was NOT
+        // applied and the instance's durable state is untouched (never a fake
+        // pause). The engine's message carries the rendered command line (no
+        // environment) + the failure mode; the remediation is the adapter's
+        // to fix, so point at its manifest.
+        EngineError::PauseCommandFailed {
+            name,
+            direction,
+            command,
+            detail,
+        } => crate::error::AgentPauseCommandFailed {
+            message: format!(
+                "the {direction} command for Agent Instance '{name}' failed — the lifecycle \
+                 change was NOT applied: {detail} (command: {command}). Fix the command in \
+                 the adapter's manifest and retry: hekma agent show {name}"
+            ),
+        }
+        .into(),
+        // Story 18-4: `drain` targeted an instance that is not `running` —
+        // the same invalid-state class as `send`'s gate (the instance exists,
+        // the timing is wrong). The engine's message names drain's own
+        // remediation (start it, or plain stop for a paused one).
+        EngineError::DrainRefused { name, state } => AgentNotRunning {
+            message: format!(
+                "Agent Instance '{name}' is not running (current state: {state}); drain stops \
+                 a running agent — start it first with: hekma agent start {name}, or use \
+                 plain stop for a paused one with: hekma agent stop {name}. List the Fleet \
+                 with: hekma agent list"
+            ),
+        }
+        .into(),
+        // Story 18-4: a drain bound outside 1..=600000 was requested
+        // programmatically (the CLI's clap range refuses it at parse time).
+        // Usage class — the value, not the environment, is at fault.
+        EngineError::DrainBoundInvalid { bound_ms } => crate::error::AgentDrainBoundInvalid {
+            message: format!(
+                "invalid drain bound {bound_ms}ms: it must be between 1 and 600000 (the \
+                 adapter-contract maximum); a zero bound could never let a drain's pause \
+                 command start"
             ),
         }
         .into(),
@@ -4897,5 +5082,136 @@ mod tests {
         for mapped in [unresolved, log, metering, backend, store] {
             assert_eq!(classify(mapped.as_ref()), ExitCode::General);
         }
+    }
+
+    // ---- governance-vectors (story 19-1) ----
+
+    #[test]
+    fn governance_vectors_summary_names_the_pin_facts() {
+        let summary = governance_vectors_summary(
+            hekma_engine::governance_vectors_json(),
+            &hekma_engine::governance_vectors_checksum(),
+        )
+        .expect("the embedded artifact parses");
+        // The pin a Host declares against: version + checksum + case count.
+        assert!(
+            summary.contains(hekma_engine::GOVERNANCE_VECTORS_VERSION),
+            "the summary names the vectors version: {summary}"
+        );
+        assert!(
+            summary.contains(&hekma_engine::governance_vectors_checksum()),
+            "the summary carries the sha256: {summary}"
+        );
+        assert!(
+            summary.contains(hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH),
+            "the summary names the artifact path: {summary}"
+        );
+        assert!(
+            summary.contains("15 decision") && summary.contains("11 derivation"),
+            "the summary gives the case mix: {summary}"
+        );
+        assert!(
+            summary.ends_with('\n'),
+            "the summary is newline-terminated: {summary}"
+        );
+    }
+
+    #[test]
+    fn governance_vectors_summary_is_an_honest_error_when_the_document_is_wrong() {
+        // A corrupt OR schema-mismatched embed must NOT print a fabricated
+        // summary — an honest error naming the defect (surfaced, not silent;
+        // 19-1 review round 1: the typed parse pins all three shapes).
+        let corrupt = governance_vectors_summary("{\"cases\": [", "deadbeef")
+            .expect_err("a corrupt document is an error");
+        assert!(
+            corrupt.to_string().contains("does not match its schema"),
+            "the error names the schema mismatch: {corrupt}"
+        );
+        // A parseable-but-WRONG document (schema_version is a string) errors —
+        // never a "schema v0" fabrication.
+        let wrong_typed = governance_vectors_summary(
+            "{\"artifact\": \"hekma-governance-vectors\", \"schema_version\": \"1\", \
+             \"vectors_version\": \"1.0.0\", \
+             \"provenance\": {\"generated_from\": []}, \"cases\": []}",
+            "deadbeef",
+        )
+        .expect_err("a wrong-typed field is an error");
+        assert!(
+            wrong_typed
+                .to_string()
+                .contains("does not match its schema"),
+            "the wrong-typed document is an honest error: {wrong_typed}"
+        );
+        // A document MISSING a required field errors — never "(missing)"
+        // placeholders.
+        let missing =
+            governance_vectors_summary("{\"artifact\": \"hekma-governance-vectors\"}", "deadbeef")
+                .expect_err("a missing field is an error");
+        assert!(
+            missing.to_string().contains("does not match its schema"),
+            "the missing-field document is an honest error: {missing}"
+        );
+    }
+
+    #[test]
+    fn a_broken_governance_stdout_pipe_stops_cleanly_while_a_real_io_failure_still_diagnoses() {
+        // THE EPIPE PIN (19-1 review round 1, the log path's fix-pass-M1
+        // parity): `hekma agent governance-vectors --json | head` must exit 0
+        // — the BrokenPipe arm keeps that promise — and it must NOT swallow
+        // other write failures (a full disk when stdout is redirected to a
+        // file is a real error), so both halves are asserted here.
+        use crate::exit_code::{classify, ExitCode};
+
+        classify_governance_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "consumer went away",
+        ))
+        .expect("a closed consumer is a clean stop, not an error");
+
+        let failed = classify_governance_stdout_write(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "no space left on device",
+        ))
+        .expect_err("a genuine write failure must stay an error");
+        assert!(
+            failed.downcast_ref::<AgentIo>().is_some(),
+            "a real stdout write failure must surface as AgentIo: {failed}"
+        );
+        assert!(failed.to_string().contains("no space left on device"));
+        assert_eq!(classify(failed.as_ref()), ExitCode::General);
+    }
+
+    #[test]
+    fn governance_vectors_handler_runs_both_paths_in_process() {
+        // The handler is I/O-free beyond stdout: both paths succeed in-process
+        // (the human summary + the verbatim `--json` dump, captured by the
+        // test runner). Byte fidelity of the `--json` path is pinned by the
+        // real-binary e2e test (`tests/governance_cli.rs`); here the artifact
+        // contract itself is pinned against the committed file. SIBLING-CHECKOUT
+        // skip-guard (19-1 review round 1, the smokes' noted-skip posture):
+        // the committed artifact lives across the crate boundary and is absent
+        // when the published `hekma` crate is tested standalone.
+        let committed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../hekma-engine/governance/vectors-v1.json");
+        if !committed_path.exists() {
+            hekma_conformance::note_uncaptured(
+                "note: governance-vectors in-process pin skipped: the committed engine \
+                 artifact is not in this checkout (the hekma crate is tested standalone)",
+            );
+            return;
+        }
+        governance_vectors(false).expect("the human path succeeds");
+        governance_vectors(true).expect("the json path succeeds");
+        let embedded = hekma_engine::governance_vectors_json();
+        let committed =
+            std::fs::read_to_string(&committed_path).expect("the committed artifact reads");
+        assert_eq!(
+            embedded, committed,
+            "the embedded bytes are the committed artifact, byte for byte"
+        );
+        assert!(
+            embedded.ends_with("}\n") && !embedded.ends_with("\n\n"),
+            "exactly one trailing newline"
+        );
     }
 }

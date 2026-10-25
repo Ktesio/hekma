@@ -16,6 +16,25 @@
 //! * `[capabilities]` — a non-empty per-OS Capability Declaration (AD-4).
 //! * `[metering]` — a viable Metering Source (AD-7; the FR-19 hard line, AC4).
 //!
+//! ## Optional sections
+//!
+//! * `[interaction]` — the documentary interaction channel (story 4.1).
+//! * `[config]` — the unified→native config mapping (story 2-2, FR-12).
+//! * `[readiness]` — ONE declared readiness probe gating the engine's
+//!   `starting → running` transition (added at contract `1.0.0 → 1.1.0`):
+//!   `http-get { url, expected_status }`, `file_fresh { path, max_age_ms }`,
+//!   or `log_contains { line }`, each with a `timeout_ms` in `1..=600_000`.
+//!   An engine built at 1.0.0 rejects the section for free
+//!   (`deny_unknown_fields`) — the versioning policy's older-same-major rule.
+//! * `[liveness]` — ONE declared liveness check the engine's reaper evaluates
+//!   while the instance is `running` (joins the SAME contract `1.1.0` minor —
+//!   both sections ship in one release, so an engine that knows `[readiness]`
+//!   but not `[liveness]` never exists): `[liveness.heartbeat_file]
+//!   { path, max_age_ms }` or `[liveness.http_get]
+//!   { url, expected_status, max_age_ms }`. The unifying semantic: the
+//!   declared signal failing CONTINUOUSLY for `max_age_ms` fails the
+//!   instance.
+//!
 //! `#[serde(deny_unknown_fields)]` (the repo's manifest style) additionally
 //! rejects unknown keys, catching typos.
 //!
@@ -25,6 +44,7 @@
 //! launch is story 1-4.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -67,6 +87,42 @@ pub struct Manifest {
     /// common). Each `[config.<key>]` sub-table declares one native mechanism
     /// (`env`/`flag`/`file`). Validated by [`Manifest::validate`] when present.
     pub config: Option<ConfigMapping>,
+    /// The declared readiness probe (added at contract `1.0.0 → 1.1.0`).
+    /// OPTIONAL: a manifest without it starts exactly as before. Validated by
+    /// [`Manifest::validate`] when present — a v1.1.0 engine names the section's
+    /// first invalid field; a v1.0.0 engine (whose schema has no `readiness`
+    /// field at all) rejects the section at PARSE time via
+    /// `deny_unknown_fields`, exactly as the versioning policy states.
+    pub readiness: Option<Readiness>,
+    /// The declared liveness check (joins the contract `1.1.0` minor). OPTIONAL:
+    /// a manifest without it supervises exactly as before (process liveness
+    /// only). Validated by [`Manifest::validate`] when present — a v1.1.0
+    /// engine names the section's first invalid field; a v1.0.0 engine (whose
+    /// schema has no `liveness` field at all) rejects the section at PARSE
+    /// time via `deny_unknown_fields`, exactly as the versioning policy
+    /// states. (Moot in practice: both 1.1.0 sections ship in one release, so
+    /// the intermediate engine never exists — the pin stays as the policy's
+    /// free guarantee.)
+    pub liveness: Option<Liveness>,
+    /// The declared exit-code classes (joins the contract `1.1.0` minor).
+    /// OPTIONAL: a manifest without it classifies nothing — every unrequested
+    /// exit is a crash exactly as before (byte-identical). Validated by
+    /// [`Manifest::validate`] when present — a v1.1.0 engine names the
+    /// section's first invalid field; a v1.0.0 engine (whose schema has no
+    /// `exit_codes` field at all) rejects the section at PARSE time via
+    /// `deny_unknown_fields`, exactly as the versioning policy states.
+    pub exit_codes: Option<ExitCodes>,
+    /// The declared drain wait (story 18-4, joins the contract `1.1.0` minor —
+    /// the story's ONLY new schema; the `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// templates it composes with are v1.0.0 seeds now executed). OPTIONAL: a
+    /// manifest without it drains with the engine's default posture (a declared
+    /// pause command gets the engine's default 30 s bound; nothing declared is a
+    /// degenerate direct stop). Validated by [`Manifest::validate`] when present
+    /// — a v1.1.0 engine names the section's first invalid field; a v1.0.0
+    /// engine (whose schema has no `drain` field at all) rejects the section at
+    /// PARSE time via `deny_unknown_fields`, exactly as the versioning policy
+    /// states.
+    pub drain: Option<Drain>,
 }
 
 /// The `[adapter]` identity block.
@@ -192,6 +248,1136 @@ pub struct Interaction {
     pub channel: InteractionChannelKind,
 }
 
+/// The declared readiness probe kind (added at contract `1.0.0 → 1.1.0`).
+///
+/// A CLOSED set, mirroring [`InteractionChannelKind`]'s seed-enum pattern:
+/// kebab-case on the wire (`http-get` / `file-fresh` / `log-contains`), an
+/// unrecognized value fails at PARSE time (an unknown variant), and an
+/// `as_str()`/`Display` pair names the wire form. Exactly ONE kind per
+/// manifest — the alternatives are alternatives, not a pipeline (the
+/// `[readiness]` section's shape — a table — is where a future ordered-gate
+/// LIST would grow, without a breaking change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadinessKind {
+    /// An HTTP GET against a URL; the probe passes when the response's status
+    /// equals the declared expected status.
+    HttpGet,
+    /// A file whose modification age is at most the declared maximum — the
+    /// agent proves readiness by (re)writing a file.
+    FileFresh,
+    /// A substring that must appear in the ENGINE-owned agent output log
+    /// after this Run's spawn point — the agent proves readiness by printing
+    /// a line.
+    LogContains,
+}
+
+impl ReadinessKind {
+    /// The kebab-case wire name, matching the serde form and manifest value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadinessKind::HttpGet => "http-get",
+            ReadinessKind::FileFresh => "file-fresh",
+            ReadinessKind::LogContains => "log-contains",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadinessKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `http-get` probe's resolved target: a loopback-first URL and the ONE
+/// status that counts as ready.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpGetProbe {
+    /// The probe URL. `http://` ONLY (no TLS, no other schemes): the probe
+    /// targets the AGENT's own listener on the same host, so a remote or
+    /// HTTPS target is refused at validation — a remote readiness endpoint
+    /// is a Host concern, not an adapter-contract one.
+    pub url: String,
+    /// The status code that counts as ready. ANY response carrying it passes
+    /// (connection-refused is a not-yet, retried on the engine's poll cadence —
+    /// never an error).
+    pub expected_status: u16,
+}
+
+/// The `file-fresh` probe's resolved target: a path (relative to the Agent
+/// Home when relative) and the maximum modification age that counts as fresh.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFreshProbe {
+    /// The file the agent (re)writes to prove readiness. A relative path
+    /// resolves against the instance's Agent Home (the agent's own working
+    /// directory); an absolute path is taken verbatim.
+    pub path: String,
+    /// The maximum modification age, in milliseconds. A file modified within
+    /// this window of the check is fresh. SystemTime deltas only — the
+    /// per-OS mtime granularity honesty (e.g. 2 s on Windows FAT) lives in
+    /// the section's docs, never in the comparison.
+    pub max_age_ms: u64,
+}
+
+/// The `log-contains` probe's resolved target: the SUBSTRING that must appear
+/// in the engine-owned agent output log after this Run's spawn point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogContainsProbe {
+    /// The readiness line. A plain SUBSTRING match (the engine is regex-free
+    /// by design) over a bounded incremental read starting at the spawn-time
+    /// cursor. Under the engine's `capture = "off"` posture no log exists, so
+    /// this probe is unsatisfiable there and fails at its timeout — honestly
+    /// named, never a fake pass.
+    pub line: String,
+}
+
+/// The ONE declared readiness probe, RESOLVED (exactly one variant, every
+/// field present and legal). Built only by [`Readiness::gate`] after
+/// validation, so the engine's runner consumes this enum without re-checking
+/// anything: an internally-tagged Rust mirror of the manifest's per-kind
+/// fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadinessProbe {
+    /// An HTTP GET with an expected status.
+    HttpGet(HttpGetProbe),
+    /// A file's maximum modification age.
+    FileFresh(FileFreshProbe),
+    /// A substring in the engine-owned agent log.
+    LogContains(LogContainsProbe),
+}
+
+/// The declared readiness gate RESOLVED (contract `1.1.0`): the probe plus
+/// its OWN budget. The engine's runner waits for [`ReadinessGate::probe`] to
+/// pass within [`ReadinessGate::timeout_ms`] on ITS OWN poll cadence (the
+/// manifest declares the budget, never the cadence).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessGate {
+    /// The probe's whole budget, in milliseconds (`1..=600_000`, enforced by
+    /// [`Readiness::gate`]).
+    pub timeout_ms: u64,
+    /// The one resolved probe.
+    pub probe: ReadinessProbe,
+}
+
+/// The optional `[readiness]` section (added at contract `1.0.0 → 1.1.0`):
+/// exactly ONE declared readiness probe, shaped `{ kind, timeout_ms, <the
+/// kind's own fields> }` —
+///
+/// ```toml
+/// [readiness]
+/// kind = "http-get"
+/// timeout_ms = 5000
+/// url = "http://127.0.0.1:8080/health"
+/// expected_status = 200
+/// ```
+///
+/// OPTIONAL: a manifest without the section behaves exactly as before (the
+/// engine's process-level startup watch alone). Declaring it makes the
+/// engine's supervisor gate `starting → running` on the probe: the instance
+/// reaches `running` only once the probe passes within its declared
+/// `timeout_ms`; a timeout lands it `failed` with the probe NAMED (a
+/// terminal failure, never an auto-restart). The section is
+/// `deny_unknown_fields` like every section struct, so an engine built at
+/// contract 1.0.0 rejects a manifest declaring it (the versioning policy's
+/// older-same-major-engine rule, for free).
+///
+/// Validation is [`Readiness::gate`] (consumed by [`Manifest::validate`]):
+/// the `kind`'s own fields are REQUIRED, every OTHER kind's fields are
+/// FORBIDDEN (a `file-fresh` manifest carrying `url` names the offender),
+/// and the value rules hold: `timeout_ms` in `1..=600_000`; `url` is
+/// `http://` targeting a LITERAL loopback address (`127.0.0.0/8` or `::1`,
+/// optional port, no hostnames — the probe never consults a resolver) with
+/// no `#fragment`; `expected_status` in `100..=599`; `max_age_ms` in
+/// `1..=timeout_ms`; `url`/`path`/`line` free of control characters (NUL
+/// and the rest of C0/C1).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    /// Which probe this is. A closed enum — an unrecognized value fails at
+    /// PARSE time (an unknown variant naming the section).
+    pub kind: ReadinessKind,
+    /// The probe's whole budget, in milliseconds. `1..=600_000` (ten
+    /// minutes): below 1 is not a poll at all, above the cap a start would
+    /// hold supervision unboundedly. The ENGINE owns the poll cadence within
+    /// this budget — the manifest declares operator intent only.
+    pub timeout_ms: u64,
+    /// `http-get` only: the probe URL. `http://` only, and the authority
+    /// must be a LITERAL loopback address (`127.0.0.0/8` or `::1`, optional
+    /// `:port`) — never a hostname, so the probe can never consult a
+    /// resolver/DNS.
+    pub url: Option<String>,
+    /// `http-get` only: the status code that counts as ready
+    /// (`100..=599`).
+    pub expected_status: Option<u16>,
+    /// `file-fresh` only: the readiness file (relative to the Agent Home).
+    pub path: Option<String>,
+    /// `file-fresh` only: the maximum modification age, in milliseconds
+    /// (`1..=timeout_ms`).
+    pub max_age_ms: Option<u64>,
+    /// `log-contains` only: the readiness line (substring, non-empty, no
+    /// control characters).
+    pub line: Option<String>,
+}
+
+impl Readiness {
+    /// Resolve this section into its [`ReadinessGate`] (the probe + its own
+    /// budget), enforcing the whole value matrix and naming the first failing
+    /// field (the section's validation — run at registration via
+    /// [`Manifest::validate`] and re-checked at start like the `[config]`
+    /// mapping).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * `timeout_ms` must be `1..=600_000`;
+    /// * the `kind`'s own fields are all required (with per-kind value rules);
+    /// * every OTHER kind's fields are forbidden — a stray `url` under
+    ///   `file-fresh` is a named `InvalidField`, never silently ignored.
+    ///
+    /// Per-kind value rules: `http-get` takes an `http://` URL whose
+    /// authority is a literal loopback address (`127.0.0.0/8` or `::1`,
+    /// optional `:port` — no hostnames, no userinfo, no fragment) and an
+    /// `expected_status` in `100..=599`; `file-fresh` takes a
+    /// `max_age_ms` in `1..=timeout_ms`; text fields (`url`, `path`,
+    /// `line`) carry no control characters (NUL and the rest of C0/C1).
+    pub fn gate(&self) -> Result<ReadinessGate, ManifestError> {
+        if self.timeout_ms == 0 || self.timeout_ms > 600_000 {
+            return Err(ManifestError::InvalidField {
+                field: "`timeout_ms` field in the `[readiness]` section".to_string(),
+                detail: format!(
+                    "{} is out of range — the declared probe budget must be between 1 and \
+                     600000 milliseconds",
+                    self.timeout_ms
+                ),
+            });
+        }
+        // The kind's OWN fields, required + per-kind value rules; the
+        // foreign-field sweep runs after, so a manifest that both omits its
+        // own field and carries a foreign one names the missing field first.
+        let probe = match self.kind {
+            ReadinessKind::HttpGet => {
+                let url = required_str(
+                    self.url.as_deref(),
+                    "`url` field in the `[readiness]` section",
+                )?;
+                if contains_control_char(url) {
+                    return Err(control_char_error("`url`", "URL"));
+                }
+                if !url.starts_with("http://") {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' is not an http:// URL — the readiness probe targets the \
+                             agent's own loopback listener, so only http:// is accepted (no \
+                             TLS, no other schemes)"
+                        ),
+                    });
+                }
+                // A `#fragment` never reaches the wire (it is client-side),
+                // so it is refused here at validation and the probe runner
+                // never has to guess what path was meant. Queries (`?`)
+                // stay allowed — servers see them.
+                if url.contains('#') {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' carries a `#fragment` — a fragment never reaches the \
+                             wire, so the probe would not request the path the URL names; \
+                             drop it"
+                        ),
+                    });
+                }
+                // The authority (host[:port]) must be present: `http://` alone
+                // or `http:///path` has nowhere to connect and would only
+                // fail obscurely at probe time.
+                // Strict single-strip: `strip_prefix` removes AT MOST one
+                // `http://`, so `http://http://...` keeps its inner scheme in
+                // the authority and is rejected by the loopback-literal rule
+                // below. (`trim_start_matches` would strip every repetition,
+                // silently laundering a double-scheme URL into a valid one.)
+                let authority = url
+                    .strip_prefix("http://")
+                    .unwrap_or(url)
+                    .split(['/', '?'])
+                    .next()
+                    .unwrap_or("");
+                if authority.is_empty() {
+                    return Err(ManifestError::InvalidField {
+                        field: "`url` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "'{url}' carries no host — the probe URL must name the agent's \
+                             listener host (e.g. http://127.0.0.1:8080/health)"
+                        ),
+                    });
+                }
+                // The loopback-literal posture: the authority is a literal
+                // loopback IP, never a name.
+                require_loopback_authority(
+                    authority,
+                    url,
+                    "`url` field in the `[readiness]` section",
+                    "readiness probe",
+                )?;
+                let expected_status = self.expected_status.ok_or_else(|| {
+                    ManifestError::missing(
+                        "`expected_status` field in the `[readiness]` section (the http-get \
+                         probe's ready status)",
+                    )
+                })?;
+                if !(100..=599).contains(&expected_status) {
+                    return Err(ManifestError::InvalidField {
+                        field: "`expected_status` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "{expected_status} is not an HTTP status code — must be 100..=599 \
+                             (1xx informational through 5xx server error)"
+                        ),
+                    });
+                }
+                ReadinessProbe::HttpGet(HttpGetProbe {
+                    url: url.to_string(),
+                    expected_status,
+                })
+            }
+            ReadinessKind::FileFresh => {
+                let path = required_str(
+                    self.path.as_deref(),
+                    "`path` field in the `[readiness]` section",
+                )?;
+                if contains_control_char(path) {
+                    return Err(control_char_error("`path`", "file path"));
+                }
+                let max_age_ms = self.max_age_ms.ok_or_else(|| {
+                    ManifestError::missing(
+                        "`max_age_ms` field in the `[readiness]` section (the file-fresh \
+                         probe's maximum age)",
+                    )
+                })?;
+                if max_age_ms == 0 {
+                    return Err(ManifestError::InvalidField {
+                        field: "`max_age_ms` field in the `[readiness]` section".to_string(),
+                        detail: "0 is not a freshness window — the file could never count \
+                                 as fresh; the minimum is 1 millisecond"
+                            .to_string(),
+                    });
+                }
+                if max_age_ms > self.timeout_ms {
+                    return Err(ManifestError::InvalidField {
+                        field: "`max_age_ms` field in the `[readiness]` section".to_string(),
+                        detail: format!(
+                            "{max_age_ms} exceeds the probe's own timeout_ms ({}) — a file \
+                             cannot be required fresher than the probe is allowed to wait",
+                            self.timeout_ms
+                        ),
+                    });
+                }
+                ReadinessProbe::FileFresh(FileFreshProbe {
+                    path: path.to_string(),
+                    max_age_ms,
+                })
+            }
+            ReadinessKind::LogContains => {
+                let line = required_str(
+                    self.line.as_deref(),
+                    "`line` field in the `[readiness]` section",
+                )?;
+                if contains_control_char(line) {
+                    return Err(control_char_error("`line`", "line"));
+                }
+                ReadinessProbe::LogContains(LogContainsProbe {
+                    line: line.to_string(),
+                })
+            }
+        };
+        // The FOREIGN-field sweep: fields belonging to a different kind must
+        // be absent. A present one is a named error (the typo-protection the
+        // house style owes), never a silently-ignored key.
+        let foreign: &[(&str, bool)] = match self.kind {
+            ReadinessKind::HttpGet => &[
+                ("`path`", self.path.is_some()),
+                ("`max_age_ms`", self.max_age_ms.is_some()),
+                ("`line`", self.line.is_some()),
+            ],
+            ReadinessKind::FileFresh => &[
+                ("`url`", self.url.is_some()),
+                ("`expected_status`", self.expected_status.is_some()),
+                ("`line`", self.line.is_some()),
+            ],
+            ReadinessKind::LogContains => &[
+                ("`url`", self.url.is_some()),
+                ("`expected_status`", self.expected_status.is_some()),
+                ("`path`", self.path.is_some()),
+                ("`max_age_ms`", self.max_age_ms.is_some()),
+            ],
+        };
+        if let Some((field, _)) = foreign.iter().find(|(_, present)| *present) {
+            return Err(ManifestError::InvalidField {
+                field: format!("{field} field in the `[readiness]` section"),
+                detail: format!(
+                    "not a `{}` probe field — the `{}` kind carries only its own fields \
+                     ({})",
+                    self.kind,
+                    self.kind,
+                    match self.kind {
+                        ReadinessKind::HttpGet => "`url`, `expected_status`",
+                        ReadinessKind::FileFresh => "`path`, `max_age_ms`",
+                        ReadinessKind::LogContains => "`line`",
+                    }
+                ),
+            });
+        }
+        Ok(ReadinessGate {
+            timeout_ms: self.timeout_ms,
+            probe,
+        })
+    }
+}
+
+/// The `[liveness.heartbeat_file]` sub-table: the agent proves liveness by
+/// (re)writing a file — the heartbeat — whose modification age must stay
+/// within `max_age_ms`. Resolved shape: serde requires both fields (neither
+/// is `Option`), so a present sub-table is already type-complete and only the
+/// VALUE rules remain for [`Liveness::check`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeartbeatFileCheck {
+    /// The heartbeat file (relative to the Agent Home when relative). The
+    /// agent rewrites/touches it on its own cadence; the engine only READS
+    /// the mtime. A missing file is failing — absent ≡ stale (an agent that
+    /// never wrote its heartbeat has never proven liveness).
+    pub path: String,
+    /// The freshness window, in milliseconds (`250..=600_000`): how long the
+    /// file's mtime may lag before the heartbeat counts as stopped. This ONE
+    /// number is the window for the unifying semantic — the signal failing
+    /// CONTINUOUSLY for `max_age_ms` fails the instance.
+    pub max_age_ms: u64,
+}
+
+/// The `[liveness.http_get]` sub-table: the agent exposes a loopback HTTP
+/// endpoint whose declared status proves liveness. The engine polls ONE
+/// bounded attempt per reaper tick; the check FAILING CONTINUOUSLY for
+/// `max_age_ms` fails the instance (a transient blip inside the window
+/// recovers — the k8s `failureThreshold × periodSeconds` precedent).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpGetCheck {
+    /// The check URL. `http://` ONLY, targeting a LITERAL loopback address —
+    /// the same no-DNS posture as the readiness probe (validation is shared).
+    pub url: String,
+    /// The status code that counts as ALIVE (`100..=599`). Any other status —
+    /// or a connect/read failure — is one failing attempt, retried on the
+    /// engine's reaper cadence (never an error that aborts supervision).
+    pub expected_status: u16,
+    /// The failure window, in milliseconds (`1..=600_000`) — the same
+    /// unifying semantic as the heartbeat's.
+    pub max_age_ms: u64,
+}
+
+/// The ONE declared liveness check, RESOLVED (exactly one variant, every
+/// field present and legal). Built only by [`Liveness::check`] after
+/// validation, so the engine's runner consumes this enum without re-checking
+/// anything — the liveness twin of [`ReadinessProbe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LivenessCheck {
+    /// A heartbeat file's maximum modification age.
+    HeartbeatFile(HeartbeatFileCheck),
+    /// An HTTP GET with an expected status.
+    HttpGet(HttpGetCheck),
+}
+
+impl LivenessCheck {
+    /// The window (`max_age_ms`) both kinds carry — the unifying semantic's
+    /// one number. The engine reads it here instead of matching the variant
+    /// again, so a third kind cannot forget to state its window.
+    pub fn max_age_ms(&self) -> u64 {
+        match self {
+            LivenessCheck::HeartbeatFile(h) => h.max_age_ms,
+            LivenessCheck::HttpGet(h) => h.max_age_ms,
+        }
+    }
+}
+
+/// The optional `[liveness]` section (joins the contract `1.0.0 → 1.1.0`
+/// minor): exactly ONE declared liveness check, shaped as ONE of two
+/// sub-tables —
+///
+/// ```toml
+/// [liveness.heartbeat_file]
+/// path = "heartbeat.marker"
+/// max_age_ms = 5000
+/// ```
+///
+/// or
+///
+/// ```toml
+/// [liveness.http_get]
+/// url = "http://127.0.0.1:8080/health"
+/// expected_status = 200
+/// max_age_ms = 5000
+/// ```
+///
+/// OPTIONAL: a manifest without the section behaves exactly as before (the
+/// engine watches PROCESS liveness only). Declaring it makes the engine's
+/// reaper evaluate the check every tick while the instance is `running`,
+/// under ONE unifying semantic — **the declared signal failing CONTINUOUSLY
+/// for `max_age_ms` fails the instance** (`running → failed`, cause
+/// `unresponsive`, and the Restart Policy applies exactly as for a crash).
+/// A transient failure shorter than the window recovers; a PAUSED instance
+/// is never probed (a suspended process cannot heartbeat). The section is
+/// `deny_unknown_fields` like every section struct, so an engine built at
+/// contract 1.0.0 rejects it at parse time (the policy's older-engine rule,
+/// for free) — though the intermediate engine that knows `[readiness]` but
+/// not `[liveness]` never exists: both sections ship in the same 1.1.0
+/// release.
+///
+/// Validation is [`Liveness::check`] (consumed by [`Manifest::validate`]):
+/// exactly ONE sub-table may be present (both or neither is a named error),
+/// and the value rules hold: `max_age_ms` in `250..=600_000`; `path` non-empty
+/// and free of control characters; `http_get.url` an `http://` URL targeting
+/// a LITERAL loopback address (`127.0.0.0/8` or `::1`, optional port — no
+/// hostnames, no DNS, no fragment, the SAME shared rule the readiness probe
+/// enforces); `expected_status` in `100..=599`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Liveness {
+    /// The heartbeat-file check. Exactly ONE of the two sub-tables may be
+    /// present — enforced here at validation (TOML cannot express
+    /// "exactly-one-of" structurally), naming the section when violated.
+    pub heartbeat_file: Option<HeartbeatFileCheck>,
+    /// The HTTP check (mutually exclusive with `heartbeat_file`).
+    pub http_get: Option<HttpGetCheck>,
+}
+
+impl Liveness {
+    /// Resolve this section into its [`LivenessCheck`], enforcing the whole
+    /// value matrix and naming the first failing field (the section's
+    /// validation — run at registration via [`Manifest::validate`] and
+    /// re-checked at start and adoption like the `[config]` mapping and the
+    /// `[readiness]` probe).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * exactly ONE sub-table present (both, or neither, names the section);
+    /// * `max_age_ms` in `250..=600_000` (below 250 the window is smaller
+    ///   than one reaper tick — ~250 ms — so a window that short could expire
+    ///   without the engine ever observing the failure; above the cap a
+    ///   wedged agent would hold supervision unboundedly);
+    /// * `heartbeat_file.path` non-empty, no control characters;
+    /// * `http_get` takes the SAME loopback-literal URL family the
+    ///   `[readiness]` probe enforces (one shared helper — the two sections
+    ///   cannot drift), plus an `expected_status` in `100..=599`.
+    pub fn check(&self) -> Result<LivenessCheck, ManifestError> {
+        // Exactly ONE check: both sub-tables is a contradiction (which signal
+        // governs?); neither is an empty declaration (declaring `[liveness]`
+        // while checking nothing would silently supervise nothing new).
+        match (&self.heartbeat_file, &self.http_get) {
+            (Some(_), Some(_)) => {
+                return Err(ManifestError::InvalidField {
+                    field: "`[liveness]` section".to_string(),
+                    detail: "declares BOTH checks (`heartbeat_file` and `http_get`) — \
+                             exactly ONE liveness check per manifest; drop one sub-table"
+                        .to_string(),
+                });
+            }
+            (None, None) => {
+                return Err(ManifestError::InvalidField {
+                    field: "`[liveness]` section".to_string(),
+                    detail: "declares NO check — add exactly ONE of \
+                             `[liveness.heartbeat_file]` or `[liveness.http_get]`, or drop \
+                             the empty `[liveness]` section"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+        let max_age_ok = |max_age_ms: u64| -> Result<(), ManifestError> {
+            if max_age_ms < 250 {
+                return Err(ManifestError::InvalidField {
+                    field: "`max_age_ms` field in the `[liveness]` section".to_string(),
+                    detail: format!(
+                        "{max_age_ms} is below the liveness floor — the window must be between \
+                         250 and 600000 milliseconds. The reaper polls the declared signal on a \
+                         ~250 ms tick, so a window shorter than one tick could expire without \
+                         the engine ever observing the failure; 250 ms is the smallest \
+                         observable window"
+                    ),
+                });
+            }
+            if max_age_ms > 600_000 {
+                return Err(ManifestError::InvalidField {
+                    field: "`max_age_ms` field in the `[liveness]` section".to_string(),
+                    detail: format!(
+                        "{max_age_ms} is out of range — the liveness window must be between \
+                         250 and 600000 milliseconds"
+                    ),
+                });
+            }
+            Ok(())
+        };
+        if let Some(heartbeat) = &self.heartbeat_file {
+            let path = required_str(
+                Some(heartbeat.path.as_str()),
+                "`path` field in the `[liveness.heartbeat_file]` sub-table",
+            )?;
+            if contains_control_char(path) {
+                return Err(ManifestError::InvalidField {
+                    field: "`path` field in the `[liveness.heartbeat_file]` sub-table".to_string(),
+                    detail: "the liveness heartbeat path contains a control character (NUL \
+                             and the rest of the C0/C1 control bytes are forbidden — they \
+                             would corrupt the path)"
+                        .to_string(),
+                });
+            }
+            max_age_ok(heartbeat.max_age_ms)?;
+            return Ok(LivenessCheck::HeartbeatFile(heartbeat.clone()));
+        }
+        let http = self
+            .http_get
+            .as_ref()
+            .expect("exactly-one guard above leaves exactly one sub-table present");
+        let url = required_str(
+            Some(http.url.as_str()),
+            "`url` field in the `[liveness.http_get]` sub-table",
+        )?;
+        if contains_control_char(url) {
+            return Err(ManifestError::InvalidField {
+                field: "`url` field in the `[liveness.http_get]` sub-table".to_string(),
+                detail: "the liveness URL contains a control character (NUL and the rest of \
+                         the C0/C1 control bytes are forbidden — a newline in a URL is \
+                         header-injection material)"
+                    .to_string(),
+            });
+        }
+        if !url.starts_with("http://") {
+            return Err(ManifestError::InvalidField {
+                field: "`url` field in the `[liveness.http_get]` sub-table".to_string(),
+                detail: format!(
+                    "'{url}' is not an http:// URL — the liveness check targets the agent's \
+                     own loopback listener, so only http:// is accepted (no TLS, no other \
+                     schemes)"
+                ),
+            });
+        }
+        // The same fragment refusal the readiness probe makes: a `#fragment`
+        // never reaches the wire, so the check would not request the path the
+        // URL names.
+        if url.contains('#') {
+            return Err(ManifestError::InvalidField {
+                field: "`url` field in the `[liveness.http_get]` sub-table".to_string(),
+                detail: format!(
+                    "'{url}' carries a `#fragment` — a fragment never reaches the wire, so \
+                     the check would not request the path the URL names; drop it"
+                ),
+            });
+        }
+        // Strict single-strip, mirroring the `[readiness]` URL rule above:
+        // at most one `http://` is removed, so `http://http://...` keeps its
+        // inner scheme in the authority and is rejected by the loopback rule.
+        let authority = url
+            .strip_prefix("http://")
+            .unwrap_or(url)
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("");
+        if authority.is_empty() {
+            return Err(ManifestError::InvalidField {
+                field: "`url` field in the `[liveness.http_get]` sub-table".to_string(),
+                detail: format!(
+                    "'{url}' carries no host — the check URL must name the agent's listener \
+                     host (e.g. http://127.0.0.1:8080/health)"
+                ),
+            });
+        }
+        // THE SHARED loopback-literal rule (the no-DNS posture): one helper
+        // backs both `[readiness]` and `[liveness]`, so the two sections
+        // cannot drift apart on which URLs they admit.
+        require_loopback_authority(
+            authority,
+            url,
+            "`url` field in the `[liveness.http_get]` sub-table",
+            "liveness check",
+        )?;
+        if !(100..=599).contains(&http.expected_status) {
+            return Err(ManifestError::InvalidField {
+                field: "`expected_status` field in the `[liveness.http_get]` sub-table".to_string(),
+                detail: format!(
+                    "{} is not an HTTP status code — must be 100..=599 (1xx informational \
+                     through 5xx server error)",
+                    http.expected_status
+                ),
+            });
+        }
+        max_age_ok(http.max_age_ms)?;
+        Ok(LivenessCheck::HttpGet(http.clone()))
+    }
+}
+
+/// Which declared class an exit code belongs to, RESOLVED (built only by
+/// [`ExitCodes::classes`] after validation, so the engine's classifier
+/// consumes this without re-checking anything).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitClass {
+    /// The agent exited with this code to REQUEST a relaunch: the engine
+    /// runs the ordinary restart plan (backoff verbatim) but the
+    /// consecutive-failure counter is NOT charged.
+    RestartRequested,
+    /// The agent finished ON PURPOSE with this code: the instance lands
+    /// `stopped` (settled like a requested stop), no restart plan, no
+    /// counter action.
+    Clean,
+}
+
+/// The declared exit-code classes, RESOLVED and validated (every code in the
+/// portable `0..=255` domain, the two lists disjoint, no duplicates within a
+/// list). Built only by [`ExitCodes::classes`] after validation; the engine
+/// classifies an observed exit with [`Self::class_of`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitCodeClasses {
+    /// The codes that request a relaunch (the exit-75 pattern).
+    pub restart_requested: Vec<u16>,
+    /// The codes that mean a deliberate, clean finish.
+    pub clean: Vec<u16>,
+}
+
+impl ExitCodeClasses {
+    /// Classify one observed exit code against the declared classes.
+    /// `None` — the overwhelmingly common answer — means "no class contains
+    /// this code": the engine treats the exit exactly as it did before this
+    /// section existed (a crash under the Restart Policy).
+    pub fn class_of(&self, code: u16) -> Option<ExitClass> {
+        // 18-3 review: defense in depth. `ExitCodes::classes` refuses an
+        // overlap, but this resolver is `pub` — a hand-built
+        // `ExitCodeClasses` (or a future construction path that skips the
+        // validation) could carry a code in BOTH lists. Classification must
+        // stay DETERMINISTIC and single-answer: an ambiguous code classifies
+        // as nothing (a crash), never "whatever the ordered check hit
+        // first".
+        let in_restart = self.restart_requested.contains(&code);
+        let in_clean = self.clean.contains(&code);
+        match (in_restart, in_clean) {
+            (true, false) => Some(ExitClass::RestartRequested),
+            (false, true) => Some(ExitClass::Clean),
+            // An overlap (unvalidated construction) or a miss: no class.
+            _ => None,
+        }
+    }
+}
+
+/// The optional `[exit_codes]` section (joins the contract `1.1.0` minor):
+/// the two ADAPTER-DECLARED exit-code classes —
+///
+/// ```toml
+/// [exit_codes]
+/// restart_requested = [75]
+/// clean = [0]
+/// ```
+///
+/// Both lists are OPTIONAL (default empty); an absent section — or one
+/// declaring nothing — leaves supervision byte-identical to before. The
+/// classes classify RUNS, not launches: an exit during `starting` (survival
+/// window, readiness probe, ACP handshake) is a launch failure and is never
+/// classified, and a signal exit carries no code to classify.
+///
+/// Semantics (the engine enforces these; this section only declares them):
+///
+/// * `restart_requested` — the agent asked its supervisor for a relaunch.
+///   The exit takes the ordinary crash-path dance (`running → failed` + a
+///   restart plan on the standard backoff) but under the
+///   `restart-requested` cause, and the consecutive-failure counter is NOT
+///   charged. A restart-requested loop therefore NEVER trips the crash-loop
+///   terminal — the operator asked — while the backoff still grows to its
+///   cap, bounding the rate.
+/// * `clean` — the agent finished on purpose. The instance lands `stopped`
+///   (settled like a requested stop), no restart plan, no counter action.
+///
+/// The operator's `RestartPolicy` stays the operator's: `never` outranks
+/// `restart_requested` (terminal failure, no plan).
+///
+/// Validation is [`ExitCodes::classes`] (consumed by [`Manifest::validate`]):
+/// every code in `0..=255` (the portable exit-code domain — unix exit
+/// status carries the low 8 bits, so a Windows code above 255 could never be
+/// observed there; declare the portable form), the two lists DISJOINT (an
+/// overlap names both fields), and no duplicates within one list. The
+/// section is `deny_unknown_fields` like every section struct, so an engine
+/// built at contract 1.0.0 rejects it at parse time (the policy's
+/// older-engine rule, for free).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExitCodes {
+    /// Exit codes with which the agent requests a relaunch (e.g. `[75]` for
+    /// the conventional `EX_TEMPFAIL`-style contract restart).
+    #[serde(default)]
+    pub restart_requested: Vec<u16>,
+    /// Exit codes with which the agent finishes deliberately (commonly
+    /// `[0]`).
+    #[serde(default)]
+    pub clean: Vec<u16>,
+}
+
+impl ExitCodes {
+    /// Resolve this section into its [`ExitCodeClasses`], enforcing the
+    /// whole value matrix and naming the first failing field (the section's
+    /// validation — run at registration via [`Manifest::validate`] and
+    /// re-checked at start and adoption like the `[config]` mapping and the
+    /// `[readiness]`/`[liveness]` sections).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * every code in `restart_requested` and `clean` is `0..=255` (the
+    ///   portable exit-code domain);
+    /// * no duplicates within ONE list (a repeated code is a declaration
+    ///   typo, not a semantic);
+    /// * the two lists are DISJOINT — an overlap is refused naming BOTH
+    ///   fields, because one exit cannot be both a relaunch request and a
+    ///   clean finish.
+    pub fn classes(&self) -> Result<ExitCodeClasses, ManifestError> {
+        for (field, codes) in [
+            ("`restart_requested`", &self.restart_requested),
+            ("`clean`", &self.clean),
+        ] {
+            for code in codes {
+                if *code > 255 {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("{field} list in the `[exit_codes]` section"),
+                        detail: format!(
+                            "{code} is out of range — exit codes must be 0..=255, the \
+                             portable exit-code domain (unix exit status carries the low \
+                             8 bits, so a wider code could never be observed there)"
+                        ),
+                    });
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for code in codes {
+                if !seen.insert(*code) {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("{field} list in the `[exit_codes]` section"),
+                        detail: format!(
+                            "{code} appears more than once — declare each code at most \
+                             once per list"
+                        ),
+                    });
+                }
+            }
+        }
+        let overlap: Vec<u16> = self
+            .restart_requested
+            .iter()
+            .filter(|c| self.clean.contains(c))
+            .copied()
+            .collect();
+        if !overlap.is_empty() {
+            let names = overlap
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ManifestError::InvalidField {
+                field: "`[exit_codes]` section".to_string(),
+                detail: format!(
+                    "code(s) {names} appear in BOTH `restart_requested` and `clean` — a \
+                     code can belong to only ONE class (an exit is either a relaunch \
+                     request or a clean finish, never both); remove it from one list"
+                ),
+            });
+        }
+        Ok(ExitCodeClasses {
+            restart_requested: self.restart_requested.clone(),
+            clean: self.clean.clone(),
+        })
+    }
+}
+
+/// The resolved `[drain]` section (story 18-4): the bounded-wait values the
+/// engine's drain composite consumes. Produced only by [`Drain::spec`] (the
+/// same validate-at-registration / re-check-at-use family as
+/// [`ReadinessGate`](crate::ReadinessGate) / [`LivenessCheck`](crate::LivenessCheck)
+/// / [`ExitCodeClasses`](crate::ExitCodeClasses)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrainSpec {
+    /// The optional idle signal path, AGENT-HOME-RELATIVE (the agent touches it
+    /// when its in-flight work reaches zero; the engine reads its freshness).
+    /// `None` = no declared idle signal.
+    pub idle_file: Option<String>,
+    /// The declared drain bound, in milliseconds (`1..=600_000`).
+    pub timeout_ms: u64,
+}
+
+/// The `[drain]` section (story 18-4, added at contract `1.1.0`): the bounded
+/// wait the engine's DRAIN composite (`stop new work → wait, bounded → stop`)
+/// observes after running the declared `[lifecycle.pause]` command.
+///
+/// Fields:
+///
+/// * `timeout_ms` (REQUIRED) — the drain's wall-clock bound, `1..=600_000`
+///   (the same ten-minute ceiling the `[readiness]`/`[liveness]` windows use).
+///   A drain that outlives it still stops (the composite's last step is
+///   unconditional); the outcome is recorded honestly (`completed: false`).
+/// * `idle_file` (OPTIONAL) — an Agent-Home-RELATIVE path the agent TOUCHES
+///   when its in-flight work reaches zero. Freshness, not existence, is the
+///   signal (the engine's evaluator applies a small freshness slack — a file
+///   touched once at startup must not read idle forever), and an
+///   absent-or-stale file reads "not idle yet", never an error.
+///
+/// The section composes with the `[lifecycle.pause]`/`[lifecycle.resume]` op
+/// templates (v1.0.0 schema, EXECUTED since 18-4): the drain runs the declared
+/// pause command, waits (this section's bound) for the command's exit-0 AND the
+/// idle file's freshness, then stops. A `[lifecycle.pause]` WITHOUT this
+/// section still drains — with the engine's default 30 s bound (the verb must
+/// work; documented). Validation is [`Drain::spec`], run by
+/// [`Manifest::validate`]; the section is `deny_unknown_fields` like every
+/// section struct, so an engine built at contract 1.0.0 rejects it at parse
+/// time (the policy's older-engine rule, for free).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drain {
+    /// The optional idle signal path (Agent-Home-relative).
+    #[serde(default)]
+    pub idle_file: Option<String>,
+    /// The drain bound in milliseconds (required, `1..=600_000`).
+    pub timeout_ms: u64,
+}
+
+impl Drain {
+    /// Resolve this section into its [`DrainSpec`], enforcing the whole value
+    /// matrix and naming the first failing field (the section's validation —
+    /// run at registration via [`Manifest::validate`] and re-checked at pause/
+    /// resume/drain like the `[readiness]`/`[liveness]`/`[exit_codes]`
+    /// sections).
+    ///
+    /// Rules, in stable diagnostic order:
+    /// * `timeout_ms` is `1..=600_000` — `0` cannot bound a wait (it would
+    ///   time out before any poll), and anything above the ten-minute ceiling
+    ///   is a stalled fleet read, not a drain;
+    /// * `idle_file`, when present, is non-empty and free of control
+    ///   characters (the C0/C1 sweep — it is used as a filesystem path),
+    ///   RELATIVE (an absolute path would read a file outside the Agent Home
+    ///   the engine has authority over), and carries no `..` component (the
+    ///   same escape refusal the `[config]` file targets enforce — the idle
+    ///   signal lives inside the agent's home or nowhere).
+    pub fn spec(&self) -> Result<DrainSpec, ManifestError> {
+        if !(1..=600_000).contains(&self.timeout_ms) {
+            return Err(ManifestError::InvalidField {
+                field: "`timeout_ms` field in the `[drain]` section".to_string(),
+                detail: format!(
+                    "{} is out of range — the drain bound must be 1..=600_000 \
+                     milliseconds (zero cannot bound a wait; ten minutes is the \
+                     declared ceiling)",
+                    self.timeout_ms
+                ),
+            });
+        }
+        let idle_file = match &self.idle_file {
+            None => None,
+            Some(path) => {
+                if path.trim().is_empty() {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: "the value is empty".to_string(),
+                    });
+                }
+                if contains_control_char(path) {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: "the drain idle_file path contains a control character \
+                                 (NUL and the rest of the C0/C1 control bytes are \
+                                 forbidden — they would corrupt the path)"
+                            .to_string(),
+                    });
+                }
+                // `is_absolute()` alone is NOT the honest absolute test on
+                // Windows: a ROOTED but DRIVELESS path (`/etc/passwd` — a
+                // RootDir with no Prefix) is `!is_absolute()` there, yet it
+                // resolves against the current drive's ROOT, outside the
+                // Agent Home the engine joins the path onto. Refuse ANY
+                // RootDir component (the portable union: a Unix `/x`, a
+                // Windows `/x`, and a drive-qualified `C:\x` all carry one);
+                // the drive-RELATIVE `C:foo` case is the Prefix arm below.
+                if std::path::Path::new(path).is_absolute()
+                    || std::path::Path::new(path)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::RootDir))
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' is an ABSOLUTE path — the idle_file is resolved \
+                             against the instance's Agent Home and must be relative \
+                             (an absolute path would read a file outside the engine's \
+                             path authority)"
+                        ),
+                    });
+                }
+                // A Windows DRIVE-RELATIVE path (`C:foo` — a `Component::
+                // Prefix` without a root) is not `is_absolute()`, but it
+                // resolves against the CURRENT DRIVE's working directory —
+                // outside the Agent Home the engine joins the path onto
+                // (review round 1, A8-ii). Refused wherever the prefix
+                // component appears; a no-op compile on Unix (where the
+                // spelling is an ordinary relative name).
+                if std::path::Path::new(path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::Prefix(_)))
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' carries a Windows drive prefix (a drive-relative \
+                             or drive-qualified path) — the idle_file is resolved against \
+                             the instance's Agent Home and must be a plain relative path \
+                             (a drive-relative path would resolve OUTSIDE the Agent Home \
+                             the engine has authority over)"
+                        ),
+                    });
+                }
+                if std::path::Path::new(path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                {
+                    return Err(ManifestError::InvalidField {
+                        field: "`idle_file` field in the `[drain]` section".to_string(),
+                        detail: format!(
+                            "'{path}' contains a `..` component — the idle_file must \
+                             stay INSIDE the Agent Home (the same escape refusal the \
+                             `[config]` file targets enforce)"
+                        ),
+                    });
+                }
+                Some(path.clone())
+            }
+        };
+        Ok(DrainSpec {
+            idle_file,
+            timeout_ms: self.timeout_ms,
+        })
+    }
+}
+
+/// Convenience constructor naming a required-but-absent `[readiness]` field
+/// (the `missing` phrasing the other section validators use).
+fn required_str<'a>(value: Option<&'a str>, field: &'static str) -> Result<&'a str, ManifestError> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v),
+        Some(_) => Err(ManifestError::InvalidField {
+            field: field.to_string(),
+            detail: "the value is empty".to_string(),
+        }),
+        None => Err(ManifestError::missing(field)),
+    }
+}
+
+/// Whether `s` carries any control character: the C0 set (U+0000..=U+001F —
+/// NUL, newline, carriage return, tab, escape) or the C1 set
+/// (U+007F..=U+009F). A `[readiness]` text field is matched against captured
+/// process output or used as a filesystem path; control bytes would corrupt
+/// both (a newline in a probe URL is header-injection material), so they are
+/// refused outright at validation.
+fn contains_control_char(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, '\u{0000}'..='\u{001F}' | '\u{007F}'..='\u{009F}'))
+}
+
+/// The shared control-character refusal for a `[readiness]` text field.
+/// The message keeps the "NUL" wording the older NUL-only pin asserted, now
+/// covering the whole C0/C1 sweep.
+fn control_char_error(field: &str, what: &str) -> ManifestError {
+    ManifestError::InvalidField {
+        field: format!("{field} field in the `[readiness]` section"),
+        detail: format!(
+            "the readiness {what} contains a control character (NUL and the rest of the \
+             C0/C1 control bytes are forbidden — they would corrupt the matched output or \
+             the path)"
+        ),
+    }
+}
+
+/// Enforce the loopback-probe posture on an http-get URL's authority
+/// (`host[:port]`, already split from scheme and path): the host must be a
+/// LITERAL loopback address — `127.0.0.0/8` or `::1` — and the optional port
+/// must be `1..=65535` (default 80 for `http://`).
+///
+/// No hostnames (`localhost` included): a name would send the probe through
+/// the machine's resolver/DNS, and neither declared poll — the `[readiness]`
+/// gate nor the `[liveness]` check — must only ever touch this host's own
+/// loopback; a literal parses locally, deterministically. IPv6 takes the
+/// bracketed `[addr]:port` form (a bare `::1` is refused — its colons are
+/// ambiguous against the port separator); userinfo (`@`) is refused.
+///
+/// `field` names the offending manifest field in the error (the `[readiness]`
+/// and `[liveness.http_get]` sections word it differently); `what` reads as
+/// the polling role in the requirement clause ("readiness probe" / "liveness
+/// check") so each section's rejection speaks its own name.
+fn require_loopback_authority(
+    authority: &str,
+    url: &str,
+    field: &str,
+    what: &str,
+) -> Result<(), ManifestError> {
+    let refuse = |why: String| ManifestError::InvalidField {
+        field: field.to_string(),
+        detail: format!(
+            "{why} — the {what} URL must target a literal loopback address \
+                 (e.g. 127.0.0.1 or [::1])"
+        ),
+    };
+    if authority.contains('@') {
+        return Err(refuse(format!(
+            "'{url}' carries userinfo; an authority is host[:port] only"
+        )));
+    }
+    // Split host from port. Inside `[...]` a `:` belongs to the IPv6
+    // literal, so a bracketed authority splits at the closing bracket;
+    // unbracketed, the LAST `:` (if any) is the port separator and more
+    // than one `:` means a bare IPv6 literal that should have been
+    // bracketed.
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((literal, tail)) => {
+                let port = match tail.strip_prefix(':') {
+                    Some(p) => Some(p),
+                    None if tail.is_empty() => None,
+                    None => {
+                        return Err(refuse(format!(
+                            "'{url}' has trailing characters after the bracketed host"
+                        )));
+                    }
+                };
+                (literal, port)
+            }
+            None => {
+                return Err(refuse(format!(
+                    "'{url}' opens a `[` bracket it never closes"
+                )));
+            }
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h, Some(p)),
+            Some(_) => {
+                return Err(refuse(format!(
+                    "'{url}' is a bare IPv6 literal — bracket it: [::1]"
+                )));
+            }
+            None => (authority, None),
+        }
+    };
+    let addr: IpAddr = host.parse().map_err(|_| {
+        refuse(format!(
+            "'{url}' names host '{host}', which is not a literal IP address (hostnames — \
+             including `localhost` — would consult the machine's resolver)"
+        ))
+    })?;
+    if !addr.is_loopback() {
+        return Err(refuse(format!(
+            "'{url}' targets {addr}, which is not a loopback address"
+        )));
+    }
+    if let Some(p) = port {
+        let valid = p.parse::<u16>().map(|n| n > 0).unwrap_or(false);
+        if !valid {
+            return Err(refuse(format!(
+                "'{url}' carries port '{p}' — the port must be a decimal 1..=65535"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Why a manifest is invalid (spine AD-3; `thiserror`, never `miette`).
 ///
 /// Every message NAMES the failing section or the invalid value (AC2), so `hekma`
@@ -283,6 +1469,11 @@ impl Manifest {
                 format!("the `[metering]` section has an invalid `source`: {message}")
             } else if expected_clause.contains("stdio") {
                 format!("the `[interaction]` section has an invalid `channel`: {message}")
+            } else if expected_clause.contains("http-get")
+                || expected_clause.contains("file-fresh")
+                || expected_clause.contains("log-contains")
+            {
+                format!("the `[readiness]` section has an invalid `kind`: {message}")
             } else {
                 message
             };
@@ -356,6 +1547,77 @@ impl Manifest {
             None => return Err(ManifestError::missing("`[lifecycle]` section")),
         }
 
+        // The pause/resume PAIR rule (story 18-4): declaring exactly ONE of
+        // `[lifecycle.pause]` / `[lifecycle.resume]` is refused at registration,
+        // naming BOTH fields. Legal schema (both fields are optional seeds),
+        // new SEMANTIC rule: a pause without a resume is an unresumable trap —
+        // since 18-4 executes the pair, a cooperatively-paused instance could
+        // never be returned to `running` by its own adapter — and every other
+        // bad manifest dies at registration, so this one does too.
+        if let Some(lifecycle) = &self.lifecycle {
+            if lifecycle.pause.is_some() != lifecycle.resume.is_some() {
+                let declared = if lifecycle.pause.is_some() {
+                    "`pause`"
+                } else {
+                    "`resume`"
+                };
+                let missing = if lifecycle.pause.is_some() {
+                    "`resume`"
+                } else {
+                    "`pause`"
+                };
+                return Err(ManifestError::InvalidField {
+                    field: "`[lifecycle]` section".to_string(),
+                    detail: format!(
+                        "{declared} is declared WITHOUT {missing} — the lifecycle \
+                         pause/resume templates form a PAIR (a cooperative pause the \
+                         adapter cannot reverse would strand the instance paused \
+                         forever); declare both, or neither (an OS-signal pause needs \
+                         no templates)"
+                    ),
+                });
+            }
+
+            // The EXECUTED pair's exec/args are free of control characters
+            // (story 18-4 review round 1, A8-iii — the control-char family
+            // every rendered field obeys): since 18-4 the templates RENDER
+            // VERBATIM into the `pause-cooperative`/`resume-cooperative`
+            // causes and the operator diagnostics, so a control character
+            // would corrupt every surface that quotes the command. Scoped to
+            // the executed pair (start/stop are not rendered into causes;
+            // their argv passes straight to the OS spawn).
+            for (op, template) in [
+                ("pause", lifecycle.pause.as_ref()),
+                ("resume", lifecycle.resume.as_ref()),
+            ] {
+                let Some(template) = template else {
+                    continue;
+                };
+                if contains_control_char(&template.exec) {
+                    return Err(ManifestError::InvalidField {
+                        field: format!("`exec` field in the `[lifecycle.{op}]` op template"),
+                        detail: "the exec contains a control character (NUL and the rest \
+                                  of the C0/C1 control bytes are forbidden — the command \
+                                  renders into transition causes and diagnostics)"
+                            .to_string(),
+                    });
+                }
+                for (index, arg) in template.args.iter().enumerate() {
+                    if contains_control_char(arg) {
+                        return Err(ManifestError::InvalidField {
+                            field: format!(
+                                "`args[{index}]` element in the `[lifecycle.{op}]` op template"
+                            ),
+                            detail: "the argument contains a control character (NUL and the \
+                                      rest of the C0/C1 control bytes are forbidden — the \
+                                      command renders into transition causes and diagnostics)"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         // [capabilities] declares real support (AD-4). Not merely non-empty: a
         // capability key with an empty per-OS map, or one whose every entry is
         // `unsupported`, promises support nowhere and is rejected — an adapter
@@ -393,6 +1655,90 @@ impl Manifest {
             }
         }
 
+        // [readiness] probe (added at contract 1.1.0), IF present. Absent is
+        // valid (the pre-1.1.0 behavior — no declared probe — and the common
+        // case). A present-but-invalid section names its first failing field
+        // (`Readiness::gate` enforces the value matrix: the timeout range,
+        // the kind's own required fields, the http:// loopback-literal
+        // posture, and the foreign-field sweep).
+        if let Some(readiness) = &self.readiness {
+            readiness.gate()?;
+        }
+
+        // [liveness] check (added at contract 1.1.0 alongside [readiness]), IF
+        // present. Absent is valid (the pre-1.1.0 behavior — the engine watches
+        // PROCESS liveness only — and the common case). A present-but-invalid
+        // section names its first failing field (`Liveness::check` enforces the
+        // exactly-one-sub-table guard, the shared window range, the chosen
+        // kind's own required fields, and the same http:// loopback-literal
+        // posture [readiness] answers to).
+        if let Some(liveness) = &self.liveness {
+            liveness.check()?;
+        }
+
+        // [exit_codes] classes (added at contract 1.1.0 alongside [readiness]
+        // and [liveness]), IF present. Absent is valid (the pre-classification
+        // behavior — every unrequested exit is a crash — and the common
+        // case). A present-but-invalid section names its first failing field
+        // (`ExitCodes::classes` enforces the portable 0..=255 code domain, the
+        // no-duplicates rule, and the DISJOINT-lists rule that names both
+        // fields on an overlap).
+        if let Some(exit_codes) = &self.exit_codes {
+            exit_codes.classes()?;
+        }
+
+        // [drain] section (story 18-4, joins the contract 1.1.0 minor), IF
+        // present. Absent is valid (the engine's default drain posture — a
+        // declared pause command gets the default 30 s bound; nothing declared
+        // is a degenerate direct stop). A present-but-invalid section names its
+        // first failing field (`Drain::spec` enforces the 1..=600_000 bound and
+        // the idle_file's relative/in-home/control-char rules).
+        if let Some(drain) = &self.drain {
+            drain.spec()?;
+        }
+        // The drain/liveness DISJOINT rule (review round 1, A8-i): the
+        // idle_file may not name the liveness heartbeat's own file (a
+        // collision makes the drain's wait vacuously complete — see the
+        // helper).
+        self.validate_drain_liveness_disjoint()?;
+
+        Ok(())
+    }
+
+    /// The drain/liveness DISJOINT rule (story 18-4 review round 1, A8-i): a
+    /// `[drain].idle_file` naming the SAME path as the declared
+    /// `[liveness.heartbeat_file].path` is refused, BOTH fields named. The
+    /// heartbeat beats exactly while the agent is alive, so the drain's
+    /// freshness wait on that very file would read "idle" within one beat of
+    /// the drain entering — vacuously complete regardless of in-flight work,
+    /// and the signal the operator thinks proves "work drained" would prove
+    /// only "process alive". Run by [`Self::validate`] and re-checked by the
+    /// engine's drain resolver (the same drift gate the pair rule rides).
+    pub fn validate_drain_liveness_disjoint(&self) -> Result<(), ManifestError> {
+        let Some(drain) = &self.drain else {
+            return Ok(());
+        };
+        let Some(idle) = &drain.idle_file else {
+            return Ok(());
+        };
+        let Some(heartbeat) = self
+            .liveness
+            .as_ref()
+            .and_then(|l| l.heartbeat_file.as_ref())
+        else {
+            return Ok(());
+        };
+        if idle == &heartbeat.path {
+            return Err(ManifestError::InvalidField {
+                field: "`idle_file` field in the `[drain]` section".to_string(),
+                detail: format!(
+                    "'{idle}' is ALSO the declared `[liveness.heartbeat_file].path` — the \
+                     drain idle_file and the liveness heartbeat must be DIFFERENT files (the \
+                     heartbeat beats while the agent is ALIVE, so the drain's freshness \
+                     wait on it would complete vacuously regardless of in-flight work)"
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -425,6 +1771,73 @@ impl Manifest {
     /// mapping. Mirrors [`Self::capability_declaration`]'s empty-when-absent shape.
     pub fn config_mapping(&self) -> ConfigMapping {
         self.config.clone().unwrap_or_default()
+    }
+
+    /// The declared readiness [`ReadinessGate`] (added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[readiness]` section — the
+    /// engine's start seam treats that as "no probe" (the pre-1.1.0 behavior,
+    /// byte-identical). The `Result` is defensive depth: a validated manifest's
+    /// section already resolved cleanly, but the engine calls THIS accessor, so
+    /// it re-states the failure honestly rather than panicking.
+    pub fn readiness_probe(&self) -> Result<Option<ReadinessGate>, ManifestError> {
+        match &self.readiness {
+            Some(section) => section.gate().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The declared liveness [`LivenessCheck`] (added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[liveness]` section — the
+    /// engine's reaper treats that as "no declared check" (the pre-1.1.0
+    /// behavior, byte-identical: process liveness only). The `Result` is
+    /// defensive depth, mirroring [`Self::readiness_probe`]: a validated
+    /// manifest's section already resolved cleanly, but the engine calls THIS
+    /// accessor, so it re-states the failure honestly rather than panicking.
+    pub fn liveness_check(&self) -> Result<Option<LivenessCheck>, ManifestError> {
+        match &self.liveness {
+            Some(section) => section.check().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The declared exit-code [`ExitCodeClasses`] (added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[exit_codes]` section —
+    /// the engine's crash classifier treats that as "classify nothing" (the
+    /// pre-classification behavior, byte-identical: every unrequested exit is
+    /// a crash under the Restart Policy). The `Result` is defensive depth,
+    /// mirroring [`Self::readiness_probe`] / [`Self::liveness_check`]: a
+    /// validated manifest's section already resolved cleanly, but the engine
+    /// calls THIS accessor, so it re-states the failure honestly rather than
+    /// panicking.
+    pub fn exit_codes(&self) -> Result<Option<ExitCodeClasses>, ManifestError> {
+        match &self.exit_codes {
+            Some(section) => section.classes().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The declared drain [`DrainSpec`] (story 18-4, added at contract 1.1.0),
+    /// present only after [`Self::validate`] (which resolves the section).
+    ///
+    /// Returns `None` when the manifest declares no `[drain]` section — the
+    /// engine's drain verb treats that as "no declared wait" (the engine's
+    /// default posture: a declared pause command drains under its own default
+    /// bound; nothing declared is a degenerate direct stop). The `Result` is
+    /// defensive depth, mirroring [`Self::readiness_probe`] /
+    /// [`Self::liveness_check`] / [`Self::exit_codes`]: a validated manifest's
+    /// section already resolved cleanly, but the engine calls THIS accessor, so
+    /// it re-states the failure honestly rather than panicking.
+    pub fn drain(&self) -> Result<Option<DrainSpec>, ManifestError> {
+        match &self.drain {
+            Some(section) => section.spec().map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -999,5 +2412,1234 @@ channel = "stdio"
         let toml = format!("{VALID}\n[config.model]\nbogus = \"x\"\n");
         let err = Manifest::from_toml_str(&toml).unwrap_err();
         assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    // -- [readiness] (added at contract 1.0.0 → 1.1.0) ----------------------
+
+    /// Append a `[readiness]` section carrying exactly `body` to [`VALID`].
+    fn with_readiness(body: &str) -> String {
+        format!("{VALID}\n[readiness]\n{body}\n")
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_readiness_section() {
+        // The v1.0.0-rejection PIN (the versioning policy's
+        // older-same-major-engine rule, stated on the release surface): an
+        // engine built at contract 1.0.0 has a `Manifest` schema WITHOUT the
+        // `readiness` field, and `deny_unknown_fields` refuses the unknown
+        // section at PARSE time. Simulated here with the exact pre-1.1.0
+        // shape — the same section list, minus `readiness` — against a
+        // 1.1.0 manifest that declares the section. The diagnostic must NAME
+        // it (`readiness`), so an operator on an older engine learns which
+        // section their engine does not speak.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"ready\"");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("readiness"), "got {err}");
+    }
+
+    #[test]
+    fn no_readiness_section_is_valid_and_resolves_to_none() {
+        // The pre-1.1.0 shape: no section, no probe — the engine's start
+        // behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.readiness_probe().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn readiness_http_get_parses_and_resolves() {
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::HttpGet(HttpGetProbe {
+                    url: "http://127.0.0.1:8080/health".to_string(),
+                    expected_status: 200,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_file_fresh_parses_and_resolves() {
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 250",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::FileFresh(FileFreshProbe {
+                    path: "ready.marker".to_string(),
+                    max_age_ms: 250,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_log_contains_parses_and_resolves() {
+        let toml =
+            with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"listening on\"");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.readiness_probe().expect("resolve"),
+            Some(ReadinessGate {
+                timeout_ms: 5000,
+                probe: ReadinessProbe::LogContains(LogContainsProbe {
+                    line: "listening on".to_string(),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_timeout_bounds_are_enforced() {
+        // Below 1 is not a poll at all; above 600_000 a start would hold
+        // supervision unboundedly. Both name the field. Both are written as
+        // plain TOML integers — TOML allows digit separators, so `600_001`
+        // parses fine and must reach VALIDATION (the old comment claiming
+        // it was not TOML integer syntax was wrong; the rejection is the
+        // range check, not the parser).
+        for timeout in ["0", "600_001"] {
+            let toml = with_readiness(&format!(
+                "kind = \"log-contains\"\ntimeout_ms = {timeout}\nline = \"ready\""
+            ));
+            let m = Manifest::from_toml_str(&toml).expect("toml must parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("timeout_ms"),
+                "timeout {timeout} must name the field: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_non_http_url_is_rejected_naming_the_field() {
+        // The loopback-probe posture: http:// only — no TLS, no other schemes.
+        for url in [
+            "https://127.0.0.1:8080/health",
+            "tcp://127.0.0.1:8080",
+            "127.0.0.1:8080/health",
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"{url}\"\nexpected_status = 200"
+            ));
+            let m = Manifest::from_toml_str(&toml).expect("parse");
+            let err = m.validate().unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("`url`") && text.contains("readiness"),
+                "url {url} must name the field + section: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_url_without_a_host_is_rejected() {
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("no host"),
+            "a host-less URL must name why: {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_http_url_must_target_a_literal_loopback_address() {
+        // The loopback-literal posture: the authority is PARSED as an IP,
+        // never resolved — a name would consult the machine's resolver/DNS,
+        // and the gate must only ever touch this host's own loopback. The
+        // whole `127.0.0.0/8` counts (not just `.1`), `::1` takes the
+        // bracketed form, the port is optional (`http://` default 80) or
+        // `1..=65535`.
+        for url in [
+            "http://127.0.0.1:8080/health",
+            "http://127.0.0.1/",
+            "http://127.0.0.2:9/x",
+            "http://[::1]:9000/x",
+            "http://[::1]/",
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"{url}\"\nexpected_status = 200"
+            ));
+            Manifest::from_toml_str(&toml)
+                .unwrap_or_else(|e| panic!("{url} must parse: {e}"))
+                .validate()
+                .unwrap_or_else(|e| panic!("{url} must be accepted: {e}"));
+        }
+
+        for url in [
+            "http://example.com/health",  // a hostname — DNS, never
+            "http://localhost:8080/",     // `localhost` included
+            "http://192.168.1.5/",        // a literal NON-loopback address
+            "http://127.0.0.1:8080@x/",   // userinfo smuggled into the authority
+            "http://user@127.0.0.1/",     // classic userinfo form
+            "http://127.0.0.1:0/",        // port 0 is not a port
+            "http://127.0.0.1:65536/",    // above the u16 port range
+            "http://[::2]/",              // IPv6 but not loopback
+            "http://[::ffff:127.0.0.1]/", // v4-mapped is not `::1`
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"{url}\"\nexpected_status = 200"
+            ));
+            let err = Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("literal loopback address"),
+                "{url} must name the loopback posture: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_url_with_a_fragment_is_rejected_and_a_query_is_allowed() {
+        // A `#fragment` never reaches the wire (it is client-side), so the
+        // probe would not request the path the URL names — rejected here at
+        // validation, before the runner ever sees it.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health#frag\"\nexpected_status = 200",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("fragment"),
+            "the fragment must be named: {err}"
+        );
+
+        // A query (`?`) DOES reach the wire — allowed.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+             \"http://127.0.0.1:8080/health?probe=1\"\nexpected_status = 200",
+        );
+        Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .expect("a query is part of the request path");
+    }
+
+    #[test]
+    fn readiness_expected_status_bounds_are_enforced() {
+        // A status is 100..=599: below 100 is not an HTTP status, 600+ is
+        // not a code any conforming server may send.
+        for status in [0u16, 99, 600, 1000] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"http://127.0.0.1:8080/health\"\nexpected_status = {status}"
+            ));
+            let err = Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("expected_status"),
+                "status {status} must name the field: {err}"
+            );
+        }
+        // The edges hold: 100 (informational) and 599 (max server error).
+        for status in [100u16, 599] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"http://127.0.0.1:8080/health\"\nexpected_status = {status}"
+            ));
+            Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_or_else(|e| panic!("status {status} must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn readiness_zero_max_age_is_rejected() {
+        // A 0 ms freshness window can never be satisfied — the file would
+        // always be at least "now" old — so the probe would spin its whole
+        // budget on an unsatisfiable ask.
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 0",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("max_age_ms") && text.contains("freshness"),
+            "must name the field and why: {text}"
+        );
+    }
+
+    #[test]
+    fn readiness_control_characters_are_rejected_in_url_path_and_line() {
+        // The C0/C1 sweep across all three text fields — beyond NUL, which
+        // keeps its own named pin above. A control byte would corrupt the
+        // matched output stream or the path (and a newline in a URL is
+        // request-smuggling material), so the whole set is refused.
+        let cases: &[(&str, &str)] = &[
+            ("url", "\\u0001"),
+            ("url", "\\u001f"),
+            ("url", "\\u007f"),
+            ("url", "\\u009f"),
+            ("path", "\\u000b"),
+            ("path", "\\u0085"),
+            ("line", "\\n"),
+            ("line", "\\r"),
+            ("line", "\\t"),
+        ];
+        for (field, escaped) in cases {
+            let body = match *field {
+                "url" => format!(
+                    "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                     \"http://127.0.0.1:8080/health{escaped}\"\nexpected_status = 200"
+                ),
+                "path" => format!(
+                    "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \
+                     \"ready{escaped}.marker\"\nmax_age_ms = 250"
+                ),
+                _ => {
+                    format!("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"ready{escaped}\"")
+                }
+            };
+            let err = Manifest::from_toml_str(&with_readiness(&body))
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("control character"),
+                "{field} carrying {escaped} must name the control-character rule: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_max_age_above_timeout_is_rejected() {
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 500\npath = \"ready.marker\"\nmax_age_ms = 501",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("max_age_ms") && text.contains("timeout_ms"),
+            "must name both fields: {text}"
+        );
+    }
+
+    #[test]
+    fn readiness_empty_or_nul_line_is_rejected() {
+        let empty = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"  \"");
+        let err = Manifest::from_toml_str(&empty)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("`line`"), "got {err}");
+
+        let nul = format!(
+            "{}\n[readiness]\nkind = \"log-contains\"\ntimeout_ms = 5000\nline = \"a\\u0000b\"\n",
+            VALID
+        );
+        let err = Manifest::from_toml_str(&nul)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("NUL"),
+            "a NUL byte must be named: {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_foreign_kind_fields_are_rejected_naming_the_field() {
+        // Exactly ONE probe per manifest, and the kind's shape is exact: a
+        // `file-fresh` manifest carrying `url` names the stray field (typo
+        // protection — never a silently-ignored key).
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 250\n\
+             url = \"http://127.0.0.1:8080/health\"",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`url`")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_missing_kind_fields_are_rejected_naming_the_field() {
+        // http-get without expected_status.
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://127.0.0.1:8080/health\"",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("expected_status"), "got {err}");
+
+        // file-fresh without max_age_ms.
+        let toml =
+            with_readiness("kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"");
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("max_age_ms"), "got {err}");
+
+        // log-contains without line.
+        let toml = with_readiness("kind = \"log-contains\"\ntimeout_ms = 5000");
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("`line`"), "got {err}");
+    }
+
+    #[test]
+    fn readiness_unknown_kind_fails_at_parse_naming_the_section() {
+        // The closed kind vocabulary: an unrecognized value is an unknown
+        // VARIANT at parse time, attributed to the section (the same
+        // disambiguation the metering/interaction enums get).
+        let toml = with_readiness("kind = \"tcp-connect\"\ntimeout_ms = 5000");
+        let err = Manifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Toml { detail } if detail.contains("[readiness]")),
+            "got {err}"
+        );
+    }
+
+    // -- [liveness] (added at contract 1.0.0 → 1.1.0, alongside [readiness]) -
+
+    /// Append a `[liveness]` section carrying exactly `body` (including the
+    /// sub-table header) to [`VALID`].
+    fn with_liveness(body: &str) -> String {
+        format!("{VALID}\n[liveness]\n{body}\n")
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_liveness_section() {
+        // The v1.0.0-rejection PIN, liveness twin of the readiness one: an
+        // engine built at contract 1.0.0 has a `Manifest` schema WITHOUT the
+        // `liveness` field, and `deny_unknown_fields` refuses the unknown
+        // section at PARSE time. Simulated with the exact pre-1.1.0 shape —
+        // the same section list, minus `readiness` and `liveness` — against a
+        // 1.1.0 manifest that declares the section. The diagnostic must NAME
+        // it (`liveness`).
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml =
+            with_liveness("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("liveness"), "got {err}");
+    }
+
+    #[test]
+    fn no_liveness_section_is_valid_and_resolves_to_none() {
+        // The pre-1.1.0 shape: no section, no declared check — the engine's
+        // reaper behavior must stay byte-identical for it (process liveness
+        // only).
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.liveness_check().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn liveness_heartbeat_file_parses_and_resolves() {
+        let toml = with_liveness(
+            "[liveness.heartbeat_file]\npath = \"heartbeat.marker\"\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.liveness_check().expect("resolve"),
+            Some(LivenessCheck::HeartbeatFile(HeartbeatFileCheck {
+                path: "heartbeat.marker".to_string(),
+                max_age_ms: 5000,
+            }))
+        );
+    }
+
+    #[test]
+    fn liveness_http_get_parses_and_resolves() {
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.liveness_check().expect("resolve"),
+            Some(LivenessCheck::HttpGet(HttpGetCheck {
+                url: "http://127.0.0.1:8080/health".to_string(),
+                expected_status: 200,
+                max_age_ms: 5000,
+            }))
+        );
+    }
+
+    #[test]
+    fn liveness_max_age_ms_accessor_reads_both_kinds() {
+        // `max_age_ms()` is the engine's one-number window read: it must see
+        // through both variants (a third kind cannot forget to state its
+        // window, but the accessor must not lie about the two that exist).
+        let hb = LivenessCheck::HeartbeatFile(HeartbeatFileCheck {
+            path: "hb.marker".to_string(),
+            max_age_ms: 250,
+        });
+        assert_eq!(hb.max_age_ms(), 250);
+        let http = LivenessCheck::HttpGet(HttpGetCheck {
+            url: "http://127.0.0.1:8080/health".to_string(),
+            expected_status: 200,
+            max_age_ms: 750,
+        });
+        assert_eq!(http.max_age_ms(), 750);
+    }
+
+    #[test]
+    fn liveness_with_both_sub_tables_is_rejected_naming_the_section() {
+        // The exactly-one guard: two declared checks is a contradiction (which
+        // signal governs?), refused naming the section.
+        let toml = with_liveness(
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000\n\
+             [liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field == "`[liveness]` section"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("BOTH checks"), "got {err}");
+    }
+
+    #[test]
+    fn liveness_empty_section_is_rejected_naming_the_section() {
+        // An empty `[liveness]` declares nothing — it would silently supervise
+        // nothing new, so it is refused naming the section.
+        let toml = with_liveness("");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field == "`[liveness]` section"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("NO check"), "got {err}");
+    }
+
+    #[test]
+    fn liveness_max_age_bounds_are_enforced() {
+        // The shared window range `250..=600_000`, for BOTH kinds: below the
+        // 250 ms floor the window is smaller than one reaper tick (~250 ms),
+        // so expiry could go unobserved; above the cap a wedged agent would
+        // hold supervision unboundedly. Both name the field.
+        for body in [
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 0",
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 249",
+            "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 600_001",
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 0",
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 249",
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 600_001",
+        ] {
+            let m = Manifest::from_toml_str(&with_liveness(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, .. }
+                    if field == "`max_age_ms` field in the `[liveness]` section"),
+                "body `{body}`: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_min_window_is_accepted_at_the_floor() {
+        // Exactly 250 is legal (the floor is inclusive) for both kinds.
+        let toml =
+            with_liveness("[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 250");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("250 ms is the inclusive floor");
+
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 250",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("250 ms is the inclusive floor");
+    }
+
+    #[test]
+    fn double_scheme_urls_are_rejected_in_both_sections() {
+        // The strict single-strip rule: `strip_prefix` removes AT MOST one
+        // `http://`, so a double-scheme URL keeps its inner scheme in the
+        // authority and is rejected by the loopback-literal rule (an inner
+        // scheme is not a literal loopback IP). `trim_start_matches` (the
+        // pre-review shape) stripped every repetition and would have
+        // LAUNDERED this URL into `127.0.0.1:8080/health`. Pinned for BOTH
+        // sections — the shared posture cannot drift.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://http://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[liveness.http_get]` sub-table"),
+            "got {err}"
+        );
+
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://http://127.0.0.1:8080/health\"\nexpected_status = 200",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[readiness]` section"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn liveness_heartbeat_path_rules_are_enforced() {
+        // Empty path (the value-is-empty refusal, naming the sub-table field).
+        let toml = with_liveness("[liveness.heartbeat_file]\npath = \"\"\nmax_age_ms = 5000");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`path` field in the `[liveness.heartbeat_file]` sub-table"),
+            "got {err}"
+        );
+
+        // Control characters (NUL named explicitly, like the readiness pin).
+        let toml = with_liveness(
+            "[liveness.heartbeat_file]\npath = \"hb\\u0001.marker\"\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`path` field in the `[liveness.heartbeat_file]` sub-table"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("control character"), "got {err}");
+    }
+
+    #[test]
+    fn liveness_http_url_rules_are_enforced() {
+        // Non-http scheme (no TLS, no other schemes — loopback only).
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"https://127.0.0.1:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[liveness.http_get]` sub-table"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("http://"), "got {err}");
+
+        // Fragment.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health#x\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("fragment"), "got {err}");
+
+        // No host at all.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http:///health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("no host"), "got {err}");
+
+        // A hostname — the SHARED loopback-literal rule must name the
+        // LIVENESS role ("liveness check URL"), proving the sections share
+        // one helper without borrowing readiness's wording.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://localhost:8080/health\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[liveness.http_get]` sub-table"),
+            "got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the liveness check URL must target a literal loopback address"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn liveness_expected_status_bounds_are_enforced() {
+        for status in ["99", "600"] {
+            let toml = with_liveness(&format!(
+                "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\nexpected_status = {status}\nmax_age_ms = 5000",
+            ));
+            let m = Manifest::from_toml_str(&toml).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, .. }
+                    if field == "`expected_status` field in the `[liveness.http_get]` sub-table"),
+                "status {status}: got {err}"
+            );
+        }
+    }
+
+    // -- [exit_codes] (added at contract 1.1.0) ------------------------------
+
+    /// Append an `[exit_codes]` section carrying exactly `body` to [`VALID`].
+    fn with_exit_codes(body: &str) -> String {
+        format!("{VALID}\n[exit_codes]\n{body}\n")
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_exit_codes_section() {
+        // The v1.0.0-rejection PIN, exit-codes twin of the readiness/liveness
+        // ones: an engine built at contract 1.0.0 has a `Manifest` schema
+        // WITHOUT the `exit_codes` field, and `deny_unknown_fields` refuses
+        // the unknown section at PARSE time. Simulated with the exact
+        // pre-18-3 shape — the same section list, minus the three 1.1.0
+        // sections — against a 1.1.0 manifest that declares the section. The
+        // diagnostic must NAME it (`exit_codes`).
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_exit_codes("restart_requested = [75]\nclean = [0]");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("exit_codes"), "got {err}");
+    }
+
+    #[test]
+    fn no_exit_codes_section_is_valid_and_resolves_to_none() {
+        // The pre-18-3 shape: no section, no classes — every unrequested exit
+        // is a crash; the engine's behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.exit_codes().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn exit_codes_parse_and_resolve_both_lists() {
+        let toml = with_exit_codes("restart_requested = [75, 71]\nclean = [0]");
+        let m = Manifest::from_toml_str(&toml).expect("parse");
+        m.validate().expect("validate");
+        let classes = m.exit_codes().expect("resolve").expect("declared");
+        assert_eq!(
+            classes,
+            ExitCodeClasses {
+                restart_requested: vec![75, 71],
+                clean: vec![0],
+            }
+        );
+        assert_eq!(classes.class_of(75), Some(ExitClass::RestartRequested));
+        assert_eq!(classes.class_of(71), Some(ExitClass::RestartRequested));
+        assert_eq!(classes.class_of(0), Some(ExitClass::Clean));
+        assert_eq!(classes.class_of(99), None, "unclassified exits stay None");
+    }
+
+    #[test]
+    fn exit_codes_lists_are_optional_and_default_empty() {
+        // Both lists optional (serde defaults), and an entirely empty section
+        // is legal: it declares nothing and classifies nothing — exactly like
+        // an absent section (never a half-declared contradiction).
+        let empty = Manifest::from_toml_str(&with_exit_codes("")).expect("parse");
+        empty.validate().expect("validate");
+        let resolved = empty.exit_codes().expect("resolve").expect("declared");
+        assert_eq!(resolved, ExitCodeClasses::default());
+        assert_eq!(resolved.class_of(0), None);
+
+        let one_list = Manifest::from_toml_str(&with_exit_codes("clean = [0]")).expect("parse");
+        one_list.validate().expect("validate");
+        let resolved = one_list.exit_codes().expect("resolve").expect("declared");
+        assert!(resolved.restart_requested.is_empty());
+        assert_eq!(resolved.class_of(0), Some(ExitClass::Clean));
+    }
+
+    #[test]
+    fn exit_codes_above_the_portable_domain_are_refused() {
+        // 0..=255 is the portable exit-code domain: unix exit status carries
+        // the low 8 bits, so a code above 255 could never be observed there.
+        // 256 is the first refusal; 0 and 255 are the accepted edges.
+        for body in [
+            "restart_requested = [256]",
+            "clean = [1000]",
+            "restart_requested = [0, 65535]",
+        ] {
+            let m = Manifest::from_toml_str(&with_exit_codes(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains("list in the `[exit_codes]` section")
+                        && detail.contains("0..=255")),
+                "{body}: got {err}"
+            );
+        }
+        let edges = Manifest::from_toml_str(&with_exit_codes(
+            "restart_requested = [0, 255]\nclean = [128]",
+        ))
+        .expect("parse");
+        edges.validate().expect("the 0..=255 edges are accepted");
+    }
+
+    #[test]
+    fn exit_codes_duplicates_within_one_list_are_refused() {
+        for body in ["restart_requested = [75, 75]", "clean = [0, 0, 0]"] {
+            let m = Manifest::from_toml_str(&with_exit_codes(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains("list in the `[exit_codes]` section")
+                        && detail.contains("more than once")),
+                "{body}: got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn exit_codes_overlapping_lists_are_refused_naming_both_fields() {
+        let m = Manifest::from_toml_str(&with_exit_codes(
+            "restart_requested = [75, 9]\nclean = [0, 9]",
+        ))
+        .expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`[exit_codes]` section"
+                    && detail.contains("BOTH `restart_requested` and `clean`")
+                    && detail.contains('9')),
+            "the overlap must name both fields and the offending code: {err}"
+        );
+        // And the same overlap in the other declaration order.
+        let m = Manifest::from_toml_str(&with_exit_codes("clean = [3]\nrestart_requested = [3]"))
+            .expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("BOTH"), "got {err}");
+    }
+
+    #[test]
+    fn exit_codes_negative_values_fail_at_parse() {
+        // A negative code is not a process exit status at all — the `u16`
+        // field type refuses it at PARSE time (surfaced as the section-naming
+        // Toml error), like every other typed field.
+        let err = Manifest::from_toml_str(&with_exit_codes("clean = [-1]")).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    #[test]
+    fn class_of_refuses_a_code_in_both_lists_even_when_hand_built() {
+        // 18-3 review: `ExitCodeClasses` is `pub` with `pub` fields, so a
+        // construction path that skips `ExitCodes::classes` validation can
+        // carry an OVERLAP. The classifier must stay deterministic and
+        // single-answer: an ambiguous code classifies as NOTHING (a crash),
+        // never "whatever the ordered check hit first" — while unambiguous
+        // codes still classify normally.
+        let ambiguous = ExitCodeClasses {
+            restart_requested: vec![75, 9],
+            clean: vec![0, 9],
+        };
+        assert_eq!(ambiguous.class_of(9), None, "an overlap classifies nothing");
+        assert_eq!(ambiguous.class_of(75), Some(ExitClass::RestartRequested));
+        assert_eq!(ambiguous.class_of(0), Some(ExitClass::Clean));
+        assert_eq!(ambiguous.class_of(1), None, "a miss stays None");
+    }
+
+    // -- [lifecycle] pair rule + [drain] (story 18-4) ------------------------
+
+    /// Append a `[drain]` section carrying exactly `body` to [`VALID`].
+    fn with_drain(body: &str) -> String {
+        format!("{VALID}\n[drain]\n{body}\n")
+    }
+
+    #[test]
+    fn drain_section_parses_and_resolves() {
+        let m = Manifest::from_toml_str(&with_drain(
+            "timeout_ms = 5000\nidle_file = \"work/idle.marker\"",
+        ))
+        .expect("parse");
+        m.validate().expect("validate");
+        assert_eq!(
+            m.drain().expect("resolve").expect("declared"),
+            DrainSpec {
+                idle_file: Some("work/idle.marker".to_string()),
+                timeout_ms: 5000,
+            }
+        );
+    }
+
+    #[test]
+    fn no_drain_section_is_valid_and_resolves_to_none() {
+        // The pre-18-4 shape: no section — the engine's default drain posture
+        // (a declared pause command gets its default bound; nothing declared
+        // drains degenerately). Behavior must stay byte-identical for it.
+        let m = Manifest::from_toml_str(VALID).expect("parse");
+        m.validate().expect("validate");
+        assert!(m.drain().expect("resolve").is_none());
+    }
+
+    #[test]
+    fn drain_timeout_out_of_range_is_refused_naming_the_field() {
+        // 0 cannot bound a wait; >600_000 busts the declared ten-minute
+        // ceiling. The accepted edges are 1 and 600_000.
+        for body in [
+            "timeout_ms = 0",
+            "timeout_ms = 600_001",
+            "timeout_ms = 9_999_999",
+        ] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == "`timeout_ms` field in the `[drain]` section"
+                        && detail.contains("1..=600_000")),
+                "{body}: got {err}"
+            );
+        }
+        for body in ["timeout_ms = 1", "timeout_ms = 600_000"] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            m.validate().expect("the range edges are accepted");
+        }
+    }
+
+    #[test]
+    fn drain_missing_timeout_is_refused_naming_the_field() {
+        // `timeout_ms` is REQUIRED (not a serde default): an empty section is a
+        // declaration typo, refused at PARSE time naming the field (the same
+        // posture as every other required-by-deserialization field).
+        let err = Manifest::from_toml_str(&with_drain("")).unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::Toml { detail } if detail.contains("timeout_ms")),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn drain_idle_file_value_matrix_is_enforced() {
+        // The idle_file rules: non-empty, control-char-free, RELATIVE, and
+        // without a `..` escape. A good relative path passes.
+        for (body, field_fragment, detail_fragment) in [
+            ("timeout_ms = 100\nidle_file = \"\"", "idle_file", "empty"),
+            (
+                "timeout_ms = 100\nidle_file = \"idle\\u0001.marker\"",
+                "idle_file",
+                "control character",
+            ),
+            (
+                "timeout_ms = 100\nidle_file = \"/etc/passwd\"",
+                "idle_file",
+                "ABSOLUTE",
+            ),
+            (
+                "timeout_ms = 100\nidle_file = \"../outside.marker\"",
+                "idle_file",
+                "`..`",
+            ),
+        ] {
+            let m = Manifest::from_toml_str(&with_drain(body)).expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field.contains(field_fragment) && detail.contains(detail_fragment)),
+                "{body}: got {err}"
+            );
+        }
+        let ok = Manifest::from_toml_str(&with_drain("timeout_ms = 100\nidle_file = \"a/b\""))
+            .expect("parse");
+        ok.validate().expect("a relative in-home path is accepted");
+    }
+
+    #[test]
+    fn drain_unknown_fields_fail_at_parse() {
+        // deny_unknown_fields (the manifest style) catches typos at parse.
+        let err = Manifest::from_toml_str(&with_drain("timeout_ms = 100\nbogus = 1")).unwrap_err();
+        assert!(matches!(err, ManifestError::Toml { .. }), "got {err}");
+    }
+
+    #[test]
+    fn contract_v1_0_0_engine_rejects_the_drain_section() {
+        // The v1.0.0-rejection PIN, drain twin of the readiness/liveness/
+        // exit-codes ones: an engine built at contract 1.0.0 has a `Manifest`
+        // schema WITHOUT the `drain` field, and `deny_unknown_fields` refuses
+        // the unknown section at PARSE time. Simulated with the exact pre-18-4
+        // shape — the same section list, minus the 1.1.0 sections — against a
+        // 1.1.0 manifest that declares the section. The diagnostic must NAME
+        // it (`drain`).
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct V1EngineManifest {
+            #[allow(dead_code)]
+            contract_version: Option<String>,
+            #[allow(dead_code)]
+            adapter: Option<AdapterIdentity>,
+            #[allow(dead_code)]
+            lifecycle: Option<Lifecycle>,
+            #[allow(dead_code)]
+            capabilities: Option<CapabilityDeclaration>,
+            #[allow(dead_code)]
+            metering: Option<Metering>,
+            #[allow(dead_code)]
+            interaction: Option<Interaction>,
+            #[allow(dead_code)]
+            config: Option<ConfigMapping>,
+        }
+        let toml = with_drain("timeout_ms = 5000");
+        let err = toml::from_str::<V1EngineManifest>(&toml).unwrap_err();
+        assert!(err.to_string().contains("drain"), "got {err}");
+    }
+
+    #[test]
+    fn pause_without_resume_is_refused_naming_both_fields() {
+        // The 18-4 PAIR rule: exactly ONE of pause/resume is a legal-schema
+        // declaration with a TRAP semantic (an unresumable cooperative pause),
+        // so registration refuses it naming BOTH fields. Both directions are
+        // pinned (pause-only and resume-only); declaring BOTH passes. The
+        // splice point is `[lifecycle.stop]` — a full table header — so the
+        // inserted tables never swallow `VALID`'s own fields.
+        let pause_only = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.pause]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&pause_only).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`[lifecycle]` section"
+                    && detail.contains("`pause`")
+                    && detail.contains("`resume`")),
+            "the refusal must name both fields: {err}"
+        );
+
+        let resume_only = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.resume]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&resume_only).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(err.to_string().contains("`resume`"), "got {err}");
+
+        // The declared PAIR passes validation (the 18-4 target shape).
+        let pair = VALID.replacen(
+            "[lifecycle.stop]",
+            "[lifecycle.pause]\nexec = \"/bin/true\"\n\n\
+             [lifecycle.resume]\nexec = \"/bin/true\"\n\n[lifecycle.stop]",
+            1,
+        );
+        let m = Manifest::from_toml_str(&pair).expect("parse");
+        m.validate().expect("the declared pair is valid");
+    }
+
+    #[test]
+    fn drain_idle_file_naming_the_liveness_heartbeat_is_refused_naming_both() {
+        // The A8-i disjoint rule: the idle_file may not name the liveness
+        // heartbeat's own file. The heartbeat beats while the agent is
+        // ALIVE, so the drain's freshness wait on that very file would read
+        // "idle" within one beat of the drain entering — vacuously complete
+        // regardless of in-flight work, and the signal the operator thinks
+        // proves "work drained" would prove only "process alive". Refused
+        // naming BOTH files.
+        let collide = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"alive.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&collide).expect("parse");
+        let err = m.validate().unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, detail }
+                if field == "`idle_file` field in the `[drain]` section"
+                    && detail.contains("alive.marker")
+                    && detail.contains("DIFFERENT files")),
+            "got {err}"
+        );
+
+        // Different paths coexist legally (the intended shape: the heartbeat
+        // proves liveness, the idle_file proves drained work).
+        let distinct = format!(
+            "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+             [liveness]\n[liveness.heartbeat_file]\npath = \"alive.marker\"\nmax_age_ms = 5000\n"
+        );
+        let m = Manifest::from_toml_str(&distinct).expect("parse");
+        m.validate().expect("distinct paths are accepted");
+
+        // The rule is silent when either side is absent (no drain section, no
+        // idle_file, no heartbeat — the liveness http_get twin instead): every
+        // pre-review shape stays valid.
+        for body in [
+            VALID.to_string(),
+            format!("{VALID}\n[drain]\ntimeout_ms = 100\n"),
+            format!(
+                "{VALID}\n[drain]\ntimeout_ms = 100\nidle_file = \"idle.marker\"\n\n\
+                 [liveness]\n[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\"\n\
+                 expected_status = 200\nmax_age_ms = 5000\n"
+            ),
+        ] {
+            let m = Manifest::from_toml_str(&body).expect("parse");
+            m.validate().expect("rule is silent when a side is absent");
+        }
+    }
+
+    #[test]
+    fn drain_idle_file_windows_drive_prefix_is_refused_where_it_parses_as_one() {
+        // A8-ii: `C:foo` is a `Component::Prefix` (drive-RELATIVE) on Windows
+        // — not `is_absolute()`, yet it resolves against the current drive's
+        // working directory, outside the Agent Home the engine joins the path
+        // onto. Refused wherever the prefix component exists; on Unix the
+        // spelling is an ordinary relative name, so the same manifest is
+        // accepted (the check is a structural no-op there).
+        let m = Manifest::from_toml_str(&with_drain(
+            "timeout_ms = 100\nidle_file = \"C:foo.marker\"",
+        ))
+        .expect("parse");
+        // Data-driven OS branch (NOT `cfg!` — the boundary CI job forbids
+        // OS-conditional cfg outside the enumerated allowlist; see
+        // ci.yml's boundary step): the prefix component exists only on
+        // Windows builds of std.
+        if crate::os::OsId::current() == crate::os::OsId::Windows {
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == "`idle_file` field in the `[drain]` section"
+                        && detail.contains("drive")),
+                "got {err}"
+            );
+        } else {
+            m.validate()
+                .expect("no prefix component parses on Unix — accepted");
+        }
+    }
+
+    #[test]
+    fn lifecycle_pair_exec_and_args_are_control_char_free() {
+        // A8-iii: since 18-4 the pair's templates render VERBATIM into the
+        // pause-cooperative/resume-cooperative causes and operator
+        // diagnostics, so a control character in the executed pair's
+        // exec/args corrupts every surface that quotes the command. Scoped to
+        // the executed pair (start/stop pass straight to the OS spawn and are
+        // not rendered into causes). Both pair members are declared in every
+        // splice so the PAIR rule never fires first.
+        let pair_with = |op: &str, body: &str| -> String {
+            let (pause_body, resume_body) = if op == "pause" {
+                (body.to_string(), "exec = \"/bin/resume\"".to_string())
+            } else {
+                ("exec = \"/bin/pause\"".to_string(), body.to_string())
+            };
+            VALID.replacen(
+                "[lifecycle.stop]",
+                &format!(
+                    "[lifecycle.pause]\n{pause_body}\n\n\
+                     [lifecycle.resume]\n{resume_body}\n\n[lifecycle.stop]"
+                ),
+                1,
+            )
+        };
+        // exec refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(op, "exec = \"/bin/true\\u0001\""))
+                .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`exec` field in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // args[i] refusal, both pair members.
+        for op in ["pause", "resume"] {
+            let m = Manifest::from_toml_str(&pair_with(
+                op,
+                "exec = \"/bin/true\"\nargs = [\"--mode\", \"x\\u0007y\"]",
+            ))
+            .expect("parse");
+            let err = m.validate().unwrap_err();
+            assert!(
+                matches!(&err, ManifestError::InvalidField { field, detail }
+                    if field == &format!("`args[1]` element in the `[lifecycle.{op}]` op template")
+                        && detail.contains("control character")),
+                "{op}: got {err}"
+            );
+        }
+        // The clean pair passes (the intended shape rides the same splice).
+        let m =
+            Manifest::from_toml_str(&pair_with("pause", "exec = \"/bin/pause\"")).expect("parse");
+        m.validate().expect("a control-char-free pair is valid");
+        // Scoped exclusion: the SAME control byte in START (never rendered
+        // into causes; its argv goes straight to the OS spawn) is out of
+        // A8-iii's scope and still validates.
+        let start_body = VALID.replacen("exec = \"demo-agent\"", "exec = \"/bin/true\\u0001\"", 1);
+        let m = Manifest::from_toml_str(&start_body).expect("parse");
+        m.validate()
+            .expect("start is out of the A8-iii scope — not refused here");
     }
 }

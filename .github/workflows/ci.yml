@@ -845,6 +845,12 @@ jobs:
           fetch-depth: 0
       - name: Validate docs
         run: python3 scripts/check_docs.py
+      - name: Validate the docs-gate self-test (provenance-regex pins)
+        # The gate's own regex contract (19-1 review round 1): the `retro`
+        # provenance pattern's match/no-match samples, pinned so the pattern
+        # cannot silently re-open the hyphen-joined provenance hole (or break
+        # the `no-retro-repricing` wire token's verbatim quoting).
+        run: python3 scripts/check_docs.py --self-test
       - name: Validate release doc generation
         run: python3 scripts/generate_release_docs.py v0.0.0 --output-dir target/release-docs-test
       - name: Test automation helpers
@@ -1446,6 +1452,60 @@ jobs:
         # contributor's local build.
         run: cargo +1.96.1 check --workspace --all-targets
 
+  governance-vectors:
+    name: governance-vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify the vectors artifact checksum
+        # The published `.sha256` names the repo-relative path, so this
+        # verifies in place: the committed artifact IS the checksummed bytes.
+        run: sha256sum -c crates/hekma-engine/governance/vectors-v1.json.sha256
+      - name: Parse the vectors artifact (stand-in Host verification)
+        # What a non-Rust Host does with the artifact: parse JSON, pin the
+        # header, assert unique ids, both case kinds, and full rule coverage.
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path("crates/hekma-engine/governance/vectors-v1.json")
+          document = json.loads(path.read_text(encoding="utf-8"))
+          assert document["artifact"] == "hekma-governance-vectors", document["artifact"]
+          assert document["schema_version"] == 1, document["schema_version"]
+          assert document["vectors_version"], "vectors_version must be set"
+          kinds = {}
+          tags = set()
+          ids = set()
+          for case in document["cases"]:
+              kind = case["kind"]
+              kinds[kind] = kinds.get(kind, 0) + 1
+              assert case["id"] not in ids, f"duplicate case id {case['id']}"
+              ids.add(case["id"])
+              tags.update(case["covers"])
+          expected = {
+              "threshold-ge",
+              "latch-per-scope",
+              "latch-re-arm",
+              "token-before-dollar",
+              "integer-micros",
+              "round-half-up",
+              "saturation",
+              "no-retro-repricing",
+          }
+          missing = expected - tags
+          assert not missing, f"uncovered rules: {sorted(missing)}"
+          assert kinds.get("decision"), f"no decision cases: {kinds}"
+          assert kinds.get("derivation"), f"no derivation cases: {kinds}"
+          print(
+              "governance vectors ok:"
+              f" {len(document['cases'])} cases {kinds},"
+              f" {len(tags)} rules covered"
+          )
+          PY
+
   coverage:
     name: coverage
     # 2026-10-17 (#292): pinned to ubuntu-26.04 like the test matrix's linux
@@ -1460,7 +1520,7 @@ jobs:
     # freeze — so the pin moves the last 24.04 consumer off the drifting
     # ubuntu-latest label (migrating Oct 19–Nov 19 anyway).
     runs-on: ubuntu-26.04
-    needs: [fmt, clippy, test, build, docs, boundary, semver]
+    needs: [fmt, clippy, test, build, docs, boundary, semver, governance-vectors]
     # 90: the FIRST run on a cold coverage cache must compile the ENTIRE dependency
     # graph WITH coverage instrumentation — a separate fingerprint from the other
     # jobs' normal-profile target, so nothing is reusable. That one-time cold build
@@ -1574,9 +1634,11 @@ jobs:
         # already printed, so a per-crate OOM is diagnosable (which crate, at what
         # `free`/`df`) instead of one opaque --workspace failure.
         #
-        # Flags unchanged from the --workspace gate: --engine llvm (parity with the
-        # local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
-        # instrumented target), --timeout 180 (raise tarpaulin's 60 s per-test cap),
+        # Flags unchanged from the --workspace gate: --engine llvm (parity with
+        # the local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
+        # instrumented target), --timeout "$tarp_timeout" (a per-crate budget —
+        # see the case arm in the loop below — raising tarpaulin's 60 s
+        # per-test-binary cap),
         # --verbose (progress). Env unchanged (AI-23): RUST_TEST_THREADS=1 runs the
         # instrumented tests serially; CARGO_PROFILE_DEV_DEBUG=1 builds line-tables-
         # only debuginfo (smaller instrumented binaries, coverage unchanged). The
@@ -1701,6 +1763,23 @@ jobs:
             echo "--- resources before $pkg ---"
             free -h || true
             df -h / || true
+            # Per-crate tarpaulin budget (#334): --timeout is tarpaulin's
+            # PER-TEST-BINARY cap, and the flat 180 s held every crate until
+            # the epic-18 engine suites landed — exit_codes/drain/liveness/
+            # readiness are wall-clock-bound (real stability windows, restart
+            # ladders, sleeps) and run SERIALLY (RUST_TEST_THREADS=1), so the
+            # exit_codes binary alone needs >180 s under llvm instrumentation.
+            # Observed: killed at exactly 180 s mid-suite, deterministically,
+            # on 8/8 attempts across two stacked PRs — a wall-clock overrun
+            # the 4-attempt retry loop below can never converge. The engine
+            # gets 420 s (≈2× the observed need); every other crate keeps the
+            # 180 s default. Bounded either way: a genuinely hung engine
+            # binary still fails in 4 × 420 s = 28 min worst case, inside the
+            # 90-min job wall.
+            case "$pkg" in
+              hekma-engine) tarp_timeout=420 ;;
+              *) tarp_timeout=180 ;;
+            esac
             # Bounded per-crate retry (2026-09-28, #239): the llvm_profparser
             # merge intermittently dies on "llvm_profparsers works on complete
             # data" — a same-SHA run-to-run flip, so this converges. Each
@@ -1734,7 +1813,7 @@ jobs:
               rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
               cargo +stable build -p hekma-conformance --bin fake_agent \
                 --bin hermes_shim --bin fake_acp_agent
-              if cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              if cargo +stable tarpaulin --engine llvm --skip-clean --timeout "$tarp_timeout" --verbose \
                   --exclude-files 'crates/hekma-conformance/src/bin/*' \
                   --exclude-files 'crates/hekma-engine/examples/*' \
                   -p "$pkg" --out Lcov --output-dir "cov/$pkg"; then

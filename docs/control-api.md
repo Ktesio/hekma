@@ -71,6 +71,7 @@ it).
 | `POST` | `/v0/instances/{name}/stop` | Stop through the bounded ladder; optional body `{"window_secs": N}` (1..=86400, out-of-bounds is a 400). A PRESENT body must parse — only a truly ABSENT body means the engine's default window | 200 + read-back |
 | `POST` | `/v0/instances/{name}/pause` | Pause the agent | 200 + read-back |
 | `POST` | `/v0/instances/{name}/resume` | Resume a paused agent | 200 + read-back |
+| `POST` | `/v0/instances/{name}/drain` | Drain the agent (pause command → bounded idle wait → stop); optional body `{"timeout_ms": N}` (`1..=600000`, out-of-bounds is a 400; a truly absent body means the manifest tier, else the engine default). BOTH outcomes are `200` — a timed-out drain still stopped the agent, and the document reports it honestly (`completed: false`, with `waited_ms` the measured wait) rather than as an error. Draining a non-running instance is refused with the lifecycle verbs' 409 conflict, and so is a declared pause command that fails (nonzero exit / spawn failure / overrun — the adapter refused the verb, the agent is untouched, so it is a retryable 409 `conflict` carrying the rendered command, never a 500). The response is `{"schema_version", "instance", "completed", "waited_ms"}` | 200 + read-back + outcome |
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
@@ -147,7 +148,7 @@ layer: without a valid bearer, any path answers `401` first.
 | `invalid_name` | 400 | The instance name is not a legal name |
 | `not_found` | 404 | The instance does not exist — or the path matches no route |
 | `method_not_allowed` | 405 | The path exists but the method does not |
-| `conflict` | 409 | The action contradicts the instance's state (stop on a stopped instance; remove a running one) |
+| `conflict` | 409 | The action contradicts the instance's state (stop on a stopped instance; remove a running one) — or the adapter's own lifecycle command refused it (a pause/resume/drain command that exits nonzero, cannot spawn, or overruns its bound; the instance's state is untouched and the error names the rendered command) |
 | `cursor_invalid` | 409 | The cursor contradicts the journal: the per-instance pull's cursor PAST the family's committed count, an export cursor below the outbox journal's retained floor or PAST its committed tail, or an export ack past the tail — the engine's truncation/retention guards, surfaced verbatim (never a clamp) |
 | `internal` | 500 | Something failed on the host side; the message names it |
 
