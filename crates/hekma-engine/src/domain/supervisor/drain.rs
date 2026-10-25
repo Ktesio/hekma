@@ -803,4 +803,212 @@ mod tests {
         // with ONE honest note — never blocks past it.
         assert_eq!(KILL_REAP_BOUND, Duration::from_secs(5));
     }
+
+    // -- Coverage repair (AD-21's pool): the bounded-command runner's real
+    // arms — spawn failure, nonzero exit (quiet + stderr tail), the overrun
+    // kill, the unrepresentable bound, and the kill-on-drop guard. The
+    // lingering/failing child is THIS test binary re-exec'd into a helper
+    // (the agent_cli suite's cross-OS pattern; no cfg anywhere).
+
+    /// The re-exec helper target: with `KTESIO_DRAIN_HELPER` unset this is a
+    /// trivial pass; with a mode it becomes the child the tests need.
+    #[test]
+    fn drain_bounded_command_helper_subprocess() {
+        let Ok(mode) = std::env::var("KTESIO_DRAIN_HELPER") else {
+            return;
+        };
+        match mode.as_str() {
+            // A command that never finishes on its own — the overrun legs.
+            "linger" => std::thread::sleep(Duration::from_secs(60)),
+            // A command that fails WITHOUT saying why (the empty-tail arm).
+            "fail-quiet" => hekma_conformance::exit_helper_subprocess(3),
+            // A command that fails WITH its own printed why (the stderr-tail
+            // arm — the reader thread captures it while the child runs).
+            "fail-noisy" => {
+                eprint!("the pause command's own printed why");
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+                hekma_conformance::exit_helper_subprocess(3);
+            }
+            _ => {}
+        }
+    }
+
+    /// The re-exec helper invocation's libtest args (the FULL module-path
+    /// test name — `--exact` matches the whole name in the lib test binary).
+    fn helper_args() -> Vec<String> {
+        vec![
+            "--exact".to_string(),
+            "domain::supervisor::drain::tests::drain_bounded_command_helper_subprocess".to_string(),
+            "--nocapture".to_string(),
+        ]
+    }
+
+    /// The helper as a [`StartLaunch`] (the re-exec invocation).
+    fn helper_launch(mode: &str) -> StartLaunch {
+        StartLaunch {
+            exec: std::env::current_exe()
+                .expect("test exe")
+                .to_string_lossy()
+                .into_owned(),
+            args: helper_args(),
+            env: [("KTESIO_DRAIN_HELPER".to_string(), mode.to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn run_bounded_command_reports_a_spawn_failure_as_failed_with_the_exec_named() {
+        let home = tempfile::tempdir().unwrap();
+        let outcome = run_bounded_command(
+            home.path(),
+            &StartLaunch {
+                exec: "/definitely/not/an/executable/path".to_string(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        match outcome {
+            BoundedCommandOutcome::Failed { detail } => {
+                assert!(
+                    detail.contains("could not spawn"),
+                    "the spawn failure names itself: {detail}"
+                );
+                assert!(
+                    detail.contains("/definitely/not/an/executable/path"),
+                    "the detail names the exec: {detail}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bounded_command_reports_a_nonzero_exit_with_and_without_a_stderr_tail() {
+        let home = tempfile::tempdir().unwrap();
+        // Quiet failure: the detail carries NO stderr suffix (the empty-tail
+        // arm — an honest "no why was printed" instead of a fabricated one).
+        let outcome = run_bounded_command(
+            home.path(),
+            &helper_launch("fail-quiet"),
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        );
+        match outcome {
+            BoundedCommandOutcome::Failed { detail } => {
+                assert!(detail.contains("exited"), "{detail}");
+                assert!(
+                    !detail.contains("stderr"),
+                    "a silent command's failure must not invent a tail: {detail}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Noisy failure: the adapter's own printed why rides the detail —
+        // the whole point of the bounded stderr tail.
+        let outcome = run_bounded_command(
+            home.path(),
+            &helper_launch("fail-noisy"),
+            Duration::from_secs(30),
+            Duration::from_millis(10),
+        );
+        match outcome {
+            BoundedCommandOutcome::Failed { detail } => {
+                assert!(
+                    detail.contains("the pause command's own printed why"),
+                    "the captured stderr tail rides the failure: {detail}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_bounded_command_kills_a_command_that_overruns_its_bound() {
+        // The bound is REAL: a command that outlives it is killed and reaped
+        // (bounded) and the outcome is Overran with no unreaped note — a
+        // normal child reaps promptly after its kill.
+        let home = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = run_bounded_command(
+            home.path(),
+            &helper_launch("linger"),
+            Duration::from_millis(250),
+            Duration::from_millis(10),
+        );
+        match outcome {
+            BoundedCommandOutcome::Overran { unreaped_note } => {
+                assert!(
+                    unreaped_note.is_none(),
+                    "a killable child reaps promptly: {unreaped_note:?}"
+                );
+            }
+            other => panic!("expected Overran, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the overrun path is bounded, not a hang"
+        );
+    }
+
+    #[test]
+    fn run_bounded_command_treats_an_unrepresentable_bound_as_already_expired() {
+        // The saturating-deadline rule: a bound that cannot be represented
+        // as an Instant ends IMMEDIATELY (the deadline IS now) — never a
+        // panic, never an unbounded wait.
+        let home = tempfile::tempdir().unwrap();
+        let outcome = run_bounded_command(
+            home.path(),
+            &helper_launch("linger"),
+            Duration::from_secs(u64::MAX),
+            Duration::from_millis(10),
+        );
+        assert!(
+            matches!(outcome, BoundedCommandOutcome::Overran { .. }),
+            "the unrepresentable bound expires at once: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn kill_on_drop_kills_an_armed_child_and_disarm_spares_a_reaped_one() {
+        // The A6 guard: dropping a STILL-ARMED guard kills the child (an
+        // engine death mid-command never orphans it); after `disarm` (the
+        // exited-and-reaped path) the drop must not signal anything.
+        let home = tempfile::tempdir().unwrap();
+        let launch = helper_launch("linger");
+        // The ARMED drop: the guard fires and the lingering child is killed
+        // best-effort (no blocking wait on a drop path — there is no caller
+        // left to surface a note to).
+        let mut command = std::process::Command::new(&launch.exec);
+        command
+            .args(&launch.args)
+            .current_dir(home.path())
+            .env("KTESIO_DRAIN_HELPER", "linger")
+            .stdin(std::process::Stdio::null());
+        let armed = KillOnDrop {
+            child: command.spawn().expect("the armed child spawns"),
+            armed: true,
+        };
+        drop(armed);
+        std::thread::sleep(Duration::from_millis(200));
+        // The DISARM path: a child that already exited and was reaped is
+        // dropped without a kill (a kill after a reap could signal a
+        // recycled pid).
+        let mut command2 = std::process::Command::new(&launch.exec);
+        command2
+            .args(&launch.args)
+            .current_dir(home.path())
+            .env("KTESIO_DRAIN_HELPER", "fail-quiet")
+            .stdin(std::process::Stdio::null());
+        let mut reaped = KillOnDrop {
+            child: command2.spawn().expect("the exiting child spawns"),
+            armed: true,
+        };
+        let _ = reaped.child.wait().expect("the child is reaped");
+        reaped.disarm();
+        drop(reaped);
+    }
 }

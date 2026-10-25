@@ -36,6 +36,7 @@
 mod control;
 mod drain;
 mod lock;
+mod otlp;
 mod signals;
 
 use std::path::PathBuf;
@@ -43,6 +44,10 @@ use std::sync::{Arc, Mutex};
 
 pub use drain::{drain_and_stop, drain_plan, DrainOutcome, StopResult};
 pub use lock::{read_holder_pid, HostLock, LockRefusal};
+// The exporter's operator-facing configuration types (AD-21): ServeOptions
+// carries the parsed flags; the parse itself lives on ONE site
+// (`OtlpOptions::from_flags`) both CLI surfaces call.
+pub use otlp::{OtlpExporter, OtlpHeaderValue, OtlpOptions};
 
 /// The engine's diagnostic sink contract, re-used verbatim: one
 /// `Arc<Mutex<Box<dyn Write + Send>>>` the host's (and the engine's)
@@ -93,6 +98,12 @@ pub struct ServeOptions {
     /// The sink for host + engine notices. `None` (the default) routes both
     /// to stderr, byte-compatible with the engine's no-sink behavior.
     pub diagnostics: Option<DiagnosticSink>,
+    /// The OTLP telemetry exporter's configuration (AD-21). The DEFAULT is
+    /// the exporter ABSENT — with no endpoint configured no task is
+    /// spawned and nothing dials out (the structural privacy default,
+    /// test-proven). Header values may be `secret:NAME` references; their
+    /// Debug (and this struct's) never shows one.
+    pub otlp: OtlpOptions,
 }
 
 /// The inclusive lower bound of every stop-window option (whole seconds):
@@ -120,6 +131,9 @@ impl std::fmt::Debug for ServeOptions {
             .field("bearer_secret", &self.bearer_secret)
             .field("log_capture", &self.log_capture)
             .field("diagnostics", &self.diagnostics.as_ref().map(|_| "<sink>"))
+            // The OtlpOptions Debug redacts header VALUES (the no-leak
+            // discipline: a literal header value IS secret material).
+            .field("otlp", &self.otlp)
             .finish()
     }
 }
@@ -316,6 +330,7 @@ where
         bearer_secret,
         log_capture,
         diagnostics,
+        otlp,
     } = options;
     let has_caller_sink = diagnostics.is_some();
     let notifier = match diagnostics {
@@ -377,6 +392,21 @@ where
         }
     }
     let control_addr = control_listen;
+
+    // (0.5) The OTLP exporter's options, validated BEFORE anything is
+    // touched (the same rejected-INVOCATION class): a non-http endpoint,
+    // an out-of-bounds flush interval, headers without an endpoint, or a
+    // malformed header spec is `InvalidOptions` — never a runtime surprise
+    // mid-open. The default (no endpoint) validates trivially: the
+    // exporter simply does not exist.
+    let otlp_options = otlp;
+    if let Err(message) = otlp_options.validate() {
+        let err = ServeError::InvalidOptions { message };
+        if has_caller_sink {
+            notifier.note(&err.to_string());
+        }
+        return Err(err);
+    }
 
     // (1) The state root, via the engine's path authority (the host NEVER
     // joins path segments of the state layout itself — only the engine's own
@@ -473,6 +503,30 @@ where
                 }
             }
         }
+    };
+
+    // (2.6) The OTLP exporter's secret header references — resolved ONCE,
+    // through the same composite the bearer uses (env, then the state-dir
+    // secrets file — AD-10), AFTER the lock and BEFORE the runtime: an
+    // unresolvable reference is a typed refusal NAMING the secret (the
+    // `--bearer-secret` rule; the I/O matrix's exit-2 class) and NOTHING
+    // binds, NOTHING opens. The RESOLVED values are consumed only by the
+    // HTTP client — never options, notices, or logs.
+    let otlp_headers_resolved = if otlp_options.configured() {
+        let resolver =
+            hekma_engine::ports::CompositeSecretResolver::env_then_file(paths.secrets_file());
+        match otlp_options.resolve_headers(&resolver) {
+            Ok(headers) => Some(headers),
+            Err(message) => {
+                let err = ServeError::InvalidOptions { message };
+                if has_caller_sink {
+                    notifier.note(&err.to_string());
+                }
+                return Err(err);
+            }
+        }
+    } else {
+        None
     };
 
     // (3) The host runtime — built BEFORE the engine opens (review finding
@@ -621,6 +675,38 @@ where
         _ => None,
     };
 
+    // (5.6) The OTLP telemetry exporter mounts here (AD-21) — the SAME
+    // mount shape as the Control API: AFTER the engine opens, BEFORE the
+    // signal wait. With NO endpoint configured (the default) this block is
+    // skipped ENTIRELY — no task is spawned, no socket is dialed, serve is
+    // byte-identical to the pre-exporter host (the structural privacy
+    // default, asserted by tests/otlp_export.rs). The exporter subscribes
+    // READ-ONLY to the engine's public event bus (lock-free, publish-after-
+    // commit honored by the bus contract) and degrades visibly — every
+    // drop/delivery failure is a surfaced note plus the
+    // `hekma.otlp.dropped` self-metric, never an error into supervision.
+    let exporter = match otlp_options.configured() {
+        false => None,
+        true => {
+            let headers = otlp_headers_resolved.unwrap_or_default();
+            let config = otlp::task::ExporterConfig {
+                endpoint: otlp_options
+                    .endpoint
+                    .clone()
+                    .expect("validated configured() means an endpoint"),
+                headers,
+                flush_interval: std::time::Duration::from_secs(
+                    otlp_options.effective_flush_interval(),
+                ),
+                service_instance_id: otlp::service_instance_id(paths.state_base()),
+            };
+            let rx = engine.subscribe();
+            let exporter =
+                rt.block_on(async { otlp::OtlpExporter::start(rx, config, notifier.sink.clone()) });
+            Some(exporter)
+        }
+    };
+
     // (6) Resolve the received signal's name — either it already arrived
     // during the arming window or the open (held by the armed streams), or
     // we wait for it now. The streams stay armed through the whole drain
@@ -646,6 +732,29 @@ where
         "{received} received; stopping running and paused agents (graceful window {}s) ...",
         window.as_secs_f32()
     ));
+
+    // (6.4) The OTLP exporter stops BEFORE/WITH the Control API (the AD-21
+    // shutdown order): fire the handshake, await the bounded final flush
+    // within the exporter's OWN bound (P7: the task's FINAL_FLUSH_BOUND —
+    // the constant, never a re-hardcoded magic number) — the host's exit is
+    // never held past it. The task's own notes carry the honest in-flight
+    // outcome (lost points named; cumulative sums reset at restart).
+    if let Some(exporter) = exporter {
+        let lost = rt.block_on(exporter.shutdown(otlp::task::FINAL_FLUSH_BOUND));
+        notifier.note("otlp export stopped; telemetry export ends before the shutdown drain");
+        match lost {
+            Some(0) => {}
+            Some(n) => notifier.note(&format!(
+                "otlp export: {n} in-flight observation(s) were NOT delivered at stop \
+                 (cumulative sums reset at restart — the documented restart-reset)"
+            )),
+            // The task could not be awaited within the bound: say so.
+            None => notifier.note(
+                "otlp export: the exporter task did not settle within its stop bound — \
+                 it no longer blocks the shutdown; supervision continues",
+            ),
+        }
+    }
 
     // (6.5) The API stops accepting FIRST (the frozen mount order): graceful
     // shutdown of the accept loop and a bounded grace for in-flight requests.

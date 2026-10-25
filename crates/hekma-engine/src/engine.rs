@@ -1262,6 +1262,24 @@ impl Engine {
         crate::shutdown::drain_and_stop(self, window, &notes).await
     }
 
+    /// Epic 20-1 coverage seam (cfg(test) only — the established
+    /// fault-injection idiom, see [`Supervisor`]'s `stop_fault_pids` field
+    /// docs): arm the stop fault for a HELD instance's pid, so the shutdown
+    /// drain's failed-stop arms (the honest `Failed` outcome against a row
+    /// the fleet still reports) are stageable hermetically through a real
+    /// `Engine`. No-op when no live handle is held under `name`. Lib-test
+    /// only; production binaries do not even compile it.
+    #[cfg(test)]
+    pub(crate) fn arm_test_stop_fault(&self, name: &str) {
+        use crate::domain::StopFault;
+        let inner = Arc::clone(&self.inner);
+        let name = InstanceName::new(name).expect("test instance name");
+        let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+        if let Some(pid) = supervisor.held_pid(&name) {
+            supervisor.arm_stop_fault(pid, StopFault::Fail);
+        }
+    }
+
     /// Pause a running Agent Instance with honest, per-OS semantics (story 1-5,
     /// AC1/AC2/AC3). Drives the supervisor's three-level dispatch on the effective
     /// (current-OS) pause `SupportLevel`: guaranteed → real SIGSTOP suspension +

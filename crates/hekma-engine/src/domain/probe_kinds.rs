@@ -466,4 +466,122 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -- Coverage repair (AD-21's pool): the total, never-panicking arms of
+    // the attempt evaluators — each a real behavioral pin, not a line chase.
+
+    /// A tiny accept-and-respond server for one attempt: `mode` decides what
+    /// the peer does after accepting.
+    fn one_shot_peer(mode: PeerMode) -> std::net::SocketAddr {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("peer bind");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            match mode {
+                PeerMode::CloseImmediately => drop(stream),
+                PeerMode::SendThenClose(head) => {
+                    let _ = stream.write_all(&head);
+                    let _ = stream.flush();
+                }
+                PeerMode::FloodWithoutStatusLine => {
+                    let chunk = [b'x'; 4096];
+                    for _ in 0..4 {
+                        let _ = stream.write_all(&chunk);
+                    }
+                    let _ = stream.flush();
+                }
+            }
+            // The peer holds the accepted socket until the attempt ends (or
+            // its own write closes it) — drop closes it either way.
+        });
+        addr
+    }
+
+    enum PeerMode {
+        CloseImmediately,
+        SendThenClose(Vec<u8>),
+        FloodWithoutStatusLine,
+    }
+
+    #[test]
+    fn http_get_attempt_is_a_plain_false_on_unsplitable_and_unresolvable_urls() {
+        // Lines 70/73: the split and authority-parse early returns — the
+        // total, never-panicking answer for a URL the probe cannot even
+        // address. No connection is attempted, no panic escapes.
+        let deadline = Instant::now() + _Duration::from_secs(1);
+        assert!(!http_get_attempt("not-a-url", 200, deadline));
+        assert!(!http_get_attempt("https://127.0.0.1/health", 200, deadline));
+        assert!(!http_get_attempt(
+            "http://localhost:9/health",
+            200,
+            deadline
+        ));
+    }
+
+    #[test]
+    fn http_get_attempt_is_a_plain_false_when_nothing_listens() {
+        // Line 88: the connect-refusal early return — the normal pre-ready
+        // state, answered `false` for the caller's own retry cadence.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // the port is closed again
+        let deadline = Instant::now() + _Duration::from_secs(2);
+        assert!(!http_get_attempt(
+            &format!("http://{addr}/health"),
+            200,
+            deadline
+        ));
+    }
+
+    #[test]
+    fn http_get_attempt_parses_whatever_completed_when_the_peer_closes_first() {
+        // Lines 114 + 131: a peer that accepts and closes with NO bytes ends
+        // the read loop at EOF; the final status-line parse answers false —
+        // and a peer that sends a complete NON-matching status line answers
+        // false through the same final parse.
+        let addr = one_shot_peer(PeerMode::CloseImmediately);
+        let deadline = Instant::now() + _Duration::from_secs(2);
+        assert!(!http_get_attempt(
+            &format!("http://{addr}/health"),
+            200,
+            deadline
+        ));
+        let addr = one_shot_peer(PeerMode::SendThenClose(
+            b"HTTP/1.1 500 Internal Server Error\r\n\r\n".to_vec(),
+        ));
+        let deadline = Instant::now() + _Duration::from_secs(2);
+        assert!(!http_get_attempt(
+            &format!("http://{addr}/health"),
+            200,
+            deadline
+        ));
+    }
+
+    #[test]
+    fn http_get_attempt_caps_a_peer_that_never_completes_a_status_line() {
+        // Lines 124/125: a peer that keeps talking but never sends a
+        // `\r\n`-terminated line is cut off at HTTP_READ_CAP_BYTES; the
+        // attempt still answers (false — the truncated head parses as no
+        // status) instead of reading forever.
+        let addr = one_shot_peer(PeerMode::FloodWithoutStatusLine);
+        let deadline = Instant::now() + _Duration::from_secs(5);
+        assert!(!http_get_attempt(
+            &format!("http://{addr}/health"),
+            200,
+            deadline
+        ));
+    }
+
+    #[test]
+    fn parse_authority_refuses_malformed_bracket_forms_and_nonnumeric_ports() {
+        // Lines 167/181: the bracketed-IPv6 junk-suffix arm and the
+        // non-numeric-port arm — both a per-attempt None, though validation
+        // refuses both long before any runner runs.
+        assert_eq!(parse_authority("[::1]junk"), None);
+        assert_eq!(parse_authority("[::1:notaport]"), None);
+        assert_eq!(parse_authority("127.0.0.1:http"), None);
+    }
 }

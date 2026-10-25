@@ -11,6 +11,7 @@
     "commands",
     "control-api",
     "hosting",
+    "telemetry",
     "manifest",
     "adapter-contract",
     "agents",

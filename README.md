@@ -20,6 +20,7 @@ An *agent* here is a program that calls a language model on your behalf: a codin
 |---|---|
 | **Lifecycle** | `start`, `stop`, `pause` and `resume` any agent through one state machine. Crashes are recorded and restarted with backoff, and the fleet's state survives a reboot. |
 | **Metering** | Counts input, output and cached tokens, either reported by the agent or read off the wire by a proxy on `127.0.0.1`. |
+| **Telemetry export** | Opt-in OTLP/HTTP+JSON metrics export to any OpenTelemetry-compatible collector (`--otlp-endpoint` on `hekma serve`) — token usage, budget breaches, derived cost, lifecycle state. Off by default: no endpoint, no exporter. [Telemetry docs](https://hekma.ktesio.dev/docs/telemetry/). |
 | **Budgets** | Token and dollar ceilings, per run or over the agent's life, with a `pause`, `stop` or `warn` action applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
 | **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. The [adapter gallery](https://hekma.ktesio.dev/docs/adapters/) is the validated index of which agents run today, with per-capability honesty tables. |
 | **Scripting** | Versioned JSON output and stable exit codes on every command. |
