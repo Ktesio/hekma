@@ -361,3 +361,16 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-18-4-cooperative-pause-drain.md` (review round 1, 2026-10-24 — item D2)
   summary: The lifecycle-command overrun kill is SINGLE-PID — `run_bounded_command` kills the direct child only (`kill_and_reap_bounded` → `std::process::Child::kill`, plus the `KillOnDrop` fire-and-forget guard), NOT the child's process group / job object (the STOP ladder's escalation is group-based; this seam is not). A pause command that spawns its own children and then overruns its cap leaves those GRANDCHILDREN orphaned and running after the kill — the engine reports the overrun honestly (with the bounded-reap note when even the direct child would not confirm), but the collateral processes are the adapter's to manage. A process-group/job-object lifecycle for spawned commands needs a backend-trait seam (spawn-into-group + group-kill across Linux/macOS/Windows job objects) — an adapter-api/backend shape change, not a review patch.
   evidence: `crates/hekma-engine/src/domain/supervisor/drain.rs` (`run_bounded_command` — plain `Command::spawn`, `kill_and_reap_bounded`, `KillOnDrop`; no `process_group`/job-object plumbing, contrast the stop ladder's group-based escalation); the B7 TERM-immune drill (`sh -c "trap '' TERM; sleep 60"`) pins the direct-child kill only. Trigger: an adapter's pause command reports orphaned grandchildren after a cap kill (or a review of a future command-spawning surface asks for group semantics).
+
+
+## Deferred from: spec-20-3 review triage (2026-10-24)
+
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: fragment anchors unvalidated)
+  summary: check_docs strips `#fragment` targets, so the gallery's deep anchors (adapter-contract.md#…, agents.md#the-re-validation-duty) break silently when a heading is reworded — fragment-existence validation is deferred.
+  evidence: scripts/check_docs.py validate_link skips http(s) and fragments (:242-248); ten gallery pages lean on deep anchors. Trigger: the first heading reword breaks a gallery link.
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: lane cost as the gallery grows)
+  summary: the gallery lane runs the full TCK suite serially per manifest (~4s each today); pacing (subsets, parallelization, or a budget cap) is deferred until the manifest count grows.
+  evidence: gallery_manifests.rs single-loop design; measured 3.7-3.9s per manifest at one entry. Trigger: manifest entries grow past a handful or the lane exceeds its budget on windows-latest.
+- source_spec: `spec-20-3-adapter-gallery.md` (review finding: same comment error upstream)
+  summary: crates/hekma-engine/tests/hermes.rs carries the same misattributed SAFETY comment ("edition 2024 requires the unsafe block") — fixed in the gallery test, deferred there (untouched file).
+  evidence: set_var/remove_var are unsafe on all editions since Rust 1.82; the workspace is edition 2021. Trigger: any change touching that block.

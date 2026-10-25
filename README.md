@@ -21,7 +21,7 @@ An *agent* here is a program that calls a language model on your behalf: a codin
 | **Lifecycle** | `start`, `stop`, `pause` and `resume` any agent through one state machine. Crashes are recorded and restarted with backoff, and the fleet's state survives a reboot. |
 | **Metering** | Counts input, output and cached tokens, either reported by the agent or read off the wire by a proxy on `127.0.0.1`. |
 | **Budgets** | Token and dollar ceilings, per run or over the agent's life, with a `pause`, `stop` or `warn` action applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
-| **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. |
+| **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. The [adapter gallery](https://hekma.ktesio.dev/docs/adapters/) is the validated index of which agents run today, with per-capability honesty tables. |
 | **Scripting** | Versioned JSON output and stable exit codes on every command. |
 | **Embedding** | The engine is the `hekma-engine` crate, with an event stream, so your program can run the fleet without the CLI. |
 
@@ -105,7 +105,7 @@ The engine runs in your process with a blocking or async API, an event stream, a
 
 ## Write an adapter
 
-An adapter tells Hekma how to launch an agent, what it supports on each OS, and where its token counts come from. Most agents need only an `adapter.toml` ([reference](https://hekma.ktesio.dev/docs/manifest/)). The conformance kit, `hekma-conformance`, checks an adapter against the versioned [adapter contract](https://hekma.ktesio.dev/docs/adapter-contract/) from an ordinary `cargo test`. It is not on crates.io yet, so depend on it by git, pinned to a release commit:
+An adapter tells Hekma how to launch an agent, what it supports on each OS, and where its token counts come from. Most agents need only an `adapter.toml` ([reference](https://hekma.ktesio.dev/docs/manifest/)). Before writing one, check the [adapter gallery](https://hekma.ktesio.dev/docs/adapters/) — ten seed agents (Copilot CLI, Hermes Agent, opencode, Claude Code, Codex, Gemini CLI, goose, Crush, Aider, Cursor CLI) already carry an honesty table and, for Aider, a CI-validated manifest you can copy. The conformance kit, `hekma-conformance`, checks an adapter against the versioned [adapter contract](https://hekma.ktesio.dev/docs/adapter-contract/) from an ordinary `cargo test`. It is not on crates.io yet, so depend on it by git, pinned to a release commit:
 
 ```toml
 [dev-dependencies]
