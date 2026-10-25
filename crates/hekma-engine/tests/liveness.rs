@@ -1304,25 +1304,75 @@ fn expired_detached_wedge_is_force_killed_and_the_restart_rebinds_its_port() {
         "the adopted wedge's window to expire",
     );
 
-    // THE P4 PIN: at the failure the wedge is DEAD — nobody serves the port.
-    // The wedge's endpoint, while alive, still ACCEPTS connections by design
-    // (that is the wedge), so an ESTABLISHED connect is the one refuting
-    // outcome. A refused connection is the Unix shape for "no listener"; a
-    // just-terminated listener can surface as a different error kind on
-    // Windows, so the pin is "the connect must not ESTABLISH", with the full
-    // outcome in the message when it does (windows-latest triage 2026-10-24 —
-    // the bare assert could not distinguish a surviving wedge from a
-    // non-refused dead-listener error kind).
+    // THE P4 PIN: at the failure the wedge is DEAD — nobody serves the port
+    // as the WEDGE. The wedge's endpoint, while alive, still ACCEPTS
+    // connections by design (that is the wedge), so an ESTABLISHED connect
+    // is the one refuting outcome. A refused connection is the Unix shape
+    // for "no listener"; a just-terminated listener can surface as a
+    // different error kind on Windows, so the pin is "the connect must not
+    // ESTABLISH", with the full outcome in the message when it does
+    // (windows-latest triage 2026-10-24 — the bare assert could not
+    // distinguish a surviving wedge from a non-refused dead-listener error
+    // kind).
     // The force-kill runs BEFORE the failure commits, so Failed already
-    // implies the teardown happened.
+    // implies the teardown happened — and, since the backend's confirm_death
+    // polls to the SIGNALED process object (layer 8), it also implies the
+    // wedge is truly gone, not merely termination-initiated.
+    //
+    // Layer 9 (windows-latest triage 2026-10-25): that honesty flipped which
+    // process can answer this connect. `Failed` now commits at TRUE death,
+    // and the on-failure policy may rebind the SAME port with the
+    // replacement within one supervisor cadence of that commit — on a loaded
+    // runner the replacement's bind beats the test's 50ms state poll. An
+    // ESTABLISHED connect at observation time is therefore ambiguous between
+    // "the original wedge survived the kill" (a real supervision failure)
+    // and "the replacement already rebound" (the system working as designed
+    // — the bind is EXCLUSIVE, so a rebound port is itself proof the wedge
+    // released it). Discriminate through the engine, not the socket: only a
+    // restart that reaches Running can own an answering port; a port that
+    // answers while the instance still sits Failed (no restart, or a
+    // replacement that could not bind) is a genuine surviving wedge. The
+    // observation window only has to span a spawn that has ALREADY BOUND —
+    // the only thing that can answer this connect — so a bound replacement
+    // reaches Running well inside it; a slower first bind would have left
+    // this very connect refused and passed above.
     let wedge_connect =
         std::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
     let wedge_gone = wedge_connect.is_err();
-    assert!(
-        wedge_gone,
-        "the detached wedge was force-killed at expiry — the port must refuse \
-         (connect outcome: {wedge_connect:?})"
-    );
+    if !wedge_gone {
+        let mut restart_owns_it = false;
+        let mut last_state = LifecycleState::Failed;
+        let mut last_causes: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(status) = facade_b.instance_status("wedged-hb") {
+                last_state = status.instance.state;
+                if last_state == LifecycleState::Running {
+                    restart_owns_it = true;
+                    break;
+                }
+            }
+            if let Ok(events) = facade_b.transition_events("wedged-hb") {
+                last_causes = events
+                    .iter()
+                    .rev()
+                    .take(4)
+                    .map(|event| format!("{:?}", event.cause))
+                    .collect();
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            restart_owns_it,
+            "the detached wedge was force-killed at expiry — the port must refuse \
+             unless the on-failure restart already rebound it \
+             (connect outcome: {wedge_connect:?}; final state: {last_state:?}; \
+             recent causes: {last_causes:?})"
+        );
+    }
 
     // The on-failure restart re-binds the SAME port: wait Running, then
     // connect (bounded retries — the restart's own launch takes a beat).
