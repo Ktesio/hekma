@@ -1575,6 +1575,17 @@ impl StateStore for SqliteStore {
             self.transition_snapshot_in_txn(name, expected_prior, new_state, expected_backing)
         })
     }
+
+    fn set_state_if_prior(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+    ) -> Result<(), StoreError> {
+        in_immediate_txn(&self.conn, || {
+            self.set_state_if_prior_in_txn(name, expected_prior, new_state)
+        })
+    }
 }
 
 /// The story-15-6 transactional seams' statement-level internals: each txn is
@@ -1710,6 +1721,47 @@ impl SqliteStore {
             });
         }
         Ok(snapshot)
+    }
+
+    /// The conditional state write under the write lock (story 18-2 review
+    /// round 1, P3): the guarded liveness expiry's commit step. Mirrors
+    /// `transition_snapshot_in_txn`'s guard + persisted shape, minus the
+    /// backing read — the read and the write happen in ONE `BEGIN IMMEDIATE`
+    /// transaction, so a concurrent transition between the reaper's phase-4
+    /// lookup and this write is SEEN (typed refusal, nothing persisted),
+    /// never raced past.
+    fn set_state_if_prior_in_txn(
+        &self,
+        name: &InstanceName,
+        expected_prior: LifecycleState,
+        new_state: LifecycleState,
+    ) -> Result<(), StoreError> {
+        let found = self.state_in_txn(name)?;
+        if found != expected_prior.as_str() {
+            return Err(StoreError::StateConflict {
+                name: name.as_str().to_string(),
+                expected: expected_prior.as_str().to_string(),
+                found,
+            });
+        }
+        // Mirrors `set_state`'s persisted shape (state + updated_at bump).
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE agent_instances SET state = ?1, updated_at = ?2 WHERE name = ?3",
+                rusqlite::params![
+                    new_state.as_str(),
+                    crate::time::now_rfc3339(),
+                    name.as_str(),
+                ],
+            )
+            .map_err(backend)?;
+        if affected == 0 {
+            return Err(StoreError::NotFound {
+                name: name.as_str().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The persisted Lifecycle State (wire form) of `name` inside the open
@@ -4712,6 +4764,72 @@ mod tests {
             "expected StateConflict, got {err:?}"
         );
         assert_eq!(lifecycle_row(&store, "demo"), before);
+    }
+
+    #[test]
+    fn set_state_if_prior_commits_when_the_state_still_matches() {
+        // Story 18-2 review round 1 (P3), the commit arm: the guarded write
+        // commits the liveness expiry exactly when the row still reads the
+        // expected prior state, persisting the SAME shape as the
+        // unconditional `set_state` (state + updated_at bump).
+        let store = seeded_in_state("demo", LifecycleState::Running);
+        store
+            .set_state_if_prior(
+                &name("demo"),
+                LifecycleState::Running,
+                LifecycleState::Failed,
+            )
+            .expect("the matching prior commits");
+        assert_eq!(lifecycle_row(&store, "demo").0, "failed");
+    }
+
+    #[test]
+    fn set_state_if_prior_refuses_the_moved_state_and_persists_nothing() {
+        // Story 18-2 review round 1 (P3), the race arm: another command
+        // moved the state between the reaper's lookup and the expiry commit
+        // — the guarded write refuses TYPED (naming both sides) and the row
+        // is byte-unchanged (nothing about the refusal leaks a write).
+        let store = seeded_in_state("demo", LifecycleState::Running);
+        store
+            .set_state(&name("demo"), LifecycleState::Paused)
+            .unwrap();
+        let before = lifecycle_row(&store, "demo");
+        let err = store
+            .set_state_if_prior(
+                &name("demo"),
+                LifecycleState::Running,
+                LifecycleState::Failed,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::StateConflict { expected, found, .. }
+                if expected == "running" && found == "paused"),
+            "expected StateConflict, got {err:?}"
+        );
+        assert_eq!(
+            lifecycle_row(&store, "demo"),
+            before,
+            "the refusal must persist nothing — state + updated_at unchanged"
+        );
+    }
+
+    #[test]
+    fn set_state_if_prior_on_a_missing_instance_is_not_found() {
+        // The guarded write is a write: a row that vanished (concurrent
+        // remove) is the typed NotFound, same as the unconditional write.
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("state.db")).unwrap();
+        let err = store
+            .set_state_if_prior(
+                &name("ghost"),
+                LifecycleState::Running,
+                LifecycleState::Failed,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::NotFound { name } if name == "ghost"),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[test]

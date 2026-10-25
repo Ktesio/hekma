@@ -262,3 +262,31 @@ pub struct AgentMemoryHotSwap {
 pub struct AgentMemoryKindConflict {
     pub message: String,
 }
+
+/// Story 18-4: the adapter's declared lifecycle COMMAND (`[lifecycle.pause]` /
+/// `[lifecycle.resume]`) failed — it exited nonzero, could not spawn, or
+/// outlived its bound — so the pause/resume was NOT applied and the instance's
+/// durable state is untouched (never a fake pause). The command line is
+/// rendered (no environment — no-leak); the detail names the failure mode.
+/// Classified as exit `1` (General) through the documented catch-all: the
+/// adapter's own command failed, which is neither a usage error nor a
+/// capability refusal.
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::agent::pause_command_failed))]
+pub struct AgentPauseCommandFailed {
+    pub message: String,
+}
+
+/// Story 18-4: a drain bound outside `1..=600000` ms was requested
+/// programmatically (the CLI's own clap range refuses it at parse time —
+/// this diagnostic covers the embedding path, the same shape as
+/// [`ServeOptionsInvalid`]). Classified as exit `2` (Usage — the bound
+/// value, not the environment, is at fault); no new exit-code number was
+/// minted (DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::agent::drain_bound_invalid))]
+pub struct AgentDrainBoundInvalid {
+    pub message: String,
+}
