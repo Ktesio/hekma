@@ -320,8 +320,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # gate — is caught. The old `--workspace --fail-under 95` command must be
         # GONE (tarpaulin's own per-run fail-under is replaced by the merged gate).
         self.assertNotIn("--workspace --fail-under 95", ci)
-        # The per-crate tarpaulin invocation shape (llvm + skip-clean + timeout 180 +
-        # verbose preserved; -p "$pkg" + Lcov out into cov/$pkg replaces --workspace).
+        # The per-crate tarpaulin invocation shape (llvm + skip-clean + the
+        # per-crate --timeout budget + verbose preserved; -p "$pkg" + Lcov out
+        # into cov/$pkg replaces --workspace).
         # Whitespace-normalized (line-continuation backslashes and indentation
         # collapsed): the 2026-09-28 bounded retry loop (#239) wraps the
         # invocation in an `if`, which necessarily re-indents the continuation
@@ -329,12 +330,24 @@ class ReleaseDocsTests(unittest.TestCase):
         # not the column it starts at.
         ci_flat = " ".join(ci.replace("\\\n", " ").split())
         self.assertIn(
-            "cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 "
+            'cargo +stable tarpaulin --engine llvm --skip-clean --timeout "$tarp_timeout" '
             "--verbose --exclude-files 'crates/hekma-conformance/src/bin/*' "
             "--exclude-files 'crates/hekma-engine/examples/*' "
             '-p "$pkg" --out Lcov --output-dir "cov/$pkg"',
             ci_flat,
         )
+        # Per-crate tarpaulin budget (#334): --timeout is tarpaulin's
+        # PER-TEST-BINARY cap, and the engine's wall-clock-bound integration
+        # suites (exit_codes/drain/liveness/readiness, serial under
+        # RUST_TEST_THREADS=1) outgrew the flat 180 s — killed at exactly
+        # 180 s mid-suite, deterministically, on 8/8 attempts across two
+        # stacked PRs. The case arm is the budget: the engine gets 420 s,
+        # every other crate keeps 180 s. Pin BOTH arms so a future edit
+        # cannot silently drop the engine budget (back to the deterministic
+        # overrun) or inflate the default for every crate.
+        self.assertIn('case "$pkg" in', ci)
+        self.assertIn("hekma-engine) tarp_timeout=420 ;;", ci)
+        self.assertIn("*) tarp_timeout=180 ;;", ci)
         # The exact six workspace crates, lightest → heaviest with hekma-engine
         # LAST (so a heavy-crate OOM still leaves the lighter crates' numbers
         # logged). Story 17-2 added hekma-host before the engines.
@@ -369,8 +382,10 @@ class ReleaseDocsTests(unittest.TestCase):
         )
         # --engine llvm: parity with the local macOS gate (ptrace is unavailable
         # there). llvm-tools-preview supplies the llvm-profdata/llvm-cov it shells
-        # out to. --timeout 180 lifts tarpaulin's 60 s per-test default so a heavy
-        # survival test under instrumentation is not killed spuriously.
+        # out to. --timeout "$tarp_timeout" lifts tarpaulin's 60 s per-test-binary
+        # default (per-crate budget: 180 s, 420 s for the engine — see the
+        # case-arm pin above) so a heavy survival suite under instrumentation is
+        # not killed spuriously.
         self.assertIn("rustup component add llvm-tools-preview", ci)
         # The coverage TIMEOUT fix (AI-23): a DEDICATED cache key so the instrumented
         # target — whose fingerprints differ from the other jobs' normal-profile

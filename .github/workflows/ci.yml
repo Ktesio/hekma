@@ -1404,9 +1404,11 @@ jobs:
         # already printed, so a per-crate OOM is diagnosable (which crate, at what
         # `free`/`df`) instead of one opaque --workspace failure.
         #
-        # Flags unchanged from the --workspace gate: --engine llvm (parity with the
-        # local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
-        # instrumented target), --timeout 180 (raise tarpaulin's 60 s per-test cap),
+        # Flags unchanged from the --workspace gate: --engine llvm (parity with
+        # the local macOS gate, see docs/testing.md), --skip-clean (reuse the cached
+        # instrumented target), --timeout "$tarp_timeout" (a per-crate budget —
+        # see the case arm in the loop below — raising tarpaulin's 60 s
+        # per-test-binary cap),
         # --verbose (progress). Env unchanged (AI-23): RUST_TEST_THREADS=1 runs the
         # instrumented tests serially; CARGO_PROFILE_DEV_DEBUG=1 builds line-tables-
         # only debuginfo (smaller instrumented binaries, coverage unchanged). The
@@ -1531,6 +1533,23 @@ jobs:
             echo "--- resources before $pkg ---"
             free -h || true
             df -h / || true
+            # Per-crate tarpaulin budget (#334): --timeout is tarpaulin's
+            # PER-TEST-BINARY cap, and the flat 180 s held every crate until
+            # the epic-18 engine suites landed — exit_codes/drain/liveness/
+            # readiness are wall-clock-bound (real stability windows, restart
+            # ladders, sleeps) and run SERIALLY (RUST_TEST_THREADS=1), so the
+            # exit_codes binary alone needs >180 s under llvm instrumentation.
+            # Observed: killed at exactly 180 s mid-suite, deterministically,
+            # on 8/8 attempts across two stacked PRs — a wall-clock overrun
+            # the 4-attempt retry loop below can never converge. The engine
+            # gets 420 s (≈2× the observed need); every other crate keeps the
+            # 180 s default. Bounded either way: a genuinely hung engine
+            # binary still fails in 4 × 420 s = 28 min worst case, inside the
+            # 90-min job wall.
+            case "$pkg" in
+              hekma-engine) tarp_timeout=420 ;;
+              *) tarp_timeout=180 ;;
+            esac
             # Bounded per-crate retry (2026-09-28, #239): the llvm_profparser
             # merge intermittently dies on "llvm_profparsers works on complete
             # data" — a same-SHA run-to-run flip, so this converges. Each
@@ -1564,7 +1583,7 @@ jobs:
               rm -f target/debug/fake_acp_agent target/debug/fake_acp_agent.exe
               cargo +stable build -p hekma-conformance --bin fake_agent \
                 --bin hermes_shim --bin fake_acp_agent
-              if cargo +stable tarpaulin --engine llvm --skip-clean --timeout 180 --verbose \
+              if cargo +stable tarpaulin --engine llvm --skip-clean --timeout "$tarp_timeout" --verbose \
                   --exclude-files 'crates/hekma-conformance/src/bin/*' \
                   --exclude-files 'crates/hekma-engine/examples/*' \
                   -p "$pkg" --out Lcov --output-dir "cov/$pkg"; then
