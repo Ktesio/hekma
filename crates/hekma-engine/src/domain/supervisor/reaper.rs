@@ -91,6 +91,49 @@ impl Supervisor {
         );
     }
 
+    /// Arm the cfg(test) stop-fault seam for `pid` (coverage second pass,
+    /// epic 20-1): the LIVENESS-EXPIRY teardown's force-kill and the
+    /// READINESS-TIMEOUT teardown's final-leg stop behave as `fault` for this
+    /// pid until this supervisor is dropped. Lib-test only.
+    #[cfg(test)]
+    pub(crate) fn arm_stop_fault(&mut self, pid: u32, fault: StopFault) {
+        self.stop_fault_pids.insert(pid, fault);
+    }
+
+    /// The held handle's pid for `name` (cfg(test)) — the key the stop-fault
+    /// seam is armed by; `None` when no live handle is held under the name.
+    /// Lib-test only (the engine-level fault arming resolves the pid through
+    /// this; the supervisor tests reach into `running` directly instead).
+    #[cfg(test)]
+    pub(crate) fn held_pid(&self, name: &InstanceName) -> Option<u32> {
+        self.running
+            .get(name)
+            .map(|supervised| self.backend.pid(&supervised.handle))
+    }
+
+    /// The injected stop result for `pid` at a `backend.stop(Duration::ZERO)`
+    /// site: `Some` carries the fault's synthesized `Result` (a failed stop,
+    /// or the graceful-not-forced lie); `None` means run the REAL stop. An
+    /// ASSOCIATED fn over the fault map (not a `&self` method) so a call site
+    /// holding a `&mut` handle borrow of `self.running` stays legal.
+    /// Mirrors the `injected_poll_fault` wiring shape (cfg(test) only).
+    #[cfg(test)]
+    pub(super) fn injected_zero_stop(
+        faults: &std::collections::HashMap<u32, StopFault>,
+        pid: u32,
+    ) -> Option<Result<crate::ports::StopOutcome, BackendError>> {
+        match faults.get(&pid).copied() {
+            Some(StopFault::Fail) => Some(Err(BackendError::Control {
+                op: "stop",
+                detail: "injected cfg(test) stop fault (epic 20-1 teardown seam)".to_string(),
+            })),
+            Some(StopFault::GracefulNotForced) => {
+                Some(Ok(crate::ports::StopOutcome { forced: false }))
+            }
+            None => None,
+        }
+    }
+
     /// The crash-detection reaper pass (story 1-6, AC-A / AC3 / AC5).
     ///
     /// Polls every held handle via the EXISTING `backend.poll` and reacts to an
@@ -875,9 +918,50 @@ impl Supervisor {
                             // (the backend reaped an exit on the way in — for
                             // a process that just polled alive, that is the
                             // silent-skip signature).
-                            let poll = self.backend.poll(&mut supervised.handle);
+                            let poll = {
+                                // AI-12 wiring seam (cfg(test)) at the P4
+                                // teardown poll site (mirrors the stuck-stop
+                                // retry branch's second poll site): the armed
+                                // pid's poll fails here too, driving the
+                                // did-not-poll-alive skip arm below.
+                                #[cfg(test)]
+                                let poll = {
+                                    let pid = self.backend.pid(&supervised.handle);
+                                    if self.poll_fault_pids.contains(&pid) {
+                                        Err(BackendError::Control {
+                                            op: "poll",
+                                            detail: "injected cfg(test) poll fault \
+                                                     (AI-12 wiring seam)"
+                                                .to_string(),
+                                        })
+                                    } else {
+                                        self.backend.poll(&mut supervised.handle)
+                                    }
+                                };
+                                #[cfg(not(test))]
+                                let poll = self.backend.poll(&mut supervised.handle);
+                                poll
+                            };
                             if matches!(poll, Ok(ProcessStatus::Alive)) {
-                                match self.backend.stop(&mut supervised.handle, Duration::ZERO) {
+                                // Coverage-second-pass wiring seam (cfg(test)):
+                                // an armed pid's zero-window stop fails (or
+                                // "succeeds" WITHOUT forcing) at this site,
+                                // driving the surfaced diagnostic arms below
+                                // without staging a real unstoppable process.
+                                #[cfg(test)]
+                                let stop = {
+                                    let pid = self.backend.pid(&supervised.handle);
+                                    match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
+                                        Some(injected) => injected,
+                                        None => self
+                                            .backend
+                                            .stop(&mut supervised.handle, Duration::ZERO),
+                                    }
+                                };
+                                #[cfg(not(test))]
+                                let stop =
+                                    self.backend.stop(&mut supervised.handle, Duration::ZERO);
+                                match stop {
                                     Ok(outcome) if !outcome.forced => {
                                         self.emit_diagnostic(&format!(
                                             "{}: liveness-expiry teardown stop returned a \
@@ -1385,7 +1469,28 @@ impl Supervisor {
                                 continue;
                             }
                         }
-                        match registry.try_acquire_adoption_lease(&name, record.lease, me) {
+                        // Coverage-second-pass wiring seam (cfg(test)): an
+                        // armed name's lease CAS reports the fault (the lost
+                        // race `Ok(false)`, or the failed persist) instead of
+                        // touching the store — a concurrent adoption or a real
+                        // store outage cannot be staged in-process.
+                        #[cfg(test)]
+                        let lease = match self.adoption_lease_faults.get(&name) {
+                            Some(AdoptionLeaseFault::Lost) => Ok(false),
+                            Some(AdoptionLeaseFault::Persist) => {
+                                Err(crate::domain::RegistryError::Store(
+                                    crate::ports::StoreError::Backend(
+                                        "injected cfg(test) adoption-lease persist fault \
+                                         (epic 20-1 seam)"
+                                            .to_string(),
+                                    ),
+                                ))
+                            }
+                            None => registry.try_acquire_adoption_lease(&name, record.lease, me),
+                        };
+                        #[cfg(not(test))]
+                        let lease = registry.try_acquire_adoption_lease(&name, record.lease, me);
+                        match lease {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.emit_diagnostic(&format!(

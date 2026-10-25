@@ -93,6 +93,11 @@ pub(crate) use resync::read_committed;
 pub use secret::{SecretString, REDACTED};
 pub(crate) use supervisor::registry_to_engine as registry_error_to_engine;
 pub use supervisor::{DiagnosticSink, DrainOutcome, RestartPlan, Supervisor, DEFAULT_STOP_WINDOW};
+// cfg(test) only (epic 20-1 coverage seam): the stop-fault vocabulary the
+// engine-level test arming (`Engine::arm_test_stop_fault`) names — never
+// compiled into production binaries.
+#[cfg(test)]
+pub(crate) use supervisor::StopFault;
 pub use transition::{next_state, LifecycleCommand, LifecycleError};
 pub use usage::{
     RecordOutcome, RunId, UsageEvent, UsageTotals, UsageUpdateEvent, USAGE_SCHEMA_VERSION,

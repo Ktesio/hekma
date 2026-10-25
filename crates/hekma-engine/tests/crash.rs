@@ -230,3 +230,49 @@ fn on_failure_crash_is_restarted_by_the_reaper() {
     // and (unlike the old every-launch-crash version) it cannot race a second crash.
     let _ = facade.stop("recovering", Some(Duration::from_secs(5)));
 }
+
+#[test]
+fn an_agent_that_exits_before_its_start_time_is_read_fails_with_the_honest_arm() {
+    // Coverage repair (AD-21's pool): the spawn error path's honest arm — an
+    // agent that exits INSTANTLY at startup never yields a process start
+    // time; the refusal names THE AGENT's instant exit ("exited immediately,
+    // before its process start-time could be read"), never a fabricated
+    // platform/start-time-source failure, and the instance lands `failed`.
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The start-time source arm is the unix backend's; the Windows
+        // backend's equivalent path is covered by the Windows matrix. The
+        // skip is data-driven (OsId), never cfg.
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // Exit ~1ms after the agent's own start: the spawn's start-time read
+    // window (a few retry attempts) reliably loses the race.
+    write_fake_manifest(manifest.path(), "gone", &["--exit-with", "7:1"]);
+    let engine = open(&state);
+    let facade = engine.blocking();
+    facade
+        .register_with_adapter("gone", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    facade
+        .set_restart_policy("gone", RestartPolicy::Never)
+        .unwrap();
+
+    let err = facade
+        .start("gone")
+        .expect_err("an instantly-exiting agent fails its start");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("exited immediately"),
+        "the honest instant-exit arm names the agent, not the platform: {rendered}"
+    );
+    assert!(
+        !rendered
+            .to_lowercase()
+            .contains("start-time-source failure"),
+        "the platform-failure wording must NOT surface: {rendered}"
+    );
+    // The instance landed `failed` (the start refusal is durable truth).
+    let status = facade.instance_status("gone").unwrap();
+    assert_eq!(status.instance.state, LifecycleState::Failed);
+}

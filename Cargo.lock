@@ -716,9 +716,14 @@ name = "hekma-host"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "futures-util",
  "hekma-conformance",
  "hekma-engine",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "tempfile",
