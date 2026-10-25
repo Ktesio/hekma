@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-24-2026 17:40"  # stack-base #334 merged main in (post-#332/#333/#337); epic-18 squash-merged onto #334, epic-20 open on main
+last_updated: "10-25-2026 23:01"  # stack-base #334 merged main in (post-#332/#333/#337); epic-18 squash-merged onto #334, epic-20 open on main
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -198,11 +198,11 @@ development_status:
   19-4-per-call-records-for-hosts: backlog
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
-  epic-20: in-progress  # opened 2026-10-23 by sprint-change-proposal-2026-10-23-adoptability.md (Adoptability: OTLP export FR-46/AD-21 option (a); CI recipe FR-47 in-repo; adapter gallery FR-48; PRD §6 amendment D2; does not disturb epics 18/19; 20.1 = AI-55 two-pass)
+  epic-20: done  # 🎉 COMPLETE 2026-10-25: all three stories merged (20-3 76e13e7/#340 gallery, 20-2 83b32b5/#341 CI recipe + dogfood lane with ktesio.dev #29 the same day, 20-1 81aa8e5/#346 OTLP export AD-21 + the coverage-gate repair 94.0183%→95.3168% after 3 CI rounds). Retro per convention (same closeout): epic-20-retro-2026-10-25.md — accepted-with-open-items, DECLARED criteria (proposal §5, all five met), pending_stories []; findings F1-F6, action items AI-72..AI-78; behavior verified live (OTLP off-by-default + degradation + semconv metrics through the real host; gallery lane; deployed site). Open: story-spec closeout + CHANGELOG banners (AI-72), telemetry site port (AI-74).
   20-1-otlp-telemetry-export: done  # 2026-10-25 MERGED as 81aa8e5 (PR #346): AD-21 OTLP/HTTP+JSON exporter in hekma-host (zero new deps) + the 95% coverage gate restored (94.0183% → 95.3168%); ~230 fault-arm lines across 3 passes; 19.4/19.5-dependent metrics join as follow-ups
   20-2-agents-in-ci-the-github-actions-recipe: done  # 2026-10-25 MERGED as 83b32b5 (PR #341, incl. the agents.md gallery pointer): recipe page + agents-in-ci dogfood lane; ktesio.dev port merged same day (ktesio.dev #29, site live with the probe-pinned title)
   20-3-the-adapter-gallery: done  # 2026-10-24 MERGED as 76e13e7 (PR #340): gallery index + 10 pages + aider manifest + PATH-shadowed TCK lane + nav/exec drift guards + docs-probe pin; docs/agents.md pointer applied by Islam post-merge
-  epic-20-retrospective: optional
+  epic-20-retrospective: done
   epic-9: done  # squash-merged to main 2026-07-14 as 39f0a57 (PR #114). kt --help now matches the shipped agent-runner README/GitHub positioning; v0.6.0. All 3 stories + AD-16/Epic-8 re-scope done. Issues #110/#111/#112/#113 closed. Follow-up #109 (adoption x86 CI deadlock root-cause) remains open/tracked separately, not a blocker.
   9-1-remove-the-legacy-skill-manager-command-surface-modules-and: done  # committed 42896b7 on feat/epic-9-retire-legacy-cli; TWO-pass review APPROVED (primary + adversarial: byte-identical agent/self-update help vs baseline, no over/under-deletion, AgentManifest* boundary intact, all 9 gates green / 767 tests). 2 LOW deferred: dangling [workspace.dependencies] (→9-2), stale check_docs KT_COMMANDS allowlist (→9-3).
   9-2-reposition-the-top-level-kt-identity-to-the-agent-runner: done  # (was tracked as 9-2-rebrand-kt-identity-and-make-agent-list-show-canonical) committed 45d203e on feat/epic-9-retire-legacy-cli (on top of 9-1); CI green cross-OS incl. coverage on PR #114. Review APPROVED-WITH-NITS (rebrand text verified verbatim-consistent with the live README/GitHub description; canonical-surface guard proven non-vacuous via live smoke; 0.6.0 bump isolated to workspace.package; dangling deps confirmed gone). 1 LOW cosmetic nit (story-file wording, reconciled) — no functional follow-up.
@@ -1652,3 +1652,66 @@ action_items:
     owner: "Islam"
     status: open
     ref: "_bmad-output/implementation-artifacts/epic-16-retro-2026-10-19.md"
+  - id: "AI-72"
+    epic: 20
+    action: "Epic-20 closeout chore: flip spec-20-1/20-2/20-3 frontmatter to done,
+      tick their execution checkboxes against landed evidence, and add the three CHANGELOG.md
+      Unreleased banners from the landed RELEASE_NOTES text (epic-20 retro F2: 0/9,
+      0/6, 7/8 checkboxes; CHANGELOG has none of the three banners)."
+    owner: "agent"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-73"
+    epic: 20
+    action: "Canonize the landing checklist in AGENTS.md — executes epic-16-retro-item-103:
+      a story spec-closeout (frontmatter + execution checkboxes) and its CHANGELOG/RELEASE_NOTES
+      entries are verified against the landed diff before the story is called done
+      (epic-20 retro F2: the class recurred 3x after epic-16 flagged it)."
+    owner: "Islam"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-74"
+    epic: 20
+    action: "Port docs/telemetry.md to the ktesio.dev site and title-pin /docs/telemetry/
+      in .github/workflows/docs-probe.yml — the deployed site 404s it live (2026-10-25)
+      while the page is registered in docs/meta.json (epic-20 retro F6)."
+    owner: "agent"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-75"
+    epic: 20
+    action: "Add a conflict-marker residue guard to scripts/check_docs.py: fail on
+      lines matching ^<<<<<<<, ^=======$, or ^>>>>>>> across docs/*.md, docs/RELEASE_NOTES.md
+      and CHANGELOG.md (epic-20 retro F5: #341 left a duplicated banner + live markers
+      on main until #346; every gate stayed green)."
+    owner: "agent"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-76"
+    epic: 20
+    action: "Red-gate repair policy: a merge that lands with the workspace coverage
+      gate below 95% opens the repair as its own immediate change — it never rides
+      the next story PR (epic-20 retro F1: #334 merged at 94.0183% and every subsequent
+      PR inherited red until #346 restored 95.3168%)."
+    owner: "Islam"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-77"
+    epic: 20
+    action: "Fix the append-only Spec Change Log discipline at the executor: the build
+      workflow change-log step (or its session checklist) must APPEND entries and
+      never rewrite prior ones — two same-class violations in the epic-20 run, both
+      self-caught and restored (provenance notes in spec-20-3 and spec-20-1 change
+      logs; epic-20 retro F3)."
+    owner: "agent"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
+  - id: "AI-78"
+    epic: 20
+    action: "Codify the docs/agents.md write-guard workaround (recurring platform
+      filename protection): a standing sanctioned path for applying that file edits
+      (CLI-side write or guard exception) so the gallery-pointer class of edit stops
+      being a per-session incident (epic-20 retro F4)."
+    owner: "Islam + agent"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-20-retro-2026-10-25.md"
