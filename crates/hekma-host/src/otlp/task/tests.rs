@@ -392,10 +392,14 @@ async fn a_lagged_bus_surfaces_the_drop_count_then_folds_and_delivers_the_retain
     );
 }
 
-/// The refused collector at the final flush: the fold completes, delivery
-/// is TERMINAL (connection refused never becomes retryable), and the
-/// in-flight count is reported honestly as NOT delivered (AI-18) — the
-/// handshake still returns within its bound.
+/// The unreachable collector at the final flush: the fold completes,
+/// delivery cannot land, and the in-flight count is reported honestly as
+/// NOT delivered (AI-18) — the handshake still returns within its bound.
+/// Transport shapes differ per OS: a closed loopback port fast-REFUSES on
+/// Unix (the terminal "did not deliver" note), while on Windows the same
+/// connect can ride all the way to the flush BOUND (the "did not complete
+/// within the bound" note). Both notes name the count and the documented
+/// restart-reset — the test pins THAT contract, not the transport path.
 #[tokio::test]
 async fn a_refused_collector_at_shutdown_reports_the_undelivered_in_flight_count() {
     let (sink_handle, sink) = SharedSink::sink();
@@ -408,9 +412,12 @@ async fn a_refused_collector_at_shutdown_reports_the_undelivered_in_flight_count
         "the single observed event is the honest loss"
     );
     let text = sink_handle.text();
+    let terminal = text.contains("the final flush did not deliver — 1 in-flight");
+    let bounded = text.contains("did not complete within the")
+        && text.contains("1 in-flight observation(s) were NOT delivered");
     assert!(
-        text.contains("the final flush did not deliver — 1 in-flight"),
-        "the loss is named with its count:\n{text}"
+        terminal || bounded,
+        "the loss is named with its count by either honest note:\n{text}"
     );
     assert!(
         text.contains("restart-reset"),
