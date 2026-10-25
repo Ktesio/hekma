@@ -1,0 +1,37 @@
+# The `agents-in-ci` dogfood lane's adapter manifest (see docs/agents-in-ci.md).
+#
+# The CI job copies this file per leg and substitutes `__FAKE_AGENT_BIN__`
+# with the absolute path of the branch-built `fake_agent` helper before
+# `hekma agent register --manifest` runs. The shape mirrors the conformance
+# kit's UJ-3 flow fixture: adapter contract v1, `pause` + `interaction`
+# guaranteed on all three OSes (the cross-OS claim is the conformance
+# kit's to exercise — this lane runs ubuntu only), `self-reported` metering
+# (the viable source a manifest registers under), and a `model` -> `MODEL`
+# env mapping. The agent emits a known, fixed batch — 5 usage events of
+# 10 input + 20 output tokens each (150 total) — then idles so only the
+# lane's own `hekma agent stop` ends the Run.
+
+contract_version = "1.0.0"
+
+[adapter]
+kind = "ci-fake-agent"
+
+[lifecycle.start]
+exec = "__FAKE_AGENT_BIN__"
+args = ["--emit-usage", "5", "--linger-ms", "600000"]
+
+[capabilities.interaction]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[capabilities.pause]
+linux = "guaranteed"
+macos = "guaranteed"
+windows = "guaranteed"
+
+[metering]
+source = "self-reported"
+
+[config.model]
+env = "MODEL"

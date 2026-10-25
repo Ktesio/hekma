@@ -321,3 +321,8 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-20-3-adapter-gallery.md` (review finding: same comment error upstream)
   summary: crates/hekma-engine/tests/hermes.rs carries the same misattributed SAFETY comment ("edition 2024 requires the unsafe block") — fixed in the gallery test, deferred there (untouched file).
   evidence: set_var/remove_var are unsafe on all editions since Rust 1.82; the workspace is edition 2021. Trigger: any change touching that block.
+## Deferred from: implementation of spec-20-2-agents-in-ci (2026-10-24)
+
+- source_spec: `spec-20-2-agents-in-ci.md` (installer version pin / musl target knob)
+  summary: The installer has neither a version pin nor a musl target knob — `scripts/public/install.sh` resolves the LATEST release and hands out the glibc archive only — so a CI workflow wanting a reproducible, checksum-verified binary must download the static musl archive directly (curl + `sha256sum -c`, the docs/agents-in-ci.md recipe) instead of using the installer. Growing the knob touches the installer contract (a public release surface) and its pinned installer tests (test_automation.py's install contract cases), so it is out of a docs-page story's scope by design (the spec's pre-decided checkpoint 3).
+  evidence: `scripts/public/install.sh` `detect_release_target` (no musl arm, no version env) and the docs/agents-in-ci.md step-1 honesty note that names the gap; the lane/page split in the spec change log (the dogfood lane builds the branch binary precisely because no pinned-install surface exists). Trigger: a user asks for pinned (or musl) installs.
