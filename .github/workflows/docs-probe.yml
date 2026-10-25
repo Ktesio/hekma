@@ -106,6 +106,14 @@ jobs:
           # links it) — the probe pins it so a missing/lagged site port
           # fails BY NAME instead of shipping dead README links green.
           check "https://hekma.ktesio.dev/docs/adapters/" "<title>Adapter Gallery</title>"
+          # The telemetry page is the OTLP exposition's public URL (the
+          # README links it) — pinned like the gallery above. The marker is
+          # the page-title PREFIX the deployed page carries (the full title
+          # is "Telemetry export (OTLP) — Hekma docs"); it goes live with
+          # the ktesio.dev docs port (ktesio.dev PR #31) — until that port
+          # deploys, this check fails by name rather than shipping a dead
+          # README telemetry link green.
+          check "https://hekma.ktesio.dev/docs/telemetry/" "<title>Telemetry export (OTLP)"
           exit "$failed"
 
       - name: Check the legacy URLs still redirect
