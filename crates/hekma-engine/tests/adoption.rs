@@ -286,6 +286,19 @@ fn adoption_helper_subprocess() {
             facade.pause("nap").unwrap();
             hekma_conformance::exit_helper_subprocess(0);
         }
+        // 18-4 review round 1 (B1): start `coop`, pause it COOPERATIVELY (the
+        // declared pause command runs to a zero exit — NO OS suspension
+        // exists), then crash. The next engine adopts a live, UNSUSPENDED
+        // process with a `paused` row; its stop ladder must SKIP the OS
+        // resume signal (there is no suspension to undo) and say so.
+        "coop_paused_survivor" => {
+            facade
+                .register_with_adapter("coop", &AdapterRef::Manifest(manifest.clone()))
+                .unwrap();
+            facade.start("coop").unwrap();
+            facade.pause("coop").unwrap();
+            hekma_conformance::exit_helper_subprocess(0);
+        }
         // AI-13: start `mortal` under a `never` Restart Policy, then crash. The
         // parent adopts the live process and later kills it — the reaper's crash
         // cause must record the UNAVAILABLE exit code (an adopted process is not
@@ -1218,6 +1231,99 @@ fn ai7_paused_live_process_is_adopted_and_resumable() {
 }
 
 #[test]
+fn coop_paused_orphan_stops_without_the_signal_resume_and_says_so() {
+    // 18-4 review round 1 (B1): a COOPERATIVELY paused orphan — its row reads
+    // `paused` from the DECLARED pause command's committed edge, and the
+    // process is live and NOT suspended — survives the engine crash and is
+    // adopted. The stop ladder must SKIP the OS resume signal: there is no
+    // suspension to undo, and claiming a resume would be exactly the lie the
+    // cooperative skip exists to prevent. The skip is surfaced (`paused
+    // COOPERATIVELY` reaches the sink) and the signal-path note never fires.
+    //
+    // Windows data-driven skip (the survivor_and_ghost sibling's shape): the
+    // crash leg needs the agent to OUTLIVE the `run_engine1` helper, but on
+    // Windows the spawning engine's Job-Object kill-on-close takes the child
+    // at the helper's exit (the documented NFR-1 semantics) — a crash-shaped
+    // helper can never leave a live adoptable child there, whatever the
+    // pause flavor. The Windows-correct counterpart semantics — engine death
+    // kills the child — are asserted affirmatively on the Windows leg by
+    // `windows_engine_death_kills_the_child_and_reconciles_its_record_to_failed`;
+    // the in-engine half of THIS proof (a cooperatively paused row's stop
+    // skips the OS resume and surfaces the note) is pinned cross-OS by the
+    // drain.rs suite's ladder drills. NO `#[cfg]` (this file is outside the
+    // backends allowlist).
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    // No Windows runtime skip: the cooperative path is OS-independent by
+    // construction (only the same #109 Linux-CI mitigation as its siblings).
+    if is_linux_ci() {
+        return;
+    }
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // The PAIR manifest (the touch-pair fixture builder): pause +
+    // resume templates, no `[capabilities.pause]` needed — the cooperative
+    // arm owns the transition on command strength.
+    hekma_conformance::test_support::ManifestFixture::new("svc", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+
+    run_engine1("coop_paused_survivor", state.path(), manifest.path());
+    let pid = wait_for_agent_pid(&agent_log_path(state.path(), "coop"));
+    assert!(
+        pid_alive(pid),
+        "the coop-paused process must survive the engine-1 crash"
+    );
+
+    // Engine 2 adopts the live orphan with the sink installed from the first
+    // moment (the stop ladder's note must reach it).
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine =
+        Engine::open_with_diagnostics(Some(state.path().to_path_buf()), make_sink(&shared))
+            .unwrap();
+    let facade = engine.blocking();
+    assert_eq!(
+        facade.instance_status("coop").unwrap().instance.state,
+        LifecycleState::Paused,
+        "the live coop-paused orphan must be adopted while staying paused"
+    );
+    // The committed pause edge is the cooperative one — the durable record
+    // the stop ladder's skip (and every other classify_pause_kind reader)
+    // re-derives from.
+    let events = facade.transition_events("coop").unwrap();
+    let pause_edge = events
+        .iter()
+        .rev()
+        .find(|e| e.new_state == LifecycleState::Paused)
+        .expect("the cooperative pause edge exists");
+    let cause = serde_json::to_string(&pause_edge.cause).unwrap();
+    assert!(
+        cause.contains("pause-cooperative"),
+        "the adopted row's pause edge is the committed cooperative one: {cause}"
+    );
+
+    // The stop: the ladder skips the OS resume (surfaced) and lands stopped.
+    facade.stop("coop", Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        facade.instance_status("coop").unwrap().instance.state,
+        LifecycleState::Stopped
+    );
+    let sink = String::from_utf8_lossy(&shared.lock().unwrap()).into_owned();
+    assert!(
+        sink.contains("paused COOPERATIVELY"),
+        "the cooperative skip must be surfaced to the sink: {sink}"
+    );
+    assert!(
+        !sink.contains("resumed the paused process before the stop ladder"),
+        "a cooperative pause's stop must not claim a signal resume (there is no \
+         suspension to undo): {sink}"
+    );
+    wait_until_gone(pid, "stop must terminate the adopted process");
+}
+
+#[test]
 fn ai13_adopted_process_exit_records_the_unavailable_exit_code_cause() {
     // AI-13: an ADOPTED (non-child) process exits with `code: None` — on UNIX
     // the engine cannot recover a non-child's exit code — so the crash cause
@@ -1371,10 +1477,44 @@ fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused()
         )
         .unwrap()
     };
+    // While the breach pause holds — frozen straight through adoption — the
+    // ledger must be FROZEN too: the adopting engine never resumed the agent
+    // and never metered anything new. Poll a short window; any growth HERE is
+    // the strand/runaway this story exists to forbid.
+    let frozen_window = Instant::now() + Duration::from_millis(750);
+    loop {
+        let count = {
+            let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_events e \
+                 JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = 'napbud'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            count, committed,
+            "the ledger grew while the agent was suspended — the adopted row \
+             must stay paused, never resumed"
+        );
+        if Instant::now() >= frozen_window {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     facade.stop("napbud", Some(Duration::from_secs(5))).unwrap();
     wait_until_gone(pid, "stop must terminate the adopted paused process");
-    // No further usage: a suspended agent emits nothing, and the ledger count
-    // is unchanged by the adoption + stop cycle.
+    // No runaway: a suspended agent emits nothing on its own. The stop ladder,
+    // though, DELIBERATELY resumes a signal-frozen process first (a suspended
+    // process cannot receive the graceful stop signal) — and in that
+    // resume→death window the agent may flush the REST of its `--emit-usage 5`
+    // batch, which the engine's terminal drain-on-reap honestly records. So
+    // the post-stop ledger may exceed the frozen count by at most the unflushed
+    // batch remainder — bounded by the batch total — never by a LIVE agent
+    // (the process is gone by this assert). The old `after == committed` pin
+    // overclaimed: it went red on the slower macos/windows runners exactly
+    // when one in-flight line landed in that window.
     let after = {
         let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
         conn.query_row(
@@ -1385,9 +1525,10 @@ fn ai44_adopting_an_over_budget_paused_row_records_the_breach_and_stays_paused()
         )
         .unwrap()
     };
-    assert_eq!(
-        after, committed,
-        "no further usage may land after the breach (the agent was suspended)"
+    assert!(
+        (committed..=5).contains(&after),
+        "post-stop ledger = frozen count plus at most the resumed batch's \
+         flush (frozen {committed}, after {after}, batch total 5)"
     );
 }
 

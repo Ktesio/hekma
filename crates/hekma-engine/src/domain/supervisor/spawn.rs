@@ -242,6 +242,41 @@ impl Supervisor {
         let mapping = adapter::resolve_config_mapping(&kind, manifest_path.as_deref())
             .map_err(|e| launch_to_engine(&name, e))?;
 
+        // (2b-readiness) Resolve the adapter's optional declared readiness gate
+        // (contract `1.1.0`): the `[readiness]` section's ONE probe + its
+        // timeout budget. Pre-transition like every fallible resolution above —
+        // an invalid (or drifted-since-registration) section rejects the start
+        // with NO state change. A manifest without the section (or a native
+        // adapter) resolves `None` — the pre-1.1.0 behavior, byte-identical.
+        // The gate is consumed AFTER the ACP handshake below (ordering:
+        // survival window → handshake → probe).
+        let readiness_gate = adapter::resolve_readiness_probe(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-liveness) Resolve the adapter's optional declared liveness check
+        // (contract `1.1.0`, story 18-2): the `[liveness]` section's ONE
+        // check + its `max_age_ms` window. Pre-transition like every fallible
+        // resolution above — an invalid (or drifted-since-registration)
+        // section rejects the start with NO state change. A manifest without
+        // the section (or a native adapter) resolves `None` — the pre-1.1.0
+        // behavior, byte-identical. The check is carried on the `Supervised`
+        // record below, where the reaper evaluates it per tick while the
+        // instance is EXACTLY `running`.
+        let liveness_check = adapter::resolve_liveness_check(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+
+        // (2b-exit-codes) Resolve the adapter's optional declared exit-code
+        // classes (contract `1.1.0`, story 18-3): the `[exit_codes]` section's
+        // two validated lists. Pre-transition like every fallible resolution
+        // above — an invalid (or drifted-since-registration) section rejects
+        // the start with NO state change. A manifest without the section (or
+        // a native adapter) resolves `None` — the pre-classification behavior,
+        // byte-identical. The classes are carried on the `Supervised` record
+        // below, where the reaper's crash classifier consults them for a
+        // coded exit out of `running`.
+        let exit_codes = adapter::resolve_exit_codes(&kind, manifest_path.as_deref())
+            .map_err(|e| launch_to_engine(&name, e))?;
+
         // (2b-memory) MANAGED MEMORY BACKING (story 5-1, spine AD-11). Read the
         // attached backing (one DB read) and — for a `filesystem` kind — ensure
         // the managed directory exists: ONE idempotent `create_dir_all`, no
@@ -828,6 +863,230 @@ impl Supervisor {
             None
         };
 
+        // (6c) READINESS PROBE (contract `1.1.0`) — the adapter's declared
+        // probe gates `starting → running`: the instance reaches `running`
+        // only once the probe passes within its own `timeout_ms`, on the
+        // ENGINE-owned poll cadence. Ordering: the startup survival watch (5)
+        // ran first, then the ACP handshake (6b) — the probe is the LAST gate.
+        //
+        // The wait runs synchronously under the supervisor lock (the same
+        // accepted bounded-wait posture as the handshake: the probe budget is
+        // declared in the manifest, so supervision cannot wedge unboundedly),
+        // and DETACHED starts share it — `--detach` returns ready-or-failed,
+        // bounded, exactly like a handshake-bearing start.
+        //
+        // Three outcomes, each landed honestly:
+        // * Ready → fall through to (7) unchanged.
+        // * TimedOut → TERMINAL: stop + drop the handle (the handshake-failure
+        //   teardown shape), land `starting → failed` with the
+        //   `readiness-timeout` cause naming the probe + the honest wait, and
+        //   refuse the start. NO Restart Policy consult — an adapter that
+        //   survived startup but never declared ready is a broken deployment;
+        //   a restart would replay the same failure.
+        // * ProcessExited → the EXISTING crash path, verbatim: consult the
+        //   Restart Policy (`plan_restart` — the write-ahead record exists
+        //   from (6)), land the `Crashed` transition, and QUEUE the restart
+        //   plan so the very next engine-cadence pass executes it with normal
+        //   backoff timing (the start path must return, so it cannot sleep the
+        //   backoff itself).
+        if let Some(gate) = &readiness_gate {
+            // Surfaced, not silent (AI-18): the probe wait is a NEW, operator-
+            // visible phase of the start — say the engine is waiting, and on
+            // WHAT (the rendered probe), so a start that later times out was
+            // already explained live on stderr.
+            let probe_note = format!(
+                "{}: waiting up to {}ms for the declared readiness probe: {}",
+                name.as_str(),
+                gate.timeout_ms,
+                super::super::readiness::describe(&gate.probe),
+            );
+            self.emit_diagnostic(&probe_note);
+            // The log-contains probe reads the ENGINE-owned agent output log
+            // from the pre-spawn cursor — the same file + cursor the usage
+            // ingestion uses. Under `capture = "off"` there IS no log: the
+            // probe is unsatisfiable there and runs out its budget honestly
+            // (the timeout names the probe; the capture-off note above already
+            // said output is not captured).
+            let probe_log_path: Option<&std::path::Path> = match capture_mode {
+                LogCaptureMode::Off => None,
+                LogCaptureMode::Full | LogCaptureMode::Metadata => Some(agent_log_path.as_path()),
+            };
+            let outcome = match super::super::readiness::run_probe(
+                gate,
+                &self.backend,
+                &mut handle,
+                probe_log_path,
+                usage_cursor,
+                &home,
+            ) {
+                super::super::readiness::ProbeOutcome::TimedOut {
+                    description,
+                    waited_ms,
+                    poll_errors,
+                } => {
+                    // Review round 1 (E1): the budget expired on the runner's
+                    // LAST poll — the process may have died in the window
+                    // since that snapshot. ONE re-poll before condemning: an
+                    // exit remaps to the crash path below (the same
+                    // Restart-Policy consult a wait-caught exit gets), so a
+                    // start that failed because the process DIED is never
+                    // mislabeled a readiness timeout.
+                    match self.backend.poll(&mut handle) {
+                        Ok(ProcessStatus::Exited { code }) => {
+                            super::super::readiness::ProbeOutcome::ProcessExited(code)
+                        }
+                        Ok(ProcessStatus::Alive) => {
+                            super::super::readiness::ProbeOutcome::TimedOut {
+                                description,
+                                waited_ms,
+                                poll_errors,
+                            }
+                        }
+                        Err(poll_err) => {
+                            // Surfaced, not silent (AI-18): the death re-check
+                            // could not run, so the timeout conclusion carries
+                            // that caveat visibly.
+                            self.emit_diagnostic(&format!(
+                                "{}: the pre-timeout liveness re-check failed ({poll_err}); \
+                                 treating the outcome as a readiness timeout",
+                                name.as_str()
+                            ));
+                            super::super::readiness::ProbeOutcome::TimedOut {
+                                description,
+                                waited_ms,
+                                poll_errors,
+                            }
+                        }
+                    }
+                }
+                other => other,
+            };
+            match outcome {
+                super::super::readiness::ProbeOutcome::Ready { waited_ms } => {
+                    // Review round 1: the pass is SURFACED beside the
+                    // wait-begins note above — the operator sees both halves
+                    // of the wait (began / passed after how long), and the
+                    // ordering (pass strictly BEFORE the `starting →
+                    // running` transition below) becomes observable evidence.
+                    self.emit_diagnostic(&format!(
+                        "{}: readiness probe passed after {}ms: {}",
+                        name.as_str(),
+                        waited_ms,
+                        super::super::readiness::describe(&gate.probe),
+                    ));
+                }
+                super::super::readiness::ProbeOutcome::TimedOut {
+                    description,
+                    waited_ms,
+                    poll_errors,
+                } => {
+                    // Teardown first (the handshake-failure shape: a short
+                    // graceful stop — which also works on a DETACHED handle —
+                    // then the drop releases whatever remains).
+                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    // Review round 1 (E2): a graceful window is an offer, not
+                    // a guarantee — if the process is STILL alive after it,
+                    // escalate to the stop ladder's final leg (a zero-window
+                    // stop is SIGKILL + confirm on unix) instead of dropping a
+                    // possibly-live handle onto the OS.
+                    if matches!(self.backend.poll(&mut handle), Ok(ProcessStatus::Alive)) {
+                        if let Err(kill_err) = self.backend.stop(&mut handle, Duration::ZERO) {
+                            self.emit_diagnostic(&format!(
+                                "{}: readiness-timeout teardown could not force-kill the \
+                                 surviving process: {kill_err}",
+                                name.as_str()
+                            ));
+                        }
+                    }
+                    drop(handle);
+                    let mut detail = format!(
+                        "{description} did not pass within its {waited_ms}ms budget — the \
+                         instance is failed and will NOT be restarted; check the agent's \
+                         readiness mechanism (the probe targets the instance's own home, \
+                         logs, or listener)"
+                    );
+                    // Review round 1 (E5): the runner tolerates a liveness
+                    // poll ERROR as alive, so a timeout that watched a
+                    // degraded death-check says so.
+                    if poll_errors > 0 {
+                        detail.push_str(&format!(
+                            " (process poll errored {poll_errors} times during the wait)"
+                        ));
+                    }
+                    return Err(self.fail_launch_with_cause(
+                        registry,
+                        &name,
+                        TransitionCause::readiness_timeout(description, waited_ms),
+                        detail,
+                    ));
+                }
+                super::super::readiness::ProbeOutcome::ProcessExited(code) => {
+                    // The process died while the probe watched — caught by a
+                    // wait poll, or by the pre-timeout re-check above: either
+                    // way the crash path, verbatim. The poll already reaped
+                    // it (the same "reap done by poll" fact the survival
+                    // watch relies on), so no stop is needed — drop the
+                    // handle.
+                    let base_detail = match code {
+                        Some(c) => {
+                            format!("process exited during the readiness probe with code {c}")
+                        }
+                        None => "process exited during the readiness probe (terminated by \
+                                 signal)"
+                            .to_string(),
+                    };
+                    // Story 18-3: `running_for: None` — a LAUNCH-phase exit is
+                    // never a run (the classes classify runs, and so does the
+                    // stable-window reset); the charged crash path applies
+                    // verbatim with no anchor to measure.
+                    let decision = self.plan_restart(registry, &name, &base_detail, None);
+                    let crash_log_capture = self.backend.log_capture(&handle);
+                    if self
+                        .transition_with_log_capture(
+                            registry,
+                            &name,
+                            starting,
+                            LifecycleState::Failed,
+                            TransitionCause::crashed(decision.crash_cause.clone()),
+                            crash_log_capture,
+                        )
+                        .is_err()
+                    {
+                        // The transition persist failed: the write-ahead
+                        // record survives for a later reconcile (the reaper's
+                        // posture) — but the start is still refused, because
+                        // an exited process is never `running`.
+                    }
+                    // The plan is queued whether or not the row write landed:
+                    // the crash is the durable world's truth (the reaper
+                    // reconciles toward it), and a restart attempt against a
+                    // reconciled row is honest — skipping it on a store hiccup
+                    // would strand the policy's promise.
+                    if let Some(plan) = decision.plan {
+                        // Review round 1 (E3): surfaced, not silent — QUEUED
+                        // is not EXECUTED. The next engine-cadence pass runs
+                        // this plan with normal backoff; a host that exits
+                        // before the next tick (a short-lived `kt agent
+                        // start` that returns here) drops it. Say both facts.
+                        self.emit_diagnostic(&format!(
+                            "{}: restart queued (attempt {}, backoff {}ms) — it runs on the \
+                             next engine-cadence pass; a host that exits before that pass \
+                             does not restart it",
+                            name.as_str(),
+                            plan.attempt,
+                            plan.delay.as_millis(),
+                        ));
+                        self.queue_pending_restart(plan);
+                    }
+                    drop(handle);
+                    return Err(EngineError::LaunchFailed {
+                        name: name.as_str().to_string(),
+                        detail: decision.crash_cause,
+                    });
+                }
+            }
+        }
+
         // (7) starting → running (adapter ready, or a Restart Policy restart).
         let ready_cause = match restart {
             Some((attempt, waited)) => {
@@ -867,6 +1126,23 @@ impl Supervisor {
         // A fresh Run starts from a ZERO poll-error streak (AI-12): a stale entry
         // from this name's PRIOR handle must never pre-load the new one.
         self.clear_poll_error_streak(&name);
+        // Story 18-3: a FRESH OPERATOR start clears the restart-requested
+        // streak — the operator's new Run has no recycle chain to pace, and
+        // the fresh record's counter is 0, so the first restart-requested
+        // relaunch of the new Run computes the delay index
+        // `current + streak + 1` = 0 + 0 + 1: the BASE backoff (the durable
+        // counter was untouched by the PRIOR chain and is re-seeded at 0 by
+        // this fresh record anyway). A POLICY RELAUNCH
+        // (`restart: Some(..)`) deliberately KEEPS the streak: the recycle
+        // chain continues across its own relaunches, and the growing delay
+        // index (`current + streak + 1`, clamped by `BackoffSchedule`) is
+        // what bounds the loop's RATE — the cap still arrives, exactly as
+        // the reaper's `plan_requested_restart` documents. Clearing here
+        // unconditionally would reset the pace every relaunch and strand
+        // that contract (the growth machinery could never engage).
+        if restart.is_none() {
+            self.requested_restart_streaks.remove(&name);
+        }
         self.running.insert(
             name.clone(),
             Supervised {
@@ -908,6 +1184,29 @@ impl Supervisor {
                 // Story 14-1: the acp transport lives with the handle (a fresh
                 // session for this Run; teardown drops with the Supervised).
                 acp,
+                // Story 18-2: the declared liveness check (resolved in the
+                // (2b-liveness) block above) + its FRESH failure window — a
+                // new Run grants the agent a whole new window, the restart
+                // resets the streak by construction. The reopen counter is
+                // fresh per Run too (P6).
+                liveness_check,
+                liveness_failing_since: None,
+                liveness_reopens: 0,
+                // Story 18-3: the declared exit-code classes (resolved in
+                // the (2b-exit-codes) block above) — the crash classifier's
+                // per-Run lens. `None` classifies nothing (byte-identical).
+                exit_codes,
+                // Story 18-3: the stability anchor — stamped at THIS
+                // `starting → running` transition (and at every later
+                // `paused → running` resume). The just-committed transition
+                // is the anchor; the crash classifier reads it through the
+                // state gate (only a crash out of EXACTLY `running`).
+                running_since: std::time::Instant::now(),
+                // Story 18-4: a fresh Run starts UNPAUSED — the cooperative
+                // flag flips only when THIS engine commits a
+                // cooperative-pause edge (and re-derives from the record at
+                // adoption/re-acquire).
+                cooperatively_paused: false,
             },
         );
 
@@ -989,7 +1288,7 @@ impl Supervisor {
     /// signal with no code), or `None` if it stayed alive the whole window
     /// (ready). Reaps on exit (no zombie).
     fn watch_startup(&self, handle: &mut backends::Handle) -> Option<Option<i32>> {
-        let deadline = std::time::Instant::now() + READINESS_WINDOW;
+        let deadline = std::time::Instant::now() + STARTUP_SURVIVAL_WINDOW;
         loop {
             match self.backend.poll(handle) {
                 Ok(ProcessStatus::Exited { code }) => return Some(code),

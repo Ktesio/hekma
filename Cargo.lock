@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "hekma-adapter-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "semver",
  "serde",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "hekma-engine"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "directories",

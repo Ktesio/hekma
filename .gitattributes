@@ -1,0 +1,6 @@
+# The governance conformance vectors (story 19-1) are CHECKSUMMED bytes: the
+# `.sha256` sidecar, the in-crate checksum const, and the CLI `--json` pin all
+# hash the exact file bytes, so git must never normalize line endings on them
+# (a CRLF checkout would break `sha256sum -c` on Windows). LF everywhere, on
+# every platform.
+crates/hekma-engine/governance/** text eol=lf

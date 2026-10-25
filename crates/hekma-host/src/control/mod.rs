@@ -112,6 +112,7 @@ fn router(state: ApiState) -> Router {
         .route("/v0/instances/{name}/events", get(routes::events_pull))
         .route("/v0/instances/{name}/start", post(routes::start))
         .route("/v0/instances/{name}/stop", post(routes::stop))
+        .route("/v0/instances/{name}/drain", post(routes::drain))
         .route("/v0/instances/{name}/pause", post(routes::pause))
         .route("/v0/instances/{name}/resume", post(routes::resume))
         // Live events (SSE).

@@ -88,6 +88,35 @@ pub struct ManifestFixture {
     capabilities: Vec<CapabilityBlock>,
     metering_source: String,
     config_env: Vec<(String, String)>,
+    /// The raw `[readiness]` section BODY (the lines under the header, header
+    /// excluded), appended verbatim as the LAST section. Raw TOML (not
+    /// per-field chain methods) because the readiness tests are exactly about
+    /// the SECTION's shape — valid and invalid — and the shapes are tiny.
+    readiness: Option<String>,
+    /// The raw `[liveness]` section BODY (the lines under the header —
+    /// INCLUDING the chosen sub-table header), appended verbatim after the
+    /// `[readiness]` block. Raw for the same reason: the liveness tests are
+    /// about the section's shape. E.g.
+    /// `"[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000"`.
+    liveness: Option<String>,
+    /// The raw `[exit_codes]` section BODY (the lines under the header),
+    /// appended verbatim after the `[liveness]` block. Raw for the same
+    /// reason: the exit-codes tests are about the section's shape. E.g.
+    /// `"restart_requested = [75]\nclean = [0]"`.
+    exit_codes: Option<String>,
+    /// The raw `[drain]` section BODY (the lines under the header), appended
+    /// verbatim after the `[exit_codes]` block. Raw for the same reason: the
+    /// drain tests are about the section's shape — valid and invalid — and
+    /// every shape is one or two short lines. E.g.
+    /// `"timeout_ms = 10000\nidle_file = \"idle.sentinel\""`.
+    drain: Option<String>,
+    /// The 18-4 cooperative-pause PAIR paths (pause sentinel, resume
+    /// sentinel): when `Some`, the `[lifecycle.pause]`/`[lifecycle.resume]`
+    /// op templates are written, each `fake_agent --touch <path>` (the
+    /// lifecycle-command fixture whose observable side effect is the
+    /// sentinel file, created in the Agent Home). The pair rule requires
+    /// BOTH or NEITHER, and this builder only writes both.
+    touch_pair: Option<(String, String)>,
 }
 
 /// One `[capabilities.<name>]` block: the per-OS `os = "level"` entries in
@@ -111,6 +140,11 @@ impl ManifestFixture {
             capabilities: Vec::new(),
             metering_source: MeteringSource::SelfReported.as_str().to_string(),
             config_env: Vec::new(),
+            readiness: None,
+            liveness: None,
+            exit_codes: None,
+            drain: None,
+            touch_pair: None,
         }
     }
 
@@ -278,6 +312,59 @@ impl ManifestFixture {
         self
     }
 
+    /// A raw `[readiness]` section — `body` is the section's lines WITHOUT
+    /// the header, appended verbatim as the LAST section of the manifest
+    /// (after the `[config.*]` blocks), e.g.
+    /// `"kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://127.0.0.1:9/health\"\nexpected_status = 200"`.
+    /// Raw because the readiness tests are exactly about the section's shape
+    /// — valid and invalid — and every shape is two to four short lines.
+    pub fn readiness(mut self, body: &str) -> Self {
+        self.readiness = Some(body.to_string());
+        self
+    }
+
+    /// A raw `[liveness]` section — `body` is the section's lines WITH the
+    /// chosen sub-table header (the `[liveness]` table itself is empty; the
+    /// shape is one of two sub-tables), appended verbatim AFTER the
+    /// `[readiness]` block, e.g.
+    /// `"[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = 5000"`.
+    /// Raw because the liveness tests are exactly about the section's shape —
+    /// valid and invalid — and every shape is two to four short lines.
+    pub fn liveness(mut self, body: &str) -> Self {
+        self.liveness = Some(body.to_string());
+        self
+    }
+
+    /// A raw `[exit_codes]` section — `body` is the section's lines WITHOUT
+    /// the header, appended verbatim AFTER the `[liveness]` block, e.g.
+    /// `"restart_requested = [75]\nclean = [0]"`. Raw because the exit-codes
+    /// tests are exactly about the section's shape — valid and invalid — and
+    /// every shape is one or two short lines.
+    pub fn exit_codes(mut self, body: &str) -> Self {
+        self.exit_codes = Some(body.to_string());
+        self
+    }
+
+    /// Declare the 18-4 cooperative-pause PAIR: `[lifecycle.pause]` +
+    /// `[lifecycle.resume]`, each a `fake_agent --touch <path>` fixture (the
+    /// observable side effect is the sentinel file, created in the Agent
+    /// Home; the engine runs each as a bounded lifecycle command). The pair
+    /// rule requires BOTH or NEITHER — this builder only writes both.
+    pub fn touch_pair(mut self, pause_path: &str, resume_path: &str) -> Self {
+        self.touch_pair = Some((pause_path.to_string(), resume_path.to_string()));
+        self
+    }
+
+    /// A raw `[drain]` section — `body` is the section's lines WITHOUT the
+    /// header, appended verbatim AFTER the `[exit_codes]` block, e.g.
+    /// `"timeout_ms = 10000\nidle_file = \"idle.sentinel\""`. Raw because the
+    /// drain tests are exactly about the section's shape — valid and invalid
+    /// — and every shape is one or two short lines.
+    pub fn drain(mut self, body: &str) -> Self {
+        self.drain = Some(body.to_string());
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -325,17 +412,51 @@ impl ManifestFixture {
             .iter()
             .map(|(key, env)| format!("\n[config.{key}]\nenv = \"{env}\""))
             .collect::<String>();
+        let readiness = self
+            .readiness
+            .map(|body| format!("\n[readiness]\n{body}\n"))
+            .unwrap_or_default();
+        let liveness = self
+            .liveness
+            .map(|body| format!("\n[liveness]\n{body}\n"))
+            .unwrap_or_default();
+        let exit_codes = self
+            .exit_codes
+            .map(|body| format!("\n[exit_codes]\n{body}\n"))
+            .unwrap_or_default();
+        let drain = self
+            .drain
+            .map(|body| format!("\n[drain]\n{body}\n"))
+            .unwrap_or_default();
+        let touch_pair = self
+            .touch_pair
+            .as_ref()
+            .map(|(pause, resume)| {
+                format!(
+                    "\n[lifecycle.pause]\nexec = {exec:?}\nargs = [\"--touch\", {pause:?}]\n\n\
+                     [lifecycle.resume]\nexec = {exec:?}\nargs = [\"--touch\", {resume:?}]",
+                    exec = exec,
+                    pause = pause,
+                    resume = resume,
+                )
+            })
+            .unwrap_or_default();
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
-             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{capabilities}\n\n\
-             [metering]\nsource = \"{metering}\"{config}\n",
+             [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{touch_pair}{capabilities}\n\n\
+             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}{exit_codes}{drain}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
             args_toml = args_toml,
+            touch_pair = touch_pair,
             capabilities = capabilities,
             metering = self.metering_source,
             config = config,
+            readiness = readiness,
+            liveness = liveness,
+            exit_codes = exit_codes,
+            drain = drain,
         );
         let path = dir.join("adapter.toml");
         std::fs::write(&path, body).expect("write the fixture manifest");
@@ -736,7 +857,7 @@ mod tests {
     fn the_uj3_flow_preset_carries_the_pinned_shape() {
         let dir = TempDir::new().unwrap();
         let text = toml_of(ManifestFixture::uj3_flow(), dir.path());
-        assert!(text.contains("contract_version = \"1.0.0\""));
+        assert!(text.contains("contract_version = \"1.1.0\""));
         assert!(text.contains(&format!("kind = \"{}\"", crate::uj3::MANIFEST_KIND)));
         assert!(text.contains("source = \"self-reported\""));
         assert!(text.contains(&format!("--emit-usage\", \"{}\"", crate::uj3::EMIT_EVENTS)));

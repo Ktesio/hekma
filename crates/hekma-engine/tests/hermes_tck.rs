@@ -112,7 +112,7 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
 
     // ---- The report contract.
     assert_eq!(report.adapter_kind, "hermes");
-    assert_eq!(report.sections.len(), 8, "the report must be complete");
+    assert_eq!(report.sections.len(), 12, "the report must be complete");
 
     // Everything applicable to the declaration PASSED.
     assert!(
@@ -156,6 +156,27 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
         })
     );
 
+    // The four service sections (18-5): Hermes declares none of
+    // readiness/liveness/exit_codes/drain, so each reads not_applicable
+    // NAMING the absent declaration — the honest degradation, never a
+    // fabricated pass.
+    for (id, marker) in [
+        (section_ids::DRAIN, "[drain]"),
+        (section_ids::READINESS, "[readiness]"),
+        (section_ids::LIVENESS, "[liveness]"),
+        (section_ids::EXIT_CLASSES, "[exit_codes]"),
+    ] {
+        match report.section(id) {
+            Some(SectionResult::NotApplicable { reason }) => {
+                assert!(
+                    reason.contains(marker),
+                    "the {id} skip must name the absent {marker} declaration: {reason}"
+                );
+            }
+            other => panic!("expected NotApplicable for {id}, got {other:?}"),
+        }
+    }
+
     // The native-launch shape: the code-declared gateway argv is contract, so
     // the config section cannot observe delivered config through a `--dump`
     // seam — not_applicable with the justification, never a silent pass.
@@ -170,8 +191,9 @@ fn hermes_tck_passes_every_section_applicable_to_its_declaration() {
     }
 
     // The report carries the contract version the run was governed by
-    // (retro #163, finding B8) — the frozen v1 this engine negotiates.
-    assert_eq!(report.contract_version, "1.0.0");
+    // (retro #163, finding B8) — the frozen v1 this engine negotiates
+    // (rides the additive Adapter Contract minors).
+    assert_eq!(report.contract_version, "1.1.0");
 }
 
 /// The serialization lock for THIS binary's PATH-mutating tests. Plain
