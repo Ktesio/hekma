@@ -66,6 +66,13 @@
 //!   NOT a one-shot server: the engine's readiness probe opens a fresh
 //!   connection on every poll and each one is answered. The target a manifest's
 //!   `http-get` readiness probe polls. Pure `std`, NO OS-cfg.
+//! * `--http-ready-after <MS>`  DELAY the `--http-ready` endpoint: nothing is
+//!   bound on the port until `<MS>` after PROCESS START (then the ordinary
+//!   persistent responder takes over for the process's whole lifetime). The
+//!   late-binding subject: a drill can PROVE the engine's gate actually held —
+//!   before `<MS>` the probe cannot pass, so a start that lands `running`
+//!   early skipped the wait. Requires `--http-ready` (refused with exit 2
+//!   otherwise — there is no endpoint to delay). Pure `std`, NO OS-cfg.
 //! * `--ready-file <PATH>:<DELAY_MS>`  create `<PATH>` after `<DELAY_MS>` — the
 //!   signal a manifest's `file-fresh` readiness probe waits for; the delay
 //!   proves the probe genuinely waited. Pure `std`, NO OS-cfg.
@@ -151,17 +158,24 @@
 //!   then honestly times out instead of faking a completion). Pure `std`,
 //!   NO OS-cfg.
 //!
-//! * `--exit-on-pause <DELAY_MS>:<ANCHOR>`  (18-4 follow-up)  wait until
-//!   `<ANCHOR>` EXISTS (polling every 25 ms), sleep `<DELAY_MS>`, then EXIT 0
-//!   — the self-exit twin of `--idle-on-pause`: the delay counts from the
-//!   pause sentinel's arrival (the file the drain's own pause command
-//!   writes), not from process start, so a drain drill's agent provably dies
-//!   ON ITS OWN a fixed distance into the drain regardless of when the drain
-//!   began. This is what keeps a drain drill fast on platforms whose graceful
-//!   stop is a pure exit-watch (Windows has no deliverable graceful signal,
-//!   so the stop ladder would otherwise poll its whole default window before
-//!   the forced kill). The value splits on the FIRST colon (`<ANCHOR>` may
-//!   itself contain colons, a Windows drive path). Pure `std`, NO OS-cfg.
+//! * `--exit-on-pause <DELAY_MS>:<ANCHOR>[:<CANCEL_ANCHOR>]`  (18-4
+//!   follow-up)  wait until `<ANCHOR>` EXISTS (polling every 25 ms), sleep
+//!   `<DELAY_MS>`, then EXIT 0 — the self-exit twin of `--idle-on-pause`: the
+//!   delay counts from the pause sentinel's arrival (the file the drain's own
+//!   pause command writes), not from process start, so a drain drill's agent
+//!   provably dies ON ITS OWN a fixed distance into the drain regardless of
+//!   when the drain began. This is what keeps a drain drill fast on platforms
+//!   whose graceful stop is a pure exit-watch (Windows has no deliverable
+//!   graceful signal, so the stop ladder would otherwise poll its whole
+//!   default window before the forced kill). The optional `<CANCEL_ANCHOR>`
+//!   (the resume sentinel) stands the self-exit down when the pause is
+//!   reversed before the delay elapses — the form a fixture that ALSO serves
+//!   pause→resume sections uses; only a pause never resumed, the drain shape,
+//!   ends the process. The value splits on the FIRST colon for the delay;
+//!   the anchor then splits at ITS first colon when a cancel anchor is
+//!   present (an anchor containing a colon — a Windows drive path —
+//!   therefore cannot carry a cancel anchor; the fixture convention keeps
+//!   every anchor an Agent-Home-relative name). Pure `std`, NO OS-cfg.
 //!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
@@ -359,6 +373,13 @@ struct Opts {
     /// every connection with the given status. Lets a manifest's `http-get`
     /// readiness probe pass against THIS process. `None` = no endpoint.
     http_ready: Option<(u16, u16)>,
+    /// Delay the `--http-ready` endpoint by this many ms FROM PROCESS START
+    /// (18-5 review round 1, A2): nothing is bound on the port until the
+    /// delay elapses, so a start declared `running` before it provably
+    /// skipped the readiness wait — the late-binding subject a gate-hold
+    /// drill observes. `None` = bind immediately (the default; existing
+    /// tests unaffected).
+    http_ready_after: Option<u64>,
     /// Create this file after `<delay_ms>` (the readiness-gate story): the
     /// readiness signal a manifest's `file-fresh` probe watches for. The delay
     /// gates WHEN the file appears (so a test can prove the probe genuinely
@@ -438,8 +459,12 @@ struct Opts {
     /// sentinel's arrival, not process start, so the agent provably dies on
     /// its own a fixed distance into the drain — the Windows-graceful-stop
     /// fixture (the stop ladder's exit-watch needs the process to end).
-    /// `None` = no anchored self-exit.
-    exit_on_pause: Option<(u64, PathBuf)>,
+    /// The optional third element is a CANCEL anchor: when it appears before
+    /// the delay elapses (the resume sentinel — the pause was reversed), the
+    /// self-exit stands down permanently, so a fixture that also serves
+    /// pause→resume sections never dies under them. `None` = no anchored
+    /// self-exit.
+    exit_on_pause: Option<(u64, PathBuf, Option<PathBuf>)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -500,6 +525,7 @@ fn parse() -> Opts {
     let mut sniff_stdin_at_startup = false;
     let mut drop_env: Vec<String> = Vec::new();
     let mut http_ready: Option<(u16, u16)> = None;
+    let mut http_ready_after: Option<u64> = None;
     let mut http_health: Option<(u16, u16)> = None;
     let mut http_health_fail_after: Option<Duration> = None;
     let mut heartbeat_file: Option<(PathBuf, u64)> = None;
@@ -513,7 +539,7 @@ fn parse() -> Opts {
     let mut watch_sentinel: Option<(PathBuf, PathBuf, PathBuf)> = None;
     let mut idle_after: Option<(PathBuf, u64)> = None;
     let mut idle_on_pause: Option<(u64, PathBuf, PathBuf)> = None;
-    let mut exit_on_pause: Option<(u64, PathBuf)> = None;
+    let mut exit_on_pause: Option<(u64, PathBuf, Option<PathBuf>)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -593,6 +619,22 @@ fn parse() -> Opts {
                     std::process::exit(2);
                 }
             },
+            "--http-ready-after" => {
+                // Fail FAST on a missing/malformed value (the `--http-ready`
+                // convention): a silently-ignored delay would leave the
+                // endpoint binding immediately and any hold drill measuring
+                // nothing but a pass.
+                match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => http_ready_after = Some(ms),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --http-ready-after requires a DELAY_MS value (got \
+                             missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--ready-file" => match args
                 .next()
                 .as_deref()
@@ -911,28 +953,39 @@ fn parse() -> Opts {
                 }
             }
             "--exit-on-pause" => {
-                // DELAY_MS:ANCHOR — split on the FIRST colon (a number never
-                // contains one; the ANCHOR tail may itself contain colons, a
-                // Windows drive path — the `--idle-on-pause` discipline).
-                // FAIL FAST (the ready-file posture): a silently-ignored
-                // anchored self-exit would make a Windows drain drill burn
-                // the stop ladder's whole graceful window instead of the
-                // anchored exit the drill is built on.
+                // DELAY_MS:ANCHOR[:CANCEL_ANCHOR] — the delay splits on the
+                // FIRST colon (a number never contains one). The optional
+                // third segment is a CANCEL anchor (the resume sentinel): when
+                // it appears before the delay elapses, the self-exit stands
+                // down. Splitting the anchor at ITS first colon means an
+                // anchor containing a colon (a Windows drive path) cannot
+                // carry a cancel anchor — the fixture convention keeps every
+                // anchor an Agent-Home-relative NAME. FAIL FAST (the
+                // ready-file posture): a silently-ignored anchored self-exit
+                // would make a Windows drain drill burn the stop ladder's
+                // whole graceful window instead of the anchored exit the
+                // drill is built on.
                 let parsed = args.next().as_deref().and_then(|v| {
-                    let (ms, anchor) = v.split_once(':')?;
+                    let (ms, rest) = v.split_once(':')?;
                     let ms = ms.parse::<u64>().ok()?;
-                    if anchor.is_empty() {
+                    if rest.is_empty() {
                         return None;
                     }
-                    Some((ms, PathBuf::from(anchor)))
+                    let (anchor, cancel) = match rest.split_once(':') {
+                        Some((anchor, cancel)) if !anchor.is_empty() && !cancel.is_empty() => {
+                            (anchor, Some(PathBuf::from(cancel)))
+                        }
+                        _ => (rest, None),
+                    };
+                    Some((ms, PathBuf::from(anchor), cancel))
                 });
                 match parsed {
-                    Some(pair) => exit_on_pause = Some(pair),
+                    Some(triple) => exit_on_pause = Some(triple),
                     None => {
                         eprintln!(
-                            "fake_agent: --exit-on-pause requires DELAY_MS:ANCHOR (a \
-                             non-negative millisecond delay and a path, colon-separated; \
-                             got a missing or malformed value)"
+                            "fake_agent: --exit-on-pause requires DELAY_MS:ANCHOR[:CANCEL_ANCHOR] \
+                             (a non-negative millisecond delay and one or two paths, \
+                             colon-separated; got a missing or malformed value)"
                         );
                         std::process::exit(2);
                     }
@@ -975,6 +1028,17 @@ fn parse() -> Opts {
         eprintln!(
             "fake_agent: --http-health-fail-after requires --http-health PORT:STATUS \
              (there is no health endpoint to fail)"
+        );
+        std::process::exit(2);
+    }
+    // 18-5 review round 1 (A2): a delay with no endpoint is a silent no-op —
+    // a hold drill built on the pair would measure an immediately-answering
+    // responder instead of the behavior under test. Name BOTH flags in the
+    // refusal.
+    if http_ready_after.is_some() && http_ready.is_none() {
+        eprintln!(
+            "fake_agent: --http-ready-after requires --http-ready PORT:STATUS \
+             (there is no endpoint to delay)"
         );
         std::process::exit(2);
     }
@@ -1050,6 +1114,7 @@ fn parse() -> Opts {
         sniff_stdin_at_startup,
         drop_env,
         http_ready,
+        http_ready_after,
         ready_file,
         ready_line,
         never_ready,
@@ -1181,8 +1246,8 @@ fn main() {
     // pause sentinel, the agent provably dies on its own a fixed distance
     // into the drain, whatever the platform's graceful mechanism is. Pure
     // `std`, NO OS-cfg.
-    if let Some((ms, anchor)) = opts.exit_on_pause.clone() {
-        thread::spawn(move || exit_on_pause_after(Duration::from_millis(ms), anchor));
+    if let Some((ms, anchor, cancel)) = opts.exit_on_pause.clone() {
+        thread::spawn(move || exit_on_pause_after(Duration::from_millis(ms), anchor, cancel));
     }
 
     // Readiness-probe fixtures: each thread starts EARLY (before the ready
@@ -1193,8 +1258,17 @@ fn main() {
     if let Some((port, status)) = opts.http_ready {
         // Persistent for this process's lifetime (NOT one-shot): the
         // engine's readiness probe reconnects on every poll and every
-        // connection is answered.
-        thread::spawn(move || serve_http_ready(port, status));
+        // connection is answered. The A2 delay (when armed) sleeps INSIDE
+        // the thread — same EARLY-start posture, but nothing is bound on
+        // the port until the delay elapses, which is how a drill proves
+        // the engine's gate genuinely held.
+        let delay = opts.http_ready_after.map(Duration::from_millis);
+        thread::spawn(move || {
+            if let Some(delay) = delay {
+                sleep(delay);
+            }
+            serve_http_ready(port, status);
+        });
     }
     if let Some((path, ms)) = opts.ready_file.clone() {
         thread::spawn(move || touch_ready_file(path, Duration::from_millis(ms)));
@@ -1680,15 +1754,31 @@ fn touch_idle_on_pause(delay: Duration, anchor: PathBuf, idle: PathBuf) {
 /// command writes), which is what the Windows stop ladder's graceful
 /// exit-watch step needs to conclude quickly: that platform has no
 /// deliverable graceful signal, so a never-ending agent would otherwise burn
-/// the ladder's whole default window before the forced kill. Exiting is
-/// unconditional once armed (no failure mode — the process just ends, the
-/// honest observable). Pure `std`, NO OS-cfg.
+/// the ladder's whole default window before the forced kill. With a CANCEL
+/// anchor (the resume sentinel), the delay is spent POLLING the cancel file
+/// instead of sleeping: a pause reversed before the delay elapses stands the
+/// self-exit down permanently (a fixture that also serves pause→resume
+/// sections never dies under them — only a pause that is never resumed, the
+/// drain shape, ends the process). Exiting remains unconditional once the
+/// delay burns out (no failure mode — the process just ends, the honest
+/// observable). Pure `std`, NO OS-cfg.
 #[cfg(not(tarpaulin_include))]
-fn exit_on_pause_after(delay: Duration, anchor: PathBuf) {
+fn exit_on_pause_after(delay: Duration, anchor: PathBuf, cancel: Option<PathBuf>) {
     while std::fs::metadata(&anchor).is_err() {
         sleep(Duration::from_millis(25));
     }
-    sleep(delay);
+    match cancel {
+        None => sleep(delay),
+        Some(cancel) => {
+            let deadline = std::time::Instant::now() + delay;
+            while std::time::Instant::now() < deadline {
+                if std::fs::metadata(&cancel).is_ok() {
+                    return;
+                }
+                sleep(Duration::from_millis(25));
+            }
+        }
+    }
     std::process::exit(0);
 }
 

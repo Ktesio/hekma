@@ -104,6 +104,12 @@ pub struct ManifestFixture {
     /// reason: the exit-codes tests are about the section's shape. E.g.
     /// `"restart_requested = [75]\nclean = [0]"`.
     exit_codes: Option<String>,
+    /// The raw `[drain]` section BODY (the lines under the header), appended
+    /// verbatim after the `[exit_codes]` block. Raw for the same reason: the
+    /// drain tests are about the section's shape — valid and invalid — and
+    /// every shape is one or two short lines. E.g.
+    /// `"timeout_ms = 10000\nidle_file = \"idle.sentinel\""`.
+    drain: Option<String>,
     /// The 18-4 cooperative-pause PAIR paths (pause sentinel, resume
     /// sentinel): when `Some`, the `[lifecycle.pause]`/`[lifecycle.resume]`
     /// op templates are written, each `fake_agent --touch <path>` (the
@@ -137,6 +143,7 @@ impl ManifestFixture {
             readiness: None,
             liveness: None,
             exit_codes: None,
+            drain: None,
             touch_pair: None,
         }
     }
@@ -348,6 +355,16 @@ impl ManifestFixture {
         self
     }
 
+    /// A raw `[drain]` section — `body` is the section's lines WITHOUT the
+    /// header, appended verbatim AFTER the `[exit_codes]` block, e.g.
+    /// `"timeout_ms = 10000\nidle_file = \"idle.sentinel\""`. Raw because the
+    /// drain tests are exactly about the section's shape — valid and invalid
+    /// — and every shape is one or two short lines.
+    pub fn drain(mut self, body: &str) -> Self {
+        self.drain = Some(body.to_string());
+        self
+    }
+
     /// Write `adapter.toml` into `dir` (created if missing) and return the
     /// directory path — both `AdapterRef::Manifest` and
     /// `kt agent register --manifest` accept a directory.
@@ -407,6 +424,10 @@ impl ManifestFixture {
             .exit_codes
             .map(|body| format!("\n[exit_codes]\n{body}\n"))
             .unwrap_or_default();
+        let drain = self
+            .drain
+            .map(|body| format!("\n[drain]\n{body}\n"))
+            .unwrap_or_default();
         let touch_pair = self
             .touch_pair
             .as_ref()
@@ -423,7 +444,7 @@ impl ManifestFixture {
         let body = format!(
             "\ncontract_version = \"{contract_version}\"\n\n[adapter]\nkind = \"{kind}\"\n\n\
              [lifecycle.start]\nexec = {exec:?}\nargs = [{args_toml}]{touch_pair}{capabilities}\n\n\
-             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}{exit_codes}\n",
+             [metering]\nsource = \"{metering}\"{config}{readiness}{liveness}{exit_codes}{drain}\n",
             contract_version = hekma_adapter_api::CONTRACT_VERSION,
             kind = self.kind,
             exec = exec,
@@ -435,6 +456,7 @@ impl ManifestFixture {
             readiness = readiness,
             liveness = liveness,
             exit_codes = exit_codes,
+            drain = drain,
         );
         let path = dir.join("adapter.toml");
         std::fs::write(&path, body).expect("write the fixture manifest");

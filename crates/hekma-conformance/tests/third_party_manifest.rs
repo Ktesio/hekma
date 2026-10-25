@@ -78,7 +78,11 @@ fn third_party_manifest_adapter_is_proven_conformant_by_the_public_harness() {
     let expected_order = [
         section_ids::CAPABILITY_EDGES,
         section_ids::LIFECYCLE,
+        section_ids::DRAIN,
         section_ids::PAUSE,
+        section_ids::READINESS,
+        section_ids::LIVENESS,
+        section_ids::EXIT_CLASSES,
         section_ids::CONFIG_MAPPING,
         section_ids::METERING_SELF_REPORTED,
         section_ids::METERING_ENGINE_OBSERVED,
@@ -137,6 +141,25 @@ fn third_party_manifest_adapter_is_proven_conformant_by_the_public_harness() {
             );
         }
         other => panic!("expected NotApplicable for engine-observed, got {other:?}"),
+    }
+
+    // The four service sections (18-5): this adapter declares none of them,
+    // so each reads not_applicable NAMING the absent declaration.
+    for (id, marker) in [
+        (section_ids::DRAIN, "[drain]"),
+        (section_ids::READINESS, "[readiness]"),
+        (section_ids::LIVENESS, "[liveness]"),
+        (section_ids::EXIT_CLASSES, "[exit_codes]"),
+    ] {
+        match report.section(id) {
+            Some(SectionResult::NotApplicable { reason }) => {
+                assert!(
+                    reason.contains(marker),
+                    "the {id} skip must name the absent {marker} declaration: {reason}"
+                );
+            }
+            other => panic!("expected NotApplicable for {id}, got {other:?}"),
+        }
     }
 
     // The report is machine-readable per capability: it serializes to JSON

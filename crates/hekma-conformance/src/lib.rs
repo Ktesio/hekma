@@ -4,9 +4,15 @@
 //! AD-2, AD-3):
 //!
 //! * [`tck`] — the Conformance Test Kit itself: register any adapter with a
-//!   fresh engine, run the eight proof sections, and get back a
+//!   fresh engine, run the twelve proof sections, and get back a
 //!   machine-readable [`ConformanceReport`]. The public entry point for
 //!   third-party adapter crates' dev-tests.
+//! * [`gateway`] — the REFERENCE gateway manifest (story 18-5): the one
+//!   canonical `adapter.toml` declaring everything epic 18 shipped
+//!   (readiness, liveness, exit-code classes, the pause/resume pair, the
+//!   drain), composed from the fake agent's fixture flags. The kit's
+//!   executable single source of truth; `docs/manifest.md` shows the same
+//!   five declarations as THE composed example.
 //! * A **mock native adapter** ([`MockAdapter`]) and an **inert scripted fake
 //!   agent** ([`ScriptedFakeAgent`]), the reusable fixtures the engine's
 //!   lifecycle/governance tests (and the TCK's own probes) build on.
@@ -54,14 +60,17 @@ use hekma_adapter_api::{
     MeteringSource, OsId, SupportLevel,
 };
 
+pub mod gateway;
 pub mod tck;
 pub mod test_notes;
 pub mod test_support;
 pub mod uj3;
 
 pub use tck::{
-    run_conformance, run_conformance_with, run_mock_conformance, section_ids, ConformanceReport,
-    SectionReport, SectionResult, SectionSelection, TckAdapter, TckConfig, TckSection,
+    run_conformance, run_conformance_with, run_conformance_with_evidence, run_mock_conformance,
+    section_ids, ConformanceReport, DrainEvidence, ExitClassesEvidence, LivenessEvidence,
+    PauseEvidence, ReadinessEvidence, SectionReport, SectionResult, SectionSelection,
+    ServiceRunEvidence, TckAdapter, TckConfig, TckSection,
 };
 
 // The `fake_agent` locator lives in `test_support` (the shared test-support
