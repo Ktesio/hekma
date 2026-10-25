@@ -1037,11 +1037,19 @@ impl Supervisor {
                         }
                     }
                     drop(handle);
+                    // The message names the DECLARED budget (deterministic
+                    // for the operator and the tests that pin it); the
+                    // MEASURED wait — which can overshoot the budget by up to
+                    // one poll interval on a slow machine (the macOS leg
+                    // observed 411/512/549ms against a 400ms budget) — rides
+                    // the durable `readiness-timeout` cause below instead, so
+                    // neither number misreads as the other.
                     let mut detail = format!(
-                        "{description} did not pass within its {waited_ms}ms budget — the \
+                        "{description} did not pass within its {}ms budget — the \
                          instance is failed and will NOT be restarted; check the agent's \
                          readiness mechanism (the probe targets the instance's own home, \
-                         logs, or listener)"
+                         logs, or listener)",
+                        gate.timeout_ms
                     );
                     // Review round 1 (E5): the runner tolerates a liveness
                     // poll ERROR as alive, so a timeout that watched a
