@@ -15,26 +15,42 @@ The manifest is parsed and validated **before** any state is written. Unknown ke
 
 ## Complete Example
 
+The example below is THE reference service-mode manifest — the same shape the
+Conformance Test Kit's own gateway subject (`tck-gateway`) declares, and the
+one the kit's end-to-end run drives through every section. A gateway is the
+canonical service-mode agent: it opens a loopback HTTP port and only then is
+ready, it proves it is alive by rewriting a heartbeat file, it asks for
+relaunches with the conventional exit 75, and it drains cooperatively — a
+pause/resume command pair plus an idle marker the drain waits on.
+
 ```toml
 contract_version = "1.1.0"
 
 [adapter]
-kind = "my-agent"
-name = "My Agent"
+kind = "my-gateway"
+name = "My Gateway"
 
+# Service-mode startup: open the loopback API, prove readiness through it,
+# and carry the --dump delivery seam the config/memory proofs read.
 [lifecycle.start]
-exec = "my-agent"
-args = ["--serve"]
-env = { LOG_LEVEL = "info" }
+exec = "my-gateway"
+args = ["--port", "8080", "--dump", "config-dump.txt"]
 
-[lifecycle.stop]
-exec = "my-agent"
-args = ["--shutdown"]
+# The cooperative pause/resume PAIR (both or neither): the agent stops and
+# restarts accepting work under its own program — OS-independent, and it
+# works even where the capability table says "unsupported".
+[lifecycle.pause]
+exec = "my-gateway"
+args = ["--pause"]   # touches pause.sentinel in the Agent Home
+
+[lifecycle.resume]
+exec = "my-gateway"
+args = ["--resume"]  # touches resume.sentinel in the Agent Home
 
 [capabilities.pause]
 linux = "guaranteed"
 macos = "guaranteed"
-windows = "best-effort"
+windows = "guaranteed"
 
 [capabilities.interaction]
 linux = "guaranteed"
@@ -44,26 +60,48 @@ windows = "guaranteed"
 [metering]
 source = "self-reported"
 
-[interaction]
-channel = "stdio"
-
+# The readiness gate (added at 1.1.0): the start stays in `starting` — never
+# `running` — until the declared probe passes.
 [readiness]
 kind = "http-get"
-timeout_ms = 5000
-url = "http://127.0.0.1:8080/health"
+timeout_ms = 8000
+url = "http://127.0.0.1:8080/models"
 expected_status = 200
 
+# The liveness watch (added at 1.1.0): while `running`, the agent rewrites
+# the heartbeat; a signal stale for the whole window fails the instance.
 [liveness.heartbeat_file]
-path = "heartbeat.marker"
-max_age_ms = 5000
+path = "gateway.heartbeat"
+max_age_ms = 1500
 
+# Exit classes (added at 1.1.0): 75 is the conventional "please relaunch me"
+# ask — the engine relaunches WITHOUT charging the crash loop.
 [exit_codes]
 restart_requested = [75]
-clean = [0]
 
+# The drain composite (added at 1.1.0): stop-new-work → wait (bounded) for
+# the idle marker → stop. A timed-out drain still stops, honestly reporting
+# `completed: false`.
+[drain]
+timeout_ms = 10000
+idle_file = "gateway.idle"
+
+# Config delivery: the unified key → the agent's env, proven through the
+# --dump seam above. The reserved "memory.dir" key declares Memory Backing
+# delivery (the engine injects the managed dir under the named env var).
 [config.model]
-env = "MODEL"
+env = "GATEWAY_MODEL"
+
+[config."memory.dir"]
+env = "GATEWAY_MEMORY_DIR"
 ```
+
+Every section above is cross-referenced in detail below. The five
+service-mode declarations — `[readiness]`, `[liveness]`, `[exit_codes]`, the
+`[lifecycle.pause]`/`[lifecycle.resume]` pair, and `[drain]` — are each
+optional; a manifest that omits one simply reads `not_applicable` in the
+[Conformance Test Kit](testing.md#the-conformance-test-kit) section that
+would have proven it.
 
 ## Mandatory Sections
 
