@@ -100,6 +100,17 @@ impl Supervisor {
         self.stop_fault_pids.insert(pid, fault);
     }
 
+    /// The held handle's pid for `name` (cfg(test)) — the key the stop-fault
+    /// seam is armed by; `None` when no live handle is held under the name.
+    /// Lib-test only (the engine-level fault arming resolves the pid through
+    /// this; the supervisor tests reach into `running` directly instead).
+    #[cfg(test)]
+    pub(crate) fn held_pid(&self, name: &InstanceName) -> Option<u32> {
+        self.running
+            .get(name)
+            .map(|supervised| self.backend.pid(&supervised.handle))
+    }
+
     /// The injected stop result for `pid` at a `backend.stop(Duration::ZERO)`
     /// site: `Some` carries the fault's synthesized `Result` (a failed stop,
     /// or the graceful-not-forced lie); `None` means run the REAL stop. An

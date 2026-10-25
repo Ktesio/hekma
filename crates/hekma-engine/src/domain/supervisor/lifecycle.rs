@@ -494,33 +494,48 @@ impl Supervisor {
         let (outcome, log_capture) = match self.running.get_mut(&name) {
             Some(supervised) => {
                 let log_capture = self.backend.log_capture(&supervised.handle);
-                let outcome = self.backend.stop(&mut supervised.handle, window).map_err(
-                    |source| match source {
-                        // Fix pass (review of #80 follow-up — the CRITICAL
-                        // finding): mark the handle so a RETRY `stop` (or the
-                        // crash reaper's own poll) recognizes this EXACT
-                        // scenario and reconciles it with a cheap,
-                        // non-blocking poll instead of re-running the whole
-                        // bounded SIGTERM/SIGKILL/confirm sequence (see
-                        // `stop_inner`'s retry-branch docs above and
-                        // `poll_once`'s docs). This `?` skips
-                        // `self.running.remove` below, so the handle is
-                        // RETAINED, never silently dropped — the instance
-                        // stays `stopping` (the terminal transition below is
-                        // never reached), an honest, non-terminal state.
-                        BackendError::StopUnconfirmed { timeout_secs } => {
-                            supervised.stop_unconfirmed = true;
-                            EngineError::StopUnconfirmed {
-                                name: name.as_str().to_string(),
-                                timeout_secs,
-                            }
-                        }
-                        other => EngineError::Backend {
+                // Epic 20-1 coverage seam (cfg(test) only — the established
+                // fault-injection idiom, see the `stop_fault_pids` field
+                // docs): an armed fault ALSO fronts the LADDER's windowed
+                // stop, so "a stop that errors against a still-live process,
+                // leaving the honest `stopping` row and the retained handle"
+                // is stageable hermetically (the shutdown drain's failed-stop
+                // arms pin exactly that scenario; production is unchanged).
+                #[cfg(test)]
+                let raw_stop = {
+                    let pid = self.backend.pid(&supervised.handle);
+                    match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
+                        Some(faulted) => faulted,
+                        None => self.backend.stop(&mut supervised.handle, window),
+                    }
+                };
+                #[cfg(not(test))]
+                let raw_stop = self.backend.stop(&mut supervised.handle, window);
+                let outcome = raw_stop.map_err(|source| match source {
+                    // Fix pass (review of #80 follow-up — the CRITICAL
+                    // finding): mark the handle so a RETRY `stop` (or the
+                    // crash reaper's own poll) recognizes this EXACT
+                    // scenario and reconciles it with a cheap,
+                    // non-blocking poll instead of re-running the whole
+                    // bounded SIGTERM/SIGKILL/confirm sequence (see
+                    // `stop_inner`'s retry-branch docs above and
+                    // `poll_once`'s docs). This `?` skips
+                    // `self.running.remove` below, so the handle is
+                    // RETAINED, never silently dropped — the instance
+                    // stays `stopping` (the terminal transition below is
+                    // never reached), an honest, non-terminal state.
+                    BackendError::StopUnconfirmed { timeout_secs } => {
+                        supervised.stop_unconfirmed = true;
+                        EngineError::StopUnconfirmed {
                             name: name.as_str().to_string(),
-                            source: other,
-                        },
+                            timeout_secs,
+                        }
+                    }
+                    other => EngineError::Backend {
+                        name: name.as_str().to_string(),
+                        source: other,
                     },
-                )?;
+                })?;
                 (outcome, log_capture)
             }
             None => (crate::ports::StopOutcome { forced: false }, None),
