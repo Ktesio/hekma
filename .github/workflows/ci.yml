@@ -604,6 +604,236 @@ jobs:
             perf-budgets-serve-report.json
           if-no-files-found: warn
 
+  agents-in-ci:
+    name: agents-in-ci
+    # FR-47's dogfood lane: the agents-in-CI recipe (docs/agents-in-ci.md)
+    # run END-TO-END in this repository's own CI, on every PR — the lane is
+    # the recipe's test, so the page cannot silently rot. Two deterministic
+    # legs against the BRANCH-BUILT binary (this commit under test, no
+    # release download, no egress — the page documents the tag-pinned musl
+    # download users copy; the lane's build step is the one part not copied):
+    #   * success leg — generous ceiling, the fake_agent's KNOWN batch
+    #     (5 events x (10 in + 20 out)) polls to committed, the summary
+    #     renders tokens + labeled dollars from `usage --json`/`show --json`,
+    #     exit 0;
+    #   * breach leg — the proven 90-token ceiling (crossed at event 3)
+    #     pauses the agent; there is NO breach exit code (0-6 only), so the
+    #     leg proves the breach from the PUBLIC surface — the paused Fleet
+    #     row + its budget fields on `show --json` — and NAMES the breach in
+    #     the summary. No path masks a breach as success: continue-on-error
+    #     stays false and a leg that cannot prove its expected state fails
+    #     loudly with the last JSON blob printed, never a bare timeout.
+    # Determinism: every wait polls for a KNOWN committed state (the start
+    # session's reaper drains the batch before `start --detach` returns) —
+    # never a wall-clock sleep. The whole job shares the workflow's
+    # `permissions: contents: read` and is wall-clock bounded at
+    # `timeout-minutes: 15`; the fake agent calls nothing and no secret is
+    # involved.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build the branch hekma + fake_agent (stale-helper guard)
+        # The SAME rm+rebuild freshness guard the test/coverage/perf jobs
+        # carry: this job's target/ cache key is Cargo.lock-derived, so a
+        # helper-only change cannot bust it and a frozen binary would
+        # silently ignore newer flags (fake_agent ignores unknown args).
+        # rm + explicit rebuild makes both binaries deterministic instead
+        # of racing a stale cache hit. Explicit +stable (see the fmt job):
+        # the root rust-toolchain.toml pins only local bare cargo.
+        shell: bash
+        run: |
+          rm -f target/release/hekma target/release/hekma.exe
+          rm -f target/release/fake_agent target/release/fake_agent.exe
+          cargo +stable build --release -p hekma -p hekma-conformance --bin hekma --bin fake_agent
+      - name: Success leg — generous ceiling, known batch, labeled-dollar summary
+        # The recipe's happy path end to end: register from the checked-in
+        # fixture manifest (the __FAKE_AGENT_BIN__ placeholder substituted
+        # with the absolute branch-built path), arm a generous ceiling +
+        # rates, start detached, poll `usage --json` for the KNOWN committed
+        # batch, assert the agent is still running (no breach), render the
+        # `## Agents in CI` summary block from `usage --json` + `show --json`
+        # (tokens; micro-dollars with the `estimated` label; cached/dollars
+        # honesty — `—` when absent, never a fabricated 0/$0.00), stop, and
+        # assert the terminal state. The renderer is the docs page's §4
+        # snippet verbatim; the assertions around it are the lane's own.
+        env:
+          # Belt-and-braces: the update check already auto-skips under
+          # CI=true, which GitHub runners always set.
+          KTESIO_NO_UPDATE_CHECK: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          leg="$RUNNER_TEMP/lane-success"
+          mkdir -p "$leg/state" "$leg/manifest"
+          export KTESIO_STATE_DIR="$leg/state"
+          hekma="target/release/hekma"
+          sed "s|__FAKE_AGENT_BIN__|$PWD/target/release/fake_agent|" \
+            .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
+          "$hekma" agent register ci-bot --manifest "$leg/manifest"
+          "$hekma" agent config set ci-bot budget.tokens.cumulative 100000
+          "$hekma" agent config set ci-bot budget.breach_action pause
+          "$hekma" agent config set ci-bot cost.rate.input 3.00
+          "$hekma" agent config set ci-bot cost.rate.output 15.00
+          "$hekma" agent start ci-bot --detach
+          committed=""
+          for i in $(seq 1 60); do
+            "$hekma" agent usage ci-bot --json > "$leg/usage.json" || { sleep 1; continue; }
+            in_tok=$(jq -r '.usage.cumulative_input_tokens // 0' "$leg/usage.json") \
+              || { echo "::error::success leg: malformed usage JSON"; cat "$leg/usage.json"; exit 1; }
+            out_tok=$(jq -r '.usage.cumulative_output_tokens // 0' "$leg/usage.json") \
+              || { echo "::error::success leg: malformed usage JSON"; cat "$leg/usage.json"; exit 1; }
+            if [ "$in_tok" -ge 50 ] && [ "$out_tok" -ge 100 ]; then committed=1; break; fi
+            sleep 1
+          done
+          if [ -z "$committed" ]; then
+            echo "::error::success leg: usage never reached the known 50-in/100-out batch; last read:"
+            cat "$leg/usage.json"
+            exit 1
+          fi
+          "$hekma" agent show ci-bot --json > "$leg/show.json"
+          state=$(jq -r '.instance.state // empty' "$leg/show.json") \
+            || { echo "::error::success leg: malformed show JSON"; cat "$leg/show.json"; exit 1; }
+          if [ "$state" != "running" ]; then
+            echo "::error::success leg: expected running before stop, got: $state"
+            cat "$leg/show.json"
+            exit 1
+          fi
+          # The budget block must be present on the happy path too (the
+          # breach leg validates its enforcement; this pins its projection).
+          s_limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
+          s_action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
+          if [ "$s_limit" != "100000" ] || [ "$s_action" != "pause" ]; then
+            echo "::error::success leg: show --json budget block missing/wrong (limit=$s_limit action=$s_action)"
+            cat "$leg/show.json"
+            exit 1
+          fi
+          # Deterministic money math, asserted: 50 in x $3/1M + 100 out x
+          # $15/1M = 1650 micro-dollars, labeled estimated (AI-55 class:
+          # money surfaces get proven, not rendered-and-hoped).
+          cost="— (no rate configured)"
+          if jq -e '.usage.cumulative_dollars' "$leg/usage.json" > /dev/null; then
+            micros=$(jq -r '.usage.cumulative_dollars' "$leg/usage.json")
+            label=$(jq -r '.usage.estimate_label // empty' "$leg/usage.json")
+            if [ "$micros" != "1650" ] || [ "$label" != "estimated" ]; then
+              echo "::error::success leg: expected 1650 estimated micro-dollars, got: $micros ($label)"
+              cat "$leg/usage.json"
+              exit 1
+            fi
+            cost=$(awk -v m="$micros" -v l="$label" 'BEGIN { printf "$%.6f (%s)", m / 1000000, l }')
+          else
+            echo "::error::success leg: rates were configured, yet cumulative_dollars is absent"
+            cat "$leg/usage.json"
+            exit 1
+          fi
+          cached=$(jq -r '.usage.cumulative_cached_tokens // empty' "$leg/usage.json")
+          [ -n "$cached" ] && [ "$cached" -gt 0 ] || cached="—"
+          {
+            echo "## Agents in CI — success leg"
+            echo ""
+            echo "ci-bot ran under a generous 100000-token budget, committed its"
+            echo "whole known batch (50 in / 100 out), and stayed within budget."
+            echo ""
+            echo "| agent | state | input tok | output tok | cached tok | cost |"
+            echo "|-------|-------|-----------|------------|------------|------|"
+            printf '| %s | %s | %s | %s | %s | %s |\n' \
+              ci-bot "$state" "$in_tok" "$out_tok" "$cached" "$cost"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          "$hekma" agent stop ci-bot --timeout 0
+          # The terminal state is asserted, not assumed: a stop that left the
+          # agent in any non-stopped state fails the leg by name.
+          "$hekma" agent show ci-bot --json > "$leg/final.json"
+          final=$(jq -r '.instance.state // empty' "$leg/final.json")
+          if [ "$final" != "stopped" ]; then
+            echo "::error::success leg: expected stopped after stop --timeout 0, got: $final"
+            cat "$leg/final.json"
+            exit 1
+          fi
+      - name: Breach leg — the 90-token ceiling pauses the agent; the row proves it
+        # The proven recipe: fixed 10-in/20-out sentinels against a cumulative
+        # ceiling of 90 tokens crosses at event 3. No rate is configured on
+        # this leg, and the summary's dollar cell renders the honest absence
+        # (`—`, never a fabricated $0.00) only AFTER the absence is asserted
+        # from `usage --json`. The breach proof is the paused
+        # Fleet row + budget fields (cumulative_limit 90, remaining clamped
+        # to 0, breach_action pause) read through `show --json` — the CLI
+        # has no breach exit code and the lane does not pretend otherwise.
+        env:
+          KTESIO_NO_UPDATE_CHECK: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          leg="$RUNNER_TEMP/lane-breach"
+          mkdir -p "$leg/state" "$leg/manifest"
+          export KTESIO_STATE_DIR="$leg/state"
+          hekma="target/release/hekma"
+          sed "s|__FAKE_AGENT_BIN__|$PWD/target/release/fake_agent|" \
+            .github/fixtures/agents-in-ci-adapter.toml > "$leg/manifest/adapter.toml"
+          "$hekma" agent register ci-breach --manifest "$leg/manifest"
+          "$hekma" agent config set ci-breach budget.tokens.cumulative 90
+          "$hekma" agent config set ci-breach budget.breach_action pause
+          "$hekma" agent start ci-breach --detach
+          paused=""
+          for i in $(seq 1 60); do
+            "$hekma" agent show ci-breach --json > "$leg/show.json" || { sleep 1; continue; }
+            state=$(jq -r '.instance.state // empty' "$leg/show.json")
+            limit=$(jq -r '.instance.budget.cumulative_limit // empty' "$leg/show.json")
+            remaining=$(jq -r '.instance.budget.cumulative_remaining // empty' "$leg/show.json")
+            action=$(jq -r '.instance.budget.breach_action // empty' "$leg/show.json")
+            if [ "$state" = "paused" ] && [ "$limit" = "90" ] && [ "$remaining" = "0" ] && [ "$action" = "pause" ]; then
+              paused=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$paused" ]; then
+            echo "::error::breach leg: the agent never reached paused with its budget fields within the bound; last read:"
+            cat "$leg/show.json"
+            exit 1
+          fi
+          in_tok=$(jq -r '.instance.usage.cumulative_input_tokens // 0' "$leg/show.json")
+          out_tok=$(jq -r '.instance.usage.cumulative_output_tokens // 0' "$leg/show.json")
+          total=$((in_tok + out_tok))
+          if [ "$total" -lt 90 ]; then
+            echo "::error::breach leg: the paused row shows only $total committed tokens, below the 90 ceiling"
+            cat "$leg/show.json"
+            exit 1
+          fi
+          # The honest absence is ASSERTED, not assumed: no rate is
+          # configured on this leg, so both dollar fields must be absent
+          # from `usage --json` — a regression that fabricated a $0.00
+          # (or an unlabeled figure) fails right here.
+          "$hekma" agent usage ci-breach --json > "$leg/usage.json"
+          jq -e '(.usage.cumulative_dollars == null) and (.usage.estimate_label == null)' \
+            "$leg/usage.json" > /dev/null \
+            || { echo "::error::breach leg: no rate configured, yet dollars/label are present in usage --json"; cat "$leg/usage.json"; exit 1; }
+          {
+            echo "## Agents in CI — breach leg"
+            echo ""
+            echo "ci-breach crossed its cumulative ceiling of ${limit} tokens"
+            echo "(committed ${total}: ${in_tok} in / ${out_tok} out) and was paused by the"
+            echo "configured Breach Action (\`${action}\`). There is no dedicated breach"
+            echo "exit code — this paused Fleet row IS the proof."
+            echo ""
+            echo "| agent | state | ceiling tok | remaining | breach action | committed tok | cost |"
+            echo "|-------|-------|-------------|-----------|---------------|---------------|------|"
+            printf '| %s | %s | %s | %s | %s | %s | — (no rate configured) |\n' \
+              ci-breach "$state" "$limit" "$remaining" "$action" "$total"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          "$hekma" agent stop ci-breach --timeout 0
+
   docs:
     name: docs
     runs-on: ubuntu-latest
