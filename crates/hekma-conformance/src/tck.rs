@@ -185,10 +185,37 @@ use hekma_engine::{
 /// How long any single section's poll may run by DEFAULT before it fails the
 /// section (never the harness) with a timeout reason. Generous: this covers a
 /// loaded CI runner plus the engine reaper's ~250ms cadence. A configured
-/// run overrides it via [`TckConfig::section_timeout`] (spec 15-3); this
-/// constant stays the [`Default`] and the value every pre-config harness
-/// call (`run_conformance` / `run_mock_conformance`) keeps using.
+/// run overrides it via [`TckConfig::section_timeout`] (spec 15-3). NOT the
+/// whole default story: [`default_section_timeout`] scales the
+/// [`TckConfig`] default up on Windows (see that fn for why), and the
+/// pre-config harness calls (`run_conformance` / `run_mock_conformance`)
+/// ride that default — this constant remains the fast-leg budget and the
+/// fallback for unmodeled platforms.
 const SECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The platform-aware DEFAULT section budget (what [`TckConfig::default`]
+/// and every pre-config harness call actually use).
+///
+/// Windows gets 90s. The windows-latest leg runs this same nextest matrix on
+/// a smaller runner, and under contention the engine-observed metering
+/// pipeline (fake helper → loopback proxy → the test process's upstream
+/// stub → engine reaper commit) has repeatedly needed more than the flat
+/// 30s to commit its third usage row — the Windows CI flake family charter
+/// (#236), escalated 2026-10-24/25 on the loaded branches to consume every
+/// nextest retry of a job (a slow RUNNER is slow for the whole job, so all
+/// three retries of the same test miss the same way). The larger budget is
+/// also the charter's discriminating instrument: a row that lands inside
+/// 90s was contention latency; one that still never lands is a dropped
+/// call the helper's bounded retry envelope owns, and the section still
+/// names the failure with the same honesty. Resolved at runtime per the
+/// per-OS-as-data rule — no compile-time platform selection.
+fn default_section_timeout() -> Duration {
+    if OsId::current() == OsId::Windows {
+        Duration::from_secs(90)
+    } else {
+        SECTION_TIMEOUT
+    }
+}
 
 /// The `agent.*` pass-through key the config-mapping section sets. The engine
 /// delivers it to the env var named by the VERBATIM key tail — so env
@@ -1055,8 +1082,10 @@ impl SectionSelection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TckConfig {
     /// The per-poll budget every section's bounded wait uses (state polls,
-    /// dump/log/row polls). The default (30s) covers a loaded CI runner;
-    /// a tight CI can shrink it with the usual timeout-flake trade-off.
+    /// dump/log/row polls). The default is platform-aware
+    /// ([`default_section_timeout`]): 30s on the fast legs, 90s on Windows
+    /// (#236). A tight CI can shrink it with the usual timeout-flake
+    /// trade-off.
     pub section_timeout: Duration,
     /// A caller-owned state root used AS-IS instead of the harness's fresh
     /// hermetic tempdir: `None` (the default) creates the tempdir, `Some(p)`
@@ -1082,7 +1111,7 @@ pub struct TckConfig {
 impl Default for TckConfig {
     fn default() -> Self {
         Self {
-            section_timeout: SECTION_TIMEOUT,
+            section_timeout: default_section_timeout(),
             state_root: None,
             sections: SectionSelection::default(),
         }
@@ -1090,8 +1119,8 @@ impl Default for TckConfig {
 }
 
 impl TckConfig {
-    /// [`TckConfig::default`] — the pre-config behavior (30s timeout, fresh
-    /// hermetic tempdir, every section).
+    /// [`TckConfig::default`] — the pre-config behavior (the platform-scaled
+    /// timeout, fresh hermetic tempdir, every section).
     pub fn new() -> Self {
         Self::default()
     }
@@ -7314,13 +7343,33 @@ env = "MODEL"
         assert!(facade.memory_status("tck-memory-probe").unwrap().is_none());
     }
 
+    /// The default section budget is PLATFORM-SCALED at runtime (the
+    /// per-OS-as-data rule, no compile-time selection): 90s where the
+    /// engine-observed metering row commit has needed more than the flat
+    /// 30s under CI contention (Windows, the #236 charter), the flat
+    /// [`SECTION_TIMEOUT`] everywhere else. Pinned on every leg so a
+    /// platform drift fails the platform's own lane by name.
+    #[test]
+    fn default_section_timeout_scales_with_the_running_os() {
+        let expected = match ::hekma_engine::OsId::current() {
+            ::hekma_engine::OsId::Windows => Duration::from_secs(90),
+            _ => SECTION_TIMEOUT,
+        };
+        assert_eq!(default_section_timeout(), expected);
+        assert_eq!(TckConfig::default().section_timeout, expected);
+    }
+
     /// The `TckConfig` semantics (spec 15-3): the Default is exactly today's
     /// behavior; `TckSection::id` maps to the stable report ids; selection is
     /// a filter over the FIXED pipeline order (never the caller's order);
     /// an empty `Only` selects nothing (documented vacuity).
     #[test]
     fn tck_config_defaults_and_selection_semantics() {
-        assert_eq!(TckConfig::default().section_timeout, SECTION_TIMEOUT);
+        assert_eq!(
+            TckConfig::default().section_timeout,
+            default_section_timeout(),
+            "the default rides the platform-scaled budget (#236)"
+        );
         assert_eq!(TckConfig::default().state_root, None);
         assert_eq!(
             TckConfig::default().sections,
