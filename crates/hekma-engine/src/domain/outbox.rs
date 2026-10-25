@@ -365,12 +365,39 @@ pub(crate) fn repair_torn_tail(path: &Path) -> Result<bool, String> {
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.to_string()),
+            // Names the path: on Windows a directory at the journal path
+            // fails HERE (ERROR_ACCESS_DENIED) — before the regular-file
+            // guard below ever runs — and a bare OS detail names nothing.
+            Err(e) => {
+                return Err(format!(
+                    "could not open the outbox journal for repair: {}: {e}",
+                    path.display()
+                ))
+            }
         };
-        let len = file
-            .metadata()
-            .map_err(|e| format!("could not stat the outbox journal for repair: {e}"))?
-            .len();
+        let meta = file.metadata().map_err(|e| {
+            format!(
+                "could not stat the outbox journal for repair: {}: {e}",
+                path.display()
+            )
+        })?;
+        // The journal path must be a REGULAR file. `File::open` happily
+        // opens a directory, and when that directory is empty its
+        // `st_size` is 0 on filesystems that size empty directories at
+        // zero (btrfs) — so the `len == 0` clean shortcut below returned
+        // "clean" without a single read ever erroring (the unreadable-
+        // journal red only showed on btrfs boxes; ext4/tmpfs dirs carry a
+        // nonzero size and fail later at the EISDIR read). A FIFO would
+        // hang the reads instead of erroring at all. The unreadable-
+        // journal contract: surface it, never serve a false caught-up
+        // read.
+        if !meta.is_file() {
+            return Err(format!(
+                "the outbox journal is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let len = meta.len();
         if len == 0 {
             return Ok(None);
         }
@@ -1167,6 +1194,10 @@ mod tests {
         std::fs::create_dir(&journal).unwrap();
         let err = repair_torn_tail(&journal).unwrap_err();
         assert!(!err.is_empty(), "the OS detail is preserved: {err}");
+        assert!(
+            err.contains("outbox.jsonl"),
+            "the error names the non-file journal path: {err}"
+        );
     }
 
     #[test]
