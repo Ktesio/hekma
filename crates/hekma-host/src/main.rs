@@ -41,6 +41,9 @@ fn main() {
     let mut control_listen: Option<std::net::SocketAddr> = None;
     let mut bearer_secret: Option<String> = None;
     let mut log_capture: Option<hekma_engine::LogCaptureMode> = None;
+    let mut otlp_endpoint: Option<String> = None;
+    let mut otlp_headers: Option<String> = None;
+    let mut otlp_flush_interval: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -125,10 +128,60 @@ fn main() {
                     }
                 }
             }
+            "--otlp-endpoint" => {
+                i += 1;
+                match args.get(i) {
+                    // The collector base URL — http:// only in v1 (the
+                    // https deferral is named in its refusal). The scheme
+                    // check itself lives in `OtlpOptions::from_flags` (the
+                    // ONE parse site both surfaces call); the flag-looking
+                    // guard here mirrors `--bearer-secret` (a swallowed
+                    // neighbor is a usage error, not a value).
+                    Some(url) if !url.starts_with('-') => otlp_endpoint = Some(url.clone()),
+                    Some(_) => usage_error(
+                        "--otlp-endpoint needs a collector URL like \
+                         http://127.0.0.1:4318",
+                    ),
+                    None => usage_error("--otlp-endpoint needs a collector URL"),
+                }
+            }
+            "--otlp-headers" => {
+                i += 1;
+                match args.get(i) {
+                    // `k=v[,k=v...]` — values may be `secret:NAME` refs.
+                    // The spec is parsed by `OtlpOptions::from_flags`; the
+                    // raw text is held verbatim and never printed (the
+                    // redacting newtype wraps it inside the options).
+                    Some(spec) if !spec.starts_with('-') => otlp_headers = Some(spec.clone()),
+                    Some(_) => usage_error(
+                        "--otlp-headers needs name=value pairs like \
+                         authorization=secret:OTLP_AUTH",
+                    ),
+                    None => usage_error("--otlp-headers needs name=value pairs"),
+                }
+            }
+            "--otlp-flush-interval" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                    Some(secs) => otlp_flush_interval = Some(secs),
+                    None => usage_error("--otlp-flush-interval needs a whole number of seconds"),
+                }
+            }
             other => usage_error(&format!("unknown argument {other:?}")),
         }
         i += 1;
     }
+    // The OTLP flags parse through the ONE site both surfaces share; a
+    // malformed combination (bad scheme, out-of-bounds interval, headers
+    // without an endpoint) is the same usage refusal as any bad flag value.
+    let otlp = match hekma_host::OtlpOptions::from_flags(
+        otlp_endpoint,
+        otlp_headers.as_deref(),
+        otlp_flush_interval,
+    ) {
+        Ok(options) => options,
+        Err(message) => usage_error(&message),
+    };
     let options = hekma_host::ServeOptions {
         state_base: state_dir,
         stop_window,
@@ -140,6 +193,7 @@ fn main() {
         // CLI, never a second one here).
         log_capture: log_capture.unwrap_or_default(),
         diagnostics: None,
+        otlp,
     };
     match hekma_host::serve(options) {
         Ok(()) => std::process::exit(0),
@@ -191,6 +245,17 @@ fn usage_text() -> String {
                                   metadata (hashed records at rest), or off\n    \
                                   (nothing captured). Same flag and values\n    \
                                   as `hekma serve`\n    \
+         --otlp-endpoint <url>    OPT-IN OTLP metrics export to this\n    \
+                                  collector (http:// in v1; https is\n    \
+                                  deferred). Default: off - no export\n    \
+                                  task, no dial\n    \
+         --otlp-headers <k=v,...> Headers for every OTLP POST; a value may\n    \
+                                  be a `secret:NAME` reference (resolved\n    \
+                                  at startup, never logged). Requires\n    \
+                                  --otlp-endpoint\n    \
+         --otlp-flush-interval <secs>\n    \
+                                  The export flush interval, whole seconds\n    \
+                                  1..=3600 (default: 10)\n    \
          -h, --help               Print this help\n    \
          -V, --version            Print the version\n\
      \n\

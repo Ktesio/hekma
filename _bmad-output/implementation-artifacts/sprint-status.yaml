@@ -199,7 +199,7 @@ development_status:
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
   epic-20: in-progress  # opened 2026-10-23 by sprint-change-proposal-2026-10-23-adoptability.md (Adoptability: OTLP export FR-46/AD-21 option (a); CI recipe FR-47 in-repo; adapter gallery FR-48; PRD §6 amendment D2; does not disturb epics 18/19; 20.1 = AI-55 two-pass)
-  20-1-otlp-telemetry-export: backlog  # sequences after 19.1 merges, from main; 19.4/19.5-dependent metrics join as follow-ups
+  20-1-otlp-telemetry-export: review  # 2026-10-25 implementation + 2 build passes + 3-layer review (~20 patches); coverage repair ~166 lines vs ~134 needed; PR opening
   20-2-agents-in-ci-the-github-actions-recipe: review  # 2026-10-24 implementation + 3-layer review patches (both legs re-rehearsed green post-patch); PR #341 (rebased onto #340)
   20-3-the-adapter-gallery: done  # 2026-10-24 MERGED as 76e13e7 (PR #340): gallery index + 10 pages + aider manifest + PATH-shadowed TCK lane + nav/exec drift guards + docs-probe pin; docs/agents.md pointer applied by Islam post-merge
   epic-20-retrospective: optional

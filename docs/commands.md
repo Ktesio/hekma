@@ -454,7 +454,7 @@ checksum exactly. The command reads the artifact embedded in the binary; it
 touches no state directory, needs no registered instance, and works offline.
 The same files ship as release assets with every release.
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr>] [--bearer-secret <name>] [--state-dir <dir>] [--log-capture <mode>]`
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr>] [--bearer-secret <name>] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -465,6 +465,7 @@ hekma serve
 hekma serve --stop-window 10
 hekma serve --metering-listen 8400 --state-dir ~/agents-state
 hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
+hekma serve --otlp-endpoint http://127.0.0.1:4318 --otlp-headers authorization=secret:OTLP_AUTH
 ```
 
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
@@ -482,6 +483,8 @@ hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
   **The metadata-mode crash window, stated plainly.** Metadata mode keeps agent content off persistent disk *at rest* — content still touches disk WHILE the agent runs (the raw redirects above), and the unlink that removes it happens at a CLEAN stop. If the host machine dies uncleanly (power loss, `kill -9` of the host, a vanished container), that unlink never runs and the raw files — agent output included — remain on the volume for whoever picks it up. A Host that needs content gone EVEN on unclean death cannot get it from any direct-redirect design (the alternative trades away crash-recovery of the agent's own last output); treat the volume itself as sensitive, or use `off` and accept degraded sentinel metering.
 
   **The `hekma-host` binary.** The container-oriented `hekma-host` binary (the bin+lib shape the host crate ships in) takes the SAME flags and values — `--log-capture <full|metadata|off>` included — so a container image can reach every capture posture without the `hekma` CLI present; an unparseable mode is the same usage refusal naming the three values. Its full operator surface (flags, env wiring, health exposure) is a future host-release scope.
+
+- `--otlp-endpoint <url>` / `--otlp-headers <k=v,...>` / `--otlp-flush-interval <secs>` — **opt-in OTLP telemetry export**: POST the host's governance metrics (token usage, budget breaches, derived cost, lifecycle state) to your collector over OTLP/HTTP+JSON, on a bounded flush cadence (default 10s). With NO `--otlp-endpoint` the exporter does not exist — no task, no dial, nothing leaves the machine. Header values may be `secret:NAME` references (resolved at startup; an unresolvable one refuses the startup naming the secret) and are never logged. http:// only in v1 (https is a documented deferral — put a local collector in front). The full versioned exposition (`otlp-metrics v1`: metric names, types, attributes, histogram bounds, the mandatory estimate label on every dollar, and the drop/diagnostic honesty rules) lives in [Telemetry export](telemetry.md).
 
 ### Placing the state directory on a Host-chosen volume
 

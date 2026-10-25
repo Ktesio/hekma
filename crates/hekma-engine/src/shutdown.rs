@@ -518,4 +518,36 @@ mod tests {
         let notes = Notes::over(Some(&sink));
         notes.note("a panicking writer is swallowed, not propagated");
     }
+
+    #[test]
+    fn notes_recover_from_a_poisoned_sink_mutex() {
+        // The poisoned-lock arm: a writer that panicked while HOLDING the
+        // sink mutex poisons it; the note-taker takes the poisoned guard
+        // anyway (a torn line is better than NO line) and its own
+        // catch_unwind swallows the panicking writer — the shutdown survives
+        // a poisoned, panicking sink, never a panic out of the drain.
+        struct AlwaysPanicWriter;
+        impl Write for AlwaysPanicWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("host writer bug");
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(AlwaysPanicWriter)));
+        let holder = sink.clone();
+        // Panic while the guard is alive INSIDE the closure: the unwind
+        // drops the guard mid-panic and the mutex poisons.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = holder.lock().unwrap();
+            let _ = guard.write_all(b"x");
+        }));
+        assert!(
+            sink.lock().is_err(),
+            "the writer's mid-hold panic must have poisoned the mutex"
+        );
+        let notes = Notes::over(Some(&sink));
+        notes.note("the drain survives a poisoned, panicking sink");
+    }
 }

@@ -12,6 +12,7 @@ const files = [
   'commands.md',
   'control-api.md',
   'hosting.md',
+  'telemetry.md',
   'manifest.md',
   'adapter-contract.md',
   'embedding.md',

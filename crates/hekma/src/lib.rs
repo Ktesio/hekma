@@ -43,6 +43,8 @@ Examples:
   hekma serve --stop-window 10
   hekma serve --metering-listen 8400 --state-dir ~/agents-state
   hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
+  hekma serve --otlp-endpoint http://127.0.0.1:4318 \\
+      --otlp-headers authorization=secret:OTLP_AUTH
 
 The Control API (--listen + --bearer-secret, both or neither) exposes the
 unstable v0 HTTP/JSON surface — fleet, per-instance lifecycle/config/status,
@@ -176,6 +178,29 @@ enum Commands {
         /// captures nothing and disables usage reported in logs.
         #[arg(long, value_name = "MODE")]
         log_capture: Option<hekma_engine::LogCaptureMode>,
+        /// OPT-IN OTLP telemetry export: POST otlp-metrics v1 metric batches
+        /// to this collector over OTLP/HTTP+JSON (http:// in v1 — https is a
+        /// documented deferral). Default: off — no export task exists, no
+        /// socket is dialed, nothing leaves the machine.
+        #[arg(long, value_name = "URL")]
+        otlp_endpoint: Option<String>,
+        /// Headers for every OTLP POST, `name=value[,name=value...]`; a value
+        /// may be a `secret:NAME` reference resolved at startup (unresolvable
+        /// = a typed startup refusal; values never enter logs). Requires
+        /// --otlp-endpoint.
+        #[arg(long, value_name = "SPEC", requires = "otlp_endpoint")]
+        otlp_headers: Option<String>,
+        /// The export flush interval in whole seconds, 1..=3600 (default 10).
+        /// Requires --otlp-endpoint (the exporter never half-exists — the
+        /// same rule `--otlp-headers` carries, mirrored in
+        /// `OtlpOptions::validate` for library callers).
+        #[arg(
+            long,
+            value_name = "SECS",
+            value_parser = clap::value_parser!(u64).range(1..=3_600),
+            requires = "otlp_endpoint"
+        )]
+        otlp_flush_interval: Option<u64>,
     },
 }
 
@@ -417,6 +442,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             listen,
             bearer_secret,
             log_capture,
+            otlp_endpoint,
+            otlp_headers,
+            otlp_flush_interval,
         }) => cli::serve::run(
             stop_window,
             metering_listen,
@@ -427,6 +455,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // `serve::run`'s single `unwrap_or_default` is THE defaulting
             // site (no clap `default_value` duplicates it).
             log_capture,
+            otlp_endpoint,
+            otlp_headers.as_deref(),
+            otlp_flush_interval,
         ),
         Some(Commands::Agent { command }) => match command {
             AgentCommands::Register {
@@ -1102,6 +1133,74 @@ mod tests {
                 err.use_stderr(),
                 "an invalid mode is a usage error naming the accepted values"
             ),
+        }
+    }
+
+    #[test]
+    fn test_serve_otlp_flags_parse_and_headers_require_the_endpoint() {
+        // The OTLP flags are pinned at the clap surface too: the endpoint
+        // lands in its field, the headers ride as the RAW spec string (the
+        // parse into typed values happens once, in serve::run), the
+        // interval has clap-range bounds, and `--otlp-headers` without
+        // `--otlp-endpoint` is refused (the exporter never half-exists).
+        let cli = Cli::try_parse_from([
+            "hekma",
+            "serve",
+            "--otlp-endpoint",
+            "http://127.0.0.1:4318",
+            "--otlp-headers",
+            "authorization=secret:OTLP_AUTH",
+            "--otlp-flush-interval",
+            "30",
+        ])
+        .expect("the otlp flag set parses");
+        let Some(Commands::Serve {
+            otlp_endpoint,
+            otlp_headers,
+            otlp_flush_interval,
+            ..
+        }) = &cli.command
+        else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(
+            otlp_endpoint.as_deref(),
+            Some("http://127.0.0.1:4318"),
+            "the endpoint lands verbatim"
+        );
+        assert_eq!(
+            otlp_headers.as_deref(),
+            Some("authorization=secret:OTLP_AUTH"),
+            "the headers spec rides RAW (parsed once in serve::run)"
+        );
+        assert_eq!(*otlp_flush_interval, Some(30));
+
+        let bare = Cli::try_parse_from(["hekma", "serve"]).expect("bare serve parses");
+        let Some(Commands::Serve { otlp_endpoint, .. }) = &bare.command else {
+            panic!("expected the serve subcommand");
+        };
+        assert_eq!(
+            *otlp_endpoint, None,
+            "no --otlp-endpoint parses as None — the exporter is ABSENT by default"
+        );
+
+        match Cli::try_parse_from(["hekma", "serve", "--otlp-headers", "a=b"]) {
+            Ok(_) => panic!("--otlp-headers without --otlp-endpoint must be refused"),
+            Err(err) => assert!(
+                err.use_stderr(),
+                "half-configured export is a usage error (the exporter never half-exists)"
+            ),
+        }
+        match Cli::try_parse_from([
+            "hekma",
+            "serve",
+            "--otlp-endpoint",
+            "http://h",
+            "--otlp-flush-interval",
+            "0",
+        ]) {
+            Ok(_) => panic!("an out-of-bounds flush interval must be a parse refusal"),
+            Err(err) => assert!(err.use_stderr(), "the clap range refuses 0"),
         }
     }
 }

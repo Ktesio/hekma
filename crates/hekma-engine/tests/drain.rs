@@ -1690,3 +1690,121 @@ fn drain_refuses_non_running_instances_and_out_of_range_bounds() {
     };
     assert_eq!(refused_state, "failed");
 }
+
+// ---------------------------------------------------------------------------
+// Coverage repair (AD-21's pool): the drain verb's reachable refusal and
+// overrun arms — each a real operator-facing behavior pinned at the public
+// engine surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn drain_refuses_an_invalid_instance_name_before_anything_happens() {
+    // The name gate is the FIRST thing the verb does: a malformed name is a
+    // typed InvalidName refusal — no state store write, no command run, no
+    // enumeration.
+    let state = TempDir::new().unwrap();
+    let engine = open(&state);
+    let facade = engine.blocking();
+    let err = facade
+        .drain("NOT a valid instance name", None)
+        .expect_err("an invalid name is refused");
+    match &err {
+        EngineError::InvalidName { name, .. } => {
+            assert_eq!(name, "NOT a valid instance name");
+        }
+        other => panic!("expected InvalidName, got {other:?}"),
+    }
+}
+
+#[test]
+fn drain_rejects_when_the_pause_command_cannot_run_and_touches_nothing() {
+    // A declared pause command that cannot SPAWN rejects the verb with the
+    // typed PauseCommandFailed (exit 1 class) — never a fake pause, never a
+    // silent skip — and the agent is untouched (still running).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    let bin = hekma_conformance::fake_agent_bin();
+    let body = format!(
+        "\ncontract_version = \"1.1.0\"\n\n[adapter]\nkind = \"svc\"\n\n\
+         [lifecycle.start]\nexec = {bin:?}\nargs = [\"--linger-ms\", \"600000\"]\n\n\
+         [lifecycle.pause]\nexec = \"/definitely/not/an/executable\"\nargs = []\n\n\
+         [lifecycle.resume]\nexec = {bin:?}\nargs = [\"--touch\", \"resume.sentinel\"]\n\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [metering]\nsource = \"self-reported\"\n"
+    );
+    std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open_with_sink(&state, &shared);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let err = facade.drain("svc", None).expect_err("the verb rejects");
+    match &err {
+        EngineError::PauseCommandFailed {
+            name,
+            direction,
+            detail,
+            ..
+        } => {
+            assert_eq!(name, "svc");
+            assert_eq!(direction, "pause");
+            assert!(
+                detail.contains("could not spawn"),
+                "the spawn failure is the detail: {detail}"
+            );
+        }
+        other => panic!("expected PauseCommandFailed, got {other:?}"),
+    }
+    // The instance's state is untouched: still running (never a fake pause).
+    let shown = facade.instance_status("svc").unwrap();
+    assert_eq!(shown.instance.state, LifecycleState::Running);
+}
+
+#[test]
+fn drain_overrun_records_the_bound_as_the_ender_and_still_stops() {
+    // A pause command that OUTLIVES the drain's bound is killed at the
+    // bound, commits NO pause-cooperative edge (the row stays running
+    // through the wait), the diagnostic names the bound as the ender, and
+    // the drain STILL stops the instance with an honestly not-completed
+    // outcome.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    // The pause command lingers far past the drain's 300ms bound; the idle
+    // file is never touched — the ONLY ending is the overrun.
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        Some(&["--linger-ms", "600000"]),
+        Some(&["--touch", "resume.sentinel"]),
+        Some("timeout_ms = 300\nidle_file = \"idle.sentinel\""),
+        Some("guaranteed"),
+    );
+
+    let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let engine = open_with_sink(&state, &shared);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let report = facade.drain("svc", None).unwrap();
+    assert_eq!(report.instance.state, LifecycleState::Stopped);
+    assert!(
+        !report.outcome.completed,
+        "an overrun is honestly not-completed: {:?}",
+        report.outcome
+    );
+    // The overrun path is deliberately note-free when the killed command
+    // reaps cleanly (the unreaped-corpse note is the only one it carries);
+    // the honesty lives in the OUTCOME and the DURABLE cause: the terminal
+    // edge records drain-stopped{completed:false} — the bound, not the
+    // adapter, ended it, and the record says so.
+    let events = facade.transition_events("svc").unwrap();
+    let last = events.last().expect("a stopped edge");
+    assert_eq!(last.new_state, LifecycleState::Stopped);
+    let cause = serde_json::to_string(&last.cause).unwrap();
+    assert!(
+        cause.contains("drain-stopped") && cause.contains("\"completed\":false"),
+        "the terminal cause records the honest overrun outcome: {cause}"
+    );
+}
