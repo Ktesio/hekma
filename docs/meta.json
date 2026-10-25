@@ -27,6 +27,7 @@
     "adapters/crush",
     "adapters/aider",
     "embedding",
+    "governance",
     "---Internals---",
     "architecture",
     "---Design---",

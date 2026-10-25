@@ -187,6 +187,47 @@ pub fn is_crash_loop(consecutive_failures: u32) -> bool {
     consecutive_failures >= MAX_CONSECUTIVE_FAILURES
 }
 
+/// The stable-run window (story 18-3): a run that held `running`
+/// CONTINUOUSLY for at least this long proves enough stability that its
+/// crash RESETS the consecutive-failure counter first — the crash then
+/// charges as failure #1. ENGINE-owned supervision policy, never adapter
+/// surface (the 18-3 Design Note; the 18-1 engine-owned-cadence precedent).
+/// PRODUCTION is exactly 30 s, pinned by
+/// `stable_run_window_is_production_pinned` below; tests scale it through
+/// the `window` parameter of [`next_consecutive_failures`] the same way
+/// [`BackoffSchedule`] scales its base — the production constant itself is
+/// never weakened.
+pub const STABLE_RUN_WINDOW: Duration = Duration::from_secs(30);
+
+/// The pure reset-then-charge arithmetic (story 18-3): given the counter's
+/// current value and how long the just-ended run held `running`
+/// continuously, return the NEXT counter value and whether a stable-run
+/// reset happened.
+///
+/// * `stable_run >= window` → reset FIRST, then this crash charges as
+///   failure #1 of a fresh streak: `(1, true)`.
+/// * anything else → the plain increment the pre-18-3 code always did:
+///   `(current + 1, false)`.
+///
+/// `stable_run: None` never resets — that is the adopted-instance case (no
+/// in-memory anchor: adoption re-proves nothing about stability) and the
+/// pause-gate case (the anchor is cleared while paused). PURE: the caller
+/// owns the store writes and the crash detail line; this module only
+/// decides.
+pub fn next_consecutive_failures(
+    current: u32,
+    stable_run: Option<Duration>,
+    window: Duration,
+) -> (u32, bool) {
+    match stable_run {
+        Some(run) if run >= window => (1, true),
+        // Saturating, never wrapping: a `u32::MAX` streak that somehow
+        // keeps charging must not panic (debug builds) or wrap to 0 —
+        // 0 would masquerade as a fresh streak.
+        _ => (current.saturating_add(1), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +339,101 @@ mod tests {
         // 80ms > 50ms cap.
         assert_eq!(s.delay_for(4), Duration::from_millis(50));
         assert_eq!(s.delay_for(10), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn stable_run_window_is_production_pinned() {
+        // Story 18-3: the engine-owned window is exactly 30 s in production.
+        // Guard the constant so a test-speed override can never leak into
+        // prod (mirrors `production_constants_are_exactly_the_spine_values`).
+        assert_eq!(STABLE_RUN_WINDOW, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn stable_run_resets_then_charges_failure_one() {
+        // A run that held `running` >= the window resets the streak FIRST:
+        // no matter how long the previous history was, this crash is #1.
+        for current in [0u32, 1, 4, 5, 50] {
+            let (next, reset) = next_consecutive_failures(
+                current,
+                Some(Duration::from_secs(30)),
+                STABLE_RUN_WINDOW,
+            );
+            assert_eq!(next, 1, "current {current} resets then charges 1");
+            assert!(reset, "current {current} reports the reset");
+        }
+    }
+
+    #[test]
+    fn stable_window_boundary_is_inclusive_at_exactly_the_window() {
+        // The spec's `>=` at exactly 30 s: a run of exactly the window IS
+        // stable. One tick under is not.
+        let (next, reset) =
+            next_consecutive_failures(3, Some(STABLE_RUN_WINDOW), STABLE_RUN_WINDOW);
+        assert_eq!(next, 1);
+        assert!(reset);
+        let (next, reset) = next_consecutive_failures(
+            3,
+            Some(STABLE_RUN_WINDOW - Duration::from_nanos(1)),
+            STABLE_RUN_WINDOW,
+        );
+        assert_eq!(next, 4);
+        assert!(!reset);
+    }
+
+    #[test]
+    fn young_run_increments_as_today() {
+        // Below the window, the arithmetic is the pre-18-3 increment — the
+        // helper must be a no-op against the old behavior.
+        for current in [0u32, 1, 4] {
+            let (next, reset) =
+                next_consecutive_failures(current, Some(Duration::from_secs(1)), STABLE_RUN_WINDOW);
+            assert_eq!(next, current + 1);
+            assert!(!reset);
+        }
+    }
+
+    #[test]
+    fn no_anchor_never_resets() {
+        // `None` — the adopted-instance case (no in-memory anchor) and the
+        // paused-gate case — never resets, whatever the count.
+        for current in [0u32, 4, 5, 99] {
+            let (next, reset) = next_consecutive_failures(current, None, STABLE_RUN_WINDOW);
+            assert_eq!(next, current + 1);
+            assert!(!reset);
+        }
+    }
+
+    #[test]
+    fn saturated_counter_never_panics_or_wraps() {
+        // A `u32::MAX` streak keeps charging as `u32::MAX` — no debug-overflow
+        // panic, no wrap to 0 (0 would masquerade as a fresh streak). The
+        // reset arm still wins first, so saturation is invisible to stable
+        // runs either way.
+        assert_eq!(
+            next_consecutive_failures(u32::MAX, None, STABLE_RUN_WINDOW),
+            (u32::MAX, false)
+        );
+        assert_eq!(
+            next_consecutive_failures(u32::MAX, Some(STABLE_RUN_WINDOW), STABLE_RUN_WINDOW),
+            (1, true)
+        );
+    }
+
+    #[test]
+    fn window_parameter_scales_for_tests() {
+        // The test-scaling seam: the same helper with a millisecond window
+        // keeps the exact shape (>= inclusive, reset-to-1, no-anchor
+        // increment) so integration tests never sleep for real seconds.
+        let window = Duration::from_millis(40);
+        assert_eq!(
+            next_consecutive_failures(2, Some(Duration::from_millis(40)), window),
+            (1, true)
+        );
+        assert_eq!(
+            next_consecutive_failures(2, Some(Duration::from_millis(39)), window),
+            (3, false)
+        );
+        assert_eq!(next_consecutive_failures(2, None, window), (3, false));
     }
 }

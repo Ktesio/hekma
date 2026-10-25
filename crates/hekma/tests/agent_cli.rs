@@ -7,9 +7,10 @@
 
 mod helpers;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use hekma_conformance::test_support::{current_os_key, ManifestFixture};
+use hekma_conformance::test_support::{current_os_key, fake_agent_bin, ManifestFixture};
 use hekma_conformance::uj3;
 use hekma_engine::{Engine, FleetEntry, LifecycleState, UsageView};
 use helpers::{run_hekma_agent, run_hekma_agent_with_env, KtRun, TestContext};
@@ -1297,6 +1298,325 @@ fn start_unknown_instance_exits_nonzero() {
 }
 
 #[test]
+fn start_readiness_timeout_exits_nonzero_and_names_the_probe() {
+    // The readiness probes at the CLI: a manifest whose `[readiness]` probe
+    // never passes (`--never-ready` announces nothing) → `hekma agent start`
+    // exits NON-ZERO, stderr names the probe (the rendered description + the
+    // honest wait), the engine's probe-wait note is surfaced on the same
+    // stream, and `show` reports the failed cause naming the probe.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = ctx.project_dir.join("never-ready-adapter");
+    ManifestFixture::new("fake", &["--never-ready", "10000"])
+        .guaranteed_on_all_oses("interaction")
+        .readiness("kind = \"log-contains\"\ntimeout_ms = 1500\nline = \"never printed\"")
+        .write(&m);
+
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "sleepy",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_hekma_agent(&["agent", "start", "sleepy"], &ctx.project_dir, state_dir);
+    assert!(!run.success, "a readiness timeout must exit non-zero");
+    assert!(
+        run.stderr.contains("readiness probe log-contains"),
+        "stderr must name the probe: stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("never printed"),
+        "stderr must name the probe's target: stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("waiting up to 1500ms for the declared readiness probe"),
+        "the probe-wait phase must be surfaced on stderr BEFORE the failure: stderr={}",
+        run.stderr
+    );
+
+    // The instance is `failed`, and `show` carries the probe-naming cause.
+    let list = run_hekma_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+    assert!(list.stdout.contains("failed"), "stdout={}", list.stdout);
+    let show = run_hekma_agent(&["agent", "show", "sleepy"], &ctx.project_dir, state_dir);
+    let shown = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        shown.contains("readiness probe log-contains") && shown.contains("Failed cause"),
+        "show must surface the readiness-timeout cause: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+}
+
+#[test]
+fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
+    // The liveness sibling of the readiness e2e above. Liveness has no
+    // start-command failure to ride: the declared signal fails while the
+    // instance is RUNNING, and supervision is command-scoped — so the drill
+    // necessarily spans commands:
+    //
+    //   1. register a manifest declaring `[liveness.heartbeat_file]` whose
+    //      file the agent NEVER writes (absent ≡ stale);
+    //   2. seed the pid-0 `never` Restart Policy seed directly into the state
+    //      DB (the `set_restart_policy`-before-start shape — there is no CLI
+    //      verb for policy) so the expiry is TERMINAL: under the shipped
+    //      `on-failure` default the follow command's own engine would restart
+    //      the agent mid-drill (its 1s backoff fires inside the follow's 2s
+    //      final-drain window), the restarted child dies at that command's
+    //      kill-on-drop exit, and the row would end reconciled to the
+    //      orphan-not-found cause instead of the unresponsive edge this e2e
+    //      pins. The engine-level drill
+    //      (`unresponsive_failures_restart_under_on_failure_until_the_crash_loop`)
+    //      covers the restart cadence; HERE the terminal path keeps every
+    //      assertion deterministic;
+    //   3. `start --detach` — the child survives the command exit (12-1);
+    //   4. a background `logs --follow`: its engine ADOPTS the child with a
+    //      FRESH window (the ≤-one-extra-window honesty), the reaper expires
+    //      it, and the follow observes the failure and exits cleanly on its
+    //      own (AC-C) — the follow is the long-lived command whose engine
+    //      runs the reaper long enough for the window to expire at all;
+    //   5. `show` names the check + the failing streak (the "no new verbs"
+    //      surface), and the follow's stderr carries the window diagnostics
+    //      SINGLE-SHOT (one first-failure note, one terminal policy
+    //      conclusion — never per-tick spam).
+    //
+    // Runs on all three OSes: `--detach` survival is the 12-1 mechanism that
+    // works affirmatively everywhere (no `_unix` suffix).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let max_age_ms = 600u64;
+    let m = ctx.project_dir.join("unresponsive-adapter");
+    ManifestFixture::new(
+        "fake",
+        &[
+            "--heartbeat-file",
+            "hb.marker:100",
+            "--heartbeat-stop-after",
+            "0",
+            "--linger-ms",
+            "30000",
+        ],
+    )
+    .guaranteed_on_all_oses("interaction")
+    .liveness(&format!(
+        "[liveness.heartbeat_file]\npath = \"hb.marker\"\nmax_age_ms = {max_age_ms}"
+    ))
+    .write(&m);
+
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "fading",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // The `never` policy seed: pid 0 (a policy seed, NOT a live process —
+    // adoption skips it; the start carries it into the spawn record the way
+    // `set_restart_policy` before `start` does at the engine level).
+    {
+        let conn = rusqlite::Connection::open(state_db(state_dir)).expect("open state db");
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = ?1",
+                ["fading"],
+                |r| r.get(0),
+            )
+            .expect("instance id");
+        conn.execute(
+            "INSERT INTO agent_runtime \
+             (instance_id, pid, start_time, restart_policy, restart_count, last_known_cause) \
+             VALUES (?1, 0, 0, 'never', 0, NULL)",
+            rusqlite::params![id],
+        )
+        .expect("insert the never policy seed");
+    }
+
+    let start = run_hekma_agent(
+        &["agent", "start", "fading", "--detach"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        start.success,
+        "the detached start should exit 0; stderr={}",
+        start.stderr
+    );
+    assert!(start.stdout.contains("running"), "stdout={}", start.stdout);
+    assert!(
+        start.stderr.contains("detached:"),
+        "the detached notice must be present; stderr={}",
+        start.stderr
+    );
+
+    // Spawn the follow and RETRY until it adopts (V4, review round 1): the
+    // follow's engine can only adopt the child once the start command's
+    // engine has fully exited, and a blind sleep raced that teardown. A
+    // too-early follow refuses ("supervised by another live engine") and
+    // exits fast; the retry loop drains its stderr, checks the refusal
+    // marker, and spawns again — bounded, so a wedged start-engine fails
+    // the test loudly instead of the drift passing silently. The beat is
+    // 500ms: a refusal exits well inside it, while a LEGITIMATE follow exit
+    // (it observed the failure) needs adoption + a 600ms window + ticks —
+    // never under ~900ms — so the two are cleanly separable.
+    let adopt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut child = loop {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+            .args(["agent", "logs", "fading", "--follow"])
+            .current_dir(&ctx.project_dir)
+            .env("KTESIO_NO_UPDATE_CHECK", "1")
+            .env("KTESIO_STATE_DIR", state_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hekma agent logs --follow");
+        // Poll the beat: still running at 500ms ⇒ it adopted; exited inside
+        // the beat ⇒ a refusal (or something unexpected — named loudly).
+        let beat_end = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut exited_early = false;
+        loop {
+            match child.try_wait().expect("poll the follow child") {
+                None => {
+                    if std::time::Instant::now() >= beat_end {
+                        break; // adopted — keep this child.
+                    }
+                }
+                Some(_) => {
+                    exited_early = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !exited_early {
+            break child;
+        }
+        let mut early_stderr = String::new();
+        {
+            use std::io::Read;
+            let _ = child
+                .stderr
+                .take()
+                .expect("the follow's stderr pipe")
+                .read_to_string(&mut early_stderr);
+        }
+        assert!(
+            early_stderr.contains("supervised by another live engine"),
+            "the follow exited before adopting for an unexpected reason; \
+             stderr={early_stderr}"
+        );
+        assert!(
+            std::time::Instant::now() < adopt_deadline,
+            "the start engine never released the instance for adoption"
+        );
+    };
+
+    // The failure needs the follow's adoption + a fresh window (600ms) +
+    // reaper ticks. Poll `list` until the unresponsive edge has landed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let list = run_hekma_agent(&["agent", "list"], &ctx.project_dir, state_dir);
+        if list.stdout.contains("failed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the unresponsive failure never landed at the CLI; last list:\n{}",
+            list.stdout
+        );
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    // `show` names the check + the failing streak (no new verb — the same
+    // failed-cause projection the readiness timeout rides). Under the seeded
+    // `never` policy the FIRST expiry is already terminal, and the verdict
+    // rides the persisted cause's detail (P8) — so the failed-cause fold
+    // carries the not-restarting conclusion too.
+    let show = run_hekma_agent(&["agent", "show", "fading"], &ctx.project_dir, state_dir);
+    let shown = format!("{}{}", show.stdout, show.stderr);
+    assert!(
+        shown.contains("Failed cause")
+            && shown.contains("liveness check heartbeat-file")
+            && shown.contains("hb.marker")
+            && shown.contains("failing for")
+            && shown.contains("restart policy is 'never'"),
+        "show must name the unresponsive check + the never verdict: out={} err={}",
+        show.stdout,
+        show.stderr
+    );
+
+    // The follow process must have exited on its own within a bounded time —
+    // never hang — once it observed the non-running state (AC-C).
+    let follow_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < follow_deadline,
+            "hekma agent logs --follow must not hang after the instance failed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(
+        status.success(),
+        "follow must exit 0 on a failure-triggered end"
+    );
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    {
+        use std::io::Read;
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+    }
+    assert!(
+        stderr.contains("is failed; no further output will arrive."),
+        "an honest state-appropriate exit note must be printed; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("hb.marker"),
+        "the window diagnostics must name the declared check's target; stderr={stderr}"
+    );
+    // SINGLE-SHOT pins (surfaced, not silent — and never per-tick spam):
+    // exactly ONE first-failure note when the window opened, and exactly ONE
+    // terminal policy conclusion on the immediate-console surface. (The
+    // verdict ALSO rides the persisted cause's detail — the `show` assert
+    // above pins that durable surface; these pins stay console-only.)
+    assert_eq!(
+        stderr.matches("declared liveness check failing").count(),
+        1,
+        "exactly ONE first-failure diagnostic (single-shot, not per-tick); stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.matches("restart policy is 'never'").count(),
+        1,
+        "exactly ONE terminal policy conclusion; stderr={stderr}"
+    );
+}
+
+#[test]
 fn stop_accepts_timeout_flag() {
     // The `--timeout <secs>` flag parses and drives the graceful window. Stop on
     // a registered instance still rejects (AC4) but proves the flag is accepted.
@@ -1731,6 +2051,272 @@ fn pause_on_registered_returns_uniform_invalid_transition() {
     assert!(
         run.stderr.contains("cannot pause"),
         "uniform invalid-transition; stderr={}",
+        run.stderr
+    );
+}
+
+// ---- Story 18-4: `hekma agent drain <name> [--timeout-ms <ms>]` ----
+
+/// Write the story-18-4 drain manifest (the engine drain suite's shape — the
+/// COMPILED `fake_agent` binary, a `[lifecycle.pause]`/`[lifecycle.resume]`
+/// command pair, an optional raw `[drain]` body, NO `[capabilities.pause]`
+/// row: the cooperative command path is OS-independent and needs no
+/// capability entry). Returns the manifest dir for `--manifest`.
+fn write_drain_manifest_for_cli(dir: &Path, agent_args: &[&str], drain_body: &str) -> PathBuf {
+    let bin = fake_agent_bin();
+    let args_toml = |args: &[&str]| {
+        args.iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let body = format!(
+        "\ncontract_version = \"1.1.0\"\n\n[adapter]\nkind = \"drain-cli\"\n\n\
+         [lifecycle.start]\nexec = {bin:?}\nargs = [{agent_toml}]\n\n\
+         [lifecycle.pause]\nexec = {bin:?}\nargs = [\"--touch\", \"pause.sentinel\"]\n\n\
+         [lifecycle.resume]\nexec = {bin:?}\nargs = [\"--touch\", \"resume.sentinel\"]\n\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [drain]\n{drain_body}\n\n[metering]\nsource = \"self-reported\"\n",
+        bin = bin.to_string_lossy(),
+        agent_toml = args_toml(agent_args),
+    );
+    let manifest_dir = dir.join("drain-adapter");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(manifest_dir.join("adapter.toml"), body).unwrap();
+    manifest_dir
+}
+
+#[test]
+fn drain_completes_and_exits_zero_unix() {
+    // The COMPLETED drain outcome at the CLI (story 18-4): exit 0, the final
+    // `stopped` state on stdout, and NO timed-out note on stderr — the stderr
+    // leg that DISTINGUISHES the outcomes. Runtime-skip on Windows
+    // (`start_via_surviving_engine`'s cross-lifetime survival cannot be
+    // simulated there — the `_unix` convention, tested everywhere it can
+    // be); the cross-OS affirmative sibling is
+    // `drain_on_registered_refuses_with_invalid_state_cross_os`.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // The idle signal lands 800ms after the PAUSE SENTINEL — the file
+        // THIS drain's own pause command writes — so it provably arrives
+        // during the drain's wait at any machine speed (review round 1,
+        // B13's re-anchored fixture; the old process-start clock could let
+        // the file predate the drain entry).
+        &[
+            "--linger-ms",
+            "600000",
+            "--idle-on-pause",
+            "800:pause.sentinel:idle.sentinel",
+        ],
+        "timeout_ms = 10000\nidle_file = \"idle.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // The drain command must adopt a SURVIVING instance (a plain `hekma
+    // agent start` would kill the child on the command's clean engine drop —
+    // the single-lifetime boundary; the pause family's harness).
+    start_via_surviving_engine(state_dir, "svc");
+
+    let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a COMPLETED drain exits 0; stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("Drained"),
+        "the success line is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        !run.stderr.contains("did NOT complete"),
+        "a completed drain prints NO timed-out note; stderr={}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_bound_override_reaches_the_engine_unix() {
+    // Review round 1 (B8): the CLI `--timeout-ms` override is the FIRST tier
+    // of the drain's three-tier bound — it must REACH the engine. The
+    // manifest declares a 600_000ms (ten-minute) bound over an idle file
+    // nobody touches; the 900ms override must govern instead. The
+    // override-is-advisory mutant burns the manifest bound (a ten-minute
+    // test); the elapsed wall-clock assert fails it fast.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // No idle fixture: the declared idle file is NEVER touched, so the
+        // drain can only end via its bound.
+        &["--linger-ms", "600000"],
+        "timeout_ms = 600000\nidle_file = \"never.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let started = std::time::Instant::now();
+    let run = run_hekma_agent(
+        &["agent", "drain", "svc", "--timeout-ms", "900"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the 900ms override must govern the drain (the manifest's ten-minute \
+         bound must not burn) — took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("did NOT complete"),
+        "the timed-out outcome is surfaced on stderr: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_that_times_out_still_exits_zero_and_says_so_unix() {
+    // The TIMED-OUT drain outcome at the CLI (story 18-4): the bound burns
+    // (the declared idle file is never touched), the drain STILL stops the
+    // instance — exit 0 BOTH ways — and the timed-out note is SURFACED on
+    // stderr (AI-18: the outcome difference lives on the surface the
+    // operator watches). Runtime-skip on Windows (the surviving-engine
+    // harness's convention); the cross-OS affirmative sibling is
+    // `drain_on_registered_refuses_with_invalid_state_cross_os`.
+    if std::env::consts::OS == "windows" {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        // No `--idle-after-ms`: the declared idle file is NEVER touched.
+        &["--linger-ms", "600000"],
+        "timeout_ms = 800\nidle_file = \"never.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "svc",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    start_via_surviving_engine(state_dir, "svc");
+
+    let run = run_hekma_agent(&["agent", "drain", "svc"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(0),
+        "a TIMED-OUT drain STILL exits 0 (the stop is unconditional); stderr={} stdout={}",
+        run.stderr,
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("stopped"),
+        "the final state is on stdout in BOTH outcomes: {}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("did NOT complete"),
+        "the timed-out outcome is surfaced on stderr: {}",
+        run.stderr
+    );
+}
+
+#[test]
+fn drain_on_registered_refuses_with_invalid_state_cross_os() {
+    // The cross-OS AFFIRMATIVE drain CLI test (the `_unix` convention: the
+    // wire shape — refusal class, exit code, the state named — must also be
+    // pinned somewhere that RUNS on Windows). Drain's running-only gate
+    // refuses a registered (never started) instance naming the state, mapped
+    // to the uniform invalid-state exit code 4.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = write_drain_manifest_for_cli(
+        &ctx.project_dir,
+        &["--linger-ms", "600000"],
+        "timeout_ms = 1000\nidle_file = \"idle.sentinel\"",
+    );
+    run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "nat",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let run = run_hekma_agent(&["agent", "drain", "nat"], &ctx.project_dir, state_dir);
+    assert_eq!(
+        run.code,
+        Some(4),
+        "drain on a non-running instance exits invalid-state; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("not running"),
+        "the refusal names the gate; stderr={}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("registered"),
+        "the refusal names the CURRENT state; stderr={}",
         run.stderr
     );
 }
@@ -6168,7 +6754,7 @@ fn register_incompatible_contract_manifest_exits_one_naming_both_versions_and_th
         run.stderr
     );
     assert!(
-        run.stderr.contains("1.0.0"),
+        run.stderr.contains("1.1.0"),
         "names the engine version: {}",
         run.stderr
     );

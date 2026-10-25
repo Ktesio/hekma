@@ -101,7 +101,54 @@ use thiserror::Error;
 /// names both versions and fails to load. The `--json` memory wire surface
 /// (story 5-2's deferral) landed IN this freeze, so the frozen v1 surface is
 /// complete: adding it after the freeze would have been a breaking wire change.
-pub const CONTRACT_VERSION: &str = "1.0.0";
+///
+/// **Bumped `1.0.0 → 1.1.0` (story 18-1, the AD-15 amendment):** the manifest
+/// schema gains an OPTIONAL `[readiness]` section declaring ONE readiness probe
+/// (`http-get` / `file-fresh` / `log-contains`, each with its own bounded
+/// `timeout_ms`) that gates the engine's `starting → running` transition. An
+/// ADDITIVE minor under the published policy: no existing section, field, or
+/// enum value changed, so every 1.0.0 manifest parses identically under 1.1.0.
+/// The policy's own rule still applies verbatim: negotiation matches MAJORS, so
+/// this build still accepts a `1.0.0` manifest — but an engine built at 1.0.0
+/// REJECTS a 1.1.0 manifest that declares `[readiness]` (its frozen
+/// `deny_unknown_fields` schema refuses the unknown section). Stated on the
+/// release surface; the schema change is pinned by
+/// `contract_v1_0_0_engine_rejects_the_readiness_section`.
+///
+/// **The same `1.1.0` minor also carries `[liveness]` (story 18-2):** the
+/// schema gains an OPTIONAL `[liveness]` section declaring ONE liveness check
+/// (`[liveness.heartbeat_file]` or `[liveness.http_get]`, each with a bounded
+/// `max_age_ms` window) that the engine's reaper evaluates against the RUNNING
+/// agent, moving it `running → failed` (cause `unresponsive`) when the signal
+/// fails continuously for the whole window. Same additive posture: absent
+/// means byte-identical supervision, and the `1.0.0`-engine rejection is
+/// pinned by `contract_v1_0_0_engine_rejects_the_liveness_section`.
+///
+/// **The same `1.1.0` minor also carries `[exit_codes]` (story 18-3):** the
+/// schema gains an OPTIONAL `[exit_codes]` section declaring the two
+/// ADAPTER-DECLARED exit-code classes (`restart_requested = [codes]` — the
+/// agent asked for a relaunch: the restart plan runs but the
+/// consecutive-failure counter is not charged; `clean = [codes]` — the agent
+/// finished on purpose: `running → stopped`, settled, no plan). Same additive
+/// posture: absent means every unrequested exit is a crash exactly as before,
+/// and the `1.0.0`-engine rejection is pinned by
+/// `contract_v1_0_0_engine_rejects_the_exit_codes_section`.
+///
+/// **The same `1.1.0` minor also carries `[drain]` (story 18-4) — and EXECUTES
+/// the lifecycle pair:** the schema gains an OPTIONAL `[drain]` section
+/// declaring the drain composite's bounded wait (`timeout_ms`, required,
+/// `1..=600_000`; optional `idle_file` — an Agent-Home-relative path the agent
+/// touches when its in-flight work reaches zero). The SAME story makes the
+/// v1.0.0-era `[lifecycle.pause]`/`[lifecycle.resume]` op templates EXECUTED
+/// (cooperative pause/resume commands, causes `pause-cooperative` /
+/// `resume-cooperative`; the declared command outranks the OS-signal path and
+/// is OS-independent) and adds one semantic validation rule: declaring
+/// exactly ONE of the pair is refused at registration (an unresumable pause is
+/// a trap; both fields named). `[drain]` alone is new schema, so the additive
+/// posture holds verbatim: a manifest without it parses identically, and the
+/// `1.0.0`-engine rejection is pinned by
+/// `contract_v1_0_0_engine_rejects_the_drain_section`.
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The Adapter Contract compatibility rule the engine enforces at registration
 /// (FR-30; ratified at the 6-6 checkpoint). Quoted VERBATIM by the negotiation
@@ -206,8 +253,10 @@ pub use adapter::{AdapterError, AgentAdapter};
 pub use capability::{Capability, CapabilityDeclaration, EffectiveCapabilities, SupportLevel};
 pub use config::{ConfigMapping, ConfigTarget, FilePlacement, FileTarget};
 pub use manifest::{
-    AdapterIdentity, Interaction, InteractionChannelKind, Lifecycle, Manifest, ManifestError,
-    Metering, OpTemplate,
+    AdapterIdentity, Drain, DrainSpec, ExitClass, ExitCodeClasses, ExitCodes, FileFreshProbe,
+    HeartbeatFileCheck, HttpGetCheck, HttpGetProbe, Interaction, InteractionChannelKind, Lifecycle,
+    Liveness, LivenessCheck, LogContainsProbe, Manifest, ManifestError, Metering, OpTemplate,
+    Readiness, ReadinessGate, ReadinessKind, ReadinessProbe,
 };
 pub use metering::MeteringSource;
 pub use os::OsId;
@@ -217,13 +266,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn contract_version_is_frozen_v1() {
-        // The v1 FREEZE (story 6-6): the contract tags 1.0.0 and the engine
-        // negotiates on its major. Pinning the exact triple makes an
-        // unannounced bump fail here first — the "announce" gate.
+    fn contract_version_is_v1_line_additive_minors_only() {
+        // The contract tags 1.0.0 at the v1 FREEZE (story 6-6) and moves within
+        // the 1.x line only by ADDITIVE minors (the published policy: within a
+        // major, changes are additive). 18-1's `[readiness]` section bumps
+        // 1.0.0 → 1.1.0. Pinning the exact triple makes an unannounced bump
+        // fail here first — the "announce" gate.
         let parsed = semver::Version::parse(CONTRACT_VERSION).expect("CONTRACT_VERSION is semver");
         assert_eq!(parsed.major, 1);
-        assert_eq!(parsed.minor, 0);
+        assert_eq!(parsed.minor, 1);
         assert_eq!(parsed.patch, 0);
     }
 

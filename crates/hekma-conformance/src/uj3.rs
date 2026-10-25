@@ -166,8 +166,9 @@ pub const BREACH_ACTION: &str = "pause";
 pub const METERING_SOURCE: &str = "self-reported";
 
 /// The manifest `contract_version` the fixture carries (contract v1 — the
-/// frozen, negotiated surface registration gates on).
-pub const CONTRACT_VERSION: &str = "1.0.0";
+/// frozen, negotiated surface registration gates on; rides the additive
+/// Adapter Contract minors).
+pub const CONTRACT_VERSION: &str = "1.1.0";
 
 /// The flow's config as `(key, value)` pairs in ONE pinned order. The host
 /// test sets each through `Blocking::set_config`; the CLI journey runs each
@@ -195,7 +196,7 @@ pub fn flow_config_pairs() -> Vec<(&'static str, &'static str)> {
 /// [`crate::test_support::ManifestFixture::uj3_flow`] — the ONE parameterized
 /// fixture builder — with this shape:
 ///
-/// * `contract_version = "1.0.0"` — the negotiated contract major,
+/// * `contract_version = "1.1.0"` — the negotiated contract major,
 /// * `pause` + `interaction` **guaranteed on all three OSes** so the default
 ///   pause Breach Action lands the committed `paused` state deterministically
 ///   everywhere — which is what the assertions pin. HONESTY about the

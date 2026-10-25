@@ -625,6 +625,75 @@ pub enum EngineError {
         snapshot: String,
     },
 
+    /// Story 18-4: a declared lifecycle COMMAND (`[lifecycle.pause]` /
+    /// `[lifecycle.resume]`) failed — it exited nonzero, could not be spawned
+    /// at all, or outlived its bound (the standalone pause-command cap, or
+    /// the drain bound when the command runs as the drain's step (a)). The
+    /// cooperative model means the pause/resume NEVER happened, so the
+    /// requested lifecycle change is REJECTED with the instance's durable
+    /// state untouched — never a committed `paused` row the process does not
+    /// honor (a fake pause is a lie the stop ladder would inherit). Distinct
+    /// from [`EngineError::Backend`]: nothing is wrong with process control —
+    /// the agent's own command spoke, and it said no.
+    ///
+    /// `direction` is `"pause"` or `"resume"`; `command` is the rendered
+    /// command line (exec + args — environment is deliberately NOT rendered,
+    /// NFR-6); `detail` names which of the three failure modes fired and why.
+    #[error(
+        "the {direction} command for Agent Instance '{name}' failed — the lifecycle change \
+         was NOT applied: {detail} (command: {command})"
+    )]
+    PauseCommandFailed {
+        /// The instance whose declared command failed.
+        name: String,
+        /// Which lifecycle direction failed: `"pause"` or `"resume"`.
+        direction: String,
+        /// The rendered command line (exec + args joined with spaces; no
+        /// environment, NFR-6).
+        command: String,
+        /// Which failure mode fired (nonzero exit with its code, spawn
+        /// failure with the OS why, or the bound overrun) + remediation.
+        detail: String,
+    },
+
+    /// Story 18-4: `drain` was targeted at an instance NOT in
+    /// [`LifecycleState::Running`](super::lifecycle::LifecycleState::Running).
+    /// Drain's contract is "stop a RUNNING agent gracefully" — its step (a)
+    /// drives a running → paused transition, which is meaningless (and
+    /// refused, before any side effect) for a paused/stopped/failed/
+    /// starting/stopping instance. Mirrors [`EngineError::NotRunning`]'s
+    /// pre-flight shape (`send`'s gate) but is its own variant so a drain
+    /// refusal renders drain's remediation, not send's. Checked BEFORE the
+    /// bound validation and the plan resolution — the transition gate before
+    /// any side effect.
+    #[error(
+        "Agent Instance '{name}' is not running (current state: {state}); drain stops a \
+         running agent — start it first, or use plain stop for a paused one"
+    )]
+    DrainRefused {
+        /// The instance `drain` targeted.
+        name: String,
+        /// The instance's current Lifecycle State (wire form, e.g. `"paused"`).
+        state: String,
+    },
+
+    /// Story 18-4: the drain bound override was ZERO (`--timeout-ms 0`, or a
+    /// `timeout_ms: 0` — the adapter manifest validation already refuses
+    /// zero there, so this fires for the CLI/engine override). A zero bound
+    /// would time out every drain before its pause command could start —
+    /// refusing every declared drain — so it is refused UP FRONT with this
+    /// typed error instead of silently keeping the default (a caller asking
+    /// for zero gets an answer, not a surprise 30 s). Names the rejected
+    /// value.
+    #[error(
+        "invalid drain bound {bound_ms}ms: it must be between 1 and 600000 (the \
+         adapter-contract maximum); a zero bound could never let a drain's pause command start"
+    )]
+    DrainBoundInvalid {
+        /// The rejected bound (milliseconds).
+        bound_ms: u64,
+    },
+
     /// A [`StateStore`](crate::ports::StateStore) operation failed.
     #[error(transparent)]
     Store(#[from] StoreError),

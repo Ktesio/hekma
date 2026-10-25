@@ -2554,6 +2554,53 @@ fn cause_suffix_and_engine_transition_line_text_cover_every_transition_cause() {
             ),
             " (breach: cumulative dollars)",
         ),
+        // Epic 18 causes (18-2/18-3): every renderer arm is pinned — the
+        // wire tags (`readiness-timeout`, `unresponsive`,
+        // `restart-requested`, `clean-exit`) are greppable contract.
+        (
+            TransitionCause::readiness_timeout("the /health probe", 1500),
+            " (readiness-timeout: waited 1500ms)",
+        ),
+        (
+            TransitionCause::unresponsive("heartbeat file", 900),
+            " (unresponsive: heartbeat file, failing for 900ms)",
+        ),
+        (
+            TransitionCause::unresponsive_with_detail(
+                "heartbeat file",
+                900,
+                "stale when first observed",
+            ),
+            " (unresponsive: heartbeat file, failing for 900ms — stale when first observed)",
+        ),
+        (
+            TransitionCause::restart_requested_with_detail(
+                75,
+                "declared class `restart_requested`; requested-recycle 2",
+            ),
+            " (restart-requested: exit code 75 — declared class `restart_requested`; \
+             requested-recycle 2)",
+        ),
+        (TransitionCause::clean_exit(0), " (clean-exit: exit code 0)"),
+        // Story 18-4: the cooperative + drain arms are pinned — the wire tags
+        // (`pause-cooperative`, `resume-cooperative`, `drain-stopped`) are
+        // greppable contract, and the drain arm spells the OUTCOME.
+        (
+            TransitionCause::pause_cooperative("fake-agent --touch pause.sentinel"),
+            " (pause-cooperative: fake-agent --touch pause.sentinel)",
+        ),
+        (
+            TransitionCause::resume_cooperative("fake-agent --touch resume.sentinel"),
+            " (resume-cooperative: fake-agent --touch resume.sentinel)",
+        ),
+        (
+            TransitionCause::drain_stopped(true, 1500),
+            " (drain-stopped: completed in 1500ms)",
+        ),
+        (
+            TransitionCause::drain_stopped(false, 30_000),
+            " (drain-stopped: timed out after 30000ms; stopped anyway)",
+        ),
     ];
     for (cause, want_suffix) in cases {
         assert_eq!(cause_suffix(&cause), want_suffix, "{cause:?}");
@@ -3519,10 +3566,68 @@ fn write_pause_guaranteed_manifest(dir: &Path, kind: &str, args: &[&str]) {
     std::fs::write(dir.join("adapter.toml"), body).unwrap();
 }
 
+/// Write a `fake_agent` manifest declaring the COOPERATIVE PAUSE PAIR (story
+/// 18-4): `[lifecycle.pause]` + `[lifecycle.resume]`, each a `fake_agent`
+/// invocation with the given args (in practice a `--touch` fixture).
+/// `pause_level` is the OPTIONAL current-OS `[capabilities.pause]` level —
+/// `None` registers the pair with NO pause capability at all (the
+/// cooperative arm must own the transition on command strength alone),
+/// `Some(level)` layers the signal dispatch beneath the command (the
+/// cooperative-first and breach-signal drills). Interaction is guaranteed
+/// everywhere so registration passes. The lib-test sibling of
+/// `tests/drain.rs`'s `write_drain_manifest`.
+fn write_coop_pair_manifest(
+    dir: &Path,
+    kind: &str,
+    args: &[&str],
+    pause_args: &[&str],
+    resume_args: &[&str],
+    pause_level: Option<&str>,
+) {
+    let bin = hekma_conformance::fake_agent_bin();
+    let args_toml = |args: &[&str]| {
+        args.iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let os = match OsId::current() {
+        OsId::Linux => "linux",
+        OsId::Macos => "macos",
+        OsId::Windows => "windows",
+        OsId::Other => "other",
+    };
+    let capability = match pause_level {
+        Some(level) => format!("\n[capabilities.pause]\n{os} = \"{level}\"\n"),
+        None => String::new(),
+    };
+    let bin_str = bin.to_string_lossy().into_owned();
+    let start_toml = args_toml(args);
+    let pause_toml = args_toml(pause_args);
+    let resume_toml = args_toml(resume_args);
+    let body = format!(
+        "contract_version = \"1.0.0\"\n\n\
+         [adapter]\nkind = \"{kind}\"\n\n\
+         [lifecycle.start]\nexec = {bin_str:?}\nargs = [{start_toml}]\n\n\
+         [lifecycle.pause]\nexec = {bin_str:?}\nargs = [{pause_toml}]\n\n\
+         [lifecycle.resume]\nexec = {bin_str:?}\nargs = [{resume_toml}]\n{capability}\n\
+         [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+         [metering]\nsource = \"self-reported\"\n"
+    );
+    std::fs::write(dir.join("adapter.toml"), body).unwrap();
+}
+
 /// Count `heartbeat <n>` lines in an agent-output log (0 when absent).
 fn heartbeat_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|c| c.lines().filter(|l| l.starts_with("heartbeat ")).count())
+        .unwrap_or(0)
+}
+
+/// Count `work <n>` lines in a `--watch-sentinel` work log (0 when absent).
+fn work_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|c| c.lines().filter(|l| l.starts_with("work ")).count())
         .unwrap_or(0)
 }
 
@@ -5768,6 +5873,65 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
 }
 
 #[test]
+fn a_failed_totals_read_surfaces_the_degradation_and_decides_on_the_zero() {
+    // Story 19-1 review round 1 (the AI-18 surfaced-not-silent rule): the
+    // `enforce_budget` totals reads degrade to zero on a store failure — and
+    // the degradation is now SURFACED through the enforcement diagnostic
+    // (instance + degraded scope + reason), decisions UNCHANGED: the
+    // fabricated zero still flows into `decide()`, so the ZERO per-run
+    // ceiling fires the breach on it (the pre-existing 3-2/3-3 semantics;
+    // changing the decision is a money-path behavior change deferred to its
+    // own story — the deferred-work entry from 19-1 review round 1). Driven
+    // through the cfg(test) `totals_read_fault_names` seam (the AI-9/AI-12
+    // fault-injection precedent) — no real store outage staged.
+    let (state, _manifest, registry) = setup_fake(
+        "degradedread",
+        &["--emit-usage", "2", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("degradedread").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.per_run", "0")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.totals_read_fault_names.insert(name.clone());
+    sup.start(&registry, "degradedread").unwrap();
+    drain_until_committed(&mut sup, &registry, state.path(), "degradedread", 2);
+
+    // SURFACED: the diagnostic names the instance + the degraded scope.
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("degradedread: the per-run token totals read failed"),
+        "the degraded read must be surfaced naming the instance + scope: {text}"
+    );
+    assert!(
+        text.contains("enforcement degrades it to zero"),
+        "the diagnostic must state the degradation, not just the error: {text}"
+    );
+
+    // DECISIONS UNCHANGED: the degraded 0 crossed the zero ceiling, so the
+    // breach fired on the fabricated total (limit 0, observed 0) — exactly
+    // once (the latch holds the re-evaluations), as `warn` (no transition).
+    let breaches = Supervisor::read_breach_events(&registry, "degradedread").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the degraded zero fired the zero-ceiling breach exactly once: {breaches:?}"
+    );
+    assert_eq!(breaches[0].limit, 0, "the limit is the zero ceiling");
+    assert_eq!(
+        breaches[0].observed, 0,
+        "the observed total is the fabricated degraded zero"
+    );
+    assert_eq!(state_of(&registry, "degradedread"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "degradedread", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_malformed_instance_config_disarms_enforcement_without_a_crash() {
     // The `enforce_budget` config-read guard (usage.rs, the `let Ok(…)` early
     // return): a MALFORMED on-disk instance config layer must degrade to "no
@@ -6190,6 +6354,160 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
                 .is_some_and(|record| record.fingerprint.pid == 0),
         "the settled record is gone or a pid-0 seed"
     );
+}
+
+#[test]
+fn the_release_pass_leaves_a_cooperatively_paused_detached_child_paused() {
+    // The COOPERATIVE arm (18-4, review round 1 B2): a detached child paused
+    // via its DECLARED pause command has no OS suspension to undo, and no
+    // resume the operator asked for — the release pass sends NO signal,
+    // runs NO resume command, records NO paused→running edge, and surfaces
+    // the honest note naming the cooperative kind + the recovery. Registered
+    // WITHOUT any `[capabilities.pause]` support on purpose: the cooperative
+    // arm must own the transition on command strength alone.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coop",
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter("coop", &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coop").unwrap();
+    // The cooperative pause: the declared command owns the transition.
+    sup.pause(&registry, "coop").unwrap();
+    assert_eq!(state_of(&registry, "coop"), LifecycleState::Paused);
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "coop"),
+        LifecycleState::Paused,
+        "a cooperative pause has no OS resume to undo at release — the row stays 'paused'"
+    );
+    let events = Supervisor::read_events(&registry, "coop").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.prior_state == LifecycleState::Paused
+                && e.new_state == LifecycleState::Running),
+        "no paused→running edge may be recorded for the cooperative freeze: {events:?}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("paused COOPERATIVELY"),
+        "the note must name the cooperative kind: {text}"
+    );
+    assert!(
+        !text.contains("resumed the paused process"),
+        "the cooperative arm must never run the resume command: {text}"
+    );
+    // Teardown: stop reaches the (alive, cooperative-paused) child.
+    sup.stop(&registry, "coop", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
+    // Review round 1 (A1 + B4): the pair manifest does NOT turn a BREACH
+    // pause's resume into a command resume. The breach pause went through
+    // the REAL signal path (the budget override bypasses the cooperative arm
+    // by design — enforcement must stop spend with a real suspension), so
+    // the process is SIGSTOPped; running the declared resume command instead
+    // would commit `paused → running` while the process stays frozen (a
+    // lying edge AND a frozen agent). The A1 pause-kind gate routes the
+    // resume through the signal dispatch: the cause is the signal resume,
+    // never `resume-cooperative`, the declared commands never run (no
+    // sentinels), and on Unix the work log GROWS again — the process itself
+    // provably unfroze.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "brpair",
+        &[
+            "--emit-usage",
+            "3",
+            "--watch-sentinel",
+            "pause.sentinel:resume.sentinel:work.log",
+            "--linger-ms",
+            "600000",
+        ],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        Some("guaranteed"),
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "brpair",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("brpair").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "brpair").unwrap();
+    // The breach pause lands through the real enforcement path (the paused
+    // edge carries the BudgetExceeded cause; the pause COMMAND must not run).
+    drain_until_state(&mut sup, &registry, "brpair", LifecycleState::Paused);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !registry.agent_home(&name).join("pause.sentinel").exists(),
+        "the breach pause must bypass the cooperative arm — no pause command ran"
+    );
+
+    let resumed = sup.resume(&registry, "brpair").unwrap();
+    assert_eq!(resumed.state, LifecycleState::Running);
+    let events = Supervisor::read_events(&registry, "brpair").unwrap();
+    let resume_edge = events
+        .iter()
+        .rev()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the resume edge must be recorded");
+    let cause = serde_json::to_string(&resume_edge.cause).unwrap();
+    assert!(
+        !cause.contains("resume-cooperative"),
+        "a breach pause's resume is the SIGNAL resume, never the command: {cause}"
+    );
+    assert!(
+        cause.contains("resume"),
+        "the signal resume's cause names the resume command: {cause}"
+    );
+    assert!(
+        !registry.agent_home(&name).join("resume.sentinel").exists(),
+        "the declared resume command must not have run"
+    );
+    // The process itself unfroze: the work log (frozen while SIGSTOPped)
+    // grows again past its suspended count. Unix-only — the SIGSTOP freeze
+    // the growth proves is a Unix mechanism. Data-driven OS gate (NOT `#[cfg]` —
+    // the boundary CI job forbids OS-conditional cfg outside the enumerated
+    // allowlist; the line-3331 precedent in this file): the block's APIs are
+    // all portable, only the SIGSTOP mechanism it observes is Unix's.
+    if matches!(OsId::current(), OsId::Linux | OsId::Macos) {
+        let work = registry.agent_home(&name).join("work.log");
+        let frozen = work_lines(&work);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while work_lines(&work) == frozen {
+            assert!(
+                Instant::now() < deadline,
+                "the work log must grow again after the signal resume ({frozen} lines frozen)"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    sup.stop(&registry, "brpair", Some(Duration::from_secs(5)))
+        .unwrap();
 }
 
 #[test]
@@ -6897,4 +7215,193 @@ fn agent_log_truncates_at_the_toy_cap_and_metering_stays_double_count_free() {
         "the live file stays bounded by the cap (last truncate landed): {final_len}"
     );
     let _ = sup.stop(&registry, "trunc", Some(Duration::from_secs(5)));
+}
+
+// ---- story 18-2 review round 1: the phase-4 degradation arms (P2/P3) ------
+
+/// Register a `fake_agent`-backed instance whose manifest declares a
+/// `[liveness.heartbeat_file]` check on a path the agent NEVER writes
+/// (absent ≡ stale — the window opens on the first reaper tick). Returns
+/// the (state dir, manifest dir, registry).
+fn setup_fake_with_absent_liveness(
+    name: &str,
+    args: &[&str],
+) -> (tempfile::TempDir, tempfile::TempDir, Registry) {
+    use hekma_conformance::test_support::ManifestFixture;
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    let dir = manifest.path().join(name);
+    ManifestFixture::new(name, args)
+        .guaranteed_on_all_oses("interaction")
+        .liveness("[liveness.heartbeat_file]\npath = \"never-written/hb.marker\"\nmax_age_ms = 250")
+        .write(&dir);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(dir))
+        .unwrap();
+    (state, manifest, registry)
+}
+
+/// Poll until `pred(sink_text)` holds, bounded — the degraded-arm tests'
+/// diagnostic waiter (same shape as the integration tests').
+fn wait_for_sink_line(buffer: &Arc<Mutex<Vec<u8>>>, needle: &str, what: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = sink_text(buffer);
+        if let Some(line) = text.lines().find(|l| l.contains(needle)) {
+            return line.to_string();
+        }
+        // Keep the reaper ticking while waiting.
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn liveness_store_read_failure_is_surfaced_once_per_episode_then_silent() {
+    // Review round 1 (P2): a phase-4 registry lookup that ERRORS must (1)
+    // pause the check for the tick (never fail an instance on an unreadable
+    // state), (2) surface ONE degradation diagnostic for the episode, (3)
+    // stay silent on further Errs, and (4) re-arm after a recovered read.
+    // Driven through the cfg(test) lookup-fault seam (a real outage cannot
+    // be staged deterministically in-process).
+    let (_state, _manifest, registry) = setup_fake_with_absent_liveness("lvlook", &[]);
+    let name = InstanceName::new("lvlook").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "lvlook").unwrap();
+    assert_eq!(state_of(&registry, "lvlook"), LifecycleState::Running);
+
+    // Arm the seam: every phase-4 lookup behaves like a store-read failure.
+    sup.liveness_lookup_fault_names.insert(name.clone());
+    sup.poll_once(&registry);
+    let first = wait_for_sink_line(
+        &buffer,
+        "declared liveness check could not consult the instance state",
+        "the ONE degraded-read diagnostic",
+    );
+    assert!(
+        first.contains("checks paused until reads recover"),
+        "the diagnostic names the pause: {first}"
+    );
+
+    // Further Errs in the SAME episode stay silent (no per-tick spam).
+    sup.poll_once(&registry);
+    sup.poll_once(&registry);
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 1, "exactly ONE diagnostic per episode");
+
+    // A recovered read (seam disarmed) clears the episode SILENTLY.
+    sup.liveness_lookup_fault_names.remove(&name);
+    sup.poll_once(&registry);
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 1, "recovery is silent");
+
+    // The NEXT episode re-arms: the fault again produces a fresh diagnostic.
+    sup.liveness_lookup_fault_names.insert(name);
+    sup.poll_once(&registry);
+    wait_for_sink_line(
+        &buffer,
+        "could not consult the instance state",
+        "the re-armed episode's diagnostic",
+    );
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("could not consult the instance state"))
+        .count();
+    assert_eq!(count, 2, "a new episode emits its own ONE diagnostic");
+
+    // The instance was never failed by an unreadable state.
+    assert_eq!(state_of(&registry, "lvlook"), LifecycleState::Running);
+}
+
+#[test]
+fn liveness_expiry_refused_by_a_moved_state_skips_failure_and_plan() {
+    // Review round 1 (P3): when the guarded running→failed commit is
+    // REFUSED (the row moved between the phase-4 lookup and the expiry —
+    // the concurrent-transition race), the reaper emits the ONE
+    // skip-diagnostic, the instance is NOT failed, and NO restart plan is
+    // produced. Driven through the cfg(test) commit-fault seam, which
+    // injects the typed StateConflict the race produces.
+    let (_state, _manifest, registry) = setup_fake_with_absent_liveness("lvskip", &[]);
+    let name = InstanceName::new("lvskip").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "lvskip").unwrap();
+    assert_eq!(state_of(&registry, "lvskip"), LifecycleState::Running);
+
+    // Arm the seam: the expiry's commit refuses with StateConflict.
+    sup.liveness_commit_fault_names.insert(name.clone());
+
+    // Drive the reaper past the 250ms window; the expiry arm runs and the
+    // commit is refused.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("liveness expiry skipped") {
+        assert!(
+            Instant::now() < deadline,
+            "the skip diagnostic never appeared"
+        );
+        sup.poll_once(&registry);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The refusal is the ONE skip-diagnostic; the instance stays Running;
+    // NO unresponsive failure ever landed; NO restart plan exists (nothing
+    // queued).
+    let count = sink_text(&buffer)
+        .lines()
+        .filter(|l| l.contains("liveness expiry skipped"))
+        .count();
+    assert_eq!(count, 1, "exactly ONE skip diagnostic");
+    assert_eq!(
+        state_of(&registry, "lvskip"),
+        LifecycleState::Running,
+        "the refused expiry must not fail the instance"
+    );
+    let events = Supervisor::read_events(&registry, "lvskip").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.cause, TransitionCause::Unresponsive { .. })),
+        "no unresponsive event may exist"
+    );
+    assert!(
+        sup.pending_restarts.lock().unwrap().is_empty(),
+        "no restart plan may be queued by a refused expiry"
+    );
+}
+
+#[test]
+fn a_zero_stable_run_window_override_is_ignored_with_a_diagnostic() {
+    // 18-3 review: a zero window would make EVERY run trivially "stable"
+    // (any elapsed >= 0), so the reset would fire on every crash and the
+    // consecutive-failure counter could never climb past 1 — the override
+    // seam refuses a zero by KEEPING the current window and saying so
+    // (surfaced, not silent). A valid override still lands, so the guard
+    // is a gate on zero only.
+    let mut sup = Supervisor::new();
+    let buffer = install_capture_sink(&mut sup);
+    sup.override_stable_run_window(Duration::ZERO);
+    assert_eq!(
+        sup.stable_run_window, STABLE_RUN_WINDOW,
+        "a zero override must NOT land — the production window stays"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("ignoring a zero stable-run window override"),
+        "the refusal must be surfaced, not silent: {text}"
+    );
+    // And the seam still works for a real (non-zero) override.
+    sup.override_stable_run_window(Duration::from_millis(40));
+    assert_eq!(
+        sup.stable_run_window,
+        Duration::from_millis(40),
+        "a valid override must still land"
+    );
 }
