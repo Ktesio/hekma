@@ -702,4 +702,48 @@ mod tests {
             other => panic!("the defaulted body must return Backend, got {other:?}"),
         }
     }
+
+    #[test]
+    fn the_defaulted_guarded_write_and_adoption_lease_fail_loud_naming_the_seam() {
+        // Coverage repair (AD-21's pool): the two REMAINING defaulted seam
+        // bodies, pinned with the same NEVER-Ok discipline as
+        // `set_spawn_run_id` above — a silent default here would let the
+        // liveness-expiry caller believe the guarded running→failed write
+        // committed (or the adoption pass believe a lease was taken) while
+        // NOTHING was persisted. Each names its seam so the surfaced
+        // diagnostic points at the implementation that must override it.
+        let name = InstanceName::new("away").unwrap();
+        let err = BareStore
+            .set_state_if_prior(&name, LifecycleState::Running, LifecycleState::Failed)
+            .unwrap_err();
+        match err {
+            StoreError::Backend(detail) => {
+                assert!(
+                    detail.contains("does not override set_state_if_prior"),
+                    "the default must NAME the seam: {detail}"
+                );
+                assert!(
+                    detail.contains("declines to commit the unresponsive failure"),
+                    "the default must name the honest fallback: {detail}"
+                );
+            }
+            other => panic!("expected the Backend default, got {other:?}"),
+        }
+        let err = BareStore
+            .try_acquire_adoption_lease(&name, None, ProcessFingerprint::new(42, 7))
+            .unwrap_err();
+        match err {
+            StoreError::Backend(detail) => {
+                assert!(
+                    detail.contains("does not override try_acquire_adoption_lease"),
+                    "the default must NAME the seam: {detail}"
+                );
+                assert!(
+                    detail.contains("pre-v11 adopt posture"),
+                    "the default must name the documented fallback posture: {detail}"
+                );
+            }
+            other => panic!("expected the Backend default, got {other:?}"),
+        }
+    }
 }

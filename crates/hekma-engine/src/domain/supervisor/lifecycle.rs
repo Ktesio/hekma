@@ -402,10 +402,27 @@ impl Supervisor {
                     name.as_str(),
                 ));
             } else {
-                let resume_outcome = self
-                    .running
-                    .get_mut(&name)
-                    .map(|supervised| self.backend.resume(&mut supervised.handle));
+                let resume_outcome = self.running.get_mut(&name).map(|supervised| {
+                    // Story 20-1 review — the cfg(test) fault-injection
+                    // seam extended to THIS direct backend.resume (the
+                    // stop ladder's own pre-flight resume, NOT the
+                    // `signal_backend` path a `pause`/`resume` command
+                    // takes): a real un-signalable paused process cannot
+                    // be staged hermetically, so the armed name fails
+                    // here with an injected error — the seam truly fronts
+                    // EVERY backend pause/resume now (see the
+                    // `signal_fault_names` field docs).
+                    #[cfg(test)]
+                    if self.signal_fault_names.contains(&name) {
+                        return Err(BackendError::Control {
+                            op: "resume",
+                            detail: "injected cfg(test) signal fault \
+                                         (stop-ladder resume seam)"
+                                .to_string(),
+                        });
+                    }
+                    self.backend.resume(&mut supervised.handle)
+                });
                 match resume_outcome {
                     Some(Ok(())) => {
                         self.emit_diagnostic(&format!(
@@ -1300,7 +1317,37 @@ impl Supervisor {
                 ));
                 continue;
             }
-            match self.backend.resume(&mut supervised.handle) {
+            // Coverage-second-pass wiring seam (cfg(test)): an armed name's
+            // RELEASE resume FAILS here too (the signal_fault_names seam
+            // fronts every backend pause/resume for the instance, the release
+            // pass included), driving the surfaced could-not-resume arm below.
+            #[cfg(test)]
+            let resume = if self.signal_fault_names.contains(&name) {
+                Err(EngineError::Backend {
+                    name: name.as_str().to_string(),
+                    source: BackendError::Control {
+                        op: "resume",
+                        detail: "injected cfg(test) signal fault (AI-9 post-commit seam)"
+                            .to_string(),
+                    },
+                })
+            } else {
+                self.backend
+                    .resume(&mut supervised.handle)
+                    .map_err(|source| EngineError::Backend {
+                        name: name.as_str().to_string(),
+                        source,
+                    })
+            };
+            #[cfg(not(test))]
+            let resume = self
+                .backend
+                .resume(&mut supervised.handle)
+                .map_err(|source| EngineError::Backend {
+                    name: name.as_str().to_string(),
+                    source,
+                });
+            match resume {
                 Ok(()) => {
                     let detail = "resumed at engine release: a detached child is never \
                                   left SIGSTOPped and unsupervised between commands";

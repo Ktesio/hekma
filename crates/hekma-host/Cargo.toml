@@ -53,6 +53,19 @@ serde_json = { workspace = true }
 # here adds NO new package to `cargo tree -p hekma-host -e normal`; it only
 # names what we compile against directly.
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# The OTLP exporter's POST client (AD-21): the workspace's hyper family,
+# ALL already in this crate's normal closure via axum + hekma-engine's
+# metering listener — declaring them adds NO new package to
+# `cargo tree -p hekma-host -e normal`; it only names what the exporter
+# compiles against directly (the plain-HTTP POST, the bounded timeout, the
+# body type). NO TLS stack here: v1 is http-only by decision.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+# `http` has no workspace pin (nothing compiled against it directly before);
+# it is ALREADY in the normal tree (hyper's own dependency) — same 1.x pin.
+http = "1"
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 # Hermetic per-test state roots.

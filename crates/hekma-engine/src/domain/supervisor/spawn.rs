@@ -931,7 +931,30 @@ impl Supervisor {
                     // Restart-Policy consult a wait-caught exit gets), so a
                     // start that failed because the process DIED is never
                     // mislabeled a readiness timeout.
-                    match self.backend.poll(&mut handle) {
+                    // Coverage-second-pass wiring seam (cfg(test)): an armed
+                    // pid's (or instance's) death re-check FAILS with the
+                    // injected error, driving the surfaced degraded-recheck
+                    // arm below without staging a real procfs outage (the
+                    // injected_poll_fault shape; AI-12). The name-keyed set
+                    // exists because the re-check runs DURING `start`, before
+                    // a pid exists to arm.
+                    #[cfg(test)]
+                    let recheck = if self.spawn_recheck_fault_names.contains(&name) {
+                        Err(BackendError::Control {
+                            op: "poll",
+                            detail: "injected cfg(test) spawn-recheck poll fault \
+                                     (epic 20-1 seam)"
+                                .to_string(),
+                        })
+                    } else {
+                        match self.injected_poll_fault(self.backend.pid(&handle)) {
+                            Some(source) => Err(source),
+                            None => self.backend.poll(&mut handle),
+                        }
+                    };
+                    #[cfg(not(test))]
+                    let recheck = self.backend.poll(&mut handle);
+                    match recheck {
                         Ok(ProcessStatus::Exited { code }) => {
                             super::super::readiness::ProbeOutcome::ProcessExited(code)
                         }
@@ -990,7 +1013,22 @@ impl Supervisor {
                     // stop is SIGKILL + confirm on unix) instead of dropping a
                     // possibly-live handle onto the OS.
                     if matches!(self.backend.poll(&mut handle), Ok(ProcessStatus::Alive)) {
-                        if let Err(kill_err) = self.backend.stop(&mut handle, Duration::ZERO) {
+                        // Coverage-second-pass wiring seam (cfg(test)): an
+                        // armed pid's final-leg stop FAILS here, driving the
+                        // surfaced could-not-force-kill arm below (the same
+                        // injected_zero_stop shape the liveness-expiry teardown
+                        // fronts).
+                        #[cfg(test)]
+                        let kill = {
+                            let pid = self.backend.pid(&handle);
+                            match Self::injected_zero_stop(&self.stop_fault_pids, pid) {
+                                Some(injected) => injected,
+                                None => self.backend.stop(&mut handle, Duration::ZERO),
+                            }
+                        };
+                        #[cfg(not(test))]
+                        let kill = self.backend.stop(&mut handle, Duration::ZERO);
+                        if let Err(kill_err) = kill {
                             self.emit_diagnostic(&format!(
                                 "{}: readiness-timeout teardown could not force-kill the \
                                  surviving process: {kill_err}",

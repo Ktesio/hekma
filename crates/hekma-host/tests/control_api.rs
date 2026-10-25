@@ -111,6 +111,7 @@ fn spawn_serve_with_api(base: PathBuf, sink: SharedSink) -> ServeHandle {
         stop_window: Some(2),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink)),
+        otlp: Default::default(),
     };
     let mut server = spawn_serve(options);
     // Wait for the listening notice, then parse the OS-chosen address —
@@ -1719,6 +1720,7 @@ fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host(
         stop_window: Some(2),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: None,
+        otlp: Default::default(),
     };
     let err = hekma_host::serve(options).expect_err("the second host must be refused");
     assert!(
@@ -2464,6 +2466,7 @@ fn a_non_loopback_bind_warns_loudly() {
         stop_window: Some(1),
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+        otlp: Default::default(),
     };
     let server = spawn_serve(options);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);

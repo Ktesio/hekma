@@ -230,6 +230,7 @@ fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
             bearer_secret: Some("render_check_bearer".to_string()),
             log_capture: hekma_engine::LogCaptureMode::Metadata,
             diagnostics: Some(sink),
+            otlp: Default::default(),
         }
     );
     assert!(
@@ -691,4 +692,70 @@ fn a_poisoned_sink_never_silences_the_refusal_notice() {
         "the poisoned sink was recovered and the notice still landed:\n{}",
         sink_handle.text()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Coverage repair (AD-21's pool): the two remaining reachable serve-startup
+// arms — a state base that is an existing FILE (the create refuses before
+// any lock or engine work) and a signal factory that PANICS (the arming
+// handshake joins the task and surfaces the JoinError as a typed Startup).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_state_base_that_is_a_file_is_a_typed_startup_refusal_touching_nothing() {
+    // The state root must be creatable as a DIRECTORY: a path that already
+    // exists as a regular file refuses with the typed Startup error (the
+    // create_dir_all arm), naming the path — before the lock, before any
+    // engine open (nothing to clean up, nothing adopted).
+    let parent = tempfile::tempdir().unwrap();
+    let file_base = parent.path().join("not-a-directory");
+    std::fs::write(&file_base, b"occupying bytes").unwrap();
+    let (_sink_handle, sink) = SharedSink::new();
+    let options = ServeOptions {
+        state_base: Some(file_base.clone()),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, immediate_signal())
+        .expect_err("a file where the state root belongs is refused");
+    match &err {
+        ServeError::Startup { message } => {
+            assert!(
+                message.contains(&file_base.to_string_lossy().to_string()),
+                "the refusal names the path: {message}"
+            );
+        }
+        other => panic!("expected Startup, got {other:?}"),
+    }
+    // AI-18: this arm's surfacing is the RETURNED error alone (the caller
+    // prints it — the same no-double-emit discipline as the lock refusal).
+    let _ = _sink_handle; // the sink rides the options; the note stays empty here
+}
+
+#[test]
+fn a_panicking_signal_factory_is_a_typed_startup_refusal_not_a_hang_or_panic() {
+    // The arming handshake JOINS the signal-wait task: a factory that
+    // panics resolves as a JoinError, surfaced as the typed Startup error
+    // ("the shutdown-signal wait task failed") — never an unwinding panic
+    // out of serve, never a host that runs without an armed wait.
+    let state = tempfile::tempdir().unwrap();
+    let (_sink_handle, sink) = SharedSink::new();
+    let options = ServeOptions {
+        state_base: Some(state.path().to_path_buf()),
+        diagnostics: Some(sink),
+        ..ServeOptions::default()
+    };
+    let err = serve_with_signal(options, |_sink| async {
+        panic!("the test signal source exploded during registration");
+    })
+    .expect_err("a panicking signal factory refuses the startup");
+    match &err {
+        ServeError::Startup { message } => {
+            assert!(
+                message.contains("the shutdown-signal wait task failed"),
+                "the JoinError is surfaced verbatim: {message}"
+            );
+        }
+        other => panic!("expected Startup, got {other:?}"),
+    }
 }
