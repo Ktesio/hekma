@@ -1181,14 +1181,33 @@ mod tests {
         assert!(!outcome.forced);
     }
 
+    /// A child that is ALIVE past spawn's post-exec start-time read and then
+    /// exits on its own in a fraction of a second. The historical stand-in,
+    /// `true`, exits so fast it can LOSE that race — harmless on Linux, where
+    /// an unreaped zombie keeps its /proc entry, but macOS has no such grace:
+    /// the read fails and spawn classifies the child as having "exited
+    /// immediately, before its process start-time could be read" (a startup
+    /// failure). 0.3 s outlives the read by orders of magnitude while still
+    /// exiting well inside every bound these tests assert.
+    fn short_lived_spec() -> SpawnSpec {
+        spec("sleep", &["0.3"])
+    }
+
     #[test]
     fn stop_an_already_exited_process_is_graceful() {
-        // `true` exits immediately. By the time we stop, it is already gone; the
-        // backend reaps it and reports a non-forced stop (desired end state).
+        // A short-lived child exits on its own; by the time we stop, it is
+        // already gone; the backend reaps it and reports a non-forced stop
+        // (desired end state).
         let backend = UnixBackend::new();
-        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
-        // Give it a moment to exit.
-        sleep(Duration::from_millis(50));
+        let mut proc = backend
+            .spawn(&short_lived_spec())
+            .expect("spawn short-lived");
+        // Let it exit on its own and reap via poll so the handle knows.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.poll(&mut proc).unwrap().is_exited() {
+            assert!(Instant::now() < deadline, "process did not exit in time");
+            sleep(Duration::from_millis(10));
+        }
         let outcome = backend
             .stop(&mut proc, Duration::from_secs(1))
             .expect("stop");
@@ -1198,7 +1217,9 @@ mod tests {
     #[test]
     fn poll_reports_exit_of_a_short_lived_process() {
         let backend = UnixBackend::new();
-        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let mut proc = backend
+            .spawn(&short_lived_spec())
+            .expect("spawn short-lived");
         // Poll until it exits (bounded).
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1462,10 +1483,12 @@ mod tests {
     #[test]
     fn adopt_returns_none_for_a_gone_pid() {
         // AC7: a fingerprint whose pid is gone yields Ok(None) → the caller
-        // reconciles the record to `failed`. Spawn `true`, let it exit, then try
-        // to adopt its (now-dead) fingerprint.
+        // reconciles the record to `failed`. Spawn a short-lived child, let it
+        // exit, then try to adopt its (now-dead) fingerprint.
         let backend = UnixBackend::new();
-        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let mut proc = backend
+            .spawn(&short_lived_spec())
+            .expect("spawn short-lived");
         let fp = backend.fingerprint(&proc);
         // Wait for it to exit + reap.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1889,14 +1912,16 @@ mod tests {
     #[test]
     fn confirm_death_returns_promptly_once_the_process_actually_exits() {
         // The self-healing / no-compounding counterpart: once the process
-        // DOES exit (here, naturally and quickly via `true`), confirm_death
-        // must return Ok promptly rather than waiting out the full bound —
-        // this is what lets a RETRY `stop()` (Supervisor::stop_inner) or the
-        // crash reaper reconcile a previously-stuck instance quickly once
+        // DOES exit (here, naturally and quickly via a short-lived sleep),
+        // confirm_death must return Ok promptly rather than waiting out the
+        // full bound — this is what lets a RETRY `stop()` (Supervisor::stop_inner)
+        // or the crash reaper reconcile a previously-stuck instance quickly once
         // the underlying condition clears, instead of always paying the
         // full timeout.
         let backend = UnixBackend::new();
-        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
+        let mut proc = backend
+            .spawn(&short_lived_spec())
+            .expect("spawn short-lived");
         let start = Instant::now();
         confirm_death(&mut proc, Duration::from_secs(5)).expect("must confirm death");
         let elapsed = start.elapsed();
@@ -2007,12 +2032,17 @@ mod tests {
     #[test]
     fn pause_and_resume_on_an_already_exited_process_are_harmless_no_ops() {
         // A dead process cannot be paused/resumed; both are harmless no-ops
-        // (parity with stop-on-dead). `true` exits immediately.
+        // (parity with stop-on-dead). A short-lived child exits on its own.
         let backend = UnixBackend::new();
-        let mut proc = backend.spawn(&spec("true", &[])).expect("spawn true");
-        sleep(Duration::from_millis(50));
-        // Reap it via poll so the handle knows it exited.
-        assert!(backend.poll(&mut proc).unwrap().is_exited());
+        let mut proc = backend
+            .spawn(&short_lived_spec())
+            .expect("spawn short-lived");
+        // Let it exit, then reap it via poll so the handle knows it exited.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !backend.poll(&mut proc).unwrap().is_exited() {
+            assert!(Instant::now() < deadline, "process did not exit in time");
+            sleep(Duration::from_millis(10));
+        }
         backend.pause(&mut proc).expect("pause on dead is Ok");
         backend.resume(&mut proc).expect("resume on dead is Ok");
     }
