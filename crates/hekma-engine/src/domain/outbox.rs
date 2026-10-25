@@ -365,11 +365,22 @@ pub(crate) fn repair_torn_tail(path: &Path) -> Result<bool, String> {
         let mut file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.to_string()),
+            // Names the path: on Windows a directory at the journal path
+            // fails HERE (ERROR_ACCESS_DENIED) — before the regular-file
+            // guard below ever runs — and a bare OS detail names nothing.
+            Err(e) => {
+                return Err(format!(
+                    "could not open the outbox journal for repair: {}: {e}",
+                    path.display()
+                ))
+            }
         };
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("could not stat the outbox journal for repair: {e}"))?;
+        let meta = file.metadata().map_err(|e| {
+            format!(
+                "could not stat the outbox journal for repair: {}: {e}",
+                path.display()
+            )
+        })?;
         // The journal path must be a REGULAR file. `File::open` happily
         // opens a directory, and when that directory is empty its
         // `st_size` is 0 on filesystems that size empty directories at
