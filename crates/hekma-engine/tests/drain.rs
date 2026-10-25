@@ -1775,7 +1775,25 @@ fn drain_overrun_records_the_bound_as_the_ender_and_still_stops() {
     write_drain_manifest(
         manifest.path(),
         "svc",
-        &["--linger-ms", "600000"],
+        &[
+            "--linger-ms",
+            "600000",
+            // The Windows graceful-stop fixture (the control_api drain
+            // convention): that platform's graceful step is a pure
+            // exit-watch, so a lingering agent would burn the stop ladder's
+            // whole default window (30s) before the forced kill — rewriting
+            // the terminal cause this test pins (drain-stopped) into
+            // stop-forced. The anchored self-exit (2000ms — past the 300ms
+            // bound, so the pause command's overrun still happens and the
+            // wait still genuinely times out first; well inside the window)
+            // ends the agent on its own; a Unix drain stop is a delivered
+            // signal long before it, so nothing changes there. The anchor is
+            // START-anchored (`--exit-with`), not pause-anchored: this test's
+            // pause command never writes its sentinel — it is the overrun
+            // subject — so an `--exit-on-pause` anchor would never fire.
+            "--exit-with",
+            "0:2000",
+        ],
         Some(&["--linger-ms", "600000"]),
         Some(&["--touch", "resume.sentinel"]),
         Some("timeout_ms = 300\nidle_file = \"idle.sentinel\""),

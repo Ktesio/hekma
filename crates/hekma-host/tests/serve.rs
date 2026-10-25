@@ -334,12 +334,12 @@ fn an_out_of_bounds_stop_window_is_refused_before_anything_is_touched() {
             ServeError::InvalidOptions { message } => {
                 assert!(
                     message.contains(&format!("invalid stop window {bad}")),
-                    "the rejection names the value: {message}"
+                    "the rejection names the value"
                 );
                 assert!(
                     message.contains(&hekma_host::MIN_STOP_WINDOW_SECS.to_string())
                         && message.contains(&hekma_host::MAX_STOP_WINDOW_SECS.to_string()),
-                    "the rejection names both bounds: {message}"
+                    "the rejection names both bounds"
                 );
             }
             other => panic!("expected InvalidOptions, got {other:?}"),
@@ -441,7 +441,7 @@ fn a_listen_without_a_bearer_secret_is_refused_and_noted_through_the_sink() {
         ServeError::InvalidOptions { message } => assert!(
             message.contains("--listen 127.0.0.1:0 requires --bearer-secret")
                 && message.contains("never serves unauthenticated"),
-            "the refusal names the flag pair and the reason: {message}"
+            "the refusal names the flag pair and the reason"
         ),
         other => panic!("expected InvalidOptions, got {other:?}"),
     }
@@ -481,7 +481,7 @@ fn a_bearer_secret_without_a_listen_is_refused_and_noted_through_the_sink() {
         ServeError::InvalidOptions { message } => assert!(
             message.contains("--bearer-secret requires --listen")
                 && message.contains("no API to guard"),
-            "the refusal names the flag pair and the reason: {message}"
+            "the refusal names the flag pair and the reason"
         ),
         other => panic!("expected InvalidOptions, got {other:?}"),
     }

@@ -1920,10 +1920,18 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
     );
     match result {
         Err(hekma_host::ServeError::InvalidOptions { message }) => {
-            assert!(message.contains("bearer"), "{message}");
+            // Plain-worded labels (the #319/#320 CodeQL remedy): embedding
+            // {message} carries the bearer-tainted startup text into the
+            // panic output, which the analyzer rightly flags as cleartext
+            // logging of a secret. The contains() conditions still pin the
+            // full wording.
+            assert!(
+                message.contains("bearer"),
+                "the refusal names the bearer requirement"
+            );
             assert!(
                 message.contains("never serves unauthenticated"),
-                "{message}"
+                "the refusal says the API never serves unauthenticated"
             );
         }
         other => panic!("a half-configured API must be InvalidOptions: {other:?}"),
@@ -1941,7 +1949,10 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
     );
     match result {
         Err(hekma_host::ServeError::InvalidOptions { message }) => {
-            assert!(message.contains("requires --listen"), "{message}");
+            assert!(
+                message.contains("requires --listen"),
+                "the orphan bearer name is refused with the --listen pair"
+            );
         }
         other => panic!("an orphan bearer name must be InvalidOptions: {other:?}"),
     }
