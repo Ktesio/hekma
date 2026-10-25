@@ -1113,6 +1113,35 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     liveness_commit_fault_names: std::collections::HashSet<InstanceName>,
+    /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
+    /// the backend STOP boundary: a pid entry here makes the LIVENESS-EXPIRY
+    /// teardown's force-kill (reaper.rs) and the READINESS-TIMEOUT teardown's
+    /// final-leg stop (spawn.rs) behave as the named fault — a failed stop,
+    /// or a "successful" stop that did NOT force — driving those surfaced
+    /// (AI-18) diagnostic arms deterministically instead of staging a real
+    /// unstoppable process. Same placement rationale as `poll_fault_pids`
+    /// (the seam fronts the backend; the state lives on the supervisor; never
+    /// compiled outside the lib's own test builds).
+    #[cfg(test)]
+    stop_fault_pids: std::collections::HashMap<u32, StopFault>,
+    /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
+    /// the adoption-lease CAS ([`Registry::try_acquire_adoption_lease`]): an
+    /// instance named here makes the CAS behave as the fault names — `Lost`
+    /// is the expected-race `Ok(false)`, `Persist` is a failed lease
+    /// write-back — driving the adopt_orphans skip arms (each a surfaced
+    /// AI-18 diagnostic) deterministically; a real concurrent adoption or a
+    /// real store outage cannot be staged in-process. Same placement
+    /// rationale as `liveness_commit_fault_names`.
+    #[cfg(test)]
+    adoption_lease_faults: std::collections::HashMap<InstanceName, AdoptionLeaseFault>,
+    /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
+    /// the spawn path's PRE-TIMEOUT death re-check (spawn.rs): an instance
+    /// named here makes that ONE re-check poll fail with an injected error,
+    /// driving the surfaced degraded-recheck arm deterministically. Name-keyed
+    /// (unlike `poll_fault_pids`) because the re-check runs DURING `start` —
+    /// before any pid exists for the test to arm. Same placement rationale.
+    #[cfg(test)]
+    spawn_recheck_fault_names: std::collections::HashSet<InstanceName>,
     /// Readiness probes (Epic 18) — restart plans QUEUED by the start path when
     /// the declared probe observes the process EXIT mid-wait. The start path
     /// has already driven the `starting → failed` crash transition, but it
@@ -1125,6 +1154,31 @@ pub struct Supervisor {
     /// `outbox_next_seq`'s atomic; a poisoned lock is RECOVERED (the guarded
     /// Vec is always valid — queued plans must survive a panicking peer).
     pending_restarts: std::sync::Mutex<Vec<RestartPlan>>,
+}
+
+/// The fault a cfg(test) adoption-lease seam entry injects (see the
+/// `adoption_lease_faults` field docs). Lib-test builds only.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdoptionLeaseFault {
+    /// The CAS reports the lease LOST (`Ok(false)`) — a concurrent adopter
+    /// won the record.
+    Lost,
+    /// The lease write-back FAILS — the store refused the persist.
+    Persist,
+}
+
+/// The fault a cfg(test) stop seam entry injects (see the `stop_fault_pids`
+/// field docs). Lib-test builds only.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopFault {
+    /// The stop FAILS with an injected backend error (the force-kill could
+    /// not run — the wedge survives).
+    Fail,
+    /// The stop "succeeds" WITHOUT forcing (a graceful outcome for a process
+    /// that just polled alive — the silent-skip signature).
+    GracefulNotForced,
 }
 
 impl Supervisor {
@@ -1173,6 +1227,12 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            stop_fault_pids: std::collections::HashMap::new(),
+            #[cfg(test)]
+            adoption_lease_faults: std::collections::HashMap::new(),
+            #[cfg(test)]
+            spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1221,6 +1281,12 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            stop_fault_pids: std::collections::HashMap::new(),
+            #[cfg(test)]
+            adoption_lease_faults: std::collections::HashMap::new(),
+            #[cfg(test)]
+            spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -1269,6 +1335,12 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            stop_fault_pids: std::collections::HashMap::new(),
+            #[cfg(test)]
+            adoption_lease_faults: std::collections::HashMap::new(),
+            #[cfg(test)]
+            spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
     }

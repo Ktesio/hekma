@@ -7405,3 +7405,729 @@ fn a_zero_stable_run_window_override_is_ignored_with_a_diagnostic() {
         "a valid override must still land"
     );
 }
+
+// ---- Coverage second pass (epic 20-1): the fault-arm pins -----------------
+//
+// The AI-12/AI-41 precedent: fault arms that cannot be staged as real OS
+// outages are pinned through cfg(test) injection seams on the supervisor,
+// never by restructuring product code. Every test here is OS-neutral —
+// `fake_agent` + the registry + data-driven seams only, no OS gates.
+
+/// A detached instance with an absent (≡ stale) heartbeat, started with a
+/// SHORT linger so a wedge whose teardown was sabotaged by a seam still
+/// self-exits long before the suite ends (no leaked live process between
+/// tests — the liveness-expiry path is what's under test, not the kill).
+fn setup_detached_absent_liveness(
+    name: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, Registry, InstanceName) {
+    let (state, manifest, registry) =
+        setup_fake_with_absent_liveness(name, &["--linger-ms", "3000"]);
+    let parsed = InstanceName::new(name).unwrap();
+    (state, manifest, registry, parsed)
+}
+
+/// The held handle's pid (the seam key — the backend fronts faults by pid).
+fn held_pid(sup: &Supervisor, name: &InstanceName) -> u32 {
+    let handle = &sup
+        .running
+        .get(name)
+        .unwrap_or_else(|| panic!("{name} must be held"))
+        .handle;
+    sup.backend.pid(handle)
+}
+
+#[test]
+fn liveness_expiry_force_kill_failure_is_surfaced_on_a_detached_wedge() {
+    // P4's failure arm: a DETACHED wedge that polls Alive at expiry gets the
+    // zero-window force-kill — and when the kill FAILS, the operator hears
+    // "could not force-kill" (AI-18), never a silent drop of a live handle.
+    // Driven through the cfg(test) stop-fault seam (a real unstoppable
+    // process cannot be staged deterministically in-process).
+    let (_state, _manifest, registry, name) = setup_detached_absent_liveness("lvkill");
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, name.as_str()).unwrap();
+    sup.arm_stop_fault(held_pid(&sup, &name), StopFault::Fail);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("could not force-kill") {
+        assert!(
+            Instant::now() < deadline,
+            "the force-kill failure was never surfaced:\n{}",
+            sink_text(&buffer)
+        );
+        sup.poll_once(&registry);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The expiry still landed the honest failure: unresponsive cause, failed
+    // row (the teardown's bookkeeping is independent of the kill's outcome).
+    assert_eq!(state_of(&registry, name.as_str()), LifecycleState::Failed);
+    let events = Supervisor::read_events(&registry, name.as_str()).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.cause, TransitionCause::Unresponsive { .. })),
+        "the expiry must carry the unresponsive cause: {events:?}"
+    );
+}
+
+#[test]
+fn liveness_expiry_graceful_not_forced_stop_is_flagged_on_a_detached_wedge() {
+    // P4's silent-skip arm: a stop that reports a GRACEFUL outcome for a
+    // process that JUST polled alive is the "the wedge may still be running"
+    // signature — it must be SAID (AI-18), not recorded as teardown.
+    let (_state, _manifest, registry, name) = setup_detached_absent_liveness("lvgrace");
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, name.as_str()).unwrap();
+    sup.arm_stop_fault(held_pid(&sup, &name), StopFault::GracefulNotForced);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("returned a graceful (not forced) outcome") {
+        assert!(
+            Instant::now() < deadline,
+            "the graceful-not-forced flag was never surfaced:\n{}",
+            sink_text(&buffer)
+        );
+        sup.poll_once(&registry);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(state_of(&registry, name.as_str()), LifecycleState::Failed);
+}
+
+#[test]
+fn liveness_expiry_teardown_skips_the_force_kill_when_the_wedge_poll_fails() {
+    // The not-alive arm: the expiry teardown's own poll ERRORS (an injected
+    // poll fault — the AI-12 seam at this second poll site) → the process
+    // "did not poll alive", the force-kill is skipped, and the skip is
+    // surfaced with the poll outcome named.
+    let (_state, _manifest, registry, name) = setup_detached_absent_liveness("lvpoll");
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, name.as_str()).unwrap();
+    sup.arm_poll_fault(held_pid(&sup, &name));
+
+    // Exactly TWO passes: pass 1 opens the window (the heartbeat is absent ≡
+    // failing; the injected poll error is tolerated as a streak of 1); pass
+    // 2, past the 250ms window, expires it — the teardown poll then errs and
+    // the skip is surfaced. More passes would trip the AI-12 persistent-poll
+    // failure threshold (10) BEFORE the expiry could run.
+    sup.poll_once(&registry);
+    assert!(
+        sink_text(&buffer).contains("the window is open"),
+        "pass 1 must open the window:\n{}",
+        sink_text(&buffer)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    sup.poll_once(&registry);
+    assert!(
+        sink_text(&buffer).contains("did not poll alive"),
+        "the skip diagnostic must surface on the expiry pass:\n{}",
+        sink_text(&buffer)
+    );
+    assert_eq!(state_of(&registry, name.as_str()), LifecycleState::Failed);
+}
+
+/// Rewrite a detached record as a DEAD-OWNER orphan with NO lease — the
+/// shape the adoption boundary lets a fresh engine adopt.
+fn make_dead_owner_record(registry: &Registry, name: &InstanceName) {
+    let mut record = registry.spawn_record(name).unwrap().unwrap();
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_997, 1));
+    record.lease = None;
+    registry.write_spawn_record(&record).unwrap();
+}
+
+#[test]
+fn adoption_lease_lost_race_skips_the_record_and_says_so() {
+    // The Ok(false) arm: the lease CAS reports the record LOST to a
+    // concurrent adopter — THIS engine holds nothing, the skip is surfaced,
+    // and the record is left untouched for the winner. The lease arbitrates
+    // ATTACHED records only (a detached record's adoption is already
+    // disarmed), so the orphan here is the crashed-engine ATTACHED shape:
+    // an attached start whose supervisor is `mem::forget`-crashed (the
+    // SIGKILLed-engine stand-in — a real drop would kill-on-drop the child).
+    let (_s, _m, registry) = setup_fake("leaselost", &["--linger-ms", "3000"]);
+    let name = InstanceName::new("leaselost").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "leaselost").unwrap();
+    std::mem::forget(sup);
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.adoption_lease_faults
+        .insert(name.clone(), AdoptionLeaseFault::Lost);
+
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        0,
+        "a lost lease adopts NOTHING"
+    );
+    let text = wait_for_sink_line(
+        &buffer,
+        "the adoption lease was lost",
+        "the lost-lease note",
+    );
+    assert!(
+        text.contains("an explicit stop re-acquires"),
+        "the note names the recovery: {text}"
+    );
+    assert!(
+        registry.spawn_record(&name).unwrap().is_some(),
+        "the record is left for the winning adopter"
+    );
+    // No handle was re-held, so there is nothing to tear down: the short
+    // --linger child self-exits and the test process's exit releases it.
+}
+
+#[test]
+fn adoption_lease_persist_failure_leaves_the_record_and_says_so() {
+    // The Err arm: the lease write-back FAILS (the store refused) — surfaced,
+    // the record is left for the next open, THIS engine holds no handle.
+    let (_s, _m, registry) = setup_fake("leaspersist", &["--linger-ms", "3000"]);
+    let name = InstanceName::new("leaspersist").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "leaspersist").unwrap();
+    std::mem::forget(sup);
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.adoption_lease_faults
+        .insert(name.clone(), AdoptionLeaseFault::Persist);
+
+    assert_eq!(sup2.adopt_orphans(&registry), 0);
+    let text = wait_for_sink_line(
+        &buffer,
+        "the adoption lease could not be persisted",
+        "the persist-failure note",
+    );
+    assert!(
+        text.contains("left for the next open"),
+        "the note names the record's fate: {text}"
+    );
+    assert!(registry.spawn_record(&name).unwrap().is_some());
+}
+
+#[test]
+fn adopting_a_prerecord_run_id_record_mints_and_persists_a_fresh_one() {
+    // A pre-v9 record (no durable Run id) gets a minted id PERSISTED back
+    // onto the record — and the one-time note comes only AFTER the
+    // write-back succeeds (the Ok arm's note; the Err arm carries the
+    // failure instead).
+    let (_s, _m, registry) = setup_fake("runmint", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runmint").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let mut record = crash_engine_leaving_record(&mut sup, &registry, "runmint");
+    record.run_id = None;
+    record.owner = Some(crate::ports::ProcessFingerprint::new(999_999_996, 1));
+    record.lease = None;
+    registry.write_spawn_record(&record).unwrap();
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    wait_for_sink_line(
+        &buffer,
+        "predates durable Run ids",
+        "the mint-and-persist note",
+    );
+    let persisted = registry.spawn_record(&name).unwrap().unwrap();
+    assert!(
+        persisted.run_id.is_some(),
+        "the minted Run id was persisted onto the record"
+    );
+    // BEST-EFFORT teardown: an adopted handle belongs to a process this test
+    // process PARENTED, so a killed child lingers as an unreaped zombie the
+    // adopted-branch confirmation cannot see past (kill(pid, 0) succeeds for
+    // a zombie). The SIGKILL itself always lands; only the CONFIRMATION can
+    // time out — so the ladder's outcome is deliberately not asserted here.
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+}
+
+/// The shared engine-observed adoption setup: an ATTACHED engine-observed
+/// start under a real runtime, then the supervisor `mem::forget`-crashed
+/// (skipping its kill-on-drop — the in-process stand-in for a SIGKILLed
+/// engine, since a DETACHED observed start is refused by design). The child
+/// survives with a record whose owner is THIS process — always adoptable.
+/// Returns (state dir, manifest dir, registry, runtime, name).
+#[allow(clippy::type_complexity)]
+fn setup_observed_crashed_engine(
+    name: &str,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Registry,
+    tokio::runtime::Runtime,
+    InstanceName,
+) {
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), name, &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let parsed = InstanceName::new(name).unwrap();
+    registry
+        .set_config(
+            &parsed,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, name).unwrap();
+    assert_eq!(state_of(&registry, name), LifecycleState::Running);
+    // The crash: forget, never drop — an ATTACHED drop is kill-on-drop, and
+    // this test NEEDS the orphaned-live-process shape adoption reconciles.
+    std::mem::forget(sup);
+    (state, manifest, registry, rt, parsed)
+}
+
+#[test]
+fn adopted_engine_observed_rebind_failure_is_surfaced_with_the_strand_note() {
+    // Story 17-2's re-bind, the Err arm: the adopting engine pins a FIXED
+    // metering port that is ALREADY TAKEN (a squatter socket) — the re-bind
+    // fails, the failure is SURFACED (AI-18), and because no listener landed,
+    // the stranded-observed-listener warning fires too (the instance's
+    // injected base_url still points at the dead port).
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eorebind");
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = squatter.local_addr().unwrap().port();
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(port, false, LogCaptureMode::Full)
+        .unwrap();
+    assert_eq!(
+        sup2.adopt_orphans(&registry),
+        1,
+        "the crashed engine's live agent adopts"
+    );
+    wait_for_sink_line(
+        &buffer,
+        "could not re-bind the observed-metering",
+        "the re-bind failure note",
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("stranded observed listener"),
+        "the strand warning fires when no listener landed:\n{text}"
+    );
+    // Cleanup (see the zombie note on runmint): the SIGKILL lands, the
+    // confirmation may not — and `forget` skips Drop's armed-handle teardown
+    // so a slow confirmation can never stall the test end.
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+    drop(squatter);
+}
+
+#[test]
+fn adopted_engine_observed_config_read_failure_strands_openly() {
+    // The config-read Err arm: the adopted engine-observed instance's
+    // effective config cannot be read (a malformed instance layer) — the
+    // degraded posture is the pre-17-2 strand, SURFACED, with the same
+    // stranded-listener warning.
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eofconf");
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "this is = = not valid toml",
+    )
+    .unwrap();
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(47211, false, LogCaptureMode::Full)
+        .unwrap();
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    wait_for_sink_line(
+        &buffer,
+        "effective config could not be read",
+        "the config-read failure note",
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("stranded observed listener"),
+        "the strand warning fires here too:\n{text}"
+    );
+    // Cleanup (see the zombie note on runmint).
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+}
+
+#[test]
+fn adopted_paused_detached_child_notes_the_session_hold_recovery() {
+    // The adopted-PAUSED note, OPERATOR arm (story 15-2, AI-18): adoption
+    // never auto-resumes; the note names the stays-paused fact and the
+    // this-session-holds-it recovery (a session exit RESUMES a signal-paused
+    // child — never the breach freeze wording).
+    let (_s, _m, registry) = setup_pause_guaranteed("adopp", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("adopp").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "adopp").unwrap();
+    sup.pause(&registry, "adopp").unwrap();
+    assert_eq!(state_of(&registry, "adopp"), LifecycleState::Paused);
+    make_dead_owner_record(&registry, &name);
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let text = wait_for_sink_line(
+        &buffer,
+        "adopted a PAUSED instance",
+        "the adopted-paused note",
+    );
+    assert!(
+        !text.contains("BUDGET BREACH"),
+        "an operator pause must not read as the breach freeze: {text}"
+    );
+    assert!(
+        text.contains("resume") || text.contains("stop"),
+        "the note names the explicit path: {text}"
+    );
+    // Cleanup (see the zombie note on runmint): the adopted handle is
+    // DISARMED (a detached record), so nothing needs the ladder's outcome.
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+}
+
+#[test]
+fn adopted_breach_paused_child_notes_the_between_commands_freeze() {
+    // The adopted-PAUSED note, BREACH arm: a child paused by a BUDGET BREACH
+    // stays frozen across adoption — the note says the between-commands
+    // window is enforcement-free and this engine's exit does NOT resume it.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_pause_guaranteed_manifest(
+        manifest.path(),
+        "adopbrz",
+        &["--emit-usage", "3", "--linger-ms", "600000"],
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "adopbrz",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("adopbrz").unwrap();
+    registry
+        .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start_detached(&registry, "adopbrz").unwrap();
+    drain_until_state(&mut sup, &registry, "adopbrz", LifecycleState::Paused);
+    make_dead_owner_record(&registry, &name);
+
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let text = wait_for_sink_line(
+        &buffer,
+        "adopted a PAUSED instance",
+        "the adopted-paused note",
+    );
+    assert!(
+        text.contains("BUDGET BREACH"),
+        "the breach freeze must be named at adoption: {text}"
+    );
+    // The freeze HELD: the row still reads paused after adoption.
+    assert_eq!(state_of(&registry, "adopbrz"), LifecycleState::Paused);
+    // Cleanup (see the zombie note on runmint).
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+}
+
+/// Sabotage the engine's transition-event log: replace `instance.log` with a
+/// DIRECTORY, so every subsequent transition APPEND fails (the same OS-neutral
+/// staging the breach-IO test uses) while earlier committed events are gone.
+/// Returns a closure that repairs the path for clean teardown.
+fn break_instance_event_log(registry: &Registry, name: &InstanceName) {
+    let log = registry.instance_log_path(name);
+    match std::fs::remove_file(&log) {
+        Ok(()) => {}
+        // Nothing there yet — nothing to remove.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Any OTHER failure: the path may already be a directory from a
+        // previous break (repair that); a repair that also fails PROPAGATES
+        // clearly here instead of detonating as an opaque unwrap-panic in
+        // the create_dir below (P11 — the site the review flagged).
+        Err(err) => {
+            if std::fs::remove_dir(&log).is_err() {
+                panic!(
+                    "could not sabotage {} for the break test (remove_file: {err}) — \
+                     not a file, not absent, not a removable directory",
+                    log.display()
+                );
+            }
+        }
+    }
+    std::fs::create_dir(&log).unwrap();
+}
+
+fn repair_instance_event_log(registry: &Registry, name: &InstanceName) {
+    let log = registry.instance_log_path(name);
+    if log.is_dir() {
+        std::fs::remove_dir(&log).unwrap();
+    }
+}
+
+#[test]
+fn cooperative_pause_divergence_after_the_command_ran_is_surfaced() {
+    // AI-18's post-commit divergence arm (18-4): the declared PAUSE command
+    // already RAN, then the ledger REFUSES the paused transition — the note
+    // names BOTH sides (command ran / record failed) plus the recovery verb,
+    // and the error is returned (never swallowed into a silent Ok).
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coopdiv",
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "coopdiv",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("coopdiv").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coopdiv").unwrap();
+
+    break_instance_event_log(&registry, &name);
+    let _err = sup.pause(&registry, "coopdiv").unwrap_err();
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("the pause command already ran"),
+        "the note names the side that already happened:\n{text}"
+    );
+    assert!(
+        text.contains("recording the running→paused transition failed"),
+        "the note names the failed record: {text}"
+    );
+    assert!(
+        text.contains("diverge") && text.contains("recovery:"),
+        "the note names the divergence and the recovery: {text}"
+    );
+    assert!(
+        text.contains("hekma agent stop coopdiv"),
+        "a failed PAUSE commit realigns via stop: {text}"
+    );
+
+    // Repair the log so the teardown's own transitions land.
+    repair_instance_event_log(&registry, &name);
+    sup.stop(&registry, "coopdiv", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn release_pass_resume_commit_failure_is_surfaced() {
+    // The release pass's Err arm on the COMMIT: the SIGCONT resume succeeded
+    // but recording the paused→running edge FAILED — surfaced (the row may
+    // read paused until the next command adopts it), teardown continues.
+    let (_s, _m, registry) = setup_pause_guaranteed("relcommit", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("relcommit").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "relcommit").unwrap();
+    sup.pause(&registry, "relcommit").unwrap();
+    assert_eq!(state_of(&registry, "relcommit"), LifecycleState::Paused);
+
+    break_instance_event_log(&registry, &name);
+    sup.release_detached_paused(&registry);
+    wait_for_sink_line(
+        &buffer,
+        "recording the paused→running transition failed",
+        "the release commit-failure note",
+    );
+
+    repair_instance_event_log(&registry, &name);
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn release_pass_resume_signal_failure_still_releases_and_says_so() {
+    // The release pass's resume-ERROR arm: the resume signal itself FAILS
+    // (the signal-fault seam — a real un-signalable process cannot be staged)
+    // — the note names the failure + the recovery, and the disarmed handle
+    // is still released (no kill, no hold).
+    let (_s, _m, registry) = setup_pause_guaranteed("relsig", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("relsig").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "relsig").unwrap();
+    sup.pause(&registry, "relsig").unwrap();
+    sup.signal_fault_names.insert(name.clone());
+
+    sup.release_detached_paused(&registry);
+    let text = wait_for_sink_line(
+        &buffer,
+        "could NOT be resumed at engine release",
+        "the resume-failure note",
+    );
+    assert!(
+        text.contains("hekma agent resume relsig"),
+        "the note names the recovery verb: {text}"
+    );
+
+    // Disarm → the stop ladder resumes-then-stops the (still paused) child.
+    sup.signal_fault_names.remove(&name);
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn stop_ladder_resume_failure_is_surfaced_and_the_outcome_still_lands_stopped() {
+    // Story 20-1 review (P8): the stop ladder's OWN resume site (the direct
+    // backend.resume before the ladder, NOT signal_backend's) — an armed
+    // fault makes the pre-ladder SIGCONT fail: the "could not resume the
+    // paused process before the stop ladder" note fires, AND the stop still
+    // completes (the ladder escalates within the window — best-effort
+    // resume, never a blocked stop). Mirrors the release-pass signal-fault
+    // test's shape; the fault is armed AFTER the pause so the pause itself
+    // (through signal_backend) is unaffected.
+    let (_s, _m, registry) = setup_pause_guaranteed("stopsig", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("stopsig").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "stopsig").unwrap();
+    sup.pause(&registry, "stopsig").unwrap();
+    assert_eq!(state_of(&registry, "stopsig"), LifecycleState::Paused);
+    sup.signal_fault_names.insert(name.clone());
+
+    sup.stop(&registry, name.as_str(), Some(Duration::from_secs(2)))
+        .unwrap();
+    let text = wait_for_sink_line(
+        &buffer,
+        "could not resume the paused process before the stop ladder",
+        "the stop-ladder resume-failure note",
+    );
+    assert!(
+        text.contains("escalate"),
+        "the note names the consequence honestly: {text}"
+    );
+    // The outcome still lands Stopped — a failed resume never blocks the
+    // stop (the ladder escalates within the window).
+    assert_eq!(
+        state_of(&registry, "stopsig"),
+        LifecycleState::Stopped,
+        "the stop completed despite the resume failure"
+    );
+}
+
+#[test]
+fn wal_spawn_record_commit_failure_lands_failed_and_tears_down_the_detached_child() {
+    // AD-5's write-ahead safety, the DETACHED commit-failure arm: the spawn
+    // record commit fails (an injected DB trigger aborts the agent_runtime
+    // INSERT — the OS-neutral stand-in for a store outage), so the instance
+    // lands `failed` and the live detached child is EXPLICITLY torn down
+    // (a disarmed drop would leak an unrecorded process). No record, no
+    // process, honest error.
+    let (_s, _m, registry) = setup_fake("walfail", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("walfail").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+
+    // The injection: a BEFORE INSERT trigger on the runtime table aborts
+    // exactly the spawn-record write (the `→ starting` transition is an
+    // UPDATE and sails through).
+    let conn = rusqlite::Connection::open(registry.paths().state_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER wal_commit_fault BEFORE INSERT ON agent_runtime \
+         BEGIN SELECT RAISE(ABORT, 'injected cfg(test) WAL commit fault (epic 20-1)'); END;",
+    )
+    .unwrap();
+
+    let err = sup.start_detached(&registry, "walfail").unwrap_err();
+    match &err {
+        EngineError::LaunchFailed { name: n, detail } => {
+            assert_eq!(n, "walfail");
+            assert!(
+                detail.contains("could not commit the write-ahead spawn record"),
+                "the error names the failed commit: {detail}"
+            );
+            assert!(
+                detail.contains("injected cfg(test) WAL commit fault"),
+                "the store's abort reason rides the detail: {detail}"
+            );
+        }
+        other => panic!("expected LaunchFailed, got {other:?}"),
+    }
+    assert_eq!(state_of(&registry, "walfail"), LifecycleState::Failed);
+    assert!(
+        registry.spawn_record(&name).unwrap().is_none(),
+        "no write-ahead record survives a failed commit"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        !text.contains("adopt"),
+        "nothing was adopted or left supervisable: {text}"
+    );
+
+    conn.execute_batch("DROP TRIGGER wal_commit_fault;")
+        .unwrap();
+}
+
+#[test]
+fn readiness_timeout_death_recheck_failure_is_surfaced_on_the_timeout() {
+    // The degraded-recheck arm (review round 1 E1): the probe budget expired
+    // and the ONE re-poll before condemning ERRORS — the timeout conclusion
+    // carries that caveat VISIBLY (AI-18) instead of silently claiming the
+    // death check ran. Driven through the cfg(test) spawn-recheck seam (the
+    // re-check runs during `start`, before a pid exists to arm; a real
+    // procfs outage cannot be staged in-process).
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    let dir = manifest.path().join("rdyrechk");
+    use hekma_conformance::test_support::ManifestFixture;
+    ManifestFixture::new("rdyrechk", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 400\npath = \"never-ready.marker\"\nmax_age_ms = 400",
+        )
+        .write(&dir);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter("rdyrechk", &AdapterRef::Manifest(dir))
+        .unwrap();
+    let name = InstanceName::new("rdyrechk").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.spawn_recheck_fault_names.insert(name.clone());
+
+    let err = sup.start(&registry, "rdyrechk").unwrap_err();
+    // The surfaced caveat rode the sink.
+    wait_for_sink_line(
+        &buffer,
+        "the pre-timeout liveness re-check failed",
+        "the degraded-recheck caveat",
+    );
+    // The conclusion is STILL the readiness timeout (the caveat does not
+    // soften it), the instance is failed, and it will NOT be restarted.
+    match &err {
+        EngineError::LaunchFailed { name: n, detail } => {
+            assert_eq!(n, "rdyrechk");
+            assert!(
+                detail.contains("did not pass within its 400ms budget"),
+                "the timeout detail names the budget: {detail}"
+            );
+        }
+        other => panic!("expected LaunchFailed, got {other:?}"),
+    }
+    assert_eq!(state_of(&registry, "rdyrechk"), LifecycleState::Failed);
+    let events = Supervisor::read_events(&registry, "rdyrechk").unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.cause, TransitionCause::ReadinessTimeout { .. })),
+        "the failure carries the readiness-timeout cause: {events:?}"
+    );
+}

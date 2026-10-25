@@ -518,4 +518,193 @@ mod tests {
         let notes = Notes::over(Some(&sink));
         notes.note("a panicking writer is swallowed, not propagated");
     }
+
+    #[test]
+    fn notes_recover_from_a_poisoned_sink_mutex() {
+        // The poisoned-lock arm: a writer that panicked while HOLDING the
+        // sink mutex poisons it; the note-taker takes the poisoned guard
+        // anyway (a torn line is better than NO line) and its own
+        // catch_unwind swallows the panicking writer — the shutdown survives
+        // a poisoned, panicking sink, never a panic out of the drain.
+        struct AlwaysPanicWriter;
+        impl Write for AlwaysPanicWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                panic!("host writer bug");
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink: DiagnosticSink = Arc::new(Mutex::new(Box::new(AlwaysPanicWriter)));
+        let holder = sink.clone();
+        // Panic while the guard is alive INSIDE the closure: the unwind
+        // drops the guard mid-panic and the mutex poisons.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = holder.lock().unwrap();
+            let _ = guard.write_all(b"x");
+        }));
+        assert!(
+            sink.lock().is_err(),
+            "the writer's mid-hold panic must have poisoned the mutex"
+        );
+        let notes = Notes::over(Some(&sink));
+        notes.note("the drain survives a poisoned, panicking sink");
+    }
+
+    // ------------------------------------------------------------------
+    // The drain facade's failure arms (epic 20-1 coverage pass): driven
+    // through a real Engine — the FAILED stop (staged through the cfg(test)
+    // stop-fault seam, the codebase's established fault-injection idiom)
+    // and the UNREADABLE fleet (the store's table dropped out from under
+    // an open registry connection).
+    // ------------------------------------------------------------------
+
+    /// A recording sink (the host suites' SharedSink shape): every note the
+    /// drain emits lands in a shared buffer the test asserts on.
+    #[derive(Clone)]
+    struct RecordingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl RecordingSink {
+        fn new() -> (Self, crate::DiagnosticSink) {
+            let shared = Self(Arc::new(Mutex::new(Vec::new())));
+            let sink: crate::DiagnosticSink = Arc::new(Mutex::new(Box::new(shared.clone())));
+            (shared, sink)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Register + start a `fake_agent` instance named `name` under a fresh
+    /// state root, through the engine's own blocking facade (the same seam
+    /// the CLI's register/start drive). The short linger means a child the
+    /// teardown cannot reach still self-exits promptly.
+    fn started_fake_agent(name: &str) -> (tempfile::TempDir, crate::Engine) {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        let bin = hekma_conformance::fake_agent_bin();
+        let body = format!(
+            "contract_version = \"1.0.0\"\n\n\
+             [adapter]\nkind = \"fake\"\n\n\
+             [lifecycle.start]\nexec = {exec:?}\nargs = [\"--linger-ms\", \"5000\"]\n\n\
+             [capabilities.interaction]\nlinux = \"guaranteed\"\nmacos = \"guaranteed\"\nwindows = \"guaranteed\"\n\n\
+             [metering]\nsource = \"self-reported\"\n",
+            exec = bin.to_string_lossy(),
+        );
+        std::fs::write(manifest.path().join("adapter.toml"), body).unwrap();
+        let engine = crate::Engine::open(Some(state.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                name,
+                &crate::AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap();
+        let started = facade.start(name).unwrap();
+        assert_eq!(started.state, LifecycleState::Running);
+        (state, engine)
+    }
+
+    #[test]
+    fn a_failed_drain_stop_reports_failed_and_leaves_the_row_honestly_stopping() {
+        // The stop-failure arms (finding 6's Err side): a stop that errors
+        // against a still-live process — staged through the cfg(test)
+        // stop-fault seam, because a real unstoppable process cannot be
+        // hermetic — must surface a `Failed` outcome naming the reason and
+        // the remediation, leave the row in the honest `stopping` state
+        // (never a fabricated `stopped` over a live process), and never
+        // abort the drain (the roll-up still runs and says nothing false).
+        // Driven through the blocking facade: the Engine owns its runtime,
+        // so it cannot live inside an async test context.
+        let (_state, engine) = started_fake_agent("wedge");
+        engine.arm_test_stop_fault("wedge");
+        let (sink_handle, sink) = RecordingSink::new();
+        let outcomes = engine
+            .blocking()
+            .shutdown(Duration::from_secs(2), Some(&sink));
+        assert_eq!(outcomes.len(), 1, "exactly one drain outcome");
+        let text = sink_handle.text();
+        assert!(
+            text.contains("stopping wedge (graceful window"),
+            "the pass notes the ladder attempt:\n{text}"
+        );
+        assert!(
+            text.contains("wedge:") && text.contains("NOT stopped"),
+            "the failed outcome is surfaced honestly (AI-18):\n{text}"
+        );
+        assert!(
+            text.contains("injected cfg(test) stop fault"),
+            "the outcome carries the backend's reason:\n{text}"
+        );
+        // The row is left `stopping`: the ladder really started, the backend
+        // failed, and nothing was fabricated over the live process.
+        let fleet = engine.blocking().fleet().unwrap();
+        let wedge = fleet
+            .iter()
+            .find(|entry| entry.name.as_str() == "wedge")
+            .expect("the wedged instance is still listed");
+        assert_eq!(
+            wedge.state,
+            LifecycleState::Stopping,
+            "no phantom stopped/failed row over a live process"
+        );
+        // The roll-up's honesty cap stays quiet: a `stopping` row is not a
+        // "still running or paused" straggler.
+        assert!(
+            !text.contains("still running or paused after the shutdown drain"),
+            "the honesty cap names only rows that are really still live:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_fleet_surfaces_every_enumeration_refusal() {
+        // The fleet-read failure arms: a registry whose backing table is
+        // dropped from a second connection (the registry's own connection
+        // discovers the loss on its next read) makes EVERY fleet read fail —
+        // both passes surface the enumeration refusal (naming that NO
+        // instance went through the ladder), the nothing-to-stop note still
+        // fires, and the final roll-up says the drain's completion is
+        // UNVERIFIED — a surfaced degradation, never a silent Ok. Driven
+        // through the blocking facade (the Engine owns its runtime).
+        let state = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::open(Some(state.path().to_path_buf())).unwrap();
+        let db = state.path().join("state.db");
+        rusqlite::Connection::open(&db)
+            .expect("open the state store directly")
+            .execute("DROP TABLE agent_instances", [])
+            .expect("drop the fleet's table");
+        let (sink_handle, sink) = RecordingSink::new();
+        let outcomes = engine
+            .blocking()
+            .shutdown(Duration::from_secs(2), Some(&sink));
+        assert!(outcomes.is_empty(), "no stop was even attempted");
+        let text = sink_handle.text();
+        assert!(
+            text.contains("could not enumerate the fleet for the shutdown drain"),
+            "the pass's enumeration failure is surfaced:\n{text}"
+        );
+        assert!(
+            text.contains("no instance went through the bounded stop ladder"),
+            "the first-pass note names that the ladder never ran:\n{text}"
+        );
+        assert!(
+            text.contains("no running or paused agents; nothing to stop"),
+            "the nothing-to-stop note still fires:\n{text}"
+        );
+        assert!(
+            text.contains("could not re-read the fleet to confirm the drain completed"),
+            "the roll-up names the unverified completion:\n{text}"
+        );
+    }
 }

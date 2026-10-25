@@ -268,6 +268,13 @@ every route, `/v0/version` included, sits behind the bearer layer (an
 unauthenticated probe gets `401`, not a health answer). The honest liveness
 signal is the process being up and the `[hekma] ` notice stream on stderr.
 
+For feeding the fleet's governance metrics to an observability stack, the
+host has an opt-in OTLP export (`--otlp-endpoint`, http:// on loopback or an
+in-network collector; the exporter does not exist without the flag). The
+versioned metric exposition and its container-relevant honesty rules
+(bounded POSTs, the drop counter, the bounded shutdown flush) live in
+[Telemetry export](telemetry.md).
+
 To stop it, let the runtime do its part:
 
 ```bash
