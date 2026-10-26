@@ -100,6 +100,18 @@ jobs:
           - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
             test_job_timeout_minutes: 15
+          # windows-latest job budget 50→60 (2026-10-26): epic-18/19/20
+          # growth put green legs at 44–46m (six most recent through Oct 25)
+          # against the 50m default, and #334 @ 889ae3d already lost a run
+          # to the wall AFTER the suite passed — the PR leg's attempt 1
+          # (job 121051106083) was CANCELLED at exactly 50m08s
+          # (02:18:39→03:08:47Z) in post-test cache-save while the push
+          # twin passed the same tree at 48m19s (job 121051095775), reding
+          # the ruleset-required `test` check for the SHA. Same mechanism
+          # the 40→50 default bump bought (run 39472620931); macOS legs
+          # run 12–13m and keep the 50 default.
+          - os: windows-latest
+            test_job_timeout_minutes: 60
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
@@ -128,7 +140,10 @@ jobs:
     # the PINNED ubuntu-26.04 leg to 15m (tracking #292): the healthy lane is
     # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
     # 15+5m service window instead of 45m and surfaces as a fast visible
-    # cancel rather than a silent three-quarter-hour burn.
+    # cancel rather than a silent three-quarter-hour burn. The windows
+    # include raises THAT leg to 60m (2026-10-26): green legs ride 44–46m
+    # and the 50m wall claimed an after-suite cancel (#334 @ 889ae3d — see
+    # the matrix include comment for the run IDs).
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout
