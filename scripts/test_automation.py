@@ -578,6 +578,15 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
         self.assertIn("- os: ubuntu-26.04", ci)
         self.assertIn("test_job_timeout_minutes: 15", ci)
+        # Windows leg override 50→60 (2026-10-26): epic-18/19/20 growth put
+        # green windows-latest legs at 44–46m against the 50m default, and
+        # #334 @ 889ae3d lost attempt 1 of its PR leg to the wall AFTER the
+        # suite passed — job 121051106083 was CANCELLED at exactly 50m08s
+        # (02:18:39→03:08:47Z) in post-test cache-save while the push twin
+        # passed the same tree at 48m19s (job 121051095775), reding the
+        # ruleset-required `test` check. 60 restores cold-cache headroom;
+        # macOS legs run 12–13m and keep the 50 default.
+        self.assertIn("test_job_timeout_minutes: 60", ci)
         # Default test-job budget 40→50 (2026-10-20): the suite passed 1,671
         # nextest tests with epic-17 and the windows-latest leg rides 33-38m
         # green; run 39472620931 lost ~9m to a double cold-cache miss (new
