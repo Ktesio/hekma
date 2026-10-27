@@ -255,10 +255,12 @@ class ReleaseDocsTests(unittest.TestCase):
         # NAMED, time-boxed failure instead of a silent job-level cancel whose
         # logs GitHub discards (the ubuntu symptom), and its retries absorb the
         # windows-latest per-test timing flake. Doctests run separately because
-        # nextest does not execute them. nextest is installed with the repo's
-        # standard `cargo install --locked` idiom (same as the semver / tarpaulin
-        # gates), not a third-party install action, so the SHA-pinned-actions
-        # posture is preserved. Assert the whole shape so a regression back to the
+        # nextest does not execute them. nextest is installed from a
+        # VERSION+SHA256-pinned official release tarball (the install step's
+        # own comment carries the why: the source build was ~6m per cold leg
+        # and its ~/.cargo/bin cache kept getting LRU-evicted) — pinned
+        # first-party artifacts keep the SHA-pinned-actions supply-chain
+        # posture. Assert the whole shape so a regression back to the
         # hang-prone plain `cargo test` suite run — or a dropped doctest pass — is
         # caught.
         self.assertIn("cargo +stable nextest run --workspace --all-targets", ci)
@@ -300,12 +302,18 @@ class ReleaseDocsTests(unittest.TestCase):
             "cargo +stable build -p hekma-conformance --bin hermes_shim",
             coverage_step,
         )
+        # The pinned-prebuilt install: exact version + per-OS sha256 pins +
+        # the release-tarball URL + the hash gate. The old floating source
+        # install and the obsolete nextest-bin cache key must both stay GONE
+        # (that cache was the eviction victim that forced the ~6m rebuilds).
+        self.assertIn('NEXTEST_VERSION: "0.9.149"', ci)
         self.assertIn(
-            "command -v cargo-nextest >/dev/null 2>&1 "
-            "|| cargo +stable install cargo-nextest --locked",
+            "cargo-nextest-${NEXTEST_VERSION}-${art}.tar.gz",
             ci,
         )
-        self.assertIn("${{ runner.os }}-cargo-nextest-bin", ci)
+        self.assertIn('sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp"', ci)
+        self.assertNotIn("cargo +stable install cargo-nextest", ci)
+        self.assertNotIn("${{ runner.os }}-cargo-nextest-bin", ci)
         # The old plain-`cargo test` suite command must be GONE — the only
         # remaining `cargo +stable test` in the test job is the `--doc` pass.
         self.assertNotIn("cargo +stable test --workspace --all-targets", ci)
