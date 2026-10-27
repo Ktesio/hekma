@@ -617,6 +617,63 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertNotIn("matrix.os == 'ubuntu-latest'", ci)
         self.assertNotIn("matrix.os != 'ubuntu-latest'", ci)
 
+    def test_ci_windows_leg_runs_the_parallel_heavy_nextest_profile(self) -> None:
+        # 2026-10-27: the `engine-integration-serial` group (the #106/#281
+        # x86-ubuntu 2-core D-state wedge fix above) had grown the
+        # windows-latest test step to 40m02s serialized (51m51s job, run
+        # 40383210835) — past the 50m job budget on main (runs 40355871363
+        # and 40337860524 both cancelled at the windows timeout). The wedge
+        # never occurred on windows/macos (parallelism proven green there
+        # pre-#106), so the windows leg selects the `parallel-heavy`
+        # profile: same suite/settings, the three serialization overrides
+        # SHADOWED by same-filter overrides routing to an unbounded
+        # test-group (nextest consults the SELECTED profile's overrides
+        # first; an empty custom profile would inherit `default`'s
+        # serialization — verified on cargo-nextest 0.9.148). Measured:
+        # 12m15s step / 24m01s job (run 40459586527). Lock the per-leg
+        # selection (matrix DATA, never a per-OS step branch), the single
+        # uniform invocation, and the shadow-pair equality with the
+        # serialized filters.
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        nextest = (release_docs.ROOT / ".config" / "nextest.toml").read_text(
+            encoding="utf-8"
+        )
+        # Selection rides the matrix include as DATA: every leg gets a
+        # profile, windows diverges, exactly the other two stay `default`.
+        self.assertIn("nextest_profile: default", ci)
+        self.assertEqual(ci.count("nextest_profile: default"), 2)
+        self.assertIn("nextest_profile: parallel-heavy", ci)
+        self.assertEqual(ci.count("nextest_profile: parallel-heavy"), 1)
+        self.assertIn('PROFILE="${{ matrix.nextest_profile }}"', ci)
+        # The run step stays ONE uniform invocation for all OSes: both the
+        # capped and uncapped paths read the same matrix var, and no step
+        # branches on matrix.os (the bisect-era guards above).
+        self.assertIn('--profile "$PROFILE"', ci)
+        self.assertEqual(ci.count('--profile "$PROFILE"'), 2)
+        self.assertNotIn("--profile parallel-heavy", ci)
+        # The unbounded group + shadow profile exist.
+        self.assertIn("[test-groups.unbounded]", nextest)
+        self.assertIn("max-threads = 2147483647", nextest)
+        self.assertIn("[profile.parallel-heavy]", nextest)
+        # Shadow-pair equality: each serialized filter appears EXACTLY
+        # twice — once under `default`'s overrides (serialized group) and
+        # once under `parallel-heavy`'s (unbounded shadow) — and the three
+        # shadows route to the unbounded group. The equality IS the
+        # contract: a dropped or drifted shadow silently re-serializes the
+        # windows leg (or shadows a filter nothing serializes).
+        for serialized_filter in (
+            'filter = "kind(test) & package(hekma-engine)"',
+            'filter = "kind(test) & package(hekma)"',
+            'filter = "kind(lib) & package(hekma-engine)"',
+        ):
+            self.assertEqual(nextest.count(serialized_filter), 2)
+        self.assertEqual(nextest.count('test-group = "unbounded"'), 3)
+        # The wedge's home leg keeps the serialized default.
+        self.assertIn("- os: ubuntu-26.04", ci)
+        self.assertIn("nextest_wallclock_cap: 30m", ci)
+
     def test_ci_enforces_workspace_boundary_and_semver_gates(self) -> None:
         ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
