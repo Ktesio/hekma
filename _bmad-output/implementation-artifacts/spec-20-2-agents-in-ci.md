@@ -2,7 +2,7 @@
 title: 'Agents in CI — the GitHub Actions recipe and dogfood lane'
 type: 'feature'
 created: '2026-10-24'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: '42fe5c50e807a5ab631c525dc8ce6d0ce65f3e0b'
 context:
@@ -57,12 +57,12 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `docs/agents-in-ci.md` — NEW: the recipe — (1) get hekma on the runner (tag-pinned musl curl+sha256, checksum-verified); (2) register the agent (inline `adapter.toml` for any process, or `--kind acp`), set `budget.tokens.cumulative` + `budget.breach_action` + optional `cost.rate.*`; (3) run bounded (`timeout-minutes` + hekma's bounded commands); (4) render `$GITHUB_STEP_SUMMARY` from `usage --json`/`show --json` (shell snippet handling micro-dollars, estimate label, absent-cached/absent-dollars honesty); (5) branch on exit codes 0/2/3/4/5/6 with the no-breach-code honesty note (spend checks read usage totals, breaches read the Fleet row); (6) the secret: wiring note for auth-gated agents (`secret:NAME` refs, never literals in YAML)
-- [ ] `.github/workflows/ci.yml` — NEW top-level job `agents-in-ci` (ubuntu, `timeout-minutes: 10`, contents: read inherited): checkout → build branch `hekma` + `fake_agent` (rm+build guard) → success leg (inline manifest, absolute fake path, generous ceiling, exit 0, summary written, tokens asserted) → breach leg (uj3 recipe: ceiling 90 → poll `show --json` for paused + budget fields within the bound → summary names breach; `continue-on-error: false`) — both legs write `## Agents in CI` step-summary blocks with the `:-/dev/null` fallback
-- [ ] `docs/meta.json` + `docs/source.config.ts` — register `agents-in-ci` page
-- [ ] `README.md` — one-line pointer to the recipe (beside the gallery pointer if 20.3 lands first)
-- [ ] `_bmad-output/implementation-artifacts/deferred-work.md` — entry: installer pin/target knob (`install.sh` resolves latest-release gnu only; the CI recipe needs direct curl+sha256 until it grows a `HEKMA_VERSION`/musl knob) — trigger: a user asks for pinned installs
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-2 per house convention on PR open
+- [x] `docs/agents-in-ci.md` — NEW: the recipe — (1) get hekma on the runner (tag-pinned musl curl+sha256, checksum-verified); (2) register the agent (inline `adapter.toml` for any process, or `--kind acp`), set `budget.tokens.cumulative` + `budget.breach_action` + optional `cost.rate.*`; (3) run bounded (`timeout-minutes` + hekma's bounded commands); (4) render `$GITHUB_STEP_SUMMARY` from `usage --json`/`show --json` (shell snippet handling micro-dollars, estimate label, absent-cached/absent-dollars honesty); (5) branch on exit codes 0/2/3/4/5/6 with the no-breach-code honesty note (spend checks read usage totals, breaches read the Fleet row); (6) the secret: wiring note for auth-gated agents (`secret:NAME` refs, never literals in YAML)
+- [x] `.github/workflows/ci.yml` — NEW top-level job `agents-in-ci` (ubuntu, `timeout-minutes: 10`, contents: read inherited): checkout → build branch `hekma` + `fake_agent` (rm+build guard) → success leg (inline manifest, absolute fake path, generous ceiling, exit 0, summary written, tokens asserted) → breach leg (uj3 recipe: ceiling 90 → poll `show --json` for paused + budget fields within the bound → summary names breach; `continue-on-error: false`) — both legs write `## Agents in CI` step-summary blocks with the `:-/dev/null` fallback
+- [x] `docs/meta.json` + `docs/source.config.ts` — register `agents-in-ci` page
+- [x] `README.md` — one-line pointer to the recipe (beside the gallery pointer if 20.3 lands first)
+- [x] `_bmad-output/implementation-artifacts/deferred-work.md` — entry: installer pin/target knob (`install.sh` resolves latest-release gnu only; the CI recipe needs direct curl+sha256 until it grows a `HEKMA_VERSION`/musl knob) — trigger: a user asks for pinned installs
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-2 per house convention on PR open
 
 **Acceptance Criteria:**
 - Given the lane on a PR, both legs pass deterministically (no wall-clock sleeps; the breach leg proves the paused row + breach fields from `show --json`).

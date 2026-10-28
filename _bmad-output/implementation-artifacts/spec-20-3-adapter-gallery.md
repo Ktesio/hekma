@@ -2,7 +2,7 @@
 title: 'Adapter gallery — ten seed entries, honesty tables, CI-validated manifests'
 type: 'feature'
 created: '2026-10-24'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: '42fe5c50e807a5ab631c525dc8ce6d0ce65f3e0b'
 context:
@@ -67,7 +67,7 @@ context:
 - [x] `scripts/check_docs.py` — add `docs/adapters/*.md` to DOC_PATHS; run `--self-test`
 - [x] `docs/meta.json` + `docs/source.config.ts` — register the 11 new pages (Reference group)
 - [x] `README.md` + `docs/agents.md` — pointers to the gallery (agents.md keeps its pins; the gallery does not duplicate the deprecated-hermes-kind notice without linking it) — *(2026-10-24: README pointers applied; the docs/agents.md one-line reverse pointer is BLOCKED by the environment's agent-instruction-file write guard on the `agents.md` filename (approval timed out, no user present) — the exact sentence is recorded in the run's decision list for Islam to apply or bless; check_docs/link integrity does not depend on it)* — README done 2026-10-24; the docs/agents.md edit was DENIED by the agents.md write-guard (autonomous run, no user consent surface) — apply the one-line pointer at PR open
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-3 per house convention on PR open (row updated 2026-10-24 with the implementation record + the blocked item; flip to done at PR open)
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-3 per house convention on PR open (row updated 2026-10-24 with the implementation record + the blocked item; flip to done at PR open)
 
 **Acceptance Criteria:**
 - Given the gallery test on any OS lane, when a shipped manifest or page-manifest pair drifts, then the build fails with a named reason.
