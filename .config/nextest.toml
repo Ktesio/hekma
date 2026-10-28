@@ -108,3 +108,45 @@ test-group = "engine-integration-serial"
 [[profile.default.overrides]]
 filter = "kind(lib) & package(hekma-engine)"
 test-group = "engine-integration-serial"
+
+# Unbounded test-group, referenced ONLY by the `parallel-heavy` profile below.
+# A profile override must assign a test-group; max-threads at i32::MAX turns
+# the group into a no-op throttle that restores nextest's default UNLIMITED
+# concurrency for the tests routed to it.
+[test-groups.unbounded]
+max-threads = 2147483647
+
+# `parallel-heavy` — the windows-latest CI leg's profile (adopted
+# 2026-10-27): the SAME suite, the SAME retries / slow-timeout /
+# failure-output / status-level (all inherited from `default` through the
+# profile chain) — but with the three serialization overrides above SHADOWED
+# so the engine/CLI/lib spawners run at nextest's default parallelism.
+# Measured on the full matrix: `default` serialized the windows test step
+# to 40m02s (51m51s job, run 40383210835) — past the 50m job budget on
+# main (runs 40355871363 and 40337860524 both cancelled at the windows
+# timeout); `parallel-heavy` runs the same suite in 12m15s (24m01s job,
+# run 40459586527) — 3.3x on the step, 2x headroom back under the budget.
+#
+# Why shadowing rather than an empty profile: nextest consults `default`'s
+# [[overrides]] for EVERY custom profile through the inheritance chain
+# (verified empirically on cargo-nextest 0.9.148: an empty custom profile
+# serializes exactly like `default`), and the selected profile's own
+# overrides are consulted FIRST — so a same-filter override assigning an
+# unbounded group is the one mechanism that restores parallelism.
+#
+# Scope: runners where the #106/#281 x86-ubuntu 2-core D-state wedge NEVER
+# occurred (this file's own record: adoption "passes on macOS, Windows, and
+# arm64-2core"). The ubuntu leg keeps the serialized `default` profile; the
+# CI matrix selects this profile per-OS via matrix data.
+[profile.parallel-heavy]
+[[profile.parallel-heavy.overrides]]
+filter = "kind(test) & package(hekma-engine)"
+test-group = "unbounded"
+
+[[profile.parallel-heavy.overrides]]
+filter = "kind(test) & package(hekma)"
+test-group = "unbounded"
+
+[[profile.parallel-heavy.overrides]]
+filter = "kind(lib) & package(hekma-engine)"
+test-group = "unbounded"
