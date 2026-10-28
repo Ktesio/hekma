@@ -96,10 +96,28 @@ jobs:
         # classes; the freeze class is environment-bounded via the 26.04 pin).
         # Carried as matrix DATA (not an in-step OS comparison) so the run step
         # stays one uniform invocation for all three OSes.
+        # nextest profile per leg (2026-10-27): the windows-latest leg runs
+        # the suite through the `parallel-heavy` profile (.config/
+        # nextest.toml) — same retries/timeouts, serialization overrides
+        # shadowed. The serialization guards against the #106/#281
+        # x86-ubuntu 2-core D-state wedge, which never occurred on
+        # windows/macos (parallelism was proven green there pre-#106) — and
+        # serialized windows had outgrown the 50m job budget (test step
+        # 40m02s / job 51m51s on #347's green run; main runs 40355871363
+        # and 40337860524 cancelled at the windows timeout). Un-serialized:
+        # 12m15s step / 24m01s job (run 40459586527). The other legs keep
+        # `default` (explicit `--profile default` is valid and
+        # behavior-identical to the bare invocation). Carried as matrix
+        # DATA so the run step stays one uniform invocation.
         include:
           - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
             test_job_timeout_minutes: 15
+            nextest_profile: default
+          - os: macos-latest
+            nextest_profile: default
+          - os: windows-latest
+            nextest_profile: parallel-heavy
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
     # build is slow; this job builds test binaries, runs the suite, and runs the
@@ -297,9 +315,12 @@ jobs:
         shell: bash
         run: |
           CAP="${{ matrix.nextest_wallclock_cap }}"
+          PROFILE="${{ matrix.nextest_profile }}"
           if [ -z "$CAP" ]; then
-            # Uncapped leg: plain foreground invocation, untouched semantics.
-            exec cargo +stable nextest run --workspace --all-targets
+            # Uncapped leg: plain foreground invocation, untouched semantics
+            # except the profile flag (matrix data; "default" is explicit-
+            # valid and behavior-identical for the legs that keep it).
+            exec cargo +stable nextest run --workspace --all-targets --profile "$PROFILE"
           fi
           # Capped leg: double-fork the suite into its own session and
           # supervise. `setsid` plus the backgrounding subshell re-parent the
@@ -323,6 +344,7 @@ jobs:
                   echo $? > "$exitf"
                 ' quarantine "$PIDF" "$EXITF" \
               cargo +stable nextest run --workspace --all-targets \
+              --profile "$PROFILE" \
               < /dev/null > "$LOG" 2>&1 &
           )
           START=$SECONDS
