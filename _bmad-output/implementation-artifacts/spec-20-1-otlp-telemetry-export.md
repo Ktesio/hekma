@@ -2,7 +2,7 @@
 title: 'OTLP telemetry export (AD-21) + restore the 95% coverage gate'
 type: 'feature'
 created: '2026-10-25'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'f7ba049a08f2d960c3a390da1224ec7defab8bf8'
 context:
@@ -63,15 +63,15 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/hekma-host/src/otlp/` — NEW module: `mod.rs` (OtlpOptions + redacting Debug + wiring into serve_with_signal + shutdown handshake), `payload.rs` (versioned metric derivation: event → metric families, serde payload types, camelCase/string-int rules), `client.rs` (plain-HTTP POST, bounded timeout, retry classes), `task.rs` (bus-drain loop: try_recv into bounded queue, Lagged accounting, flush interval, drop-oldest)
-- [ ] `crates/hekma-host/src/main.rs` + `crates/hekma/src/lib.rs` (clap Serve variant) + `crates/hekma/src/cli/serve.rs` — the three `--otlp-*` flags on both surfaces, parsed once into ServeOptions
-- [ ] `crates/hekma-host/tests/otlp_export.rs` — NEW, OS-neutral: (1) no-endpoint → no dial/task (assert via diagnostics + a sink that would fail the test if contacted); (2) end-to-end: in-test axum sink on 127.0.0.1:0, serve_with_signal with a fake_agent instance driving usage + a breach → assert POST path/content-type + payload decoded against the versioned exposition (names, attributes incl. estimate_state, camelCase, string ints, cumulative temporality, histogram bounds); (3) collector-refused → surfaced diagnostic + dropped counter; (4) unresolvable secret:NAME header → typed startup refusal; (5) restart note honesty (kill path or simulated queue loss)
-- [ ] `crates/hekma-host/src/otlp/payload.rs` unit tests — every metric family + edge attributes (the I/O matrix rows) pinned without I/O
-- [ ] Coverage repair (target ≥180 newly-covered lines, each a real test in the owning crate): engine `ports/probe_kinds.rs`, `ports/state_store.rs`, `ports/process_backend.rs` error arms; `backends/unix` spawn/exec-failure arms (OS-neutral guards); `supervisor/drain.rs` KillOnDrop; `shutdown.rs` facade arms; `hekma/src/cli/agent.rs` unknown-kind + memory_status-None arms via the existing CLI test harness; host `lib.rs` :394 + :515-517 arms
-- [ ] `docs/telemetry.md` — NEW: `otlp-metrics v1` exposition (names, types, units, attributes, bounds, temporality, restart-reset semantics, the estimated|reconciled rule, the drop/diagnostic behavior, config reference, http-only note + https deferral); registered in meta.json + source.config.ts; cross-linked from commands.md serve section + hosting.md
-- [ ] `_bmad-output/implementation-artifacts/deferred-work.md` — https:// endpoints entry (trigger: a user names an https collector); ledger-sourced lossless re-derivation already deferred (2026-10-23 entry)
-- [ ] `docs/RELEASE_NOTES.md` — Unreleased bullet
-- [ ] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-1 per house convention on PR open
+- [x] `crates/hekma-host/src/otlp/` — NEW module: `mod.rs` (OtlpOptions + redacting Debug + wiring into serve_with_signal + shutdown handshake), `payload.rs` (versioned metric derivation: event → metric families, serde payload types, camelCase/string-int rules), `client.rs` (plain-HTTP POST, bounded timeout, retry classes), `task.rs` (bus-drain loop: try_recv into bounded queue, Lagged accounting, flush interval, drop-oldest)
+- [x] `crates/hekma-host/src/main.rs` + `crates/hekma/src/lib.rs` (clap Serve variant) + `crates/hekma/src/cli/serve.rs` — the three `--otlp-*` flags on both surfaces, parsed once into ServeOptions
+- [x] `crates/hekma-host/tests/otlp_export.rs` — NEW, OS-neutral: (1) no-endpoint → no dial/task (assert via diagnostics + a sink that would fail the test if contacted); (2) end-to-end: in-test axum sink on 127.0.0.1:0, serve_with_signal with a fake_agent instance driving usage + a breach → assert POST path/content-type + payload decoded against the versioned exposition (names, attributes incl. estimate_state, camelCase, string ints, cumulative temporality, histogram bounds); (3) collector-refused → surfaced diagnostic + dropped counter; (4) unresolvable secret:NAME header → typed startup refusal; (5) restart note honesty (kill path or simulated queue loss)
+- [x] `crates/hekma-host/src/otlp/payload.rs` unit tests — every metric family + edge attributes (the I/O matrix rows) pinned without I/O
+- [x] Coverage repair (target ≥180 newly-covered lines, each a real test in the owning crate): engine `ports/probe_kinds.rs`, `ports/state_store.rs`, `ports/process_backend.rs` error arms; `backends/unix` spawn/exec-failure arms (OS-neutral guards); `supervisor/drain.rs` KillOnDrop; `shutdown.rs` facade arms; `hekma/src/cli/agent.rs` unknown-kind + memory_status-None arms via the existing CLI test harness; host `lib.rs` :394 + :515-517 arms
+- [x] `docs/telemetry.md` — NEW: `otlp-metrics v1` exposition (names, types, units, attributes, bounds, temporality, restart-reset semantics, the estimated|reconciled rule, the drop/diagnostic behavior, config reference, http-only note + https deferral); registered in meta.json + source.config.ts; cross-linked from commands.md serve section + hosting.md
+- [x] `_bmad-output/implementation-artifacts/deferred-work.md` — https:// endpoints entry (trigger: a user names an https collector); ledger-sourced lossless re-derivation already deferred (2026-10-23 entry)
+- [x] `docs/RELEASE_NOTES.md` — Unreleased bullet
+- [x] `_bmad-output/implementation-artifacts/sprint-status.yaml` — tick 20-1 per house convention on PR open
 
 **Acceptance Criteria:**
 - Given no `--otlp-endpoint`, when the host serves normally, then nothing dials out and no exporter task exists (test-proven).
