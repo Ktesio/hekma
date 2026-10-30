@@ -1,13 +1,15 @@
 ---
 title: Hekma
-description: Run AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets, from a single Rust CLI.
+description: The control plane for agent workloads — run, see and steer any AI agent. Today Hekma supervises, meters and budgets them, from a single Rust CLI.
 ---
 
 # Hekma Documentation
 
-![Hekma banner: run AI agents like services — supervise, meter, and budget them](assets/hekma-banner.png)
+![Hekma banner: the control plane for agent workloads](assets/hekma-banner.png)
 
-Welcome to the Hekma docs. Hekma is a Rust CLI and engine that **runs AI agents like services**: register any agent, supervise its lifecycle, meter its real token usage, and enforce token and dollar budgets. These pages explain how to install it, run agents, configure them, and contribute.
+Welcome to the Hekma docs. Hekma is **the control plane for agent workloads**: one way to run, see and steer any agent — a coding agent, a personal agent, a CrewAI or LangGraph flow, or a raw model call — from a laptop to a fleet, built so that it is never the reason prod stops. Today, in 0.11.0, it supervises, meters and budgets the agents you run; Runs, Policies, Run Keys and wire control are being built in the open, and their pages below are tagged *in development* or *planned*.
+
+The public docs live at [hekma.ktesio.dev/docs](https://hekma.ktesio.dev/docs/); the [roadmap](https://hekma.ktesio.dev/docs/status/#roadmap) shows what lands next.
 
 By *agent* these pages mean a third-party program you run for yourself that calls a model on your behalf: a personal agent such as Hermes Agent or OpenClaw, or a coding agent such as OpenCode or GitHub Copilot CLI. Hekma runs that program as a supervised, metered process; it is not a framework for writing agents.
 
@@ -19,6 +21,15 @@ Hekma is a [Ktesio](https://ktesio.com) project, developed in the open at [ktesi
 - [Installation](installation.md)
 - [Command reference](commands.md)
 - [Troubleshooting](troubleshooting.md)
+
+## The control plane (being built)
+
+Nothing in this section is in 0.11.0 yet; names, commands and defaults may change before it ships.
+
+- [Runs, Control Depth, ps and top](runs.md) — *in development*
+- [Policies and the warn default](policies.md) — *in development*
+- [Run Keys and key custody](run-keys.md) — *planned*
+- [Attach and wire control](attach.md) — *planned*
 
 ## Concepts
 
