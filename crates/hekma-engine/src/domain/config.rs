@@ -68,7 +68,7 @@ pub const BUDGET_TOKENS_PER_RUN_KEY: &str = "budget.tokens.per_run";
 pub const BUDGET_TOKENS_CUMULATIVE_KEY: &str = "budget.tokens.cumulative";
 
 /// The engine-namespace config key for the Breach Action (story 3-2, AC-C). A
-/// validated key; its value parses as a [`BreachAction`] (`pause`/`stop`/`warn`)
+/// validated key; its value parses as a [`BreachAction`] (`pause`/`stop`/`warn`/`block`)
 /// at write time. Absent → [`BreachAction::default`] (`pause`, the ratified
 /// default). Story 3-3: the SAME key governs a DOLLAR breach too (one action for
 /// both token and dollar breaches — see [`resolve_cost`]).
@@ -1139,7 +1139,8 @@ pub enum ConfigError {
 
     /// A config write supplied a VALUE that failed the key's typed contract
     /// (story 3-2, AC-C) — a `budget.tokens.*` value that is not a `u64`, or a
-    /// `budget.breach_action` that is not `pause`/`stop`/`warn`. Rejected BEFORE
+    /// `budget.breach_action` that is not `pause`/`stop`/`warn`/`block` (or is
+    /// `block` on an instance with no metering listener, story 19-2). Rejected BEFORE
     /// any persistence (the instance `config.toml` is left byte-unchanged), NAMES
     /// the key + the offending value + the reason so `kt` renders a remediation.
     /// (Distinct from [`ConfigError::UnknownKey`]: the KEY is known/valid — its
