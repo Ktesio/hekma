@@ -106,7 +106,7 @@ Examples:
 #[command(
     name = "hekma",
     version,
-    about = "Run AI agents like services — supervise, meter, and budget them",
+    about = "The control plane for agent workloads — run, see and steer AI agents",
     after_help = HELP_FOOTER
 )]
 struct Cli {

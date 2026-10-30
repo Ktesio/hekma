@@ -4,6 +4,13 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — Hekma's identity: the control plane for agent workloads (docs + metadata).**
+> Announced ahead of the release that ships it:
+>
+> - The README, the docs index, the `hekma --help` line, the `hekma` crate description and the Homebrew formula description now introduce Hekma as the control plane for agent workloads: one way to run, see and steer any agent. Budgets become one control among several rather than the headline.
+> - Four docs pages describe what is being built, each tagged with its stage: [Runs](docs/runs.md) and [Policies and the warn default](docs/policies.md) (*in development*), [Run Keys](docs/run-keys.md) and [Attach and wire control](docs/attach.md) (*planned*). Nothing on them ships in this change; names, commands and defaults may change before they do.
+> - No behaviour changes: the default breach action is still `pause`. Its coming change to `warn` will be announced in its own release notes, and agents that rely on today's default keep `pause`.
+
 > **Unreleased — the agents-in-CI recipe (docs + dogfood lane).**
 > Announced ahead of the release that ships it:
 >
