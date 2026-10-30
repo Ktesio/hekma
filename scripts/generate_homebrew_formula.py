@@ -14,8 +14,8 @@ from pathlib import Path
 REPO = "Ktesio/hekma"
 FORMULA_CLASS = "Hekma"
 DESCRIPTION = (
-    "Run AI agents like services: supervise their lifecycle, meter real "
-    "token usage, and enforce dollar budgets."
+    # Short, and without a leading article: `brew audit` flags both.
+    "Control plane for agent workloads: run, see and steer AI agents"
 )
 # Standard SPDX license (v0.9.0+: fully OSS under Apache-2.0; pre-0.9.0
 # releases shipped a custom source-available license). SPDX ids are

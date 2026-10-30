@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Ktesio/hekma/main/docs/assets/hekma-banner.png" alt="Hekma banner: run AI agents like services" width="100%">
+  <img src="https://raw.githubusercontent.com/Ktesio/hekma/main/docs/assets/hekma-banner.png" alt="Hekma banner: the control plane for agent workloads" width="100%">
 </p>
 
 # Hekma
@@ -8,23 +8,48 @@
 [![Crates.io](https://img.shields.io/crates/v/hekma.svg)](https://crates.io/crates/hekma)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/Ktesio/hekma/blob/main/LICENSE)
 
-Hekma runs the AI agents you already use like services. It starts, stops, pauses and restarts them, counts the tokens they spend, and pauses or stops an agent as soon as it crosses a token or dollar budget. It is a single Rust binary for macOS, Linux and Windows, and an engine you can embed in your own Rust program.
+**Hekma is the control plane for agent workloads.** One way to run, see and steer any agent — a coding agent such as OpenCode, a personal agent such as Hermes Agent, a CrewAI or LangGraph flow, or a raw model call — from a laptop to a fleet, built so that it is never the reason prod stops. It is a single Rust binary for macOS, Linux and Windows, and an engine you can embed in your own Rust program.
 
-**Docs: [hekma.ktesio.dev/docs](https://hekma.ktesio.dev/docs/)**, starting with the [five-minute quickstart](https://hekma.ktesio.dev/docs/get-started/).
+Hekma is built in the open, in stages. **Today, in 0.11.0,** it supervises, meters and budgets the agents you run. **Runs, Policies, Run Keys and wire control are being built now**; they are marked *in development* or *planned* below and in the docs, and their names and defaults may change before they ship.
 
-An *agent* here is a program that calls a language model on your behalf: a coding agent such as OpenCode, a personal agent such as Hermes Agent, or a script of your own. Hekma runs it as a process and governs it from the outside. It does not help you write agents.
+**Docs: [hekma.ktesio.dev/docs](https://hekma.ktesio.dev/docs/)**, starting with the [five-minute quickstart](https://hekma.ktesio.dev/docs/get-started/). The [roadmap](https://hekma.ktesio.dev/docs/status/#roadmap) shows what lands next.
 
-## What it does
+An *agent* here is a program that calls a language model on your behalf. Hekma works on it from the outside — as a process it runs, or, soon, as traffic and telemetry it sees — and does not help you write agents.
+
+## How Hekma is built to behave
+
+These are the rules the control plane is being built to; most of what makes them true is *in development* or *planned* (see below).
+
+- **Signal, don't stop.** A crossed limit will be made loud — in listings, events, metrics and response headers — so your framework or your on-call can act. Pausing, stopping or fencing a run is something you choose, never a surprise. *(The `warn` default is in development; in 0.11.0 the default breach action is `pause`.)*
+- **One interface, whatever the agent.** The same verbs, API and telemetry for every agent technology, so changing frameworks does not change your tooling.
+- **Operators set the limits.** An agent or framework will be able to tighten what you configured, never loosen it.
+- **OpenTelemetry first.** Hekma feeds the observability stack you already run (OTLP export is on main, unreleased); its own surfaces are the CLI, for emergencies, and the Control API, for daily work.
+- **Built for scale.** The goal is one agent on a laptop to millions of Runs, with exception-first views that show you only what needs you.
+
+## What ships today
 
 | | |
 |---|---|
 | **Lifecycle** | `start`, `stop`, `pause` and `resume` any agent through one state machine. Crashes are recorded and restarted with backoff, and the fleet's state survives a reboot. |
 | **Metering** | Counts input, output and cached tokens, either reported by the agent or read off the wire by a proxy on `127.0.0.1`. |
-| **Telemetry export** | Opt-in OTLP/HTTP+JSON metrics export to any OpenTelemetry-compatible collector (`--otlp-endpoint` on `hekma serve`) — token usage, budget breaches, derived cost, lifecycle state. Off by default: no endpoint, no exporter. [Telemetry docs](https://hekma.ktesio.dev/docs/telemetry/). |
-| **Budgets** | Token and dollar ceilings, per run or over the agent's life, with a `pause`, `stop` or `warn` action applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
+| **Telemetry export** *(unreleased: on main, after 0.11.0)* | Opt-in OTLP/HTTP+JSON metrics export to any OpenTelemetry-compatible collector (`--otlp-endpoint` on `hekma serve`) — token usage, budget breaches, derived cost, lifecycle state. Off by default: no endpoint, no exporter. [Telemetry docs](https://hekma.ktesio.dev/docs/telemetry/). |
+| **Budgets** | Token and dollar ceilings, per run or over the agent's life, with the action you choose — `warn`, `pause` or `stop` — applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
 | **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. The [adapter gallery](https://hekma.ktesio.dev/docs/adapters/) is the validated index of which agents run today, with per-capability honesty tables. |
 | **Scripting** | Versioned JSON output and stable exit codes on every command. |
 | **Embedding** | The engine is the `hekma-engine` crate, with an event stream, so your program can run the fleet without the CLI. |
+
+## Being built
+
+None of this is in 0.11.0 yet. Each item links to its docs page, which is tagged with its stage.
+
+| | Stage | |
+|---|---|---|
+| **Runs** | in development | Every supervised agent, and the work a Host opens inside one, becomes a Run with an id, labels, a status and a Control Depth; Runs Hekma did not start follow (planned). `hekma ps` lists them exception-first, and Selectors let every verb act on `flow=claims,env=prod` instead of one agent at a time. [Runs](https://hekma.ktesio.dev/docs/runs/) |
+| **Policies** | in development | Standing limits matched by label, with `warn` as the default breach action and an opt-in `block` fence that refuses further model calls. [Policies](https://hekma.ktesio.dev/docs/policies/) |
+| **Always-on host** | in development | `hekma serve` (on main) supervises all the time, and the CLI starts a local one on demand, so agents outlive your terminal. [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/) |
+| **Run Keys** | planned | A per-Run key in the agent's API-key slot; the real provider key never leaves Hekma, and a call around the proxy is flagged. [Run Keys](https://hekma.ktesio.dev/docs/run-keys/) |
+| **Attach and wire control** | planned | Framework flows join through one shared proxy, a header or inbound OpenTelemetry; hold a Run's next model call with its state intact, then release, reroute or reject it. [Attach](https://hekma.ktesio.dev/docs/attach/) |
+| **Never the reason prod stops** | planned | Agents survive host restarts, upgrades and crashes through a small shim per process, and `hekma top` shows it all live. [Roadmap](https://hekma.ktesio.dev/docs/status/#roadmap) |
 
 ## Install
 
@@ -61,17 +86,17 @@ Release archives for each platform are on [GitHub Releases](https://github.com/K
 
 ```bash
 # Describe the agent once, in a folder holding its adapter.toml.
-hekma agent register my-agent --manifest `/agents/my-agent
+hekma agent register my-agent --manifest ~/agents/my-agent
 
-# Give it a budget: pause it after 500,000 tokens.
+# Optional: a ceiling that only records a warning when crossed (pause is the 0.11.0 default).
 hekma agent config set my-agent budget.tokens.cumulative 500000
-hekma agent config set my-agent budget.breach_action pause
+hekma agent config set my-agent budget.breach_action warn
 
 # Run it in the background, and watch it. Metering and budgets run live.
 hekma agent start my-agent --detach
 hekma agent logs my-agent --follow
 
-# See the fleet: state, budget and token usage for every agent.
+# See the fleet: state, supervision and token usage for every agent.
 hekma agent list
 ```
 
@@ -94,6 +119,8 @@ Letting an agent loose in CI? The [Agents in GitHub Actions](https://hekma.ktesi
 | `hekma agent memory attach`, `detach` | Give an agent durable memory |
 | `hekma agent remove` | Remove an agent |
 | `hekma self-update` | Update Hekma through the channel you installed it with |
+
+Coming with Runs and Policies *(in development)*: `hekma ps`, `hekma label` and `hekma policy`, with `--selector` on every verb.
 
 The [CLI reference](https://hekma.ktesio.dev/docs/commands/) has every flag, the [exit codes](https://hekma.ktesio.dev/docs/exit-codes/) and the [JSON documents](https://hekma.ktesio.dev/docs/json-output/).
 
@@ -125,7 +152,7 @@ fn my_adapter_conforms() {
 
 ## Status
 
-Hekma is at 0.11.0 and moving quickly. The CLI, the JSON output, the exit codes and the adapter contract are compatibility surfaces: a breaking change is announced at least one minor release ahead and lands only in a major release. [Status and roadmap](https://hekma.ktesio.dev/docs/status/) lists what ships today and what is on the main branch, and the [release notes](https://hekma.ktesio.dev/docs/release-notes/) cover each release.
+Hekma is at 0.11.0 and moving quickly toward the control plane described above. The CLI, the JSON output, the exit codes and the adapter contract are compatibility surfaces: a breaking change is announced at least one minor release ahead and lands only in a major release. The coming change of the default breach action to `warn` is announced in the release notes before it ships, and agents that rely on today's `pause` default keep it. [Status and roadmap](https://hekma.ktesio.dev/docs/status/) lists what ships today, what is on the main branch and what is being built, and the [release notes](https://hekma.ktesio.dev/docs/release-notes/) cover each release.
 
 ## Contributing
 

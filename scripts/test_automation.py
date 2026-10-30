@@ -481,7 +481,7 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("expected 200", probe)
         self.assertNotIn("docs.ktesio.dev", probe)
         # Title markers on the landing page and the docs home.
-        self.assertIn('"<title>Hekma: run AI agents like services</title>"', probe)
+        self.assertIn('"<title>Hekma: the control plane for agent workloads</title>"', probe)
         self.assertIn('"<title>Hekma docs</title>"', probe)
         # The legacy URLs baked into published release bodies and the
         # deprecated crates' READMEs must keep 301ing to the exact target,
