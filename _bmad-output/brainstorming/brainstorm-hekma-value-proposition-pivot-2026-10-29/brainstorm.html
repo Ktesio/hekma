@@ -1,0 +1,1349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gatekeeper to Hive</title>
+<meta name="description" content="A keepsake of the Hekma value-proposition brainstorm of 29 October 2026: from cost gatekeeper to the control plane for agent workloads.">
+<script>document.documentElement.classList.add('js');</script>
+<style>
+:root{
+  --bg:#fbf6ea; --bg-2:#f3e9d2; --wax:#fffaf0; --line:#e0cfa9; --line-strong:#c9b085;
+  --ink:#2a1d0e; --ink-soft:#5a4730;
+  --honey:#f0b429; --honey-deep:#a86800; --resin:#7a3f12;
+  --user-bg:#fde9b0; --user-ink:#5c3700; --user-badge:#f0b429; --user-badge-ink:#2a1d0e; --user-edge:#d99a12;
+  --coach-bg:#e8eff4; --coach-ink:#21495f; --coach-badge:#24506d; --coach-badge-ink:#ffffff; --coach-edge:#8eaec3;
+  --boom:#b8410e; --boom-bg:#fde3d4;
+  --term-bg:#17110a; --term-ink:#efe0bf; --term-dim:#ad966e; --term-green:#a6d98a; --term-amber:#f5b82e; --term-red:#ff8a65; --term-blue:#9cc9ea;
+  --night-bg:#110b04; --night-2:#1d1408; --night-ink:#f8ecd2; --night-soft:#cdb88f; --night-honey:#f5b82e;
+  --focus:#1f6fb2;
+  --shadow:0 1px 0 rgba(90,60,10,.06), 0 8px 24px -12px rgba(90,60,10,.25);
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,"Times New Roman",serif;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  color-scheme:light dark;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14100a; --bg-2:#1d170e; --wax:#211910; --line:#3d301d; --line-strong:#5c4a2e;
+    --ink:#f6ead2; --ink-soft:#cbb791;
+    --honey:#f5b82e; --honey-deep:#f5b82e; --resin:#e39a5a;
+    --user-bg:#33250b; --user-ink:#ffd978; --user-badge:#f5b82e; --user-badge-ink:#1a1206; --user-edge:#b98411;
+    --coach-bg:#13212b; --coach-ink:#b3d6ef; --coach-badge:#a9d1ee; --coach-badge-ink:#0d1a24; --coach-edge:#3f6680;
+    --boom:#ff9a66; --boom-bg:#3a1a0c;
+    --focus:#8cc8ff;
+    --shadow:0 1px 0 rgba(0,0,0,.4), 0 10px 28px -14px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14100a; --bg-2:#1d170e; --wax:#211910; --line:#3d301d; --line-strong:#5c4a2e;
+  --ink:#f6ead2; --ink-soft:#cbb791;
+  --honey:#f5b82e; --honey-deep:#f5b82e; --resin:#e39a5a;
+  --user-bg:#33250b; --user-ink:#ffd978; --user-badge:#f5b82e; --user-badge-ink:#1a1206; --user-edge:#b98411;
+  --coach-bg:#13212b; --coach-ink:#b3d6ef; --coach-badge:#a9d1ee; --coach-badge-ink:#0d1a24; --coach-edge:#3f6680;
+  --boom:#ff9a66; --boom-bg:#3a1a0c;
+  --focus:#8cc8ff;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.6 var(--sans);overflow-x:hidden}
+img,svg,canvas{max-width:100%}
+a{color:inherit}
+:focus-visible{outline:3px solid var(--focus);outline-offset:3px;border-radius:4px}
+.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+h1,h2,h3{font-family:var(--serif);line-height:1.15;letter-spacing:-.01em;margin:0}
+h2{font-size:clamp(2rem,6vw,3.4rem)}
+h3{font-size:clamp(1.3rem,3.4vw,1.7rem)}
+p{margin:.6em 0}
+.kicker{font:600 .78rem/1.3 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
+.lede{font-size:clamp(1.05rem,2.4vw,1.25rem);color:var(--ink-soft);max-width:44em}
+section{padding:72px 0;position:relative}
+.act-head{display:grid;gap:10px;margin-bottom:34px}
+.act-num{font:700 .8rem/1 var(--mono);letter-spacing:.2em;color:var(--honey-deep)}
+
+/* honeycomb texture (mask so it follows theme tokens) */
+.comb{position:absolute;inset:0;pointer-events:none;background:var(--line);opacity:.55;-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='100'%3E%3Cpath d='M28 66L0 50L0 16L28 0L56 16L56 50L28 66L28 100' fill='none' stroke='%23000' stroke-width='1.2'/%3E%3C/svg%3E") repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='100'%3E%3Cpath d='M28 66L0 50L0 16L28 0L56 16L56 50L28 66L28 100' fill='none' stroke='%23000' stroke-width='1.2'/%3E%3C/svg%3E") repeat}
+
+/* ---------- notes: the two authors ---------- */
+.notes{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+.n{position:relative;padding:12px 14px 12px 16px;border-radius:12px;font-size:.97rem;line-height:1.5;transition:opacity .25s, filter .25s, transform .25s}
+.n .tag{display:inline-block;margin:0 8px 4px 0;padding:2px 8px 2px 7px;border-radius:999px;font:700 .68rem/1.5 var(--mono);letter-spacing:.08em;text-transform:uppercase;vertical-align:1px;white-space:nowrap}
+.n.u{background:var(--user-bg);color:var(--user-ink);border:1px solid var(--user-edge);box-shadow:inset 4px 0 0 var(--honey)}
+.n.u .tag{background:var(--user-badge);color:var(--user-badge-ink)}
+.n.u .tag::before{content:"\2B22\00A0";}
+.n.c{background:var(--coach-bg);color:var(--coach-ink);border:1px dashed var(--coach-edge)}
+.n.c .tag{background:var(--coach-badge);color:var(--coach-badge-ink)}
+.n.c .tag::before{content:"\2B21\00A0";}
+.n.u.big{font-family:var(--serif);font-size:1.18rem;line-height:1.45;padding:18px 20px}
+.n.dec{border-width:2px;border-style:solid}
+.n.dec .tag{background:var(--ink);color:var(--bg)}
+.n.dec .tag::before{content:"\2713\00A0"}
+.n.q .tag::before{content:"?\00A0"}
+body.spot .n.c{opacity:.28;filter:saturate(.3)}
+body.spot .n.u{transform:translateX(4px);box-shadow:inset 4px 0 0 var(--honey),0 0 0 3px color-mix(in srgb,var(--honey) 45%,transparent)}
+.twocol{display:grid;gap:18px;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));align-items:start}
+.colhead{font:700 .75rem/1.3 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 10px}
+
+/* spotlight toggle */
+.spotbtn{position:fixed;right:16px;bottom:16px;z-index:50;display:none;align-items:center;gap:8px;border:2px solid var(--user-edge);background:var(--wax);color:var(--ink);font:600 .9rem/1 var(--sans);padding:10px 14px;border-radius:999px;box-shadow:var(--shadow);cursor:pointer}
+.js .spotbtn{display:inline-flex}
+.spotbtn .hx{width:16px;height:18px;background:var(--honey);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+.spotbtn[aria-pressed="true"]{background:var(--honey);color:#2a1d0e;border-color:var(--honey)}
+.spotbtn[aria-pressed="true"] .hx{background:#2a1d0e}
+
+/* ---------- hero ---------- */
+.hero{padding:56px 0 40px;overflow:hidden}
+.hero-grid{position:relative;display:grid;gap:28px;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));align-items:center}
+.hero h1{font-size:clamp(2.6rem,9vw,5.4rem);line-height:.98}
+.hero h1 .strike{position:relative;color:var(--ink-soft)}
+.hero h1 .strike::after{content:"";position:absolute;left:-2%;right:-2%;top:54%;height:.09em;background:var(--boom);transform:rotate(-3deg);border-radius:4px}
+.hero h1 em{font-style:italic;color:var(--honey-deep)}
+.toc{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;padding:0;list-style:none}
+.toc a{display:inline-block;text-decoration:none;font:600 .85rem/1 var(--sans);padding:9px 12px;border:1px solid var(--line-strong);border-radius:999px;background:var(--wax)}
+.toc a:hover{border-color:var(--honey);background:var(--user-bg)}
+.ratio{margin-top:26px;max-width:560px}
+.ratio-bar{display:flex;height:16px;border-radius:999px;overflow:hidden;border:1px solid var(--line-strong)}
+.ratio-bar .u{background:var(--honey)}
+.ratio-bar .c{background:repeating-linear-gradient(135deg,var(--coach-bg) 0 6px,var(--coach-edge) 6px 8px)}
+.ratio-legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font-size:.9rem;color:var(--ink-soft)}
+.ratio-legend b{color:var(--ink)}
+.stats{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px}
+.stat{background:var(--wax);border:1px solid var(--line);border-radius:12px;padding:10px 14px;min-width:96px}
+.stat b{display:block;font:700 1.6rem/1 var(--serif)}
+.stat span{font-size:.78rem;color:var(--ink-soft)}
+.hero-art{width:100%;height:auto}
+@keyframes drift{0%,100%{transform:translate(0,0)}50%{transform:translate(4px,-6px)}}
+.hero-art .fly{animation:drift 5s ease-in-out infinite}
+.hero-art .fly:nth-of-type(2n){animation-duration:6.5s}
+.hero-art .fly:nth-of-type(3n){animation-duration:4.2s}
+@keyframes glow{0%,100%{opacity:.55}50%{opacity:1}}
+.hero-art .glow{animation:glow 3s ease-in-out infinite}
+
+/* ---------- spark ---------- */
+.spark{background:var(--bg-2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.ticket{position:relative;background:var(--wax);border:1px solid var(--line-strong);border-radius:16px;padding:22px;box-shadow:var(--shadow)}
+.ticket::before,.ticket::after{content:"";position:absolute;top:50%;width:22px;height:22px;border-radius:50%;background:var(--bg-2);border:1px solid var(--line-strong);transform:translateY(-50%)}
+.ticket::before{left:-12px;clip-path:inset(0 0 0 50%)}
+.ticket::after{right:-12px;clip-path:inset(0 50% 0 0)}
+.forks{list-style:none;padding:0;margin:0;display:grid;gap:10px;counter-reset:fork}
+.forks li{counter-increment:fork;display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:start;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--wax)}
+.forks li::before{content:counter(fork);display:grid;place-items:center;width:30px;height:34px;font:700 .95rem/1 var(--mono);color:#2a1d0e;background:var(--honey);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+.forks small{display:block;color:var(--ink-soft);font-size:.82rem}
+
+/* ---------- Act I: voices ---------- */
+.voices{background:linear-gradient(180deg,var(--bg),var(--bg-2))}
+.tablist{display:none;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+.js .tablist{display:flex}
+.tab{display:flex;align-items:center;gap:10px;border:1px solid var(--line-strong);background:var(--wax);color:var(--ink);padding:8px 14px 8px 8px;border-radius:999px;cursor:pointer;font:600 .92rem/1.2 var(--sans)}
+.tab .mask{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;font:700 .78rem/1 var(--mono)}
+.tab small{display:block;font:500 .7rem/1.2 var(--mono);color:var(--ink-soft);letter-spacing:.05em}
+.tab[aria-selected="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.tab[aria-selected="true"] small{color:var(--bg);opacity:.8}
+.m-sre{background:#ffd9c7;color:#6b2205}
+.m-vp{background:var(--honey);color:#2a1d0e}
+.m-solo{background:#d6ecc8;color:#234314}
+.m-agent{background:#d9e4f5;color:#1d3a66}
+.m-comp{background:#ead9f2;color:#4a1f63}
+.panel{background:var(--wax);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:var(--shadow);margin-bottom:22px}
+.js .panel[hidden]{display:none}
+.panel-head{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:16px}
+.panel-head .mask{display:grid;place-items:center;width:58px;height:58px;border-radius:50%;font:700 1rem/1 var(--mono);flex:none}
+.panel-head p{margin:2px 0 0;color:var(--ink-soft);font-style:italic;font-family:var(--serif)}
+.voicedby{margin-left:auto;font:700 .72rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;padding:6px 10px;border-radius:999px}
+.voicedby.u{background:var(--user-badge);color:var(--user-badge-ink)}
+.voicedby.c{background:var(--coach-badge);color:var(--coach-badge-ink)}
+.tension{margin-top:16px;padding:16px;border-radius:14px;border:2px solid var(--boom);background:var(--boom-bg);display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:center}
+.tension .zap{width:38px;height:38px}
+.term{background:var(--term-bg);color:var(--term-ink);border-radius:12px;padding:14px 16px;font:12.5px/1.55 var(--mono);overflow-x:auto;margin:0;border:1px solid #3a2c18;white-space:pre}
+.term .d{color:var(--term-dim)} .term .g{color:var(--term-green)} .term .a{color:var(--term-amber)} .term .r{color:var(--term-red)} .term .b{color:var(--term-blue)}
+.term-cap{font:600 .72rem/1.3 var(--mono);color:var(--ink-soft);margin:6px 2px 0;letter-spacing:.04em}
+@keyframes blink{50%{opacity:0}}
+.cursor{display:inline-block;width:.6em;height:1.05em;background:var(--term-amber);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+
+/* auditor's fears: envelopes */
+.fears{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));margin:18px 0}
+.env{position:relative;background:var(--wax);border:1px solid var(--line-strong);border-radius:10px;padding:56px 16px 16px;min-height:170px;overflow:hidden}
+.env::before{content:"";position:absolute;left:0;right:0;top:0;height:64px;background:var(--bg-2);clip-path:polygon(0 0,100% 0,50% 100%);border-bottom:1px solid var(--line)}
+.env .seal{position:absolute;left:50%;top:38px;transform:translateX(-50%);width:40px;height:40px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#e0533a,#9e1f12);color:#fff;display:grid;place-items:center;font:700 .9rem/1 var(--serif);box-shadow:0 2px 6px rgba(0,0,0,.3)}
+.env p{position:relative;margin:10px 0 0}
+.env .who{font:700 .68rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--user-ink);background:var(--user-bg);border:1px solid var(--user-edge);padding:3px 7px;border-radius:999px}
+.env.scariest{border:2px solid var(--boom);grid-column:span 1}
+.env.scariest .seal{width:48px;height:48px;font-size:1rem}
+.env.scariest .sc{display:inline-block;margin-left:6px;font:700 .68rem/1 var(--mono);color:#fff;background:var(--boom);padding:3px 7px;border-radius:999px;text-transform:uppercase;letter-spacing:.08em}
+.subhead{font:700 1.05rem/1.3 var(--serif);margin:22px 0 10px}
+.hdrs{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));margin-top:14px}
+
+/* ---------- Act II: detonations ---------- */
+.detonations{background:var(--bg-2);border-top:1px solid var(--line)}
+.preface{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:22px}
+.boom{position:relative;overflow:hidden;background:var(--wax);border:1px solid var(--line-strong);border-radius:22px;padding:24px;margin-bottom:26px;box-shadow:var(--shadow)}
+.boom-top{display:grid;grid-template-columns:auto 1fr;gap:18px;align-items:center}
+.bomb{position:relative;width:64px;height:64px;flex:none}
+.bomb svg{width:64px;height:64px}
+.boom h3 .wi{display:block;font:700 .75rem/1.2 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--boom);margin-bottom:6px}
+.fuse{display:none;margin-top:14px;border:2px solid var(--boom);background:transparent;color:var(--boom);font:700 .9rem/1 var(--mono);letter-spacing:.06em;padding:10px 16px;border-radius:999px;cursor:pointer}
+.js .fuse{display:inline-block}
+.fuse:hover{background:var(--boom);color:#fff}
+.boom .ring{position:absolute;left:56px;top:56px;width:24px;height:24px;margin:-12px 0 0 -12px;border-radius:50%;border:4px solid var(--boom);opacity:0;pointer-events:none}
+.boom.blown .ring{animation:ring 1.1s cubic-bezier(.1,.7,.3,1) forwards}
+.boom.blown .ring.r2{animation-delay:.12s}
+@keyframes ring{0%{opacity:.9;transform:scale(.2)}100%{opacity:0;transform:scale(60)}}
+.boom.blown{animation:shake .45s linear}
+@keyframes shake{20%{transform:translate(-3px,1px)}40%{transform:translate(3px,-2px)}60%{transform:translate(-2px,2px)}80%{transform:translate(2px,-1px)}}
+.after{margin-top:20px}
+.js .boom:not(.blown) .after{display:none}
+.boom.blown .after{animation:rise .7s ease-out both}
+@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.survived{font:700 .75rem/1.3 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--ink-soft);margin:0 0 12px;display:flex;align-items:center;gap:10px}
+.survived::after{content:"";flex:1;height:1px;background:var(--line-strong)}
+.fig{margin:20px 0 0;padding:16px;border:1px dashed var(--line-strong);border-radius:16px;background:var(--bg)}
+.fig figcaption{font-size:.85rem;color:var(--ink-soft);margin-top:10px}
+
+/* verbs matrix */
+.matrix{width:100%;border-collapse:collapse;font:12.5px/1.2 var(--mono)}
+.matrix-wrap{overflow-x:auto}
+.matrix th,.matrix td{padding:7px 6px;text-align:center;border-bottom:1px solid var(--line)}
+.matrix th{font-weight:700;color:var(--ink-soft)}
+.matrix th:first-child,.matrix td:first-child{text-align:left}
+.matrix td .dot{display:inline-block;width:12px;height:14px;background:var(--honey);clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+
+/* control ladder */
+.ladder{position:relative;display:grid;gap:0;margin:6px 0 0;padding:0 0 0 0;list-style:none}
+.ladder::before,.ladder::after{content:"";position:absolute;top:-6px;bottom:-6px;width:6px;border-radius:3px;background:var(--line-strong)}
+.ladder::before{left:18px}
+.ladder::after{left:58px}
+.rung{position:relative;display:grid;grid-template-columns:82px 1fr;gap:12px;align-items:center;padding:10px 0}
+.rung .bar{position:relative;height:10px;margin:0 0 0 12px;width:58px;border-radius:5px;background:var(--honey)}
+.rung .lvl{font:700 1rem/1.2 var(--mono)}
+.rung .lvl small{display:block;font:500 .82rem/1.4 var(--sans);color:var(--ink-soft)}
+.rung[data-depth="1"] .bar{opacity:.4}
+.rung[data-depth="2"] .bar{opacity:.6}
+.rung[data-depth="3"] .bar{opacity:.8}
+.ladder-cap{display:flex;justify-content:space-between;font:700 .7rem/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft)}
+
+/* timeline */
+.tl text{font-family:var(--mono)}
+
+/* canvas */
+.fleet{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));align-items:center}
+.fleet canvas{width:100%;height:auto;aspect-ratio:1/1;display:block;border-radius:10px;background:var(--bg)}
+.switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;font-weight:600;font-size:.95rem}
+.switch input{width:20px;height:20px;accent-color:var(--honey-deep)}
+.legend{display:grid;gap:6px;margin:12px 0 0;padding:0;list-style:none;font-size:.88rem}
+.legend li{display:flex;align-items:center;gap:8px}
+.legend i{width:12px;height:12px;border-radius:3px;display:inline-block}
+
+/* ---------- Act III: hive ---------- */
+.hive{background:linear-gradient(180deg,#2a1a07,#3b2509 40%,#2a1a07);color:#fbeed4;overflow:hidden}
+.hive .comb{background:#f5b82e;opacity:.13}
+.hive .kicker,.hive .lede{color:#e9d3a6}
+.hive .act-num{color:#f5b82e}
+.hive .card{position:relative;background:rgba(20,12,3,.55);border:1px solid rgba(245,184,46,.35);border-radius:22px;padding:22px;margin-bottom:22px;backdrop-filter:blur(2px)}
+.hive .n.c{background:#13212b;color:#b3d6ef;border-color:#3f6680}
+.hive .n.c .tag{background:#a9d1ee;color:#0d1a24}
+.hive .n.u{background:#3a2a0c;color:#ffe08f;border-color:#b98411}
+.hive .n.u .tag{background:#f5b82e;color:#1a1206}
+.hive .n.dec .tag{background:#fbeed4;color:#1a1206}
+.hive h3{color:#ffe1a1}
+.beequote{font-family:var(--serif);font-size:clamp(1.25rem,3.4vw,1.75rem);line-height:1.4;margin:0 0 18px;color:#ffe08f}
+.beequote::before{content:"\201C";color:#f5b82e;font-size:2em;line-height:0;vertical-align:-.35em;margin-right:4px}
+.beequote cite{display:block;margin-top:8px;font:700 .72rem/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;font-style:normal;color:#f5b82e}
+.seg{display:inline-flex;border:1px solid rgba(245,184,46,.6);border-radius:999px;padding:3px;gap:3px;margin:6px 0 14px;flex-wrap:wrap}
+.seg label{position:relative;cursor:pointer}
+.seg input{position:absolute;opacity:0;inset:0;cursor:pointer}
+.seg span{display:block;padding:8px 16px;border-radius:999px;font:700 .85rem/1 var(--mono);color:#ffe1a1}
+.seg input:checked+span{background:#f5b82e;color:#1a1206}
+.seg input:focus-visible+span{outline:3px solid #8cc8ff;outline-offset:2px}
+.entrance{position:relative;display:grid;gap:10px;margin:4px 0 10px}
+.lane{position:relative;height:46px;border-radius:999px;background:rgba(255,225,161,.08);border:1px solid rgba(245,184,46,.25)}
+.lane .lbl{position:absolute;left:14px;top:50%;transform:translateY(-50%);font:600 .74rem/1 var(--mono);color:#e9d3a6;white-space:nowrap}
+.lane .guard{position:absolute;left:60%;top:50%;width:34px;height:40px;transform:translate(-50%,-50%);background:#f5b82e;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);display:grid;place-items:center;font:700 .7rem/1 var(--mono);color:#1a1206}
+.lane .call{position:absolute;top:50%;left:30%;width:18px;height:18px;margin-top:-9px;border-radius:50%;background:#a6d98a;box-shadow:0 0 12px #a6d98a}
+.lane.unscented .call{background:#ff8a65;box-shadow:0 0 12px #ff8a65}
+.lane .logged{position:absolute;right:12px;top:50%;transform:translateY(-50%) rotate(-6deg);font:700 .7rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:#1a1206;background:#b3d6ef;padding:4px 7px;border-radius:4px;opacity:0;transition:opacity .3s}
+@keyframes pass{0%{left:30%;opacity:0}10%{opacity:1}85%{opacity:1}100%{left:94%;opacity:0}}
+@keyframes bounce{0%{left:30%;opacity:0}10%{opacity:1}45%{left:55%;transform:scale(1)}55%{left:55%;transform:scale(1.5)}100%{left:30%;opacity:0;transform:scale(1)}}
+.lane .call{animation:pass 2.6s linear infinite}
+.entrance[data-mode="enforce"] .unscented .call{animation-name:bounce}
+.entrance[data-mode="shadow"] .unscented .logged{opacity:1}
+.outcome{min-height:3.2em;font-size:.98rem;color:#fbeed4;padding:10px 14px;border-left:4px solid #f5b82e;background:rgba(245,184,46,.08);border-radius:0 10px 10px 0}
+.propolis{display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr));align-items:center}
+.propolis svg{width:100%;max-width:260px;height:auto;display:block;margin:0 auto}
+.propolis .ringp{fill:none;stroke:#f5b82e;stroke-width:2;opacity:.35;transition:all .35s}
+.propolis .ringp.on{fill:#8a4a14;stroke:#ffb86b;opacity:1}
+.propolis .ringp.loud{fill:none;stroke:#ff8a65;stroke-width:5;opacity:1;animation:glow 1.2s ease-in-out infinite}
+.levels{list-style:none;padding:0;margin:10px 0 0;display:grid;gap:8px;counter-reset:lv}
+.levels li{counter-increment:lv;display:grid;grid-template-columns:auto 1fr;gap:10px;align-items:start;padding:10px 12px;border-radius:12px;border:1px solid rgba(245,184,46,.25);opacity:.55;transition:opacity .3s,background .3s}
+.levels li::before{content:counter(lv);font:700 .9rem/1.4 var(--mono);color:#f5b82e}
+.levels li.on{opacity:1;background:rgba(245,184,46,.12)}
+.levels li b{color:#ffe1a1}
+.no-js-hint{font-size:.85rem;color:#e9d3a6}
+.range{width:100%;accent-color:#f5b82e}
+.range-row{display:none;gap:10px;align-items:center}
+.js .range-row{display:flex}
+.range-row output{font:700 .85rem/1 var(--mono);color:#ffe1a1;min-width:9em}
+
+/* ---------- convergence ---------- */
+.conv .flower{display:grid;gap:28px;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));align-items:center}
+.flower svg{width:100%;max-width:440px;height:auto;display:block;margin:0 auto}
+.flower a{text-decoration:none}
+.flower a:focus-visible{outline:none}
+.flower a:focus-visible .cell{stroke:var(--focus);stroke-width:5}
+.cell{stroke-width:2.5;transition:transform .2s}
+.cell.now{fill:var(--honey);stroke:var(--honey-deep)}
+.cell.later{fill:var(--wax);stroke:var(--line-strong);stroke-dasharray:6 5}
+.cell.half{fill:url(#gHalf);stroke:var(--honey-deep)}
+.flower a:hover .cell{filter:brightness(1.06)}
+.flower .L{font:700 34px/1 var(--serif);text-anchor:middle}
+.flower .W{font:600 13.5px/1 var(--sans);text-anchor:middle}
+.flower .now-t{fill:#2a1d0e}
+.flower .later-t{fill:var(--ink-soft)}
+.keytable{list-style:none;padding:0;margin:0;display:grid;gap:8px;font-size:.92rem}
+.keytable li{display:flex;gap:10px;align-items:center}
+.keytable i{width:22px;height:25px;flex:none;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+.draft{margin-top:30px;display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));align-items:stretch}
+.draft .paper{border:1px dashed var(--coach-edge);background:var(--coach-bg);color:var(--coach-ink);border-radius:14px;padding:16px;position:relative}
+.draft .paper .stampx{position:absolute;right:12px;top:12px;font:700 .68rem/1 var(--mono);text-transform:uppercase;letter-spacing:.1em;border:2px solid currentColor;padding:4px 6px;border-radius:4px;transform:rotate(6deg);opacity:.75}
+.draft .paper dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:10px 0 0;font-size:.92rem}
+.draft .paper dt{font:700 .78rem/1.6 var(--mono)}
+.draft .paper dd{margin:0}
+.draft .call{border:2px solid var(--user-edge);background:var(--user-bg);color:var(--user-ink);border-radius:14px;padding:16px;position:relative}
+.draft .call .big{font:700 1.25rem/1.35 var(--serif);margin:8px 0 0}
+.horizon{margin-top:36px;display:grid;gap:22px}
+.band{display:grid;gap:14px}
+.band-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.band-head h3{font-size:1.5rem}
+.band-head span{font:700 .72rem/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;padding:5px 9px;border-radius:999px}
+.band.now .band-head span{background:var(--honey);color:#2a1d0e}
+.band.later .band-head span{border:1px dashed var(--line-strong);color:var(--ink-soft)}
+.themes{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr))}
+.theme{position:relative;border-radius:16px;padding:18px 18px 16px;scroll-margin-top:20px;transition:box-shadow .3s}
+.theme:target{box-shadow:0 0 0 4px var(--focus)}
+.band.now .theme{background:var(--wax);border:2px solid var(--honey)}
+.band.later .theme{background:transparent;border:2px dashed var(--line-strong)}
+.theme .lt{position:absolute;right:14px;top:10px;font:700 2.2rem/1 var(--serif);color:var(--honey-deep);opacity:.9}
+.band.later .theme .lt{color:var(--ink-soft);opacity:.6}
+.theme h4{margin:0 2.4em 6px 0;font:700 1.08rem/1.3 var(--serif)}
+.theme p{margin:0;font-size:.93rem;color:var(--ink-soft)}
+.theme .seeds{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+.seed{font:600 .72rem/1.3 var(--mono);padding:3px 7px;border-radius:6px}
+.seed.u{background:var(--user-bg);color:var(--user-ink);border:1px solid var(--user-edge)}
+.seed.c{background:var(--coach-bg);color:var(--coach-ink);border:1px dashed var(--coach-edge)}
+.parked{font-size:.9rem;color:var(--ink-soft)}
+
+/* ---------- climax ---------- */
+.climax{background:radial-gradient(1200px 600px at 50% 0%,#3b2507 0%,var(--night-bg) 60%);color:var(--night-ink);padding:96px 0 80px;overflow:hidden}
+.climax .comb{background:#f5b82e;opacity:.07}
+.climax .kicker{color:var(--night-soft)}
+.climax .act-num{color:var(--night-honey)}
+.vp{position:relative;max-width:980px;margin:16px auto 0;text-align:center}
+.vp blockquote{margin:0;font-family:var(--serif);font-size:clamp(1.55rem,4.6vw,3rem);line-height:1.22;letter-spacing:-.01em}
+.vp .cp{color:var(--night-honey);font-style:italic}
+.vp .verbs b{color:#fff;border-bottom:3px solid var(--night-honey)}
+.vp .vow{display:block;margin-top:.4em;color:#ffe08f}
+.vp .runtimes{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin:26px 0 0;padding:0;list-style:none}
+.vp .runtimes li{font:600 .85rem/1 var(--mono);padding:8px 12px;border:1px solid rgba(245,184,46,.5);border-radius:999px;color:var(--night-soft)}
+.waxseal{display:inline-grid;place-items:center;width:108px;height:108px;border-radius:50%;margin:30px auto 0;background:radial-gradient(circle at 35% 30%,#ffd166,#c27c00 70%,#8a5200);color:#2a1d0e;text-align:center;font:700 .72rem/1.15 var(--mono);letter-spacing:.06em;text-transform:uppercase;box-shadow:0 0 0 6px rgba(245,184,46,.18),0 10px 30px rgba(0,0,0,.6);transform:rotate(-8deg)}
+.waxseal b{display:block;font:700 1.05rem/1 var(--serif);text-transform:none;letter-spacing:0}
+.climax h3{color:#ffe1a1}
+.climax-grid{display:grid;gap:22px;margin-top:64px}
+.keystone{background:var(--night-2);border:1px solid rgba(245,184,46,.35);border-radius:22px;padding:22px}
+.keystone .k-head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.keystone .k-head span{font:700 .7rem/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--night-honey)}
+.keystone p{color:var(--night-soft)}
+.keysvg{width:100%;max-width:620px;height:auto;display:block;margin:10px auto}
+.hats{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));margin:12px 0 0;padding:0;list-style:none;counter-reset:hat}
+.hats li{counter-increment:hat;position:relative;padding:14px 14px 14px 52px;border-radius:14px;background:rgba(245,184,46,.08);border:1px solid rgba(245,184,46,.3);color:var(--night-ink);font-size:.95rem}
+.hats li::before{content:counter(hat);position:absolute;left:12px;top:12px;width:28px;height:32px;display:grid;place-items:center;font:700 .9rem/1 var(--mono);background:var(--night-honey);color:#1a1206;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%)}
+.hats li small{display:block;color:var(--night-soft);font-size:.8rem;margin-top:2px}
+.prepay{margin-top:14px;font-family:var(--serif);font-size:1.15rem;color:#ffe08f}
+.trio{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}
+.trio .keystone h3{font-size:1.25rem;margin-bottom:4px}
+.principles{list-style:none;padding:0;margin:0;display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));counter-reset:pr}
+.principles li{counter-increment:pr;position:relative;padding:16px 16px 14px 60px;border-radius:16px;background:var(--night-2);border:1px solid rgba(245,184,46,.25)}
+.principles li::before{content:counter(pr,decimal-leading-zero);position:absolute;left:16px;top:14px;font:700 1.25rem/1 var(--serif);color:var(--night-honey)}
+.principles b{display:block;font:700 1.08rem/1.3 var(--serif);color:#fff;margin-bottom:4px}
+.principles span{color:var(--night-soft);font-size:.9rem}
+.src{display:inline-flex;gap:5px;margin-top:8px;flex-wrap:wrap}
+.src i{font:700 .64rem/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;font-style:normal;padding:3px 6px;border-radius:999px}
+.src .u{background:#f5b82e;color:#1a1206}
+.src .c{background:#a9d1ee;color:#0d1a24}
+.questions{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr))}
+.qcell{position:relative;padding:22px 18px 18px;border:2px dashed rgba(245,184,46,.45);border-radius:18px;color:var(--night-ink)}
+.qcell .qm{position:absolute;right:14px;top:6px;font:700 2.6rem/1 var(--serif);color:rgba(245,184,46,.35)}
+.qcell h4{margin:0 2em 6px 0;font:700 1.05rem/1.3 var(--serif);color:#ffe1a1}
+.qcell p{margin:0;font-size:.92rem;color:var(--night-soft)}
+.qcell.answered{border-style:solid;border-color:#7fb069}
+.qcell.answered .qm{color:rgba(127,176,105,.6)}
+.qcell.worry{border-color:#f5b82e;background:rgba(245,184,46,.08)}
+.qcell.worry .qm{color:rgba(245,184,46,.7)}
+.climax .subt{margin:56px 0 18px}
+
+footer{padding:40px 0 90px;font-size:.88rem;color:var(--ink-soft);border-top:1px solid var(--line)}
+footer .legend-row{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-top:10px}
+footer .legend-row .n{padding:6px 10px;font-size:.85rem}
+
+@media (max-width:520px){
+  body{font-size:16px}
+  section{padding:56px 0}
+  .panel,.boom,.hive .card,.keystone{padding:18px}
+  .boom-top{grid-template-columns:1fr}
+  .bomb{width:52px;height:52px}
+  .bomb svg{width:52px;height:52px}
+  .boom .ring{left:44px;top:44px}
+  .tension{grid-template-columns:1fr}
+  .voicedby{margin-left:0}
+  .rung{grid-template-columns:70px 1fr}
+  .rung .bar{width:46px}
+  .ladder::after{left:52px}
+}
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}
+  .lane .call{left:92%}
+  .entrance[data-mode="enforce"] .unscented .call{left:52%}
+}
+@media print{
+  .spotbtn,.fuse,.tablist{display:none!important}
+  .js .panel[hidden]{display:block}
+  .js .boom .after{display:block}
+}
+</style>
+</head>
+<body>
+
+<button class="spotbtn" type="button" aria-pressed="false" id="spot"><span class="hx" aria-hidden="true"></span><span>Spotlight your ideas</span></button>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <div class="comb" aria-hidden="true"></div>
+  <div class="wrap hero-grid">
+    <div>
+      <p class="kicker">Hekma &middot; brainstorming keepsake &middot; 29 October 2026</p>
+      <h1>From <span class="strike">gatekeeper</span><br>to <em>hive.</em></h1>
+      <p class="lede">One evening, one Rust supervisor, three techniques and 114 log entries. Hekma went in as a cost gate that blocks and pauses. It came out as the control plane for agent workloads.</p>
+      <div class="ratio" role="group" aria-label="Who wrote the session">
+        <div class="ratio-bar" aria-hidden="true"><div class="u" style="width:38.9%"></div><div class="c" style="width:61.1%"></div></div>
+        <div class="ratio-legend">
+          <span><b>42</b> entries are yours, including every one of the five decisions</span>
+          <span><b>66</b> came from the coach</span>
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>5</b><span>voices played</span></div>
+        <div class="stat"><b>4</b><span>detonations</span></div>
+        <div class="stat"><b>1</b><span>beehive</span></div>
+        <div class="stat"><b>7</b><span>themes, A to G</span></div>
+        <div class="stat"><b>1</b><span>value proposition</span></div>
+      </div>
+      <nav aria-label="Sections">
+        <ul class="toc">
+          <li><a href="#spark">The spark</a></li>
+          <li><a href="#voices">I &middot; Voices</a></li>
+          <li><a href="#detonations">II &middot; Detonations</a></li>
+          <li><a href="#hive">III &middot; The hive</a></li>
+          <li><a href="#convergence">Convergence</a></li>
+          <li><a href="#synthesis">The synthesis</a></li>
+        </ul>
+      </nav>
+    </div>
+    <svg class="hero-art" viewBox="0 0 440 300" role="img" aria-labelledby="heroArtT">
+      <title id="heroArtT">The bars of a gate break apart into honeycomb cells that gather into a hive</title>
+      <defs>
+        <polygon id="hh" points="0,-22 19,-11 19,11 0,22 -19,11 -19,-11"/>
+      </defs>
+      <!-- gate -->
+      <g fill="none" stroke="var(--ink-soft)" stroke-width="5" stroke-linecap="round">
+        <path d="M30 270 V70 Q90 20 150 70 V270" stroke="var(--line-strong)" stroke-width="7"/>
+        <line x1="54" y1="62" x2="54" y2="270"/>
+        <line x1="78" y1="50" x2="78" y2="270"/>
+        <line x1="102" y1="50" x2="102" y2="168"/>
+        <line x1="126" y1="62" x2="126" y2="130"/>
+        <line x1="30" y1="150" x2="150" y2="150" stroke="var(--line-strong)"/>
+      </g>
+      <!-- the cost lock, set aside -->
+      <g transform="translate(82 214) rotate(-14)" opacity=".75">
+        <rect x="-16" y="-6" width="32" height="26" rx="5" fill="var(--boom)"/>
+        <path d="M-9 -6 V-14 a9 9 0 0 1 18 0 V-2" fill="none" stroke="var(--boom)" stroke-width="5"/>
+        <text x="0" y="13" font-family="ui-monospace,Menlo,monospace" font-size="13" font-weight="700" text-anchor="middle" fill="#fff">$</text>
+      </g>
+      <!-- bars turning into cells -->
+      <g fill="var(--honey)" stroke="var(--honey-deep)" stroke-width="2">
+        <use href="#hh" class="fly" x="150" y="180" opacity=".35"/>
+        <use href="#hh" class="fly" x="186" y="140" opacity=".5"/>
+        <use href="#hh" class="fly" x="214" y="210" opacity=".55"/>
+        <use href="#hh" class="fly" x="240" y="104" opacity=".7"/>
+      </g>
+      <!-- hive -->
+      <g stroke="var(--honey-deep)" stroke-width="2">
+        <use href="#hh" x="320" y="110" fill="var(--honey)"/>
+        <use href="#hh" x="358" y="110" fill="var(--honey)"/>
+        <use href="#hh" x="301" y="143" fill="var(--honey)"/>
+        <use href="#hh" x="339" y="143" fill="var(--honey)" class="glow"/>
+        <use href="#hh" x="377" y="143" fill="var(--wax)" stroke-dasharray="4 4"/>
+        <use href="#hh" x="320" y="176" fill="var(--wax)" stroke-dasharray="4 4"/>
+        <use href="#hh" x="358" y="176" fill="var(--wax)" stroke-dasharray="4 4"/>
+      </g>
+      <text x="339" y="148" text-anchor="middle" font-family="Georgia,serif" font-weight="700" font-size="15" fill="#2a1d0e">C</text>
+      <text x="339" y="232" text-anchor="middle" font-family="ui-monospace,Menlo,monospace" font-size="12" fill="var(--ink-soft)">run, see, steer</text>
+    </svg>
+  </div>
+</header>
+
+<main>
+
+<!-- ================= SPARK ================= -->
+<section class="spark" id="spark">
+  <div class="wrap">
+    <div class="act-head">
+      <span class="act-num">PROLOGUE</span>
+      <h2>The spark</h2>
+      <p class="lede">The session opened on a sentence from you that the rest of the evening kept answering.</p>
+    </div>
+    <div class="twocol">
+      <div class="ticket">
+        <p class="kicker" style="margin-top:0">Your opening brief</p>
+        <ul class="notes">
+          <li class="n u big"><span class="tag">your direction</span>Budget block and pause alone are not enough reason to adopt Hekma. OpenCode and Hermes are individual-level agents; businesses build with LangGraph and CrewAI, and they fear a prod workflow pausing on cost. Keep the individuals. Pivot from gatekeeper to external management for running, managing, observing and supervising agentic workloads.</li>
+        </ul>
+        <p style="margin-bottom:0"><b>Goal of the session:</b> a value proposition businesses take seriously, LangGraph and CrewAI teams and the prod-pause fear included, without losing individual users.</p>
+      </div>
+      <div>
+        <p class="colhead">Four forks in the road, carried in as inputs</p>
+        <ol class="forks">
+          <li><div>Process boundary or in-framework?<small>Does Hekma stand outside the agent, or inside its code?</small></div></li>
+          <li><div>Where it stands among neighbours<small>Gateways, observability, durable execution, orchestration.</small></div></li>
+          <li><div>The prod-pause fear<small>Turn a single stop switch into a policy ladder.</small></div></li>
+          <li><div>Individuals and enterprise on one core<small>A solo laptop and a business fleet, one product.</small></div></li>
+        </ol>
+        <ul class="notes" style="margin-top:12px">
+          <li class="n u dec"><span class="tag">your call</span>Coach stance: Creative Partner. Techniques: Role Playing, What If Scenarios, Nature's Solutions.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ACT I: VOICES ================= -->
+<section class="voices" id="voices">
+  <div class="wrap">
+    <div class="act-head">
+      <span class="act-num">ACT I &middot; ROLE PLAYING</span>
+      <h2>Five voices walk into the control room</h2>
+      <p class="lede">Each one wanted something different from Hekma. You voiced three of them yourself; the coach played the SRE and, at your request, the compliance officer. About fifty ideas came out of it.</p>
+    </div>
+
+    <div class="tablist" role="tablist" aria-label="Voices">
+      <button class="tab" role="tab" id="tab-sre" aria-controls="p-sre" aria-selected="true"><span class="mask m-sre" aria-hidden="true">SRE</span><span>On-call SRE<small>3 a.m. pager</small></span></button>
+      <button class="tab" role="tab" id="tab-vp" aria-controls="p-vp" aria-selected="false" tabindex="-1"><span class="mask m-vp" aria-hidden="true">VP</span><span>VP Eng<small>voiced by you</small></span></button>
+      <button class="tab" role="tab" id="tab-solo" aria-controls="p-solo" aria-selected="false" tabindex="-1"><span class="mask m-solo" aria-hidden="true">&gt;_</span><span>Solo dev<small>voiced by you</small></span></button>
+      <button class="tab" role="tab" id="tab-agent" aria-controls="p-agent" aria-selected="false" tabindex="-1"><span class="mask m-agent" aria-hidden="true">{ }</span><span>The agent<small>voiced by you</small></span></button>
+      <button class="tab" role="tab" id="tab-comp" aria-controls="p-comp" aria-selected="false" tabindex="-1"><span class="mask m-comp" aria-hidden="true">&sect;</span><span>Compliance<small>and the auditor</small></span></button>
+    </div>
+
+    <!-- SRE -->
+    <article class="panel" role="tabpanel" id="p-sre" aria-labelledby="tab-sre">
+      <div class="panel-head">
+        <span class="mask m-sre" aria-hidden="true">SRE</span>
+        <div><h3>The on-call SRE</h3><p>"One run is on fire. Don't make me restart the building."</p></div>
+        <span class="voicedby c">voiced by the coach</span>
+      </div>
+      <ul class="notes">
+        <li class="n c"><span class="tag">coach</span>Control at the run level, not the process level: find the one misbehaving run (its step, its customer) and act on just that run.</li>
+        <li class="n c"><span class="tag">coach</span>A cost pause is worse than a crash for a prod workflow. A crash restarts; a pause strands. Hekma's default for prod should keep the work moving.</li>
+        <li class="n c"><span class="tag">coach</span>Kill one run now and replay it later from where it stopped: a checkpoint-aware stop instead of a pause.</li>
+      </ul>
+    </article>
+
+    <!-- VP ENG -->
+    <article class="panel" role="tabpanel" id="p-vp" aria-labelledby="tab-vp">
+      <div class="panel-head">
+        <span class="mask m-vp" aria-hidden="true">VP</span>
+        <div><h3>The VP of Engineering</h3><p>"Boring, in the best possible way."</p></div>
+        <span class="voicedby u">voiced by you</span>
+      </div>
+      <div class="twocol">
+        <div>
+          <p class="colhead">Your wishlist, in the VP's voice</p>
+          <ul class="notes">
+            <li class="n u"><span class="tag">your idea</span>Plugs easily into our existing observability landscape.</li>
+            <li class="n u"><span class="tag">your idea</span>Easy operator control over how Hekma behaves.</li>
+            <li class="n u"><span class="tag">your idea</span>No unexpected shutdowns of agentic workflows in prod.</li>
+            <li class="n u"><span class="tag">your idea</span>No redeploys to change a Hekma config: config changes live.</li>
+            <li class="n u"><span class="tag">your idea</span>Controls a CrewAI workflow with little or no integration work.</li>
+            <li class="n u"><span class="tag">your idea</span>Pause and restart a workflow from a checkpoint, safely.</li>
+            <li class="n u"><span class="tag">your idea</span>Blast-radius isolation: acting on one flow never breaks other flows, work or critical paths.</li>
+          </ul>
+        </div>
+        <div>
+          <p class="colhead">The coach's answers</p>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach</span>Pause at the wire: Hekma holds the workflow's next model call instead of signalling the process. The workflow is suspended mid-step with state intact, and a base-URL override means zero code change.</li>
+            <li class="n c"><span class="tag">coach</span>Release, reroute (to a cheaper model) or reject the held call later. A resume is just letting the call through.</li>
+            <li class="n c"><span class="tag">coach</span>Policy as live data: budgets and rules change through the Control API or a watched policy file, versioned and audited, with no redeploy.</li>
+            <li class="n c"><span class="tag">coach</span>Shadow mode: a new policy runs observe-only first and reports what it would have done before it may act in prod.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="tension">
+        <svg class="zap" viewBox="0 0 40 40" aria-hidden="true"><path d="M23 2 L7 23 H19 L15 38 L33 15 H21 Z" fill="var(--boom)"/></svg>
+        <ul class="notes"><li class="n c"><span class="tag">coach insight &middot; tension</span>Zero integration versus checkpoint. From outside the process Hekma cannot checkpoint framework state, but the model wire is the zero-code seam where a hold acts like a checkpoint.</li></ul>
+      </div>
+    </article>
+
+    <!-- SOLO DEV -->
+    <article class="panel" role="tabpanel" id="p-solo" aria-labelledby="tab-solo">
+      <div class="panel-head">
+        <span class="mask m-solo" aria-hidden="true">&gt;_</span>
+        <div><h3>The solo developer</h3><p>"A dozen agent sessions, one pair of eyes."</p></div>
+        <span class="voicedby u">voiced by you</span>
+      </div>
+      <div class="twocol">
+        <div>
+          <ul class="notes">
+            <li class="n u"><span class="tag">your idea</span>Hekma as a terminal multiplexer for agents: many OpenCode and Hermes sessions and workflows side by side.</li>
+            <li class="n u"><span class="tag">your idea</span>Per-session usage visible right in the command line. Loved.</li>
+            <li class="n u"><span class="tag">your idea</span>Easy with any ACP-capable tool.</li>
+            <li class="n u"><span class="tag">your insight &middot; pain</span>A blocked agent, Hermes especially, works around Hekma by calling the LLM provider directly. Governance is bypassable.</li>
+            <li class="n u"><span class="tag">your insight</span>LiteLLM gives similar usage visibility but no control over one specific OpenCode or Hermes session. Per-session control is Hekma's edge.</li>
+          </ul>
+        </div>
+        <div>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach</span><b>hekma top</b>: a live htop-style TUI with sessions, state, tokens per second, burn rate and budget left, plus hotkeys to pause, kill, attach or raise a limit.</li>
+          </ul>
+          <pre class="term" style="margin-top:10px" aria-label="Sketch of a hekma top screen"><span class="a">hekma top</span>  <span class="d">sessions 6 · burn $0.84/h · 1 held</span>
+<span class="d">SESSION        STATE    TOK/S   BURN    LEFT</span>
+opencode:api   <span class="g">running</span>    412   $0.31   <span class="g">71%</span>
+hermes:inbox   <span class="a">held</span>         0   $0.00   <span class="a">4%</span>
+crewai:digest  <span class="g">running</span>    188   $0.22   <span class="g">58%</span>
+raw:eval-07    <span class="b">silent</span>       0   $0.00   <span class="g">90%</span>
+<span class="d">[p]ause [k]ill [a]ttach [+]limit</span> <span class="cursor"></span></pre>
+          <p class="term-cap">Sketch of the coach's idea. Illustrative, not real output.</p>
+          <ul class="notes" style="margin-top:12px">
+            <li class="n c"><span class="tag">coach</span>Key custody: the agent never holds the real provider key. Hekma injects a per-session virtual key that only works through its proxy, so a bypass has no credentials.</li>
+            <li class="n c"><span class="tag">coach</span>Bypass detection: flag any direct connection from a supervised session to a known provider host, on the CLI and in OTLP.</li>
+            <li class="n c"><span class="tag">coach</span>Complement the gateway, don't compete: Hekma tags every call with its session and run identity, and can sit in front of LiteLLM or Portkey.</li>
+            <li class="n c"><span class="tag">coach insight</span>A gateway knows the call; Hekma knows the session that made it. Binding calls to sessions and processes is the differentiator.</li>
+          </ul>
+        </div>
+      </div>
+    </article>
+
+    <!-- AGENT -->
+    <article class="panel" role="tabpanel" id="p-agent" aria-labelledby="tab-agent">
+      <div class="panel-head">
+        <span class="mask m-agent" aria-hidden="true">{ }</span>
+        <div><h3>The agent itself</h3><p>"Tell me my limits up front, and I'll carry them myself."</p></div>
+        <span class="voicedby u">voiced by you</span>
+      </div>
+      <ul class="notes">
+        <li class="n u big"><span class="tag">your idea</span>CrewAI Flows and LangGraph graphs send their own flow policy with each outgoing request to Hekma's gateway (max budget, max rpm and so on) plus a flow identifier. Hekma's rules become dynamic, declared by the framework.</li>
+        <li class="n u"><span class="tag">your idea</span>Hekma-level non-negotiable standard policies that callers cannot override, or can only where Hekma's config allows it.</li>
+      </ul>
+      <div class="hdrs">
+        <div>
+          <pre class="term" aria-label="Sketch of a request carrying a flow policy and a response carrying budget headers"><span class="d"># the flow declares</span>
+<span class="b">POST</span> /v1/chat/completions
+<span class="a">x-hekma-flow</span>: claims-intake
+<span class="a">x-hekma-policy</span>: budget=4.00; rpm=30
+<span class="d"># Hekma answers, like rate-limit headers</span>
+<span class="g">200 OK</span>
+<span class="a">x-hekma-budget-remaining</span>: 2.71
+<span class="a">x-hekma-policy-id</span>: ops/claims@v3</pre>
+          <p class="term-cap">Header names invented for this keepsake.</p>
+        </div>
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Two-layer policy: callers declare, operators bound. A caller may only tighten an operator rule, never loosen it, unless the operator delegates headroom (like IAM permission boundaries or a Kubernetes LimitRange).</li>
+          <li class="n c"><span class="tag">coach</span>Budget headers on every response (remaining tokens or dollars, reset, policy id), so the agent self-paces without any SDK.</li>
+          <li class="n c"><span class="tag">coach</span>Ask, don't work around: on exhaustion Hekma answers with a typed response that names how to request more, routed to auto-approve rules or a human.</li>
+          <li class="n c"><span class="tag">coach</span>A policy header standard: publish the request-policy header as an open format that CrewAI, LangGraph and AutoGen can emit, with Hekma as the reference enforcer.</li>
+        </ul>
+      </div>
+    </article>
+
+    <!-- COMPLIANCE -->
+    <article class="panel" role="tabpanel" id="p-comp" aria-labelledby="tab-comp">
+      <div class="panel-head">
+        <span class="mask m-comp" aria-hidden="true">&sect;</span>
+        <div><h3>The compliance officer, and the auditor</h3><p>"Show me who could stop it, and prove what it didn't do."</p></div>
+        <span class="voicedby c">voiced by the coach, at your request</span>
+      </div>
+      <ul class="notes">
+        <li class="n u"><span class="tag">your direction</span>Not familiar with the EU AI Act, so you asked the coach to voice the compliance and security officer.</li>
+        <li class="n c"><span class="tag">coach insight</span>Hekma is not itself a high-risk AI system, but its customers (deployers) need logging, with logs kept at least six months (AI Act Art. 12 and 26), and human oversight including the ability to stop (Art. 14). Hekma's pause, stop and drain already are an oversight control. Dates are in flux, and this is not legal advice.</li>
+      </ul>
+      <div class="twocol" style="margin-top:12px">
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Tamper-evident run ledger: a hash-chained record of every model call, tool call, policy decision and policy change, with retention and export.</li>
+          <li class="n c"><span class="tag">coach</span>Oversight as a feature: approval gates on high-impact tool calls (pay, email, delete) with a named human approver recorded in the ledger.</li>
+          <li class="n c"><span class="tag">coach</span>Egress and residency control at the wire: per-flow allow-lists of providers and regions, non-EU endpoints blocked, optional PII redaction before the call leaves.</li>
+        </ul>
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Evidence pack on demand: a per-flow report for an auditor covering runs, models, spend, interventions, who approved what, and policy history.</li>
+          <li class="n c"><span class="tag">coach</span>Four-eyes policy changes: in regulated mode a live policy edit needs a second approver, and every change lands in the ledger.</li>
+        </ul>
+      </div>
+
+      <p class="subhead">The auditor's three fears, as you named them</p>
+      <div class="fears">
+        <div class="env"><span class="seal" aria-hidden="true">1</span><p><span class="who">&#11042; your idea</span></p><p>The agent sends a <b>wrong application approval</b> to a customer.</p></div>
+        <div class="env"><span class="seal" aria-hidden="true">2</span><p><span class="who">&#11042; your idea</span></p><p>The agent sends <b>letters or emails</b> to customers it should not.</p></div>
+        <div class="env scariest"><span class="seal" aria-hidden="true">3</span><p><span class="who">&#11042; your idea</span><span class="sc">scariest</span></p><p><b>Cross-process data contamination</b>: a process for customer X gets data from a process for customer Y, and leaks it.</p></div>
+      </div>
+      <ul class="notes">
+        <li class="n c"><span class="tag">coach insight</span>All three fears are about the wire. Irreversible customer-facing actions and cross-subject data flow both pass through a point Hekma can sit on.</li>
+      </ul>
+      <div class="twocol" style="margin-top:10px">
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Customer-facing outbox: every outbound to a customer (email, letter, decision) goes through a Hekma outbox with policy: hold, sample N% for review, human approve, or a recall window before release.</li>
+          <li class="n c"><span class="tag">coach</span>Subject-scoped runs: each run declares its data subject (customer id); Hekma blocks and alerts when prompts, tool arguments or outputs carry another subject's identifiers.</li>
+          <li class="n c"><span class="tag">coach</span>Contamination canaries: seed a unique fake marker per run. If run A's canary ever shows up in run B's traffic, contamination is proven and both runs freeze.</li>
+          <li class="n c"><span class="tag">coach</span>Proving the negative: the ledger plus subject checks let Hekma state, per customer run, that no other customer's identifiers crossed the wire.</li>
+        </ul>
+        <ul class="notes">
+          <li class="n u"><span class="tag">your idea</span>Leak paths: the vector store, shared memory, and many more.</li>
+          <li class="n u big"><span class="tag">your idea &middot; hardest risk</span>Bad input: a CrewAI or LangGraph flow starts with incorrect data, or agents call tools with the wrong request parameters.</li>
+          <li class="n c"><span class="tag">coach insight</span>Hekma cannot judge whether data is correct, but it can judge whether it is consistent with what the run declared. Consistency is checkable at the wire; correctness is not.</li>
+        </ul>
+      </div>
+      <p class="subhead">The coach's answer to bad input: bind the run</p>
+      <div class="twocol">
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Run binding: at start a run declares its binding (customer_id, application_id); every tool call and outbound must reference the same binding or be held. One mechanism for wrong parameters and contamination.</li>
+          <li class="n c"><span class="tag">coach</span>Tool-argument contracts at the wire: per-tool rules, such as send_email.to belongs to the bound customer, approve_application.id equals the bound application, amount within range.</li>
+        </ul>
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Intake preflight: the flow declares an input schema, and Hekma validates the starting payload before the first model call and refuses bad starts.</li>
+          <li class="n c"><span class="tag">coach</span>Quarantine and resume: on a binding or contract violation, freeze the run and hold its outbox, let a human fix the input, and resume from the last checkpoint without touching other runs.</li>
+        </ul>
+      </div>
+    </article>
+  </div>
+</section>
+
+<!-- ================= ACT II: DETONATIONS ================= -->
+<section class="detonations" id="detonations">
+  <div class="wrap">
+    <div class="act-head">
+      <span class="act-num">ACT II &middot; WHAT IF SCENARIOS</span>
+      <h2>Four detonations</h2>
+      <p class="lede">Blow up one assumption at a time and see what survives. About thirty entries came out of the rubble.</p>
+    </div>
+    <div class="preface">
+      <ul class="notes"><li class="n u"><span class="tag">your insight</span>Hekma is open source, so "worth paying for" doesn't apply directly. The bar is <b>worth adopting</b>.</li></ul>
+    </div>
+
+    <!-- 1 -->
+    <article class="boom" id="boom-1">
+      <span class="ring" aria-hidden="true"></span><span class="ring r2" aria-hidden="true"></span>
+      <div class="boom-top">
+        <div class="bomb" aria-hidden="true"><svg viewBox="0 0 64 64"><circle cx="30" cy="38" r="20" fill="var(--ink)"/><rect x="25" y="14" width="10" height="8" rx="2" fill="var(--ink)"/><path d="M30 14 Q34 4 46 8" fill="none" stroke="var(--ink-soft)" stroke-width="3"/><circle cx="48" cy="8" r="4" fill="var(--honey)"/><circle cx="24" cy="32" r="5" fill="var(--bg)" opacity=".25"/></svg></div>
+        <div>
+          <h3><span class="wi">What if #1</span>Hekma enforced nothing at all?</h3>
+          <button class="fuse" type="button" aria-expanded="false" aria-controls="after-1">Light the fuse</button>
+        </div>
+      </div>
+      <div class="after" id="after-1">
+        <p class="survived">What survived the blast</p>
+        <div class="twocol">
+          <ul class="notes">
+            <li class="n u big"><span class="tag">your idea</span>One consistent interface for any agentic workload. Install it anywhere (local, a cloud function, EC2) or connect to Hekma endpoints, then manage, observe, pause, resume, stop, budget and emit telemetry the same way whether it runs CrewAI, LangGraph, Hermes or a plain LLM call. No new tooling when the agent tech changes.</li>
+            <li class="n u"><span class="tag">your idea</span>For individuals: Hekma nodes over a tailnet give one global view of, and control over, the whole agentic estate from a single installation.</li>
+          </ul>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach insight</span>Enforcement becomes one optional verb. The core value is a uniform control plane over mixed agent runtimes, what kubectl and Docker did for processes and containers.</li>
+            <li class="n c"><span class="tag">coach</span>Same verbs everywhere: hekma ps, logs, top, pause, resume, stop and budget work identically for every runtime.</li>
+            <li class="n c"><span class="tag">coach</span>The swap-the-engine promise: move a flow from CrewAI to LangGraph and its dashboards, policies, alerts and runbooks stay unchanged. Portability is the pitch.</li>
+            <li class="n c"><span class="tag">coach</span>Nodes and a hub: every box runs hekma serve; one hub, or peer federation over a tailnet, aggregates runs, spend and controls across laptop, home server, VPS and cloud.</li>
+            <li class="n c q"><span class="tag">coach question</span>The business model for open-source Hekma stays open: adoption first, monetisation out of scope for this session.</li>
+          </ul>
+        </div>
+        <figure class="fig">
+          <div class="matrix-wrap">
+            <table class="matrix">
+              <caption class="sr">Every Hekma verb works the same for every runtime</caption>
+              <thead><tr><th scope="col">verb</th><th scope="col">CrewAI</th><th scope="col">LangGraph</th><th scope="col">Hermes</th><th scope="col">OpenCode</th><th scope="col">raw call</th></tr></thead>
+              <tbody>
+                <tr><th scope="row">ps</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+                <tr><th scope="row">logs</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+                <tr><th scope="row">top</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+                <tr><th scope="row">pause / resume</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+                <tr><th scope="row">stop</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+                <tr><th scope="row">budget</th><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td><td><span class="dot" aria-label="same"></span></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <figcaption>Same verbs everywhere: a full grid is the point. Change the engine, keep the column.</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <!-- 2 -->
+    <article class="boom" id="boom-2">
+      <span class="ring" aria-hidden="true"></span><span class="ring r2" aria-hidden="true"></span>
+      <div class="boom-top">
+        <div class="bomb" aria-hidden="true"><svg viewBox="0 0 64 64"><circle cx="30" cy="38" r="20" fill="var(--ink)"/><rect x="25" y="14" width="10" height="8" rx="2" fill="var(--ink)"/><path d="M30 14 Q34 4 46 8" fill="none" stroke="var(--ink-soft)" stroke-width="3"/><circle cx="48" cy="8" r="4" fill="var(--honey)"/><circle cx="24" cy="32" r="5" fill="var(--bg)" opacity=".25"/></svg></div>
+        <div>
+          <h3><span class="wi">What if #2</span>Hekma could only attach, and never launch anything?</h3>
+          <button class="fuse" type="button" aria-expanded="false" aria-controls="after-2">Light the fuse</button>
+        </div>
+      </div>
+      <div class="after" id="after-2">
+        <p class="survived">What survived the blast</p>
+        <div class="twocol">
+          <ul class="notes">
+            <li class="n u"><span class="tag">your insight</span>Attach-only, control weakens: Hekma may fail to control the other process. What's left is the wire.</li>
+            <li class="n u"><span class="tag">your insight</span>Attach-only Hekma loses an accurate hekma ps. It has to wait for incoming requests to discover running agents.</li>
+            <li class="n c"><span class="tag">coach insight</span>Wire control is stronger than it looks. An agent that cannot reach models or tools is effectively paused, and with key custody it also cannot bypass. The Hermes bypass fix and attach-mode control are the same feature.</li>
+          </ul>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach</span>The control-depth ladder made explicit: observed &lt; wire &lt; registered &lt; supervised, with a CONTROL column per run in hekma ps.</li>
+            <li class="n c"><span class="tag">coach</span>Lease-based presence: attached runs hold a lease renewed by heartbeat or traffic. An expired lease shows as silent, not gone, so ps stays honest without spawning anything.</li>
+            <li class="n c"><span class="tag">coach</span>Self-announce: frameworks register a run on start (a header, an OTel span or one SDK call), turning wire-discovered runs into registered runs.</li>
+          </ul>
+        </div>
+        <figure class="fig">
+          <div class="twocol" style="align-items:center">
+            <div>
+              <div class="ladder-cap"><span>more control</span></div>
+              <ol class="ladder" reversed aria-label="Control-depth ladder, from most to least control">
+                <li class="rung" data-depth="4"><span class="bar" aria-hidden="true"></span><span class="lvl">supervised<small>hekma run owns the process</small></span></li>
+                <li class="rung" data-depth="3"><span class="bar" aria-hidden="true"></span><span class="lvl">registered<small>the run announces itself and heartbeats</small></span></li>
+                <li class="rung" data-depth="2"><span class="bar" aria-hidden="true"></span><span class="lvl">wire<small>hold, reroute or reject its calls</small></span></li>
+                <li class="rung" data-depth="1"><span class="bar" aria-hidden="true"></span><span class="lvl">observed<small>telemetry only</small></span></li>
+              </ol>
+              <div class="ladder-cap"><span>less control</span></div>
+            </div>
+            <div>
+<pre class="term" aria-label="Sketch of hekma ps with a CONTROL column"><span class="a">$ hekma ps</span>
+<span class="d">RUN     RUNTIME    CONTROL     STATE</span>
+r-7f3a  langgraph  <span class="g">supervised</span>  running
+r-19bc  crewai     <span class="g">registered</span>  <span class="a">held</span>
+r-c004  hermes     <span class="b">wire</span>        running
+r-e2d1  raw-http   <span class="d">observed</span>    <span class="b">silent</span></pre>
+              <p class="term-cap">Illustrative. "silent" is an expired lease, not a vanished run.</p>
+            </div>
+          </div>
+          <figcaption>The control-depth ladder: every run sits on a rung, and ps says which.</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <!-- 3 -->
+    <article class="boom" id="boom-3">
+      <span class="ring" aria-hidden="true"></span><span class="ring r2" aria-hidden="true"></span>
+      <div class="boom-top">
+        <div class="bomb" aria-hidden="true"><svg viewBox="0 0 64 64"><circle cx="30" cy="38" r="20" fill="var(--ink)"/><rect x="25" y="14" width="10" height="8" rx="2" fill="var(--ink)"/><path d="M30 14 Q34 4 46 8" fill="none" stroke="var(--ink-soft)" stroke-width="3"/><circle cx="48" cy="8" r="4" fill="var(--honey)"/><circle cx="24" cy="32" r="5" fill="var(--bg)" opacity=".25"/></svg></div>
+        <div>
+          <h3><span class="wi">What if #3</span>A run lasted months?</h3>
+          <button class="fuse" type="button" aria-expanded="false" aria-controls="after-3">Light the fuse</button>
+        </div>
+      </div>
+      <div class="after" id="after-3">
+        <p class="survived">What survived the blast</p>
+        <div class="twocol">
+          <ul class="notes">
+            <li class="n u big"><span class="tag">your principle</span>Run duration must not change how a workload runs, unless it breaches a Hekma policy.</li>
+            <li class="n u"><span class="tag">your insight &middot; risk</span>If Hekma crashes it takes the processes it owns (hekma run) with it. Registered runs keep going.</li>
+            <li class="n u"><span class="tag">your idea</span>Resilience and safe recovery when Hekma crashes with owned processes, for example by running them detached.</li>
+          </ul>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach</span>Shim-per-run supervision, the containerd-shim and tmux-server pattern: a tiny per-run shim owns the process and its pipes, so the Hekma daemon can crash, restart or upgrade and reattach to every shim.</li>
+            <li class="n c"><span class="tag">coach</span>Durable run registry: runs, budgets and leases are journaled to disk, so a restart recovers ps, spend so far and holds exactly where they were.</li>
+            <li class="n c"><span class="tag">coach</span>Zero-downtime Hekma upgrades under months-long runs, without restarting them.</li>
+            <li class="n c"><span class="tag">coach</span>Windowed budgets (per day, per month) for long runs, not only per-run totals.</li>
+            <li class="n c q"><span class="tag">coach question</span>Policy versioning: does a run started under policy v3 follow v5 when ops change it, or stay pinned? Proposed: pinned by default, opt-in follow-latest, and the ledger records which.</li>
+          </ul>
+        </div>
+        <figure class="fig">
+          <svg class="tl" viewBox="0 0 420 180" role="img" aria-labelledby="tlT">
+            <title id="tlT">Over six months the Hekma daemon crashes once and is upgraded once, while the run held by its shim continues without a break</title>
+            <g font-size="11" fill="var(--ink-soft)">
+              <text x="30" y="170">Jan</text><text x="95" y="170">Feb</text><text x="160" y="170">Mar</text><text x="225" y="170">Apr</text><text x="290" y="170">May</text><text x="355" y="170">Jun</text>
+            </g>
+            <text x="20" y="38" font-size="12" font-weight="700" fill="var(--ink)">hekma daemon</text>
+            <g stroke="var(--coach-badge)" stroke-width="5" stroke-linecap="round">
+              <line x1="24" y1="56" x2="130" y2="56"/>
+              <line x1="150" y1="56" x2="262" y2="56"/>
+              <line x1="282" y1="56" x2="400" y2="56"/>
+            </g>
+            <g font-size="11" font-weight="700">
+              <text x="140" y="61" text-anchor="middle" fill="var(--boom)">&#x2715;</text>
+              <text x="140" y="82" text-anchor="middle" fill="var(--boom)">crash</text>
+              <text x="272" y="62" text-anchor="middle" fill="var(--honey-deep)">&#x25B2;</text>
+              <text x="272" y="82" text-anchor="middle" fill="var(--honey-deep)">upgrade</text>
+            </g>
+            <text x="20" y="112" font-size="12" font-weight="700" fill="var(--ink)">your run, held by its shim</text>
+            <line x1="24" y1="130" x2="400" y2="130" stroke="var(--honey)" stroke-width="10" stroke-linecap="round"/>
+            <g stroke="var(--ink-soft)" stroke-width="1.5" stroke-dasharray="3 3">
+              <line x1="140" y1="88" x2="140" y2="122"/>
+              <line x1="272" y1="88" x2="272" y2="122"/>
+            </g>
+            <text x="148" y="108" font-size="10.5" fill="var(--ink-soft)">reattach</text>
+            <text x="280" y="108" font-size="10.5" fill="var(--ink-soft)">no restart</text>
+          </svg>
+          <figcaption>The daemon can stumble; the run doesn't notice. Shim per run plus a durable registry.</figcaption>
+        </figure>
+      </div>
+    </article>
+
+    <!-- 4 -->
+    <article class="boom" id="boom-4">
+      <span class="ring" aria-hidden="true"></span><span class="ring r2" aria-hidden="true"></span>
+      <div class="boom-top">
+        <div class="bomb" aria-hidden="true"><svg viewBox="0 0 64 64"><circle cx="30" cy="38" r="20" fill="var(--ink)"/><rect x="25" y="14" width="10" height="8" rx="2" fill="var(--ink)"/><path d="M30 14 Q34 4 46 8" fill="none" stroke="var(--ink-soft)" stroke-width="3"/><circle cx="48" cy="8" r="4" fill="var(--honey)"/><circle cx="24" cy="32" r="5" fill="var(--bg)" opacity=".25"/></svg></div>
+        <div>
+          <h3><span class="wi">What if #4</span>It were 10,000+ runs across 200 machines?</h3>
+          <button class="fuse" type="button" aria-expanded="false" aria-controls="after-4">Light the fuse</button>
+        </div>
+      </div>
+      <div class="after" id="after-4">
+        <p class="survived">What survived the blast</p>
+        <div class="twocol">
+          <ul class="notes">
+            <li class="n u big"><span class="tag">your insight</span>At 10,000+ runs the CLI is for emergencies only, and it needs pagination, limits and filtering. Day to day is the API for actions and the observability provider's dashboards, fed by Hekma's OTel.</li>
+            <li class="n u"><span class="tag">your idea</span>Scale target: 10,000 or 10,000,000 runs should work smoothly. Hekma must scale to millions of runs.</li>
+            <li class="n c"><span class="tag">coach insight</span>Positioning: OTel-first, UI-optional. Hekma is the control plane and the telemetry source, not another dashboard to adopt.</li>
+          </ul>
+          <ul class="notes">
+            <li class="n c"><span class="tag">coach</span>Act on sets, not runs: label selectors for every verb, like kubectl (hekma pause --selector flow=claims,region=eu).</li>
+            <li class="n c"><span class="tag">coach</span>Exception-first views: by default show only runs that are anomalous, held, over budget or silent. Healthy runs are counts.</li>
+            <li class="n c"><span class="tag">coach</span>Hierarchical rollups: nodes aggregate locally and hubs merge summaries, so control and counts scale without central per-call traffic.</li>
+            <li class="n c"><span class="tag">coach</span>OTel cardinality discipline: run_id on traces and exemplars, flow and policy labels on metrics, so millions of runs don't explode the customer's observability bill.</li>
+            <li class="n c"><span class="tag">coach</span>Canary policy rollout: apply a new policy to 1% of matching runs in shadow, compare, then widen.</li>
+          </ul>
+        </div>
+        <figure class="fig">
+          <div class="fleet">
+            <canvas id="fleet" width="400" height="400" role="img" aria-label="Ten thousand runs drawn as 200 machines of 50 runs each. With the exception-first view on, healthy runs fade and only the few held, over-budget or silent runs stand out."></canvas>
+            <div>
+              <label class="switch"><input type="checkbox" id="exfirst" checked> Exception-first view</label>
+              <p id="fleetCount" style="font-family:var(--serif);font-size:1.25rem;margin:12px 0 4px">10,000 runs on 200 machines.</p>
+              <p style="color:var(--ink-soft);font-size:.92rem;margin:0">Each block is a machine; each speck is a run. Healthy runs collapse into a count. The handful that matter light up.</p>
+              <ul class="legend">
+                <li><i style="background:var(--honey)"></i> held</li>
+                <li><i style="background:var(--boom)"></i> over budget</li>
+                <li><i style="background:var(--coach-badge)"></i> silent (lease expired)</li>
+                <li><i style="background:var(--line-strong)"></i> healthy</li>
+              </ul>
+            </div>
+          </div>
+          <figcaption>Exception-first at fleet scale. Simulated data, drawn for this keepsake.</figcaption>
+        </figure>
+      </div>
+    </article>
+  </div>
+</section>
+
+<!-- ================= ACT III: HIVE ================= -->
+<section class="hive" id="hive">
+  <div class="comb" aria-hidden="true"></div>
+  <div class="wrap" style="position:relative">
+    <div class="act-head">
+      <span class="act-num">ACT III &middot; NATURE'S SOLUTIONS</span>
+      <h2>The hive already solved this</h2>
+      <p class="lede">A short round, about three prompts, led by you. You picked the animal.</p>
+    </div>
+    <ul class="notes" style="margin-bottom:18px">
+      <li class="n u dec"><span class="tag">your call</span>Run a short Nature's Solutions round (about three prompts, user-led) before converging.</li>
+    </ul>
+    <p class="beequote">The beehive: distinct roles, each bee knows where it goes and what it does; invaders are spotted fast and isolated quickly.<cite>&#11042; your idea</cite></p>
+    <ul class="notes" style="margin-bottom:26px">
+      <li class="n c"><span class="tag">coach insight</span>Two hive mechanisms worth stealing. Guard bees at the entrance check colony scent, identity by smell with no central registry. And intruders too big to remove are sealed in propolis where they stand: contain what you can't kill.</li>
+    </ul>
+
+    <!-- scent -->
+    <div class="card">
+      <h3>Colony scent: the run key</h3>
+      <div class="twocol" style="margin-top:12px">
+        <ul class="notes">
+          <li class="n u big"><span class="tag">your idea</span>Hekma's colony scent: registering, or being owned by hekma run, grants a unique run key that must ride on every request back to Hekma. It expires, and only the original process holds the refresh key.</li>
+          <li class="n u q"><span class="tag">your question</span>Should run keys be optional? Requiring them may break processes that fail to authenticate correctly with Hekma.</li>
+        </ul>
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Guard like a hive: lenient during a nectar flow, strict in robbing season. The scent check is a policy: off, shadow (log unscented calls) or enforce (reject). Dev lenient; prod and regulated strict.</li>
+          <li class="n c"><span class="tag">coach</span>Scent = the run key = the provider virtual key. One credential carries run identity and binding (the customer), so key custody, bypass prevention and contamination checks share one mechanism.</li>
+          <li class="n u dec"><span class="tag">your call</span>You liked the three-level scent check: off / shadow / enforce.</li>
+        </ul>
+      </div>
+      <h3 style="font-size:1.1rem;margin-top:22px">Try the guard</h3>
+      <div class="seg" role="radiogroup" aria-label="Scent check level">
+        <label><input type="radio" name="scent" value="off"><span>off</span></label>
+        <label><input type="radio" name="scent" value="shadow"><span>shadow</span></label>
+        <label><input type="radio" name="scent" value="enforce" checked><span>enforce</span></label>
+      </div>
+      <div class="entrance" id="entrance" data-mode="enforce" aria-hidden="true">
+        <div class="lane"><span class="lbl">call with run key</span><span class="call"></span><span class="guard">key</span></div>
+        <div class="lane unscented"><span class="lbl">call without a key</span><span class="call"></span><span class="guard">key</span><span class="logged">logged</span></div>
+      </div>
+      <p class="outcome" id="outcome" aria-live="polite"><b>Enforce</b> (prod, regulated): the unscented call is turned away at the entrance. Keyed calls pass as always.</p>
+    </div>
+
+    <!-- propolis -->
+    <div class="card">
+      <h3>Propolis: make it loud, then seal only what you must</h3>
+      <div class="twocol" style="margin-top:12px">
+        <ul class="notes">
+          <li class="n u big"><span class="tag">your idea</span>Hekma's propolis is to make it loud: an anomaly warning in hekma ps, warn-level telemetry, and a response header telling the agent it is misbehaving or contaminated.</li>
+          <li class="n u"><span class="tag">your insight</span>The responsibility split: the agent or its framework (CrewAI, LangGraph) corrects itself; ops act on the telemetry and build alerting around it. Hekma signals rather than kills.</li>
+        </ul>
+        <ul class="notes">
+          <li class="n c"><span class="tag">coach</span>Graduated propolis: loud (signal only), then seal the outbox (hold only irreversible customer-facing actions while the run keeps working), then seal the subject (block only calls carrying foreign identifiers), then a full hold. Policy picks the level per flow.</li>
+          <li class="n c"><span class="tag">coach</span>A self-heal contract: a contamination header names a standard remedy that frameworks can implement: drop memory, re-fetch context, resume from the last clean checkpoint.</li>
+        </ul>
+      </div>
+      <div class="propolis" style="margin-top:20px">
+        <svg viewBox="-110 -120 220 240" role="img" aria-labelledby="propT">
+          <title id="propT">Concentric hexagon rings around an intruder, sealing inward as the level rises</title>
+          <polygon class="ringp" data-r="4" points="0,-110 95.3,-55 95.3,55 0,110 -95.3,55 -95.3,-55"/>
+          <polygon class="ringp" data-r="3" points="0,-82 71,-41 71,41 0,82 -71,41 -71,-41"/>
+          <polygon class="ringp" data-r="2" points="0,-56 48.5,-28 48.5,28 0,56 -48.5,28 -48.5,-28"/>
+          <polygon class="ringp" data-r="1" points="0,-32 27.7,-16 27.7,16 0,32 -27.7,16 -27.7,-16"/>
+          <circle r="11" fill="#ff8a65"/>
+          <circle r="11" fill="none" stroke="#ff8a65" stroke-width="2" opacity=".5"><animate attributeName="r" values="11;26;11" dur="2.4s" repeatCount="indefinite"/><animate attributeName="opacity" values=".6;0;.6" dur="2.4s" repeatCount="indefinite"/></circle>
+        </svg>
+        <div>
+          <div class="range-row">
+            <input class="range" type="range" min="1" max="4" step="1" value="1" id="seal" aria-label="Sealing level" aria-valuetext="Loud">
+            <output for="seal" id="sealOut">1 &middot; Loud</output>
+          </div>
+          <ol class="levels" id="levels">
+            <li data-l="1" class="on"><span><b>Loud.</b> Signal only: ps warning, warn telemetry, a response header. The run keeps going.</span></li>
+            <li data-l="2"><span><b>Seal the outbox.</b> Hold only irreversible customer-facing actions; the run keeps working.</span></li>
+            <li data-l="3"><span><b>Seal the subject.</b> Block only the calls that carry another subject's identifiers.</span></li>
+            <li data-l="4"><span><b>Full hold.</b> The whole run is sealed in place.</span></li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CONVERGENCE ================= -->
+<section class="conv" id="convergence">
+  <div class="wrap">
+    <div class="act-head">
+      <span class="act-num">CONVERGENCE &middot; AFFINITY CLUSTERING, THEN MOSCOW</span>
+      <h2>Seven cells, one comb</h2>
+      <p class="lede">Everything above settled into seven themes. Capped honey is what you chose for the next horizon; open wax is planned for later. The run key sits in the middle, because everything else leans on it.</p>
+    </div>
+    <div class="flower">
+      <svg viewBox="84 46 332 328" role="img" aria-labelledby="flT">
+        <title id="flT">Seven themes as a honeycomb. Now: A, B, C at the centre, and the core of G. Later: D, E, F.</title>
+        <defs>
+          <polygon id="cellp" points="0,-56 48.5,-28 48.5,28 0,56 -48.5,28 -48.5,-28"/>
+          <linearGradient id="gHalf" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" style="stop-color:var(--wax)"/><stop offset=".5" style="stop-color:var(--wax)"/>
+            <stop offset=".5" style="stop-color:var(--honey)"/><stop offset="1" style="stop-color:var(--honey)"/>
+          </linearGradient>
+        </defs>
+        <a href="#t-A"><use href="#cellp" class="cell now" x="198" y="120"/><text class="L now-t" x="198" y="122">A</text><text class="W now-t" x="198" y="145">One plane</text></a>
+        <a href="#t-B"><use href="#cellp" class="cell now" x="302" y="120"/><text class="L now-t" x="302" y="122">B</text><text class="W now-t" x="302" y="145">Depth</text></a>
+        <a href="#t-F"><use href="#cellp" class="cell later" x="146" y="210"/><text class="L later-t" x="146" y="212">F</text><text class="W later-t" x="146" y="235">Proof</text></a>
+        <a href="#t-C"><use href="#cellp" class="cell now" x="250" y="210"/><text class="L now-t" x="250" y="212">C</text><text class="W now-t" x="250" y="235">Run keys</text></a>
+        <a href="#t-G"><use href="#cellp" class="cell half" x="354" y="210"/><text class="L later-t" x="354" y="205">G</text><text class="W now-t" x="354" y="240">core now</text></a>
+        <a href="#t-E"><use href="#cellp" class="cell later" x="198" y="300"/><text class="L later-t" x="198" y="302">E</text><text class="W later-t" x="198" y="325">Safety</text></a>
+        <a href="#t-D"><use href="#cellp" class="cell later" x="302" y="300"/><text class="L later-t" x="302" y="302">D</text><text class="W later-t" x="302" y="325">Policy</text></a>
+      </svg>
+      <div>
+        <ul class="keytable">
+          <li><i style="background:var(--honey)"></i><span><b>Capped honey</b>: the next horizon</span></li>
+          <li><i style="background:linear-gradient(180deg,var(--wax) 50%,var(--honey) 50%);outline:1px solid var(--honey-deep)"></i><span><b>Half capped</b>: G's core now, the rest later</span></li>
+          <li><i style="background:var(--line-strong)"></i><span><b>Open wax</b>: planned for later</span></li>
+        </ul>
+        <ul class="notes" style="margin-top:16px">
+          <li class="n c"><span class="tag">coach insight</span>Clusters: A uniform control plane; B control depth and attach; C run identity and keys (scent); D policy that never breaks prod; E customer safety at the wire; F proof and compliance; G operability and scale.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="draft">
+      <div class="paper">
+        <span class="stampx">draft</span>
+        <p class="kicker" style="margin:0;color:inherit">The coach's proposed MoSCoW</p>
+        <dl>
+          <dt>Must</dt><dd>A, B, C, and G-core (shim per run, durable registry)</dd>
+          <dt>Should</dt><dd>D (two-layer policy, header spec, loud by default) and E (run binding, outbox)</dd>
+          <dt>Could</dt><dd>F (ledger, evidence pack, approval gates, residency) and canaries</dd>
+          <dt>Won't now</dt><dd>Four-eyes changes; a fleet hub at millions-of-runs scale</dd>
+        </dl>
+      </div>
+      <div class="call">
+        <p class="kicker" style="margin:0;color:inherit">&#11042; Your call, which stands</p>
+        <p class="big">Next horizon: A, B, C and G-core.<br>D, E and F planned for later.</p>
+        <p style="margin:8px 0 0;font-size:.92rem">And the value proposition, accepted as written. It waits at the end of the page.</p>
+      </div>
+    </div>
+
+    <div class="horizon">
+      <div class="band now">
+        <div class="band-head"><h3>Now</h3><span>next horizon</span></div>
+        <div class="themes">
+          <article class="theme" id="t-A"><span class="lt" aria-hidden="true">A</span><h4>One control plane</h4><p>Same verbs, ps to budget, for CrewAI, LangGraph, Hermes, OpenCode or a raw model call. Swap the engine, keep the dashboards and runbooks. Nodes everywhere, a hub over the tailnet.</p><div class="seeds"><span class="seed u">one consistent interface</span><span class="seed u">tailnet estate</span><span class="seed u">agent multiplexer</span><span class="seed c">same verbs</span></div></article>
+          <article class="theme" id="t-B"><span class="lt" aria-hidden="true">B</span><h4>Control depth and attach</h4><p>Observed, wire, registered, supervised, shown honestly in a CONTROL column. Leases keep ps truthful; self-announce promotes discovered runs; the wire hold pauses without an SDK.</p><div class="seeds"><span class="seed u">attach-only limits</span><span class="seed c">ladder</span><span class="seed c">leases</span><span class="seed c">wire hold</span></div></article>
+          <article class="theme" id="t-C"><span class="lt" aria-hidden="true">C</span><h4>Run identity and key custody</h4><p>The colony scent: a run key on every request, refreshable only by its process, doubling as the provider virtual key. Off, shadow or enforce. Bypass has no credentials.</p><div class="seeds"><span class="seed u">run key</span><span class="seed u">Hermes bypass</span><span class="seed u">off / shadow / enforce</span><span class="seed c">key custody</span></div></article>
+          <article class="theme" id="t-G"><span class="lt" aria-hidden="true">G</span><h4>Operability, the core</h4><p>A tiny shim owns each process, so the daemon can crash, restart or upgrade and reattach. Runs, budgets and leases are journaled to disk. Later: selectors, exception-first views, rollups, cardinality discipline.</p><div class="seeds"><span class="seed u">crash risk</span><span class="seed u">duration principle</span><span class="seed c">shim per run</span><span class="seed c">durable registry</span></div></article>
+        </div>
+      </div>
+      <div class="band later">
+        <div class="band-head"><h3>Later</h3><span>planned, not dropped</span></div>
+        <div class="themes">
+          <article class="theme" id="t-D"><span class="lt" aria-hidden="true">D</span><h4>Policy that never breaks prod</h4><p>Callers declare, operators bound. Live policy, shadow and canary rollout, budget headers and an open header spec, loud by default, windowed budgets, pinned versions.</p><div class="seeds"><span class="seed u">flow-declared policy</span><span class="seed u">non-negotiables</span><span class="seed c">two-layer</span></div></article>
+          <article class="theme" id="t-E"><span class="lt" aria-hidden="true">E</span><h4>Customer safety at the wire</h4><p>Run binding, tool-argument contracts, a customer-facing outbox, subject-scoped runs, intake preflight, quarantine and resume, graduated sealing.</p><div class="seeds"><span class="seed u">three fears</span><span class="seed u">bad input</span><span class="seed c">run binding</span></div></article>
+          <article class="theme" id="t-F"><span class="lt" aria-hidden="true">F</span><h4>Proof and compliance</h4><p>A tamper-evident ledger, evidence packs, approval gates with named approvers, egress and residency control, four-eyes changes, contamination canaries.</p><div class="seeds"><span class="seed u">auditor's view</span><span class="seed c">ledger</span><span class="seed c">evidence pack</span></div></article>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CLIMAX ================= -->
+<section class="climax" id="synthesis">
+  <div class="comb" aria-hidden="true"></div>
+  <div class="wrap" style="position:relative">
+    <p class="act-num" style="text-align:center">THE SYNTHESIS</p>
+    <div class="vp">
+      <blockquote>
+        Hekma is <span class="cp">the control plane for agent workloads</span>:
+        <span class="verbs">one way to <b>run</b>, <b>see</b> and <b>steer</b> any agent,</span>
+        from a laptop to a fleet,
+        <span class="vow">without ever being the reason prod stops.</span>
+      </blockquote>
+      <ul class="runtimes" aria-label="Any agent">
+        <li>CrewAI</li><li>LangGraph</li><li>Hermes</li><li>OpenCode</li><li>a raw model call</li>
+      </ul>
+      <div class="waxseal" role="img" aria-label="Accepted: your call"><span><b>Accepted</b>your call</span></div>
+    </div>
+
+    <h3 class="subt" style="font-size:clamp(1.6rem,4vw,2.3rem)">The keystone</h3>
+    <div class="keystone">
+      <div class="k-head"><h3 style="font-size:1.35rem">The run key is one idea wearing four hats</h3><span>theme C</span></div>
+      <svg class="keysvg" viewBox="0 0 620 170" role="img" aria-labelledby="keyT">
+        <title id="keyT">A key with four numbered tags hanging from its shaft</title>
+        <circle cx="70" cy="62" r="44" fill="none" stroke="#f5b82e" stroke-width="16"/>
+        <polygon points="70,40 89,51 89,73 70,84 51,73 51,51" fill="#f5b82e"/>
+        <rect x="112" y="54" width="440" height="16" rx="8" fill="#f5b82e"/>
+        <rect x="500" y="66" width="16" height="32" rx="3" fill="#f5b82e"/>
+        <rect x="528" y="66" width="16" height="22" rx="3" fill="#f5b82e"/>
+        <rect x="472" y="66" width="12" height="26" rx="3" fill="#f5b82e"/>
+        <g stroke="#cdb88f" stroke-width="1.5" fill="none">
+          <path d="M170 70 L160 120"/><path d="M260 70 L262 128"/><path d="M350 70 L356 120"/><path d="M430 70 L440 128"/>
+        </g>
+        <g font-family="ui-monospace,Menlo,monospace" font-weight="700" font-size="15" text-anchor="middle">
+          <polygon points="160,108 176,117 176,135 160,144 144,135 144,117" fill="#f5b82e"/><text x="160" y="131" fill="#1a1206">1</text>
+          <polygon points="262,116 278,125 278,143 262,152 246,143 246,125" fill="#f5b82e"/><text x="262" y="139" fill="#1a1206">2</text>
+          <polygon points="356,108 372,117 372,135 356,144 340,135 340,117" fill="#f5b82e"/><text x="356" y="131" fill="#1a1206">3</text>
+          <polygon points="440,116 456,125 456,143 440,152 424,143 424,125" fill="#f5b82e"/><text x="440" y="139" fill="#1a1206">4</text>
+        </g>
+      </svg>
+      <ol class="hats">
+        <li>It ends the bypass.<small>No real provider key, nothing to go around Hekma with.</small></li>
+        <li>It makes ps accurate in attach mode.<small>Scent on every request means the run is known.</small></li>
+        <li>It carries the run binding.<small>The customer rides with the key, against contamination.</small></li>
+        <li>It carries the flow policy.<small>Your framework-declared rules travel with it.</small></li>
+      </ol>
+      <p class="prepay">Building C now pre-pays D and E.</p>
+    </div>
+
+    <div class="trio" style="margin-top:18px">
+      <div class="keystone">
+        <div class="k-head"><span>tension resolved</span></div>
+        <h3>The wire hold is the checkpoint</h3>
+        <p>Holding the next model call pauses a framework run with its state intact and no SDK. Loud by default plus graduated sealing reconciles "no prod shutdowns" with the auditor's fears.</p>
+      </div>
+      <div class="keystone">
+        <div class="k-head"><span>one product</span></div>
+        <h3>Solo multiplexer and million-run fleet</h3>
+        <p>hekma top at scale is selectors plus exception-first views. The tailnet hub is the bridge between your laptop and the fleet.</p>
+      </div>
+      <div class="keystone">
+        <div class="k-head"><span>three voices, one answer</span></div>
+        <h3>Shim per run plus a durable registry</h3>
+        <p>It answers your crash risk, the months-long run, and the VP Eng's "no unexpected shutdowns" at once.</p>
+      </div>
+    </div>
+
+    <h3 class="subt" style="font-size:clamp(1.6rem,4vw,2.3rem)">Principles the session left behind</h3>
+    <ol class="principles">
+      <li><b>Never be the reason prod stops.</b><span>A pause strands where a crash restarts. Keep the work moving.</span><span class="src"><i class="u">you</i><i class="c">coach</i></span></li>
+      <li><b>Duration changes nothing; only a policy breach does.</b><span>A run that lasts months runs like one that lasts minutes.</span><span class="src"><i class="u">you</i></span></li>
+      <li><b>Signal, don't kill.</b><span>Make it loud. Frameworks self-correct; ops alert on the telemetry.</span><span class="src"><i class="u">you</i></span></li>
+      <li><b>Callers declare, operators bound.</b><span>Flows send their own policy; Hekma's non-negotiables cap it.</span><span class="src"><i class="u">you</i><i class="c">coach</i></span></li>
+      <li><b>Control the run, not the process.</b><span>Blast radius of one: act on a flow without touching its neighbours.</span><span class="src"><i class="u">you</i><i class="c">coach</i></span></li>
+      <li><b>Config is live data.</b><span>No redeploys to change how Hekma behaves.</span><span class="src"><i class="u">you</i></span></li>
+      <li><b>Know the session, not just the call.</b><span>Complement the gateway; bind every call to the run that made it.</span><span class="src"><i class="u">you</i><i class="c">coach</i></span></li>
+      <li><b>Consistency is checkable at the wire; correctness is not.</b><span>Judge what the run declared, not what is true.</span><span class="src"><i class="c">coach</i></span></li>
+      <li><b>OTel-first, UI-optional.</b><span>The CLI is for emergencies; dashboards live where teams already look.</span><span class="src"><i class="u">you</i><i class="c">coach</i></span></li>
+      <li><b>Worth adopting is the bar.</b><span>Open source: the question is adoption, not price.</span><span class="src"><i class="u">you</i></span></li>
+    </ol>
+
+    <h3 class="subt" style="font-size:clamp(1.6rem,4vw,2.3rem)">Cells still open</h3>
+    <div class="questions">
+      <div class="qcell"><span class="qm" aria-hidden="true">?</span><h4>The OSS business model</h4><p>Adoption first. Monetisation was out of scope for this session and stays open.</p></div>
+      <div class="qcell"><span class="qm" aria-hidden="true">?</span><h4>Pinned or follow-latest?</h4><p>When ops change a policy, does a long run follow it? Leaning: pinned by default, opt-in follow-latest, recorded in the ledger.</p></div>
+      <div class="qcell"><span class="qm" aria-hidden="true">?</span><h4>Real CrewAI and LangGraph attach paths</h4><p>Base-URL override and self-announce need validating with real flows before they are called first-class.</p></div>
+      <div class="qcell answered"><span class="qm" aria-hidden="true">&#x2713;</span><h4>Should run keys be optional?</h4><p>Your question, answered in the hive: a scent check per policy, off, shadow or enforce.</p></div>
+      <div class="qcell worry"><span class="qm" aria-hidden="true">&#11042;</span><h4>Your parting worry</h4><p>The session surfaced serious gaps against Hekma today, and the plan must not miss anything. The seven cells above are the map of those gaps.</p></div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p><b>Hekma value-proposition pivot</b> &middot; BMAD brainstorming, Creative Partner mode &middot; 29 October 2026, closed at 23:39 &middot; status complete.</p>
+    <p>Techniques: Role Playing, What If Scenarios, Nature's Solutions, then affinity clustering and MoSCoW. Drawn from the session's own log; where an earlier proposal and a later decision differ, the decision wins.</p>
+    <div class="legend-row">
+      <span class="n u"><span class="tag">yours</span>filled honey cell</span>
+      <span class="n c"><span class="tag">coach</span>open wax cell</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var root = document.documentElement;
+
+  /* spotlight */
+  var spot = document.getElementById('spot');
+  spot.addEventListener('click', function(){
+    var on = spot.getAttribute('aria-pressed') !== 'true';
+    spot.setAttribute('aria-pressed', on ? 'true' : 'false');
+    document.body.classList.toggle('spot', on);
+  });
+
+  /* voice tabs */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+  function select(t, focus){
+    tabs.forEach(function(x){
+      var sel = x === t;
+      x.setAttribute('aria-selected', sel ? 'true' : 'false');
+      x.tabIndex = sel ? 0 : -1;
+      document.getElementById(x.getAttribute('aria-controls')).hidden = !sel;
+    });
+    if (focus) t.focus();
+  }
+  if (tabs.length) select(tabs[0]);
+  tabs.forEach(function(t, i){
+    t.addEventListener('click', function(){ select(t); });
+    t.addEventListener('keydown', function(e){
+      var k = e.key, j = null;
+      if (k === 'ArrowRight' || k === 'ArrowDown') j = (i + 1) % tabs.length;
+      else if (k === 'ArrowLeft' || k === 'ArrowUp') j = (i - 1 + tabs.length) % tabs.length;
+      else if (k === 'Home') j = 0;
+      else if (k === 'End') j = tabs.length - 1;
+      if (j !== null){ e.preventDefault(); select(tabs[j], true); }
+    });
+  });
+
+  /* detonations */
+  Array.prototype.forEach.call(document.querySelectorAll('.boom .fuse'), function(b){
+    b.addEventListener('click', function(){
+      var card = b.closest('.boom');
+      var open = card.classList.contains('blown');
+      if (open){ card.classList.remove('blown'); b.setAttribute('aria-expanded','false'); b.textContent = 'Light the fuse'; return; }
+      card.classList.add('blown');
+      b.setAttribute('aria-expanded','true');
+      b.textContent = 'Rebuild';
+      if (card.id === 'boom-4') requestAnimationFrame(drawFleet);
+    });
+  });
+
+  /* scent guard */
+  var entrance = document.getElementById('entrance');
+  var outcome = document.getElementById('outcome');
+  var msgs = {
+    off: '<b>Off</b> (lenient, like a nectar flow): the unscented call walks straight in and nobody notes it.',
+    shadow: '<b>Shadow</b>: the unscented call still passes, but it is logged as one that enforce would have rejected.',
+    enforce: '<b>Enforce</b> (prod, regulated): the unscented call is turned away at the entrance. Keyed calls pass as always.'
+  };
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="scent"]'), function(r){
+    r.addEventListener('change', function(){
+      entrance.setAttribute('data-mode', r.value);
+      outcome.innerHTML = msgs[r.value];
+    });
+  });
+
+  /* propolis */
+  var seal = document.getElementById('seal');
+  var sealOut = document.getElementById('sealOut');
+  var names = ['', 'Loud', 'Seal the outbox', 'Seal the subject', 'Full hold'];
+  function setSeal(v){
+    v = +v;
+    sealOut.textContent = v + ' · ' + names[v];
+    seal.setAttribute('aria-valuetext', names[v]);
+    Array.prototype.forEach.call(document.querySelectorAll('#levels li'), function(li){
+      li.classList.toggle('on', +li.getAttribute('data-l') <= v);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll('.ringp'), function(p){
+      var r = +p.getAttribute('data-r');
+      p.classList.toggle('loud', v === 1 && r === 4);
+      /* seal from the inside out: level 2 seals ring 1, level 4 seals all */
+      p.classList.toggle('on', v >= 2 && r <= (v === 4 ? 4 : v - 1));
+    });
+  }
+  seal.addEventListener('input', function(){ setSeal(seal.value); });
+  setSeal(1);
+
+  /* fleet canvas */
+  var cv = document.getElementById('fleet');
+  var ex = document.getElementById('exfirst');
+  var count = document.getElementById('fleetCount');
+  var seed = 7, runs = [];
+  function rnd(){ seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }
+  for (var i = 0; i < 10000; i++){
+    var x = rnd(), s = 0;
+    if (x < 0.0011) s = 1; else if (x < 0.0019) s = 2; else if (x < 0.0026) s = 3;
+    runs.push(s);
+  }
+  var flagged = runs.filter(function(s){ return s; }).length;
+  function tok(n){ return getComputedStyle(root).getPropertyValue(n).trim(); }
+  function drawFleet(){
+    if (!cv || !cv.getContext) return;
+    var w = cv.clientWidth || 400;
+    var dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(w * dpr); cv.height = Math.round(w * dpr);
+    var c = cv.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, w, w);
+    var gap = Math.max(2, w / 110);
+    var cell = (w - 9 * gap) / 100;
+    var cellH = (w - 19 * gap) / 100;
+    var cols = { 0: tok('--line-strong'), 1: tok('--honey'), 2: tok('--boom'), 3: tok('--coach-badge') };
+    var exOn = ex.checked;
+    var hot = [];
+    for (var m = 0; m < 200; m++){
+      var mx = (m % 10) * (10 * cell + gap), my = Math.floor(m / 10) * (5 * cellH + gap);
+      for (var r = 0; r < 50; r++){
+        var st = runs[m * 50 + r];
+        var px = mx + (r % 10) * cell, py = my + Math.floor(r / 10) * cellH;
+        if (st){ hot.push([px, py, st]); continue; }
+        c.globalAlpha = exOn ? 0.12 : 0.75;
+        c.fillStyle = cols[0];
+        c.fillRect(px + 0.3, py + 0.3, Math.max(cell - 0.6, 0.6), Math.max(cellH - 0.6, 0.6));
+      }
+    }
+    c.globalAlpha = 1;
+    hot.forEach(function(h){
+      c.fillStyle = cols[h[2]];
+      var pad = exOn ? cell * 0.9 : 0;
+      c.fillRect(h[0] - pad, h[1] - pad, cell + 2 * pad, cellH + 2 * pad);
+    });
+    count.textContent = exOn
+      ? (10000 - flagged).toLocaleString('en-US') + ' healthy runs, shown as a count. ' + flagged + ' worth a look.'
+      : '10,000 runs on 200 machines. Good luck finding the ' + flagged + '.';
+  }
+  ex.addEventListener('change', drawFleet);
+  var rt; window.addEventListener('resize', function(){ clearTimeout(rt); rt = setTimeout(drawFleet, 120); });
+  if (window.matchMedia){
+    var mq = window.matchMedia('(prefers-color-scheme: dark)');
+    if (mq.addEventListener) mq.addEventListener('change', drawFleet);
+  }
+  drawFleet();
+})();
+</script>
+</body>
+</html>
