@@ -142,7 +142,7 @@ FR-3: Epic 1 — Unregister/remove
 FR-4: Epic 1 — Fleet visibility
 FR-5: Epic 1 — Start
 FR-6: Epic 1 — Stop with escalation
-FR-7: Epic 1 — Pause/resume honesty
+FR-7: Epic 1 — Pause/resume honesty; amendment (wire hold stands in for native pause) → Epic 23 (23.4)
 FR-8: Epic 1 — State machine
 FR-9: Epic 1 — Crash detection + Restart Policy
 FR-10: Epic 1 — State persistence
@@ -154,7 +154,7 @@ FR-15: Epic 5 — Attach/detach Memory Backing
 FR-16: Epic 5 — filesystem + native backings
 FR-17: Epic 5 — Portability boundary
 FR-18: Epic 3 — Token Budgets
-FR-19: Epic 3 — Metering ingestion (both sources)
+FR-19: Epic 3 — Metering ingestion (both sources); amendment (wire, announced and observed metering) → Epic 22 (22.2) + Epic 23 (23.1, 23.3)
 FR-20: Epic 3 — Rate & dollar derivation
 FR-21: Epic 3 — Cost Cap enforcement (pause default)
 FR-22: Epic 3 — Usage & cost visibility
@@ -182,11 +182,11 @@ FR-43: Epic 19 (19.2, 19.4) + Epic 21 (21.2 child Runs) + Epic 23 (23.4) — Gov
 FR-44: Epic 19 (19.1) — Portable governance semantics
 FR-45: Epic 19 (19.5) — Reconciliation with confirmed actuals
 FR-46: Epic 20 (20.1) — OTLP telemetry export
-FR-47: Epic 20 (20.2) — Agents-in-CI recipe
+FR-47: Epic 20 (20.2) — Agents-in-CI recipe; amendment (the recipe sets `stop` explicitly) → Epic 21 (21.3)
 FR-48: Epic 20 (20.3) — Adapter gallery
-FR-49: Epic 21 (21.1, 21.2) — Runs as first-class entities
+FR-49: Epic 21 (21.1, 21.2, 21.9) — Runs as first-class entities
 FR-50: Epic 21 (21.5, 21.6) — Listing and verbs at scale
-FR-51: Epic 23 (23.1, 23.3) + Epic 21 (21.8) + Epic 22 (22.5) — Discovered Runs
+FR-51: Epic 23 (23.1 incl. `hekma binding`, 23.3) + Epic 21 (21.8) + Epic 22 (22.5) — Discovered Runs
 FR-52: Epic 23 (23.2) — Self-announce and Leases
 FR-53: Epic 22 (22.1, 22.2, 22.3) — Run identity and key custody
 FR-54: Epic 22 (22.4) — Bypass detection
@@ -195,7 +195,7 @@ FR-56: Epic 23 (23.4) — Wire hold, release, reroute, reject
 FR-57: Epic 21 (21.7) — `hekma top`
 FR-58: Epic 25 — Nodes and Hub
 FR-59: Epic 24 (24.5) — Telemetry at Run scale
-FR-60: Epic 21 (21.3) — Policies
+FR-60: Epic 21 (21.3, 21.9) — Policies
 FR-21 (2026-10-30 amendment): Epic 21 (21.3) — `warn` default and the upgrade write
 FR-41 (2026-10-30 amendment): Epic 21 (21.4) CLI auto-start + Epic 24 (24.2) Handoff Mode
 
@@ -1289,13 +1289,21 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
 ### Story 19.2: The wire fence — a `block` Breach Action (D4, AD-7 amendment)
 - *(Amended 2026-10-30.)* `block` is never a default Breach Action; once configured it always
   refuses, whatever the Scent-Check Mode (PRD FR-43 amendment). Built on today's per-instance
-  listener so the waiting Host is not blocked on Epic 23; Story 23.4 carries it into the shared
-  proxy's disposition snapshot (AD-26).
+  listener so the waiting Host is not blocked on Epic 23; Story 23.1 carries it into the shared
+  proxy's disposition snapshot so the fence never lapses, and 23.4 reuses its response for `reject`
+  (AD-7, AD-26).
 - On breach, the pipeline flips a lock-free per-instance flag.
 - `forward()` refuses further model calls with a typed, non-retryable response (not 429), until the
   ceiling is raised or reset.
 - The breach event and log record the fence like any action.
 - Docs state its cooperative scope (NFR-6).
+- *(Readiness 2026-10-30.)* The spec records the refusal response as the first slice of `proxy-wire v1`: a
+  status code common SDKs do not retry, a JSON error body with a stable type and code naming
+  dimension and scope, never content (AD-7).
+- The flag is rebuilt from the durable breach record on engine restart and adoption, as the latch
+  is; `block` is refused at configuration on an instance with no listener (self-reported metering).
+- The new `BreachAction` variant is a semver-visible engine change: bump per the armed gate. After
+  21.1 the store writer sets the flag (AD-27).
 
 ### ~~Story 19.3: Task scope — Host units of work~~ *(removed 2026-10-30)*
 Absorbed into Story 21.2 as child Runs: one Run concept, no Task/Run split (PRD FR-43 amendment,
@@ -1304,8 +1312,9 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 ### Story 19.4: Per-call records for Hosts
 - *(Amended 2026-10-30.)* Runs after Stories 22.1 and 23.1: the shared Metering Proxy emits the
   records into the calls store (AD-26, AD-27); this story is their Host read surface.
-- For each proxied call: call id, run id, Control Depth, token id once 22.1 lands, disposition and
-  hold end, status class, latency, model when present, tokens, sub-second timestamp.
+- For each proxied call: call id, run id, Control Depth, token id, disposition (`pass` or `block`
+  until 23.4 lands) and hold end, status class, latency, model when present, tokens, sub-second
+  timestamp.
 - Never request or response content — the sentinel no-leak matrix is extended.
 - Readable through the facade and the Control API.
 
@@ -1385,9 +1394,10 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 > (UJ-4, UJ-5). Batch-epic shape: full ACs are derived at the spec stage. 21.1 and 21.3 are money
 > code (AI-55 two-pass review).
 >
-> **Build order across Epics 19 and 21–25:** 21.1 → 21.2 → 21.3 → 21.4 → 21.5 → 21.6 → 22.1 → 23.1 →
+> **Build order across Epics 19 and 21–25** *(21.9 inserted by the readiness gate, 2026-10-30)*: 21.1 → 21.2 → 21.9 → 21.3 → 21.4 → 21.5 → 21.6 → 22.1 → 23.1 →
 > 19.4 → 22.2 → 22.3 → 23.2 → 23.3 → 23.4 → 21.7 → 21.8 → 22.5 → 24.1 → 22.4 → 24.2 → 24.3 → 24.4 →
-> 24.5 → 25. Story 19.2 may run at any time; 19.5 follows 19.4.
+> 24.5 → 25. Story 19.2 may run at any time but lands before 21.3 (Policies order `block`); 19.5
+> follows 19.4. Decisions behind these stories: `implementation-readiness-2026-10-30.md`.
 
 ### Story 21.1: The store writer and Run-scale storage (AD-27, NFR-4)
 - One store writer task with its own connection becomes the only state.db writer: every write is a
@@ -1401,6 +1411,17 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
   external database; keyset pagination helpers; usage rollups per instance.
 - Dedup keys gain a launch generation, fixing the adoption sequence-reset undercount.
 - A `--serve-shape`-style benchmark harness lands here so every later story measures against NFR-4.
+- *(Readiness 2026-10-30.)* Transition and breach records move into `transition_events` and `breach_events`,
+  committed with the outbox row; `instance.log` and `breaches.log` become best-effort mirrors;
+  `resync_events` reads SQLite; the upgrade imports the existing logs once (D1, AD-27).
+- The writer takes no engine mutex; acked writes flush at once (the 250 ms / 512 bound is for
+  unacked streams); the ack wait is bounded at 1 s, then a typed retryable error; the caller applies
+  returned process actions before releasing its locks (D2, AD-27).
+- `run_latches` keyed by the run id string (no foreign key until 21.2), seeded on upgrade from
+  `breaches.log` for each live instance's current run.
+- Until 21.4 the single-writer rule holds per engine process; cross-process writes keep
+  `BEGIN IMMEDIATE` and the busy timeout.
+- The spec states 21.1's own NFR-4 pass criterion and the harness's seed shape.
 
 ### Story 21.2: Runs as first-class entities (FR-49, FR-43, AD-25)
 - Run registry beside `Supervisor`; `runs`, `run_labels` (bound | caller source), `run_identities`
@@ -1412,19 +1433,41 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 - Depth changes keep the run id and emit an event; new event families for Runs.
 - The verb × Control Depth table is a conformance-tested fixture, filled in as later stories enable
   each cell.
+- *(Readiness 2026-10-30.)* The instance `labels` config key (a map merged per key across the FR-11 layers;
+  no invocation override) gives supervised Runs their bound labels (D3, AD-25).
+- Builds the snapshot publisher (AD-25) with the Run index; 21.3 adds resolved Policies to it.
+- Child Runs here are registry, rollup and cascade bookkeeping, tested with synthetic
+  run-attributed usage; a Host-opened child is `announced` with no Lease until 23.2; before 23.4 a
+  `parent-paused` cascade records Run Status `held` with its cause. Attributed calls to a child
+  land in 23.1.
+- The spec writes the Run Status transition table for supervised and child Runs and the set/clear
+  rule for each Anomaly; the upgrade backfills the live run as a `supervised` Run with its legacy
+  id and historical ids as `ended` Runs; a release note says per-run budgets no longer reset on a
+  crash relaunch.
+- Ancestor ceilings extend the Governance Vectors additively with a `vectors_version` bump.
 
 ### Story 21.3: Policies, the default Policy and the `warn` default (FR-60, FR-21, AD-7, AD-25)
 - `policies` table and the pure Policy-resolution function in the domain core: explicit limits
   first, most specific Selector per limit, ties to the tightest, then the default Policy; bound
   labels only; Caller limits apply only while tighter.
 - The stored, editable `default` Policy carries the default Breach Action (`warn`), the
-  environment's Scent-Check default and the model-keyed Rate table.
+  Scent-Check Mode seeded `off` until 22.3 decides Q9, and the model-keyed Rate table.
 - The upgrade migration writes `pause` for instances relying on the implicit default, with the store
   marker, the "kept on pause by upgrade" note and one `breach_default_upgraded` event; a malformed
   `breach_action` fails closed to `pause`.
 - A Policy Breach Action a Run's depth cannot execute falls back to `warn` plus an Anomaly; create /
   change reports the fallback count.
 - `hekma policy` and `/v0/policies` CRUD; every change is an event.
+- *(Readiness 2026-10-30.)* Policies follow the latest (PRD Q11 interim): a change re-resolves every matched
+  open Run in the writer's next batch; lowering below usage breaches at once, raising re-arms.
+  Resolved Policies join the published snapshot.
+- The upgrade write is crash-safe: a pending list in state.db first, idempotent `config.toml`
+  writes under their locks, then markers, event and list cleared in one transaction; an unwritable
+  config keeps `pause` through its marker (AD-7).
+- The spec records the Rate table's contents and model matching; a Policy Cost Cap on an unpriced
+  model raises an Anomaly instead of staying silently inert.
+- Updates the agents-in-CI recipe and the dogfood lane to set `stop` explicitly and drops the
+  "`pause` (the default)" wording (FR-47 amendment, NFR-7).
 
 ### Story 21.4: One data-path owner — the CLI routes through a local Service Host (FR-41, AD-20)
 - When no Service Host runs, the first CLI command needing a write or the proxy auto-starts a
@@ -1435,6 +1478,8 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 - A non-loopback Control API bind requires TLS and is refused at start without it.
 - Existing CLI behaviour and exit codes stay the same from the user's side; agents now outlive the
   terminal.
+- *(Readiness 2026-10-30.)* The spec lists the Control API routes added for each CLI write the frozen
+  projection lacks (send, memory, restart policy).
 
 ### Story 21.5: `hekma ps` and Run listing (FR-50)
 - `hekma ps`: run id or name, CONTROL column, Run Status, Anomalies, labels with source, usage and
@@ -1450,7 +1495,8 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
   matched set and confirms; the Control API returns the set with a token and acts on exactly that
   set, reporting success or failure per Run.
 - `hekma budget` reads, sets and raises Token Budgets and Cost Caps on matched Runs; raising
-  re-arms the latch (the 19.3 re-arm, landed here).
+  re-arms the latch (the 19.3 re-arm, landed here), extending the Governance Vectors additively
+  with a `vectors_version` bump.
 - Only Operator or Host credentials raise a ceiling.
 
 ### Story 21.7: `hekma top` (FR-57)
@@ -1458,11 +1504,20 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
   left; refresh ≤ 2 s; exception-first and Selector-filterable at scale.
 - Hotkeys pause, stop, hold, raise a limit and attach, each confirming as the CLI verb does.
 - Points at a local or remote Service Host (and later a Hub).
+- *(Readiness 2026-10-30.)* Attach needs raw output over the Control API, which FR-41 allows only when
+  explicitly enabled: record that switch and its authority in AD-20 before this story starts.
 
 ### Story 21.8: Gateway complement — identity headers and recipes (FR-51, PRD §8)
 - Operator-switchable outbound identity headers (run id and labels, never content) on forwarded
   calls.
 - Docs recipes for Hekma in front of LiteLLM and Portkey; the "not a model gateway" line stated.
+
+### Story 21.9: Bound labels — `hekma label` (FR-49, FR-60, AD-20, AD-25)
+- *(Added by the readiness gate, 2026-10-30, ruled by Islam as D3.)* Runs after 21.2 and before
+  21.3, so Policies have bound labels to select.
+- `hekma label` sets and removes bound labels on Runs, with `--selector`, `--dry-run` and `--yes`
+  like every Run verb; `/v0/runs/{id}/labels` mirrors it; Operator bearer only.
+- A Caller can never set a bound key; each change is an event and re-resolves the Run's Policies.
 
 ## Epic 22: Run Identity and Key Custody
 
@@ -1493,7 +1548,9 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 ### Story 22.3: Scent-Check Modes (FR-53)
 - `off` / `shadow` / `enforce` per Policy; unscented calls are an Anomaly and an OTLP counter;
   `enforce` refuses with a typed response.
-- Decides PRD §13 Q9 (defaults per environment) in the spec and records it in the default Policy.
+- Decides PRD §13 Q9 (defaults per environment, redefined now that every CLI write routes through a
+  Service Host) in the spec and records it in the default Policy, never overwriting a default
+  Policy the Operator has edited (seeded `off` by 21.3).
 - A Caller can never lower the mode.
 
 ### Story 22.4: Bypass detection in the Shim (FR-54, AD-23)
@@ -1505,7 +1562,8 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 
 ### Story 22.5: An authenticated proxy beyond loopback (FR-51, AD-20, AD-26)
 - TLS required for any non-loopback proxy bind; proxy-access credentials per endpoint binding
-  (hashed, swapped for the binding's custodied key, not a Scent-Check identity).
+  (issued through `hekma binding`, shown once, hashed, swapped for the binding's custodied key, not
+  a Scent-Check identity).
 - Port-squatting limit and the socket-activation recommendation in the docs.
 
 ## Epic 23: Attach and Wire Control
@@ -1524,6 +1582,13 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
 - Reads only the published snapshot: no engine mutex, no SQLite on the hot path; Run creation on a
   first call awaits the writer with a bound.
 - `proxy-wire v1` documented in `docs/` (PRD §7 item 6).
+- *(Readiness 2026-10-30.)* `hekma binding` and `/v0/bindings` create endpoint bindings (path prefix, upstream
+  origin, bound labels, optional custodied key), their reroute routes and per-binding announce and
+  proxy-access credentials; Operator bearer only; each change is an event (D3, AD-20).
+- Carries 19.2's `block` into the snapshot with the same response, so the fence never lapses.
+- Creates the calls store (AD-27) and its first producer.
+- Calls carrying a child's identity (Run Key or a hint beneath the parent's identity) are
+  attributed to the child Run; calls without one stay on the parent.
 
 ### Story 23.2: Self-announce, run identities and Leases (FR-52)
 - Announce header (returns Run Key and refresh credential after publish), Run-scoped announce
@@ -1545,8 +1610,8 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
   clears only its own reason.
 - Holds queue a Run's new calls in arrival order with a per-Run cap (typed hold-full response plus
   an Anomaly); hold end causes recorded; held count and oldest age reach `hekma ps`.
-- Reroute to configured routes (a custodied key never leaves its origin); reject is the typed
-  non-retryable response and carries 19.2's `block` into the shared proxy.
+- Reroute to routes configured through `hekma binding` (a custodied key never leaves its origin);
+  reject reuses 19.2's typed non-retryable response.
 - The FR-7 amendment: a wire hold may stand in for native pause, surfaced as qualified.
 
 ## Epic 24: Operability at Scale
