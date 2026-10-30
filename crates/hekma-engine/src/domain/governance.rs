@@ -55,7 +55,7 @@ pub const GOVERNANCE_VECTORS_ARTIFACT_PATH: &str = "crates/hekma-engine/governan
 /// release notes (the pinning contract, docs/governance.md). Mirrored inside
 /// the artifact's `vectors_version` field by the generator — they cannot
 /// drift.
-pub const GOVERNANCE_VECTORS_VERSION: &str = "1.0.0";
+pub const GOVERNANCE_VECTORS_VERSION: &str = "1.1.0";
 
 /// The artifact's schema version — `1` until the DOCUMENT shape itself
 /// changes (a breaking schema change is a major `vectors_version` bump).
@@ -63,12 +63,13 @@ pub const GOVERNANCE_VECTORS_SCHEMA_VERSION: u32 = 1;
 
 /// The provenance list — the engine symbols every case is generated from and
 /// verified against (fixed order; the byte-compare pins it).
-const GENERATED_FROM: [&str; 5] = [
+const GENERATED_FROM: [&str; 6] = [
     "BudgetEvaluator",
     "CostEvaluator",
     "cost_micros",
     "cost_micros_with_cached",
     "governance::decide",
+    "governance::fence_refusal",
 ];
 
 // ---------------------------------------------------------------------------
@@ -326,6 +327,84 @@ fn fire_unless_latched(
 }
 
 // ---------------------------------------------------------------------------
+// The wire fence — `block`'s decision consumer (story 19-2)
+// ---------------------------------------------------------------------------
+
+/// The HTTP status of the fence refusal (`proxy-wire v1`, story 19-2):
+/// **402 Payment Required**. Common SDKs (OpenAI, Anthropic, the Vercel AI
+/// SDK) retry 408, 409, 429 and 5xx — never 402 — so a fenced agent fails
+/// fast instead of hammering the listener; 403 is avoided because agents
+/// read it as a credential failure.
+pub const FENCE_REFUSAL_STATUS: u16 = 402;
+
+/// The refusal body's stable error class (`error.type`) — the same for every
+/// fence reason; `error.code` names the reason.
+pub const FENCE_ERROR_TYPE: &str = "hekma_budget_block";
+
+/// The `proxy-wire` contract version the refusal belongs to (story 19-2
+/// ships its first slice; story 23-1 documents the rest unchanged).
+pub const PROXY_WIRE_VERSION: &str = "v1";
+
+/// The canonical fence-reason order: tokens before dollars (the
+/// `token-before-dollar` rule), per-run before cumulative (the evaluators'
+/// scope precedence). The refusal names the FIRST raised reason in this
+/// order, and the listener's reason bitmask uses each reason's index here
+/// as its bit.
+pub const FENCE_REASON_ORDER: [LatchKey; 4] = [
+    LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+    LatchKey::new(BreachDimension::Tokens, BreachScope::Cumulative),
+    LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun),
+    LatchKey::new(BreachDimension::Dollars, BreachScope::Cumulative),
+];
+
+/// The stable `error.code` for one fence reason — dimension and scope in the
+/// snake_case code convention OpenAI-compatible clients expect.
+pub fn fence_code(reason: LatchKey) -> &'static str {
+    match (reason.dimension, reason.scope) {
+        (BreachDimension::Tokens, BreachScope::PerRun) => "tokens_per_run",
+        (BreachDimension::Tokens, BreachScope::Cumulative) => "tokens_cumulative",
+        (BreachDimension::Dollars, BreachScope::PerRun) => "dollars_per_run",
+        (BreachDimension::Dollars, BreachScope::Cumulative) => "dollars_cumulative",
+    }
+}
+
+/// What a fenced listener answers (story 19-2): the status, the stable error
+/// class and code, and the reason it reports. Pinned by the vectors'
+/// `fence` cases, so a Host's guard and the engine refuse identically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRefusal {
+    /// The HTTP status — always [`FENCE_REFUSAL_STATUS`].
+    pub status: u16,
+    /// The body's `error.type` — always [`FENCE_ERROR_TYPE`].
+    pub error_type: String,
+    /// The body's `error.code` — [`fence_code`] of the reported reason.
+    pub code: String,
+    /// The reported reason's dimension.
+    pub dimension: BreachDimension,
+    /// The reported reason's scope.
+    pub scope: BreachScope,
+}
+
+/// The fence's decision consumer (story 19-2): given the raised fence
+/// reasons — every `(dimension, scope)` whose breach fired `block` this Run
+/// — decide the refusal. No reason → `None` (the call passes). Otherwise the
+/// FIRST reason in [`FENCE_REASON_ORDER`] is reported, whatever order the
+/// reasons were raised in and however often one repeats. Pure, like
+/// [`decide`]: the listener calls exactly this on every fenced request.
+pub fn fence_refusal(reasons: &[LatchKey]) -> Option<FenceRefusal> {
+    let reason = FENCE_REASON_ORDER
+        .into_iter()
+        .find(|candidate| reasons.contains(candidate))?;
+    Some(FenceRefusal {
+        status: FENCE_REFUSAL_STATUS,
+        error_type: FENCE_ERROR_TYPE.to_string(),
+        code: fence_code(reason).to_string(),
+        dimension: reason.dimension,
+        scope: reason.scope,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The vectors artifact (schema + generator)
 // ---------------------------------------------------------------------------
 
@@ -362,6 +441,12 @@ pub enum CoverTag {
     /// persisted WITH it; rows at different rates sum per-row, which differs
     /// from repricing the total at the latest rate.
     NoRetroRepricing,
+    /// The `block` fence (story 19-2, vectors 1.1.0): a `block` decision
+    /// fires under the same threshold, latch and order rules as any action,
+    /// and a fenced Run refuses with status 402 and the
+    /// `hekma_budget_block` class, reporting the first raised reason
+    /// (tokens before dollars, per-run before cumulative).
+    BlockFence,
 }
 
 impl CoverTag {
@@ -376,6 +461,7 @@ impl CoverTag {
             CoverTag::RoundHalfUp => "round-half-up",
             CoverTag::Saturation => "saturation",
             CoverTag::NoRetroRepricing => "no-retro-repricing",
+            CoverTag::BlockFence => "block-fence",
         }
     }
 }
@@ -392,6 +478,7 @@ pub const ALL_COVERS: &[CoverTag] = &[
     CoverTag::RoundHalfUp,
     CoverTag::Saturation,
     CoverTag::NoRetroRepricing,
+    CoverTag::BlockFence,
 ];
 
 /// A `decision` case (story 19-1): a [`GovernanceInput`] (ledger state,
@@ -496,8 +583,24 @@ pub struct DerivationCase {
     pub expected_micros: i64,
 }
 
-/// ONE case of the vectors artifact. The `kind` tag discriminates the two
-/// case kinds; the variant's fields are inlined beside it.
+/// A `fence` case (story 19-2, vectors 1.1.0): the raised fence reasons in,
+/// the exact refusal out (`null` when nothing is raised) — what a Host's
+/// wire guard answers for a fenced Run. Generated from [`fence_refusal`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceCase {
+    /// The case's unique, stable id (kebab-case).
+    pub id: String,
+    /// Which rules this case pins (≥1).
+    pub covers: Vec<CoverTag>,
+    /// The raised fence reasons, in raise order (duplicates allowed).
+    pub reasons: Vec<LatchKey>,
+    /// The expected refusal, or `null` when the call passes.
+    pub expected: Option<FenceRefusal>,
+}
+
+/// ONE case of the vectors artifact. The `kind` tag discriminates the case
+/// kinds; the variant's fields are inlined beside it. A consumer pinned to
+/// an older minor skips a kind it does not know (docs/governance.md).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Case {
@@ -505,6 +608,9 @@ pub enum Case {
     Decision(DecisionCase),
     /// A pure cost derivation: derivation inputs → expected [`Micros`].
     Derivation(DerivationCase),
+    /// The wire fence's refusal: raised reasons → expected refusal (story
+    /// 19-2, vectors 1.1.0).
+    Fence(FenceCase),
 }
 
 /// Where the artifact's cases come from — the exact engine symbols the
@@ -551,6 +657,7 @@ impl VectorsDocument {
             let covers: &[CoverTag] = match case {
                 Case::Decision(decision) => &decision.covers,
                 Case::Derivation(derivation) => &derivation.covers,
+                Case::Fence(fence) => &fence.covers,
             };
             for tag in covers {
                 if !seen.contains(tag) {
@@ -602,9 +709,12 @@ pub fn generate() -> VectorsDocument {
                 .map(|symbol| symbol.to_string())
                 .collect(),
         },
+        // Story 19-2 (1.1.0) APPENDS its cases after the 1.0.0 set, so every
+        // 1.0.0 case keeps its bytes and its position.
         cases: decision_cases()
             .into_iter()
             .chain(derivation_cases())
+            .chain(block_fence_cases())
             .collect(),
     }
 }
@@ -943,6 +1053,122 @@ fn decision_cases() -> Vec<Case> {
             },
         ),
     ]
+}
+
+/// The story-19-2 cases (vectors 1.1.0), appended after the 1.0.0 set:
+/// `block` decisions under the shared rules, then the fence refusals.
+fn block_fence_cases() -> Vec<Case> {
+    let key = LatchKey::new;
+    vec![
+        // ---- block-fence: `block` fires at exactly the ceiling like any
+        // action (the threshold is action-agnostic) ----
+        decision_case(
+            "decision-block-fires-at-exact-ceiling",
+            &[CoverTag::BlockFence, CoverTag::ThresholdGe],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 1_000,
+                    cumulative_total: 1_000,
+                    budget: TokenBudget {
+                        per_run: Some(1_000),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Block,
+                }),
+                dollar: None,
+                latched: vec![],
+            },
+        ),
+        // ---- block-fence: both dimensions trip under `block` — token
+        // first, both latch, both carry `block` ----
+        decision_case(
+            "decision-block-both-dimensions-token-first",
+            &[CoverTag::BlockFence, CoverTag::TokenBeforeDollar],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 50,
+                    cumulative_total: 5_000,
+                    budget: TokenBudget {
+                        per_run: None,
+                        cumulative: Some(5_000),
+                    },
+                    action: BreachAction::Block,
+                }),
+                dollar: Some(DollarArm {
+                    run_cost: Micros(2_000_000),
+                    cumulative_cost: Micros(2_000_000),
+                    cap: CostCap {
+                        per_run: Some(Micros(1_000_000)),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Block,
+                }),
+                latched: vec![],
+            },
+        ),
+        // ---- block-fence: an already-latched `block` pair never re-fires
+        // (the fence stays raised; nothing re-records) ----
+        decision_case(
+            "decision-block-latch-holds",
+            &[CoverTag::BlockFence, CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 2_000,
+                    cumulative_total: 2_000,
+                    budget: TokenBudget {
+                        per_run: Some(1_000),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Block,
+                }),
+                dollar: None,
+                latched: vec![key(BreachDimension::Tokens, BreachScope::PerRun)],
+            },
+        ),
+        // ---- block-fence: no raised reason → the call passes ----
+        fence_case("fence-no-reason-passes", &[]),
+        // ---- block-fence: a single reason is reported as itself ----
+        fence_case(
+            "fence-single-dollar-cumulative",
+            &[key(BreachDimension::Dollars, BreachScope::Cumulative)],
+        ),
+        // ---- block-fence: tokens are reported before dollars, whatever the
+        // raise order ----
+        fence_case(
+            "fence-reports-tokens-before-dollars",
+            &[
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+                key(BreachDimension::Tokens, BreachScope::Cumulative),
+            ],
+        ),
+        // ---- block-fence: per-run is reported before cumulative ----
+        fence_case(
+            "fence-reports-per-run-before-cumulative",
+            &[
+                key(BreachDimension::Tokens, BreachScope::Cumulative),
+                key(BreachDimension::Tokens, BreachScope::PerRun),
+            ],
+        ),
+        // ---- block-fence: a repeated reason behaves like a single one ----
+        fence_case(
+            "fence-duplicate-reason-is-one-reason",
+            &[
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+            ],
+        ),
+    ]
+}
+
+/// Author ONE fence case: the raised reasons as written, the expected
+/// refusal computed by [`fence_refusal`].
+fn fence_case(id: &str, reasons: &[LatchKey]) -> Case {
+    Case::Fence(FenceCase {
+        id: id.to_string(),
+        covers: vec![CoverTag::BlockFence],
+        reasons: reasons.to_vec(),
+        expected: fence_refusal(reasons),
+    })
 }
 
 /// Author ONE decision case: the inputs + coverage tags as written, the
@@ -1578,6 +1804,14 @@ mod tests {
                         );
                     }
                 }
+                Case::Fence(case) => {
+                    assert_eq!(
+                        fence_refusal(&case.reasons),
+                        case.expected,
+                        "case `{}`: the committed refusal does not match fence_refusal()",
+                        case.id
+                    );
+                }
             }
         }
     }
@@ -1592,6 +1826,7 @@ mod tests {
             let (id, covers): (&str, &[CoverTag]) = match case {
                 Case::Decision(case) => (&case.id, &case.covers),
                 Case::Derivation(case) => (&case.id, &case.covers),
+                Case::Fence(case) => (&case.id, &case.covers),
             };
             assert!(!ids.contains(&id), "duplicate case id `{id}`");
             assert!(!covers.is_empty(), "case `{id}` carries no covers tags");
@@ -1626,6 +1861,97 @@ mod tests {
                 "cost_micros",
                 "cost_micros_with_cached",
                 "governance::decide",
+                "governance::fence_refusal",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_1_1_0_cases_are_appended_after_the_1_0_0_set() {
+        // Story 19-2: the minor bump is ADDITIVE — the 26 cases 1.0.0
+        // shipped keep their position, and every story-19-2 case follows
+        // them. A consumer pinned to 1.0.0 sees its cases unchanged.
+        let document = generate();
+        let first_fence_era = document
+            .cases
+            .iter()
+            .position(|case| match case {
+                Case::Decision(case) => case.id.starts_with("decision-block-"),
+                Case::Fence(_) => true,
+                Case::Derivation(_) => false,
+            })
+            .expect("the 1.1.0 cases exist");
+        assert_eq!(first_fence_era, 26, "the 1.0.0 set is 26 cases");
+        assert!(document.cases[first_fence_era..]
+            .iter()
+            .all(|case| match case {
+                Case::Decision(case) =>
+                    case.input.token.map(|arm| arm.action) == Some(BreachAction::Block),
+                Case::Fence(_) => true,
+                Case::Derivation(_) => false,
+            }));
+    }
+
+    #[test]
+    fn fence_refusal_passes_with_no_reason() {
+        assert_eq!(fence_refusal(&[]), None);
+    }
+
+    #[test]
+    fn fence_refusal_reports_the_first_reason_in_canonical_order() {
+        // Every subset of the four reasons reports its lowest canonical
+        // member — the order the listener's bitmask relies on.
+        for mask in 1u8..16 {
+            let raised: Vec<LatchKey> = FENCE_REASON_ORDER
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, key)| *key)
+                .collect();
+            let expected = FENCE_REASON_ORDER[mask.trailing_zeros() as usize];
+            let refusal = fence_refusal(&raised).expect("a raised reason refuses");
+            assert_eq!(
+                (refusal.dimension, refusal.scope),
+                (expected.dimension, expected.scope)
+            );
+            assert_eq!(refusal.code, fence_code(expected));
+            assert_eq!(refusal.status, 402);
+            assert_eq!(refusal.error_type, "hekma_budget_block");
+        }
+    }
+
+    #[test]
+    fn a_fence_case_serializes_its_kind_and_an_explicit_null_pass() {
+        let refused = serde_json::to_value(fence_case(
+            "x",
+            &[LatchKey::new(BreachDimension::Dollars, BreachScope::PerRun)],
+        ))
+        .unwrap();
+        assert_eq!(refused["kind"], "fence");
+        assert_eq!(refused["covers"][0], "block-fence");
+        assert_eq!(refused["reasons"][0]["dimension"], "dollars");
+        assert_eq!(refused["reasons"][0]["scope"], "per-run");
+        assert_eq!(refused["expected"]["status"], 402);
+        assert_eq!(refused["expected"]["error_type"], "hekma_budget_block");
+        assert_eq!(refused["expected"]["code"], "dollars_per_run");
+        let passed = serde_json::to_value(fence_case("y", &[])).unwrap();
+        assert!(passed["expected"].is_null(), "{passed}");
+    }
+
+    #[test]
+    fn fence_codes_name_dimension_and_scope() {
+        let codes: Vec<&str> = FENCE_REASON_ORDER
+            .iter()
+            .map(|key| fence_code(*key))
+            .collect();
+        assert_eq!(
+            codes,
+            vec![
+                "tokens_per_run",
+                "tokens_cumulative",
+                "dollars_per_run",
+                "dollars_cumulative"
             ]
         );
     }

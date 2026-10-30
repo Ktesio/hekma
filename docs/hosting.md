@@ -191,6 +191,79 @@ its own external choke point (a proxy or gateway it controls) and treats
 Hekma's ledger as the cooperative record to reconcile against. The reasoning
 is in [the metering design essay](design/metering-agents-you-dont-control.md).
 
+## The wire fence: `block` refuses further model calls
+
+`budget.breach_action = block` makes the metering listener refuse an
+engine-observed agent's model calls once a ceiling is reached. Unlike `pause` and
+`stop`, it does not change the agent's lifecycle state. The process keeps running,
+and every further model call through the listener gets a typed refusal that
+common SDKs do not retry. The breach is recorded like any other (the breach event
+carries `"action": "block"`), and the engine log notes that the fence is up.
+
+```bash
+hekma agent config set my-agent budget.tokens.cumulative 2000000
+hekma agent config set my-agent budget.breach_action block
+```
+
+The rules:
+
+- **It is never a default.** `block` applies only where you set it.
+- **It needs the listener.** `block` is refused at `config set` on an instance
+  that does not meter through the engine-observed listener (a `self-reported`
+  instance), and the error names the instance's metering source. If `block`
+  reaches such an instance some other way, for example through a hand-edited
+  config file, a breach is recorded, acts as `warn`, and the engine log says
+  the fence could not be raised.
+- **It lifts with the Run.** The fence lives as long as the Run's listener.
+  It lifts when the Run ends (`stop` then `start`, or a Restart Policy relaunch,
+  which starts a new Run). A new Run is checked before its process starts: if
+  it already sits at or over a `block` ceiling (usually the cumulative one), the
+  fence is up before its first call. To un-fence, raise the ceiling, then start
+  a new Run. Un-fencing a live Run when its ceiling is raised is planned for a
+  later release.
+- **A relaunch does not carry a per-run fence.** A Restart Policy relaunch starts
+  a fresh per-run budget, and the engine log says so when the replaced Run was
+  fenced. Pair a per-run `block` ceiling with a cumulative one to bound an agent
+  that crashes and is relaunched.
+- **Restarts and adoption keep it.** A host that restarts and adopts the
+  instance on the same `--metering-listen` port rebuilds the fence from the
+  breach log before serving traffic.
+- **Safe methods pass.** `GET`, `HEAD` and `OPTIONS` requests (model listings,
+  probes) are forwarded. They carry no billable completion.
+- **It is cooperative (NFR-6).** The fence refuses calls that go through the
+  listener. An agent that calls the provider directly is not fenced. Your own
+  choke point stays the enforcement of record.
+
+### The refusal (`proxy-wire v1`)
+
+A fenced call is answered without being forwarded or metered:
+
+- **Status `402 Payment Required`.** The OpenAI, Anthropic and Vercel AI SDKs
+  retry 408, 409, 429 and 5xx, but not 402. Hekma avoids 403 because agents
+  read it as a credential failure.
+- **Headers:** `content-type: application/json` and `x-should-retry: false`
+  (the OpenAI and Anthropic SDKs check this header before the status). There is
+  no `retry-after`.
+- **Body:** compact JSON that parses as both an OpenAI and an Anthropic error:
+
+```json
+{"type":"error","error":{"type":"hekma_budget_block","code":"tokens_cumulative","message":"Hekma budget fence: this agent's cumulative token ceiling is reached, so further model calls are refused. This is not retryable; the operator raises the ceiling or starts a new Run.","param":null,"dimension":"tokens","scope":"cumulative","proxy_wire":"v1"}}
+```
+
+`error.type` is always `hekma_budget_block`. `error.code` names the ceiling:
+`tokens_per_run`, `tokens_cumulative`, `dollars_per_run` or
+`dollars_cumulative`. When more than one ceiling is fenced, the first in that
+order is reported. `dimension` and `scope` repeat the code in Hekma's own
+spelling. The body never carries a limit, a total, an instance name, or any
+request or response content. Key on `error.type` and `error.code`; the message
+text may change.
+
+This response is the first part of `proxy-wire v1`, the versioned wire contract
+of Hekma's metering proxy. Later releases keep it unchanged. The governance
+vectors pin the same refusal (the `fence` cases, from vectors 1.1.0), so a Host
+guard can prove it answers the same way. See
+[Governance conformance vectors](governance.md).
+
 ## A worked recipe: FROM scratch
 
 The image below is deliberately minimal: a fetch stage downloads the release

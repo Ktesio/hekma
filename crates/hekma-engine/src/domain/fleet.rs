@@ -107,7 +107,7 @@ pub struct BudgetView {
     /// present ONLY when a Rate is configured; v1 always `estimated`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_label: Option<EstimateLabel>,
-    /// The configured Breach Action (`pause` / `stop` / `warn`). Governs BOTH the
+    /// The configured Breach Action (`pause` / `stop` / `warn` / `block`). Governs BOTH the
     /// token and the dollar breach (story 3-3: one action).
     pub breach_action: BreachAction,
 }

@@ -4,6 +4,17 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — the wire fence: a `block` Breach Action (hekma-engine 0.10.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`budget.breach_action = block`** (never a default): on a budget or Cost Cap breach the engine-observed metering listener refuses every further model call. The agent process keeps running (no lifecycle transition); the breach event records `"action": "block"` and the engine log notes the fence. `GET`/`HEAD`/`OPTIONS` requests still pass.
+> - **The refusal is the first slice of `proxy-wire v1`:** HTTP `402`, `content-type: application/json`, `x-should-retry: false`, no `retry-after`, and a body that parses as an OpenAI and an Anthropic error — `{"type":"error","error":{"type":"hekma_budget_block","code":"<tokens|dollars>_<per_run|cumulative>","message":…,"param":null,"dimension":…,"scope":…,"proxy_wire":"v1"}}`. No limit, total, instance name or request/response content. Later releases keep it unchanged.
+> - **When it lifts:** with the Run. A new Run that starts at or over a `block` ceiling is fenced before its process spawns; an engine restart or adoption on the same `--metering-listen` port rebuilds the fence from the breach log. A Restart Policy relaunch starts a new Run with a fresh per-run budget (the engine log says so when the replaced Run was fenced). Un-fencing a live Run on a raised ceiling is planned for a later release.
+> - **Refused where it cannot work:** `config set … budget.breach_action block` fails on an instance without the listener (a `self-reported` source), naming the source. If `block` reaches such an instance another way, the breach records, acts as `warn`, and the engine log says so.
+> - **Cooperative (NFR-6):** the fence refuses calls routed through the listener; an agent calling its provider directly is not fenced.
+> - **Governance vectors 1.0.0 → 1.1.0 (additive):** a ninth rule tag `block-fence`, three `block` decision cases and a new `fence` case kind (5 cases) appended after the unchanged 1.0.0 set (34 cases); `provenance.generated_from` gains `governance::fence_refusal`; new checksum.
+> - **Breaking engine surface — `hekma-engine` 0.9.0 → 0.10.0:** `BreachAction` (an exhaustive public enum) gains `Block`, so an exhaustive downstream `match` needs an arm. Additive alongside it: `fence_refusal`, `fence_code`, `FenceRefusal`, `FenceCase`, `Case::Fence`, `CoverTag::BlockFence`, and the `FENCE_*`/`PROXY_WIRE_VERSION` constants. The OTLP `hekma.budget.action` attribute gains the `block` value.
+
 > **Unreleased — Hekma's identity: the control plane for agent workloads (docs + metadata).**
 > Announced ahead of the release that ships it:
 >
