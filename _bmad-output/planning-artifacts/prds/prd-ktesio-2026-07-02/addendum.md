@@ -14,7 +14,7 @@ Technical-how, options-considered, and carried context that the PRD deliberately
 Two declared Metering Sources, different fidelity/effort trade-offs:
 
 - **`self-reported`** — the Adapter forwards the Agent's own usage accounting (Hermes Agent exposes `/usage` + analytics; brief addendum §C). Cheap to build, fidelity depends on the Agent, arrives in batches → enforcement latency is bounded by report cadence; reconciliation must be idempotent (no double-count on replays).
-- **`engine-observed`** — the Adapter routes the Agent's model traffic through an Engine-provided interception point (env-injected base-URL/proxy is the common mechanism; cf. LiteLLM-style proxies, brief addendum §B — but Ktesio acts on *lifecycle*, not per-request rejection). Higher fidelity and real-time; requires the Agent's model client to honor endpoint override — true for most, not all.
+- **`engine-observed`** — the Adapter routes the Agent's model traffic through an Engine-provided interception point (env-injected base-URL/proxy is the common mechanism; cf. LiteLLM-style proxies, brief addendum §B — but Ktesio acts on *lifecycle*, not per-request rejection) *(Superseded 2026-10-30: Hekma also acts per request — `block`, wire hold and reroute, PRD FR-43 and FR-56.)*. Higher fidelity and real-time; requires the Agent's model client to honor endpoint override — true for most, not all.
 - Rejected for v1: parsing provider dashboards/billing APIs for actuals (per-provider sprawl, auth burden). Reconciliation-with-actuals stays an interface concept (FR-23 labels) without a v1 implementation.
 
 ## 2. Process supervision per OS (feeds NFR-2, FR-5–FR-10)
