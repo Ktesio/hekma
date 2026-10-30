@@ -192,7 +192,7 @@ development_status:
   epic-18-retrospective: optional
   epic-19: in-progress  # opened 2026-09-30 (Wire Governance for Hosts; FR-43..FR-45; was Epic 17 pre-renumber). RE-SCOPED 2026-10-30 by sprint-change-proposal-2026-10-30-control-plane-pivot.md (D2a): 19-3 absorbed into 21-2; 19-2 gains "never a default; once configured always refuses whatever the Scent-Check Mode"; 19-4 gains run id + control depth and runs after 22-1 and 23-1, before 19-5
   19-1-governance-conformance-vectors: done  # PR #334 merged 2026-10-25 (f7ba049)
-  19-2-the-wire-fence-block-breach-action: backlog  # AC 2026-10-30: never a default; once configured always refuses whatever the Scent-Check Mode; built on today's listener, carried into the shared proxy by 23-4
+  19-2-the-wire-fence-block-breach-action: backlog  # AC 2026-10-30: never a default; once configured always refuses whatever the Scent-Check Mode; built on today's listener; its refusal response is the first slice of proxy-wire v1; carried into the shared snapshot by 23-1; lands before 21-3
   19-4-per-call-records-for-hosts: backlog  # AC 2026-10-30: Host read surface for the shared proxy's per-call records (run id, Control Depth, token id); runs after 22-1 and 23-1, before 19-5
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
@@ -204,8 +204,9 @@ development_status:
   # Epics 21-25 (control-plane pivot) — opened 2026-10-30 via correct-course
   # (sprint-change-proposal-2026-10-30-control-plane-pivot.md, APPROVED by Islam with D1a/D2a/D3a/D4-open/D5a).
   # PRD and spine re-baselined 2026-10-30; stories renumbered into build order (epics.md, Epic 21 note):
-  # 21-1 → 21-2 → 21-3 → 21-4 → 21-5 → 21-6 → 22-1 → 23-1 → 19-4 → 22-2 → 22-3 → 23-2 → 23-3 → 23-4
-  # → 21-7 → 21-8 → 22-5 → 24-1 → 22-4 → 24-2 → 24-3 → 24-4 → 24-5 → 25. 19-2 any time; 19-5 after 19-4.
+  # 21-1 → 21-2 → 21-9 → 21-3 → 21-4 → 21-5 → 21-6 → 22-1 → 23-1 → 19-4 → 22-2 → 22-3 → 23-2 → 23-3 → 23-4
+  # → 21-7 → 21-8 → 22-5 → 24-1 → 22-4 → 24-2 → 24-3 → 24-4 → 24-5 → 25. 19-2 any time, before 21-3; 19-5 after 19-4.
+  # Readiness gate 2026-10-30 (implementation-readiness-2026-10-30.md): CONCERNS resolved by Islam's D1-D3 rulings; 21-9 added.
   epic-21: backlog  # One Control Plane (FR-49, FR-50, FR-57, FR-60; FR-21/FR-41 amendments; AD-20, AD-25, AD-27)
   21-1-the-store-writer-and-run-scale-storage: backlog  # AD-27; money code (AI-55)
   21-2-runs-as-first-class-entities: backlog  # AD-25; absorbs 19-3 as child Runs
@@ -215,6 +216,7 @@ development_status:
   21-6-selectors-on-every-verb-and-hekma-budget: backlog  # latch re-arm from 19-3 lands here
   21-7-hekma-top: backlog  # after 23-4
   21-8-gateway-complement-identity-headers-and-recipes: backlog
+  21-9-bound-labels-hekma-label: backlog  # added 2026-10-30 by the readiness gate (D3); runs after 21-2, before 21-3
   epic-21-retrospective: optional
   epic-22: backlog  # Run Identity and Key Custody (FR-53, FR-54; AD-22)
   22-1-run-keys-minting-hashing-refresh-and-revocation: backlog
@@ -224,10 +226,10 @@ development_status:
   22-5-an-authenticated-proxy-beyond-loopback: backlog
   epic-22-retrospective: optional
   epic-23: backlog  # Attach and Wire Control (FR-51, FR-52, FR-56; AD-26, AD-28)
-  23-1-the-shared-metering-proxy: backlog  # replaces the per-instance listener; proxy-wire v1
+  23-1-the-shared-metering-proxy: backlog  # replaces the per-instance listener; proxy-wire v1; carries 19-2 block; hekma binding (D3); creates the calls store
   23-2-self-announce-run-identities-and-leases: backlog
   23-3-inbound-otlp-and-observed-runs: backlog
-  23-4-wire-hold-release-reroute-and-reject: backlog  # carries 19-2 block into the shared proxy
+  23-4-wire-hold-release-reroute-and-reject: backlog  # reject reuses 19-2's block response
   epic-23-retrospective: optional
   epic-24: backlog  # Operability at Scale (FR-55, FR-59, NFR-4, NFR-9; AD-18, AD-21, AD-23)
   24-1-one-shim-per-supervised-process: backlog
