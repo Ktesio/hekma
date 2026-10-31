@@ -7,7 +7,7 @@
 //! `→ BudgetEvaluator (inside the same commit path) → BreachDecision → supervisor
 //! executes the Breach Action → emits the breach event`. This module is the pure,
 //! I/O-free heart of that: the [`TokenBudget`] domain shape (FR-18's two scopes),
-//! the [`BreachAction`] the operator configures (`pause`/`stop`/`warn`, default
+//! the [`BreachAction`] the operator configures (`pause`/`stop`/`warn`/`block`, default
 //! `pause`), the [`BreachScope`]/[`BreachDecision`] the evaluator returns, and the
 //! [`BudgetEvaluator`] itself — a total, pure token comparison that turns
 //! just-committed totals into a decision.
@@ -78,9 +78,14 @@ impl TokenBudget {
 /// lifecycle — AD-15, NO new state/edge, only a new CAUSE): **`pause`** drives
 /// `running → paused` (honoring the adapter pause Capability Declaration — story
 /// 1-5); **`stop`** drives `running → stopping → stopped` (story 1-4);
-/// **`warn`** performs NO lifecycle transition (records the breach event only).
-/// The wire spelling is kebab-case (`"pause"`/`"stop"`/`"warn"`) — the config
-/// value + the breach-event `action` field.
+/// **`warn`** performs NO lifecycle transition (records the breach event only);
+/// **`block`** (story 19-2) performs NO lifecycle transition either — it raises
+/// the instance's WIRE FENCE, so the engine-observed metering listener refuses
+/// further model calls with the typed non-retryable `proxy-wire v1` response
+/// until the Run ends. `block` is never the default and needs a listener
+/// (refused at configuration for a `self-reported` instance).
+/// The wire spelling is kebab-case (`"pause"`/`"stop"`/`"warn"`/`"block"`) — the
+/// config value + the breach-event `action` field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BreachAction {
@@ -94,10 +99,16 @@ pub enum BreachAction {
     /// Record the breach event only — NO lifecycle transition (the agent keeps
     /// running; the lightest guardrail: visibility without interruption).
     Warn,
+    /// Fence the wire (story 19-2): the agent process keeps running, but its
+    /// engine-observed metering listener refuses every further model call with
+    /// HTTP 402 and the `hekma_budget_block` error body until the Run ends.
+    /// Cooperative (NFR-6): a call that bypasses the listener is not fenced.
+    /// NEVER the default.
+    Block,
 }
 
 impl BreachAction {
-    /// The stable wire/label form (`"pause"`/`"stop"`/`"warn"`), matching the
+    /// The stable wire/label form (`"pause"`/`"stop"`/`"warn"`/`"block"`), matching the
     /// serde kebab-case rename so a config string and this label never diverge
     /// (the [`super::restart::RestartPolicy`] convention).
     pub fn as_str(&self) -> &'static str {
@@ -105,6 +116,7 @@ impl BreachAction {
             BreachAction::Pause => "pause",
             BreachAction::Stop => "stop",
             BreachAction::Warn => "warn",
+            BreachAction::Block => "block",
         }
     }
 }
@@ -128,7 +140,7 @@ impl std::fmt::Display for ParseBreachActionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "'{}' is not a valid breach action (expected one of: pause, stop, warn)",
+            "'{}' is not a valid breach action (expected one of: pause, stop, warn, block)",
             self.value
         )
     }
@@ -148,6 +160,7 @@ impl FromStr for BreachAction {
             "pause" => Ok(BreachAction::Pause),
             "stop" => Ok(BreachAction::Stop),
             "warn" => Ok(BreachAction::Warn),
+            "block" => Ok(BreachAction::Block),
             other => Err(ParseBreachActionError {
                 value: other.to_string(),
             }),
@@ -332,16 +345,22 @@ mod tests {
     fn breach_action_default_is_pause() {
         // The ratified shipped default (PRD FR-21).
         assert_eq!(BreachAction::default(), BreachAction::Pause);
+        // Story 19-2: `block` is NEVER a default (amended FR-43).
+        assert_ne!(BreachAction::default(), BreachAction::Block);
     }
 
     #[test]
-    fn breach_action_parses_the_three_known_tokens() {
+    fn breach_action_parses_the_four_known_tokens() {
         assert_eq!(
             "pause".parse::<BreachAction>().unwrap(),
             BreachAction::Pause
         );
         assert_eq!("stop".parse::<BreachAction>().unwrap(), BreachAction::Stop);
         assert_eq!("warn".parse::<BreachAction>().unwrap(), BreachAction::Warn);
+        assert_eq!(
+            "block".parse::<BreachAction>().unwrap(),
+            BreachAction::Block
+        );
     }
 
     #[test]
@@ -354,6 +373,7 @@ mod tests {
         assert!(msg.contains("pause"), "{msg}");
         assert!(msg.contains("stop"), "{msg}");
         assert!(msg.contains("warn"), "{msg}");
+        assert!(msg.contains("block"), "{msg}");
         // Case-sensitive: the config convention is lower-case.
         assert!("Pause".parse::<BreachAction>().is_err());
         assert!("".parse::<BreachAction>().is_err());
@@ -365,6 +385,7 @@ mod tests {
             (BreachAction::Pause, "pause"),
             (BreachAction::Stop, "stop"),
             (BreachAction::Warn, "warn"),
+            (BreachAction::Block, "block"),
         ] {
             assert_eq!(action.as_str(), wire);
             assert_eq!(action.to_string(), wire);

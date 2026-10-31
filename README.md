@@ -33,7 +33,7 @@ These are the rules the control plane is being built to; most of what makes them
 | **Lifecycle** | `start`, `stop`, `pause` and `resume` any agent through one state machine. Crashes are recorded and restarted with backoff, and the fleet's state survives a reboot. |
 | **Metering** | Counts input, output and cached tokens, either reported by the agent or read off the wire by a proxy on `127.0.0.1`. |
 | **Telemetry export** *(unreleased: on main, after 0.11.0)* | Opt-in OTLP/HTTP+JSON metrics export to any OpenTelemetry-compatible collector (`--otlp-endpoint` on `hekma serve`) — token usage, budget breaches, derived cost, lifecycle state. Off by default: no endpoint, no exporter. [Telemetry docs](https://hekma.ktesio.dev/docs/telemetry/). |
-| **Budgets** | Token and dollar ceilings, per run or over the agent's life, with the action you choose — `warn`, `pause` or `stop` — applied at the usage event that crossed the line. Dollar figures are estimates from rates you set. |
+| **Budgets** | Token and dollar ceilings, per run or over the agent's life, with the action you choose — `warn`, `pause` or `stop` — applied at the usage event that crossed the line, or `block` *(unreleased: on main, after 0.11.0)*, which makes the metering listener refuse further model calls. Dollar figures are estimates from rates you set. |
 | **Any agent** | A built-in `acp` kind for Agent Client Protocol agents (OpenCode and Hermes Agent are tested against it), and an `adapter.toml` manifest for anything else you can start as a process. The [adapter gallery](https://hekma.ktesio.dev/docs/adapters/) is the validated index of which agents run today, with per-capability honesty tables. |
 | **Scripting** | Versioned JSON output and stable exit codes on every command. |
 | **Embedding** | The engine is the `hekma-engine` crate, with an event stream, so your program can run the fleet without the CLI. |
@@ -45,7 +45,7 @@ None of this is in 0.11.0 yet. Each item links to its docs page, which is tagged
 | | Stage | |
 |---|---|---|
 | **Runs** | in development | Every supervised agent, and the work a Host opens inside one, becomes a Run with an id, labels, a status and a Control Depth; Runs Hekma did not start follow (planned). `hekma ps` lists them exception-first, and Selectors let every verb act on `flow=claims,env=prod` instead of one agent at a time. [Runs](https://hekma.ktesio.dev/docs/runs/) |
-| **Policies** | in development | Standing limits matched by label, with `warn` as the default breach action and an opt-in `block` fence that refuses further model calls. [Policies](https://hekma.ktesio.dev/docs/policies/) |
+| **Policies** | in development | Standing limits matched by label, with `warn` as the default breach action; the opt-in `block` fence (on main per agent) applies to them too. [Policies](https://hekma.ktesio.dev/docs/policies/) |
 | **Always-on host** | in development | `hekma serve` (on main) supervises all the time, and the CLI starts a local one on demand, so agents outlive your terminal. [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/) |
 | **Run Keys** | planned | A per-Run key in the agent's API-key slot; the real provider key never leaves Hekma, and a call around the proxy is flagged. [Run Keys](https://hekma.ktesio.dev/docs/run-keys/) |
 | **Attach and wire control** | planned | Framework flows join through one shared proxy, a header or inbound OpenTelemetry; hold a Run's next model call with its state intact, then release, reroute or reject it. [Attach](https://hekma.ktesio.dev/docs/attach/) |

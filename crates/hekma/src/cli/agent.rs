@@ -2484,7 +2484,8 @@ fn map_config_error(err: ConfigError) -> Box<dyn std::error::Error> {
         .into(),
         // Story 3-2 (AC-C): a KNOWN budget key with a malformed VALUE — a
         // `budget.tokens.*` that is not a whole number, or a `budget.breach_action`
-        // that is not pause/stop/warn. Rejected before any persistence (nothing
+        // that is not pause/stop/warn/block (or `block` on an instance without a
+        // metering listener). Rejected before any persistence (nothing
         // changed); the message names the key + value + the accepted form.
         ConfigError::InvalidValue { .. } => AgentConfig {
             message: format!("{err}. Nothing was changed. Fix the value and try again."),
@@ -2571,14 +2572,18 @@ fn governance_vectors_summary(
             .into())
         }
     };
-    let decision_cases = document
-        .cases
-        .iter()
-        .filter(|case| matches!(case, hekma_engine::Case::Decision(_)))
-        .count();
-    let derivation_cases = document.cases.len() - decision_cases;
+    // Counted per kind with an exhaustive match, so a new case kind can never
+    // be folded silently into another kind's count.
+    let (mut decision_cases, mut derivation_cases, mut fence_cases) = (0, 0, 0);
+    for case in &document.cases {
+        match case {
+            hekma_engine::Case::Decision(_) => decision_cases += 1,
+            hekma_engine::Case::Derivation(_) => derivation_cases += 1,
+            hekma_engine::Case::Fence(_) => fence_cases += 1,
+        }
+    }
     Ok(format!(
-        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation)\n  \
+        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
@@ -2588,6 +2593,7 @@ fn governance_vectors_summary(
         document.cases.len(),
         decision_cases,
         derivation_cases,
+        fence_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
     ))
 }
@@ -5107,7 +5113,9 @@ mod tests {
             "the summary names the artifact path: {summary}"
         );
         assert!(
-            summary.contains("15 decision") && summary.contains("11 derivation"),
+            summary.contains("18 decision")
+                && summary.contains("11 derivation")
+                && summary.contains("5 fence"),
             "the summary gives the case mix: {summary}"
         );
         assert!(
