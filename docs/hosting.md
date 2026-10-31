@@ -230,7 +230,7 @@ The rules:
   breach log before serving traffic.
 - **Safe methods pass.** `GET`, `HEAD` and `OPTIONS` requests (model listings,
   probes) are forwarded. They carry no billable completion.
-- **It is cooperative (NFR-6).** The fence refuses calls that go through the
+- **It is cooperative.** The fence refuses calls that go through the
   listener. An agent that calls the provider directly is not fenced. Your own
   choke point stays the enforcement of record.
 
