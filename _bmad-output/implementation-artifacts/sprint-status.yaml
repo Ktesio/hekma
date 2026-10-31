@@ -1,5 +1,5 @@
 # generated: 2026-07-02
-# last_updated: 2026-10-30
+# last_updated: 2026-10-31
 # project: ktesio
 # project_key: NOKEY
 # tracking_system: file-system
@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "2026-10-30"  # control-plane pivot (sprint-change-proposal-2026-10-30-control-plane-pivot.md): epic-18 + 19-1 drift fixed, 19-3 absorbed into 21-2, epics 21-25 added and renumbered into build order
+last_updated: "2026-10-31"  # 19-2 done (PR #358). 2026-10-30: control-plane pivot (sprint-change-proposal-2026-10-30-control-plane-pivot.md): epic-18 + 19-1 drift fixed, 19-3 absorbed into 21-2, epics 21-25 added and renumbered into build order
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -192,7 +192,7 @@ development_status:
   epic-18-retrospective: optional
   epic-19: in-progress  # opened 2026-09-30 (Wire Governance for Hosts; FR-43..FR-45; was Epic 17 pre-renumber). RE-SCOPED 2026-10-30 by sprint-change-proposal-2026-10-30-control-plane-pivot.md (D2a): 19-3 absorbed into 21-2; 19-2 gains "never a default; once configured always refuses whatever the Scent-Check Mode"; 19-4 gains run id + control depth and runs after 22-1 and 23-1, before 19-5
   19-1-governance-conformance-vectors: done  # PR #334 merged 2026-10-25 (f7ba049)
-  19-2-the-wire-fence-block-breach-action: review  # PR #358 opened 2026-10-31 (rebased onto main + docs aligned with the control-plane pages). AC 2026-10-30: never a default; once configured always refuses whatever the Scent-Check Mode; built on today's listener; its refusal response is the first slice of proxy-wire v1; carried into the shared snapshot by 23-1; lands before 21-3
+  19-2-the-wire-fence-block-breach-action: done  # 2026-10-31 MERGED as fda3844 (PR #358): `block` Breach Action, proxy-wire v1 402 refusal, governance vectors 1.1.0, hekma-engine 0.10.0; site mirror Ktesio/ktesio.dev#35. Semver baseline left at 1e71389 (the #358 semver check passed against it). AC 2026-10-30: never a default; once configured always refuses whatever the Scent-Check Mode; built on today's listener; its refusal response is the first slice of proxy-wire v1; carried into the shared snapshot by 23-1; lands before 21-3
   19-4-per-call-records-for-hosts: backlog  # AC 2026-10-30: Host read surface for the shared proxy's per-call records (run id, Control Depth, token id); runs after 22-1 and 23-1, before 19-5
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
