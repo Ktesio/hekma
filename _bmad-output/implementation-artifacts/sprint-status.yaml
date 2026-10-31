@@ -207,8 +207,8 @@ development_status:
   # 21-1 → 21-2 → 21-9 → 21-3 → 21-4 → 21-5 → 21-6 → 22-1 → 23-1 → 19-4 → 22-2 → 22-3 → 23-2 → 23-3 → 23-4
   # → 21-7 → 21-8 → 22-5 → 24-1 → 22-4 → 24-2 → 24-3 → 24-4 → 24-5 → 25. 19-2 any time, before 21-3; 19-5 after 19-4.
   # Readiness gate 2026-10-30 (implementation-readiness-2026-10-30.md): CONCERNS resolved by Islam's D1-D3 rulings; 21-9 added.
-  epic-21: backlog  # One Control Plane (FR-49, FR-50, FR-57, FR-60; FR-21/FR-41 amendments; AD-20, AD-25, AD-27)
-  21-1-the-store-writer-and-run-scale-storage: backlog  # AD-27; money code (AI-55)
+  epic-21: in-progress  # One Control Plane (FR-49, FR-50, FR-57, FR-60; FR-21/FR-41 amendments; AD-20, AD-25, AD-27)
+  21-1-the-store-writer-and-run-scale-storage: review  # AD-27; money code (AI-55)
   21-2-runs-as-first-class-entities: backlog  # AD-25; absorbs 19-3 as child Runs
   21-3-policies-the-default-policy-and-the-warn-default: backlog  # FR-60, FR-21 upgrade write; money code (AI-55)
   21-4-one-data-path-owner-the-cli-routes-through-a-local-service-host: backlog  # AD-20 auto-start, credential resolver, TLS

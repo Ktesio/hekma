@@ -660,10 +660,10 @@ fn two_engines_racing_attach_against_start_only_ever_launch_with_the_row() {
 #[test]
 fn concurrent_engines_degrade_to_the_typed_busy_error_under_a_held_write_txn() {
     // The concurrent-writers row of the matrix, end to end through a second
-    // ENGINE (not a raw store): a held write txn costs the attach one full
-    // busy_timeout wait, then the TYPED busy error surfaces — never a raw
-    // SQLITE_BUSY string (AI-18). Costs ~5s: that IS the bounded-wait
-    // contract under test.
+    // ENGINE (not a raw store): a held write txn makes the attach wait the
+    // store writer's 1 s acknowledgement bound, then the TYPED busy error
+    // surfaces — never a raw SQLITE_BUSY string (AI-18) — and the write is
+    // not applied.
     let state = TempDir::new().unwrap();
     let engine_b = open(&state);
     let facade_b = engine_b.blocking();
@@ -680,12 +680,15 @@ fn concurrent_engines_degrade_to_the_typed_busy_error_under_a_held_write_txn() {
 
     match &err {
         RegistryError::Store(StoreError::Busy { waited_ms }) => {
-            assert_eq!(*waited_ms, 5_000, "the stop-ladder bounded window");
+            assert_eq!(
+                *waited_ms, 1_000,
+                "the store writer's acknowledgement bound"
+            );
         }
         other => panic!("expected the typed Busy error, got {other:?}"),
     }
     assert!(
-        waited >= Duration::from_millis(5_000),
+        waited >= Duration::from_millis(1_000) && waited < Duration::from_millis(4_000),
         "the bounded wait must elapse before the typed error: {waited:?}"
     );
     let rendered = err.to_string();

@@ -4,6 +4,19 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — one store writer and Run-scale storage (hekma-engine 0.11.0).**
+> Announced ahead of the release that ships it:
+>
+> - **One writer per engine process.** Every `state.db` write now runs on one store writer thread with its own connection; the registry's connection is read-only. A write waits at most 1 s to be taken, then fails with the typed `Busy` error (`waited_ms: 1000`, was up to 5000) and is not applied, so a retry is safe; metering retries it without ever skipping usage. Two engine processes on one state dir still serialize through SQLite's write lock.
+> - **One transaction per event.** A usage event, its per-instance and per-Run rollups, the budget evaluation, every breach it fires and their outbox entries commit together; a transition commits its state, event row and outbox entry together. Usage totals and the budget evaluation read the rollups instead of re-summing the ledger.
+> - **Event order on a breach changes:** the bus and the export now show usage, then every breach it fired, then the `pause`/`stop` transition (was usage, token breach, pause, dollar breach). Bus order still equals commit order.
+> - **Breaches re-fire once when the Breach Action changes mid-Run.** The latch that stops a breach repeating is durable and keyed by action, so changing `budget.breach_action` after a breach fires it once more under the new action — live, as adoption already did. Switching to `block` after a breach now records a `block` breach, so the fence survives an engine restart.
+> - **The records move into `state.db`.** Transitions, breaches and the export outbox are tables; `instance.log` and `breaches.log` are still written after each commit as mirrors. `resync_events`, `transition_events`, `budget_breach_events` and the export read the database; `torn_tail_skipped` and `blank_lines_skipped` stay on the wire and are always `false`/`0`. An outbox write failure now fails the event's commit (it used to be best-effort). Removing an instance removes its event rows.
+> - **Export seqs are global.** One sequence in the database orders every engine process sharing the state dir (was one counter per process).
+> - **Adopted observed instances no longer lose usage.** Usage rows carry a launch generation bumped at every spawn, restart and adoption, so the metering listener's sequence restarting after an adoption is no longer dropped as a replay.
+> - **One-way upgrade — stop older engines first.** The first open migrates `state.db` to schema 12 and imports `instance.log`, `breaches.log`, `outbox.jsonl` and `outbox-ack.json` once (seqs and the ack carry over; the outbox files are renamed `*.migrated`; unreadable log lines are named on the engine log). An older engine refuses the upgraded state dir as too new when it opens it, but one already running (a `hekma serve`) does not notice: stop it before upgrading. Usage it still records is counted, but its transitions, breaches and export entries after the upgrade are not.
+> - **`hekma-engine` 0.10.0 → 0.11.0** for the schema step and the changed event order and outbox contract. No public types change.
+
 > **Unreleased — the wire fence: a `block` Breach Action (hekma-engine 0.10.0).**
 > Announced ahead of the release that ships it:
 >

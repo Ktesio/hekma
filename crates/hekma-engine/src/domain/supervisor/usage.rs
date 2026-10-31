@@ -3,7 +3,9 @@
 //! additional `impl Supervisor` block, no signature or behavior change.
 
 use super::*;
+use crate::domain::pipeline;
 use crate::domain::{CostCap, Rate, TokenBudget};
+use crate::ports::RunStore;
 
 /// WHICH captured-output channel a self-reported usage drain reads (story
 /// 14-3, T3). The two channels are byte-identical in SEMANTICS (the same
@@ -267,17 +269,18 @@ impl Supervisor {
                 // safely into the DB dedup key (`DuplicateReplay` — never a
                 // double-count; see the design note on AI-41's dedup safety).
                 let mut committed_count = 0usize;
+                let mut busy = false;
                 for usage in &parsed {
-                    if self
-                        .ingest_usage(registry, name, &run_id, &metering_source, usage, mode)
-                        .is_ok()
+                    match self.ingest_usage(registry, name, &run_id, &metering_source, usage, mode)
                     {
-                        committed_count += 1;
-                    } else {
-                        // Park at the FIRST store error — later events in this
-                        // block are not even attempted, so they cannot leapfrog
-                        // the failed one.
-                        break;
+                        Ok(_) => committed_count += 1,
+                        Err(err) => {
+                            // Park at the FIRST store error — later events in
+                            // this block are not even attempted, so they cannot
+                            // leapfrog the failed one.
+                            busy = is_busy(&err);
+                            break;
+                        }
                     }
                 }
                 // `cursor + consumed` equals the old whole-file path's
@@ -312,9 +315,20 @@ impl Supervisor {
                     // offset, skip the block with a loud diagnostic: billing
                     // honesty cuts both ways — announce the loss, don't strand
                     // the ledger.
+                    //
+                    // Story 21-1: a `Busy` refusal (the writer's 1 s bound under
+                    // another process's write lock) is contention, never a
+                    // poisoned row — it is retried without spending an attempt,
+                    // so bounded contention can never skip billable usage.
                     let attempts = match self.running.get(name).and_then(|s| channel.park(s)) {
-                        Some((parked_cursor, n)) if parked_cursor == cursor => n + 1,
-                        _ => 1,
+                        Some((parked_cursor, n)) if parked_cursor == cursor => {
+                            if busy {
+                                n
+                            } else {
+                                n + 1
+                            }
+                        }
+                        _ => u32::from(!busy),
                     };
                     if attempts >= USAGE_PARK_MAX_ATTEMPTS {
                         let lost = parsed.len() - committed_count;
@@ -662,14 +676,14 @@ impl Supervisor {
         // Story 12-4: break on the FIRST store error — later events cannot leapfrog
         // the failed one (billing honesty: the ledger sequence stays order-faithful).
         let mut committed_count = 0usize;
+        let mut busy = false;
         for usage in &events {
-            if self
-                .ingest_usage(registry, name, &run_id, &metering_source, usage, mode)
-                .is_ok()
-            {
-                committed_count += 1;
-            } else {
-                break;
+            match self.ingest_usage(registry, name, &run_id, &metering_source, usage, mode) {
+                Ok(_) => committed_count += 1,
+                Err(err) => {
+                    busy = is_busy(&err);
+                    break;
+                }
             }
         }
         if committed_count == events.len() {
@@ -721,9 +735,17 @@ impl Supervisor {
                 .get(name)
                 .and_then(|s| s.observed_park.as_ref())
             {
-                Some((pending, n)) if pending.front_sequence == front_sequence => n + 1,
+                // Story 21-1: `Busy` is contention, not a poisoned event — it
+                // never spends an attempt (see the self-reported drain).
+                Some((pending, n)) if pending.front_sequence == front_sequence => {
+                    if busy {
+                        *n
+                    } else {
+                        n + 1
+                    }
+                }
                 // A different front event resets the streak (the cursor-analog).
-                _ => 1,
+                _ => u32::from(!busy),
             };
             if attempts >= USAGE_PARK_MAX_ATTEMPTS {
                 // The front event is poisoned beyond the dedup key's reach: SKIP it
@@ -842,7 +864,7 @@ impl Supervisor {
     /// is NOT evaluated (nothing new was committed → no new breach can occur).
     /// Ingestion + enforcement stay best-effort to the RUN: a store/lifecycle error
     /// is a diagnostic, NEVER a supervisor crash (3-1's rule extended to enforcement).
-    fn ingest_usage(
+    pub(super) fn ingest_usage(
         &mut self,
         registry: &Registry,
         name: &InstanceName,
@@ -858,48 +880,48 @@ impl Supervisor {
             metering_source,
             now_rfc3339(),
         );
-        // Story 3-3 — NO-RETROACTIVE-REPRICING: resolve the EFFECTIVE Rate at COMMIT
-        // (a live config read) and PERSIST it onto this row, so historical dollars
-        // keep the Rate in force when consumed. A later Rate change re-prices FUTURE
-        // events only (each row is priced at its own stored Rate on read). A degraded
-        // config read / absent-or-half Rate → `None` (the row contributes $0; AC-B).
-        let rate = registry
-            .effective_config(name, ConfigLayer::empty())
-            .ok()
-            .and_then(|eff| config::resolve_cost(&eff).0);
-        match registry.record_usage_event(&event, rate) {
-            // A fresh row: build the AD-14 usage-update wire struct (frozen in 3-1;
-            // published on the event bus since 7-2), THEN run the AD-7 enforcement
-            // stage on the just-committed totals — synchronously, in this same
-            // commit path.
-            Ok(RecordOutcome::Inserted) => {
-                let update = UsageUpdateEvent::new(event);
-                // Story 7-2: the ledger row COMMITTED — publish onto the event
-                // bus BEFORE the enforcement stage runs, preserving commit
-                // order (the usage row precedes any breach/transition the
-                // enforcement commits, so the bus shows exactly the durable
-                // sequence: usage → token breach → pause → dollar breach).
-                // Ordering obligation: this runs under the supervisor lock
-                // (see the `domain::bus` caller-enforced invariant).
-                // Story 17-4: the outbox journal mirrors the same committed
-                // usage event at the SAME commit point — after the durable
-                // ledger commit, before the bus publish. Best-effort (see
-                // `outbox_append`).
-                self.outbox_append(registry, EngineEvent::UsageUpdate(update.clone()));
+        // Story 21-1: ONE store-writer job commits the row (stamped with the
+        // launch generation it was metered under), both rollups, the usage
+        // outbox row, and every breach the new totals fire — the AD-7 pipeline
+        // in one transaction (AD-27). The evaluator's inputs (the LIVE config
+        // read, AC-B; the Rate in force at commit, 3-3's no-retro-repricing)
+        // travel in the job: the writer reads no engine state (D2).
+        let generation = self
+            .running
+            .get(name)
+            .map_or(0, |supervised| supervised.launch_generation);
+        let job = pipeline::UsageJob {
+            event,
+            generation,
+            eval: self.eval_input(registry, name, run_id, metering_source),
+        };
+        match registry
+            .writer()
+            .call(move |ctx| pipeline::commit_usage(ctx, job))
+        {
+            // A fresh row: publish what committed in commit order (usage, then
+            // each breach), then execute the process Breach Actions before the
+            // drain returns (D2: the caller applies them under its locks, so a
+            // short-lived CLI engine never exits with one queued).
+            Ok(commit) => {
+                let Some((update, append)) = commit.update else {
+                    // A recognized replay — no double-count, no event emitted
+                    // (nothing new was committed; AC-A).
+                    return Ok(None);
+                };
+                self.note_outbox_append(&append);
                 self.publish(EngineEvent::UsageUpdate(update.clone()));
-                self.enforce_budget(registry, name, run_id, metering_source);
+                self.apply_evaluation(registry, name, commit.evaluation);
                 Ok(Some(update))
             }
-            // A recognized replay — no double-count, no event emitted (nothing new
-            // was committed). This is the AC-A guarantee in action; the evaluator is
-            // NOT run (AC5 — no new total, no new breach).
-            Ok(RecordOutcome::DuplicateReplay) => Ok(None),
             // AI-41: a store error must never SILENTLY drop the event. Report it
             // (diagnostic + Err) so the drains can park and retry the exact same
             // event on the next pass — the self-reported drain (its byte cursor)
             // since AI-41, and the OBSERVED drain (its pending buffer) since story
-            // 12-4. Never a supervisor crash.
+            // 12-4. Never a supervisor crash. The writer rolled the whole job back,
+            // so nothing of it (row, rollups, breaches) landed.
             Err(err) => {
+                let err = crate::domain::error::RegistryError::Store(err);
                 // Caller-factual (AI-41 loop 1; MODE-aware per the 12-4
                 // AMENDMENT): a MIDRUN drain will really retry, so the text
                 // says the event is parked for the next pass and not counted
@@ -930,43 +952,62 @@ impl Supervisor {
         }
     }
 
-    /// The AD-7 ENFORCEMENT stage (story 3-2 tokens + story 3-3 dollars), run INSIDE
-    /// [`Self::ingest_usage`] right after a fresh commit — the SOLE place a budget or
-    /// Cost Cap is evaluated + a Breach Action fired.
+    /// The pipeline's evaluator inputs for one instance and Run (story 21-1):
+    /// the LIVE resolved budget, Rate, cap and actions (AC-B — a change while
+    /// `running` applies on the very next event), whether the instance is
+    /// supervised, and its wire fence. A malformed on-disk layer degrades to
+    /// "no budget / no Rate" (best-effort — never a crash mid-ingestion), the
+    /// same degrade the in-supervisor evaluator took.
+    pub(super) fn eval_input(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+        metering_source: &str,
+    ) -> pipeline::EvalInput {
+        let effective = registry.effective_config(name, ConfigLayer::empty()).ok();
+        let (token_budget, token_action) = effective
+            .as_ref()
+            .map(config::resolve_token_budget)
+            .unwrap_or((TokenBudget::default(), BreachAction::Pause));
+        let (rate, cost_cap, cost_action) = effective
+            .as_ref()
+            .map(config::resolve_cost)
+            .unwrap_or((None, CostCap::default(), BreachAction::Pause));
+        let supervised = self.running.get(name);
+        pipeline::EvalInput {
+            name: name.clone(),
+            run_id: run_id.clone(),
+            metering_source: metering_source.to_string(),
+            token_budget,
+            token_action,
+            rate,
+            cost_cap,
+            cost_action,
+            supervised: supervised.is_some(),
+            fence: supervised
+                .and_then(|supervised| supervised.observed_listener.as_ref())
+                .map(ObservedListener::fence),
+            #[cfg(test)]
+            totals_fault: self.totals_read_fault_names.contains(name),
+        }
+    }
+
+    /// The AD-7 ENFORCEMENT stage without a new usage row (story 3-2/3-3,
+    /// moved into the store writer by story 21-1): evaluate the instance's
+    /// budgets for `run_id` on the committed totals and commit every breach
+    /// that fires. Called where a Run (re)starts against an already-spent
+    /// ledger — adoption, and a Run start under `block` (19-2) — so a
+    /// crossing that has not fired yet fires exactly once. A usage commit
+    /// evaluates inside its own job ([`Self::ingest_usage`]).
     ///
-    /// Reads the CURRENT resolved budget/Rate/cap + action (live, AC-B), reads the
-    /// committed per-run + cumulative totals, evaluates purely (TOKENS then DOLLARS,
-    /// in the SAME choke point), and on a breach records the event FIRST then
-    /// executes the action. Every step is best-effort to the RUN: a failed config
-    /// read / totals read / lifecycle op is a diagnostic, never a crash (AD-12). A
-    /// no-budget + no-cap instance evaluates to `WithinBudget` for both — so the
-    /// common path is a cheap config read + two pure comparisons and nothing else.
-    ///
-    /// **STORY 3-3 — the DOLLAR evaluation folds in HERE (AD-7, no new path):** after
-    /// the token evaluation, IF a [`Rate`](super::cost::Rate) is present AND the
-    /// [`CostCap`](super::cost::CostCap) `is_set()`, derive the per-run + cumulative
-    /// COST (each row priced at its own persisted Rate — no retro-repricing) and run
-    /// the pure [`CostEvaluator`]. NO Rate ⇒ dollar enforcement is SKIPPED entirely
-    /// (AC-B inert — a `CostCap` with no Rate cannot be enforced). Both dimensions
-    /// reuse the SAME record-first-then-act path + the SAME per-Run latch, keyed by
-    /// `(dimension, scope)` so a token breach and a dollar breach of the same scope
-    /// each fire ONCE per Run (both can fire on the same event; the action is
-    /// identical).
-    ///
-    /// **Idempotence — at most one breach per (dimension, scope) per Run:** this runs
-    /// on EVERY committed usage event, so once a total crosses a ceiling every
-    /// subsequent event would re-evaluate to the SAME breach. The per-Run breach
-    /// LATCH ([`Supervised::breached_scopes`], keyed by `(dimension, scope)`)
-    /// short-circuits BOTH the [`Self::record_breach`] and the action for an
-    /// already-fired pair; the latch resets when a new Run starts.
-    ///
-    /// **STORY 19-1 — the decision half is now [`governance::decide`]:** the reads
-    /// above (config, totals, latch snapshot) build a pure
-    /// [`governance::GovernanceInput`]; [`governance::decide`] evaluates BOTH
-    /// dimensions (token first) and filters each verdict through the latch; the
-    /// loop below applies each returned decision through the SAME
-    /// record-first-then-act path. One decision implementation, shared with the
-    /// conformance-vectors artifact — the enforcement power stays here.
+    /// **Idempotence — at most one breach per (dimension, scope) per Run and
+    /// action:** the durable `run_latches` table (story 21-1) holds every
+    /// pair that fired, under the action that fired it; the writer filters
+    /// [`governance::decide`]'s latch input to the CURRENTLY configured
+    /// action, so a reconfigured action fires once more under the new action
+    /// (the 15-2 adoption rule, now live too). One decision implementation
+    /// (19-1), shared with the conformance vectors.
     pub(super) fn enforce_budget(
         &mut self,
         registry: &Registry,
@@ -974,150 +1015,77 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
     ) {
-        // (1) LIVE config read (AC-B "changes apply immediately"): resolve the
-        // CURRENT effective config ONCE, for BOTH the token budget and the dollar
-        // Rate/cap. A malformed on-disk layer degrades to "no budget / no Rate"
-        // (best-effort — never a crash mid-ingestion).
-        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
-            return;
-        };
-        let (budget, token_action) = config::resolve_token_budget(&effective);
-        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
-
-        // Whether each dimension is ARMED: a token budget is armed when a ceiling is
-        // set; the dollar cap is armed ONLY when BOTH a Rate is present AND a cap
-        // scope is set (AC-B: a cap with no Rate is inert). If NEITHER is armed, skip
-        // the totals reads entirely (the common un-governed path).
-        let token_armed = budget.is_set();
-        let dollar_armed = rate.is_some() && cost_cap.is_set();
-        if !token_armed && !dollar_armed {
+        let input = self.eval_input(registry, name, run_id, metering_source);
+        let armed =
+            input.token_budget.is_set() || (input.rate.is_some() && input.cost_cap.is_set());
+        if !armed {
+            // The common un-governed path: nothing to evaluate, no writer trip.
             return;
         }
-
-        // (2) Build the PURE decision input: one arm per ARMED dimension (the
-        // totals reads are the same story-3-2/3-3 reads, degrade-to-zero
-        // included — but SURFACED: [`Self::surfaced_read`] emits the
-        // enforcement diagnostic on every failed read, 19-1 review round 1);
-        // `None` = skipped entirely. The latch snapshot comes off the
-        // supervisor's per-Run set (an unsupervised instance snapshots empty —
-        // decide() then fires, and apply_breach declines below, as before).
-        let (token, dollar) = self.governance_arms(
-            registry,
-            name,
-            Some(run_id),
-            (budget, token_action),
-            (rate, cost_cap, cost_action),
-        );
-        let latched: Vec<governance::LatchKey> = self
-            .running
-            .get(name)
-            .map(|supervised| {
-                supervised
-                    .breached_scopes
-                    .iter()
-                    .map(|(dimension, scope)| governance::LatchKey::new(*dimension, *scope))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // (3) DECIDE — the pure governance core (story 19-1): token dimension
-        // evaluated FIRST, dollar second, each filtered through the latch. No
-        // I/O, no state — the same input always yields the same decisions.
-        // Story 19-2 — `block` set AFTER a pair already latched under another
-        // action: the latch (keyed by dimension and scope, not action) keeps
-        // `decide()` from firing it again, so the pairs that breach NOW under
-        // `block` but are latched are found here, with the latch ignored.
-        let late_block = if token.is_some_and(|arm| arm.action == BreachAction::Block)
-            || dollar.is_some_and(|arm| arm.action == BreachAction::Block)
+        match registry
+            .writer()
+            .call(move |ctx| pipeline::evaluate(ctx, &input))
         {
-            governance::decide(&governance::GovernanceInput {
-                token,
-                dollar,
-                latched: Vec::new(),
-            })
-            .decisions
-            .into_iter()
-            .filter(|decision| decision.action == BreachAction::Block)
-            .map(|decision| governance::LatchKey::new(decision.dimension, decision.scope))
-            .filter(|key| latched.contains(key))
-            .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let outcome = governance::decide(&governance::GovernanceInput {
-            token,
-            dollar,
-            latched,
-        });
-        self.fence_late_block(registry, name, &late_block);
+            Ok(evaluation) => self.apply_evaluation(registry, name, evaluation),
+            Err(err) => self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "the budget evaluation could not be committed ({err}); no breach was \
+                     recorded, and the next usage event evaluates again"
+                ),
+            ),
+        }
+    }
 
-        // (4) APPLY — the record-first-then-act half, per decision in FIRE ORDER
-        // (token before dollar), through the SAME shared path as before.
-        for decision in &outcome.decisions {
-            match decision.dimension {
-                BreachDimension::Tokens => {
-                    let cause = TransitionCause::budget_exceeded(
-                        decision.scope,
-                        decision.limit,
-                        decision.observed,
-                    );
-                    self.apply_breach(
-                        registry,
-                        name,
-                        run_id,
-                        decision.dimension,
-                        decision.scope,
-                        decision.action,
-                        cause,
-                        metering_source,
-                        // The token breach event carries token counts (no dollar fields).
-                        |registry, sup, run_id, scope, action, src| {
-                            sup.record_token_breach(
-                                registry,
-                                name,
-                                run_id,
-                                scope,
-                                decision.limit,
-                                decision.observed,
-                                action,
-                                src,
-                            );
-                        },
-                    );
-                }
-                BreachDimension::Dollars => {
-                    // v1 the estimate label is always `estimated`.
-                    let cause = TransitionCause::cost_cap_exceeded(
-                        decision.scope,
-                        Micros(decision.limit as i64),
-                        Micros(decision.observed as i64),
-                        EstimateLabel::Estimated,
-                    );
-                    self.apply_breach(
-                        registry,
-                        name,
-                        run_id,
-                        decision.dimension,
-                        decision.scope,
-                        decision.action,
-                        cause,
-                        metering_source,
-                        // The dollar breach event carries integer micros + the label.
-                        |registry, sup, run_id, scope, action, src| {
-                            sup.record_cost_breach(
-                                registry,
-                                name,
-                                run_id,
-                                scope,
-                                Micros(decision.limit as i64),
-                                Micros(decision.observed as i64),
-                                EstimateLabel::Estimated,
-                                action,
-                                src,
-                            );
-                        },
-                    );
-                }
+    /// Everything after a pipeline job committed its breaches (story 21-1):
+    /// surface any degraded totals read, mirror each breach to `breaches.log`
+    /// (best-effort), publish each in commit order, then EXECUTE the Breach
+    /// Actions through Epic-1's lifecycle (AD-15 — a reason, not a new edge).
+    /// The breaches are already durable, so a failing pause never loses the
+    /// record (FR-21 "always recorded regardless of action"). Each breach
+    /// executes its action in commit order, as before: when a token breach
+    /// already paused the instance, the dollar breach's pause meets the
+    /// transition gate and says so on the diagnostic surface.
+    fn apply_evaluation(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        evaluation: pipeline::Evaluation,
+    ) {
+        for detail in &evaluation.degraded_reads {
+            self.log_enforcement_diagnostic(registry, name, detail);
+        }
+        for committed in &evaluation.breaches {
+            self.mirror_breach(registry, name, &committed.event);
+            self.note_outbox_append(&committed.outbox);
+            self.publish(EngineEvent::BudgetBreach(committed.event.clone()));
+        }
+        for committed in &evaluation.breaches {
+            let decision = committed.decision;
+            if decision.action == BreachAction::Block {
+                self.note_block(registry, name, decision.dimension, decision.scope);
+                continue;
+            }
+            let cause = match decision.dimension {
+                BreachDimension::Tokens => TransitionCause::budget_exceeded(
+                    decision.scope,
+                    decision.limit,
+                    decision.observed,
+                ),
+                // v1 the estimate label is always `estimated`.
+                BreachDimension::Dollars => TransitionCause::cost_cap_exceeded(
+                    decision.scope,
+                    Micros(decision.limit as i64),
+                    Micros(decision.observed as i64),
+                    EstimateLabel::Estimated,
+                ),
+            };
+            match decision.action {
+                // No lifecycle transition — the breach event is the whole guardrail.
+                BreachAction::Warn | BreachAction::Block => {}
+                BreachAction::Pause => self.enforce_pause(registry, name, cause),
+                BreachAction::Stop => self.enforce_stop(registry, name, cause),
             }
         }
     }
@@ -1266,7 +1234,7 @@ impl Supervisor {
         let Some(replaced) = replaced else {
             return;
         };
-        let Ok(events) = read_breach_events_from(&registry.instance_breach_log_path(name)) else {
+        let Ok(events) = registry.reader().run_breaches(name, replaced) else {
             return;
         };
         let lifted: Vec<&'static str> = events
@@ -1294,58 +1262,17 @@ impl Supervisor {
         );
     }
 
-    /// Raise the wire fence for `block` reasons whose breach was RECORDED
-    /// earlier this Run under another action (story 19-2): the operator moved
-    /// the action to `block` after the ceiling was reached, so the latch keeps
-    /// the breach from firing again, but the fence must still go up. No new
-    /// breach is recorded (the earlier record stands, naming its action); the
-    /// diagnostic says why the fence rose without one. Instances with no
-    /// listener are skipped (nothing to fence; `config set` refuses `block` for
-    /// them, and a fresh breach still reports the acts-as-warn fallback).
-    fn fence_late_block(
-        &mut self,
-        registry: &Registry,
-        name: &InstanceName,
-        reasons: &[governance::LatchKey],
-    ) {
-        let Some(fence) = self
-            .running
-            .get(name)
-            .and_then(|supervised| supervised.observed_listener.as_ref())
-            .map(ObservedListener::fence)
-        else {
-            return;
-        };
-        for reason in reasons {
-            if fence.is_raised(*reason) {
-                continue;
-            }
-            self.log_enforcement_diagnostic(
-                registry,
-                name,
-                &format!(
-                    "`block` now applies to the {} {} breach recorded earlier this Run under \
-                     another action — raising the wire fence without a new breach record",
-                    reason.dimension.as_str(),
-                    reason.scope.as_str(),
-                ),
-            );
-            self.enforce_block(registry, name, reason.dimension, reason.scope);
-        }
-    }
-
-    /// Execute a `block` Breach Action (story 19-2): RAISE the Run's wire
-    /// fence for `(dimension, scope)` on the instance's metering listener, so
-    /// `forward()` refuses every further model call with the `proxy-wire v1`
-    /// refusal, and surface the fence on the engine diagnostic surface (the
-    /// breach event, already recorded, carries `action: "block"`). An
-    /// instance with NO listener — a `self-reported` source reached through a
-    /// hand-edited layer or a source change after the write, or an adopted
-    /// instance whose listener could not be re-bound — cannot be fenced: the
-    /// breach stays recorded, acts as `warn`, and the diagnostic says so
-    /// loudly (AI-18; never a silent no-op).
-    fn enforce_block(
-        &mut self,
+    /// Surface a committed `block` breach (story 19-2; the fence itself was
+    /// raised by the store writer's post-commit hook before the ack, story
+    /// 21-1): with a listener the fence is UP and `forward()` refuses further
+    /// model calls with the `proxy-wire v1` refusal; an instance with NO
+    /// listener — a `self-reported` source reached through a hand-edited layer
+    /// or a source change after the write, or an adopted instance whose
+    /// listener could not be re-bound — cannot be fenced: the breach stays
+    /// recorded, acts as `warn`, and the diagnostic says so loudly (AI-18;
+    /// never a silent no-op).
+    fn note_block(
+        &self,
         registry: &Registry,
         name: &InstanceName,
         dimension: BreachDimension,
@@ -1361,6 +1288,8 @@ impl Supervisor {
             .map(ObservedListener::fence)
         {
             Some(fence) => {
+                // Belt and braces: the writer's hook already raised it; a
+                // raise is idempotent.
                 fence.raise(reason);
                 self.log_enforcement_diagnostic(
                     registry,
@@ -1392,64 +1321,6 @@ impl Supervisor {
                         scope.as_str(),
                     ),
                 );
-            }
-        }
-    }
-
-    /// Apply ONE breach decision for a given `dimension` (story 3-3 shared path):
-    /// MARK the `(dimension, scope)` pair into the per-Run latch, RECORD the breach
-    /// (via `record`, the dimension-specific event writer) FIRST/INDEPENDENTLY and
-    /// THEN execute the action via Epic-1's lifecycle (AD-15 — a REASON, not a new
-    /// edge). A missing `Supervised` (not currently supervised — a race with stop)
-    /// declines to enforce. All best-effort: a lifecycle error is a diagnostic, never
-    /// a crash.
-    ///
-    /// Since story 19-1 the latch CONSULT half (the short-circuit) lives in
-    /// [`governance::decide`], which filters on the snapshot taken before the
-    /// decisions fire; what remains here is the latch MARK half — the insert that
-    /// persists the once-per-Run state for every LATER usage event. A decision
-    /// reaching this point is already latch-cleared, so the insert marks a fresh
-    /// pair; it stays idempotent bookkeeping either way.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_breach(
-        &mut self,
-        registry: &Registry,
-        name: &InstanceName,
-        run_id: &RunId,
-        dimension: BreachDimension,
-        scope: BreachScope,
-        action: BreachAction,
-        cause: TransitionCause,
-        metering_source: &str,
-        record: impl FnOnce(&Registry, &Self, &RunId, BreachScope, BreachAction, &str),
-    ) {
-        // LATCH MARK (story 3-2/3-3; consult half moved to `governance::decide` in
-        // story 19-1): insert the pair so later events stay suppressed this Run.
-        match self.running.get_mut(name) {
-            Some(supervised) => {
-                supervised.breached_scopes.insert((dimension, scope));
-            }
-            None => return,
-        }
-        // RECORD THE BREACH FIRST (AC7/AC10 / FR-21 "always recorded regardless of
-        // action"), BEFORE the lifecycle side-effect, so a best-effort/unsupported/
-        // failing pause never loses the record.
-        record(registry, self, run_id, scope, action, metering_source);
-        // EXECUTE THE ACTION via Epic-1's EXISTING lifecycle. The breach is already
-        // recorded; a lifecycle error here is a best-effort diagnostic, never a crash.
-        match action {
-            BreachAction::Warn => {
-                // No lifecycle transition — the breach event is the whole guardrail.
-            }
-            BreachAction::Pause => {
-                self.enforce_pause(registry, name, cause);
-            }
-            BreachAction::Stop => {
-                self.enforce_stop(registry, name, cause);
-            }
-            BreachAction::Block => {
-                // Story 19-2: no lifecycle transition — the wire fence.
-                self.enforce_block(registry, name, dimension, scope);
             }
         }
     }
@@ -1497,10 +1368,13 @@ impl Supervisor {
         }
     }
 
-    /// Record a TOKEN [`BudgetBreachEvent`] (story 3-2, AC7) — the token-dimension
-    /// event writer passed to [`Self::apply_breach`]. Builds the token breach struct
-    /// (token `limit`/`observed`, no dollar fields) and persists it via
-    /// [`Self::persist_breach_event`].
+    /// Record a TOKEN [`BudgetBreachEvent`] outside a usage commit (story 3-2
+    /// shape; since story 21-1 the pipeline's own breaches commit inside the
+    /// usage job, so this records history for the paths that need a breach on
+    /// file — tests seed adoption scenarios through it). The breach row, its
+    /// latch and its outbox row commit in one writer job, then the record is
+    /// mirrored and published like any pipeline breach.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_token_breach(
         &self,
@@ -1526,88 +1400,25 @@ impl Supervisor {
         self.persist_breach_event(registry, name, &event);
     }
 
-    /// Record a DOLLAR [`BudgetBreachEvent`] (story 3-3, AC10) — the dollar-dimension
-    /// event writer passed to [`Self::apply_breach`]. Builds the dollar breach struct
-    /// (integer-micro `dollar_limit`/`dollar_observed` + the [`EstimateLabel`]) and
-    /// persists it via [`Self::persist_breach_event`]. NO `$` string, NO `f64` — the
-    /// wire carries integer micros + the label (AD-14).
-    #[allow(clippy::too_many_arguments)]
-    fn record_cost_breach(
-        &self,
-        registry: &Registry,
-        name: &InstanceName,
-        run_id: &RunId,
-        scope: BreachScope,
-        limit_micros: Micros,
-        observed_micros: Micros,
-        label: EstimateLabel,
-        action: BreachAction,
-        metering_source: &str,
-    ) {
-        let event = BudgetBreachEvent::new_cost(
-            name.as_str(),
-            run_id.as_str(),
-            scope,
-            limit_micros,
-            observed_micros,
-            label,
-            action,
-            metering_source,
-            now_rfc3339(),
-        );
-        self.persist_breach_event(registry, name, &event);
-    }
-
-    /// Persist a built [`BudgetBreachEvent`] to the durable per-instance breach log
-    /// (story 3-2 shared path, AC7 / FR-21 "always recorded regardless of action").
-    /// Recorded for EVERY action (including `warn`) and BEFORE the lifecycle
-    /// side-effect, so the breach is never lost.
-    ///
-    /// Non-fatal but NOT swallowed: this is the PRIMARY durable record of the breach
-    /// (FR-21), so a write failure (disk full / IO / perms) must not vanish silently
-    /// while the action still fires — that would lose the mandated record with no
-    /// diagnostic. We keep enforcement acting (the write failure is NOT made fatal),
-    /// but SURFACE the error on the engine-log stderr breadcrumb (mirroring how
-    /// `enforce_pause`/`enforce_stop` log their best-effort diagnostics), so a lost
-    /// breach record is visible to an operator. Both the dir-create and the append
-    /// failure are surfaced.
+    /// Commit one built breach record (row + latch + outbox) through the
+    /// store writer, then mirror and publish it. A failed commit is surfaced:
+    /// the breach record is the FR-21 mandated durable artifact, so a lost one
+    /// is never silent.
+    #[cfg(test)]
     fn persist_breach_event(
         &self,
         registry: &Registry,
         name: &InstanceName,
         event: &BudgetBreachEvent,
     ) {
-        let path = registry.instance_breach_log_path(name);
-        // Ensure the log dir exists (a never-transitioned instance may lack it) —
-        // non-fatal, mirroring `ensure_log_dir`, but a failure is surfaced (below) if
-        // it then makes the append fail.
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                self.log_enforcement_diagnostic(
-                    registry,
-                    name,
-                    &format!(
-                        "could not create the breach-log directory {}: {e} — the breach \
-                         record may be lost",
-                        parent.display()
-                    ),
-                );
-            }
-        }
-        // Surface (do NOT swallow) an append failure: the breach record is the FR-21
-        // mandated durable artifact; a lost record with no diagnostic is the bug. Log
-        // and move on — enforcement still acts.
-        match append_breach_event(&path, event) {
-            Ok(()) => {
-                // Story 7-2: the append COMMITTED — publish onto the event bus
-                // (after the durable record exists, never before; a failed
-                // append publishes nothing). Ordering obligation: this runs
-                // under the supervisor lock (see the `domain::bus`
-                // caller-enforced invariant).
-                // Story 17-4: the outbox journal mirrors the same committed
-                // breach event at the SAME commit point. Best-effort (see
-                // `outbox_append`).
-                self.outbox_append(registry, EngineEvent::BudgetBreach(event.clone()));
+        let job_event = event.clone();
+        match registry
+            .writer()
+            .call(move |ctx| pipeline::record_breach(ctx, &job_event))
+        {
+            Ok(append) => {
+                self.mirror_breach(registry, name, event);
+                self.note_outbox_append(&append);
                 self.publish(EngineEvent::BudgetBreach(event.clone()));
             }
             Err(e) => {
@@ -1615,12 +1426,34 @@ impl Supervisor {
                     registry,
                     name,
                     &format!(
-                        "could not record the budget breach event to {}: {e} — the mandated \
-                         breach record was NOT written",
-                        path.display()
+                        "could not record the budget breach event in state.db: {e} — the \
+                         mandated breach record was NOT written"
                     ),
                 );
             }
+        }
+    }
+
+    /// Append a committed breach to the instance's `breaches.log` mirror
+    /// (story 21-1: best-effort, after commit — state.db holds the record, so
+    /// a failed mirror is a diagnostic, never a lost breach).
+    fn mirror_breach(&self, registry: &Registry, name: &InstanceName, event: &BudgetBreachEvent) {
+        let path = registry.instance_breach_log_path(name);
+        let mirrored = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(|e| e.to_string())
+            .and_then(|()| append_breach_event(&path, event));
+        if let Err(e) = mirrored {
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "the budget breach is recorded in state.db, but its breaches.log mirror at \
+                     {} could not be appended: {e}",
+                    path.display()
+                ),
+            );
         }
     }
 
@@ -1691,11 +1524,17 @@ impl Supervisor {
             name: name.to_string(),
             reason,
         })?;
-        let path = registry.instance_breach_log_path(&name);
-        read_breach_events_from(&path).map_err(|detail| EngineError::Log {
-            name: name.as_str().to_string(),
-            path: path.to_string_lossy().into_owned(),
-            detail,
-        })
+        registry
+            .breach_events(&name)
+            .map_err(super::registry_to_engine)
     }
+}
+
+/// Whether a ledger commit failed only because the store writer stayed busy
+/// past its bound (story 21-1) — retryable contention, never a poisoned row.
+fn is_busy(err: &crate::domain::error::RegistryError) -> bool {
+    matches!(
+        err,
+        crate::domain::error::RegistryError::Store(crate::ports::StoreError::Busy { .. })
+    )
 }

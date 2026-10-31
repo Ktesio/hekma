@@ -45,7 +45,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,8 +57,9 @@ use crate::backends;
 use crate::metering::{ListenerError, ObservedListener};
 use crate::ports::{
     assemble_usage_event, BackendError, LogCapture, LogCaptureMode, MemoryBackingKind,
-    ObservedUsageSource, ParsedUsage, ProcessBackend, ProcessStatus, SelfReportedUsageSource,
-    SpawnRecord, SpawnSpec, UsageSource, KILL_CONFIRM_TIMEOUT, LOG_ROTATE_GENERATIONS,
+    ObservedUsageSource, ParsedUsage, ProcessBackend, ProcessStatus, RunStore,
+    SelfReportedUsageSource, SpawnRecord, SpawnSpec, UsageSource, KILL_CONFIRM_TIMEOUT,
+    LOG_ROTATE_GENERATIONS,
 };
 use crate::time::now_rfc3339;
 
@@ -75,17 +75,14 @@ use super::governance;
 use super::instance::AgentInstance;
 use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
-use super::outbox::{
-    append_with_retention, read_ack, read_journal_tolerant, OutboxEntry, OUTBOX_MAX_BYTES,
-    OUTBOX_SCHEMA_VERSION,
-};
+use super::outbox::OUTBOX_MAX_BYTES;
 use super::registry::Registry;
 use super::restart::{
     is_crash_loop, next_consecutive_failures, BackoffSchedule, RestartPolicy,
     MAX_CONSECUTIVE_FAILURES, STABLE_RUN_WINDOW,
 };
 use super::transition::{next_state, LifecycleCommand};
-use super::usage::{RecordOutcome, RunId, UsageUpdateEvent};
+use super::usage::{RunId, UsageUpdateEvent};
 
 /// The default graceful-shutdown window before a stop escalates to a forced kill
 /// (AC3). Per-instance configurable via [`Supervisor::stop`]'s `window` argument;
@@ -195,12 +192,6 @@ const MAX_CONSECUTIVE_ENVIRONMENTAL_TICKS: u32 = 40;
 /// the cursor forever) and the diagnostic noise (≤ one diagnostic per attempt
 /// per offset, then the skip note).
 const USAGE_PARK_MAX_ATTEMPTS: u32 = 3;
-
-/// The outbox size cache's "unknown" sentinel ([`Supervisor::
-/// outbox_size_bytes`], review finding 7): a real journal is bounded by the
-/// 30MB cap, far below `u64::MAX`, so the sentinel can never collide with a
-/// true size. A failed append stores it; the next append stats the file.
-const OUTBOX_SIZE_UNKNOWN: u64 = u64::MAX;
 
 /// Story 12-4 AMENDMENT (review loop 1): how many minted events the observed
 /// drain's pending park buffer may hold at once. During a store outage EVERY
@@ -653,26 +644,13 @@ struct Supervised {
     /// loud diagnostic and the rest keep counting. Dropped with the instance
     /// at the terminal transition (a terminal failure announces the loss).
     observed_park: Option<(ObservedPending, u32)>,
-    /// The per-Run breach LATCH (story 3-2 idempotence fix; story 3-3 keyed by
-    /// dimension): the set of `(dimension, scope)` pairs that have ALREADY fired a
-    /// breach for THIS Run. Enforcement (`enforce_budget`) runs on EVERY committed
-    /// usage event, but a breach must fire **at most once per (dimension, scope) per
-    /// Run** — otherwise every post-crossing event re-records a `BudgetBreachEvent`
-    /// and re-fires the action (unbounded duplicate records for `warn`; redundant
-    /// records for `pause`/`stop`). A pair is inserted the first time it trips; a
-    /// subsequent event whose pair is already latched short-circuits BOTH the record
-    /// and the action.
-    ///
-    /// STORY 3-3 — DIMENSION KEY: the latch key is `(BreachDimension, BreachScope)`
-    /// so a TOKEN breach and a DOLLAR breach of the SAME scope latch INDEPENDENTLY —
-    /// each fires once per Run (a run can legitimately trip both its token ceiling
-    /// and its dollar cap; the action is identical, so both fire once each). The
-    /// per-run and cumulative scopes still latch independently within each dimension.
-    /// The latch lives on `Supervised`, so it RESETS automatically when a new Run
-    /// starts — a fresh `Supervised` (built at `starting`, where the `run_id` is
-    /// freshly minted) begins empty, giving "at most one breach per (dimension,
-    /// scope) per Run".
-    breached_scopes: std::collections::HashSet<(BreachDimension, BreachScope)>,
+    /// The launch generation this handle meters under (story 21-1): bumped
+    /// in state.db at every spawn, Restart Policy relaunch and adoption, and
+    /// stamped on every usage row, so an engine-minted sequence that restarts
+    /// (the observed listener after an adoption) or an agent's sequence after
+    /// a relaunch never collides with an earlier attach's rows. (The per-Run
+    /// breach latch that lived here moved into state.db's `run_latches`.)
+    launch_generation: u64,
     /// The per-instance loopback forward listener for an `engine-observed` instance
     /// (story 3-4), or `None` for a `self-reported` instance (whose start path is
     /// UNCHANGED). Held for the Run; DROPPED at the terminal transition (which
@@ -941,28 +919,6 @@ pub struct Supervisor {
     /// ONLY the manifest-declared mappings (via [`SpawnSpec::inherit_env`] —
     /// the supervisor owns the decision, the backends stay dumb executors).
     child_env_allowlist: bool,
-    /// Story 17-4 — the engine's global outbox seq counter. Holds the LAST
-    /// MINTED seq (0 fresh — no seq minted yet), so the append's
-    /// `fetch_add(1) + 1` mints 1 first (0 is [`super::OutboxCursor::START`]'s
-    /// "nothing yet" sentinel and never names a real entry). `fetch_add`
-    /// BEFORE the append so concurrent appends (impossible today — every
-    /// caller holds the supervisor lock — but the atomic keeps the invariant
-    /// structural) cannot share a seq; a FAILED append ROLLS BACK the
-    /// counter so a later successful append reuses the seq (a gap would make
-    /// a reader see a hole where none existed).
-    outbox_next_seq: AtomicU64,
-    /// Story 17-4 (review finding 7) — the outbox journal's CACHED byte
-    /// size, so the hot append needs NO whole-journal read under the
-    /// supervision lock: the cap check compares this + the incoming line,
-    /// `repair_torn_tail` decides from one byte, and only an actual
-    /// compaction pays the O(journal) read. Seeded from the file at open
-    /// ([`Self::rederive_outbox_seq`]), advanced by each append's returned
-    /// post-write stat, invalidated to [`OUTBOX_SIZE_UNKNOWN`] on any failed
-    /// append so the next append re-derives. Every reader/writer holds the
-    /// supervisor lock, so the in-memory accounting is sound; the u64::MAX
-    /// sentinel means "unknown — stat the file" (a real journal is bounded
-    /// by the 30MB cap, far below it).
-    outbox_size_bytes: AtomicU64,
     /// Story 17-4 — the engine's log-capture posture (the AD-12 amendment),
     /// set open-time via [`Supervisor::set_serve_options`] from
     /// `EngineOptions::log_capture`. Resolved into each spawn's
@@ -1069,14 +1025,6 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     signal_fault_names: std::collections::HashSet<InstanceName>,
-    /// Story 16-3 — cfg(test) FAULT-INJECTION SEAM at the compensating store
-    /// write: an instance name listed here makes [`Supervisor::
-    /// compensate_transition`]'s registry write fail with an injected error,
-    /// driving the append-fails-AND-compensation-fails arm deterministically.
-    /// Same placement rationale as `signal_fault_names` above. Never compiled
-    /// outside the lib's own test builds.
-    #[cfg(test)]
-    compensation_fault_names: std::collections::HashSet<InstanceName>,
     /// Story 19-1 review round 1 — cfg(test) FAULT-INJECTION SEAM at the
     /// enforcement totals reads: an instance name listed here makes EVERY
     /// totals/cost read in [`Supervisor::enforce_budget`] fail with an
@@ -1113,6 +1061,14 @@ pub struct Supervisor {
     /// outside the lib's own test builds.
     #[cfg(test)]
     liveness_commit_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 21-1 — cfg(test) FAULT-INJECTION SEAM at the transition commit:
+    /// an instance name listed here makes every transition's writer job fail
+    /// with an injected store error before anything commits (the seam the
+    /// pre-21-1 tests got by obstructing `instance.log`, which is a
+    /// best-effort mirror now). Same placement rationale as
+    /// `liveness_commit_fault_names`.
+    #[cfg(test)]
+    transition_fault_names: std::collections::HashSet<InstanceName>,
     /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
     /// the backend STOP boundary: a pid entry here makes the LIVENESS-EXPIRY
     /// teardown's force-kill (reaper.rs) and the READINESS-TIMEOUT teardown's
@@ -1201,8 +1157,6 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
-            outbox_next_seq: AtomicU64::new(0),
-            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
             agent_log_cap_override: None,
@@ -1219,7 +1173,6 @@ impl Supervisor {
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
-            compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
             liveness_lookup_err_names: std::collections::HashSet::new(),
@@ -1227,6 +1180,8 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            transition_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1255,8 +1210,6 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
-            outbox_next_seq: AtomicU64::new(0),
-            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
             agent_log_cap_override: None,
@@ -1273,7 +1226,6 @@ impl Supervisor {
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
-            compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
             liveness_lookup_err_names: std::collections::HashSet::new(),
@@ -1281,6 +1233,8 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            transition_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1309,8 +1263,6 @@ impl Supervisor {
             metering_listen_port: 0,
             child_env_allowlist: false,
             serve_options_applied: false,
-            outbox_next_seq: AtomicU64::new(0),
-            outbox_size_bytes: AtomicU64::new(OUTBOX_SIZE_UNKNOWN),
             log_capture_mode: LogCaptureMode::default(),
             #[cfg(test)]
             agent_log_cap_override: None,
@@ -1327,7 +1279,6 @@ impl Supervisor {
             #[cfg(test)]
             signal_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
-            compensation_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             totals_read_fault_names: std::collections::HashSet::new(),
             liveness_lookup_err_names: std::collections::HashSet::new(),
@@ -1335,6 +1286,8 @@ impl Supervisor {
             liveness_lookup_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             liveness_commit_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            transition_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
@@ -1516,133 +1469,25 @@ impl Supervisor {
         crate::ports::LOG_ROTATE_MAX_BYTES
     }
 
-    /// Re-derive the outbox seq counter from the journal's committed tail
-    /// (story 17-4). Called ONCE at engine open, BEFORE any lifecycle can
-    /// append: a restart must continue the seq sequence (a restart from 1
-    /// would mint duplicate seqs, and a reader's "seq strictly greater than
-    /// cursor" walk would silently skip the reused range). The counter holds
-    /// the LAST minted seq, so the tail IS the resumed value — the next
-    /// append mints tail + 1, exactly. An absent or empty journal leaves the
-    /// counter at 0 (the first seq minted is 1) — UNLESS an ack file
-    /// survives it, in which case the counter seeds `max(tail, ack)`: the
-    /// ack is the seq floor (review finding 1) — minting a reused range
-    /// below a surviving ack would deliver events every Host cursor has
-    /// already skipped past, i.e. silently lose them.
-    ///
-    /// On a READ FAILURE the open REFUSES (review finding 1): a mis-derived
-    /// counter can mint DUPLICATE seqs, and an ack landing on a duplicate
-    /// lets compaction evict NEVER-DELIVERED events — silent loss. The
-    /// typed refusal names the file and the remediation (quarantine by
-    /// renaming; per-family `resync_events` remains the complete heal); the
-    /// caller maps it to [`crate::domain::RegistryError::OutboxOpenRefused`]
-    /// and the engine does not open.
-    ///
-    /// Also seeds the O(1) append's size cache (review finding 7) from the
-    /// journal's real byte size. Runs BEFORE the registry moves under the
-    /// engine's mutex, so the journal read and the counter/cache writes are
-    /// serialized against every later append by construction.
-    pub(crate) fn rederive_outbox_seq(&self, registry: &Registry) -> Result<(), String> {
-        let journal = registry.outbox_journal_path();
-        let view = read_journal_tolerant(&journal).map_err(|detail| {
-            format!(
-                "the outbox journal could not be read, and event sequences must not be \
-                 minted from an unverified counter (a duplicate seq under an ack lets \
-                 compaction evict never-delivered events): {detail}"
-            )
-        })?;
-        let ack_path = registry.outbox_ack_path();
-        let ack = read_ack(&ack_path).map_err(|detail| {
-            format!(
-                "the outbox ack file could not be read, and the ack is the seq floor \
-                 (seeding below it would mint a reused range every Host cursor has \
-                 already skipped past): {detail}"
-            )
-        })?;
-        let seed = view.tail.max(ack.unwrap_or(0));
-        self.outbox_next_seq.store(seed, Ordering::Relaxed);
-        let size = std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
-        self.outbox_size_bytes.store(size, Ordering::Relaxed);
-        Ok(())
+    /// Surface what an outbox append evicted (story 17-4's cap, kept by the
+    /// state.db outbox since story 21-1): an UN-ACKED eviction means a Host
+    /// that has not acked lost replayable events, so it is a diagnostic,
+    /// never silent (AI-18). An acked eviction is free and silent.
+    pub(super) fn note_outbox_append(&self, append: &crate::ports::OutboxAppend) {
+        if append.dropped_unacked > 0 {
+            self.emit_diagnostic(&format!(
+                "outbox compaction dropped {} un-acked event(s) to stay under the {}MB cap — \
+                 a Host that has not acked the export cursor lost replayable events",
+                append.dropped_unacked,
+                OUTBOX_MAX_BYTES / (1024 * 1024)
+            ));
+        }
     }
 
-    /// Append one committed event to the engine's global outbox journal
-    /// (story 17-4) — BEST-EFFORT by contract: the outbox is an
-    /// export/replay AMENITY for ephemeral hosts, never a supervision
-    /// record (the instance logs + ledger are authoritative), so an append
-    /// failure is a surfaced diagnostic and a seq ROLLBACK, never a failed
-    /// transition. Callers run at the three commit points (transition,
-    /// breach, usage), immediately AFTER the durable family commit and
-    /// BEFORE the bus publish — under the supervisor lock, same as
-    /// `publish`, so journal order == bus order == durable-log order.
-    ///
-    /// Compaction (check-before-write, [`append_with_retention`]) runs under
-    /// the same lock, so appends and compactions can never interleave. The
-    /// append is O(1) amortized (review finding 7): the cap check compares
-    /// the cached size + the incoming line, the torn-tail repair decides
-    /// from one byte, and only an actual compaction reads the journal. An
-    /// un-acked eviction (the cap crossed while a Host has not acked) is
-    /// SURFACED as a diagnostic naming the loss — never silent (AI-18).
-    fn outbox_append(&self, registry: &Registry, event: EngineEvent) {
-        let seq = self.outbox_next_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let entry = OutboxEntry {
-            schema_version: OUTBOX_SCHEMA_VERSION,
-            seq,
-            event,
-        };
-        let ack = match read_ack(&registry.outbox_ack_path()) {
-            Ok(ack) => ack,
-            Err(detail) => {
-                // Review finding 6: a corrupt/unreadable ack file must SAY
-                // it lost the ack at this compaction decision. Treating
-                // every retained entry as un-acked is the SAFE direction
-                // (nothing acked is evicted as free), but pretending the
-                // read succeeded would misattribute a later eviction as
-                // "un-acked loss" — a lie about what the Host consumed.
-                self.emit_diagnostic(&format!(
-                    "outbox: the ack file could not be read ({detail}); treating every \
-                     retained entry as UN-ACKED for this append's compaction (the safe \
-                     direction — nothing already-consumed is evicted as free, but the \
-                     journal may hold entries a Host has already acked; the ack file \
-                     should be inspected: {detail})",
-                ));
-                None
-            }
-        };
-        let raw = self.outbox_size_bytes.load(Ordering::Relaxed);
-        let cached = (raw != OUTBOX_SIZE_UNKNOWN).then_some(raw);
-        match append_with_retention(
-            &registry.outbox_journal_path(),
-            ack,
-            &entry,
-            OUTBOX_MAX_BYTES,
-            cached,
-        ) {
-            Ok((outcome, new_size)) => {
-                self.outbox_size_bytes.store(new_size, Ordering::Relaxed);
-                if outcome.dropped_unacked > 0 {
-                    self.emit_diagnostic(&format!(
-                        "outbox compaction dropped {} un-acked event(s) to stay under the \
-                         {}MB cap — a Host that has not acked the export cursor lost \
-                         replayable events",
-                        outcome.dropped_unacked,
-                        OUTBOX_MAX_BYTES / (1024 * 1024)
-                    ));
-                }
-            }
-            Err(detail) => {
-                // Roll the seq back: the entry never landed, so the seq must
-                // be reusable (a gap would fabricate a hole for exporters).
-                // The size cache is invalidated too — whatever the append
-                // touched (repair, compaction) may have moved the file.
-                self.outbox_next_seq.fetch_sub(1, Ordering::Relaxed);
-                self.outbox_size_bytes
-                    .store(OUTBOX_SIZE_UNKNOWN, Ordering::Relaxed);
-                self.emit_diagnostic(&format!(
-                    "outbox append failed (seq {seq}); the export journal lags the committed \
-                     record: {detail}"
-                ));
-            }
-        }
+    /// Surface one note from the engine open (story 21-1: the v12 import's
+    /// skipped legacy lines) on the diagnostic surface.
+    pub(crate) fn emit_open_note(&self, note: &str) {
+        self.emit_diagnostic(note);
     }
 
     /// Emit ONE engine diagnostic (story 10-2) — the engine's ONLY diagnostic
@@ -1869,21 +1714,26 @@ impl Supervisor {
         cause: TransitionCause,
         log_capture: Option<LogCapture>,
     ) -> Result<TransitionEvent, EngineError> {
-        registry.set_state(name, new).map_err(registry_to_engine)?;
-        self.record_transition(registry, name, prior, new, cause, log_capture)
+        self.transition_fault(name)?;
+        let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
+        let (_snapshot, append) =
+            commit::commit_transition(registry, name, commit::StateWrite::Plain, &event)
+                .map_err(registry_to_engine)?;
+        self.after_transition_commit(registry, name, &event, &append, log_capture);
+        Ok(event)
     }
 
     /// Story 15-6: the `→ starting` transition's TRANSACTIONAL shape — the
     /// state persist and the AUTHORITATIVE memory-backing read happen in ONE
-    /// `BEGIN IMMEDIATE` store transaction
-    /// ([`StateStore::set_state_snapshotting_memory_backing`]), conditional on
-    /// `expected_prior` (the state the start path read) and
-    /// `expected_backing` (the backing the start path's pre-check read). A
-    /// second CLI Engine on the same state root can no longer attach/detach
-    /// the backing — or transition the instance — inside the window between
-    /// the start path's reads and the persisted transition: the transaction
-    /// refuses typed and ROLLS BACK (no `starting` row lands, nothing
-    /// launches against a stale view).
+    /// store transaction, conditional on `expected_prior` (the state the start
+    /// path read) and `expected_backing` (the backing the start path's
+    /// pre-check read). A second CLI Engine on the same state root can no
+    /// longer attach/detach the backing — or transition the instance — inside
+    /// the window between the start path's reads and the persisted
+    /// transition: the transaction refuses typed and ROLLS BACK (no
+    /// `starting` row lands, nothing launches against a stale view). Since
+    /// story 21-1 the transition's event row and outbox row commit in that
+    /// same writer job.
     ///
     /// On success returns the backing snapshot read inside the same
     /// transaction — the authoritative view the launch then reflects (and the
@@ -1898,25 +1748,34 @@ impl Supervisor {
         cause: TransitionCause,
         expected_backing: Option<crate::ports::MemoryBacking>,
     ) -> Result<Option<crate::ports::MemoryBacking>, EngineError> {
-        let snapshot = registry
-            .set_state_snapshotting_memory_backing(name, prior, new, expected_backing)
-            .map_err(transition_snapshot_to_engine)?;
+        self.transition_fault(name)?;
+        let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
+        let (snapshot, append) = commit::commit_transition(
+            registry,
+            name,
+            commit::StateWrite::SnapshotBacking {
+                expected_prior: prior,
+                expected_backing,
+            },
+            &event,
+        )
+        .map_err(transition_snapshot_to_engine)?;
         // The capture lookup mirrors `transition`'s (the instance has no
         // `self.running` entry yet — the spawn comes after this transition).
         let log_capture = self.log_capture_for(name);
-        self.record_transition(registry, name, prior, new, cause, log_capture)?;
+        self.after_transition_commit(registry, name, &event, &append, log_capture);
         Ok(snapshot)
     }
 
     /// The CONDITIONAL transition (story 18-2 review round 1, P3): the
-    /// state persist goes through the guarded
-    /// [`Registry::set_state_if_prior`] — it commits only when the persisted
-    /// state still equals `prior` — and ONLY a committed write records the
-    /// event (the durable log never leads a state that did not happen).
-    /// The `engine`-attributed [`LogCapture`] is supplied EXPLICITLY (the
-    /// same reason as [`Self::transition_with_log_capture`]: the liveness
-    /// expiry removes the handle from `self.running` BEFORE committing, so
-    /// the lookup form would find nothing).
+    /// state persist is guarded — it commits only when the persisted state
+    /// still equals `prior` — and ONLY a committed write records the event
+    /// (since story 21-1 the guard, the state write and the event row are one
+    /// writer job, so the durable record can never lead a state that did not
+    /// happen). The `engine`-attributed [`LogCapture`] is supplied EXPLICITLY
+    /// (the same reason as [`Self::transition_with_log_capture`]: the liveness
+    /// expiry removes the handle from `self.running` BEFORE committing, so the
+    /// lookup form would find nothing).
     ///
     /// The liveness expiry uses this instead of [`Self::transition`] to close
     /// the race the review found: between the phase-4 lookup (which read
@@ -1946,55 +1805,62 @@ impl Supervisor {
                 },
             ));
         }
-        registry
-            .set_state_if_prior(name, prior, new)
-            .map_err(registry_to_engine)?;
-        self.record_transition(registry, name, prior, new, cause, log_capture)
+        self.transition_fault(name)?;
+        let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
+        let (_snapshot, append) =
+            commit::commit_transition(registry, name, commit::StateWrite::IfPrior(prior), &event)
+                .map_err(registry_to_engine)?;
+        self.after_transition_commit(registry, name, &event, &append, log_capture);
+        Ok(event)
     }
 
-    /// Everything a transition records AFTER the state persist: the durable
-    /// `instance.log` append, the bus publish, and the attributed-capture
-    /// engine line. Shared by [`Supervisor::transition_with_log_capture`] and
-    /// [`Supervisor::transition_with_backing_snapshot`] so both transitions
-    /// record byte-identically once the state is persisted.
-    fn record_transition(
+    /// The cfg(test) transition-commit fault (see `transition_fault_names`);
+    /// a no-op in every non-test build.
+    #[cfg(test)]
+    fn transition_fault(&self, name: &InstanceName) -> Result<(), EngineError> {
+        if self.transition_fault_names.contains(name) {
+            return Err(EngineError::Store(crate::ports::StoreError::Backend(
+                "injected transition-commit fault (test seam)".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn transition_fault(&self, _name: &InstanceName) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Everything a transition does AFTER its writer job committed (story
+    /// 21-1): the best-effort `instance.log` mirror, the outbox eviction
+    /// diagnostic, the bus publish, and the attributed-capture engine line.
+    /// The commit already made the event durable and exportable
+    /// (`transition_events` + the outbox row), so nothing here can fail the
+    /// transition: a failed mirror append is a diagnostic. Bus order is
+    /// commit order — every caller holds the supervisor lock (see the
+    /// `domain::bus` caller-enforced invariant).
+    fn after_transition_commit(
         &self,
         registry: &Registry,
         name: &InstanceName,
-        prior: LifecycleState,
-        new: LifecycleState,
-        cause: TransitionCause,
+        event: &TransitionEvent,
+        append: &crate::ports::OutboxAppend,
         log_capture: Option<LogCapture>,
-    ) -> Result<TransitionEvent, EngineError> {
-        let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
-        if let Err(detail) = append_event(&registry.instance_log_path(name), &event) {
-            // Story 16-3: the state COMMITTED but the event never landed — the
-            // row and the audit log disagree. COMPENSATE the row back to
-            // `prior` (the state the last durably-landed event supports) so the
-            // observable end-state is `prior + an error`, never `new + silence`
-            // (surfaced, not silent, AI-18). Never fabricates a synthetic
-            // event: that would trust the medium that just failed.
-            let path = registry
-                .instance_log_path(name)
-                .to_string_lossy()
-                .into_owned();
-            return Err(self.compensate_transition(registry, name, prior, new, path, detail));
+    ) {
+        if let Err(detail) = append_event(&registry.instance_log_path(name), event) {
+            self.emit_diagnostic(&format!(
+                "{}: the transition {} → {} is recorded in state.db, but its instance.log \
+                 mirror could not be appended ({detail}); `hekma agent events` and the \
+                 export read state.db and are complete",
+                name.as_str(),
+                event.prior_state.as_str(),
+                event.new_state.as_str(),
+            ));
         }
-        // Story 7-2: the append COMMITTED — publish onto the event bus. After
-        // the durable append (never before: a subscriber never sees an
-        // uncommitted event), before the best-effort text mirror below, so the
-        // bus order is exactly the durable-log order. Ordering obligation:
-        // this runs under the supervisor lock (see the `domain::bus`
-        // caller-enforced invariant).
-        // Story 17-4: the outbox journal mirrors the same committed event at
-        // the SAME commit point — AFTER the durable family append, BEFORE the
-        // bus publish — so journal order == bus order == durable-log order.
-        // Best-effort (see `outbox_append`): a journal failure never fails
-        // the transition.
-        self.outbox_append(registry, EngineEvent::Transition(event.clone()));
+        self.note_outbox_append(append);
         self.publish(EngineEvent::Transition(event.clone()));
         if let Some(capture) = log_capture {
-            let text = engine_transition_line_text(&event);
+            let text = engine_transition_line_text(event);
             capture.send_engine_line(LogLine::new(
                 name.as_str(),
                 LogStream::Engine,
@@ -2002,65 +1868,8 @@ impl Supervisor {
                 event.at.clone(),
             ));
         }
-        Ok(event)
     }
 
-    /// Story 16-3: settle the registry row back to `prior` after a committed
-    /// transition's durable event append FAILED. Best-effort but LOUD: on
-    /// success the surfaced error names the compensation; on compensation
-    /// failure the error names BOTH failures and the row stays at `new` (the
-    /// honestly-stuck state — a compensating retry loop is out of scope by
-    /// the spec's Never list). Runs under the supervisor lock
-    /// (`record_transition`'s caller discipline) — no new locking.
-    fn compensate_transition(
-        &self,
-        registry: &Registry,
-        name: &InstanceName,
-        prior: LifecycleState,
-        new: LifecycleState,
-        path: String,
-        append_detail: String,
-    ) -> EngineError {
-        let compensated = {
-            // cfg(test) FAULT-INJECTION SEAM (AI-9/AI-12 precedent): when the
-            // instance is armed, the compensating store write fails with an
-            // injected error, driving the double-failure arm deterministically
-            // in the lib's own tests without staging a real store outage.
-            // State lives on the supervisor (per-supervisor, test-isolated by
-            // construction); never compiled outside test builds.
-            #[cfg(test)]
-            if self.compensation_fault_names.contains(name) {
-                Err(super::error::RegistryError::Io {
-                    name: name.as_str().to_string(),
-                    path: path.clone(),
-                    source: std::io::Error::other("injected compensation fault (test seam)"),
-                })
-            } else {
-                registry.set_state(name, prior)
-            }
-            #[cfg(not(test))]
-            registry.set_state(name, prior)
-        };
-        match compensated {
-            Ok(()) => EngineError::Log {
-                name: name.as_str().to_string(),
-                path,
-                detail: format!(
-                    "{append_detail}; the committed '{new}' state was \
-                     compensated back to '{prior}' — the row reflects the last \
-                     event that durably landed"
-                ),
-            },
-            Err(comp) => EngineError::Log {
-                name: name.as_str().to_string(),
-                path,
-                detail: format!(
-                    "{append_detail}; COMPENSATION ALSO FAILED: the row is \
-                     stuck at '{new}'; compensating write error: {comp}"
-                ),
-            },
-        }
-    }
     /// `name`, if any (story 4-2, Task 4) — `None` when the instance has no
     /// `self.running` entry (not started this session, already torn down, or
     /// adopted with no recoverable capture pipeline).
@@ -2402,28 +2211,6 @@ fn append_event(path: &Path, event: &TransitionEvent) -> Result<(), String> {
     writeln!(file, "{line}").map_err(|e| e.to_string())
 }
 
-/// Read back the JSON-Lines transition events from an instance log.
-///
-/// Missing file → empty vec (no events recorded yet). A malformed line is an
-/// error naming it (a corrupt log is worth surfacing).
-fn read_events_from(path: &Path) -> Result<Vec<TransitionEvent>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let mut events = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: TransitionEvent = serde_json::from_str(line)
-            .map_err(|e| format!("corrupt instance-log line {}: {e}", idx + 1))?;
-        events.push(event);
-    }
-    Ok(events)
-}
-
 /// Parse JSON-Lines [`LogLine`] records from `text`, APPENDING them to `out`
 /// in encounter order (story 4-2, AC-G — append order is the sole ordering
 /// authority; callers must never re-sort the result). Blank lines are
@@ -2468,27 +2255,6 @@ fn append_breach_event(path: &Path, event: &BudgetBreachEvent) -> Result<(), Str
         .open(path)
         .map_err(|e| e.to_string())?;
     writeln!(file, "{line}").map_err(|e| e.to_string())
-}
-
-/// Read back the JSON-Lines [`BudgetBreachEvent`]s from an instance's breach log.
-/// Missing file → empty vec (no breaches recorded yet). A malformed line is an
-/// error naming it (a corrupt log is worth surfacing).
-fn read_breach_events_from(path: &Path) -> Result<Vec<BudgetBreachEvent>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let mut events = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: BudgetBreachEvent = serde_json::from_str(line)
-            .map_err(|e| format!("corrupt breach-log line {}: {e}", idx + 1))?;
-        events.push(event);
-    }
-    Ok(events)
 }
 
 /// Map a registry lookup/persist error into the lifecycle [`EngineError`].
@@ -2609,6 +2375,7 @@ mod tests;
 /// The DRAIN composite (story 18-4): `Supervisor::drain` — pause-command →
 /// idle-wait → bounded stop — with its bounded-command runner, idle-freshness
 /// probe, and the pure deadline decision.
+mod commit;
 mod drain;
 mod interaction;
 mod lifecycle;

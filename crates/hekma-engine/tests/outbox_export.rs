@@ -18,7 +18,6 @@
 //!   empty-read lie) and the Metadata-mode attributed-read refusal.
 //! * The default posture is `full` (byte-identical to 17-3).
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hekma_engine::{
@@ -413,55 +412,18 @@ fn the_usage_and_breach_hooks_write_the_journal_too() {
     );
 }
 
-/// A diagnostic sink over a shared buffer (the acp suite's SharedCapture
-/// shape, local to this file).
-struct SharedCapture(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
-fn an_outbox_append_failure_never_touches_the_committed_usage_rows() {
-    // The metering-isolation pin: the outbox journal hook runs at the commit
-    // point but must be UNABLE to affect the pipeline it mirrors. A
-    // systematically failing append (here: the journal's own path is a
-    // DIRECTORY, so every open refuses on every OS — the same refusal class
-    // a Windows sharing violation or scanner lock produces) degrades EXACTLY
-    // to the documented posture: the ledger row was already durable when the
-    // hook ran, so usage keeps committing; the seq rolls back for reuse; the
-    // loss is SURFACED; and the drain neither parks nor stalls. Once the
-    // fault clears, the next append lands gaplessly at the reused seq.
+fn a_leftover_journal_file_is_never_read_after_the_upgrade() {
+    // The outbox lives in state.db: a file at the old journal path (an older
+    // engine recreating it, or debris) is neither read nor written, and the
+    // export stays complete and gapless.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
-    hekma_conformance::test_support::ManifestFixture::new(
-        "isolated",
-        &["--emit-usage", "3", "--linger-ms", "600000"],
-    )
-    .guaranteed_on_all_oses("interaction")
-    .guaranteed_on_all_oses("pause")
-    .write(manifest.path());
-
-    let diagnostics = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let engine = Engine::open_with_diagnostics(
-        Some(state.path().to_path_buf()),
-        Arc::new(Mutex::new(Box::new(SharedCapture(Arc::clone(
-            &diagnostics,
-        ))))),
-    )
-    .expect("open");
-    // Poison AFTER the open (the open path refuses a corrupt journal) and
-    // BEFORE the first commit hook can run: the journal's path becomes a
-    // directory, so the repair/append opens refuse on every OS.
-    let journal = state.path().join(hekma_engine::paths::OUTBOX_JOURNAL_FILE);
-    std::fs::create_dir(&journal).unwrap();
+    write_fake_manifest(manifest.path(), "isolated", &["--linger-ms", "600000"]);
+    let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
+    let journal = state.path().join(hekma_engine::paths::OUTBOX_JOURNAL_FILE);
+    std::fs::write(&journal, "not an outbox record\n").unwrap();
     facade
         .register_with_adapter(
             "isolated",
@@ -469,74 +431,16 @@ fn an_outbox_append_failure_never_touches_the_committed_usage_rows() {
         )
         .unwrap();
     facade.start("isolated").unwrap();
-
-    // ALL THREE usage events commit: the hooks fail, the rows do not. A
-    // stall or a park here would be the hook leaking into the metering
-    // pipeline — the exact defect class this pin forbids.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let fleet = facade.fleet().unwrap();
-        let entry = fleet
-            .iter()
-            .find(|e| e.name.as_str() == "isolated")
-            .expect("the instance is in the fleet");
-        let got = (
-            entry.usage.cumulative_input_tokens,
-            entry.usage.cumulative_output_tokens,
-        );
-        if got == (30, 60) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "usage stopped committing at {got:?} — the outbox hook leaked into the \
-             metering pipeline"
-        );
-        std::thread::sleep(Duration::from_millis(40));
-    }
-
-    // Surfaced, not silent: the failed appends SAID so (the diagnostic names
-    // the lag honestly — the journal is behind the committed record).
-    let text = String::from_utf8(diagnostics.lock().unwrap().clone()).unwrap();
-    assert!(
-        text.contains("outbox append failed"),
-        "the append failures must be surfaced: {text}"
+    let batch = facade
+        .export_events(Some(OutboxCursor::START), 0)
+        .expect("the export reads state.db");
+    let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    assert!(seqs.len() >= 2, "the start transitions are exported");
+    assert_eq!(
+        std::fs::read_to_string(&journal).unwrap(),
+        "not an outbox record\n",
+        "the file is untouched"
     );
-    assert!(
-        text.contains("the export journal lags the committed record"),
-        "the lag must be named for what it is: {text}"
-    );
-
-    // The fault clears: the next commit hook lands GAPLESSLY — the rolled
-    // back seq is reused (a persisted gap would fabricate a hole for
-    // exporters), and the pause transition is the journal's first entry.
-    std::fs::remove_dir(&journal).unwrap();
-    facade.pause("isolated").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let batch = loop {
-        let batch = facade
-            .export_events(Some(OutboxCursor::START), 0)
-            .expect("the export pull reads the journal");
-        if !batch.events.is_empty() {
-            break batch;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the post-recovery append never landed"
-        );
-        std::thread::sleep(Duration::from_millis(40));
-    };
-    assert!(
-        batch.events.iter().all(|e| e.seq == 1),
-        "the recovery append reuses the rolled-back seq (no fabricated gap): {:?}",
-        batch.events.iter().map(|e| e.seq).collect::<Vec<_>>()
-    );
-    assert!(
-        batch
-            .events
-            .iter()
-            .all(|e| { serde_json::to_value(&e.event).unwrap()["kind"] == "transition" }),
-        "the usage hooks never landed in the journal (they failed, contained): {:?}",
-        batch.events
-    );
+    let _ = facade.stop("isolated", Some(Duration::from_secs(5)));
 }

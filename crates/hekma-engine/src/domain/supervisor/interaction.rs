@@ -207,12 +207,9 @@ impl Supervisor {
             name: name.to_string(),
             reason,
         })?;
-        let path = registry.instance_log_path(&name);
-        read_events_from(&path).map_err(|detail| EngineError::Log {
-            name: name.as_str().to_string(),
-            path: path.to_string_lossy().into_owned(),
-            detail,
-        })
+        registry
+            .transition_events(&name)
+            .map_err(super::registry_to_engine)
     }
 
     /// One-shot full read of every currently-retained ATTRIBUTED output line

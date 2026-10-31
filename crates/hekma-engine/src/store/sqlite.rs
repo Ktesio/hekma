@@ -40,12 +40,15 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use super::run_store_sqlite::LegacySource;
+#[cfg(test)]
+use super::run_store_sqlite::NoLegacy;
 use crate::domain::{
-    cost_micros_with_cached, AgentInstance, InstanceName, LifecycleState, Micros, Rate,
-    RecordOutcome, RestartPolicy, RunId, UsageEvent, UsageTotals,
+    AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome, RestartPolicy, RunId,
+    UsageEvent, UsageTotals,
 };
 use crate::ports::{
-    MemoryBacking, MemoryBackingKind, MemoryBackingTxn, ProcessFingerprint, SpawnRecord,
+    MemoryBacking, MemoryBackingKind, MemoryBackingTxn, ProcessFingerprint, RunStore, SpawnRecord,
     StateStore, StoreError,
 };
 
@@ -83,7 +86,9 @@ use crate::ports::{
 /// pre-v9 record (adoption mints + writes back + one-time note), or a
 /// policy/settle pid-0 seed row (no current Run). Not part of any key; no
 /// column renamed/removed.
-const SCHEMA_VERSION: i64 = 11;
+/// v12 (story 21-1, AD-27): the store writer's tables — see
+/// [`super::run_store_sqlite::SCHEMA_V12`].
+const SCHEMA_VERSION: i64 = 12;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -368,16 +373,51 @@ pub struct SqliteStore {
     conn: Connection,
 }
 
+/// The import notes a v12 upgrade produced (story 21-1): legacy event-file
+/// lines that could not be imported, phrased for the engine's diagnostic
+/// surface. Empty on every open that runs no v12 step.
+pub(crate) type OpenNotes = Vec<String>;
+
 impl SqliteStore {
     /// Open (creating if absent) the DB at `path`, set pragmas, and migrate.
     ///
     /// The parent directory must already exist — the registry facade creates
     /// the state dir before opening. Idempotent across reopens.
+    #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_legacy(path, &NoLegacy).map(|(store, _notes)| store)
+    }
+
+    /// Open read-write and migrate, importing the pre-v12 event files from
+    /// `legacy` if the v12 step runs (story 21-1). The store writer's open.
+    pub(crate) fn open_with_legacy(
+        path: &Path,
+        legacy: &dyn LegacySource,
+    ) -> Result<(Self, OpenNotes), StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        let notes = migrate(&conn, legacy)?;
+        // Fold any usage row another writer left unfolded (an older engine
+        // still running against this database after the upgrade).
+        in_immediate_txn(&conn, || super::run_store_sqlite::fold_unfolded_rows(&conn))?;
+        Ok((Self { conn }, notes))
+    }
+
+    /// Open the Registry's READ-ONLY connection (story 21-1, AD-27): the DB
+    /// must already be migrated (the writer opens first). `query_only` makes
+    /// SQLite itself refuse every write on this connection, so a write that
+    /// bypasses the store writer fails loudly instead of racing it.
+    pub(crate) fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open(path).map_err(backend)?;
+        Self::configure(&conn)?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(backend)?;
         Ok(Self { conn })
+    }
+
+    /// The connection, for the sibling Run-scale implementation.
+    pub(super) fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Open an in-memory DB (unit tests that do not need a file). Migrated.
@@ -385,7 +425,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
         Self::configure(&conn)?;
-        migrate(&conn)?;
+        migrate(&conn, &NoLegacy)?;
         Ok(Self { conn })
     }
 
@@ -436,7 +476,7 @@ impl SqliteStore {
     }
 
     /// Look up the internal row id for a name (used to scope ledger queries).
-    fn instance_id(&self, name: &InstanceName) -> Result<Option<i64>, StoreError> {
+    pub(super) fn instance_id(&self, name: &InstanceName) -> Result<Option<i64>, StoreError> {
         self.conn
             .query_row(
                 "SELECT id FROM agent_instances WHERE name = ?1",
@@ -540,7 +580,7 @@ impl SqliteStore {
 /// [`SCHEMA_VERSION`] was written by a newer ktesio. We refuse it with
 /// [`StoreError::SchemaTooNew`] rather than skip the DDL and stamp the version
 /// back down — the old behavior silently downgraded a forward schema.
-fn migrate(conn: &Connection) -> Result<(), StoreError> {
+fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, StoreError> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(backend)?;
@@ -604,8 +644,13 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
     if version < 11 {
         migrate_step(conn, 11, SCHEMA_V11)?;
     }
+    // Story 21-1: v12 imports the legacy event files inside its own step
+    // transaction (DDL + import + stamp, crash-atomic like every step).
+    if version < 12 {
+        return super::run_store_sqlite::migrate_v12(conn, legacy);
+    }
 
-    Ok(())
+    Ok(Vec::new())
 }
 
 /// Apply ONE schema-version step atomically (story 11-3, B3): the step's DDL
@@ -623,13 +668,37 @@ fn migrate_step(conn: &Connection, to_version: i64, ddl: &str) -> Result<(), Sto
     .map_err(backend)
 }
 
+/// Test-only: create a state DB at schema v11 (the last pre-store-writer
+/// version), for the v12 upgrade tests.
+#[cfg(test)]
+pub(crate) fn create_v11_for_test(path: &Path) -> Connection {
+    let conn = Connection::open(path).expect("open a v11 test db");
+    SqliteStore::configure(&conn).expect("configure");
+    for (version, ddl) in [
+        (1, SCHEMA_V1),
+        (2, SCHEMA_V2),
+        (3, SCHEMA_V3),
+        (4, SCHEMA_V4),
+        (5, SCHEMA_V5),
+        (6, SCHEMA_V6),
+        (7, SCHEMA_V7),
+        (8, SCHEMA_V8),
+        (9, SCHEMA_V9),
+        (10, SCHEMA_V10),
+        (11, SCHEMA_V11),
+    ] {
+        migrate_step(&conn, version, ddl).expect("a v11 step");
+    }
+    conn
+}
+
 /// Map an arbitrary `rusqlite::Error` into a backend [`StoreError`].
 ///
 /// Story 15-6: `SQLITE_BUSY` is classified into the typed
 /// [`StoreError::Busy`] (the AD-17 bounded-wait contract — the operator never
 /// sees a raw `SQLITE_BUSY`/`database is locked` string), everything else
 /// stays a [`StoreError::Backend`].
-fn backend(err: rusqlite::Error) -> StoreError {
+pub(super) fn backend(err: rusqlite::Error) -> StoreError {
     if let rusqlite::Error::SqliteFailure(e, _) = &err {
         if e.code == rusqlite::ErrorCode::DatabaseBusy {
             return StoreError::Busy {
@@ -651,7 +720,7 @@ fn backend(err: rusqlite::Error) -> StoreError {
 /// `i64::MAX` tokens (~9.2e18) is implausibly large for a real per-event count, so
 /// the clamp loses nothing real. This is the SOLE conversion used to write a token
 /// column — never a bare `as i64`.
-fn clamp_tokens(value: u64) -> i64 {
+pub(super) fn clamp_tokens(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
@@ -685,7 +754,7 @@ fn classify_insert(err: rusqlite::Error, name: &str) -> StoreError {
 /// failure (a non-unique constraint, a SQL error) maps to `None`, which the caller
 /// surfaces as a backend error — the same discipline
 /// [`non_unique_constraint_maps_to_backend_not_duplicate`] guards for names.
-fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
+pub(super) fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
     if let rusqlite::Error::SqliteFailure(inner, _) = err {
         let ext = inner.extended_code;
         if ext == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
@@ -717,6 +786,7 @@ fn classify_usage_insert(err: &rusqlite::Error) -> Option<RecordOutcome> {
 /// `None` (the honest absence a surface renders as `—`), NEVER a fabricated
 /// zero contribution. A scope with no rows at all keeps the truthful
 /// `Some(0)` from [`UsageTotals::zero`].
+#[cfg(test)]
 fn sum_tokens_saturating(
     stmt: &mut rusqlite::Statement<'_>,
     params: impl rusqlite::Params,
@@ -765,7 +835,7 @@ fn sum_tokens_saturating(
 /// AGREE exactly (FR-22 "totals equal the Usage Ledger"). `stmt` selects
 /// `(input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m,
 /// cached_tokens, cached_micros_per_1m)` — the two story-14-6 columns feed
-/// [`cost_micros_with_cached`]: a row with a KNOWN cached subset prices its
+/// [`crate::domain::cost_micros_with_cached`]: a row with a KNOWN cached subset prices its
 /// non-cached remainder at its input rate and its cached subset at its OWN
 /// stored cached rate (NULL cached rate → the conservative input-rate default;
 /// NULL cached COUNT → the whole input at the input rate).
@@ -789,6 +859,7 @@ fn sum_tokens_saturating(
 /// sub-cent bias) — never late, and never fail to breach a cost that genuinely
 /// reached the cap. Erring toward the guardrail is the correct direction for a
 /// spend limit.
+#[cfg(test)]
 fn sum_cost_saturating(
     stmt: &mut rusqlite::Statement<'_>,
     params: impl rusqlite::Params,
@@ -824,7 +895,9 @@ fn sum_cost_saturating(
             if let Some(rc) = rate_cached {
                 rate = rate.with_cached(rc);
             }
-            total = total.saturating_add(cost_micros_with_cached(input, output, cached, &rate));
+            total = total.saturating_add(crate::domain::cost_micros_with_cached(
+                input, output, cached, &rate,
+            ));
         }
     }
     Ok(total)
@@ -958,97 +1031,21 @@ impl StateStore for SqliteStore {
         event: &UsageEvent,
         rate: Option<Rate>,
     ) -> Result<RecordOutcome, StoreError> {
-        // Resolve the instance row id (the FK). An absent instance is NotFound —
-        // the commit choke point only records for a supervised (looked-up) instance,
-        // so this is a defensive guard (the instance was removed concurrently).
-        let iname = InstanceName::new(&event.instance).map_err(|e| StoreError::CorruptRow {
-            name: event.instance.clone(),
-            detail: format!("invalid instance name on usage event: {e}"),
-        })?;
-        let id = self
-            .instance_id(&iname)?
-            .ok_or_else(|| StoreError::NotFound {
-                name: event.instance.clone(),
-            })?;
-        // The per-event EFFECTIVE Rate (story 3-3, no-retro-repricing): stamped as
-        // two NULLABLE micro-dollar-per-1M columns. `None` → NULL (the row
-        // contributes $0). A rate is a `u64` micros-per-1M; clamp into the signed
-        // i64 column with the same discipline as the token counts (a giant rate
-        // cannot land a negative that poisons the cost sum).
-        let (rate_input, rate_output): (Option<i64>, Option<i64>) = match rate {
-            Some(r) => (
-                Some(clamp_tokens(r.input_micros_per_1m)),
-                Some(clamp_tokens(r.output_micros_per_1m)),
-            ),
-            None => (None, None),
-        };
-        // Story 14-6 (no-retro-repricing, extended): the OPTIONAL cached-token
-        // Rate rides its own nullable column, so a later-set cached rate
-        // re-prices FUTURE rows only — exactly the v4 discipline applied to the
-        // new price. NULL = unset at commit → the row's cached tokens price at
-        // its stored input rate.
-        let rate_cached: Option<i64> = rate.and_then(|r| r.cached_micros_per_1m).map(clamp_tokens);
-        // Story 14-6: the event's cached-token SUBSET (the INPUT-INCLUSIVE
-        // invariant). `None` → NULL (the honest unknown, e.g. a legacy payload);
-        // a freshly-assembled event is always `Some` (known-zero allowed).
-        let cached_tokens: Option<i64> = event.cached_tokens.map(clamp_tokens);
-        // One single-statement INSERT = one transaction (AD-6). A
-        // UNIQUE(instance_id, run_id, sequence) violation means this exact event was
-        // already recorded (a re-delivered batch) → classify DuplicateReplay (a
-        // no-op, NOT an error), the no-double-count DB invariant (AC-A).
-        let result = self.conn.execute(
-            "INSERT INTO usage_events \
-             (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, \
-              sequence, input_micros_per_1m, output_micros_per_1m, cached_tokens, cached_micros_per_1m) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                id,
-                event.run_id.as_str(),
-                // Saturate-clamp the u64 token counts into the signed i64 column: a
-                // bare `as i64` on a value above i64::MAX bit-wraps NEGATIVE and
-                // poisons the SUM (C1/C2). Sequence is likewise clamped so a giant
-                // ordinal cannot land a negative dedup key.
-                clamp_tokens(event.input_tokens),
-                clamp_tokens(event.output_tokens),
-                event.metering_source,
-                event.occurred_at,
-                clamp_tokens(event.sequence),
-                rate_input,
-                rate_output,
-                cached_tokens,
-                rate_cached,
-            ],
-        );
-        match result {
-            Ok(_) => Ok(RecordOutcome::Inserted),
-            Err(err) => match classify_usage_insert(&err) {
-                Some(outcome) => Ok(outcome),
-                // Not a recognized replay: surface the ORIGINAL error text so a real
-                // write fault (disk full, a genuine constraint problem) is
-                // diagnosable, rather than a hardcoded misleading string.
-                None => Err(StoreError::Backend(format!(
-                    "usage-event insert failed: {err}"
-                ))),
-            },
-        }
+        // Story 21-1: the one usage insert path is the Run-scale port's
+        // (dedup, launch generation, rollups in the same transaction). The
+        // frozen trait method has no generation, so it writes generation 0 —
+        // the engine itself commits through the store writer's pipeline job,
+        // which carries the real one.
+        self.insert_usage(event, rate, 0)
     }
 
+    // Story 21-1 (AD-27, AD-18 carried debt): the four totals reads serve from
+    // the rollups folded at commit — O(1) per read instead of a scan of the
+    // instance's whole ledger. The rollup folds each row with the same
+    // clamping, per-row pricing and saturation the scans used, so the values
+    // are identical (pinned by `rollups_equal_the_row_scan`).
     fn usage_totals(&self, name: &InstanceName) -> Result<UsageTotals, StoreError> {
-        // Cumulative over ALL the instance's rows. An absent instance totals zero
-        // (mirrors count_usage_events).
-        let Some(id) = self.instance_id(name)? else {
-            return Ok(UsageTotals::zero());
-        };
-        // Sum the rows in Rust with saturating u64 semantics (not a SQL SUM, which
-        // can overflow to a lossy float / negative — see `sum_tokens_saturating`).
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT input_tokens, output_tokens, cached_tokens \
-                 FROM usage_events WHERE instance_id = ?1",
-            )
-            .map_err(backend)?;
-        sum_tokens_saturating(&mut stmt, [id])
+        Ok(self.instance_rollup(name)?.totals)
     }
 
     fn run_usage_totals(
@@ -1056,54 +1053,15 @@ impl StateStore for SqliteStore {
         name: &InstanceName,
         run_id: &RunId,
     ) -> Result<UsageTotals, StoreError> {
-        // Per-run: scope to a single (instance_id, run_id) (AC-B). An absent
-        // instance / unknown Run totals zero.
-        let Some(id) = self.instance_id(name)? else {
-            return Ok(UsageTotals::zero());
-        };
-        // Per-Run scope, summed with the same saturating discipline as the cumulative
-        // read (overflow-safe — no SQL SUM).
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT input_tokens, output_tokens, cached_tokens \
-                 FROM usage_events WHERE instance_id = ?1 AND run_id = ?2",
-            )
-            .map_err(backend)?;
-        sum_tokens_saturating(&mut stmt, rusqlite::params![id, run_id.as_str()])
+        Ok(self.run_rollup(name, run_id)?.totals)
     }
 
     fn cost_totals(&self, name: &InstanceName) -> Result<Micros, StoreError> {
-        // Cumulative derived cost over ALL rows, each priced at ITS OWN stored Rate
-        // (no retroactive repricing — AC-A). An absent instance totals $0.
-        let Some(id) = self.instance_id(name)? else {
-            return Ok(Micros::ZERO);
-        };
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m, \
-                 cached_tokens, cached_micros_per_1m \
-                 FROM usage_events WHERE instance_id = ?1",
-            )
-            .map_err(backend)?;
-        sum_cost_saturating(&mut stmt, [id])
+        Ok(self.instance_rollup(name)?.cost)
     }
 
     fn run_cost_totals(&self, name: &InstanceName, run_id: &RunId) -> Result<Micros, StoreError> {
-        // Per-Run derived cost, same per-row-priced saturating sum scoped to one Run.
-        let Some(id) = self.instance_id(name)? else {
-            return Ok(Micros::ZERO);
-        };
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m, \
-                 cached_tokens, cached_micros_per_1m \
-                 FROM usage_events WHERE instance_id = ?1 AND run_id = ?2",
-            )
-            .map_err(backend)?;
-        sum_cost_saturating(&mut stmt, rusqlite::params![id, run_id.as_str()])
+        Ok(self.run_rollup(name, run_id)?.cost)
     }
 
     fn upsert_spawn_record(&self, record: &SpawnRecord) -> Result<(), StoreError> {
@@ -1833,6 +1791,13 @@ fn in_immediate_txn<T>(
     conn: &Connection,
     body: impl FnOnce() -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
+    // Story 21-1: inside the store writer's batch transaction the guard and
+    // the write run in a SAVEPOINT instead, so a refused guard rolls back
+    // only its own message and the batch's other messages still commit. The
+    // batch already holds the write lock (`BEGIN IMMEDIATE`).
+    if !conn.is_autocommit() {
+        return in_savepoint(conn, "guarded", body);
+    }
     begin_immediate(conn)?;
     match body() {
         Ok(value) => match commit(conn) {
@@ -1844,6 +1809,36 @@ fn in_immediate_txn<T>(
         },
         Err(err) => {
             rollback(conn);
+            Err(err)
+        }
+    }
+}
+
+/// Run `body` inside a named SAVEPOINT of the transaction already open on
+/// `conn` (story 21-1): `RELEASE` on success; `ROLLBACK TO` + `RELEASE` on a
+/// body failure, so only this body's statements are undone. A failed
+/// `RELEASE` rolls back to the savepoint too, leaving the outer transaction
+/// usable.
+pub(crate) fn in_savepoint<T>(
+    conn: &Connection,
+    name: &str,
+    body: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(backend)?;
+    let undo = |conn: &Connection| {
+        let _ = conn.execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
+    };
+    match body() {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE {name}")) {
+            Ok(()) => Ok(value),
+            Err(err) => {
+                undo(conn);
+                Err(backend(err))
+            }
+        },
+        Err(err) => {
+            undo(conn);
             Err(err)
         }
     }
@@ -1958,6 +1953,7 @@ fn row_to_memory_backing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::cost_micros_with_cached;
     use tempfile::TempDir;
 
     fn name(s: &str) -> InstanceName {
@@ -2155,10 +2151,10 @@ mod tests {
             .unwrap();
         // PINNED LITERAL (AI-66 #5, review round 1): assert the actual
         // version — comparing to SCHEMA_VERSION would pass even if the
-        // stamp and the constant drifted together. (The v11 step, the
-        // adoption-lease columns, is the current last step; bump this
-        // literal when the next additive step lands.)
-        assert_eq!(version, 11);
+        // stamp and the constant drifted together. (The v12 step, the store
+        // writer's tables, is the current last step; bump this literal when
+        // the next step lands.)
+        assert_eq!(version, 12);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -2706,7 +2702,9 @@ mod tests {
                      instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,
                      run_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,
                      output_tokens INTEGER NOT NULL, metering_source TEXT NOT NULL,
-                     occurred_at TEXT NOT NULL);
+                     occurred_at TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0,
+                     input_micros_per_1m INTEGER, output_micros_per_1m INTEGER,
+                     cached_tokens INTEGER, cached_micros_per_1m INTEGER);
                  CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);
                  CREATE TABLE agent_runtime (
                      id INTEGER PRIMARY KEY,
@@ -2739,7 +2737,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");
@@ -2761,7 +2759,7 @@ mod tests {
             // Hand-build a v9-shaped DB: the v1..v8 DDL + the v9 run_id
             // column, stamped at user_version 9.
             conn.execute_batch(
-                "BEGIN IMMEDIATE;\n                 CREATE TABLE agent_instances (\n                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,\n                     kind TEXT NOT NULL, state TEXT NOT NULL,\n                     agent_home TEXT NOT NULL, created_at TEXT NOT NULL,\n                     updated_at TEXT NOT NULL);\n                 CREATE TABLE usage_events (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     run_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,\n                     output_tokens INTEGER NOT NULL, metering_source TEXT NOT NULL,\n                     occurred_at TEXT NOT NULL);\n                 CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);\n                 CREATE TABLE agent_runtime (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     pid INTEGER NOT NULL, start_time INTEGER NOT NULL,\n                     restart_policy TEXT NOT NULL, restart_count INTEGER NOT NULL DEFAULT 0,\n                     last_known_cause TEXT, detached INTEGER NOT NULL DEFAULT 0,\n                     acp_session_id TEXT, run_id TEXT);\n                 PRAGMA user_version = 9;\n                 COMMIT;",
+                "BEGIN IMMEDIATE;\n                 CREATE TABLE agent_instances (\n                     id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,\n                     kind TEXT NOT NULL, state TEXT NOT NULL,\n                     agent_home TEXT NOT NULL, created_at TEXT NOT NULL,\n                     updated_at TEXT NOT NULL);\n                 CREATE TABLE usage_events (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     run_id TEXT NOT NULL, input_tokens INTEGER NOT NULL,\n                     output_tokens INTEGER NOT NULL, metering_source TEXT NOT NULL,\n                     occurred_at TEXT NOT NULL, sequence INTEGER NOT NULL DEFAULT 0,\n                     input_micros_per_1m INTEGER, output_micros_per_1m INTEGER,\n                     cached_tokens INTEGER, cached_micros_per_1m INTEGER);\n                 CREATE INDEX idx_usage_events_instance ON usage_events(instance_id);\n                 CREATE TABLE agent_runtime (\n                     id INTEGER PRIMARY KEY,\n                     instance_id INTEGER NOT NULL UNIQUE REFERENCES agent_instances(id) ON DELETE CASCADE,\n                     pid INTEGER NOT NULL, start_time INTEGER NOT NULL,\n                     restart_policy TEXT NOT NULL, restart_count INTEGER NOT NULL DEFAULT 0,\n                     last_known_cause TEXT, detached INTEGER NOT NULL DEFAULT 0,\n                     acp_session_id TEXT, run_id TEXT);\n                 PRAGMA user_version = 9;\n                 COMMIT;",
             )
             .unwrap();
             conn.execute(
@@ -2785,7 +2783,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(!rec.detach, "the legacy attached flag survives");
@@ -3950,7 +3948,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -4094,7 +4092,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -4172,7 +4170,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()
@@ -5007,5 +5005,199 @@ mod tests {
                 None,
             )
             .expect("the connection must still take (and commit) a later write txn");
+    }
+
+    // ---- Story 21-1: the rollups and the launch generation ----
+
+    #[test]
+    fn rollups_equal_the_row_scan() {
+        // The totals reads now serve from the rollups folded at commit; they
+        // must equal the pre-21-1 per-row scans exactly — clamping, per-row
+        // pricing (cached subset at its own rate), saturation and the
+        // unknown-cached poison included.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let rate = Rate::new(3_000_000, 15_000_000).with_cached(300_000);
+        let mut events = [
+            usage_event("demo", "run-1", 0, 1_234_567, 89_012),
+            usage_event("demo", "run-1", 1, u64::MAX, 7),
+            usage_event("demo", "run-2", 0, 999, 1),
+        ];
+        events[0].cached_tokens = Some(1_000_000);
+        events[2].cached_tokens = None;
+        for (index, event) in events.iter().enumerate() {
+            let rate = (index != 2).then_some(rate);
+            assert_eq!(
+                store.record_usage_event(event, rate).unwrap(),
+                RecordOutcome::Inserted
+            );
+        }
+        let id = store.instance_id(&name("demo")).unwrap().unwrap();
+        let scan_tokens = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+            let mut stmt = store.conn.prepare(sql).unwrap();
+            sum_tokens_saturating(&mut stmt, params).unwrap()
+        };
+        let scan_cost = |sql: &str, params: &[&dyn rusqlite::ToSql]| {
+            let mut stmt = store.conn.prepare(sql).unwrap();
+            sum_cost_saturating(&mut stmt, params).unwrap()
+        };
+        let tokens = "SELECT input_tokens, output_tokens, cached_tokens FROM usage_events WHERE instance_id = ?1";
+        let cost =
+            "SELECT input_tokens, output_tokens, input_micros_per_1m, output_micros_per_1m, \
+                    cached_tokens, cached_micros_per_1m FROM usage_events WHERE instance_id = ?1";
+        assert_eq!(
+            store.usage_totals(&name("demo")).unwrap(),
+            scan_tokens(tokens, &[&id])
+        );
+        assert_eq!(
+            store.cost_totals(&name("demo")).unwrap(),
+            scan_cost(cost, &[&id])
+        );
+        for run in ["run-1", "run-2"] {
+            let run_tokens = format!("{tokens} AND run_id = ?2");
+            let run_cost = format!("{cost} AND run_id = ?2");
+            assert_eq!(
+                store
+                    .run_usage_totals(&name("demo"), &RunId::from_wire(run))
+                    .unwrap(),
+                scan_tokens(&run_tokens, &[&id, &run])
+            );
+            assert_eq!(
+                store
+                    .run_cost_totals(&name("demo"), &RunId::from_wire(run))
+                    .unwrap(),
+                scan_cost(&run_cost, &[&id, &run])
+            );
+        }
+        assert_eq!(
+            store.usage_totals(&name("demo")).unwrap().cached_tokens,
+            None,
+            "one unknown-cached row poisons the cumulative cached total"
+        );
+        // A replay touches neither the ledger nor the rollups.
+        let before = store.usage_totals(&name("demo")).unwrap();
+        assert_eq!(
+            store.record_usage_event(&events[0], Some(rate)).unwrap(),
+            RecordOutcome::DuplicateReplay
+        );
+        assert_eq!(store.usage_totals(&name("demo")).unwrap(), before);
+    }
+
+    #[test]
+    fn a_new_launch_generation_never_collides_with_the_previous_attach() {
+        // The adoption sequence-reset undercount: an engine-minted sequence
+        // restarts at 0 under the RESUMED run id. Under a bumped generation
+        // the same (run, sequence) inserts; under the same generation it is a
+        // replay.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+            .unwrap();
+        let event = usage_event("demo", "run-1", 0, 10, 5);
+        assert_eq!(store.launch_generation(&name("demo")).unwrap(), 0);
+        assert_eq!(
+            store.insert_usage(&event, None, 0).unwrap(),
+            RecordOutcome::Inserted
+        );
+        assert_eq!(
+            store.insert_usage(&event, None, 0).unwrap(),
+            RecordOutcome::DuplicateReplay
+        );
+        assert_eq!(store.bump_launch_generation(&name("demo")).unwrap(), 1);
+        assert_eq!(
+            store.insert_usage(&event, None, 1).unwrap(),
+            RecordOutcome::Inserted,
+            "the next attach's sequence 0 is a new event"
+        );
+        assert_eq!(
+            store.usage_totals(&name("demo")).unwrap().total_tokens(),
+            30
+        );
+        assert!(matches!(
+            store.bump_launch_generation(&name("ghost")),
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn rows_another_writer_inserted_are_folded_by_the_next_commit_and_open() {
+        // An older engine still running against an upgraded database inserts
+        // usage rows without touching the rollups; the next fold (any insert,
+        // or the next writer open) takes every row above the watermark.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        {
+            let store = SqliteStore::open(&db).unwrap();
+            store
+                .create_instance(&sample("demo", "mock", "/x/agents/demo"))
+                .unwrap();
+            store
+                .record_usage_event(&usage_event("demo", "run-1", 0, 10, 5), None)
+                .unwrap();
+            let id = store.instance_id(&name("demo")).unwrap().unwrap();
+            // The old engine's insert: the v11 column list, no rollup fold.
+            store
+                .conn
+                .execute(
+                    "INSERT INTO usage_events (instance_id, run_id, input_tokens, output_tokens, \
+                     metering_source, occurred_at, sequence) \
+                     VALUES (?1, 'run-1', 100, 50, 'self-reported', '2026-10-31T00:00:00Z', 1)",
+                    [id],
+                )
+                .unwrap();
+            assert_eq!(
+                store.usage_totals(&name("demo")).unwrap().total_tokens(),
+                15
+            );
+            store
+                .record_usage_event(&usage_event("demo", "run-1", 2, 1, 1), None)
+                .unwrap();
+            assert_eq!(
+                store.usage_totals(&name("demo")).unwrap().total_tokens(),
+                167,
+                "the next commit folds the unfolded row too"
+            );
+            store
+                .conn
+                .execute(
+                    "INSERT INTO usage_events (instance_id, run_id, input_tokens, output_tokens, \
+                     metering_source, occurred_at, sequence) \
+                     VALUES (?1, 'run-1', 1000, 0, 'self-reported', '2026-10-31T00:00:00Z', 3)",
+                    [id],
+                )
+                .unwrap();
+        }
+        let reopened = SqliteStore::open(&db).unwrap();
+        assert_eq!(
+            reopened.usage_totals(&name("demo")).unwrap().total_tokens(),
+            1167,
+            "the writer open folds it"
+        );
+        assert_eq!(
+            reopened
+                .run_usage_totals(&name("demo"), &RunId::from_wire("run-1"))
+                .unwrap()
+                .total_tokens(),
+            1167
+        );
+    }
+
+    #[test]
+    fn a_v12_step_another_process_finished_first_is_skipped_under_the_lock() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("state.db");
+        drop(SqliteStore::open(&db).unwrap());
+        // A second opener read v11 before another process took the lock and
+        // migrated: its step runs on an already-migrated database and must
+        // step aside instead of re-running the DDL.
+        let conn = Connection::open(&db).unwrap();
+        let notes = super::super::run_store_sqlite::migrate_v12(
+            &conn,
+            &super::super::run_store_sqlite::NoLegacy,
+        )
+        .expect("an already-migrated database is not migrated twice");
+        assert!(notes.is_empty());
     }
 }
