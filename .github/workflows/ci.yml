@@ -202,6 +202,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$tmp"
           got="$(sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp")"
           got="${got%% *}"
+          # coreutils' sha256sum on Windows (Git Bash) prefixes the digest
+          # field with '\' (binary-mode marker for backslash paths) — strip
+          # one leading backslash so the compare is digest-only on every OS
+          # (no-op on Linux/macOS, where no marker is printed).
+          got="${got#\\}"
           if [ "$got" != "$want" ]; then
             echo "cargo-nextest tarball sha256 mismatch for $art: want $want, got $got" >&2
             echo "  $url" >&2
