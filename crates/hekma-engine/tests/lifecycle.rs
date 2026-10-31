@@ -532,13 +532,11 @@ fn double_start_on_running_is_invalid_transition() {
 }
 
 #[test]
-fn a_failed_start_append_compensates_the_row_back_to_registered_no_launch() {
-    // Story 16-3 (integration, the START path): when the durable transition
-    // append fails during start — the registered→starting commit landed but
-    // its event could not — the row is COMPENSATED back to `registered`,
-    // start surfaces the typed log error NAMING the compensation, and no
-    // process is launched: `prior + an error`, never `starting + silence`.
-    // The public blocking facade is the real surface (spine AD-13).
+fn a_failed_instance_log_mirror_never_fails_a_start() {
+    // `instance.log` is a human-readable mirror written after each
+    // transition commits to state.db: obstructing it (the VG1 idiom — the
+    // file replaced by a directory, every OS) leaves start working, every
+    // transition recorded in the query API, and only the mirror empty.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_fake_manifest(manifest.path(), "svc", &["--linger-ms", "600000"]);
@@ -548,8 +546,6 @@ fn a_failed_start_append_compensates_the_row_back_to_registered_no_launch() {
         .register_with_adapter("svc", &AdapterRef::Manifest(manifest.path().to_path_buf()))
         .unwrap();
 
-    // Obstruct the instance's transition log BEFORE start (the VG1 idiom):
-    // the registered→starting append fails deterministically on every OS.
     let log: std::path::PathBuf = state
         .path()
         .join("agents")
@@ -559,22 +555,19 @@ fn a_failed_start_append_compensates_the_row_back_to_registered_no_launch() {
     std::fs::create_dir_all(log.parent().unwrap()).unwrap();
     std::fs::create_dir(&log).unwrap();
 
-    let err = facade.start("svc").unwrap_err();
-    assert!(
-        err.to_string().contains("compensated back to"),
-        "16-3: the error must name the compensation, got: {err}"
-    );
-    let status = facade.instance_status("svc").unwrap();
-    assert_eq!(
-        status.instance.state,
-        LifecycleState::Registered,
-        "16-3: the row was compensated back to registered — no starting row survives a failed append"
-    );
-
-    // Recovery (the operator's real remediation): clear the obstruction,
-    // start again — now it commits, records, and runs — then teardown.
-    std::fs::remove_dir(&log).unwrap();
     let started = facade.start("svc").unwrap();
     assert_eq!(started.state, LifecycleState::Running);
+    let recorded: Vec<LifecycleState> = facade
+        .transition_events("svc")
+        .unwrap()
+        .iter()
+        .map(|event| event.new_state)
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![LifecycleState::Starting, LifecycleState::Running],
+        "state.db holds both start edges"
+    );
+    std::fs::remove_dir(&log).unwrap();
     facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
 }

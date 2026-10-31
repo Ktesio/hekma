@@ -25,6 +25,7 @@ mod lifecycle;
 pub(crate) mod liveness;
 mod name;
 mod outbox;
+pub(crate) mod pipeline;
 /// The shared per-attempt probe evaluators (contract `1.1.0`): the exact
 /// `http-get` / file-fresh code BOTH declared polls run — the readiness gate
 /// and the liveness check. Private to the crate.

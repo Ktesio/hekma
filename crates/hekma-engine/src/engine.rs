@@ -508,19 +508,14 @@ impl Engine {
         if let Some(cap) = pause_command_cap_override {
             supervisor.override_pause_command_cap(cap);
         }
-        // Story 17-4: continue the outbox seq sequence from whatever a prior
-        // engine lifetime committed (BEFORE the registry moves under the
-        // mutex, so the journal read and the counter write are serialized
-        // against every later append by construction). A read failure
-        // REFUSES the open (review finding 1): minting from an unverified
-        // counter can duplicate seqs, and an ack landing on a duplicate lets
-        // compaction evict never-delivered events — the typed refusal names
-        // the file and the quarantine/remediation procedure.
-        supervisor
-            .rederive_outbox_seq(&registry)
-            .map_err(|detail| RegistryError::OutboxOpenRefused { detail })?;
         if let Some(sink) = diagnostics {
             supervisor.install_diagnostics(sink);
+        }
+        // Story 21-1: anything the one-time v12 import could not carry into
+        // state.db (a torn or corrupt legacy log line) is surfaced once, on
+        // the engine's diagnostic surface, before supervision starts.
+        for note in registry.take_open_notes() {
+            supervisor.emit_open_note(&note);
         }
         let events = supervisor.event_bus();
         let inner = Arc::new(EngineInner {
@@ -1774,12 +1769,7 @@ impl Engine {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
-            export_core(
-                &registry.outbox_journal_path(),
-                &registry.outbox_ack_path(),
-                after,
-                max,
-            )
+            export_core(&registry, after, max)
         })
         .await
     }
@@ -1806,11 +1796,7 @@ impl Engine {
             // the one unsound interleaving). The guard binding is what holds
             // it.
             let _supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
-            ack_core(
-                &registry.outbox_journal_path(),
-                &registry.outbox_ack_path(),
-                seq,
-            )
+            ack_core(&registry, seq)
         })
         .await
     }

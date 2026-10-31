@@ -1700,46 +1700,6 @@ fn stop_reacquires_a_live_owners_agent_on_demand_and_really_stops_it() {
 }
 
 #[test]
-fn read_events_from_missing_file_is_empty() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("nope.log");
-    assert!(read_events_from(&path).unwrap().is_empty());
-}
-
-#[test]
-fn append_then_read_round_trips_events() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("instance.log");
-    let e1 = TransitionEvent::new(
-        "demo",
-        LifecycleState::Registered,
-        LifecycleState::Starting,
-        TransitionCause::command("start"),
-        "2026-07-04T00:00:00Z",
-    );
-    let e2 = TransitionEvent::new(
-        "demo",
-        LifecycleState::Starting,
-        LifecycleState::Running,
-        TransitionCause::AdapterReady,
-        "2026-07-04T00:00:01Z",
-    );
-    append_event(&path, &e1).unwrap();
-    append_event(&path, &e2).unwrap();
-    let back = read_events_from(&path).unwrap();
-    assert_eq!(back, vec![e1, e2]);
-}
-
-#[test]
-fn read_events_rejects_a_corrupt_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("instance.log");
-    std::fs::write(&path, "{ not valid json\n").unwrap();
-    let err = read_events_from(&path).unwrap_err();
-    assert!(err.contains("corrupt instance-log line 1"), "{err}");
-}
-
-#[test]
 fn supervisor_constructs_empty() {
     let sup = Supervisor::new();
     assert!(sup.running.is_empty());
@@ -1864,24 +1824,6 @@ fn start_with_an_unwritable_file_target_rejects_before_any_state_change() {
     // Never reached running (the failure was before the starting transition, so
     // the instance stays registered).
     assert_eq!(state_of(&registry, "badfile"), LifecycleState::Registered);
-}
-
-#[test]
-fn read_events_skips_blank_lines() {
-    // Blank lines in the log are ignored (only JSON event lines are parsed).
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("instance.log");
-    let e = TransitionEvent::new(
-        "demo",
-        LifecycleState::Registered,
-        LifecycleState::Starting,
-        TransitionCause::command("start"),
-        "2026-07-04T00:00:00Z",
-    );
-    let line = serde_json::to_string(&e).unwrap();
-    std::fs::write(&path, format!("\n{line}\n\n")).unwrap();
-    let back = read_events_from(&path).unwrap();
-    assert_eq!(back, vec![e]);
 }
 
 // ---- Story 3-2: the breach record write error is surfaced, not swallowed ----
@@ -3928,7 +3870,6 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     sup.start(&registry, "pz").unwrap();
     assert_eq!(state_of(&registry, "pz"), LifecycleState::Running);
     let agent_log = registry.agent_output_log_path(&name);
-    let log_path = registry.instance_log_path(&name);
     let wait_heartbeat = |at_least: usize| {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -3980,18 +3921,13 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
 
     // ---- Leg B: the persist commits, the event append fails. ----
     let b_before = heartbeat_lines(&agent_log);
-    std::fs::remove_file(&log_path).unwrap();
-    std::fs::create_dir(&log_path).unwrap();
+    sup.transition_fault_names.insert(name.clone());
     let b_err = sup.pause(&registry, "pz").unwrap_err();
-    let EngineError::Log {
-        detail: b_detail, ..
-    } = &b_err
-    else {
-        panic!("the append failure must surface as a typed Log error, got {b_err:?}")
-    };
     assert!(
-        b_detail.contains("compensated back to"),
-        "16-3: the surfaced error must name the compensation, got: {b_detail}"
+        b_err
+            .to_string()
+            .contains("injected transition-commit fault"),
+        "the failed transition commit surfaces typed, got: {b_err:?}"
     );
     // Story 16-3: the committed-but-unlogged `paused` was compensated back
     // to `running` — the ledger agrees with the last durably-landed event.
@@ -4006,7 +3942,7 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
             b_after > b_before,
             "a pause whose persist committed but errored must NOT have signalled SIGSTOP: heartbeat {b_before} -> {b_after}"
         );
-    std::fs::remove_dir(&log_path).unwrap();
+    sup.transition_fault_names.remove(&name);
 
     // (16-3 removed the old realign resume: the compensation already
     // restored `running`, so the ledger is aligned for the genuine
@@ -4031,18 +3967,13 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
     }
 
     // ---- Resume leg: persist commits, append fails, NO SIGCONT. ----
-    std::fs::remove_file(&log_path).unwrap();
-    std::fs::create_dir(&log_path).unwrap();
+    sup.transition_fault_names.insert(name.clone());
     let r_err = sup.resume(&registry, "pz").unwrap_err();
-    let EngineError::Log {
-        detail: r_detail, ..
-    } = &r_err
-    else {
-        panic!("the resume append failure must surface as a typed Log error, got {r_err:?}")
-    };
     assert!(
-        r_detail.contains("compensated back to"),
-        "16-3: the surfaced error must name the compensation, got: {r_detail}"
+        r_err
+            .to_string()
+            .contains("injected transition-commit fault"),
+        "the failed resume commit surfaces typed, got: {r_err:?}"
     );
     // Story 16-3: the committed-but-unlogged `running` was compensated back
     // to `paused` — the ledger agrees with the durable log (still at the
@@ -4064,7 +3995,7 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
                 "a resume whose persist committed but errored must NOT have signalled SIGCONT: the process stays suspended"
             );
     }
-    std::fs::remove_dir(&log_path).unwrap();
+    sup.transition_fault_names.remove(&name);
 
     // 16-3 recovery: the row was compensated back to `paused` while the
     // process is genuinely suspended — the honest way down is a REAL
@@ -4079,18 +4010,18 @@ fn pause_and_resume_transition_failures_fail_before_the_signal_persist_first_ai9
 }
 
 #[test]
-fn a_failed_transition_append_compensates_the_row_back_to_the_prior_state() {
-    // Story 16-3, arm 1 (append fails, compensation SUCCEEDS) — the
-    // committed-but-unlogged `running → paused` must not survive as a row
-    // the durable log cannot support. The observable end-state is the PRIOR
-    // state plus a typed Log error that NAMES the compensation (surfaced,
-    // not silent, AI-18) — `prior + an error`, never `new + silence`.
-    // Obstruction: the instance's transition log replaced by a DIRECTORY
-    // (append fails on every OS; the events_subscription VG1 idiom).
+fn a_failed_instance_log_mirror_is_a_diagnostic_and_the_transition_stands() {
+    // Story 21-1 (replacing story 16-3's compensation): the transition is
+    // durable in state.db the moment its writer job commits, and
+    // `instance.log` is a best-effort mirror. A mirror append that fails
+    // (the log path obstructed by a DIRECTORY, every OS) leaves the
+    // committed transition in place, the query API complete, and a surfaced
+    // diagnostic naming the mirror (AI-18) — never a reverted row.
     let (_state, _manifest, registry) =
         setup_pause_guaranteed("cz1", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
     let name = InstanceName::new("cz1").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
     sup.start(&registry, "cz1").unwrap();
     assert_eq!(state_of(&registry, "cz1"), LifecycleState::Running);
 
@@ -4098,73 +4029,23 @@ fn a_failed_transition_append_compensates_the_row_back_to_the_prior_state() {
     std::fs::remove_file(&log_path).unwrap();
     std::fs::create_dir(&log_path).unwrap();
 
-    let err = sup.pause(&registry, "cz1").unwrap_err();
-    let EngineError::Log { detail, .. } = &err else {
-        panic!("expected a typed Log error from the failed append, got {err:?}")
-    };
-    assert!(
-        detail.contains("compensated back to"),
-        "16-3: the error must name the compensation, got: {detail}"
-    );
+    sup.pause(&registry, "cz1").unwrap();
+    assert_eq!(state_of(&registry, "cz1"), LifecycleState::Paused);
+    let events = Supervisor::read_events(&registry, "cz1").unwrap();
     assert_eq!(
-        state_of(&registry, "cz1"),
-        LifecycleState::Running,
-        "16-3: the row was compensated back to the prior (running) state"
+        events.last().map(|e| e.new_state),
+        Some(LifecycleState::Paused),
+        "the query API reads state.db and holds the paused transition"
+    );
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("instance.log mirror could not be appended"),
+        "the lost mirror is surfaced: {text}"
     );
 
     std::fs::remove_dir(&log_path).unwrap();
+    sup.resume(&registry, "cz1").unwrap();
     sup.stop(&registry, "cz1", Some(Duration::from_millis(600)))
-        .unwrap();
-}
-
-#[test]
-fn when_compensation_also_fails_the_error_names_both_and_the_row_stays_honest() {
-    // Story 16-3, arm 2 (append fails AND the compensating store write
-    // fails) — driven deterministically through the cfg(test)
-    // `compensation_fault_names` seam (the AI-9/AI-12 fault-injection
-    // precedent; no real store outage staged). The contract: the error
-    // names BOTH failures ("COMPENSATION ALSO FAILED"), and the row stays
-    // at the committed-but-unlogged NEW state — the honestly-stuck state,
-    // per the spec's Never list (no compensating retry loop). Recovery is
-    // the operator's real remediation: clear the seam, resume, stop.
-    let (_state, _manifest, registry) =
-        setup_pause_guaranteed("cz2", &["--heartbeat-ms", "50", "--linger-ms", "600000"]);
-    let name = InstanceName::new("cz2").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "cz2").unwrap();
-    assert_eq!(state_of(&registry, "cz2"), LifecycleState::Running);
-
-    // Arm the seam: the compensating `set_state` write fails on purpose.
-    sup.compensation_fault_names.insert(name.clone());
-    let log_path = registry.instance_log_path(&name);
-    std::fs::remove_file(&log_path).unwrap();
-    std::fs::create_dir(&log_path).unwrap();
-
-    let err = sup.pause(&registry, "cz2").unwrap_err();
-    let EngineError::Log { detail, .. } = &err else {
-        panic!("expected a typed Log error from the failed append, got {err:?}")
-    };
-    assert!(
-        detail.contains("COMPENSATION ALSO FAILED"),
-        "16-3: the error must name the double failure, got: {detail}"
-    );
-    assert!(
-        detail.contains("injected compensation fault"),
-        "16-3: the error must carry the compensating write's own failure, got: {detail}"
-    );
-    assert_eq!(
-        state_of(&registry, "cz2"),
-        LifecycleState::Paused,
-        "16-3: with compensation failed the row stays at the committed (paused) state — honestly stuck, never silently reverted"
-    );
-
-    // Recovery: disarm the seam, clear the obstruction, then the operator's
-    // remediation (resume → running) and normal teardown.
-    sup.compensation_fault_names.clear();
-    std::fs::remove_dir(&log_path).unwrap();
-    sup.resume(&registry, "cz2").unwrap();
-    assert_eq!(state_of(&registry, "cz2"), LifecycleState::Running);
-    sup.stop(&registry, "cz2", Some(Duration::from_millis(600)))
         .unwrap();
 }
 
@@ -5132,29 +5013,6 @@ fn read_events_rejects_an_invalid_name_with_the_typed_error() {
 }
 
 #[test]
-fn read_events_surfaces_an_unreadable_instance_log_as_a_typed_log_error() {
-    let state = tempfile::tempdir().unwrap();
-    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
-    registry.register("evt", "mock").unwrap();
-    let name = InstanceName::new("evt").unwrap();
-    let path = registry.instance_log_path(&name);
-    std::fs::create_dir_all(&path).unwrap();
-    let err = Supervisor::read_events(&registry, "evt").unwrap_err();
-    match &err {
-        EngineError::Log {
-            name: n,
-            path: p,
-            detail,
-        } => {
-            assert_eq!(n, "evt");
-            assert_eq!(p, &path.to_string_lossy().into_owned());
-            assert!(!detail.is_empty(), "the error must name the read failure");
-        }
-        other => panic!("expected EngineError::Log, got {other:?}"),
-    }
-}
-
-#[test]
 fn read_breach_events_rejects_an_invalid_name_with_the_typed_error() {
     let state = tempfile::tempdir().unwrap();
     let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
@@ -5165,54 +5023,11 @@ fn read_breach_events_rejects_an_invalid_name_with_the_typed_error() {
     );
 }
 
-#[test]
-fn read_breach_events_surfaces_an_unreadable_breach_log_as_a_typed_log_error() {
-    let state = tempfile::tempdir().unwrap();
-    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
-    registry.register("brk", "mock").unwrap();
-    let name = InstanceName::new("brk").unwrap();
-    let path = registry.instance_breach_log_path(&name);
-    std::fs::create_dir_all(&path).unwrap();
-    let err = Supervisor::read_breach_events(&registry, "brk").unwrap_err();
-    match &err {
-        EngineError::Log {
-            name: n,
-            path: p,
-            detail,
-        } => {
-            assert_eq!(n, "brk");
-            assert_eq!(p, &path.to_string_lossy().into_owned());
-            assert!(!detail.is_empty(), "the error must name the read failure");
-        }
-        other => panic!("expected EngineError::Log, got {other:?}"),
-    }
-}
-
 /// Blank/whitespace-only lines in a breach log are SKIPPED, not corrupt-line
 /// errors — a padded log (trailing newline pairs, a whitespace run between
 /// appends) reads back only its events. The corrupt-after-blank leg proves
 /// the scan CONTINUES past blanks and still surfaces real corruption with
 /// the PHYSICAL line number, which the blanks must not shift.
-#[test]
-fn read_breach_events_skips_blank_lines_without_erroring() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("breach.log");
-
-    std::fs::write(&path, "\n   \n\t\n").unwrap();
-    assert_eq!(
-        read_breach_events_from(&path),
-        Ok(Vec::new()),
-        "blank/whitespace-only lines must be skipped, not a read error"
-    );
-
-    std::fs::write(&path, "\nnot a breach event\n").unwrap();
-    let err = read_breach_events_from(&path).unwrap_err();
-    assert!(
-        err.contains("corrupt breach-log line 2"),
-        "the scan must continue past blanks and name the corrupt line's physical number: {err}"
-    );
-}
-
 #[test]
 fn read_agent_log_since_surfaces_an_unreadable_attributed_log_as_a_typed_error() {
     // The NOT-FOUND arm is the documented empty tail; every OTHER read
@@ -5820,9 +5635,7 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
         assert!(Instant::now() < deadline, "usage sentinel never appeared");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let instance_log = registry.instance_log_path(&name);
-    std::fs::remove_file(&instance_log).unwrap();
-    std::fs::create_dir(&instance_log).unwrap();
+    sup.transition_fault_names.insert(name.clone());
 
     // THE DRAIN: commit the breaching event, trip enforcement, sabotage bites.
     sup.drain_usage_all(&registry);
@@ -5845,8 +5658,8 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
         "the enforcement breadcrumb must name the instance and the failure: {text}"
     );
     assert!(
-        text.contains("instance.log"),
-        "the surfaced error must name the sabotaged lifecycle log: {text}"
+        text.contains("injected transition-commit fault"),
+        "the surfaced error must carry the failed transition commit: {text}"
     );
 
     // (3) Best-effort means the supervisor survives. Story 16-3: the
@@ -5858,7 +5671,7 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
     assert_eq!(
         state_of(&registry, "stopfail"),
         LifecycleState::Running,
-        "16-3: the compensated stop-breach leaves the row at running"
+        "the failed stop transition committed nothing: the row reads running"
     );
 
     // Latch: a further drain of the same scope records NOTHING new (one
@@ -5872,7 +5685,7 @@ fn a_stop_breach_whose_stop_cannot_be_honored_still_records_and_survives() {
     // already restored `running` — a directly valid stop source — where the
     // uncompensated row sat at `stopping` and needed the test-only SQL seam
     // to reach a stoppable state.
-    std::fs::remove_dir(&instance_log).unwrap();
+    sup.transition_fault_names.remove(&name);
     let _ = sup.stop(&registry, "stopfail", Some(Duration::from_secs(5)));
 }
 
@@ -5909,7 +5722,7 @@ fn a_failed_totals_read_surfaces_the_degradation_and_decides_on_the_zero() {
     // SURFACED: the diagnostic names the instance + the degraded scope.
     let text = sink_text(&sink);
     assert!(
-        text.contains("degradedread: the per-run token totals read failed"),
+        text.contains("degradedread: the per-run totals read failed"),
         "the degraded read must be surfaced naming the instance + scope: {text}"
     );
     assert!(
@@ -6043,71 +5856,6 @@ fn drain_until_state(sup: &mut Supervisor, registry: &Registry, name: &str, want
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-#[test]
-fn latch_seeding_surfaces_a_corrupt_breach_log_and_fails_open() {
-    // Review round 1 (AI-18 + the fail-open contract): an unreadable
-    // breaches.log must (1) SURFACE its degradation — the operator hears the
-    // durable spent-check was unreadable — and (2) still fail OPEN: the
-    // latch seeds EMPTY, so the adoption-time re-evaluation of the
-    // still-over-ceiling run RE-FIRES (the "pause could not be honored"
-    // breadcrumb on the already-paused row is the observable of the
-    // un-suppressed enforcement attempt). The seeded control is the
-    // headline e2e: a readable log makes the same re-evaluation a no-op.
-    let (_state, _manifest, registry) = setup_pause_guaranteed(
-        "corruptlatch",
-        &["--emit-usage", "3", "--linger-ms", "600000"],
-    );
-    let name = InstanceName::new("corruptlatch").unwrap();
-    registry
-        .set_config(&name, "budget.tokens.cumulative", "15")
-        .unwrap();
-
-    // Engine 1 (in-crate): the breach fires + the default pause action lands
-    // (the pause-guaranteed fixture keeps the action honorable on every OS).
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start_detached(&registry, "corruptlatch").unwrap();
-    drain_until_state(&mut sup, &registry, "corruptlatch", LifecycleState::Paused);
-    assert_eq!(
-        Supervisor::read_breach_events(&registry, "corruptlatch")
-            .unwrap()
-            .len(),
-        1,
-        "the breach fired exactly once under the first engine"
-    );
-    // Drop the (disarmed, detached) handle — the child survives, paused.
-    drop(sup);
-
-    // Corrupt the durable spent-check: garbage in breaches.log.
-    let breach_log = registry.instance_breach_log_path(&name);
-    std::fs::write(&breach_log, "not json at all\n").unwrap();
-
-    // Engine 2 adopts: the seeding READ fails → surfaced + EMPTY latch →
-    // the over-ceiling re-evaluation is NOT suppressed.
-    let mut sup2 = Supervisor::with_backoff(fast_backoff());
-    let sink = install_capture_sink(&mut sup2);
-    sup2.adopt_orphans(&registry);
-    let text = sink_text(&sink);
-    assert!(
-        text.contains("corruptlatch: the instance's breach log could not be read"),
-        "the corrupt-log fail-open must be SURFACED (AI-18): {text}"
-    );
-    assert!(
-        text.contains("breach latch degrades to empty"),
-        "the note must name the empty-latch degradation: {text}"
-    );
-    assert!(
-        text.contains("budget breach pause could not be honored"),
-        "the EMPTY latch must let the over-ceiling re-evaluation re-fire \
-         (fail-open, never fail-silent): {text}"
-    );
-    // The row honestly keeps reading paused (adoption never auto-resumes;
-    // the re-fired pause of an already-paused row is the no-op breadcrumb).
-    assert_eq!(state_of(&registry, "corruptlatch"), LifecycleState::Paused);
-    // Teardown: the stop ladder reaches the (Unix: suspended) child.
-    sup2.stop(&registry, "corruptlatch", Some(Duration::from_secs(5)))
-        .unwrap();
 }
 
 #[test]
@@ -6652,33 +6400,43 @@ fn should_truncate_pure_seam_fires_at_and_past_the_cap_only() {
     assert!(Supervisor::should_truncate(65, 64));
 }
 
+/// Every outbox entry state.db retains, in seq order (story 21-1).
+fn outbox_entries(registry: &Registry) -> Vec<crate::domain::OutboxEntry> {
+    let floor = registry.reader().outbox_bounds().unwrap().retained_from;
+    let mut cursor = crate::domain::OutboxCursor {
+        seq: floor.saturating_sub(1),
+    };
+    let mut entries = Vec::new();
+    loop {
+        let batch =
+            crate::domain::export_core(registry, Some(cursor), 0).expect("the outbox reads");
+        if batch.events.is_empty() {
+            return entries;
+        }
+        cursor = batch.cursor;
+        entries.extend(batch.events);
+    }
+}
+
 #[test]
-fn transitions_land_in_the_outbox_journal_with_monotonic_seqs() {
-    // Story 17-4: every committed transition mirrors into the global outbox
-    // journal at the SAME commit point (after the durable family append,
-    // before the bus publish), seq monotonic from 1, schema-stamped.
-    let (state, _manifest, registry) = setup_fake("obx", &["--linger-ms", "600000"]);
+fn transitions_land_in_the_outbox_with_monotonic_seqs() {
+    // Story 17-4 (state.db since 21-1): every committed transition commits its
+    // outbox row in the SAME transaction as the state write and the event row,
+    // seq monotonic from 1, schema-stamped.
+    let (_state, _manifest, registry) = setup_fake("obx", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     sup.start(&registry, "obx").unwrap();
     let _ = sup.stop(&registry, "obx", Some(Duration::from_secs(5)));
 
-    let journal = registry.outbox_journal_path();
-    assert!(journal.exists(), "the journal exists after transitions");
-    assert_eq!(
-        journal.parent().unwrap(),
-        state.path(),
-        "the journal lives at the state root (the paths authority)"
-    );
-    let view = read_journal_tolerant(&journal).expect("the journal reads");
-    assert!(!view.torn_tail_skipped, "a clean run tears nothing");
-    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
+    let entries = outbox_entries(&registry);
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
     assert!(
         seqs.windows(2).all(|w| w[1] == w[0] + 1),
         "seqs are consecutive: {seqs:?}"
     );
     assert_eq!(seqs.first(), Some(&1), "the first seq is 1 (START is 0)");
-    for entry in &view.entries {
-        assert_eq!(entry.schema_version, OUTBOX_SCHEMA_VERSION);
+    for entry in &entries {
+        assert_eq!(entry.schema_version, crate::domain::OUTBOX_SCHEMA_VERSION);
         assert!(
             matches!(entry.event, EngineEvent::Transition(_)),
             "start/stop commit transitions: {entry:?}"
@@ -6689,164 +6447,122 @@ fn transitions_land_in_the_outbox_journal_with_monotonic_seqs() {
         seqs.len() >= 3,
         "start+stop commit ≥3 transitions: {seqs:?}"
     );
-    assert_eq!(view.tail, *seqs.last().unwrap());
+    // The transition rows and the outbox rows are the same events, in order.
+    let recorded = Supervisor::read_events(&registry, "obx").unwrap();
+    let exported: Vec<TransitionEvent> = entries
+        .into_iter()
+        .filter_map(|e| match e.event {
+            EngineEvent::Transition(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, exported);
 }
 
 #[test]
-fn outbox_seq_continues_after_a_restart_never_reuses_a_seq() {
-    // The rederive contract: a fresh supervisor continues the seq sequence
-    // from the journal's committed tail — a restart that restarted at 1
-    // would mint duplicate seqs and silently break cursor walks.
-    let (_state, _manifest, registry) = setup_fake("obxr", &["--linger-ms", "600000"]);
+fn outbox_seq_continues_after_an_engine_reopen_never_reuses_a_seq() {
+    // A reopened engine continues the ONE state.db sequence: the first seq
+    // after the reopen is exactly tail+1 (no reuse, no gap).
+    let (state, _manifest, registry) = setup_fake("obxr", &["--linger-ms", "600000"]);
     let mut sup1 = Supervisor::with_backoff(fast_backoff());
     sup1.start(&registry, "obxr").unwrap();
     let _ = sup1.stop(&registry, "obxr", Some(Duration::from_secs(5)));
-    let tail_before = read_journal_tolerant(&registry.outbox_journal_path())
-        .unwrap()
-        .tail;
+    let tail_before = outbox_entries(&registry).last().unwrap().seq;
+    drop(sup1);
+    drop(registry);
 
-    // A FRESH supervisor (a new engine lifetime) rederives, then commits more.
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     let mut sup2 = Supervisor::with_backoff(fast_backoff());
-    sup2.rederive_outbox_seq(&registry).expect("rederive");
     sup2.start(&registry, "obxr").unwrap();
     let _ = sup2.stop(&registry, "obxr", Some(Duration::from_secs(5)));
-
-    let view = read_journal_tolerant(&registry.outbox_journal_path()).unwrap();
-    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
-    assert!(
-        seqs.iter()
-            .all(|seq| *seq > tail_before || seqs.windows(2).any(|w| w[0] == w[1] - 1)),
-        "seqs never repeat: {seqs:?}"
-    );
-    // The STRICT pin: the first post-restart seq is exactly tail+1.
+    let seqs: Vec<u64> = outbox_entries(&registry).iter().map(|e| e.seq).collect();
     assert_eq!(
         seqs.get(tail_before as usize),
         Some(&(tail_before + 1)),
-        "the restart continues at tail+1 (no reuse, no gap): {seqs:?}"
+        "the reopen continues at tail+1: {seqs:?}"
     );
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
 }
 
 #[test]
-fn an_outbox_append_failure_rolls_the_seq_back_and_surfaces_a_diagnostic() {
-    // The best-effort contract, fault-injected at the journal path (the
-    // paths-suite directory idiom): the family commit is never the outbox's
-    // hostage — a failed append rolls the seq BACK (no fabricated hole for
-    // exporters) and emits the AI-18 diagnostic naming the seq, and the
-    // next append REUSES that seq.
+fn an_outbox_failure_fails_the_transition_with_nothing_committed() {
+    // Story 21-1: the outbox row commits in the transition's own transaction,
+    // so an outbox that cannot be written fails the transition as a whole —
+    // no state change, no event row — instead of the 17-4 best-effort append
+    // that let the export lag the record.
     let (_state, _manifest, registry) = setup_fake("obxf", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    let buffer = install_capture_sink(&mut sup);
-
-    // A DIRECTORY occupies the journal: every append's torn-tail repair
-    // read fails before anything is written.
-    let journal = registry.outbox_journal_path();
-    std::fs::create_dir(&journal).unwrap();
-    sup.outbox_append(
-        &registry,
-        EngineEvent::Transition(TransitionEvent::new(
-            "obxf",
-            LifecycleState::Starting,
-            LifecycleState::Running,
-            TransitionCause::AdapterReady,
-            "2026-10-19T00:00:01Z".to_string(),
-        )),
-    );
-    let text = sink_text(&buffer);
+    registry
+        .writer()
+        .call(|ctx| {
+            ctx.store().break_outbox_for_test();
+            Ok(())
+        })
+        .unwrap();
+    let err = sup.start(&registry, "obxf").unwrap_err();
     assert!(
-        text.contains("outbox append failed (seq 1)"),
-        "the failure is surfaced with its seq: {text}"
+        err.to_string().contains("outbox"),
+        "the failure names the outbox: {err}"
     );
-
-    // Recover the path and append again: the rolled-back seq is REUSED —
-    // the journal carries no hole and no burned sequence.
-    std::fs::remove_dir(&journal).unwrap();
-    sup.outbox_append(
-        &registry,
-        EngineEvent::Transition(TransitionEvent::new(
-            "obxf",
-            LifecycleState::Starting,
-            LifecycleState::Running,
-            TransitionCause::AdapterReady,
-            "2026-10-19T00:00:02Z".to_string(),
-        )),
-    );
-    let view = read_journal_tolerant(&journal).unwrap();
-    let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
+    let instance = registry
+        .lookup(&InstanceName::new("obxf").unwrap())
+        .unwrap();
     assert_eq!(
-        seqs,
-        vec![1],
-        "the failed append's seq was reused: {seqs:?}"
+        instance.state,
+        LifecycleState::Registered,
+        "nothing committed"
     );
-    assert!(
-        !sink_text(&buffer).contains("seq 2"),
-        "no second seq was burned on the retry: {}",
-        sink_text(&buffer)
-    );
+    assert!(Supervisor::read_events(&registry, "obxf")
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
 fn an_outbox_eviction_at_the_real_cap_surfaces_the_un_acked_loss() {
-    // The eviction diagnostic at the REAL 30MB cap (the toy-cap decision
-    // arms live in the pure plan + append_with_retention tests; this is the
-    // supervisor-level surfaced LOSS, AI-18): a journal staged past the cap
-    // forces the next append to evict UN-ACKED entries from the front —
-    // never the very last — and the diagnostic names the loss for the Host
-    // that has not acked its export cursor.
+    // The eviction diagnostic at the REAL 30MB cap: an outbox staged past the
+    // cap forces the next transition's append to evict UN-ACKED entries from
+    // the front — never the very last — and the diagnostic names the loss for
+    // the Host that has not acked its export cursor.
     let (_state, _manifest, registry) = setup_fake("obxe", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
 
-    // Fat entries (a 100KB launch-detail string dominates each line) so
-    // ~320 lines cross OUTBOX_MAX_BYTES. The seq counter rederives from the
-    // staged tail, exactly as an engine reopen would.
+    // Fat entries (a 100KB launch-detail string dominates each one) so ~320
+    // cross OUTBOX_MAX_BYTES.
     let fat = "x".repeat(100_000);
-    let mut staged = String::new();
     for seq in 1..=320u64 {
-        let entry = OutboxEntry {
-            schema_version: OUTBOX_SCHEMA_VERSION,
-            seq,
-            event: EngineEvent::Transition(TransitionEvent::new(
-                "obxe",
-                LifecycleState::Starting,
-                LifecycleState::Failed,
-                TransitionCause::LaunchError {
-                    detail: fat.clone(),
-                },
-                format!("2026-10-19T00:{:02}:{:02}Z", seq / 60, seq % 60),
-            )),
-        };
-        staged.push_str(&serde_json::to_string(&entry).unwrap());
-        staged.push('\n');
-    }
-    let journal = registry.outbox_journal_path();
-    std::fs::write(&journal, staged).unwrap();
-    sup.rederive_outbox_seq(&registry).expect("rederive");
-
-    // The next append crosses the cap: the un-acked eviction, surfaced.
-    sup.outbox_append(
-        &registry,
-        EngineEvent::Transition(TransitionEvent::new(
+        let event = EngineEvent::Transition(TransitionEvent::new(
             "obxe",
+            LifecycleState::Starting,
             LifecycleState::Failed,
-            LifecycleState::Registered,
-            TransitionCause::AdapterReady,
-            "2026-10-19T01:00:00Z".to_string(),
-        )),
-    );
+            TransitionCause::LaunchError {
+                detail: fat.clone(),
+            },
+            format!("2026-10-19T00:{:02}:{:02}Z", seq / 60, seq % 60),
+        ));
+        // Staged with no cap, so the journal sits past the real one.
+        registry
+            .writer()
+            .call(move |ctx| ctx.store().append_outbox(&event, u64::MAX))
+            .unwrap();
+    }
+    // The next transition crosses the cap: the un-acked eviction, surfaced.
+    sup.start(&registry, "obxe").unwrap();
+    let _ = sup.stop(&registry, "obxe", Some(Duration::from_secs(5)));
     assert!(
         sink_text(&buffer).contains("outbox compaction dropped"),
         "the un-acked eviction is surfaced: {}",
         sink_text(&buffer)
     );
-    let view = read_journal_tolerant(&journal).unwrap();
+    let entries = outbox_entries(&registry);
     assert!(
-        view.entries.first().unwrap().seq > 1,
+        entries.first().unwrap().seq > 1,
         "the oldest un-acked entries were evicted: first={}",
-        view.entries.first().unwrap().seq
+        entries.first().unwrap().seq
     );
-    assert_eq!(
-        view.tail, 321,
-        "the LAST entry (the fresh append) survives the eviction"
+    assert!(
+        entries.last().unwrap().seq > 320,
+        "the fresh appends survive the eviction"
     );
 }
 
@@ -7843,38 +7559,16 @@ fn adopted_breach_paused_child_notes_the_between_commands_freeze() {
     let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
 }
 
-/// Sabotage the engine's transition-event log: replace `instance.log` with a
-/// DIRECTORY, so every subsequent transition APPEND fails (the same OS-neutral
-/// staging the breach-IO test uses) while earlier committed events are gone.
-/// Returns a closure that repairs the path for clean teardown.
-fn break_instance_event_log(registry: &Registry, name: &InstanceName) {
-    let log = registry.instance_log_path(name);
-    match std::fs::remove_file(&log) {
-        Ok(()) => {}
-        // Nothing there yet — nothing to remove.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        // Any OTHER failure: the path may already be a directory from a
-        // previous break (repair that); a repair that also fails PROPAGATES
-        // clearly here instead of detonating as an opaque unwrap-panic in
-        // the create_dir below (P11 — the site the review flagged).
-        Err(err) => {
-            if std::fs::remove_dir(&log).is_err() {
-                panic!(
-                    "could not sabotage {} for the break test (remove_file: {err}) — \
-                     not a file, not absent, not a removable directory",
-                    log.display()
-                );
-            }
-        }
-    }
-    std::fs::create_dir(&log).unwrap();
+/// Make every transition of `name` fail at its commit (story 21-1: the
+/// cfg(test) transition-commit seam; `instance.log` is a best-effort mirror
+/// now, so obstructing it no longer fails a transition).
+fn break_instance_event_log(sup: &mut Supervisor, name: &InstanceName) {
+    sup.transition_fault_names.insert(name.clone());
 }
 
-fn repair_instance_event_log(registry: &Registry, name: &InstanceName) {
-    let log = registry.instance_log_path(name);
-    if log.is_dir() {
-        std::fs::remove_dir(&log).unwrap();
-    }
+/// Undo [`break_instance_event_log`].
+fn repair_instance_event_log(sup: &mut Supervisor, name: &InstanceName) {
+    sup.transition_fault_names.remove(name);
 }
 
 #[test]
@@ -7905,7 +7599,7 @@ fn cooperative_pause_divergence_after_the_command_ran_is_surfaced() {
     let buffer = install_capture_sink(&mut sup);
     sup.start_detached(&registry, "coopdiv").unwrap();
 
-    break_instance_event_log(&registry, &name);
+    break_instance_event_log(&mut sup, &name);
     let _err = sup.pause(&registry, "coopdiv").unwrap_err();
     let text = sink_text(&buffer);
     assert!(
@@ -7926,7 +7620,7 @@ fn cooperative_pause_divergence_after_the_command_ran_is_surfaced() {
     );
 
     // Repair the log so the teardown's own transitions land.
-    repair_instance_event_log(&registry, &name);
+    repair_instance_event_log(&mut sup, &name);
     sup.stop(&registry, "coopdiv", Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -7944,7 +7638,7 @@ fn release_pass_resume_commit_failure_is_surfaced() {
     sup.pause(&registry, "relcommit").unwrap();
     assert_eq!(state_of(&registry, "relcommit"), LifecycleState::Paused);
 
-    break_instance_event_log(&registry, &name);
+    break_instance_event_log(&mut sup, &name);
     sup.release_detached_paused(&registry);
     wait_for_sink_line(
         &buffer,
@@ -7952,7 +7646,7 @@ fn release_pass_resume_commit_failure_is_surfaced() {
         "the release commit-failure note",
     );
 
-    repair_instance_event_log(&registry, &name);
+    repair_instance_event_log(&mut sup, &name);
     sup.stop(&registry, name.as_str(), Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -8807,9 +8501,10 @@ fn an_acp_instance_accepts_block_only_once_it_meters_through_the_listener() {
 
 #[test]
 fn switching_to_block_after_a_recorded_breach_raises_the_fence_on_the_next_usage() {
-    // The latch is keyed by (dimension, scope), so a breach recorded under
-    // `warn` never fires again; moving the action to `block` mid-Run must
-    // still fence, without a second breach record.
+    // Story 21-1: the durable latch is keyed by action, so moving a Run's
+    // action from `warn` to `block` after the warn breach fires the breach
+    // ONCE more under `block` on the next usage — a durable block record
+    // (which a restart rebuilds the fence from) and the fence itself.
     let upstream = start_fence_upstream();
     let (_state, _manifest, registry, rt, name) = setup_block_instance(
         "fencelate",
@@ -8837,26 +8532,22 @@ fn switching_to_block_after_a_recorded_breach_raises_the_fence_on_the_next_usage
     registry
         .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
         .unwrap();
-    // The next committed usage event runs enforcement, which raises the fence.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !sink_text(&buffer).contains("now applies") {
-        sup.drain_observed_all(&registry);
-        assert!(Instant::now() < deadline, "the late fence never rose");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // The next committed usage event runs enforcement, which records the
+    // breach under `block` and raises the fence.
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencelate", 2);
+    assert_eq!(breaches[1].action, BreachAction::Block);
+    assert!(sink_text(&buffer).contains("the wire fence is UP"));
     let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
     assert_eq!(status, 402, "{body}");
     assert_eq!(upstream.served(), 2);
+    // Latched under `block` now: later usage records nothing more.
+    sup.drain_observed_all(&registry);
     assert_eq!(
         Supervisor::read_breach_events(&registry, "fencelate")
             .unwrap()
             .len(),
-        1,
-        "no second breach record"
+        2
     );
-    // Once raised, later usage does not repeat the note.
-    sup.drain_observed_all(&registry);
-    assert_eq!(sink_text(&buffer).matches("now applies").count(), 1);
     sup.stop(&registry, "fencelate", Some(Duration::from_secs(5)))
         .unwrap();
 }
@@ -8897,4 +8588,126 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
     let fence = crate::metering::WireFence::default();
     assert!(!sup.run_start_fence(&registry, &name, &fence));
     assert!(fence.refusal().is_none());
+}
+
+#[test]
+fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
+    // Story 21-1 (the adoption sequence-reset undercount): the adopting
+    // engine's listener mints observed sequences from 0 again under the
+    // RESUMED run id. The previous attach already committed sequence 0, so
+    // without a new launch generation the next event read as a replay and
+    // was dropped. Adoption bumps the generation; both events count.
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("genadopt");
+    let run_id = registry
+        .spawn_record(&name)
+        .unwrap()
+        .and_then(|record| record.run_id)
+        .expect("the crashed Run's id rides the record");
+    let before = registry.launch_generation(&name).unwrap();
+    assert!(before >= 1, "the spawn bumped the generation");
+    let usage = ParsedUsage {
+        sequence: 0,
+        input_tokens: 40,
+        output_tokens: 2,
+        cached_tokens: 0,
+    };
+    // The previous attach's committed sequence 0.
+    let first = crate::domain::pipeline::UsageJob {
+        event: assemble_usage_event(
+            &usage,
+            name.as_str(),
+            run_id.clone(),
+            "engine-observed",
+            now_rfc3339(),
+        ),
+        generation: before,
+        eval: Supervisor::new().eval_input(&registry, &name, &run_id, "engine-observed"),
+    };
+    registry
+        .writer()
+        .call(move |ctx| crate::domain::pipeline::commit_usage(ctx, first))
+        .unwrap();
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    assert_eq!(registry.launch_generation(&name).unwrap(), before + 1);
+    let update = sup2
+        .ingest_usage(
+            &registry,
+            &name,
+            &run_id,
+            "engine-observed",
+            &usage,
+            DrainMode::MidRun,
+        )
+        .unwrap();
+    assert!(
+        update.is_some(),
+        "the adopted attach's sequence 0 is a new event"
+    );
+    assert_eq!(registry.usage_totals(&name).unwrap().total_tokens(), 84);
+    // The same event again under the SAME attach is still a replay.
+    assert!(sup2
+        .ingest_usage(
+            &registry,
+            &name,
+            &run_id,
+            "engine-observed",
+            &usage,
+            DrainMode::MidRun,
+        )
+        .unwrap()
+        .is_none());
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+}
+
+#[test]
+fn a_busy_store_parks_usage_without_spending_attempts_and_never_skips_it() {
+    // Story 21-1 (AI-55 adversarial review, finding 2): the store writer
+    // answers `Busy` after 1 s while another process holds the write lock.
+    // That is contention, not a poisoned row, so it must never spend one of
+    // the drain's three park attempts: four busy drains in a row keep the
+    // usage parked, and it all commits once the lock is released.
+    let (state, _manifest, registry) =
+        setup_fake("busypark", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("busypark").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "busypark").unwrap();
+    let agent_log = registry.agent_output_log_path(&name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&agent_log)
+        .map(|c| c.matches("KTESIO_USAGE").count())
+        .unwrap_or(0)
+        < 2
+    {
+        assert!(Instant::now() < deadline, "usage sentinels never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let holder = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for _ in 0..4 {
+        sup.drain_usage_all(&registry);
+    }
+    holder.execute_batch("COMMIT").unwrap();
+    assert_eq!(registry.usage_event_count(&name).unwrap(), 0);
+    let text = sink_text(&buffer);
+    assert!(
+        !text.contains("SKIPPED"),
+        "contention never skips usage: {text}"
+    );
+    assert!(text.contains("parked for retry"), "{text}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while registry.usage_event_count(&name).unwrap() < 2 {
+        sup.drain_usage_all(&registry);
+        assert!(
+            Instant::now() < deadline,
+            "the parked usage never committed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = sup.stop(&registry, "busypark", Some(Duration::from_secs(5)));
 }

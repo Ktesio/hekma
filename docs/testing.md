@@ -238,6 +238,16 @@ The harness prints a machine-readable JSON report (schema v1, with environment m
 
 **The CI tolerance policy (named, not hidden):** the CPU gate carries a shared-runner tolerance factor of **1.5** (`shared_runner_tolerance`, printed as `ci_tolerance.factor` in every report) AND takes the **median of three 12 s windows** on CI. GitHub hosted runners are noisy neighbors — a co-tenant can steal cycles from under the sampling window — so in CI (detected via the runner's `CI` env; force any mode with `PERF_BUDGETS_CI=1|0`, where any other value exits 2) the CPU gate runs at an effective 3% per instance over the median window. The three subscriber-active delta gates use the SAME factor shape but deliberately stay single-window on CI (the addendum measures one window even there, and the deltas are differences taken seconds apart in one process), so for them the tolerance is the sole noise absorber and the ratified budgets are sized for it. This is NOT a budget change: the strict budgets are what local runs gate, reads and RSS gate at budget on every gate platform, both contamination directions of the window sampling are acknowledged in the report, and the factor is printed in the job log on every run. If a budget ever fails on honest local measurement (not CI noise), the remedy is a documented budget-update proposal routed to the maintainer — never a silent gate tweak. Note the budget semantics: the per-instance figures mean MARGINAL supervision overhead — the fixed engine cost amortizes over the running count — so the 25/10 fixture counts are part of the budget's meaning and a future change to them must consciously revisit the budget.
 
+### The store writer bench
+
+The state database has one writer thread per engine process, and its own bench lives with it in `crates/hekma-engine/src/store/writer/tests.rs`. It seeds M instances × N usage events (one Run each, a token ceiling armed so every event runs the full metering job: ledger row, rollups, outbox, budget evaluation) and gates three numbers: a batch of writes nobody waits for flushes within 250 ms of its first write, a single write a caller waits for is at most 50 ms at p99, and a usage event that crosses a ceiling has its breach decided within 1 s. The default seed (25 × 10,000) runs in the normal test suite. The large one is ignored by default; run it with:
+
+```bash
+HEKMA_WRITER_BENCH_INSTANCES=1000 HEKMA_WRITER_BENCH_EVENTS=1000000 cargo test --release -p hekma-engine --lib writer_bench_large_seed -- --ignored --nocapture
+```
+
+The numbers that need Runs and the shared Metering Proxy (the first page of a Run listing at 1M Runs, the proxy's added latency) are measured once those exist.
+
 ### Baseline trend tracking — the ratchet
 
 The absolute budgets catch a regression only when it crosses them; they cannot see a slow multi-week DRIFT (reads creeping from 6 ms toward 100 ms is green every week and worse every month). The ratchet closes that gap **additively** — a CI-mode run must pass both the absolute budgets and the ratchet:

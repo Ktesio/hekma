@@ -746,38 +746,45 @@ impl Supervisor {
             // arbitrated.
             lease: None,
         };
-        if let Err(e) = registry.write_spawn_record(&record) {
-            // Persisting the record failed: kill the just-spawned process and
-            // land the instance in `failed` so we never leave an unrecorded
-            // process behind (AD-5 safety).
-            //
-            // Review round 2: `drop(handle)` alone only tears the process down
-            // when the handle is ATTACHED (drop = group/job kill). A DETACHED
-            // handle is DISARMED — its Drop deliberately kills nothing — so a
-            // detached start whose record commit fails would LEAK a live,
-            // unrecorded process. The teardown is therefore explicit on the
-            // detach path: a short graceful window through the backend stop
-            // (which still works on a detached handle — the pgid/job is
-            // unchanged), then the drop releases whatever remains.
-            //
-            // AUDIT of the other post-spawn error paths in this function (why
-            // this is the ONLY fix site): between `spawn` and this commit the
-            // sole fallible step is `watch_startup`, whose failure branch runs
-            // only when the process ALREADY exited (reaped by the poll —
-            // nothing survives, detached or not); every `?` after the commit
-            // happens once the record is DURABLE, so a dropped detached
-            // handle there leaves a recorded (adoptable) process, not an
-            // unrecorded one.
-            if detach {
-                let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+        // Story 21-1: the record and the instance's NEW launch generation
+        // commit in one writer job — every usage row of this launch carries
+        // it, so a sequence a relaunch restarts never collides with the
+        // previous launch's rows.
+        let launch_generation = match registry.write_spawn_record_new_launch(&record) {
+            Ok(generation) => generation,
+            Err(e) => {
+                // Persisting the record failed: kill the just-spawned process and
+                // land the instance in `failed` so we never leave an unrecorded
+                // process behind (AD-5 safety).
+                //
+                // Review round 2: `drop(handle)` alone only tears the process down
+                // when the handle is ATTACHED (drop = group/job kill). A DETACHED
+                // handle is DISARMED — its Drop deliberately kills nothing — so a
+                // detached start whose record commit fails would LEAK a live,
+                // unrecorded process. The teardown is therefore explicit on the
+                // detach path: a short graceful window through the backend stop
+                // (which still works on a detached handle — the pgid/job is
+                // unchanged), then the drop releases whatever remains.
+                //
+                // AUDIT of the other post-spawn error paths in this function (why
+                // this is the ONLY fix site): between `spawn` and this commit the
+                // sole fallible step is `watch_startup`, whose failure branch runs
+                // only when the process ALREADY exited (reaped by the poll —
+                // nothing survives, detached or not); every `?` after the commit
+                // happens once the record is DURABLE, so a dropped detached
+                // handle there leaves a recorded (adoptable) process, not an
+                // unrecorded one.
+                if detach {
+                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                }
+                drop(handle);
+                return Err(self.fail_launch_detail(
+                    registry,
+                    &name,
+                    format!("could not commit the write-ahead spawn record: {e}"),
+                ));
             }
-            drop(handle);
-            return Err(self.fail_launch_detail(
-                registry,
-                &name,
-                format!("could not commit the write-ahead spawn record: {e}"),
-            ));
-        }
+        };
 
         // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
         // take ownership of the child's pipe halves, start the connection
@@ -1229,12 +1236,11 @@ impl Supervisor {
                 is_acp,
                 // Story 12-4: a fresh Run starts with no parked observed events.
                 observed_park: None,
-                // A fresh Run starts with an EMPTY breach latch (story 3-2): the
-                // run_id was just minted, so no scope has fired for it yet. This is
-                // how the latch RESETS per Run — a persistently-over-cumulative agent
-                // that stops and starts again gets a new Run + a clean latch, so it
-                // can fire one cumulative breach in the new Run too.
-                breached_scopes: std::collections::HashSet::new(),
+                // Story 21-1: this launch's generation (committed with the
+                // record above). The breach latch is durable (`run_latches`),
+                // keyed by the freshly minted run id, so it resets per Run by
+                // construction.
+                launch_generation,
                 observed_listener,
                 observed_source,
                 // A fresh start's stop attempt has not happened yet.

@@ -19,6 +19,7 @@
 
 mod memory_backing;
 mod process_backend;
+mod run_store;
 mod secret_resolver;
 mod state_store;
 mod usage_source;
@@ -32,6 +33,9 @@ pub(crate) use process_backend::{
 pub use process_backend::{
     BackendError, LogCaptureMode, ProcessBackend, ProcessFingerprint, ProcessStatus, SpawnSpec,
     StdinState, StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
+};
+pub(crate) use run_store::{
+    clamp_page, OutboxAppend, OutboxBounds, Page, Rollup, RunStore, PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

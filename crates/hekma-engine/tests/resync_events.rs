@@ -32,9 +32,9 @@
 //!    counts — never a silent clamp, which would re-deliver or silently skip.
 //! 4. **Honest edges** — an unregistered name fails `NotFound` (a mistyped
 //!    name must not read as a silent empty backfill), a malformed name fails
-//!    `InvalidName`, and a torn trailing append (the very crash this helper
-//!    heals) is skipped WITH the skip surfaced (`torn_tail_skipped`): the
-//!    good prefix returns, and the host knows a record may be missing.
+//!    `InvalidName`, and damage to the `instance.log` / `breaches.log`
+//!    mirrors (a torn tail, a corrupt line) leaves the backfill untouched:
+//!    the record is state.db (story 21-1).
 //! 5. **Wire pins** — `ResyncCursor`/`ResyncBatch` serialize as snake_case
 //!    and round-trip (the documented host-persistence contract), with
 //!    `torn_tail_skipped` additive (`#[serde(default)]`: an archived batch
@@ -405,11 +405,11 @@ fn a_resync_cursor_continues_from_where_the_host_left_off() {
 }
 
 // ---------------------------------------------------------------------------
-// Family (4): honest edges — name errors and the torn trailing append
+// Family (4): honest edges — name errors and damaged log mirrors
 // ---------------------------------------------------------------------------
 
 #[test]
-fn resync_surfaces_the_expected_error_arms_and_tolerates_a_torn_tail() {
+fn resync_surfaces_the_expected_error_arms_and_ignores_damaged_mirrors() {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     ManifestFixture::lingering("resync-edges").write(manifest.path());
@@ -434,10 +434,10 @@ fn resync_surfaces_the_expected_error_arms_and_tolerates_a_torn_tail() {
         EngineError::NotFound { name } if name == "never-registered"
     ));
 
-    // The torn-trailing-append case, end to end through the facade: drive a
-    // REAL lifecycle (four committed transitions), then tear the log's
-    // trailing line the way the crash this helper heals would — the backfill
-    // returns exactly the good prefix, never a failed recovery.
+    // The record is state.db: drive a REAL lifecycle (four committed
+    // transitions), then damage the `instance.log` and `breaches.log`
+    // MIRRORS — a torn tail, an interior corruption — and the backfill is
+    // untouched: exactly the committed transitions, nothing flagged.
     facade
         .register_with_adapter(
             "resync-edges",
@@ -458,61 +458,24 @@ fn resync_surfaces_the_expected_error_arms_and_tolerates_a_torn_tail() {
         .expect("the committed transitions");
     assert_eq!(committed.len(), 4, "start + stop edges committed");
 
-    let log = state
+    let logs = state
         .path()
         .join("agents")
         .join("resync-edges")
-        .join("logs")
-        .join("instance.log");
-    let existing = std::fs::read_to_string(&log).expect("the transition log exists");
-    std::fs::write(&log, format!("{existing}{{\"schema_version\":1,\"inst"))
-        .expect("tear the tail");
+        .join("logs");
+    let existing = std::fs::read_to_string(logs.join("instance.log")).expect("the mirror exists");
+    std::fs::write(
+        logs.join("instance.log"),
+        format!("{{\"not\":\"a transition\"}}\n{existing}{{\"schema_version\":1,\"inst"),
+    )
+    .expect("damage the transition mirror");
+    std::fs::write(logs.join("breaches.log"), "{\"nope\":1}\n").expect("damage the breach mirror");
 
     let batch = facade
         .resync_events("resync-edges", hekma_engine::ResyncCursor::START)
-        .expect("the torn tail is skipped, not a failed recovery");
-    assert_eq!(
-        transitions_of(&batch.events),
-        committed,
-        "exactly the good prefix backfills"
-    );
-    assert!(
-        batch.torn_tail_skipped,
-        "the torn-tail skip is SURFACED on the batch — the engine's next append fuses onto the \
-         torn fragment, so the host must know a record may be missing"
-    );
-
-    // The tolerance is bounded: a malformed INTERIOR line (a bad line with a
-    // good line AFTER it — not a trailing race) is the wrong file or a
-    // corrupting engine, and the typed error surfaces. Proven through the
-    // FACADE for BOTH log families, so both error-mapping arms are covered
-    // end to end.
-    let good_line = serde_json::to_string(&committed[0]).unwrap();
-    std::fs::write(&log, format!("{{\"not\":\"a transition\"}}\n{good_line}\n"))
-        .expect("corrupt the transition log's interior");
-    let err = facade
-        .resync_events("resync-edges", hekma_engine::ResyncCursor::START)
-        .unwrap_err();
-    assert!(matches!(err, EngineError::Log { .. }), "{err:?}");
-
-    let good_breach = serde_json::json!({
-        "schema_version": 1, "instance": "resync-edges", "run_id": "run-1",
-        "scope": "cumulative", "dimension": "tokens", "limit": 90,
-        "observed": 90, "action": "pause", "metering_source": "self-reported",
-        "at": "2026-09-10T00:00:00Z"
-    });
-    let breach_log = state
-        .path()
-        .join("agents")
-        .join("resync-edges")
-        .join("logs")
-        .join("breaches.log");
-    std::fs::write(&breach_log, format!("{{\"nope\":1}}\n{good_breach}\n"))
-        .expect("corrupt the breach log's interior");
-    let err = facade
-        .resync_events("resync-edges", hekma_engine::ResyncCursor::START)
-        .unwrap_err();
-    assert!(matches!(err, EngineError::Log { .. }), "{err:?}");
+        .expect("the backfill reads state.db, not the mirrors");
+    assert_eq!(transitions_of(&batch.events), committed);
+    assert!(!batch.torn_tail_skipped, "nothing in state.db can tear");
 }
 
 // ---------------------------------------------------------------------------

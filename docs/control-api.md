@@ -149,7 +149,7 @@ layer: without a valid bearer, any path answers `401` first.
 | `not_found` | 404 | The instance does not exist — or the path matches no route |
 | `method_not_allowed` | 405 | The path exists but the method does not |
 | `conflict` | 409 | The action contradicts the instance's state (stop on a stopped instance; remove a running one) — or the adapter's own lifecycle command refused it (a pause/resume/drain command that exits nonzero, cannot spawn, or overruns its bound; the instance's state is untouched and the error names the rendered command) |
-| `cursor_invalid` | 409 | The cursor contradicts the journal: the per-instance pull's cursor PAST the family's committed count, an export cursor below the outbox journal's retained floor or PAST its committed tail, or an export ack past the tail — the engine's truncation/retention guards, surfaced verbatim (never a clamp) |
+| `cursor_invalid` | 409 | The cursor contradicts the record: the per-instance pull's cursor PAST the family's committed count, an export cursor below the outbox's retained floor or PAST its committed tail, or an export ack past the tail — the engine's truncation/retention guards, surfaced verbatim (never a clamp) |
 | `internal` | 500 | Something failed on the host side; the message names it |
 
 ## Events
@@ -171,8 +171,9 @@ fires even if the shutdown already fired before the stream's first poll — a
 late subscriber is never left hanging.)
 
 **Durable — `GET /v0/instances/{name}/events?cursor=…`.** The engine's
-`resync` batch for one instance, verbatim: family-major, cursor-lossless, with
-`torn_tail_skipped` surfaced in the payload when a torn tail was skipped. The
+`resync` batch for one instance, verbatim: family-major, cursor-lossless, read
+from one database snapshot (`torn_tail_skipped` stays in the payload and is
+always `false`). The
 first pull may omit the cursor (from the beginning); every batch carries the
 cursor to present next. Replaying a consumed cursor is idempotent, and a
 cursor PAST the family's committed count is a `cursor_invalid` 409 —
@@ -185,12 +186,12 @@ The per-instance pull above heals one instance's family. A Host on an
 half: one durable record of EVERY committed event — transitions, budget
 breaches, usage updates, across ALL instances — that survives the host's own
 death, is bounded, and can be consumed with an acknowledgement. That is the
-engine's global outbox: one JSON-Lines journal (`outbox.jsonl`) at the state
-root, written at the same three commit points the event bus publishes from
-(after the durable family commit, before the publish — the journal never
-contains an event that did not commit, and journal order == bus order ==
-durable-log order). Every record carries a `seq` that only ever increases,
-across restarts too.
+engine's global outbox: a table in the state database, written in the same
+transaction as each committed transition, breach and usage update (so it
+never holds an event that did not commit, and never misses one that did), in
+commit order, which is also the event bus order. Every record carries a
+`seq` that only ever increases, across restarts and across every engine
+process that shares the state directory.
 
 **Pull — `GET /v0/export?cursor=&limit=`.** One bounded batch of outbox
 entries in seq order:
@@ -233,52 +234,34 @@ entries in seq order:
   `400 invalid_body` inside the versioned envelope. An empty `events` array
   means you are caught up; the batch's `cursor` is the position to hand to
   the next pull (or to the ack).
-- **`retained_from`** is the seq of the journal's first RETAINED entry. The
-  journal is bounded (compacted at append time): the acked prefix is
+- **`retained_from`** is the seq of the outbox's first RETAINED entry. The
+  outbox is bounded (compacted at append time): the acked prefix is
   dropped first, and only if the cap is still crossed the oldest UN-ACKED
-  entries too — never the very last entry (a compaction never empties the
-  journal, so a crash before the next append cannot restart the seq
-  sequence), and every un-acked eviction is announced on the host's stderr.
+  entries too — never the very last entry (the cap counts stored event
+  bytes, 30 MB), and every un-acked eviction is announced on the host's stderr.
   A Host that pulls regularly never loses an un-acked event; a Host that
   goes silent past the cap does, honestly.
-- **`torn_tail_skipped`** mirrors the per-instance pull: the journal's
-  trailing line was skipped as a torn (crash-cut) append, surfaced — never
-  silent. The next append repairs the tear.
-- **`blank_lines_skipped`** counts interior blank/whitespace journal lines
-  this read passed over. Zero on a healthy journal; nonzero is a surfaced
-  partial-corruption hint (an external edit touched the file) — counted,
-  never silently dropped, and never a hard error while the records around
-  the blanks parse.
+- **`torn_tail_skipped`** and **`blank_lines_skipped`** stay in the payload
+  for compatibility with the earlier file-backed outbox and are always
+  `false` and `0`: the outbox lives in the state database, where a crash
+  cannot tear a record.
 
 **Refusals — `409 cursor_invalid`, never a clamp.** A cursor below the
 retained floor (its entries were rotated away — serving it would silently
 skip them; the lossless rule: anything at `retained_from - 1` or above is
 servable, because its window starts at the first retained entry) and a
-cursor past the committed tail (the journal never committed that far) are
+cursor past the committed tail (the outbox never committed that far) are
 both typed 409s whose message names both counts. Reset to
 `{"seq":0}` deliberately if losing the rotated-away prefix is intended —
 the engine never guesses.
 
-**Corruption is loud, with a named procedure.** An unparseable
-newline-terminated line, a valid-JSON wrong-shape record, or a
-duplicate/decreasing `seq` between consecutive entries is a typed error —
-never a silent skip or a twin delivery. To recover: stop the engine (or
-host), quarantine the journal by RENAMING the file (a read failure at open
-refuses to start the engine — the seq sequence is never minted from an
-unverified counter — and re-derivation handles the file's absence), then
-re-sync the families with the per-instance `events` pull, which remains the
-complete heal.
-
-**Cross-process discipline.** The host lock excludes other HOSTS, not
-command-scoped engines: running `kt agent ...` against the same state
-directory while a host serves it gives the command's engine its own seq
-counter on the SAME journal. Within one process, seq order == commit order;
-across two processes, seqs can interleave and — if a command-scoped engine
-restarts — even reuse a range. The reader REFUSES that loudly (a duplicate
-or decreasing seq is the typed corruption error above) instead of
-corrupting ack math or delivering a twin. Do not drive one state
-directory's outbox from two engine processes; that is the one discipline
-this surface cannot relax.
+**A pre-upgrade journal that cannot be read is loud.** If the one-time
+import finds an `outbox.jsonl` it cannot verify (an unparseable
+newline-terminated line, a wrong-shape record, or a duplicate/decreasing
+`seq`), the engine refuses to open rather than mint seqs from an unverified
+history. To recover: quarantine the file by renaming it, open the engine
+again (the outbox then starts above the ack cursor), and re-sync the families
+with the per-instance `events` pull, which remains the complete heal.
 
 **Acknowledge — `POST /v0/export/ack`** with `{"seq": N}`: everything at or
 below `N` is consumed and becomes compaction-eligible. The ack is
@@ -292,14 +275,20 @@ read back its own idempotence:
 
 An ack past the journal's committed tail is the same `409 cursor_invalid`
 refusal — an ack is a claim about entries that exist. The ack cursor is
-durable (`outbox-ack.json`, atomic write at the state root): it survives a
-host restart, and the default pull resumes from it.
+durable (stored in the state database with the outbox): it survives a host
+restart, and the default pull resumes from it.
 
-**Ordering honesty, stated plainly.** Within ONE host process, seq order ==
-commit order (every append holds the supervision lock). Two engines on one
-state directory (the host lock only guards `hekma serve`) each hold their
-own seq counter and can interleave — the journal's physical order is then
-the only honest global order there is, and that is what a reader serves.
+**Ordering, stated plainly.** Seq order is commit order, for every engine
+process sharing the state directory (`hekma serve` and any CLI command): the
+sequence lives in the one database they share. A usage update and the
+breaches it fires commit together, so they take consecutive seqs, followed by
+the transition a `pause` or `stop` breach causes.
+
+**Upgrading from a file-backed outbox.** The first open of an engine with
+the state-database outbox imports `outbox.jsonl` and `outbox-ack.json` once —
+every retained entry keeps its seq, the ack carries over, and the next event
+continues above both — then renames them `*.migrated`. A Host cursor held
+across the upgrade stays valid.
 
 ## The cooperative caveat (read this before exposing it)
 

@@ -1602,31 +1602,24 @@ impl Supervisor {
                             minted
                         }
                     };
-                    // Story 15-2: the DURABLE latch — seed the in-memory
-                    // per-Run breach latch from the breaches ALREADY RECORDED
-                    // for the resumed Run (breaches.log keys every event by
-                    // run_id; the append-only durable record IS the spent
-                    // check). The adoption-time enforce_budget call below
-                    // still evaluates — but an already-recorded
-                    // (dimension, scope) short-circuits, so a breach that
-                    // fired before the engine change does NOT re-record a
-                    // duplicate breaches.log line or re-fire the action
-                    // (Fibery 205), while a genuinely un-recorded crossing
-                    // still fires exactly once (AI-44, now durable: the
-                    // crash-between-record-and-action window self-heals on
-                    // the FIRST adoption, not the next usage event).
+                    // Story 15-2 / 21-1: the DURABLE latch lives in state.db
+                    // (`run_latches`, keyed by the resumed run id), so a breach
+                    // that already fired for this Run is spent here with no
+                    // seeding: the adoption-time enforce_budget below still
+                    // evaluates, a latched (dimension, scope) under the
+                    // CURRENTLY configured action short-circuits (no duplicate
+                    // record, no re-fired action — Fibery 205), and a
+                    // reconfigured action fires once under the new action (the
+                    // 15-2 review-round-1 rule, now the live rule too).
                     //
-                    // Review round 1, ACTION FILTER: only events whose ACTION
-                    // equals the CURRENTLY-CONFIGURED action for their
-                    // dimension seed the latch — a reconfigured action
-                    // (e.g. `warn` → `pause`) must fire ONCE under the
-                    // resumed Run, not stay suppressed forever by the idempotence
-                    // latch keyed only on (dimension, scope). A config read
-                    // that fails degrades to an EMPTY latch (fail-open toward
-                    // one extra enforcement pass — the same direction as the
-                    // corrupt-log arm below; the enforcement call itself
-                    // returns early on a failed config read, so the seed is
-                    // moot in exactly that case).
+                    // Story 19-2: the DURABLE fence — the resumed Run's `block`
+                    // breaches recorded under the currently configured action
+                    // are the reasons its wire fence was up. Re-raised on the
+                    // re-bound listener below, so an engine restart or
+                    // adoption never drops a fence the latch would stop from
+                    // re-firing. A failed config read degrades to no fence
+                    // reasons (the enforcement call returns early on that read
+                    // too); a failed breach read is SURFACED (AI-18).
                     let (token_action, cost_action) = registry
                         .effective_config(&name, ConfigLayer::empty())
                         .map(|effective| {
@@ -1635,49 +1628,45 @@ impl Supervisor {
                             (token_action, cost_action)
                         })
                         .unwrap_or((BreachAction::Pause, BreachAction::Pause));
-                    let breach_log_events =
-                        super::read_breach_events_from(&registry.instance_breach_log_path(&name));
-                    let breach_log_events = match breach_log_events {
+                    let resumed_breaches = match registry.reader().run_breaches(&name, &run_id) {
                         Ok(events) => events,
                         Err(detail) => {
-                            // Review round 1 (AI-18): the corrupt log's
-                            // fail-open is SURFACED, never silent — the
-                            // operator hears that the durable spent-check
-                            // was unreadable and the latch degrades to
-                            // empty (one extra enforcement pass may re-fire,
-                            // a duplicate breaches.log line may land).
                             self.emit_diagnostic(&format!(
-                                "{}: the instance's breach log could not be read \
-                                 ({detail}) — the breach latch degrades to empty, so an \
-                                 already-recorded breach may fire (and re-record) ONCE \
-                                 more under the resumed Run",
+                                "{}: the resumed Run's breach records could not be read \
+                                 ({detail}) — a `block` fence it carried is not re-raised until \
+                                 the next breach evaluation",
                                 name.as_str(),
                             ));
                             Vec::new()
                         }
                     };
-                    let resumed_breaches = breach_log_events
-                        .into_iter()
-                        .filter(|event| event.run_id == run_id.as_str())
+                    let fence_reasons = resumed_breaches
+                        .iter()
                         .filter(|event| match event.dimension {
                             BreachDimension::Tokens => event.action == token_action,
                             BreachDimension::Dollars => event.action == cost_action,
                         })
-                        .collect::<Vec<_>>();
-                    let breached_scopes = resumed_breaches
-                        .iter()
-                        .map(|event| (event.dimension, event.scope))
-                        .collect::<std::collections::HashSet<_>>();
-                    // Story 19-2: the DURABLE fence — the same latch-seeding
-                    // events, narrowed to `block`, are the reasons the resumed
-                    // Run's wire fence was up. Re-raised on the re-bound
-                    // listener below, so an engine restart or adoption never
-                    // drops a fence the latch would stop from re-firing.
-                    let fence_reasons = resumed_breaches
-                        .iter()
                         .filter(|event| event.action == BreachAction::Block)
                         .map(|event| crate::domain::LatchKey::new(event.dimension, event.scope))
                         .collect::<Vec<_>>();
+                    // Story 21-1: an adoption is a NEW attach — bump the
+                    // launch generation so the re-bound listener's sequence,
+                    // which restarts at 0 under the resumed run id, never
+                    // collides with the previous attach's rows (the adoption
+                    // sequence-reset undercount). A failed bump is surfaced and
+                    // falls back to the stored generation.
+                    let launch_generation = match registry.bump_launch_generation(&name) {
+                        Ok(generation) => generation,
+                        Err(err) => {
+                            self.emit_diagnostic(&format!(
+                                "{}: the adopted instance's launch generation could not be \
+                                 advanced ({err}) — observed usage whose sequence restarted \
+                                 may be deduplicated against the previous attach's rows",
+                                name.as_str(),
+                            ));
+                            registry.launch_generation(&name).unwrap_or_default()
+                        }
+                    };
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
                     // anchors the same way (at the CURRENT end of the captured
@@ -1969,16 +1958,9 @@ impl Supervisor {
                             // Story 12-4: an adopted instance starts with no parked
                             // observed events (its prior engine's park died with it).
                             observed_park: None,
-                            // Story 15-2: the DURABLE latch — seeded above from
-                            // the breaches already recorded for the RESUMED Run
-                            // (breaches.log keys events by run_id). The adopted
-                            // Run is the SAME Run the previous engine held (the
-                            // id resumed from the spawn record), so a breach
-                            // that already fired for it is spent here — once per
-                            // RUN, not once per command (AI-44's intent, made
-                            // durable). A fresh Run (stop→start) still begins
-                            // with an empty latch at the spawn site.
-                            breached_scopes,
+                            // Story 21-1: this attach's generation (bumped
+                            // above); the latch itself is durable in state.db.
+                            launch_generation,
                             // ENGINE-OBSERVED across a crash/adoption (story 3-4,
                             // tracked follow-up — NOT just a metering gap): the pre-crash
                             // listener died with the crashed engine, but the already-

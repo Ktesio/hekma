@@ -292,7 +292,9 @@ impl Supervisor {
                                 is_acp,
                                 capture_mode: None,
                                 observed_park: None,
-                                breached_scopes: Default::default(),
+                                launch_generation: registry
+                                    .launch_generation(&name)
+                                    .unwrap_or_default(),
                                 observed_listener: None,
                                 observed_source: None,
                                 stop_unconfirmed: false,
@@ -1501,7 +1503,7 @@ pub(super) enum PauseKind {
 
 /// Classify why `name`'s row reads `paused` (see [`PauseKind`]).
 pub(super) fn classify_pause_kind(registry: &Registry, name: &InstanceName) -> PauseKind {
-    let events = super::read_events_from(&registry.instance_log_path(name)).unwrap_or_default();
+    let events = registry.transition_events(name).unwrap_or_default();
     let last_pause = events
         .iter()
         .rev()

@@ -1308,31 +1308,28 @@ fn the_cursor_pull_is_lossless_idempotent_and_truncation_guarded() {
     assert_eq!(json["torn_tail_skipped"], false);
     assert!(cursor["transitions"].as_u64().unwrap() >= 3);
 
-    // A REAL torn tail (review item 26): append a torn fragment to the
-    // transition family's store — the EXACT shape the engine's own torn-tail
-    // test writes (resync_events.rs: a truncated JSON line, no trailing
-    // newline) — then pull from START again: the committed events still
-    // deliver AND the surfaced skip flag turns TRUE (never a silent swallow,
-    // never a failed recovery).
+    // A torn `instance.log` MIRROR (the crash shape the file-backed record
+    // used to surface) no longer touches the record: the events come from
+    // state.db, so the batch is complete and the skip flag stays false.
     let torn_log = state
         .path()
         .join("agents")
         .join("evs")
         .join("logs")
         .join("instance.log");
-    let existing = std::fs::read_to_string(&torn_log).expect("the transition log exists");
+    let existing = std::fs::read_to_string(&torn_log).expect("the transition mirror exists");
     let torned = format!("{existing}{{\"schema_version\":1,\"inst");
-    std::fs::write(&torn_log, torned).expect("tear the tail");
+    std::fs::write(&torn_log, torned).expect("tear the mirror's tail");
     let mut response = get_ok(&client, &server.addr, "/v0/instances/evs/events");
     assert_eq!(response.status(), StatusCode::OK);
     let json = json_body(&mut response);
     assert_eq!(
-        json["torn_tail_skipped"], true,
-        "the torn tail is SURFACED on the wire, not swallowed: {json}"
+        json["torn_tail_skipped"], false,
+        "the record is state.db; a torn mirror is not the record: {json}"
     );
     assert!(
         json["events"].as_array().expect("events array").len() >= 3,
-        "the committed events still deliver past the torn tail: {json}"
+        "the committed events deliver: {json}"
     );
 
     // IDEMPOTENT continuation: the SAME cursor yields an EMPTY batch (the
@@ -1643,7 +1640,7 @@ fn an_invalid_instance_name_on_the_config_routes_is_400_invalid_name() {
 fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host() {
     // The story-17-4 verification leg (17-2 shipped the surface): an
     // explicit non-default base — the "Host-chosen volume" — holds the LOCK,
-    // the DB, the SECRETS file, AND the OUTBOX pair; and a second host on
+    // the DB (which holds the outbox and its ack), the SECRETS file; and a second host on
     // the same base is REFUSED naming the live holder.
     let state = tempfile::tempdir().unwrap();
     let volume = state.path().join("mounted-volume").join("hekma-state");
@@ -1695,8 +1692,6 @@ fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host(
     for name in [
         hekma_engine::paths::HOST_LOCK_FILE,
         hekma_engine::paths::SECRETS_FILE,
-        hekma_engine::paths::OUTBOX_JOURNAL_FILE,
-        hekma_engine::paths::OUTBOX_ACK_FILE,
     ] {
         assert!(
             volume.join(name).exists(),
@@ -2675,9 +2670,10 @@ fn un_acked_events_repull_after_an_acked_prefix_rotates_away() {
     // nothing silently skipped.
     let state = tempfile::tempdir().unwrap();
     let base = state.path().to_path_buf();
-    let _manifest = registered_fake_agent(&base, "worker");
 
-    // Stage the journal SYNTHETICALLY near the cap: 400 fat transition
+    // Stage a pre-upgrade journal SYNTHETICALLY near the cap, BEFORE the
+    // first engine opens the state dir (that open imports it into state.db
+    // with its seqs, as an upgrade does): 400 fat transition
     // entries (a ~100KB `at` payload each ≈ 41MB — already over the cap at
     // rest, which the check-before-write contract tolerates: only an APPEND
     // compacts, and open's rederive reads without compacting). Seqs 1..=400.
@@ -2700,6 +2696,7 @@ fn un_acked_events_repull_after_an_acked_prefix_rotates_away() {
         staged.push('\n');
     }
     std::fs::write(&journal, staged).unwrap();
+    let _manifest = registered_fake_agent(&base, "worker");
 
     let (sink_handle, _diagnostics) = SharedSink::new();
     let server = spawn_serve_with_api(base, sink_handle);

@@ -110,6 +110,7 @@ use super::event::TransitionEvent;
 use super::registry::Registry;
 use super::usage::{UsageEvent, UsageUpdateEvent};
 use super::EngineError;
+use crate::ports::RunStore;
 
 /// How far into each committed event family a host has already consumed —
 /// the resync helper's skip position (story 10-3).
@@ -203,23 +204,37 @@ pub(crate) fn read_committed(
     name: &super::InstanceName,
     after: &ResyncCursor,
 ) -> Result<ResyncBatch, EngineError> {
-    let transitions_path = registry.instance_log_path(name);
-    let (transitions, transitions_torn) = read_events_tolerant(&transitions_path, "instance-log")
-        .map_err(|detail| EngineError::Log {
-        name: name.as_str().to_string(),
-        path: transitions_path.to_string_lossy().into_owned(),
-        detail,
-    })?;
-    let breaches_path = registry.instance_breach_log_path(name);
-    let (breaches, breaches_torn) = read_breach_events_tolerant(&breaches_path, "breach-log")
-        .map_err(|detail| EngineError::Log {
-            name: name.as_str().to_string(),
-            path: breaches_path.to_string_lossy().into_owned(),
-            detail,
-        })?;
-    let usage = registry
-        .usage_rows(name)
-        .map_err(super::registry_error_to_engine)?;
+    // Story 21-1: the three families are rows in state.db, read in ONE read
+    // snapshot — so the batch is now one point-in-time view across families
+    // (stronger than the per-file reads it replaces, never weaker). A
+    // position is still a per-family COUNT: the row ordinal per instance, in
+    // commit order (the upgrade imported the old logs in their line order).
+    let (transitions, breaches, usage) = registry
+        .reader()
+        .snapshot(|store| {
+            let mut transitions = Vec::new();
+            let mut after_key = 0;
+            loop {
+                let page = store.transitions_page(name, after_key, crate::ports::PAGE_MAX)?;
+                transitions.extend(page.items);
+                match page.next {
+                    Some(next) => after_key = next,
+                    None => break,
+                }
+            }
+            let mut breaches = Vec::new();
+            let mut after_key = 0;
+            loop {
+                let page = store.breaches_page(name, after_key, crate::ports::PAGE_MAX)?;
+                breaches.extend(page.items);
+                match page.next {
+                    Some(next) => after_key = next,
+                    None => break,
+                }
+            }
+            Ok((transitions, breaches, store.usage_events(name)?))
+        })
+        .map_err(|err| super::registry_error_to_engine(err.into()))?;
 
     // Truncation-below-cursor is an ERROR, never a silent clamp: a family's
     // committed count below the caller's cursor means the record was
@@ -228,26 +243,18 @@ pub(crate) fn read_committed(
     // the never-re-deliver contract. Each family and both counts are named
     // so a host can reset its cursor DELIBERATELY if it wants a from-zero
     // backfill.
+    let db_path = registry.state_db_path();
     reject_truncated_family(
         name,
-        &transitions_path,
+        &db_path,
         "transition",
         after.transitions,
         transitions.len(),
     )?;
-    reject_truncated_family(
-        name,
-        &breaches_path,
-        "breach",
-        after.breaches,
-        breaches.len(),
-    )?;
-    let ledger_path = registry.state_db_path();
-    reject_truncated_family(name, &ledger_path, "usage-ledger", after.usage, usage.len())?;
+    reject_truncated_family(name, &db_path, "breach", after.breaches, breaches.len())?;
+    reject_truncated_family(name, &db_path, "usage-ledger", after.usage, usage.len())?;
 
-    let mut batch = assemble(&transitions, &breaches, &usage, after);
-    batch.torn_tail_skipped = transitions_torn || breaches_torn;
-    Ok(batch)
+    Ok(assemble(&transitions, &breaches, &usage, after))
 }
 
 /// The truncation guard (never silent re-delivery): a cursor position past a
@@ -325,110 +332,6 @@ pub(crate) fn assemble(
         },
         torn_tail_skipped: false,
     }
-}
-
-/// Read a JSON-Lines event log with the RESYNC posture (story 10-3, hardened
-/// by the Epic-10 adversarial review): an absent file is empty; ONE
-/// unparseable TRAILING line is skipped ONLY when it carries the torn-append
-/// signature — the file's raw text does NOT end with a newline (the engine
-/// appends `line + '\n'`, so a write cut by a crash always leaves the final
-/// newline missing) — and the skip is SURFACED via the returned flag, never
-/// silent: the engine's NEXT append fuses onto the torn fragment, so a
-/// skipped trailing line may be carrying a good post-crash record. Every
-/// other malformed line is an error naming its PHYSICAL line number (blank
-/// lines never shift the count), mirroring the strict query-API readers:
-///
-/// * a malformed INTERIOR line — the wrong file or a corrupting engine;
-/// * a newline-terminated unparseable TRAILING line — NOT a tear (the
-///   tear's signature is the missing final newline): corruption, or exactly
-///   that fused post-crash line, either way worth surfacing;
-/// * a TRAILING line that is VALID JSON but not THIS log's record shape —
-///   the wrong file, never popped as if it were a tear.
-fn read_json_lines_tolerant<T: serde::de::DeserializeOwned>(
-    path: &std::path::Path,
-    what: &str,
-) -> Result<(Vec<T>, bool), String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
-        Err(e) => return Err(e.to_string()),
-    };
-    // The torn-append signature, read off the RAW text before any line work.
-    let newline_terminated = text.ends_with('\n');
-    // (physical 0-based line number, line) pairs: the PHYSICAL numbers are
-    // what error messages report, so blank lines never shift an index.
-    let mut lines: Vec<(usize, &str)> = text
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .collect();
-    let mut torn_tail_skipped = false;
-    if let Some((last_idx, last)) = lines.last() {
-        if serde_json::from_str::<T>(last).is_err() {
-            if serde_json::from_str::<serde_json::Value>(last).is_ok() {
-                // Valid JSON, wrong record shape: the WRONG FILE, not a torn
-                // append (a tear cuts the write mid-line, which cannot leave
-                // well-formed JSON). Error — never skip.
-                return Err(format!(
-                    "corrupt {what}: line {} is valid JSON but not a {what} record — the wrong file?",
-                    last_idx + 1
-                ));
-            }
-            if newline_terminated {
-                // Newline-terminated yet unparseable: not a torn append.
-                // Corruption, or a torn append the engine's next append
-                // FUSED onto — the line may be carrying a good record that
-                // cannot be extracted here, so surface it instead of
-                // silently popping it.
-                return Err(format!(
-                    "corrupt {what}: trailing line {} is unparseable and newline-terminated — \
-                     not a torn append (corruption, or a fused line a post-crash append left); \
-                     repair the log before resyncing",
-                    last_idx + 1
-                ));
-            }
-            // The torn append itself: the crash cut the write before the
-            // newline. Skip the fragment — and SURFACE the skip (the next
-            // append fuses onto this fragment, so whatever record it was
-            // carrying did not reach the caller).
-            lines.pop();
-            torn_tail_skipped = true;
-        }
-    }
-    let mut events = Vec::new();
-    for (idx, line) in lines {
-        events.push(
-            serde_json::from_str(line)
-                .map_err(|e| format!("corrupt {what} line {}: {e}", idx + 1))?,
-        );
-    }
-    Ok((events, torn_tail_skipped))
-}
-
-/// The transition-log read ([`read_json_lines_tolerant`] over the
-/// [`TransitionEvent`] records — the same records the strict
-/// [`Supervisor::read_events`] serves, with the resync torn-tail posture).
-/// Returns the events plus the torn-tail-skipped flag.
-///
-/// [`Supervisor::read_events`]: super::supervisor::Supervisor::read_events
-fn read_events_tolerant(
-    path: &std::path::Path,
-    what: &str,
-) -> Result<(Vec<TransitionEvent>, bool), String> {
-    read_json_lines_tolerant(path, what)
-}
-
-/// The breach-log read ([`read_json_lines_tolerant`] over the
-/// [`BudgetBreachEvent`] records — the same records the strict
-/// [`Supervisor::read_breach_events`] serves, with the resync torn-tail
-/// posture). Returns the events plus the torn-tail-skipped flag.
-///
-/// [`Supervisor::read_breach_events`]: super::supervisor::Supervisor::read_breach_events
-fn read_breach_events_tolerant(
-    path: &std::path::Path,
-    what: &str,
-) -> Result<(Vec<BudgetBreachEvent>, bool), String> {
-    read_json_lines_tolerant(path, what)
 }
 
 #[cfg(test)]
@@ -581,109 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn resync_reads_survive_a_torn_trailing_line_and_surface_the_skip() {
-        // The crash-recovery posture: the crash tore the log's trailing
-        // append (the raw text does not end with a newline — the write was
-        // cut before its '\n'); the read returns the good prefix INSTEAD of
-        // failing the heal, and SURFACES the skip so a host never silently
-        // loses a record. Both log families share the reader.
-        let dir = tempfile::TempDir::new().unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        let path = dir.path().join("instance.log");
-        std::fs::write(&path, format!("{good}\n{{\"schema_version\":1,\"inst")).unwrap();
-        let (events, torn): (Vec<TransitionEvent>, bool) =
-            read_events_tolerant(&path, "instance-log").expect("torn tail tolerated");
-        assert_eq!(events, vec![transition(0)]);
-        assert!(torn, "the skipped torn tail is surfaced, never silent");
-
-        let good_breach = serde_json::to_string(&breach(0)).unwrap();
-        let breach_path = dir.path().join("breaches.log");
-        std::fs::write(&breach_path, format!("{good_breach}\n")).unwrap();
-        let (breaches, torn): (Vec<BudgetBreachEvent>, bool) =
-            read_breach_events_tolerant(&breach_path, "breach-log").expect("complete log parses");
-        assert_eq!(breaches, vec![breach(0)]);
-        assert!(!torn, "a complete log sets no flag");
-    }
-
-    #[test]
-    fn resync_reads_still_reject_a_malformed_interior_line() {
-        // Torn-tail tolerance is bounded: an unparseable NON-trailing line is
-        // not a race — it is the wrong file or a corrupting engine, and the
-        // typed error names it (mirrors the strict readers' convention).
-        let dir = tempfile::TempDir::new().unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        let path = dir.path().join("instance.log");
-        std::fs::write(&path, format!("{{\"not\":\"a transition\"}}\n{good}\n")).unwrap();
-        let err = read_events_tolerant(&path, "instance-log").unwrap_err();
-        assert!(err.contains("corrupt instance-log line 1"), "{err}");
-    }
-
-    #[test]
-    fn an_interior_error_reports_the_physical_line_number_despite_blank_lines() {
-        // The error's line number is the PHYSICAL file line: a blank line
-        // must not shift the index the message reports (a human is tailing
-        // the real file).
-        let dir = tempfile::TempDir::new().unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        let path = dir.path().join("instance.log");
-        // `{good}` is physical line 1, the blank line physical 2, the bad
-        // record physical 3 — the old filtered-index reporting said "2".
-        std::fs::write(&path, format!("{good}\n\n{{\"x\":1}}\n{good}\n")).unwrap();
-        let err = read_events_tolerant(&path, "instance-log").unwrap_err();
-        assert!(
-            err.contains("corrupt instance-log line 3"),
-            "the physical line number is reported (3, not the filtered index 2): {err}"
-        );
-    }
-
-    #[test]
-    fn a_newline_terminated_unparseable_trailing_line_is_an_error_not_a_skip() {
-        // NOT a torn append: the engine appends `line + '\n'`, so a tear
-        // always leaves the final newline MISSING. A newline-terminated
-        // unparseable trailing line is corruption — or the FUSED line a
-        // post-crash append left (torn fragment + good record) — and popping
-        // it silently would DROP a potentially-good record. Surfaced instead.
-        let dir = tempfile::TempDir::new().unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        let torn = serde_json::to_string(&transition(1)).unwrap();
-        let path = dir.path().join("instance.log");
-        // A torn fragment FUSED with the engine's next append (which wrote
-        // its own '\n'): the trailing line is newline-terminated junk.
-        let fused = format!("{good}\n{{\"schema_version\":1,\"inst{torn}\n");
-        std::fs::write(&path, fused).unwrap();
-        let err = read_events_tolerant(&path, "instance-log").unwrap_err();
-        assert!(
-            err.contains("newline-terminated"),
-            "the fused/corrupt trailing line is surfaced, never silently dropped: {err}"
-        );
-    }
-
-    #[test]
-    fn a_valid_json_wrong_shape_trailing_line_is_the_wrong_file_not_a_tear() {
-        // A trailing line that parses as JSON but not as THIS log's record
-        // shape is the wrong file — it must ERROR, never ride the torn-tail
-        // skip (an earlier posture silently popped exactly this shape).
-        let dir = tempfile::TempDir::new().unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        let path = dir.path().join("instance.log");
-        std::fs::write(&path, format!("{good}\n{{\"nope\":1}}\n")).unwrap();
-        let err = read_events_tolerant(&path, "instance-log").unwrap_err();
-        assert!(
-            err.contains("valid JSON but not a instance-log record"),
-            "a wrong-shape trailing line names the wrong-file error: {err}"
-        );
-
-        // The same verdict holds without the trailing newline: well-formed
-        // JSON of another shape cannot be a tear (a tear cuts mid-line).
-        std::fs::write(&path, format!("{good}\n{{\"nope\":1}}")).unwrap();
-        let err = read_events_tolerant(&path, "instance-log").unwrap_err();
-        assert!(
-            err.contains("valid JSON but not a instance-log record"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn a_cursor_past_a_family_committed_count_is_an_error_naming_family_and_counts() {
         // The truncation guard, end to end through read_committed: a cursor
         // position above a family's committed count means the log was
@@ -696,10 +496,12 @@ mod tests {
         let name = super::super::InstanceName::new("probe").expect("a valid probe name");
 
         // One committed transition; the cursor claims five consumed.
-        let log_path = registry.instance_log_path(&name);
-        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
-        let good = serde_json::to_string(&transition(0)).unwrap();
-        std::fs::write(&log_path, format!("{good}\n")).unwrap();
+        registry.register("probe", "mock").unwrap();
+        let event = transition(0);
+        registry
+            .writer()
+            .call(move |ctx| ctx.store().append_transition(&event))
+            .unwrap();
 
         let err = read_committed(
             &registry,
@@ -748,45 +550,5 @@ mod tests {
         .expect("a cursor AT the committed count is caught up");
         assert!(batch.events.is_empty());
         assert!(!batch.torn_tail_skipped);
-    }
-
-    #[test]
-    fn resync_reads_treat_an_absent_log_as_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (events, torn): (Vec<TransitionEvent>, bool) =
-            read_events_tolerant(&dir.path().join("never.log"), "instance-log")
-                .expect("absent file is empty");
-        assert!(events.is_empty());
-        assert!(!torn);
-    }
-
-    #[test]
-    fn a_directory_at_the_breach_log_path_fails_the_read_with_the_typed_log_error() {
-        // A non-NotFound read failure on the breach log (here: a DIRECTORY at
-        // the path — read fails EISDIR on Unix, the open is refused on
-        // Windows; the same typed arm either way, so no OS gate is needed)
-        // surfaces as `EngineError::Log` naming the instance and the path.
-        // The heal must never silently treat a broken disk as "no breaches"
-        // — that would under-report budget breaches to a host mid-heal.
-        let dir = tempfile::TempDir::new().unwrap();
-        let registry = super::super::Registry::open(Some(dir.path().to_path_buf()))
-            .expect("open a registry over a hermetic root");
-        let name = super::super::InstanceName::new("probe").expect("a valid probe name");
-        // The sabotage: the breaches.log PATH ITSELF is a directory (its
-        // parent instance dir comes along for the ride).
-        let breach_path = registry.instance_breach_log_path(&name);
-        std::fs::create_dir_all(&breach_path).unwrap();
-        let breach_str = breach_path.to_string_lossy().into_owned();
-        let err = read_committed(&registry, &name, &ResyncCursor::START)
-            .expect_err("an unreadable breach log must fail the heal read");
-        assert!(
-            matches!(&err, EngineError::Log { name, path, .. }
-                if name == "probe" && *path == breach_str),
-            "the typed error names the instance and the breach-log path: {err:?}"
-        );
-        assert!(
-            !err.to_string().is_empty(),
-            "the underlying io failure is carried: {err}"
-        );
     }
 }
