@@ -1,6 +1,8 @@
 ---
 name: bmad-create-architecture
-description: 'Deprecated — forwards to bmad-architecture (create intent).'
+description: 'Deprecated — forwards to bmad-architecture (create intent)'
+metadata:
+  lifecycle: shim
 ---
 
 # DEPRECATED — forwards to bmad-architecture (create intent)
@@ -9,9 +11,9 @@ This skill was consolidated into `bmad-architecture`. It is retained as a thin c
 
 ## On Activation
 
-1. Resolve customization: `uv run {project-root}/_bmad/scripts/resolve_customization.py --skill {skill-root} --key workflow`. This picks up any `{project-root}/_bmad/custom/bmad-create-architecture.toml` and `bmad-create-architecture.user.toml` overrides for the legacy fields (`activation_steps_prepend`, `activation_steps_append`, `persistent_facts`, `on_complete`).
+1. Resolve customization: `uv run {project-root}/_bmad/scripts/resolve_customization.py --skill {skill-root} --project-root {project-root} --key workflow`. This picks up any `{project-root}/_bmad/custom/bmad-create-architecture.toml` and `bmad-create-architecture.user.toml` overrides for the legacy fields (`activation_steps_prepend`, `activation_steps_append`, `persistent_facts`, `on_complete`).
 
-2. Load `{project-root}/_bmad/bmm/config.yaml` (and `config.user.yaml` if present) to resolve `{user_name}` and `{communication_language}`.
+2. Run `uv run {project-root}/_bmad/scripts/resolve_config.py --project-root {project-root}` and resolve `{user_name}` and `{communication_language}`.
 
 3. Emit a deprecation notice to the user in `{communication_language}`:
 
