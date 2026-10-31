@@ -91,9 +91,11 @@ jobs:
         # 2026 (actions/runner-images#14748). Unify back post-migration.
         os: [ubuntu-26.04, macos-latest, windows-latest]
         # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
-        # capped and session-quarantined, and its JOB timeout tightened to 15m —
-        # see the "Run tests (nextest)" step below for the full why (two wedge
-        # classes; the freeze class is environment-bounded via the 26.04 pin).
+        # capped and session-quarantined, and its JOB timeout tightened to 25m
+        # (recalibrated 2026-10-31 — the lane outgrew the original 15m; see the
+        # run-step comment below for the measured history) — see the "Run
+        # tests (nextest)" step below for the full why (two wedge classes; the
+        # freeze class is environment-bounded via the 26.04 pin).
         # Carried as matrix DATA (not an in-step OS comparison) so the run step
         # stays one uniform invocation for all three OSes.
         # nextest profile per leg (2026-10-27): the windows-latest leg runs
@@ -112,7 +114,7 @@ jobs:
         include:
           - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
-            test_job_timeout_minutes: 15
+            test_job_timeout_minutes: 25
             nextest_profile: default
           - os: macos-latest
             nextest_profile: default
@@ -143,10 +145,19 @@ jobs:
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
     # under epic-12 retro item 95 (see #236). The matrix `include` tightens
-    # the PINNED ubuntu-26.04 leg to 15m (tracking #292): the healthy lane is
-    # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
-    # 15+5m service window instead of 45m and surfaces as a fast visible
-    # cancel rather than a silent three-quarter-hour burn.
+    # the PINNED ubuntu-26.04 leg (tracking #292), originally to 15m when the
+    # healthy lane was ~4.5m. RECALIBRATED 15m→25m (2026-10-31): the suite
+    # outgrew the cap — green main runs measured 653–818s of job time across
+    # Oct 28–31 (runs 40778613357/41090654028/41099800716/41137817900/
+    # 41189022237), and run 41193980277 (post-#358 main) hit the 15m job
+    # timeout with the runner healthy (post-mortem: load 0.1, zero PSI
+    # pressure, no D-state) and the suite still PROGRESSING (the in-flight
+    # test 17s old at the cap) — growth, not a wedge recurrence. 25m restores
+    # ~2x headroom over the worst observed green while a class-2 freeze still
+    # costs the 25+5m service window instead of 45m and still surfaces as a
+    # fast visible cancel rather than a silent three-quarter-hour burn; it
+    # stays strictly under the 30m in-step supervisor cap, preserving the
+    # class-1 quarantine's role.
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout
@@ -307,10 +318,12 @@ jobs:
         # stayed green through the same window, and hekma main run
         # 39016343545 ran the SAME ubuntu suite green in 4m36s at 08:10Z
         # the same day — the trigger is nondeterministic. The pinned
-        # leg's JOB timeout drops to 15m (matrix data below): a class-2
-        # recurrence on 26.04 costs the 15+5m service window, not 45m,
-        # and surfaces as a fast visible cancel. The cap rides the
-        # matrix `include` as data; the other legs render an empty cap
+        # leg's JOB timeout drops to 25m (matrix data below; recalibrated
+        # from 15m on 2026-10-31 after green runs reached 653–818s and
+        # run 41193980277 capped out mid-suite on a healthy runner): a
+        # class-2 recurrence on 26.04 costs the 25+5m service window,
+        # not 45m, and surfaces as a fast visible cancel. The cap rides
+        # the matrix `include` as data; the other legs render an empty cap
         # and run the plain uncapped invocation. Tracking issue: #292.
         shell: bash
         run: |
