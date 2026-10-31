@@ -2,7 +2,7 @@
 title: 'The wire fence — a `block` Breach Action'
 type: 'feature'
 created: '2026-10-30'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 1
 baseline_commit: 'bdb5d02f7ebd7886efadde3ce610cf9303ef31a6'
 context:
