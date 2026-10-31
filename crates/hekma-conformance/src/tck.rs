@@ -1694,6 +1694,26 @@ fn conformance_inner_evidence(
     // any probe twin a failed section orphaned via `?` on its way out.
     stop_leftovers(&facade);
 
+    // Failure evidence, AFTER the stop ladder so the log's final lines (the
+    // teardown's own traffic) are included: on ANY failed section, surface
+    // the subject's engine-captured agent-log tail on stderr. A failing
+    // `#[test]` replays captured stderr, so the note lands in the CI log
+    // exactly when it is needed — and a green (or all-`not_applicable`)
+    // run prints nothing. Best-effort: an unreadable log is NAMED by the
+    // note's `Err` arm, never allowed to mask the sections' own reasons.
+    let failed = failed_section_ids(&sections);
+    if !failed.is_empty() {
+        let log = read_log_texts(&facade, "tck-subject");
+        eprintln!(
+            "{}",
+            failure_log_note(
+                "tck-subject",
+                &failed,
+                log.as_deref().map_err(String::as_str)
+            )
+        );
+    }
+
     Ok(ConformanceReport {
         schema_version: REPORT_SCHEMA_VERSION,
         contract_version: ::hekma_adapter_api::CONTRACT_VERSION.to_string(),
@@ -2104,6 +2124,82 @@ fn heartbeat_count(facade: &::hekma_engine::Blocking<'_>, name: &str) -> Result<
         .iter()
         .filter(|text| text.starts_with("heartbeat "))
         .count())
+}
+
+// ---------------------------------------------------------------------
+// Section-failure evidence (the captured agent-log tail)
+// ---------------------------------------------------------------------
+
+/// How many TRAILING captured-log lines a section-failure note shows — the
+/// tail carries the retry/transport evidence a red section's own reason
+/// cannot (refused calls, retry announcements); the head is setup noise.
+const FAILURE_LOG_TAIL_LINES: usize = 40;
+
+/// Per-line cap for the note: a captured line is an arbitrary agent output
+/// row, so one pathological line (an echoed prompt, a dump) must not turn
+/// the note into a log flood. Longer lines are cut with an ellipsis marker.
+const FAILURE_LOG_LINE_CHARS: usize = 400;
+
+/// The failed-section ids of a run's collected reports, in report order —
+/// the applicability gate for the failure-evidence note: an EMPTY list (a
+/// green run, or an all-`pass`/`not_applicable` mix) prints NOTHING, so
+/// the note is a failure-path-only side effect.
+fn failed_section_ids(sections: &[SectionReport]) -> Vec<&str> {
+    sections
+        .iter()
+        .filter_map(|entry| match entry.result {
+            SectionResult::Fail { .. } => Some(entry.section.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Render the stderr note that surfaces the subject's engine-captured agent
+/// log after a failed section (the CI-diagnosis gap, hit 2026-10-31: a red
+/// `metering_engine_observed` named its timeout but the discriminating
+/// evidence — whether the agent's observed calls were attempted, refused,
+/// or retried — sat in the captured log, unreachable from CI output). The
+/// note names the agent and EVERY failed section, states the retained-line
+/// count and how much of it is shown (truncation is visible, never silent),
+/// and prints each surfaced line on its own prefixed row. The `Err` arm
+/// names the read failure instead — an unreadable log must never mask the
+/// sections' own failure reasons. Pure so the format is unit-pinned.
+fn failure_log_note(agent: &str, failed: &[&str], log: Result<&[String], &str>) -> String {
+    let failed_list = failed.join(", ");
+    match log {
+        Ok([]) => format!(
+            "note: tck section failure evidence for '{agent}' (failed: {failed_list}) — \
+             the engine-captured agent log is EMPTY (0 lines retained)"
+        ),
+        Ok(lines) => {
+            let total = lines.len();
+            let shown = &lines[total.saturating_sub(FAILURE_LOG_TAIL_LINES)..];
+            let scope = if total > FAILURE_LOG_TAIL_LINES {
+                format!("{total} lines retained, showing last {}", shown.len())
+            } else {
+                format!("{total} lines retained, showing all")
+            };
+            let mut note = format!(
+                "note: tck section failure evidence for '{agent}' (failed: {failed_list}) — \
+                 engine-captured agent log, {scope}:"
+            );
+            for line in shown {
+                note.push_str("\n  | ");
+                if line.chars().count() > FAILURE_LOG_LINE_CHARS {
+                    let kept: String = line.chars().take(FAILURE_LOG_LINE_CHARS).collect();
+                    note.push_str(&kept);
+                    note.push('…');
+                } else {
+                    note.push_str(line);
+                }
+            }
+            note
+        }
+        Err(read_err) => format!(
+            "note: tck section failure evidence for '{agent}' (failed: {failed_list}) — \
+             the engine-captured agent log could not be read: {read_err}"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -6527,6 +6623,80 @@ source = "self-reported"
         assert_eq!(report.section("missing"), None);
         assert!(SectionResult::Pass.is_pass());
         assert!(!SectionResult::fail("x").is_pass());
+    }
+
+    #[test]
+    fn failed_section_ids_collects_only_failures_in_report_order() {
+        let sections = vec![
+            SectionReport {
+                section: "alpha".to_string(),
+                result: SectionResult::Pass,
+            },
+            SectionReport {
+                section: "beta".to_string(),
+                result: SectionResult::NotApplicable {
+                    reason: "n/a".to_string(),
+                },
+            },
+            SectionReport {
+                section: "gamma".to_string(),
+                result: SectionResult::fail("boom"),
+            },
+            SectionReport {
+                section: "delta".to_string(),
+                result: SectionResult::fail("later boom"),
+            },
+        ];
+        // `not_applicable` is NOT a failure — a manifest whose sections are
+        // all n/a must stay silent, and so must a green run.
+        assert_eq!(failed_section_ids(&sections), vec!["gamma", "delta"]);
+        assert!(failed_section_ids(&sections[..2]).is_empty());
+    }
+
+    #[test]
+    fn failure_log_note_tails_the_log_and_names_the_truncation() {
+        let lines: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
+        let note = failure_log_note("tck-subject", &["metering_engine_observed"], Ok(&lines));
+        assert!(note.contains("'tck-subject'"));
+        assert!(note.contains("failed: metering_engine_observed"));
+        assert!(note.contains("100 lines retained, showing last 40"));
+        // Exactly the LAST 40 lines, each on its own prefixed row.
+        assert!(note.contains("\n  | line-99"));
+        assert!(note.contains("\n  | line-60"));
+        assert!(!note.contains("line-59"));
+    }
+
+    #[test]
+    fn failure_log_note_short_logs_show_every_line_and_all_failed_sections() {
+        let lines = vec!["a".to_string(), "b".to_string()];
+        let note = failure_log_note("tck-subject", &["lifecycle", "pause"], Ok(&lines));
+        assert!(note.contains("2 lines retained, showing all"));
+        assert!(note.contains("\n  | a"));
+        assert!(note.contains("\n  | b"));
+        assert!(note.contains("failed: lifecycle, pause"));
+        assert!(!note.contains("showing last"));
+    }
+
+    #[test]
+    fn failure_log_note_empty_and_unreadable_logs_are_named_never_faked() {
+        let empty: Vec<String> = Vec::new();
+        let note = failure_log_note("tck-subject", &["memory"], Ok(&empty));
+        assert!(note.contains("EMPTY (0 lines retained)"));
+        assert!(!note.contains("\n  |"));
+        let read_err = "read_agent_log('tck-subject') failed: io";
+        let note = failure_log_note("tck-subject", &["memory"], Err(read_err));
+        assert!(note.contains("could not be read: read_agent_log('tck-subject') failed: io"));
+        assert!(!note.contains("EMPTY"));
+    }
+
+    #[test]
+    fn failure_log_note_bounds_each_surfaced_line() {
+        let long = "x".repeat(1000);
+        let lines = vec![long];
+        let note = failure_log_note("tck-subject", &["lifecycle"], Ok(&lines));
+        assert!(note.contains(&"x".repeat(FAILURE_LOG_LINE_CHARS)));
+        assert!(!note.contains(&"x".repeat(FAILURE_LOG_LINE_CHARS + 1)));
+        assert!(note.contains('…'));
     }
 
     // -----------------------------------------------------------------
