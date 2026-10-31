@@ -174,27 +174,68 @@ jobs:
             ~/.cargo/git
             target/
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Cache cargo-nextest binary
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          # Persist the source-installed cargo-nextest so it is not rebuilt on
-          # every fresh runner — mirrors the semver / tarpaulin binary caches
-          # (AI-1/AI-23). runner.os keys it per-OS. restore-keys lets a partial
-          # match seed ~/.cargo/bin so the install guard below finds it warm.
-          key: ${{ runner.os }}-cargo-nextest-bin
-          path: |
-            ~/.cargo/bin
-          restore-keys: ${{ runner.os }}-cargo-nextest-bin
       - name: Install cargo-nextest
-        # Repo-consistent install idiom (same as the semver / tarpaulin gates):
-        # `cargo install --locked`, guarded by `command -v` so a cache hit skips
-        # the rebuild. Deliberately NOT a third-party install action — this repo
-        # SHA-pins its actions and installs its cargo tooling from source, so a
-        # tag-pinned install-action would be an inconsistent supply-chain surface.
-        # Explicit +stable (see fmt job): install under the same toolchain the
-        # matrix legs test with.
+        # Pinned prebuilt from the official nextest release artifacts: version
+        # in the URL + the release's own sha256 sidecar value verified below
+        # (values cross-checked against cargo-nextest-0.9.149-<target>.sha256).
+        # This DELIBERATELY replaces the previous source-install idiom and its
+        # ~/.cargo/bin cache: the source build cost ~5.5-6.5m per cold leg, and
+        # the cache shielding it was repeatedly LRU-evicted by the multi-GB
+        # Cargo.lock-keyed cargo caches each deps bump mints (10GB budget) —
+        # run 121784584407 paid the full 6m37s rebuild after a 0s cache
+        # restore, and every >50m windows-latest completion includes that
+        # rebuild (the cap-kill family on #350 and main; see #347). The
+        # tarball download is ~15s, so the flaky cache is no longer
+        # load-bearing and the eviction class disappears entirely. macOS uses
+        # the universal-apple-darwin artifact (arm64 macos-latest today, both
+        # arches covered); Windows uses the tar.gz (not the zip) so one
+        # extract idiom serves all three legs (GNU tar in the bash shell reads
+        # tar.gz everywhere). Supply-chain posture matches the SHA-pinned
+        # actions: first-party artifacts, version + content hash pinned,
+        # nothing floating.
         shell: bash
-        run: command -v cargo-nextest >/dev/null 2>&1 || cargo +stable install cargo-nextest --locked
+        env:
+          NEXTEST_VERSION: "0.9.149"
+          # sha256 of cargo-nextest-0.9.149-<target>.tar.gz, from the release
+          NEXTEST_SHA_LINUX: "32d1d8c0567b7a80bee2bad8bb09125c846da96bc009b2de11ec08557290c770"
+          NEXTEST_SHA_MACOS: "47b9941765a9ff94e304a3fe5444ac1c7593da655525b8b69f8f2b31a9217507"
+          NEXTEST_SHA_WINDOWS: "8e7609fffb5a938c9b48d8788a89699fc83c39d07a9d9dbc61554f661b51d9d8"
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)   art="x86_64-unknown-linux-gnu"; want="$NEXTEST_SHA_LINUX" ;;
+            macOS)   art="universal-apple-darwin";   want="$NEXTEST_SHA_MACOS" ;;
+            Windows) art="x86_64-pc-windows-msvc";   want="$NEXTEST_SHA_WINDOWS" ;;
+            *) echo "unsupported runner OS: ${{ runner.os }}" >&2; exit 2 ;;
+          esac
+          url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${art}.tar.gz"
+          # Git Bash quirks with $RUNNER_TEMP (a Windows D:\... path): MSYS
+          # sha256sum prints a '\' digest marker for backslash paths, and GNU
+          # tar reads the drive-letter colon as a REMOTE-HOST spec
+          # ("Cannot connect to D: resolve failed"). Normalize to a POSIX
+          # path ONCE, Windows only — every consumer below then sees a
+          # colon-free path (no-op on Linux/macOS runners).
+          if command -v cygpath >/dev/null 2>&1; then
+            tmp="$(cygpath -u "$RUNNER_TEMP")/cargo-nextest.tar.gz"
+          else
+            tmp="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$tmp"
+          got="$(sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp")"
+          got="${got%% *}"
+          # coreutils' sha256sum on Windows (Git Bash) prefixes the digest
+          # field with '\' (binary-mode marker for backslash paths) — strip
+          # one leading backslash so the compare is digest-only on every OS
+          # (no-op on Linux/macOS, where no marker is printed).
+          got="${got#\\}"
+          if [ "$got" != "$want" ]; then
+            echo "cargo-nextest tarball sha256 mismatch for $art: want $want, got $got" >&2
+            echo "  $url" >&2
+            exit 2
+          fi
+          mkdir -p "$HOME/.cargo/bin"
+          tar -xzf "$tmp" -C "$HOME/.cargo/bin"
+          cargo-nextest --version
       - name: Build test binaries (nextest --no-run)
         # SPLIT build from run (#106): the fused compile+run step could not
         # attribute a stall to build-vs-run, and a job-timeout cancel discards the
