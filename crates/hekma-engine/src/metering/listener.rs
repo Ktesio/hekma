@@ -101,6 +101,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 
+use super::fence::{is_fence_exempt, refusal_response, WireFence};
 use super::parse::{parse_openai_sse_usage, parse_openai_usage};
 
 /// The outbound forward client type (story 12-3): hyper-util's legacy client
@@ -275,6 +276,10 @@ pub struct ObservedListener {
     /// The shared queue the listener pushes observed counts into; the supervisor
     /// holds the other end and the reaper drains it.
     queue: ObservedQueue,
+    /// The Run's wire fence (story 19-2): raised by the AD-7 pipeline on a
+    /// `block` breach, checked lock-free by `forward()` on every request.
+    /// Born down with the listener, so every reason clears with the Run.
+    fence: WireFence,
 }
 
 impl ObservedListener {
@@ -295,7 +300,7 @@ impl ObservedListener {
     /// start path can make.
     ///
     /// Test-only since story 17-2: production binds through
-    /// [`start_on_port`](Self::start_on_port) (the Host's `metering.listen`
+    /// [`start_on_port_with_fence`](Self::start_on_port_with_fence) (the Host's `metering.listen`
     /// seam) with the supervisor-owned port; `0` is the same ephemeral bind.
     #[cfg(test)]
     pub fn start(handle: &Handle, upstream: String) -> Result<ObservedListener, ListenerError> {
@@ -313,12 +318,30 @@ impl ObservedListener {
     /// [`ListenerError::Bind`] (naming the OS bind error, no traffic) — never
     /// a silent hop to another port, so a Host's adopted instance either lands
     /// on ITS port or fails loudly.
+    ///
+    /// Test-only since story 19-2: production binds through
+    /// [`start_on_port_with_fence`](Self::start_on_port_with_fence), which hands
+    /// in the Run's pre-raised fence.
+    #[cfg(test)]
     pub fn start_on_port(
         handle: &Handle,
         upstream: String,
         port: u16,
     ) -> Result<ObservedListener, ListenerError> {
-        Self::start_with_tls_config_on_port(handle, upstream, default_tls_config(), port)
+        Self::start_on_port_with_fence(handle, upstream, port, WireFence::default())
+    }
+
+    /// [`ObservedListener::start_on_port`] with the Run's [`WireFence`] handed in
+    /// (story 19-2): the pipeline raises the Run-start and adoption-rebuild
+    /// reasons on `fence` BEFORE this call, so the fence is already up when the
+    /// accept loop starts serving — no request can slip between bind and raise.
+    pub(crate) fn start_on_port_with_fence(
+        handle: &Handle,
+        upstream: String,
+        port: u16,
+        fence: WireFence,
+    ) -> Result<ObservedListener, ListenerError> {
+        Self::start_with_tls_config_on_port(handle, upstream, default_tls_config(), port, fence)
     }
 
     /// The historical explicit-TLS entry (story 12-3 test seam): the TLS test
@@ -332,7 +355,7 @@ impl ObservedListener {
         upstream: String,
         tls: Arc<rustls::ClientConfig>,
     ) -> Result<ObservedListener, ListenerError> {
-        Self::start_with_tls_config_on_port(handle, upstream, tls, 0)
+        Self::start_with_tls_config_on_port(handle, upstream, tls, 0, WireFence::default())
     }
 
     /// The full seam ([`start_on_port`](Self::start_on_port) + the story-12-3
@@ -344,6 +367,7 @@ impl ObservedListener {
         upstream: String,
         tls: Arc<rustls::ClientConfig>,
         port: u16,
+        fence: WireFence,
     ) -> Result<ObservedListener, ListenerError> {
         // Validate the upstream is a usable http(s):// URL BEFORE binding
         // (fail fast, no listener leak).
@@ -382,6 +406,7 @@ impl ObservedListener {
             upstream,
             task_queue,
             forward_client(tls),
+            fence.clone(),
         ));
 
         Ok(ObservedListener {
@@ -389,6 +414,7 @@ impl ObservedListener {
             local_addr,
             task: task.abort_handle(),
             queue,
+            fence,
         })
     }
 
@@ -412,6 +438,12 @@ impl ObservedListener {
     /// parsed `(input_tokens, output_tokens)`). Cloned `Arc` — cheap.
     pub fn queue(&self) -> ObservedQueue {
         Arc::clone(&self.queue)
+    }
+
+    /// The Run's wire fence (story 19-2) — the pipeline raises it on a
+    /// `block` breach; `forward()` refuses while it is up. Cloned `Arc`.
+    pub(crate) fn fence(&self) -> WireFence {
+        self.fence.clone()
     }
 }
 
@@ -458,6 +490,7 @@ async fn accept_loop(
     upstream: String,
     queue: ObservedQueue,
     client: ForwardClient,
+    fence: WireFence,
 ) {
     // One shared forward client (connection pooling to the upstream). The
     // legacy client is the lean hyper-util outbound leg; it carries a
@@ -478,6 +511,7 @@ async fn accept_loop(
         let conn_upstream = upstream.clone();
         let conn_client = client.clone();
         let conn_queue = Arc::clone(&queue);
+        let conn_fence = fence.clone();
         // Serve each connection on its own task so a slow agent connection does not
         // block accepting the next one. The service forwards every request upstream.
         tokio::spawn(async move {
@@ -485,8 +519,11 @@ async fn accept_loop(
                 let upstream = conn_upstream.clone();
                 let client = conn_client.clone();
                 let queue = Arc::clone(&conn_queue);
+                let fence = conn_fence.clone();
                 async move {
-                    Ok::<_, std::convert::Infallible>(forward(req, upstream, client, queue).await)
+                    Ok::<_, std::convert::Infallible>(
+                        forward(req, upstream, client, queue, fence).await,
+                    )
                 }
             });
             // Best-effort: a connection-level HTTP error is dropped (the agent sees a
@@ -518,12 +555,35 @@ async fn accept_loop(
 /// crash. The error body carries a STATIC message only — no request body, no header,
 /// no URL, no key (no-leak). A `usage`-PARSE miss is a silent skip (the call still
 /// succeeds for the agent) — observation is best-effort to the RUN.
+///
+/// THE WIRE FENCE (story 19-2) is checked FIRST: while the Run's fence is up,
+/// every non-safe request gets the typed non-retryable `proxy-wire v1`
+/// refusal (see [`super::fence`]) — never forwarded, never metered; its body
+/// is drained and discarded, never buffered. One atomic load decides, no lock
+/// (AD-18).
 async fn forward(
     req: Request<Incoming>,
     upstream: String,
     client: ForwardClient,
     queue: ObservedQueue,
+    fence: WireFence,
 ) -> Response<Full<Bytes>> {
+    if !is_fence_exempt(req.method()) {
+        if let Some(refusal) = fence.refusal() {
+            // An `Expect: 100-continue` client has not sent its body yet:
+            // answering at once (no drain) means hyper never sends the
+            // `100 Continue`, so the body is never uploaded at all.
+            let awaits_continue = req
+                .headers()
+                .get(hyper::header::EXPECT)
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+            if !awaits_continue {
+                drain_request_body(req.into_body()).await;
+            }
+            return refusal_response(&refusal);
+        }
+    }
+
     // Build the upstream URI: <upstream authority> + the request's path-and-query,
     // A build failure → an honest 502 (no traffic echoed).
     let Some(uri) = build_upstream_uri(&upstream, req.uri()) else {
@@ -623,6 +683,25 @@ async fn forward(
     *response.status_mut() = res_parts.status;
     *response.headers_mut() = res_parts.headers;
     response
+}
+
+/// Read a REFUSED request's body to its end, discarding every frame, so a
+/// keep-alive client that is still uploading receives the refusal instead of a
+/// connection reset (which SDKs retry as a transport error). Nothing is kept,
+/// and the read stops at the relay cap or the first transport error.
+async fn drain_request_body(mut body: Incoming) {
+    let mut seen: usize = 0;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return;
+        };
+        if let Some(data) = frame.data_ref() {
+            seen = seen.saturating_add(data.len());
+            if seen > MAX_RELAY_BODY_BYTES {
+                return;
+            }
+        }
+    }
 }
 
 /// Whether the response headers declare a Server-Sent-Events body — the

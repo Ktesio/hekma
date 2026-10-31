@@ -20,7 +20,7 @@ The Host enforces money at its own external choke point and wants Hekma's rules 
 
 ## Requirements & Constraints
 
-- **`block` (19.2):** never a default Breach Action; once configured it always refuses, whatever the Scent-Check Mode (PRD FR-43 amendment). On breach the pipeline flips a lock-free per-instance flag; `forward()` refuses further model calls with a typed, non-retryable response (not 429 — SDKs retry it) until the ceiling is raised or reset. The breach event and log record the fence like any action. The Host's choke point stays the enforcement of record; the fence is cooperative (NFR-6).
+- **`block` (19.2):** never a default Breach Action; once configured it always refuses, whatever the Scent-Check Mode (PRD FR-43 amendment). On breach the pipeline flips a lock-free per-instance flag; `forward()` refuses further model calls with a typed, non-retryable response (not 429 — SDKs retry it) until the Run ends; raising a ceiling un-fences a live Run once 21.6 lands. The breach event and log record the fence like any action. The Host's choke point stays the enforcement of record; the fence is cooperative (NFR-6).
   - The spec records the refusal response as the first slice of `proxy-wire v1`: a status code common SDKs do not retry, a JSON error body with a stable type and code naming dimension and scope, never content. 23.1 documents it unchanged and carries `block` into the shared snapshot; 23.4 reuses it for `reject`.
   - The flag is rebuilt from the durable breach record on engine restart and adoption, as the latch is.
   - `block` is refused at configuration on an instance with no listener (self-reported metering only).

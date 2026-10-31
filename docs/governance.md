@@ -23,7 +23,8 @@ against its implementation and assert byte-exact agreement.
 - Artifact id: `hekma-governance-vectors`
 - Canonical location: `crates/hekma-engine/governance/vectors-v1.json`
 - Checksum sidecar: `crates/hekma-engine/governance/vectors-v1.json.sha256`
-- Current version: **1.0.0** (schema version 1)
+- Current version: **1.1.0** (schema version 1). 1.1.0 appended the `block`
+  cases and the `fence` kind after the unchanged 1.0.0 set.
 
 ## Getting the artifact
 
@@ -47,21 +48,22 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 26 cases; the shape is identical
+An excerpt (the full artifact carries 34 cases; the shape is identical
 throughout):
 
 ```json
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.0.0",
+  "vectors_version": "1.1.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
       "CostEvaluator",
       "cost_micros",
       "cost_micros_with_cached",
-      "governance::decide"
+      "governance::decide",
+      "governance::fence_refusal"
     ]
   },
   "cases": [
@@ -95,7 +97,7 @@ throughout):
 }
 ```
 
-Two case kinds exist:
+Three case kinds exist:
 
 - **`decision`** — a full governance evaluation: arms (the armed dimensions,
   with committed totals, ceilings, and the resolved breach action), the
@@ -106,6 +108,15 @@ Two case kinds exist:
   `cost-micros` (plain per-direction pricing), `cost-micros-with-cached` (the
   cached re-split), and `two-row-own-rate-sum` (two ledger rows priced each at
   its own persisted rate).
+- **`fence`** (from 1.1.0) — the `block` wire fence: the raised fence reasons
+  (each `(dimension, scope)` whose breach fired `block`) in, and the refusal
+  out: `status` 402, `error_type` `hekma_budget_block`, the `code`, and the
+  reported reason, or `null` when no reason is raised. The response these
+  fields come from is described in
+  [Hosting: the wire fence](hosting.md#the-refusal-proxy-wire-v1).
+
+A later minor version may add a case kind, as 1.1.0 added `fence`. See the
+versioning policy for how a consumer pinned to an older version handles it.
 
 Every case carries `covers` — the rule set it pins:
 
@@ -119,6 +130,7 @@ Every case carries `covers` — the rule set it pins:
 | `round-half-up` | A token×rate divide rounds half-up; each direction rounds independently — pinned by a both-directions-at-the-tie case that an aggregate-then-round implementation fails (4 vs 3). |
 | `saturation` | A runaway product pins at the integer maximum — never wraps, so a cost can never silently un-breach. |
 | `no-retro-repricing` | Each ledger row prices at the rate persisted with it; repricing history at the latest rate produces a different (wrong) value. |
+| `block-fence` | A `block` decision fires under the same threshold, latch and order rules as any action. A fenced Run refuses with status 402 and the `hekma_budget_block` class, reporting the first raised reason: tokens before dollars, per-run before cumulative. |
 
 ## How a Host pins it
 
@@ -133,9 +145,9 @@ Every case carries `covers` — the rule set it pins:
 3. **Fail on any difference.** A mismatch means your guard disagrees with the
    engine on a pinned rule — fix the guard (or file an issue if you believe
    the vector is wrong), never silently skip the case.
-4. **On upgrade, re-run.** A new minor version adds cases; your existing
-   verdicts stay valid and the new cases extend the proof. See the
-   versioning policy below.
+4. **On upgrade, re-run.** A new minor version appends cases after the ones
+   you already pass; your existing verdicts stay valid and the new cases
+   extend the proof. See the versioning policy below.
 
 A Rust Host can skip the re-implementation entirely: the engine exposes the
 same decision core (`governance::decide`, the derivations) through its public
@@ -145,11 +157,25 @@ API — see [Embedding the engine](embedding.md).
 
 `vectors_version` is semver over the **case set**:
 
-- **Additive cases** (new scenarios pinning the same rules, or cases for new
-  rules) are a **minor** bump. A consumer's existing re-run stays green;
-  adopting the new cases is recommended but not required.
-- **Any change to an expected output, a case input, or the document schema**
-  is a **major** bump and is announced ahead of the release in the release
+- **Additive cases** are a **minor** bump: new scenarios pinning the same
+  rules, or cases for new rules. A new case may use a new case kind or a new
+  value of an existing field (1.1.0 added the `fence` kind, the `block` action
+  and the `block-fence` tag). New cases are **appended**: every case an
+  earlier version shipped keeps its bytes and its position. A consumer pinned
+  to an earlier version re-runs that version's cases, the leading prefix of
+  the list, and parses the rest only when it adopts the new version. Its
+  existing re-run stays green; adopting the new cases is recommended but not
+  required.
+
+  | Version | Cases | Added |
+  | --- | --- | --- |
+  | 1.0.0 | 1-26 | the first 26 `decision` and `derivation` cases |
+  | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
+
+  The provenance list grows with the generator functions the new cases come
+  from (1.1.0 added `governance::fence_refusal`).
+- **Any change to a shipped case** (its expected output or its input), or to
+  the shape of the header or of an existing kind, is a **major** bump and is announced ahead of the release in the release
   notes. A major bump means a pinned verdict must be re-established — it does
   not by itself mean the enforcement behavior changed; it means the *proof*
   changed.

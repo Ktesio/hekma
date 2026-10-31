@@ -85,7 +85,9 @@ hekma agent config set review-bot budget.breach_action pause
 `budget.tokens.cumulative` is the spend cap for the whole job (per-run and
 dollar caps exist too — see the [unified config keys](commands.md#unified-config-keys)).
 `budget.breach_action` is what happens at the ceiling: `pause` (the default),
-`stop`, or `warn` (record only). The budget is re-read on every usage event,
+`stop`, `warn` (record only), or `block` (engine-observed instances: the
+metering listener refuses further model calls; see
+[the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). The budget is re-read on every usage event,
 so a cap set before `start` is enforced from the first event.
 
 Agents that speak the Agent Client Protocol — most coding agents — can skip

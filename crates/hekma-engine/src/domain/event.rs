@@ -796,7 +796,7 @@ pub struct BudgetBreachEvent {
     /// string — the render module is human-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_label: Option<EstimateLabel>,
-    /// The Breach Action taken (`pause` / `stop` / `warn`).
+    /// The Breach Action taken (`pause` / `stop` / `warn` / `block`).
     pub action: BreachAction,
     /// The Metering Source that produced the breaching event's usage, as its wire
     /// string (`self-reported` / `engine-observed`).
