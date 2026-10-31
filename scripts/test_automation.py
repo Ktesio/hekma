@@ -312,6 +312,12 @@ class ReleaseDocsTests(unittest.TestCase):
             ci,
         )
         self.assertIn('sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp"', ci)
+        # The Windows digest strip: Git Bash's sha256sum prefixes the digest
+        # with '\' (binary-mode marker for backslash paths) — without this
+        # line the compare fails on windows-latest with a "mismatch" whose
+        # got-value equals the want-value plus the marker (hit on the first
+        # push of this install shape; both windows legs failed at ~1m30s).
+        self.assertIn('got="${got#\\\\}"', ci)
         self.assertNotIn("cargo +stable install cargo-nextest", ci)
         self.assertNotIn("${{ runner.os }}-cargo-nextest-bin", ci)
         # The old plain-`cargo test` suite command must be GONE — the only
