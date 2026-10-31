@@ -1,6 +1,6 @@
 # Sponsoring Hekma
 
-Hekma is an open-source runtime that runs AI agents like services: it supervises their lifecycle, meters real token usage, and enforces dollar budgets. It ships under Apache-2.0 as a Ktesio project.
+Hekma is the open-source control plane for agent workloads: one way to run, see and steer AI agents. Today it supervises their lifecycle, meters real token usage and enforces budgets. It ships under Apache-2.0 as a Ktesio project.
 
 The goal of Hekma is to make agents dependable infrastructure — supervised, observable, and budgeted like any other service.
 

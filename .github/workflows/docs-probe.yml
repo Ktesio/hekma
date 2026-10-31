@@ -100,7 +100,7 @@ jobs:
               failed=1
             fi
           }
-          check "https://hekma.ktesio.dev/" "<title>Hekma: run AI agents like services</title>"
+          check "https://hekma.ktesio.dev/" "<title>Hekma: the control plane for agent workloads</title>"
           check "https://hekma.ktesio.dev/docs/" "<title>Hekma docs</title>"
           # The adapter gallery is a README-facing public URL (the README
           # links it) — the probe pins it so a missing/lagged site port

@@ -1,9 +1,9 @@
 # generated: 2026-07-02
-# last_updated: 2026-08-24
+# last_updated: 2026-10-30
 # project: ktesio
 # project_key: NOKEY
 # tracking_system: file-system
-# story_location: /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
+# story_location: {project-root}/_bmad-output/implementation-artifacts
 
 # STATUS DEFINITIONS:
 # ==================
@@ -47,12 +47,11 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "10-25-2026 23:01"  # stack-base #334 merged main in (post-#332/#333/#337); epic-18 squash-merged onto #334, epic-20 open on main
+last_updated: "2026-10-30"  # control-plane pivot (sprint-change-proposal-2026-10-30-control-plane-pivot.md): epic-18 + 19-1 drift fixed, 19-3 absorbed into 21-2, epics 21-25 added and renumbered into build order
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
-story_location: 
-  /Users/imagdy/dev/ktesio.dev/_bmad-output/implementation-artifacts
+story_location: "{project-root}/_bmad-output/implementation-artifacts"
 
 development_status:
   # Epic 13 (engine correctness & the supervisor boundary) — opened 2026-09-19 carrying the two
@@ -184,18 +183,17 @@ development_status:
   17-4-export-for-ephemeral-hosts-outbox-and-log-capture-modes: done  # implemented + 26-finding review hardening + CI round (stable-clippy as_chunks, data-driven OS skips, Windows env-floor HOME, outbox-failure pin); PR #313 merged 2026-10-20
   17-5-static-linux-release-and-the-container-recipe: done  # implemented + 17-finding review round (release-blocking static-pie gate caught + fixed); PR #314 merged 2026-10-20; first live musl proof lands at the next v* tag
   epic-17-retrospective: skipped  # maintainer decision 2026-10-22 — the epic closes without a retro; the epic's process lessons live in the story specs' change logs and the deferred-work record
-  epic-18: in-progress  # opened 2026-09-30 by the same proposal (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber); started 2026-10-23 after 19-1 (which runs first overall), stacked on feat/epic-19-1-governance-vectors
-  18-1-readiness-probes: in-progress  # PR #335 open (round 1 applied, gates 1810/0); awaiting maintainer squash-merge after #334
-  18-2-liveness-and-the-unresponsive-failure: in-progress  # PR #336 open (round 1 + orchestrator P8 correction applied, gates 1854/0); awaiting merge after #335
-  18-3-exit-code-classes-and-the-stable-window-reset: in-progress  # PR #338 open (round 1 applied, gates 1891/0); awaiting merge after #336
-  18-4-cooperative-pause-commands-and-the-drain-verb: in-progress  # PR #339 open (round 1 applied, gates 1936/0); awaiting merge after #338
-  18-5-a-service-mode-gateway-as-a-manifest-adapter: in-progress  # impl 641bc1b (gates green 1952/0); 4-layer review round 1 done 2026-10-24 (5 wiring mutations passed the suite — proof wiring unpinned), patch round underway
+  epic-18: done  # opened 2026-09-30 by sprint-change-proposal-2026-09-30-hosted-platform-readiness.md (Service-Grade Lifecycle; FR-42; Adapter Contract v1.1.0; was Epic 16 pre-renumber); closed 2026-10-25 — all five stories merged (drift fixed 2026-10-30 by the control-plane correct-course)
+  18-1-readiness-probes: done  # PR #335 merged 2026-10-24 (86f0d39)
+  18-2-liveness-and-the-unresponsive-failure: done  # PR #336 merged 2026-10-24 (a35dfd2)
+  18-3-exit-code-classes-and-the-stable-window-reset: done  # PR #338 merged 2026-10-24 (0b5231e)
+  18-4-cooperative-pause-commands-and-the-drain-verb: done  # PR #339 merged 2026-10-24 (dd658e7)
+  18-5-a-service-mode-gateway-as-a-manifest-adapter: done  # PR #342 merged 2026-10-25 (e4542dd)
   epic-18-retrospective: optional
-  epic-19: in-progress  # opened 2026-09-30 by the same proposal (Wire Governance for Hosts; FR-43..FR-45; money code → AI-55 two-pass; was Epic 17 pre-renumber); started 2026-10-23 — 19-1 runs FIRST overall per the ratified handoff, then Epic 18's stack, then 19-2..19-5
-  19-1-governance-conformance-vectors: in-progress  # FOUNDATION — runs first; an external Host consumer waits on it. Spec 2026-10-23 (autonomous mode per Islam's cadence ruling); implementation underway on feat/epic-19-1-governance-vectors
-  19-2-the-wire-fence-block-breach-action: backlog
-  19-3-task-scope-host-units-of-work: backlog
-  19-4-per-call-records-for-hosts: backlog
+  epic-19: in-progress  # opened 2026-09-30 (Wire Governance for Hosts; FR-43..FR-45; was Epic 17 pre-renumber). RE-SCOPED 2026-10-30 by sprint-change-proposal-2026-10-30-control-plane-pivot.md (D2a): 19-3 absorbed into 21-2; 19-2 gains "never a default; once configured always refuses whatever the Scent-Check Mode"; 19-4 gains run id + control depth and runs after 22-1 and 23-1, before 19-5
+  19-1-governance-conformance-vectors: done  # PR #334 merged 2026-10-25 (f7ba049)
+  19-2-the-wire-fence-block-breach-action: backlog  # AC 2026-10-30: never a default; once configured always refuses whatever the Scent-Check Mode; built on today's listener; its refusal response is the first slice of proxy-wire v1; carried into the shared snapshot by 23-1; lands before 21-3
+  19-4-per-call-records-for-hosts: backlog  # AC 2026-10-30: Host read surface for the shared proxy's per-call records (run id, Control Depth, token id); runs after 22-1 and 23-1, before 19-5
   19-5-reconciliation-ingestion: backlog
   epic-19-retrospective: optional
   epic-20: done  # 🎉 COMPLETE 2026-10-25: all three stories merged (20-3 76e13e7/#340 gallery, 20-2 83b32b5/#341 CI recipe + dogfood lane with ktesio.dev #29 the same day, 20-1 81aa8e5/#346 OTLP export AD-21 + the coverage-gate repair 94.0183%→95.3168% after 3 CI rounds). Retro per convention (same closeout): epic-20-retro-2026-10-25.md — accepted-with-open-items, DECLARED criteria (proposal §5, all five met), pending_stories []; findings F1-F6, action items AI-72..AI-78; behavior verified live (OTLP off-by-default + degradation + semconv metrics through the real host; gallery lane; deployed site). Open: story-spec closeout + CHANGELOG banners (AI-72), telemetry site port (AI-74).
@@ -203,6 +201,45 @@ development_status:
   20-2-agents-in-ci-the-github-actions-recipe: done  # 2026-10-25 MERGED as 83b32b5 (PR #341, incl. the agents.md gallery pointer): recipe page + agents-in-ci dogfood lane; ktesio.dev port merged same day (ktesio.dev #29, site live with the probe-pinned title)
   20-3-the-adapter-gallery: done  # 2026-10-24 MERGED as 76e13e7 (PR #340): gallery index + 10 pages + aider manifest + PATH-shadowed TCK lane + nav/exec drift guards + docs-probe pin; docs/agents.md pointer applied by Islam post-merge
   epic-20-retrospective: done
+  # Epics 21-25 (control-plane pivot) — opened 2026-10-30 via correct-course
+  # (sprint-change-proposal-2026-10-30-control-plane-pivot.md, APPROVED by Islam with D1a/D2a/D3a/D4-open/D5a).
+  # PRD and spine re-baselined 2026-10-30; stories renumbered into build order (epics.md, Epic 21 note):
+  # 21-1 → 21-2 → 21-9 → 21-3 → 21-4 → 21-5 → 21-6 → 22-1 → 23-1 → 19-4 → 22-2 → 22-3 → 23-2 → 23-3 → 23-4
+  # → 21-7 → 21-8 → 22-5 → 24-1 → 22-4 → 24-2 → 24-3 → 24-4 → 24-5 → 25. 19-2 any time, before 21-3; 19-5 after 19-4.
+  # Readiness gate 2026-10-30 (implementation-readiness-2026-10-30.md): CONCERNS resolved by Islam's D1-D3 rulings; 21-9 added.
+  epic-21: backlog  # One Control Plane (FR-49, FR-50, FR-57, FR-60; FR-21/FR-41 amendments; AD-20, AD-25, AD-27)
+  21-1-the-store-writer-and-run-scale-storage: backlog  # AD-27; money code (AI-55)
+  21-2-runs-as-first-class-entities: backlog  # AD-25; absorbs 19-3 as child Runs
+  21-3-policies-the-default-policy-and-the-warn-default: backlog  # FR-60, FR-21 upgrade write; money code (AI-55)
+  21-4-one-data-path-owner-the-cli-routes-through-a-local-service-host: backlog  # AD-20 auto-start, credential resolver, TLS
+  21-5-hekma-ps-and-run-listing: backlog
+  21-6-selectors-on-every-verb-and-hekma-budget: backlog  # latch re-arm from 19-3 lands here
+  21-7-hekma-top: backlog  # after 23-4
+  21-8-gateway-complement-identity-headers-and-recipes: backlog
+  21-9-bound-labels-hekma-label: backlog  # added 2026-10-30 by the readiness gate (D3); runs after 21-2, before 21-3
+  epic-21-retrospective: optional
+  epic-22: backlog  # Run Identity and Key Custody (FR-53, FR-54; AD-22)
+  22-1-run-keys-minting-hashing-refresh-and-revocation: backlog
+  22-2-the-run-key-in-the-api-key-slot-key-custody-by-default: backlog  # security review before docs say supported
+  22-3-scent-check-modes: backlog  # decides PRD Q9
+  22-4-bypass-detection-in-the-shim: backlog  # after 24-1
+  22-5-an-authenticated-proxy-beyond-loopback: backlog
+  epic-22-retrospective: optional
+  epic-23: backlog  # Attach and Wire Control (FR-51, FR-52, FR-56; AD-26, AD-28)
+  23-1-the-shared-metering-proxy: backlog  # replaces the per-instance listener; proxy-wire v1; carries 19-2 block; hekma binding (D3); creates the calls store
+  23-2-self-announce-run-identities-and-leases: backlog
+  23-3-inbound-otlp-and-observed-runs: backlog
+  23-4-wire-hold-release-reroute-and-reject: backlog  # reject reuses 19-2's block response
+  epic-23-retrospective: optional
+  epic-24: backlog  # Operability at Scale (FR-55, FR-59, NFR-4, NFR-9; AD-18, AD-21, AD-23)
+  24-1-one-shim-per-supervised-process: backlog
+  24-2-handoff-mode-and-in-place-upgrades: backlog  # flips Handoff Mode to default on acceptance
+  24-3-crash-recovery-and-registry-completeness: backlog
+  24-4-scale-substrate-and-the-run-scale-benchmark: backlog
+  24-5-otlp-metrics-v2: backlog  # AI-55 two-pass review
+  epic-24-retrospective: optional
+  epic-25: backlog  # Nodes and Hub (FR-58; AD-24 reserved) — placeholder; stories after Epic 24 closes
+  epic-25-retrospective: optional
   epic-9: done  # squash-merged to main 2026-07-14 as 39f0a57 (PR #114). kt --help now matches the shipped agent-runner README/GitHub positioning; v0.6.0. All 3 stories + AD-16/Epic-8 re-scope done. Issues #110/#111/#112/#113 closed. Follow-up #109 (adoption x86 CI deadlock root-cause) remains open/tracked separately, not a blocker.
   9-1-remove-the-legacy-skill-manager-command-surface-modules-and: done  # committed 42896b7 on feat/epic-9-retire-legacy-cli; TWO-pass review APPROVED (primary + adversarial: byte-identical agent/self-update help vs baseline, no over/under-deletion, AgentManifest* boundary intact, all 9 gates green / 767 tests). 2 LOW deferred: dangling [workspace.dependencies] (→9-2), stale check_docs KT_COMMANDS allowlist (→9-3).
   9-2-reposition-the-top-level-kt-identity-to-the-agent-runner: done  # (was tracked as 9-2-rebrand-kt-identity-and-make-agent-list-show-canonical) committed 45d203e on feat/epic-9-retire-legacy-cli (on top of 9-1); CI green cross-OS incl. coverage on PR #114. Review APPROVED-WITH-NITS (rebrand text verified verbatim-consistent with the live README/GitHub description; canonical-surface guard proven non-vacuous via live smoke; 0.6.0 bump isolated to workspace.package; dangling deps confirmed gone). 1 LOW cosmetic nit (story-file wording, reconciled) — no functional follow-up.
