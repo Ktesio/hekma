@@ -69,12 +69,13 @@ pub use fleet::{
     Supervision, UsageGapNotice, UsageView,
 };
 pub use governance::{
-    canonical_json, checksum_file_content, decide, generate, governance_vectors_checksum,
-    run_derivation, Case, CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm,
-    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing,
-    TokenArm, VectorsDocument, ALL_COVERS, GOVERNANCE_VECTORS_ARTIFACT_ID,
+    canonical_json, checksum_file_content, decide, fence_code, fence_refusal, generate,
+    governance_vectors_checksum, run_derivation, Case, CoverTag, DecisionCase, DerivationCase,
+    DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision, GovernanceInput,
+    GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm, VectorsDocument, ALL_COVERS,
+    FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID,
     GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
-    GOVERNANCE_VECTORS_VERSION,
+    GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;

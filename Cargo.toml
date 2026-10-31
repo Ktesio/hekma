@@ -29,7 +29,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(
 
 [workspace.dependencies]
 # Internal crates
-hekma-engine = { path = "crates/hekma-engine", version = "0.9.0" }
+hekma-engine = { path = "crates/hekma-engine", version = "0.10.0" }
 # The long-running Service Host (story 17-2, AD-2 amendment 2026-10-19): the
 # `hekma` CLI's `serve` subcommand drives it; its ONLY normal dep is the
 # engine's public API (`cargo tree -p hekma-host -e normal` = engine + tokio).

@@ -133,13 +133,16 @@ pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // Story 19-1: the governance conformance vectors (AD-7/FR-44) — the embedded
 // artifact bytes plus the version/checksum accessors a Host pins against, and
 // the pure `decide` core the artifact is generated from. Additive surface.
+// Story 19-2: the wire fence's pure consumer (`fence_refusal`) and the
+// `proxy-wire v1` refusal constants join it.
 pub use domain::{
-    canonical_json, checksum_file_content, decide, generate, governance_vectors_checksum,
-    run_derivation, Case, CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm,
-    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing,
-    TokenArm, VectorsDocument, ALL_COVERS, GOVERNANCE_VECTORS_ARTIFACT_ID,
+    canonical_json, checksum_file_content, decide, fence_code, fence_refusal, generate,
+    governance_vectors_checksum, run_derivation, Case, CoverTag, DecisionCase, DerivationCase,
+    DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision, GovernanceInput,
+    GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm, VectorsDocument, ALL_COVERS,
+    FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID,
     GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
-    GOVERNANCE_VECTORS_VERSION,
+    GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 /// The governance conformance vectors artifact, embedded verbatim at build
 /// time (`governance/vectors-v1.json` — the canonical bytes the committed
