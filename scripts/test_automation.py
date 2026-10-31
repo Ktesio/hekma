@@ -577,9 +577,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # tree (stat/wchan names a D-state leftover's kernel wait channel)
         # plus a PSI readout, uploaded as a per-OS artifact. Class 2 is
         # bounded by the ENVIRONMENT instead: the linux leg pins
-        # ubuntu-26.04 and its JOB timeout tightens to 15m via the same
-        # matrix data (a freeze recurrence costs the 15+5m service window,
-        # not 45m). The cap rides
+        # ubuntu-26.04 and its JOB timeout tightens via the same
+        # matrix data (recalibrated 15m→25m on 2026-10-31 after the
+        # lane outgrew the cap — a freeze recurrence costs the 25+5m
+        # service window, not 45m). The cap rides
         # the matrix `include` as DATA (not an in-step OS comparison). Pin
         # the deliberate shape so a future edit cannot silently drop the
         # observability, loosen the fast-fail timeout, or resurrect the
@@ -592,14 +593,16 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("- name: Wedge post-mortem snapshot", ci)
         self.assertIn("name: wedge-postmortem-${{ matrix.os }}", ci)
         self.assertIn("- os: ubuntu-26.04", ci)
-        self.assertIn("test_job_timeout_minutes: 15", ci)
+        self.assertIn("test_job_timeout_minutes: 25", ci)
         # Default test-job budget 40→50 (2026-10-20): the suite passed 1,671
         # nextest tests with epic-17 and the windows-latest leg rides 33-38m
         # green; run 39472620931 lost ~9m to a double cold-cache miss (new
         # Cargo.lock key + an evicted Windows-cargo-nextest-bin that rebuilt
         # nextest from source) and the 40m job timeout cancelled the suite
-        # mid-run. 50 keeps cold-cache headroom; ubuntu stays 15m via the
-        # matrix include above.
+        # mid-run. 50 keeps cold-cache headroom; ubuntu rides 25m via the
+        # matrix include above (recalibrated from 15m on 2026-10-31 — green
+        # runs had reached 653–818s of job time and run 41193980277 capped
+        # out at 15m mid-suite with a healthy runner).
         self.assertIn(
             "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}", ci
         )
