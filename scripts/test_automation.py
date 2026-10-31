@@ -312,11 +312,12 @@ class ReleaseDocsTests(unittest.TestCase):
             ci,
         )
         self.assertIn('sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp"', ci)
-        # The Windows digest strip: Git Bash's sha256sum prefixes the digest
-        # with '\' (binary-mode marker for backslash paths) — without this
-        # line the compare fails on windows-latest with a "mismatch" whose
-        # got-value equals the want-value plus the marker (hit on the first
-        # push of this install shape; both windows legs failed at ~1m30s).
+        # The Windows path normalization: Git Bash's $RUNNER_TEMP is a
+        # Windows drive-letter path whose colon GNU tar parses as a REMOTE
+        # HOST spec ("Cannot connect to D:") — without this guard the
+        # extract can never succeed on windows-latest. Digest marker strip:
+        # MSYS sha256sum prefixes digests of backslash paths with '\'.
+        self.assertIn('tmp="$(cygpath -u "$RUNNER_TEMP")/cargo-nextest.tar.gz"', ci)
         self.assertIn('got="${got#\\\\}"', ci)
         self.assertNotIn("cargo +stable install cargo-nextest", ci)
         self.assertNotIn("${{ runner.os }}-cargo-nextest-bin", ci)
