@@ -91,7 +91,7 @@ jobs:
         # 2026 (actions/runner-images#14748). Unify back post-migration.
         os: [ubuntu-26.04, macos-latest, windows-latest]
         # Wedge forensics (2026-10-17): the ubuntu leg's test RUN is wall-clock
-        # capped and session-quarantined, and its JOB timeout tightened to 15m —
+        # capped and session-quarantined, and its JOB timeout tightened to 25m —
         # see the "Run tests (nextest)" step below for the full why (two wedge
         # classes; the freeze class is environment-bounded via the 26.04 pin).
         # Carried as matrix DATA (not an in-step OS comparison) so the run step
@@ -112,7 +112,7 @@ jobs:
         include:
           - os: ubuntu-26.04
             nextest_wallclock_cap: 30m
-            test_job_timeout_minutes: 15
+            test_job_timeout_minutes: 25
             nextest_profile: default
           - os: macos-latest
             nextest_profile: default
@@ -143,10 +143,14 @@ jobs:
     # residual Windows slow-runner flake family (TCK observed-section 30s
     # contention timeouts + a still-unidentified silent stall) is chartered
     # under epic-12 retro item 95 (see #236). The matrix `include` tightens
-    # the PINNED ubuntu-26.04 leg to 15m (tracking #292): the healthy lane is
-    # ~4.5m, so 15m keeps cold-cache headroom while a class-2 freeze costs the
-    # 15+5m service window instead of 45m and surfaces as a fast visible
-    # cancel rather than a silent three-quarter-hour burn.
+    # the PINNED ubuntu-26.04 leg to 25m (tracking #292). It was 15m when the
+    # healthy lane ran ~4.5m; by 2026-10-31 the serialized suite (2,097
+    # nextest tests) needs ~1m setup + ~4m build + ~10m run, and 15m cancelled
+    # GREEN suites (run 41209606287: all tests passed, job cancelled 8s
+    # later; main runs at fda3844 and add88ae likewise). 25m restores ~10m of
+    # cold-cache headroom while a class-2 freeze still costs the 25+5m
+    # service window instead of 45m and surfaces as a visible cancel rather
+    # than a silent three-quarter-hour burn.
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout
@@ -307,8 +311,9 @@ jobs:
         # stayed green through the same window, and hekma main run
         # 39016343545 ran the SAME ubuntu suite green in 4m36s at 08:10Z
         # the same day — the trigger is nondeterministic. The pinned
-        # leg's JOB timeout drops to 15m (matrix data below): a class-2
-        # recurrence on 26.04 costs the 15+5m service window, not 45m,
+        # leg's JOB timeout drops to 25m (matrix data below; 15m until
+        # 2026-10-31, when the grown suite outran it): a class-2
+        # recurrence on 26.04 costs the 25+5m service window, not 45m,
         # and surfaces as a fast visible cancel. The cap rides the
         # matrix `include` as data; the other legs render an empty cap
         # and run the plain uncapped invocation. Tracking issue: #292.
