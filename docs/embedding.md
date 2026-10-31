@@ -235,12 +235,14 @@ The contract, in five rules:
 
 ## The diagnostic sink
 
-The engine writes exactly two operational diagnostics — a DC-10 notice when an
-attached filesystem memory backing cannot be delivered to the agent, and an
-enforcement breadcrumb when a budget-breach action (pause/stop) could not be
-honored. With no sink installed they go to **stderr**, byte-for-byte as they
-always have; nothing is written to stdout, ever. A host that owns its stderr
-(for a daemon, a GUI, a log pipeline) can route both into its own writer:
+The engine writes two kinds of operational diagnostics — a DC-10 notice when an
+attached filesystem memory backing cannot be delivered to the agent, and
+enforcement breadcrumbs: a budget-breach action (pause/stop) that could not be
+honored, a `block` wire fence raised (or not raised, so the breach acted as
+`warn`), and a Restart Policy relaunch that lifted a per-run fence. With no
+sink installed they go to **stderr**, byte-for-byte as they always have;
+nothing is written to stdout, ever. A host that owns its stderr (for a daemon,
+a GUI, a log pipeline) can route them into its own writer:
 
 ```rust
 use hekma_engine::{DiagnosticSink, Engine};

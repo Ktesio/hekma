@@ -3040,7 +3040,7 @@ fn self_reported_start_observed_listener_is_a_no_op() {
     let sup = Supervisor::with_backoff(fast_backoff());
     // self-reported (the fake manifest declares self-reported) → Ok(None).
     let result = sup
-        .start_observed_listener(&name, "self-reported", &effective)
+        .start_observed_listener(&name, "self-reported", &effective, Default::default())
         .expect("self-reported is a no-op, not an error");
     assert!(
         result.is_none(),
@@ -3061,10 +3061,12 @@ fn engine_observed_without_upstream_rejects_with_a_clear_error() {
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
     let sup = Supervisor::with_backoff(fast_backoff());
-    let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
-        Err(e) => e,
-        Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
-    };
+    let err =
+        match sup.start_observed_listener(&name, "engine-observed", &effective, Default::default())
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
+        };
     match err {
         EngineError::ObservedMetering { name: n, detail } => {
             assert_eq!(n, "obs_noup");
@@ -3091,10 +3093,12 @@ fn engine_observed_without_runtime_handle_rejects_cleanly() {
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
     let sup = Supervisor::with_backoff(fast_backoff()); // no runtime handle
-    let err = match sup.start_observed_listener(&name, "engine-observed", &effective) {
-        Err(e) => e,
-        Ok(_) => panic!("no runtime handle must reject an engine-observed start"),
-    };
+    let err =
+        match sup.start_observed_listener(&name, "engine-observed", &effective, Default::default())
+        {
+            Err(e) => e,
+            Ok(_) => panic!("no runtime handle must reject an engine-observed start"),
+        };
     assert!(
         matches!(err, EngineError::ObservedMetering { .. }),
         "expected ObservedMetering, got {err:?}"
@@ -8130,4 +8134,767 @@ fn readiness_timeout_death_recheck_failure_is_surfaced_on_the_timeout() {
             .any(|e| matches!(e.cause, TransitionCause::ReadinessTimeout { .. })),
         "the failure carries the readiness-timeout cause: {events:?}"
     );
+}
+
+// ---- Story 19-2: the wire fence (`block`) ----
+
+/// A loopback upstream stub for the wire-fence legs: answers EVERY request
+/// with a fixed OpenAI-compatible completion (100 tokens of `usage`) and
+/// counts what it served — so "never forwarded" is a counter that did not
+/// move. Pure `std`, identical on every OS.
+struct FenceUpstream {
+    base_url: String,
+    served: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FenceUpstream {
+    fn served(&self) -> u64 {
+        self.served.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn start_fence_upstream() -> FenceUpstream {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            read_http_message(&mut stream);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"id":"c","object":"chat.completion","usage":{"prompt_tokens":30,"completion_tokens":70,"total_tokens":100}}"#;
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    FenceUpstream { base_url, served }
+}
+
+/// Read one HTTP/1.1 request (head + its Content-Length body) off `stream`.
+fn read_http_message(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let Ok(n) = stream.read(&mut chunk) else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if buffer.len() >= head_end + 4 + length {
+                return;
+            }
+        }
+    }
+}
+
+/// One HTTP/1.1 call to `base_url` (a loopback `http://` origin). Returns
+/// (status, lower-cased head, body).
+fn fence_http_call(base_url: &str, method: &str, path: &str, body: &str) -> (u16, String, String) {
+    use std::io::{Read, Write};
+    let authority = base_url.trim_start_matches("http://").trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(authority).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let text = String::from_utf8_lossy(&response).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, head.to_ascii_lowercase(), body.to_string())
+}
+
+/// Register an engine-observed instance forwarding to `upstream`, with
+/// `budget` keys and `budget.breach_action = block` written through the
+/// REAL config write (which accepts `block` because the source is
+/// engine-observed). Returns the dirs, registry, runtime and name.
+#[allow(clippy::type_complexity)]
+fn setup_block_instance(
+    name: &str,
+    upstream: &str,
+    budget: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    Registry,
+    tokio::runtime::Runtime,
+    InstanceName,
+) {
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), name, &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
+        .unwrap();
+    let parsed = InstanceName::new(name).unwrap();
+    registry
+        .set_config(
+            &parsed,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            upstream,
+        )
+        .unwrap();
+    for (key, value) in budget {
+        registry.set_config(&parsed, key, value).unwrap();
+    }
+    registry
+        .set_config(&parsed, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .expect("block is accepted on an engine-observed instance");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    (state, manifest, registry, rt, parsed)
+}
+
+/// The live listener's base URL for a supervised engine-observed instance.
+fn fence_listener_url(sup: &Supervisor, name: &InstanceName) -> String {
+    sup.running
+        .get(name)
+        .and_then(|supervised| supervised.observed_listener.as_ref())
+        .map(|listener| listener.base_url().to_string())
+        .expect("an engine-observed instance holds a listener")
+}
+
+/// Drive the observed drain (the reaper's cadence, run by the TEST) until
+/// `want` breach events are recorded for `name`.
+fn drain_observed_until_breaches(
+    sup: &mut Supervisor,
+    registry: &Registry,
+    name: &str,
+    want: usize,
+) -> Vec<BudgetBreachEvent> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        sup.drain_observed_all(registry);
+        let events = Supervisor::read_breach_events(registry, name).unwrap();
+        if events.len() >= want {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: {want} breach events never recorded (have {})",
+            events.len()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_block_breach_raises_the_wire_fence_and_forward_refuses_model_calls() {
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fence",
+        &upstream.base_url,
+        &[("budget.tokens.per_run", "100")],
+    );
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "fence").unwrap();
+    let base = fence_listener_url(&sup, &name);
+
+    // The first call passes (the fence is down) and its 100 tokens reach the
+    // per-run ceiling once drained.
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 200);
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fence", 1);
+    assert_eq!(breaches.len(), 1);
+    assert_eq!(breaches[0].action, BreachAction::Block);
+    assert_eq!(breaches[0].scope, BreachScope::PerRun);
+    // `block` is not a lifecycle action: the agent keeps running.
+    assert_eq!(state_of(&registry, "fence"), LifecycleState::Running);
+    let notes = sink_text(&buffer);
+    assert!(notes.contains("the wire fence is UP"), "{notes}");
+    assert!(notes.contains("tokens_per_run"), "{notes}");
+
+    // The next model call is refused with the proxy-wire v1 contract and
+    // never reaches the upstream.
+    let (status, head, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402);
+    assert!(head.contains("x-should-retry: false"), "{head}");
+    assert!(head.contains("content-type: application/json"), "{head}");
+    assert!(!head.contains("retry-after"), "{head}");
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "hekma_budget_block");
+    assert_eq!(value["error"]["code"], "tokens_per_run");
+    assert_eq!(upstream.served(), 1, "a fenced call is never forwarded");
+    // A large upload is drained, so the client still reads the 402 (not a
+    // reset it would retry as a transport error).
+    let large = format!("{{\"pad\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", &large);
+    assert_eq!(status, 402);
+    assert_eq!(upstream.served(), 1);
+
+    // An `Expect: 100-continue` upload is answered without inviting the body.
+    {
+        use std::io::{Read, Write};
+        let authority = base.trim_start_matches("http://");
+        let mut stream = std::net::TcpStream::connect(authority).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\n\
+             Content-Type: application/json\r\nContent-Length: 1048576\r\n\
+             Expect: 100-continue\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 402"), "{text}");
+        assert!(!text.contains("100 Continue"), "{text}");
+    }
+    assert_eq!(upstream.served(), 1);
+
+    // A safe method passes the fence (model listings and probes keep working).
+    let (status, _, _) = fence_http_call(&base, "GET", "/v1/models", "");
+    assert_eq!(status, 200);
+    assert_eq!(upstream.served(), 2);
+
+    // Later usage never re-fires the latched breach.
+    sup.drain_observed_all(&registry);
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "fence")
+            .unwrap()
+            .len(),
+        1
+    );
+    sup.stop(&registry, "fence", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_new_run_over_a_cumulative_block_ceiling_is_fenced_from_its_first_call() {
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fencerun",
+        &upstream.base_url,
+        &[("budget.tokens.cumulative", "100")],
+    );
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencerun").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200
+    );
+    let first = drain_observed_until_breaches(&mut sup, &registry, "fencerun", 1);
+    assert_eq!(first[0].scope, BreachScope::Cumulative);
+    sup.stop(&registry, "fencerun", Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // A new Run starts already over the cumulative ceiling: its fence is up
+    // before the first call, and the breach is recorded under the NEW run.
+    sup.start(&registry, "fencerun").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "{body}");
+    assert!(body.contains("tokens_cumulative"), "{body}");
+    assert_eq!(upstream.served(), 1);
+    let breaches = Supervisor::read_breach_events(&registry, "fencerun").unwrap();
+    assert_eq!(breaches.len(), 2, "{breaches:?}");
+    assert_ne!(breaches[0].run_id, breaches[1].run_id);
+    assert_eq!(breaches[1].action, BreachAction::Block);
+    sup.stop(&registry, "fencerun", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_run_under_its_block_ceiling_starts_with_the_fence_down() {
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fencedown",
+        &upstream.base_url,
+        &[("budget.tokens.cumulative", "1000")],
+    );
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencedown").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200
+    );
+    assert!(Supervisor::read_breach_events(&registry, "fencedown")
+        .unwrap()
+        .is_empty());
+    sup.stop(&registry, "fencedown", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn adoption_rebuilds_the_wire_fence_from_the_breach_log() {
+    // The engine-restart / adoption leg: the resumed Run's `block` breach is
+    // in breaches.log, so the adopting engine re-raises the fence on its
+    // re-bound listener before serving traffic — and writes no duplicate.
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("fenceadopt");
+    registry
+        .set_config(&name, "budget.tokens.per_run", "100")
+        .unwrap();
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .unwrap();
+    let run_id = registry
+        .spawn_record(&name)
+        .unwrap()
+        .and_then(|record| record.run_id)
+        .expect("the crashed Run's id rides the record");
+    Supervisor::with_backoff(fast_backoff()).record_token_breach(
+        &registry,
+        &name,
+        &run_id,
+        BreachScope::PerRun,
+        100,
+        100,
+        BreachAction::Block,
+        "engine-observed",
+    );
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(port, false, LogCaptureMode::Full)
+        .unwrap();
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let note = wait_for_sink_line(
+        &buffer,
+        "re-raised the wire fence",
+        "the fence rebuild note",
+    );
+    assert!(note.contains("tokens_per_run"), "{note}");
+    let (status, _, body) = fence_http_call(
+        &format!("http://127.0.0.1:{port}"),
+        "POST",
+        "/v1/chat/completions",
+        "{}",
+    );
+    assert_eq!(status, 402, "{body}");
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "fenceadopt")
+            .unwrap()
+            .len(),
+        1,
+        "adoption must not re-record the breach"
+    );
+    // Cleanup (see the zombie note on runmint).
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+}
+
+#[test]
+fn adoption_does_not_rebuild_a_fence_once_the_action_is_no_longer_block() {
+    // The latch action filter extends to the fence: an operator who moved
+    // the action off `block` gets no rebuilt fence on adoption.
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("fencemoved");
+    registry
+        .set_config(&name, "budget.tokens.per_run", "100")
+        .unwrap();
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "warn")
+        .unwrap();
+    let run_id = registry
+        .spawn_record(&name)
+        .unwrap()
+        .and_then(|record| record.run_id)
+        .unwrap();
+    Supervisor::with_backoff(fast_backoff()).record_token_breach(
+        &registry,
+        &name,
+        &run_id,
+        BreachScope::PerRun,
+        100,
+        100,
+        BreachAction::Block,
+        "engine-observed",
+    );
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup2);
+    sup2.set_serve_options(port, false, LogCaptureMode::Full)
+        .unwrap();
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    wait_for_sink_line(
+        &buffer,
+        "re-bound the observed-metering listener",
+        "the re-bind note",
+    );
+    assert!(!sink_text(&buffer).contains("re-raised the wire fence"));
+    let fence = sup2
+        .running
+        .get(&name)
+        .and_then(|supervised| supervised.observed_listener.as_ref())
+        .map(ObservedListener::fence)
+        .unwrap();
+    assert!(fence.refusal().is_none());
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+}
+
+#[test]
+fn an_adopted_block_run_without_a_listener_says_its_fence_was_not_rebuilt() {
+    // An ephemeral-port adopter cannot re-bind, so the fence has nowhere to
+    // live: surfaced, never silent.
+    let (_state, _manifest, registry, _rt, name) = setup_observed_crashed_engine("fencestrand");
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .unwrap();
+    let run_id = registry
+        .spawn_record(&name)
+        .unwrap()
+        .and_then(|record| record.run_id)
+        .unwrap();
+    Supervisor::with_backoff(fast_backoff()).record_token_breach(
+        &registry,
+        &name,
+        &run_id,
+        BreachScope::Cumulative,
+        100,
+        100,
+        BreachAction::Block,
+        "engine-observed",
+    );
+    let mut sup2 = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup2);
+    assert_eq!(sup2.adopt_orphans(&registry), 1);
+    let note = wait_for_sink_line(&buffer, "wire fence (", "the not-rebuilt note");
+    assert!(note.contains("could not be"), "{note}");
+    assert!(note.contains("tokens_cumulative"), "{note}");
+    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
+    std::mem::forget(sup2);
+}
+
+#[test]
+fn block_with_no_listener_records_the_breach_and_acts_as_warn_loudly() {
+    // A hand-edited instance layer reaches `block` on a self-reported
+    // instance (the config write would refuse it): the breach is recorded,
+    // nothing is fenced, and the diagnostic says so.
+    let (state, _manifest, registry) =
+        setup_fake("fencenone", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("fencenone").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 1\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "fencenone").unwrap();
+    drain_until_committed(&mut sup, &registry, state.path(), "fencenone", 1);
+    let breaches = Supervisor::read_breach_events(&registry, "fencenone").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].action, BreachAction::Block);
+    assert_eq!(state_of(&registry, "fencenone"), LifecycleState::Running);
+    let notes = sink_text(&buffer);
+    assert!(notes.contains("no wire listener to fence"), "{notes}");
+    assert!(notes.contains("acts as `warn`"), "{notes}");
+    assert!(notes.contains("self-reported"), "{notes}");
+    sup.stop(&registry, "fencenone", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_config_write_refuses_block_on_an_instance_without_a_listener() {
+    let (_state, _manifest, registry) = setup_fake("fencecfg", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencecfg").unwrap();
+    let path = registry.paths().instance_config(&name);
+    let before = std::fs::read(&path).ok();
+    for value in ["block", " block "] {
+        match registry.set_config(&name, config::BUDGET_BREACH_ACTION_KEY, value) {
+            Err(config::ConfigError::InvalidValue { key, reason, .. }) => {
+                assert_eq!(key, "budget.breach_action");
+                assert!(reason.contains("`self-reported`"), "{reason}");
+                assert!(reason.contains("pause, stop or warn"), "{reason}");
+            }
+            other => panic!("expected an InvalidValue refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        std::fs::read(&path).ok(),
+        before,
+        "a refused write leaves the config untouched"
+    );
+    for value in ["pause", "stop", "warn"] {
+        registry
+            .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, value)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_relaunch_says_a_per_run_block_fence_does_not_carry() {
+    let (_state, _manifest, registry) = setup_fake("fencerelaunch", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencerelaunch").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    let fenced = RunId::mint();
+    let unfenced = RunId::mint();
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &fenced,
+        BreachScope::PerRun,
+        10,
+        10,
+        BreachAction::Block,
+        "engine-observed",
+    );
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &unfenced,
+        BreachScope::Cumulative,
+        10,
+        10,
+        BreachAction::Block,
+        "engine-observed",
+    );
+    // No replaced Run, or one with only a cumulative fence: silent.
+    sup.note_relaunch_lifts_per_run_fence(&registry, &name, None);
+    sup.note_relaunch_lifts_per_run_fence(&registry, &name, Some(&unfenced));
+    assert!(!sink_text(&buffer).contains("does not carry"));
+    sup.note_relaunch_lifts_per_run_fence(&registry, &name, Some(&fenced));
+    let notes = sink_text(&buffer);
+    assert!(notes.contains("does not carry"), "{notes}");
+    assert!(notes.contains("(tokens)"), "{notes}");
+    assert!(notes.contains("cumulative ceiling"), "{notes}");
+}
+
+#[test]
+fn block_is_never_the_resolved_default() {
+    let (_state, _manifest, registry) = setup_fake("fencedefault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencedefault").unwrap();
+    let sup = Supervisor::with_backoff(fast_backoff());
+    assert!(!sup.block_configured(&registry, &name));
+    let effective = registry
+        .effective_config(&name, ConfigLayer::empty())
+        .unwrap();
+    assert_ne!(
+        config::resolve_token_budget(&effective).1,
+        BreachAction::Block
+    );
+    assert_ne!(config::resolve_cost(&effective).2, BreachAction::Block);
+}
+
+#[test]
+fn a_dollar_block_breach_fences_with_the_dollar_code() {
+    // The money dimension: 100 tokens at $1000/1M each way is $0.10, which
+    // reaches a $0.05 per-run Cost Cap; the fence then names the dollar code.
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fencedollar",
+        &upstream.base_url,
+        &[
+            ("cost.rate.input", "1000.00"),
+            ("cost.rate.output", "1000.00"),
+            ("budget.dollars.per_run", "0.05"),
+        ],
+    );
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencedollar").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200
+    );
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencedollar", 1);
+    assert_eq!(breaches[0].dimension, BreachDimension::Dollars);
+    assert_eq!(breaches[0].action, BreachAction::Block);
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "{body}");
+    assert!(body.contains("\"code\":\"dollars_per_run\""), "{body}");
+    assert!(body.contains("\"dimension\":\"dollars\""), "{body}");
+    assert_eq!(upstream.served(), 1);
+    sup.stop(&registry, "fencedollar", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn a_new_run_over_a_cumulative_dollar_block_cap_is_fenced_from_its_first_call() {
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fencedollarrun",
+        &upstream.base_url,
+        &[
+            ("cost.rate.input", "1000.00"),
+            ("cost.rate.output", "1000.00"),
+            ("budget.dollars.cumulative", "0.05"),
+        ],
+    );
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencedollarrun").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200
+    );
+    drain_observed_until_breaches(&mut sup, &registry, "fencedollarrun", 1);
+    sup.stop(&registry, "fencedollarrun", Some(Duration::from_secs(5)))
+        .unwrap();
+    sup.start(&registry, "fencedollarrun").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "{body}");
+    assert!(body.contains("dollars_cumulative"), "{body}");
+    assert_eq!(upstream.served(), 1);
+    sup.stop(&registry, "fencedollarrun", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn an_acp_instance_accepts_block_only_once_it_meters_through_the_listener() {
+    // The acp kind's source resolves from its effective config: without an
+    // upstream it is self-reported (refused); with one it is engine-observed.
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter("fenceacp", &AdapterRef::Native("acp".to_string()))
+        .unwrap();
+    let name = InstanceName::new("fenceacp").unwrap();
+    match registry.set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block") {
+        Err(config::ConfigError::InvalidValue { reason, .. }) => {
+            assert!(reason.contains("`self-reported`"), "{reason}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .expect("an engine-observed acp instance accepts block");
+}
+
+#[test]
+fn switching_to_block_after_a_recorded_breach_raises_the_fence_on_the_next_usage() {
+    // The latch is keyed by (dimension, scope), so a breach recorded under
+    // `warn` never fires again; moving the action to `block` mid-Run must
+    // still fence, without a second breach record.
+    let upstream = start_fence_upstream();
+    let (_state, _manifest, registry, rt, name) = setup_block_instance(
+        "fencelate",
+        &upstream.base_url,
+        &[("budget.tokens.per_run", "100")],
+    );
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "warn")
+        .unwrap();
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "fencelate").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200
+    );
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencelate", 1);
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert_eq!(
+        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
+        200,
+        "warn does not fence"
+    );
+    registry
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .unwrap();
+    // The next committed usage event runs enforcement, which raises the fence.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !sink_text(&buffer).contains("now applies") {
+        sup.drain_observed_all(&registry);
+        assert!(Instant::now() < deadline, "the late fence never rose");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "{body}");
+    assert_eq!(upstream.served(), 2);
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "fencelate")
+            .unwrap()
+            .len(),
+        1,
+        "no second breach record"
+    );
+    // Once raised, later usage does not repeat the note.
+    sup.drain_observed_all(&registry);
+    assert_eq!(sink_text(&buffer).matches("now applies").count(), 1);
+    sup.stop(&registry, "fencelate", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
+    // The pre-spawn evaluation itself: a zero per-run ceiling breaches on
+    // zero, so a fresh Run is fenced before its first call — for `block`
+    // only.
+    let (_state, _manifest, registry) = setup_fake("fencestart", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencestart").unwrap();
+    let path = registry.paths().instance_config(&name);
+    let sup = Supervisor::with_backoff(fast_backoff());
+
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 0\n",
+    )
+    .unwrap();
+    let fence = crate::metering::WireFence::default();
+    assert!(sup.run_start_fence(&registry, &name, &fence));
+    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"pause\"\n[budget.tokens]\nper_run = 0\n",
+    )
+    .unwrap();
+    let fence = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &fence));
+    assert!(fence.refusal().is_none());
+
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 10\n",
+    )
+    .unwrap();
+    let fence = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &fence));
+    assert!(fence.refusal().is_none());
 }

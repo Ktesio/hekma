@@ -27,6 +27,7 @@ use crate::ports::{
 use crate::store::SqliteStore;
 use crate::time::now_rfc3339;
 
+use super::budget::BreachAction;
 use super::config::{self, ConfigError, ConfigLayer, EffectiveConfig, SourceLayer};
 use super::error::RegistryError;
 use super::instance::AgentInstance;
@@ -1140,6 +1141,10 @@ impl Registry {
         // (1) Validate BEFORE touching disk (AC-B). A rejection returns here with
         // nothing written.
         config::validate_write(key, value)?;
+        // (1b) Story 19-2 — the instance-aware half: `block` fences model calls
+        // at the engine-observed metering listener, so it is refused on an
+        // instance that has none (PRD FR-49: never a silent no-op).
+        self.refuse_block_without_listener(name, key, value)?;
 
         // (2) Compute the AI-33 steering warnings (warn-only, before the write so
         // an Err return below can never carry a half-computed warning state).
@@ -1189,6 +1194,64 @@ impl Registry {
             }
         })?;
         Ok(warnings)
+    }
+
+    /// The instance's RESOLVED Metering Source — the one its next start uses:
+    /// an `acp` kind resolves from its effective config (story 14-3), every
+    /// other kind from the persisted adapter snapshot. Shared by the story-19-2
+    /// `block` refusal.
+    pub(crate) fn resolved_metering_source(
+        &self,
+        name: &InstanceName,
+    ) -> Result<String, ConfigError> {
+        let instance = self.require_instance(name)?;
+        if crate::acp::is_acp_kind(&instance.kind) {
+            let effective = self.effective_config(name, ConfigLayer::empty())?;
+            return Ok(crate::acp::resolve_acp_metering_source(&effective).to_string());
+        }
+        self.metering_source(name)
+            .map_err(|err| ConfigError::Store {
+                name: name.as_str().to_string(),
+                detail: err.to_string(),
+            })
+    }
+
+    /// Refuse `budget.breach_action = block` on an instance whose resolved
+    /// Metering Source is not `engine-observed` (story 19-2, PRD FR-49): the
+    /// fence lives on the metering listener, which only an engine-observed
+    /// instance runs, so `block` anywhere else would record breaches and fence
+    /// nothing. An UNREADABLE source refuses too (fail closed — money config is
+    /// never accepted on a guess). Any other key or action passes.
+    fn refuse_block_without_listener(
+        &self,
+        name: &InstanceName,
+        key: &str,
+        value: &str,
+    ) -> Result<(), ConfigError> {
+        if key != config::BUDGET_BREACH_ACTION_KEY
+            || value.trim().parse::<BreachAction>() != Ok(BreachAction::Block)
+        {
+            return Ok(());
+        }
+        let reason = match self.resolved_metering_source(name) {
+            Ok(source) if source == "engine-observed" => return Ok(()),
+            Ok(source) => format!(
+                "`block` fences model calls at the engine-observed metering listener, and this \
+                 instance meters via `{source}` (no listener) — choose pause, stop or warn, or \
+                 move the instance to engine-observed metering (set \
+                 `metering.upstream_base_url` where the adapter supports it)"
+            ),
+            Err(err) => format!(
+                "`block` needs the engine-observed metering listener, and this instance's \
+                 metering source could not be read ({err}) — fix the instance's registration \
+                 snapshot, or choose pause, stop or warn"
+            ),
+        };
+        Err(ConfigError::InvalidValue {
+            key: key.to_string(),
+            value: value.to_string(),
+            reason,
+        })
     }
 
     /// Acquire the per-instance config WRITE lock (see [`Self::set_config`]'s
