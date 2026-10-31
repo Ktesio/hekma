@@ -3,6 +3,7 @@
 //! additional `impl Supervisor` block, no signature or behavior change.
 
 use super::*;
+use crate::domain::{CostCap, Rate, TokenBudget};
 
 /// WHICH captured-output channel a self-reported usage drain reads (story
 /// 14-3, T3). The two channels are byte-identical in SEMANTICS (the same
@@ -1000,37 +1001,14 @@ impl Supervisor {
         // `None` = skipped entirely. The latch snapshot comes off the
         // supervisor's per-Run set (an unsupervised instance snapshots empty —
         // decide() then fires, and apply_breach declines below, as before).
-        let token = token_armed.then(|| governance::TokenArm {
-            run_total: self
-                .surfaced_read(registry, name, "per-run token totals", || {
-                    registry.run_usage_totals(name, run_id)
-                })
-                .map(|t| t.total_tokens())
-                .unwrap_or(0),
-            cumulative_total: self
-                .surfaced_read(registry, name, "cumulative token totals", || {
-                    registry.usage_totals(name)
-                })
-                .map(|t| t.total_tokens())
-                .unwrap_or(0),
-            budget,
-            action: token_action,
-        });
-        let dollar = dollar_armed.then(|| governance::DollarArm {
-            run_cost: self
-                .surfaced_read(registry, name, "per-run dollar cost", || {
-                    registry.run_cost_totals(name, run_id)
-                })
-                .unwrap_or(Micros::ZERO),
-            cumulative_cost: self
-                .surfaced_read(registry, name, "cumulative dollar cost", || {
-                    registry.cost_totals(name)
-                })
-                .unwrap_or(Micros::ZERO),
-            cap: cost_cap,
-            action: cost_action,
-        });
-        let latched = self
+        let (token, dollar) = self.governance_arms(
+            registry,
+            name,
+            Some(run_id),
+            (budget, token_action),
+            (rate, cost_cap, cost_action),
+        );
+        let latched: Vec<governance::LatchKey> = self
             .running
             .get(name)
             .map(|supervised| {
@@ -1045,11 +1023,33 @@ impl Supervisor {
         // (3) DECIDE — the pure governance core (story 19-1): token dimension
         // evaluated FIRST, dollar second, each filtered through the latch. No
         // I/O, no state — the same input always yields the same decisions.
+        // Story 19-2 — `block` set AFTER a pair already latched under another
+        // action: the latch (keyed by dimension and scope, not action) keeps
+        // `decide()` from firing it again, so the pairs that breach NOW under
+        // `block` but are latched are found here, with the latch ignored.
+        let late_block = if token.is_some_and(|arm| arm.action == BreachAction::Block)
+            || dollar.is_some_and(|arm| arm.action == BreachAction::Block)
+        {
+            governance::decide(&governance::GovernanceInput {
+                token,
+                dollar,
+                latched: Vec::new(),
+            })
+            .decisions
+            .into_iter()
+            .filter(|decision| decision.action == BreachAction::Block)
+            .map(|decision| governance::LatchKey::new(decision.dimension, decision.scope))
+            .filter(|key| latched.contains(key))
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let outcome = governance::decide(&governance::GovernanceInput {
             token,
             dollar,
             latched,
         });
+        self.fence_late_block(registry, name, &late_block);
 
         // (4) APPLY — the record-first-then-act half, per decision in FIRE ORDER
         // (token before dollar), through the SAME shared path as before.
@@ -1122,6 +1122,280 @@ impl Supervisor {
         }
     }
 
+    /// The pure decision input's ARMS for one instance (shared by
+    /// [`Self::enforce_budget`] and the story-19-2 [`Self::run_start_fence`]):
+    /// one arm per ARMED dimension, `None` = skipped. `run` names the Run whose
+    /// per-run totals are read; `None` is a FRESH Run whose per-run totals are
+    /// zero by construction (nothing has been committed under it yet), so only
+    /// the cumulative totals are read.
+    fn governance_arms(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        (budget, token_action): (TokenBudget, BreachAction),
+        (rate, cost_cap, cost_action): (Option<Rate>, CostCap, BreachAction),
+    ) -> (Option<governance::TokenArm>, Option<governance::DollarArm>) {
+        let token_armed = budget.is_set();
+        let dollar_armed = rate.is_some() && cost_cap.is_set();
+        let token = token_armed.then(|| governance::TokenArm {
+            run_total: run
+                .map(|run_id| {
+                    self.surfaced_read(registry, name, "per-run token totals", || {
+                        registry.run_usage_totals(name, run_id)
+                    })
+                    .map(|t| t.total_tokens())
+                    .unwrap_or(0)
+                })
+                .unwrap_or(0),
+            cumulative_total: self
+                .surfaced_read(registry, name, "cumulative token totals", || {
+                    registry.usage_totals(name)
+                })
+                .map(|t| t.total_tokens())
+                .unwrap_or(0),
+            budget,
+            action: token_action,
+        });
+        let dollar = dollar_armed.then(|| governance::DollarArm {
+            run_cost: run
+                .map(|run_id| {
+                    self.surfaced_read(registry, name, "per-run dollar cost", || {
+                        registry.run_cost_totals(name, run_id)
+                    })
+                    .unwrap_or(Micros::ZERO)
+                })
+                .unwrap_or(Micros::ZERO),
+            cumulative_cost: self
+                .surfaced_read(registry, name, "cumulative dollar cost", || {
+                    registry.cost_totals(name)
+                })
+                .unwrap_or(Micros::ZERO),
+            cap: cost_cap,
+            action: cost_action,
+        });
+        (token, dollar)
+    }
+
+    /// Whether the instance's CURRENT resolved Breach Action is `block` for
+    /// either dimension (story 19-2). A failed config read is `false` — the
+    /// same degrade `enforce_budget` takes (it returns early on that read).
+    pub(super) fn block_configured(&self, registry: &Registry, name: &InstanceName) -> bool {
+        registry
+            .effective_config(name, ConfigLayer::empty())
+            .map(|effective| {
+                let (_budget, token_action) = config::resolve_token_budget(&effective);
+                let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+                token_action == BreachAction::Block || cost_action == BreachAction::Block
+            })
+            .unwrap_or(false)
+    }
+
+    /// The RUN-START fence evaluation (story 19-2): before a new Run's process
+    /// spawns, evaluate the pure [`governance::decide`] against that FRESH Run
+    /// (per-run totals zero, cumulative totals from the ledger, an empty
+    /// latch) and RAISE `fence` for every `block` decision — so a Run that
+    /// begins at or over a `block` ceiling refuses its very first model call
+    /// instead of letting one through before the first usage event fires the
+    /// breach. Only `block` decisions act here; `pause`/`stop`/`warn` keep
+    /// their first-usage-event semantics untouched. Nothing is recorded or
+    /// latched here (the Run is not supervised yet): the caller runs
+    /// [`Self::enforce_budget`] once the `Supervised` exists, which records
+    /// and latches the same decisions under the new run id. Part of the AD-7
+    /// pipeline (same core, same module) — no other path raises a fence.
+    /// Returns whether any reason was raised, so the caller records it even
+    /// if the action changed in between (a raised fence is never unrecorded).
+    pub(super) fn run_start_fence(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        fence: &crate::metering::WireFence,
+    ) -> bool {
+        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
+            return false;
+        };
+        let (budget, token_action) = config::resolve_token_budget(&effective);
+        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
+        if token_action != BreachAction::Block && cost_action != BreachAction::Block {
+            return false;
+        }
+        let (token, dollar) = self.governance_arms(
+            registry,
+            name,
+            None,
+            (budget, token_action),
+            (rate, cost_cap, cost_action),
+        );
+        let outcome = governance::decide(&governance::GovernanceInput {
+            token,
+            dollar,
+            latched: Vec::new(),
+        });
+        let mut raised = false;
+        for decision in outcome
+            .decisions
+            .iter()
+            .filter(|decision| decision.action == BreachAction::Block)
+        {
+            fence.raise(governance::LatchKey::new(
+                decision.dimension,
+                decision.scope,
+            ));
+            raised = true;
+        }
+        raised
+    }
+
+    /// Surface that a Restart Policy relaunch LIFTS a per-run `block` fence
+    /// (story 19-2): the relaunch begins a NEW Run in today's code (a fresh run
+    /// id, a fresh per-run total, a fresh listener), so a per-run fence of the
+    /// Run it replaces does not carry — exactly as the per-run latch does not.
+    /// A cumulative fence re-raises at Run start on its own. When the replaced
+    /// Run (`replaced`, read off the spawn record before the relaunch
+    /// overwrote it) recorded a per-run `block` breach, say so, and point at
+    /// the cumulative ceiling that bounds a crash loop. Silent otherwise; an
+    /// unreadable breach log stays silent here (the adoption path already
+    /// surfaces that read). The carry itself arrives with story 21.2's Run,
+    /// which spans relaunches (deferred-work).
+    pub(super) fn note_relaunch_lifts_per_run_fence(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        replaced: Option<&RunId>,
+    ) {
+        let Some(replaced) = replaced else {
+            return;
+        };
+        let Ok(events) = read_breach_events_from(&registry.instance_breach_log_path(name)) else {
+            return;
+        };
+        let lifted: Vec<&'static str> = events
+            .iter()
+            .filter(|event| {
+                event.run_id == replaced.as_str()
+                    && event.action == BreachAction::Block
+                    && event.scope == BreachScope::PerRun
+            })
+            .map(|event| event.dimension.as_str())
+            .collect();
+        if lifted.is_empty() {
+            return;
+        }
+        self.log_enforcement_diagnostic(
+            registry,
+            name,
+            &format!(
+                "the Restart Policy relaunched this instance into a NEW Run, so the per-run \
+                 `block` fence of the previous Run ({}) does not carry into it — this Run starts \
+                 with a fresh per-run budget. Set a cumulative ceiling to bound spend across \
+                 relaunches",
+                lifted.join(", "),
+            ),
+        );
+    }
+
+    /// Raise the wire fence for `block` reasons whose breach was RECORDED
+    /// earlier this Run under another action (story 19-2): the operator moved
+    /// the action to `block` after the ceiling was reached, so the latch keeps
+    /// the breach from firing again, but the fence must still go up. No new
+    /// breach is recorded (the earlier record stands, naming its action); the
+    /// diagnostic says why the fence rose without one. Instances with no
+    /// listener are skipped (nothing to fence; `config set` refuses `block` for
+    /// them, and a fresh breach still reports the acts-as-warn fallback).
+    fn fence_late_block(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        reasons: &[governance::LatchKey],
+    ) {
+        let Some(fence) = self
+            .running
+            .get(name)
+            .and_then(|supervised| supervised.observed_listener.as_ref())
+            .map(ObservedListener::fence)
+        else {
+            return;
+        };
+        for reason in reasons {
+            if fence.is_raised(*reason) {
+                continue;
+            }
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "`block` now applies to the {} {} breach recorded earlier this Run under \
+                     another action — raising the wire fence without a new breach record",
+                    reason.dimension.as_str(),
+                    reason.scope.as_str(),
+                ),
+            );
+            self.enforce_block(registry, name, reason.dimension, reason.scope);
+        }
+    }
+
+    /// Execute a `block` Breach Action (story 19-2): RAISE the Run's wire
+    /// fence for `(dimension, scope)` on the instance's metering listener, so
+    /// `forward()` refuses every further model call with the `proxy-wire v1`
+    /// refusal, and surface the fence on the engine diagnostic surface (the
+    /// breach event, already recorded, carries `action: "block"`). An
+    /// instance with NO listener — a `self-reported` source reached through a
+    /// hand-edited layer or a source change after the write, or an adopted
+    /// instance whose listener could not be re-bound — cannot be fenced: the
+    /// breach stays recorded, acts as `warn`, and the diagnostic says so
+    /// loudly (AI-18; never a silent no-op).
+    fn enforce_block(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        dimension: BreachDimension,
+        scope: BreachScope,
+    ) {
+        let reason = governance::LatchKey::new(dimension, scope);
+        let Some(supervised) = self.running.get(name) else {
+            return;
+        };
+        match supervised
+            .observed_listener
+            .as_ref()
+            .map(ObservedListener::fence)
+        {
+            Some(fence) => {
+                fence.raise(reason);
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "budget breach ({} {}) — the wire fence is UP: the metering listener \
+                         refuses further model calls with HTTP 402 `{}` (code `{}`) until this \
+                         Run ends; raise the ceiling, then start a new Run",
+                        dimension.as_str(),
+                        scope.as_str(),
+                        governance::FENCE_ERROR_TYPE,
+                        governance::fence_code(reason),
+                    ),
+                );
+            }
+            None => {
+                let source = supervised.metering_source.clone();
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "budget breach ({} {}) is configured to `block`, but this instance has \
+                         no wire listener to fence (metering source `{source}`, or an adopted \
+                         instance whose listener could not be re-bound) — the fence could NOT \
+                         be raised; the breach is recorded and acts as `warn`. Set \
+                         `budget.breach_action` to pause or stop, or meter the instance through \
+                         the engine-observed listener",
+                        dimension.as_str(),
+                        scope.as_str(),
+                    ),
+                );
+            }
+        }
+    }
+
     /// Apply ONE breach decision for a given `dimension` (story 3-3 shared path):
     /// MARK the `(dimension, scope)` pair into the per-Run latch, RECORD the breach
     /// (via `record`, the dimension-specific event writer) FIRST/INDEPENDENTLY and
@@ -1172,6 +1446,10 @@ impl Supervisor {
             }
             BreachAction::Stop => {
                 self.enforce_stop(registry, name, cause);
+            }
+            BreachAction::Block => {
+                // Story 19-2: no lifecycle transition — the wire fence.
+                self.enforce_block(registry, name, dimension, scope);
             }
         }
     }

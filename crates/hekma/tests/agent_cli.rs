@@ -3722,6 +3722,63 @@ fn usage_view(ctx: &TestContext, state_dir: &Path, name: &str) -> UsageView {
         .unwrap_or_else(|e| panic!("usage --json usage is not a UsageView: {e}\n{doc}"))
 }
 
+// ---- Story 19-2: `block` is refused where there is no wire listener ----
+
+#[test]
+fn config_set_refuses_block_on_a_self_reported_instance_naming_the_source() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_hekma_agent(
+        &["agent", "register", "demo", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    let refused = run_hekma_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "block",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!refused.success, "stdout={}", refused.stdout);
+    assert!(
+        refused.stderr.contains("budget.breach_action")
+            && refused.stderr.contains("self-reported")
+            && refused.stderr.contains("pause, stop or warn"),
+        "the diagnostic names the key, the source and the remedy; stderr={}",
+        refused.stderr
+    );
+    let get = run_hekma_agent(
+        &["agent", "config", "get", "demo", "budget.breach_action"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        !get.stdout.contains("block"),
+        "the refused value must not land; stdout={}",
+        get.stdout
+    );
+    let warn = run_hekma_agent(
+        &[
+            "agent",
+            "config",
+            "set",
+            "demo",
+            "budget.breach_action",
+            "warn",
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(warn.success, "stderr={}", warn.stderr);
+}
+
 // ---- Story 3-3: dollar cost + Cost Cap rendering (AC-B/AC10 — AD-8) ----
 
 #[test]

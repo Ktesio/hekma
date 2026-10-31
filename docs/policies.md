@@ -5,7 +5,7 @@ description: "Standing limits that apply to every Run a Selector matches, and wa
 
 # Policies and the warn default
 
-> **In development.** Nothing on this page is in Hekma 0.11.0 or on main yet. It describes the design being built in the open, and names, commands and defaults may change before it ships. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **In development.** Apart from the `block` Breach Action, nothing on this page is in Hekma 0.11.0 or on main yet. It describes the design being built in the open, and names, commands and defaults may change before it ships. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/policies/](https://hekma.ktesio.dev/docs/policies/), where it is kept current.
 
@@ -17,7 +17,7 @@ A **Policy** is that rule: standing limits that apply to every [Run](runs.md) it
 
 In Hekma 0.11.0, limits are per-agent [config keys](https://hekma.ktesio.dev/docs/budgets/#set-a-budget): `budget.tokens.*`, `budget.dollars.*`, `cost.rate.*`, and one `budget.breach_action` for all of an agent's caps. The Breach Action defaults to `pause`, and `warn` only writes a line to `logs/breaches.log`. A cap fires once per run, and [raising it does not re-arm it](https://hekma.ktesio.dev/docs/budgets/#resume).
 
-On main, the [Control API](https://hekma.ktesio.dev/docs/control-api/) can set the same keys over HTTP. There are no Policies, labels or `block` yet.
+On main, the [Control API](https://hekma.ktesio.dev/docs/control-api/) can set the same keys over HTTP. `budget.breach_action` also accepts `block`, the wire fence, on agents whose usage is read off the wire (see [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/)). There are no Policies or labels yet.
 
 ## What is coming
 
@@ -41,7 +41,7 @@ Once Run Keys land (planned), a **Caller**, an agent or helper acting on its own
 
 **Upgrades keep your pause.** An agent registered before the change that relied on the implicit `pause` default keeps `pause`, written into its config, with a "kept on pause by upgrade" note in listings until you set a Breach Action yourself. A malformed `breach_action` fails closed to `pause` with a diagnostic, never to `warn`.
 
-**`block`, the wire fence.** `block` is never a default. Once configured, a breach refuses further model calls through the Metering Proxy with a typed, non-retryable response until the ceiling is raised or reset. An agent that bypasses the proxy bypasses the fence too.
+**`block`, the wire fence.** `block` is never a default. On main it already works per agent: on a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error, and the fence lifts when the Run ends (raise the ceiling, then start a new Run). With Policies it will apply to every Run on the Metering Proxy, and raising a ceiling will lift the fence on a live Run. An agent that bypasses the listener or the proxy bypasses the fence too.
 
 ## How it will work
 

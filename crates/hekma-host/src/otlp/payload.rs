@@ -584,6 +584,7 @@ fn action_str(action: BreachAction) -> &'static str {
         BreachAction::Pause => "pause",
         BreachAction::Stop => "stop",
         BreachAction::Warn => "warn",
+        BreachAction::Block => "block",
     }
 }
 

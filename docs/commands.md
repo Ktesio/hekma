@@ -524,7 +524,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
-| `budget.breach_action` | `pause` \| `stop` \| `warn` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering listener refuses further model calls (engine-observed instances only — see below) |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
 | `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |
@@ -540,6 +540,10 @@ Both Rate directions are required for dollars to be derived; with no Rate, dolla
 ### Budget breaches and the pause action
 
 When a token ceiling or dollar Cost Cap is crossed, the recorded breach names its scope (`per_run`/`cumulative`), the limit, and the observed value. With the default `breach_action: pause`, the enforcement pause on a **best-effort**-pause adapter carries the budget cause (`BudgetExceeded`, naming the token or dollar scope that crossed first) — the same honest cause surfaces whether the pause was operator-initiated or enforcement-initiated. When both a token ceiling and a dollar cap are set and both breach in the same enforcement pass, the token breach wins the pause (the dollar breach is still recorded); enforcement evaluates token ceilings before dollar caps. A `pause` breach on an already-paused instance does not abort the run — the breach is recorded and a diagnostic notes the pause could not be honored.
+
+### The wire fence: `block`
+
+`block` is for engine-observed instances. On a breach, the metering listener refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends: raise the ceiling, then `stop` and `start` the instance. A new Run that starts at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance without the listener (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
 
 ## Global Behavior
 
