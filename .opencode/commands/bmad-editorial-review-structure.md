@@ -1,5 +1,5 @@
 ---
-description: Deprecated — forwards to bmad-review.
+description: Deprecated — forwards to bmad-review
 ---
 
 @skills/bmad-editorial-review-structure
