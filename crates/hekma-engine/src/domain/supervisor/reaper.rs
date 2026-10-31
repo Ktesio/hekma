@@ -1656,15 +1656,28 @@ impl Supervisor {
                             Vec::new()
                         }
                     };
-                    let breached_scopes = breach_log_events
+                    let resumed_breaches = breach_log_events
                         .into_iter()
                         .filter(|event| event.run_id == run_id.as_str())
                         .filter(|event| match event.dimension {
                             BreachDimension::Tokens => event.action == token_action,
                             BreachDimension::Dollars => event.action == cost_action,
                         })
+                        .collect::<Vec<_>>();
+                    let breached_scopes = resumed_breaches
+                        .iter()
                         .map(|event| (event.dimension, event.scope))
                         .collect::<std::collections::HashSet<_>>();
+                    // Story 19-2: the DURABLE fence — the same latch-seeding
+                    // events, narrowed to `block`, are the reasons the resumed
+                    // Run's wire fence was up. Re-raised on the re-bound
+                    // listener below, so an engine restart or adoption never
+                    // drops a fence the latch would stop from re-firing.
+                    let fence_reasons = resumed_breaches
+                        .iter()
+                        .filter(|event| event.action == BreachAction::Block)
+                        .map(|event| crate::domain::LatchKey::new(event.dimension, event.scope))
+                        .collect::<Vec<_>>();
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
                     // anchors the same way (at the CURRENT end of the captured
@@ -1735,6 +1748,13 @@ impl Supervisor {
                     // [`adoption_rebind_decision`] seam (review finding 14:
                     // unit-tested on every OS — the process legs skip on the
                     // linux CI runner).
+                    // Story 19-2: the resumed Run's fence is raised BEFORE the
+                    // re-bind, so the re-bound listener is born fenced and no
+                    // request can slip through between bind and raise.
+                    let adopted_fence = crate::metering::WireFence::default();
+                    for reason in &fence_reasons {
+                        adopted_fence.raise(*reason);
+                    }
                     let adopted_listener =
                         match adoption_rebind_decision(&metering_source, self.metering_listen_port)
                         {
@@ -1745,6 +1765,7 @@ impl Supervisor {
                                             &name,
                                             &metering_source,
                                             &effective,
+                                            adopted_fence.clone(),
                                         ) {
                                             // `start_observed_listener` returns Some only for
                                             // an engine-observed instance — which this is.
@@ -1807,6 +1828,33 @@ impl Supervisor {
                     // Read BEFORE the listener moves into `Supervised` (the
                     // strand note below must know whether a live listener landed).
                     let rebind_landed = adopted_listener.is_some();
+                    // Story 19-2: report the resumed Run's rebuilt wire fence
+                    // (raised on `adopted_fence` before the re-bind above).
+                    if !fence_reasons.is_empty() {
+                        let codes = fence_reasons
+                            .iter()
+                            .map(|reason| crate::domain::fence_code(*reason))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        match adopted_listener.as_ref() {
+                            Some(_) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: re-raised the wire fence of the resumed Run from the \
+                                     breach log ({codes}) — the metering listener refuses \
+                                     further model calls until this Run ends",
+                                    name.as_str(),
+                                ));
+                            }
+                            None => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: the resumed Run's wire fence ({codes}) could not be \
+                                     rebuilt — the adopted instance has no metering listener \
+                                     (see the listener note); its breach stays recorded",
+                                    name.as_str(),
+                                ));
+                            }
+                        }
+                    }
                     // Story 18-2: re-resolve the adopted instance's declared
                     // liveness check from ITS adapter manifest (the same
                     // resolution the start seam runs). The window itself does

@@ -268,6 +268,25 @@ fn budget_breaches_sum_carry_dimension_scope_action_and_cumulative_temporality()
 }
 
 #[test]
+fn a_block_breach_is_exported_with_the_block_action() {
+    // Story 19-2: the wire fence's breach rides the same family, its action
+    // attribute spelled like the breach event's wire form.
+    let mut state = state();
+    state.observe(&token_breach("agent", BreachAction::Block));
+    let body = serde_json::to_value(state.snapshot(2_000)).unwrap();
+    let points = metric(&body, "hekma.budget.breaches")["sum"]["dataPoints"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(points.len(), 1);
+    assert!(points[0]["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["key"] == "hekma.budget.action" && a["value"]["stringValue"] == "block"));
+}
+
+#[test]
 fn a_dollar_breach_feeds_the_cost_sum_with_the_mandatory_estimate_state() {
     let mut state = state();
     state.observe(&dollar_breach(

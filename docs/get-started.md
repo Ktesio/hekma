@@ -99,7 +99,7 @@ hekma agent config set my-agent cost.rate.output 15.00
 hekma agent config set my-agent budget.dollars.cumulative 10.00
 ```
 
-The Breach Action (`pause`, `stop`, or `warn`) fires the instant a ceiling is reached, on real usage from the Usage Ledger — `warn` records the breach event only and performs no lifecycle transition. A dollar cap set without a Rate is inert until a Rate exists.
+The Breach Action (`pause`, `stop`, `warn`, or `block`) fires the instant a ceiling is reached, on real usage from the Usage Ledger — `warn` records the breach event only and performs no lifecycle transition, and `block` (engine-observed instances only) leaves the agent running but refuses its further model calls at the metering listener ([the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls)). A dollar cap set without a Rate is inert until a Rate exists.
 
 ## Inspect the fleet
 

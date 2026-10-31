@@ -28,7 +28,9 @@
 //! loopback-only bind (AC-B) + the no-leak discipline (the proxy carries the
 //! agent's API key upstream but leaks NONE of it into the ledger/logs/errors).
 
+mod fence;
 pub(crate) mod listener;
 mod parse;
 
+pub(crate) use fence::WireFence;
 pub(crate) use listener::{ListenerError, ObservedListener};

@@ -1487,7 +1487,9 @@ jobs:
         run: sha256sum -c crates/hekma-engine/governance/vectors-v1.json.sha256
       - name: Parse the vectors artifact (stand-in Host verification)
         # What a non-Rust Host does with the artifact: parse JSON, pin the
-        # header, assert unique ids, both case kinds, and full rule coverage.
+        # header, assert unique ids, every case kind, and full rule coverage.
+        # Story 19-2 (vectors 1.1.0) adds the `block-fence` rule and the
+        # `fence` kind, whose refusals a Host re-derives below.
         run: |
           python3 - <<'PY'
           import json
@@ -1516,11 +1518,35 @@ jobs:
               "round-half-up",
               "saturation",
               "no-retro-repricing",
+              "block-fence",
           }
           missing = expected - tags
           assert not missing, f"uncovered rules: {sorted(missing)}"
           assert kinds.get("decision"), f"no decision cases: {kinds}"
           assert kinds.get("derivation"), f"no derivation cases: {kinds}"
+          assert kinds.get("fence"), f"no fence cases: {kinds}"
+          # The fence consumer, re-implemented as a Host would: the first
+          # raised reason in canonical order, status 402, the stable class.
+          order = [
+              ("tokens", "per-run"),
+              ("tokens", "cumulative"),
+              ("dollars", "per-run"),
+              ("dollars", "cumulative"),
+          ]
+          for case in document["cases"]:
+              if case["kind"] != "fence":
+                  continue
+              raised = {(r["dimension"], r["scope"]) for r in case["reasons"]}
+              first = next((key for key in order if key in raised), None)
+              expected = case["expected"]
+              if first is None:
+                  assert expected is None, case["id"]
+                  continue
+              assert expected["status"] == 402, case["id"]
+              assert expected["error_type"] == "hekma_budget_block", case["id"]
+              assert (expected["dimension"], expected["scope"]) == first, case["id"]
+              code = f"{first[0]}_{first[1].replace('-', '_')}"
+              assert expected["code"] == code, case["id"]
           print(
               "governance vectors ok:"
               f" {len(document['cases'])} cases {kinds},"
