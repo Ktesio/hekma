@@ -198,7 +198,17 @@ jobs:
             *) echo "unsupported runner OS: ${{ runner.os }}" >&2; exit 2 ;;
           esac
           url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${art}.tar.gz"
-          tmp="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          # Git Bash quirks with $RUNNER_TEMP (a Windows D:\... path): MSYS
+          # sha256sum prints a '\' digest marker for backslash paths, and GNU
+          # tar reads the drive-letter colon as a REMOTE-HOST spec
+          # ("Cannot connect to D: resolve failed"). Normalize to a POSIX
+          # path ONCE, Windows only — every consumer below then sees a
+          # colon-free path (no-op on Linux/macOS runners).
+          if command -v cygpath >/dev/null 2>&1; then
+            tmp="$(cygpath -u "$RUNNER_TEMP")/cargo-nextest.tar.gz"
+          else
+            tmp="$RUNNER_TEMP/cargo-nextest.tar.gz"
+          fi
           curl --proto '=https' --tlsv1.2 -fsSL "$url" -o "$tmp"
           got="$(sha256sum "$tmp" 2>/dev/null || shasum -a 256 "$tmp")"
           got="${got%% *}"
