@@ -6,11 +6,11 @@ import { Provider } from './provider';
 
 export const metadata: Metadata = {
   description:
-    'Developer documentation for Hekma, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
+    'Developer documentation for Hekma, a Ktesio project: the control plane for agent workloads. Today it supervises the lifecycle of AI agents, meters real token usage and enforces budgets.',
   metadataBase: new URL('https://hekma.ktesio.dev'),
   openGraph: {
     description:
-      'Developer documentation for Hekma, a Ktesio project: a Rust CLI and engine that runs AI agents like services — supervise their lifecycle, meter real token usage, and enforce dollar budgets.',
+      'Developer documentation for Hekma, a Ktesio project: the control plane for agent workloads. Today it supervises the lifecycle of AI agents, meters real token usage and enforces budgets.',
     images: ['/assets/hekma-banner.png'],
     siteName: 'Hekma Docs',
     title: 'Hekma Docs',
