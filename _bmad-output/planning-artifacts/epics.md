@@ -1294,7 +1294,7 @@ Deliverables: the AD-20 spine text, and a bounded-options proposal for Islam.
   (AD-7, AD-26).
 - On breach, the pipeline flips a lock-free per-instance flag.
 - `forward()` refuses further model calls with a typed, non-retryable response (not 429), until the
-  ceiling is raised or reset.
+  Run ends (operator stop/start); raising a ceiling un-fences a live Run once 21.6 lands.
 - The breach event and log record the fence like any action.
 - Docs state its cooperative scope (NFR-6).
 - *(Readiness 2026-10-30.)* The spec records the refusal response as the first slice of `proxy-wire v1`: a
@@ -1496,7 +1496,8 @@ spine AD-25). Latch re-arm on a raised ceiling lands with `hekma budget` in Stor
   set, reporting success or failure per Run.
 - `hekma budget` reads, sets and raises Token Budgets and Cost Caps on matched Runs; raising
   re-arms the latch (the 19.3 re-arm, landed here), extending the Governance Vectors additively
-  with a `vectors_version` bump.
+  with a `vectors_version` bump. Raising a ceiling also clears the matching `block` fence reasons
+  on the live Run (19.2's deferred live un-fence).
 - Only Operator or Host credentials raise a ceiling.
 
 ### Story 21.7: `hekma top` (FR-57)
