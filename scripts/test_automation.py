@@ -1036,6 +1036,20 @@ class ReleaseDocsTests(unittest.TestCase):
         # schema version + vectors version.
         self.assertIn('document["schema_version"]', job)
         self.assertIn('document["vectors_version"]', job)
+        # Story 19-2: the stand-in Host must also require every case KIND the
+        # Rust `Case` enum serializes (a fourth kind added in Rust without the
+        # CI check would go unverified). The variants are read from the enum
+        # and kebab-cased the way its `rename_all = "kebab-case"` does.
+        case_body = governance_src.split("pub enum Case {", 1)[1].split("\n}", 1)[0]
+        case_variants = _re.findall(r"^    (\w+)\(", case_body, _re.MULTILINE)
+        self.assertTrue(case_variants, "the Case enum must list its variants")
+        for variant in case_variants:
+            kind = _re.sub(r"(?<!^)(?=[A-Z])", "-", variant).lower()
+            self.assertIn(
+                f'kinds.get("{kind}")',
+                job,
+                f"the stand-in Host must require the `{kind}` case kind",
+            )
 
     def test_ci_perf_budgets_job_runs_the_harness_blocking(self) -> None:
         # Story 7-5 (NFR-4): the designated perf job runs the perf-budgets

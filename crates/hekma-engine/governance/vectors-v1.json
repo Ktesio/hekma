@@ -1,14 +1,15 @@
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.0.0",
+  "vectors_version": "1.1.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
       "CostEvaluator",
       "cost_micros",
       "cost_micros_with_cached",
-      "governance::decide"
+      "governance::decide",
+      "governance::fence_refusal"
     ]
   },
   "cases": [
@@ -795,6 +796,235 @@
       ],
       "at_latest_rate": 6000000,
       "expected_micros": 4000000
+    },
+    {
+      "kind": "decision",
+      "id": "decision-block-fires-at-exact-ceiling",
+      "covers": [
+        "block-fence",
+        "threshold-ge"
+      ],
+      "input": {
+        "token": {
+          "run_total": 1000,
+          "cumulative_total": 1000,
+          "budget": {
+            "per_run": 1000,
+            "cumulative": null
+          },
+          "action": "block"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run",
+            "action": "block",
+            "limit": 1000,
+            "observed": 1000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-block-both-dimensions-token-first",
+      "covers": [
+        "block-fence",
+        "token-before-dollar"
+      ],
+      "input": {
+        "token": {
+          "run_total": 50,
+          "cumulative_total": 5000,
+          "budget": {
+            "per_run": null,
+            "cumulative": 5000
+          },
+          "action": "block"
+        },
+        "dollar": {
+          "run_cost": 2000000,
+          "cumulative_cost": 2000000,
+          "cap": {
+            "per_run": 1000000,
+            "cumulative": null
+          },
+          "action": "block"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative",
+            "action": "block",
+            "limit": 5000,
+            "observed": 5000
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run",
+            "action": "block",
+            "limit": 1000000,
+            "observed": 2000000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          },
+          {
+            "dimension": "dollars",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-block-latch-holds",
+      "covers": [
+        "block-fence",
+        "latch-per-scope"
+      ],
+      "input": {
+        "token": {
+          "run_total": 2000,
+          "cumulative_total": 2000,
+          "budget": {
+            "per_run": 1000,
+            "cumulative": null
+          },
+          "action": "block"
+        },
+        "latched": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "fence",
+      "id": "fence-no-reason-passes",
+      "covers": [
+        "block-fence"
+      ],
+      "reasons": [],
+      "expected": null
+    },
+    {
+      "kind": "fence",
+      "id": "fence-single-dollar-cumulative",
+      "covers": [
+        "block-fence"
+      ],
+      "reasons": [
+        {
+          "dimension": "dollars",
+          "scope": "cumulative"
+        }
+      ],
+      "expected": {
+        "status": 402,
+        "error_type": "hekma_budget_block",
+        "code": "dollars_cumulative",
+        "dimension": "dollars",
+        "scope": "cumulative"
+      }
+    },
+    {
+      "kind": "fence",
+      "id": "fence-reports-tokens-before-dollars",
+      "covers": [
+        "block-fence"
+      ],
+      "reasons": [
+        {
+          "dimension": "dollars",
+          "scope": "per-run"
+        },
+        {
+          "dimension": "tokens",
+          "scope": "cumulative"
+        }
+      ],
+      "expected": {
+        "status": 402,
+        "error_type": "hekma_budget_block",
+        "code": "tokens_cumulative",
+        "dimension": "tokens",
+        "scope": "cumulative"
+      }
+    },
+    {
+      "kind": "fence",
+      "id": "fence-reports-per-run-before-cumulative",
+      "covers": [
+        "block-fence"
+      ],
+      "reasons": [
+        {
+          "dimension": "tokens",
+          "scope": "cumulative"
+        },
+        {
+          "dimension": "tokens",
+          "scope": "per-run"
+        }
+      ],
+      "expected": {
+        "status": 402,
+        "error_type": "hekma_budget_block",
+        "code": "tokens_per_run",
+        "dimension": "tokens",
+        "scope": "per-run"
+      }
+    },
+    {
+      "kind": "fence",
+      "id": "fence-duplicate-reason-is-one-reason",
+      "covers": [
+        "block-fence"
+      ],
+      "reasons": [
+        {
+          "dimension": "dollars",
+          "scope": "per-run"
+        },
+        {
+          "dimension": "dollars",
+          "scope": "per-run"
+        }
+      ],
+      "expected": {
+        "status": 402,
+        "error_type": "hekma_budget_block",
+        "code": "dollars_per_run",
+        "dimension": "dollars",
+        "scope": "per-run"
+      }
     }
   ]
 }

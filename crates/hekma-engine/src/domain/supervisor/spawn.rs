@@ -352,8 +352,17 @@ impl Supervisor {
         // instance leaves `observed_listener` None and its start path UNCHANGED. The
         // held listener is moved into `Supervised` on success; on any later start
         // failure its `Drop` aborts the accept-loop task (RAII teardown, no leak).
+        // Story 19-2 — the RUN-START fence: before the listener serves and
+        // before the process spawns (it may call the model during startup or
+        // readiness), raise the new Run's wire fence for every `block` ceiling
+        // it already starts at or over (a cumulative ceiling, or a zero per-run
+        // one). The listener is born with this fence. Recorded + latched after
+        // the `Supervised` insert below.
+        let run_fence = crate::metering::WireFence::default();
+        let run_start_fenced = metering_source == "engine-observed"
+            && self.run_start_fence(registry, &name, &run_fence);
         let observed_listener =
-            self.start_observed_listener(&name, &metering_source, &effective)?;
+            self.start_observed_listener(&name, &metering_source, &effective, run_fence)?;
         // The effective config the MAPPING applies: for an observed instance it
         // carries the engine-injected loopback base_url (story 3-4), and for a
         // filesystem-backed instance the engine-computed managed memory dir at the
@@ -687,6 +696,13 @@ impl Supervisor {
         // (re)spawn — operator start, stop→start, or a Restart Policy restart —
         // flows through here, so each rewrites the record with a FRESH id: the
         // Run resets exactly when a new process is spawned, never on adoption.
+        // Story 19-2: a Restart Policy relaunch begins a NEW Run, so a per-run
+        // `block` fence of the Run it replaces does not carry. Read that Run's
+        // id off the record BEFORE the commit below overwrites it, so the
+        // relaunch can say so (see `note_relaunch_lifts_per_run_fence`).
+        let replaced_run_id = restart
+            .and_then(|_| registry.spawn_record(&name).ok().flatten())
+            .and_then(|record| record.run_id);
         let run_id = RunId::mint();
         let restart_count = restart.map(|(attempt, _)| attempt).unwrap_or(0);
         let record = SpawnRecord {
@@ -1189,6 +1205,10 @@ impl Supervisor {
         if restart.is_none() {
             self.requested_restart_streaks.remove(&name);
         }
+        // Story 19-2: kept for the post-insert `block` evaluation (both move
+        // into the `Supervised` below).
+        let fence_run_id = run_id.clone();
+        let fence_metering_source = metering_source.clone();
         self.running.insert(
             name.clone(),
             Supervised {
@@ -1256,6 +1276,20 @@ impl Supervisor {
             },
         );
 
+        // Story 19-2: with `block` configured (or a fence raised above, even if
+        // the action changed since — a raised fence must never go unrecorded),
+        // run the AD-7 enforcement stage once at Run start, so the breaches the
+        // Run-start fence raised above are RECORDED and LATCHED under the new
+        // run id (and an instance with
+        // no listener surfaces its acts-as-warn diagnostic now, not after the
+        // first call). Other actions keep their first-usage-event semantics.
+        if run_start_fenced || self.block_configured(registry, &name) {
+            self.enforce_budget(registry, &name, &fence_run_id, &fence_metering_source);
+        }
+        if restart.is_some() {
+            self.note_relaunch_lifts_per_run_fence(registry, &name, replaced_run_id.as_ref());
+        }
+
         registry.lookup(&name).map_err(registry_to_engine)
     }
 
@@ -1279,6 +1313,7 @@ impl Supervisor {
         name: &InstanceName,
         metering_source: &str,
         effective: &crate::domain::EffectiveConfig,
+        fence: crate::metering::WireFence,
     ) -> Result<Option<ObservedListener>, EngineError> {
         // Only an `engine-observed` instance runs a listener. `self-reported`
         // (and any other) leaves it None — its start path is byte-unchanged.
@@ -1318,13 +1353,16 @@ impl Supervisor {
         // mapping it into the detail cannot leak a secret (2-4 rigor); a pinned
         // port that is already taken surfaces here as the typed bind error
         // (AI-18 — never a silent hop).
-        let listener =
-            ObservedListener::start_on_port(runtime, upstream, self.metering_listen_port).map_err(
-                |e: ListenerError| EngineError::ObservedMetering {
-                    name: name.as_str().to_string(),
-                    detail: e.to_string(),
-                },
-            )?;
+        let listener = ObservedListener::start_on_port_with_fence(
+            runtime,
+            upstream,
+            self.metering_listen_port,
+            fence,
+        )
+        .map_err(|e: ListenerError| EngineError::ObservedMetering {
+            name: name.as_str().to_string(),
+            detail: e.to_string(),
+        })?;
         Ok(Some(listener))
     }
 
