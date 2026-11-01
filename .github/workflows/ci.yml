@@ -1288,8 +1288,10 @@ jobs:
           # TWO baselines, two honest freeze points:
           # * hekma-adapter-api @ 4119db3 — the contract-v1 freeze commit: the
           #   contract surface has been frozen since story 6-6.
-          # * hekma-engine @ 1e71389 — the epic-14 merge (2026-09-22, PR
-          #   #184): the latest deliberate post-freeze surface extension
+          # * hekma-engine @ 7783aa4 — the epic-14 squash's main-history twin
+          #   (2026-09-22, PR #193; see the 2026-10-31 CORRECTION note below
+          #   for why the twin replaced the superseded first squash): the
+          #   latest deliberate post-freeze surface extension
           #   (`EngineError::DetachRefused` + `SpawnSpec.detach` — announced
           #   in the PR) defines the new freeze point. The prior extension
           #   was epic-11's `EngineError::ResumeUnsupported` (AI-7, bee7d48,
@@ -1350,18 +1352,27 @@ jobs:
           # FRESH POST-RENAME BASELINES (pinned 2026-09-16, after the
           # hekma-* publishes, to 54dc79c — the PR #188 correction merge,
           # the first main-side rev carrying the hekma-* package names).
-          # EPIC-14 NOTE (resolved 2026-09-22): both baselines bumped to
-          # 1e71389 — the PR #193 epic-14 squash — for the announced
-          # hekma-engine 0.4.0→0.5.0 extension (`EngineError::
-          # AcpTurnInFlight` + `SpawnSpec.pipe_stdout`); the #181/#184
-          # post-merge step. adapter-api's epic-14 diff was semver-clean
-          # (doc comments only); its baseline rides the same rev.
+          # EPIC-14 NOTE (resolved 2026-09-22): both baselines bumped to the
+          # epic-14 squash — for the announced hekma-engine 0.4.0→0.5.0
+          # extension (`EngineError::AcpTurnInFlight` + `SpawnSpec.pipe_stdout`);
+          # the #181/#184 post-merge step. adapter-api's epic-14 diff was
+          # semver-clean (doc comments only); its baseline rides the same rev.
+          # 2026-10-31 CORRECTION: the pin moved 1e71389 → 7783aa4 — the
+          # main-history twin of the same #193 squash (identical trees for both
+          # gated crates: `git diff 1e713898 7783aa4 -- crates/hekma-adapter-api
+          # crates/hekma-engine` is empty). 1e713898 was the SUPERSEDED first
+          # squash of #193 — never in main's ancestry — and the semver lane
+          # rode it only while GitHub still resolved it via branches that
+          # happened to contain it; those branches' deletion (2026-10-31 merge
+          # batch) reded the gate's baseline clone ("An object prefixed …
+          # could not be found", hekma main runs 2026-10-31T22:11Z onward).
           # Same-name baseline diffing works from here on; the rename
           # surface checks above stay as the old-vs-new compat guard.
-          # BASELINE-REV CONSTRAINT: main-history revs only; bump here AND
+          # BASELINE-REV CONSTRAINT: main-history revs only — verified by
+          # ancestry, not just local resolvability; bump here AND
           # in scripts/test_automation.py together at the next freeze.
-          cargo +stable semver-checks check-release -p hekma-adapter-api --baseline-rev 1e713898f7b0b805dff83bd80e24febe99ca957f
-          cargo +stable semver-checks check-release -p hekma-engine --baseline-rev 1e713898f7b0b805dff83bd80e24febe99ca957f
+          cargo +stable semver-checks check-release -p hekma-adapter-api --baseline-rev 7783aa4c783184d06371cb61e0d66c57791535d0
+          cargo +stable semver-checks check-release -p hekma-engine --baseline-rev 7783aa4c783184d06371cb61e0d66c57791535d0
           for crate in hekma-engine hekma-adapter-api; do
             status="$(curl --silent --show-error --user-agent "$user_agent" --max-time 30 --retry 3 --output /dev/null --write-out "%{http_code}" "https://crates.io/api/v1/crates/${crate}")" || status=000
             case "$status" in
