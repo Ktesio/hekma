@@ -3164,6 +3164,129 @@ source = "self-reported"
         );
     }
 
+    // ---- set_config's per-instance write lock (story 11-2 serialization) ----
+    //
+    // The lock arms live here because the fault is FILESYSTEM-shaped: the
+    // lock's residue path is unusable, or a second writer holds the advisory
+    // lock across the engine's bounded wait. Both must surface the typed
+    // `ConfigError::Store` naming the lock (never hang, never write).
+
+    #[test]
+    fn set_config_fails_closed_when_the_config_write_lock_path_is_unusable() {
+        // Plant a DIRECTORY at the per-instance lock residue path: the
+        // open-or-create fails, and the write must fail closed with the typed
+        // Store error naming the lock — never touching the instance config
+        // (reject before side effect, the AI-24 atomicity discipline).
+        let (_tmp, reg) = open_temp();
+        reg.register("lockgone", "mock").unwrap();
+        let name = InstanceName::new("lockgone").unwrap();
+        let lock_path = reg.paths().instance_config_lock(&name);
+        std::fs::create_dir(&lock_path).unwrap();
+        let config_path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&config_path).unwrap();
+
+        let err = reg.set_config(&name, "model", "claude-op").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Store { name, detail, .. }
+                    if name == "lockgone"
+                        && detail.contains("could not open the config write lock")
+            ),
+            "an unusable lock path must fail the write with the typed Store error naming the lock"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "a failed lock acquisition must leave the instance config byte-unchanged"
+        );
+    }
+
+    #[test]
+    fn set_config_times_out_against_a_held_write_lock_and_succeeds_after_release() {
+        // A second writer holds the advisory lock: the engine's bounded wait
+        // (the store's BUSY_TIMEOUT_MS discipline) surfaces the typed Store
+        // error naming the lock without writing, and the SAME write succeeds
+        // once the holder releases — the OS owns the lock, so the residue
+        // file left behind is inert for the next writer.
+        let (_tmp, reg) = open_temp();
+        reg.register("lockheld", "mock").unwrap();
+        let name = InstanceName::new("lockheld").unwrap();
+        let lock_path = reg.paths().instance_config_lock(&name);
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        holder.try_lock().unwrap();
+        let config_path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&config_path).unwrap();
+
+        let err = reg.set_config(&name, "model", "claude-op").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::Store { name, detail, .. }
+                    if name == "lockheld" && detail.contains("config write lock")
+            ),
+            "a held lock must time out with the typed Store error naming the lock"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "the timed-out write must leave the instance config byte-unchanged"
+        );
+
+        // Release: the retry acquires the lock through the SAME residue file
+        // and the value persists (the lock, never the content, decides).
+        drop(holder);
+        reg.set_config(&name, "model", "claude-op").unwrap();
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            after.contains("claude-op"),
+            "the retried write must persist the value after the holder releases"
+        );
+    }
+
+    #[test]
+    fn set_config_refuses_block_when_the_metering_source_cannot_be_read() {
+        // FR-49 fail-closed leg: `budget.breach_action = block` on an instance
+        // whose resolved metering source is UNREADABLE (a degraded
+        // registration snapshot) is refused with the remediation reason —
+        // money config is never accepted on a guess — and nothing is written.
+        let (_tmp, reg) = open_temp();
+        let manifest = TempDir::new().unwrap();
+        register_flag_target_instance(&reg, "blkbad", manifest.path());
+        let name = InstanceName::new("blkbad").unwrap();
+        let snapshot_path = reg.paths().agent_home(&name).join("adapter.json");
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).unwrap();
+        let config_path = reg.paths().instance_config(&name);
+        let before = std::fs::read(&config_path).unwrap();
+
+        let err = reg
+            .set_config(&name, "budget.breach_action", "block")
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::InvalidValue { key, value, reason, .. }
+                    if key == "budget.breach_action"
+                        && value == "block"
+                        && reason.contains("could not be read")
+                        && reason.contains("pause, stop or warn")
+            ),
+            "an unreadable metering source must refuse block with the remediation reason"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            before,
+            "the refused write must leave the instance config byte-unchanged"
+        );
+    }
+
     #[test]
     fn set_config_agent_pass_through_key_round_trips_verbatim() {
         // AC7: an agent.* key writes successfully and round-trips verbatim at the
