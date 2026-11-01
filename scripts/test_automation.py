@@ -888,8 +888,11 @@ class ReleaseDocsTests(unittest.TestCase):
             check_release_sites,
             3,
             "three armed check-release sites: the fresh post-rename "
-            "baselines pinned to 1e71389 — the PR #193 epic-14 squash "
-            "(2026-09-22) — for hekma-adapter-api + hekma-engine, "
+            "baselines pinned to 7783aa4 — the PR #193 epic-14 squash's "
+            "main-history twin (2026-09-22; moved off the superseded first "
+            "squash 1e713898 on 2026-10-31 — never in main's ancestry, "
+            "orphaned out of baseline resolution once its containing "
+            "branches were deleted) — for hekma-adapter-api + hekma-engine, "
             "plus the crates.io release-to-release loop; "
             f"found {check_release_sites}",
         )
