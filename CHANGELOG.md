@@ -4,6 +4,11 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — `hekma agent show`, `usage <name>` and `config get` tables no longer clip a header, or a value the table has room for.**
+> Announced ahead of the release that ships it:
+>
+> - The human tables capped their columns in code, not from the terminal: `hekma agent show` printed its Capabilities header as `Support (curren…` and capped every Runtime-status value at 48 columns however wide the terminal was — a Usage row carrying both scopes lost its current-run figures (`this run: in …`), and a tokens-plus-dollars Budget row lost its inline estimate label to `(estimat…`. A column's cap is now never below its header's width, so a header renders whole wherever the table fits, and the Value columns of `show`, `usage <name>` and `config get` grow with the terminal up to their longest cell, taking only the width the table's other columns leave (a long `config get` value never squeezes the Validated and Source columns). The width comes from `COLUMNS`, else the terminal's width, else 80 columns when stdout is not a terminal (79 on Windows), clamped to 40–132 columns. A row the table has no room for is still cut at the width with `…` — on 80 columns that can fall inside a dollar label — while `--json` carries every figure whole. `hekma agent list` keeps its compact 80-column design; `--json` output and exit codes are unchanged.
+
 > **Unreleased — the wire fence: a `block` Breach Action (hekma-engine 0.10.0).**
 > Announced ahead of the release that ships it:
 >
