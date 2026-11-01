@@ -109,6 +109,14 @@
 //!   the file at all — the absent-heartbeat subject (absent ≡ stale). Pure
 //!   `std`, NO OS-cfg.
 //!
+//! * `--heartbeat-stop-on-pause <PAUSE>`  stop the `--heartbeat-ms` loop
+//!   PERMANENTLY once `<PAUSE>` exists — the resume-lying cooperative
+//!   subject: it obeys its pause command (the heartbeat freezes exactly as
+//!   a suspended process would) but never resumes beating after the resume
+//!   command runs, the lie the TCK freeze proof's post-resume growth watch
+//!   exists to catch. Requires `--heartbeat-ms` (refused with exit 2
+//!   otherwise — a silent no-op would fake a pass). Pure `std`, NO OS-cfg.
+//!
 //! * `--touch <PATH>`  (story 18-4, the lifecycle-command fixture)  create
 //!   `<PATH>` (parents created) and EXIT 0 immediately — a `--touch`
 //!   invocation's WHOLE job is the file: it runs as a plain engine lifecycle
@@ -408,6 +416,12 @@ struct Opts {
     /// needed). `Some(0)` = never touch the file at all (the absent-heartbeat
     /// subject). `None` = beat for the process's lifetime.
     heartbeat_stop_after: Option<u64>,
+    /// Stop the stdout heartbeat loop PERMANENTLY once this pause sentinel
+    /// exists (the resume-lying cooperative subject: obeys its pause
+    /// command, never resumes beating). Requires `heartbeat` — validated
+    /// after parsing. `None` = the heartbeat runs for the process's
+    /// lifetime (the default, unchanged 1-5 behavior).
+    heartbeat_stop_on_pause: Option<PathBuf>,
     /// Serve a persistent HTTP health endpoint on `127.0.0.1:<port>` answering
     /// `<status>` (the liveness story, 18-2): the signal a manifest's
     /// `[liveness.http_get]` check polls. The liveness twin of `--http-ready`
@@ -530,6 +544,7 @@ fn parse() -> Opts {
     let mut http_health_fail_after: Option<Duration> = None;
     let mut heartbeat_file: Option<(PathBuf, u64)> = None;
     let mut heartbeat_stop_after: Option<u64> = None;
+    let mut heartbeat_stop_on_pause: Option<PathBuf> = None;
     let mut ready_file: Option<(PathBuf, u64)> = None;
     let mut ready_line: Option<(String, u64)> = None;
     let mut never_ready: Option<Duration> = None;
@@ -721,6 +736,23 @@ fn parse() -> Opts {
                         eprintln!(
                             "fake_agent: --heartbeat-stop-after requires a DELAY_MS value (0 \
                              = never beat; got missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--heartbeat-stop-on-pause" => {
+                // Fail FAST (same mirror): a missing value would silently run
+                // the ever-beating subject and a resume-lying drill would
+                // measure nothing but a pass.
+                match args.next() {
+                    Some(path) if !path.is_empty() => {
+                        heartbeat_stop_on_pause = Some(PathBuf::from(path))
+                    }
+                    _ => {
+                        eprintln!(
+                            "fake_agent: --heartbeat-stop-on-pause requires a PAUSE sentinel \
+                             path (got missing or empty value)"
                         );
                         std::process::exit(2);
                     }
@@ -1024,6 +1056,13 @@ fn parse() -> Opts {
         );
         std::process::exit(2);
     }
+    if heartbeat_stop_on_pause.is_some() && heartbeat.is_none() {
+        eprintln!(
+            "fake_agent: --heartbeat-stop-on-pause requires --heartbeat-ms MS (there is no \
+             heartbeat to stop)"
+        );
+        std::process::exit(2);
+    }
     if http_health_fail_after.is_some() && http_health.is_none() {
         eprintln!(
             "fake_agent: --http-health-fail-after requires --http-health PORT:STATUS \
@@ -1120,6 +1159,7 @@ fn parse() -> Opts {
         never_ready,
         heartbeat_file,
         heartbeat_stop_after,
+        heartbeat_stop_on_pause,
         http_health,
         http_health_fail_after,
         exit_with,
@@ -1490,6 +1530,10 @@ fn main() {
     // instance is `running` first.
     let exit_with_deadline = opts.exit_with.map(|(code, d)| (code, start + d));
     let mut beats: u64 = 0;
+    // The --heartbeat-stop-on-pause mirror: the loop reads this local instead
+    // of opts.heartbeat so the pause sentinel can retire the heartbeat
+    // PERMANENTLY (opts itself stays immutable, like every other mode's read).
+    let mut stdout_heartbeat = opts.heartbeat;
     let mut next_beat = opts.heartbeat.map(|interval| Instant::now() + interval);
     // Story 4-2: an INDEPENDENT stderr counter/interval (own `beats`, own
     // `next_beat`) so both streams can heartbeat simultaneously without
@@ -1521,7 +1565,17 @@ fn main() {
                 std::process::exit(code);
             }
         }
-        if let (Some(interval), Some(due)) = (opts.heartbeat, next_beat) {
+        // The resume-lying subject: once the pause sentinel exists, the
+        // heartbeat stops PERMANENTLY. Checked every short poll — the pause
+        // command's --touch lands between iterations, and a beat already due
+        // in the same window may fire first; the stop is permanent after it.
+        if let (Some(_), Some(sentinel)) = (stdout_heartbeat, &opts.heartbeat_stop_on_pause) {
+            if sentinel.exists() {
+                stdout_heartbeat = None;
+                next_beat = None;
+            }
+        }
+        if let (Some(interval), Some(due)) = (stdout_heartbeat, next_beat) {
             if Instant::now() >= due {
                 let _ = writeln!(stdout, "heartbeat {beats}");
                 let _ = stdout.flush();

@@ -9754,4 +9754,174 @@ env = "TCK_SUBJECT_MEMORY"
         assert_eq!(back.adapter_kind, "old");
         assert_eq!(back.contract_version, "", "empty = produced pre-field");
     }
+
+    // ------------------------------------------------------------------
+    // heartbeat_freeze_inner's lie-detection arms. The harness only ever
+    // runs the freeze proof on its OWN signal-path probe (guaranteed, no
+    // command pair); these pin the DETECTION directly — a misbehaving
+    // probe of each documented lie shape must trip the named arm, never
+    // pass vacuously. All three drive the private pipeline fn through a
+    // real engine, mirroring how the section runner would call it.
+    // ------------------------------------------------------------------
+
+    /// A probe whose heartbeat NEVER STARTS: the startup wait must exhaust
+    /// its budget and fail naming the probe — a vacuous pass here would
+    /// mean the proof runs against a dead probe undetected.
+    #[test]
+    fn heartbeat_freeze_detects_a_probe_that_never_beats() {
+        let state = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-quiet-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-quiet-m-")
+            .tempdir()
+            .expect("tempdir");
+        write_probe_manifest(
+            manifest.path(),
+            "tck-quiet-probe",
+            &["--linger-ms", "600000"],
+            Some("best-effort"),
+            "guaranteed",
+            "self-reported",
+            "1.0.0",
+            None,
+        )
+        .expect("write quiet probe manifest");
+        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "tck-quiet-probe",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .expect("register quiet probe");
+        facade.start("tck-quiet-probe").expect("start quiet probe");
+        wait_for_state(
+            &facade,
+            "tck-quiet-probe",
+            LifecycleState::Running,
+            Duration::from_secs(10),
+        )
+        .expect("quiet probe reaches running");
+        // A deliberately small budget: the quiet loop must time it out.
+        let verdict =
+            heartbeat_freeze_inner(&facade, "tck-quiet-probe", Duration::from_millis(400));
+        let _ = facade.stop("tck-quiet-probe", Some(Duration::from_secs(5)));
+        let err =
+            verdict.expect_err("a never-beating probe must fail the freeze proof's startup wait");
+        assert!(
+            err.contains("heartbeat never started") && err.contains("tck-quiet-probe"),
+            "the failure must name the never-started arm and the probe"
+        );
+    }
+
+    /// The lying cooperative-pause subject: a declared
+    /// `[lifecycle.pause]`/`[lifecycle.resume]` command pair makes the
+    /// engine's cooperative-first dispatch run the SUBJECT'S commands (the
+    /// state reaches Paused without any signal) — a subject that keeps
+    /// beating while "paused" is exactly the lie the 1s watch exists to
+    /// catch.
+    #[test]
+    fn heartbeat_freeze_detects_a_subject_that_keeps_beating_while_paused() {
+        let state = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-lying-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-lying-m-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-lying-pause",
+            &["--heartbeat-ms", "50", "--linger-ms", "600000"],
+        )
+        .guaranteed_on_all_oses("pause")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "tck-lying-pause",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .expect("register lying probe");
+        facade.start("tck-lying-pause").expect("start lying probe");
+        wait_for_state(
+            &facade,
+            "tck-lying-pause",
+            LifecycleState::Running,
+            Duration::from_secs(10),
+        )
+        .expect("lying probe reaches running");
+        let verdict = heartbeat_freeze_inner(&facade, "tck-lying-pause", Duration::from_secs(5));
+        let _ = facade.stop("tck-lying-pause", Some(Duration::from_secs(5)));
+        let err = verdict
+            .expect_err("a subject that keeps beating while Paused must fail the freeze watch");
+        assert!(
+            err.contains("heartbeat must NOT grow while paused"),
+            "the failure must name the grows-while-paused arm"
+        );
+    }
+
+    /// The resume-lying subject (`--heartbeat-stop-on-pause`): it OBEYS the
+    /// pause — the heartbeat freezes when the pause command's sentinel
+    /// lands, so the whole paused window reads flat — then never resumes
+    /// beating after the resume command runs. Resume still reaches Running;
+    /// the post-resume growth wait must be the arm that names the lie.
+    #[test]
+    fn heartbeat_freeze_detects_a_subject_that_never_resumes_beating() {
+        let state = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-dead-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-dead-m-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-dead-resume",
+            &[
+                "--heartbeat-ms",
+                "50",
+                "--linger-ms",
+                "600000",
+                "--heartbeat-stop-on-pause",
+                "pause.sentinel",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "tck-dead-resume",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .expect("register dead-resume probe");
+        facade
+            .start("tck-dead-resume")
+            .expect("start dead-resume probe");
+        wait_for_state(
+            &facade,
+            "tck-dead-resume",
+            LifecycleState::Running,
+            Duration::from_secs(10),
+        )
+        .expect("dead-resume probe reaches running");
+        // The budget bounds BOTH bounded waits; 700ms is generous for the
+        // 50ms startup beats and still short for the stuck-growth wait.
+        let verdict =
+            heartbeat_freeze_inner(&facade, "tck-dead-resume", Duration::from_millis(700));
+        let _ = facade.stop("tck-dead-resume", Some(Duration::from_secs(5)));
+        let err = verdict
+            .expect_err("a subject that never resumes beating must fail the post-resume wait");
+        assert!(
+            err.contains("heartbeat must resume growing after SIGCONT"),
+            "the failure must name the stuck-after-resume arm"
+        );
+    }
 }
