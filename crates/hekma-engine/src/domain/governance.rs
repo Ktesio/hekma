@@ -1734,6 +1734,59 @@ mod tests {
     }
 
     #[test]
+    fn checksum_file_content_renders_the_sha256sum_c_line_for_any_bytes() {
+        // The bless lever's sidecar writer, pinned OUTSIDE the lever (the
+        // lever never fires in CI): for arbitrary canonical bytes the line
+        // is `<64-char lowercase hex digest>  <repo-relative artifact
+        // path>` + one newline — exactly the `sha256sum -c` contract the
+        // repo-root gate verifies in place.
+        let line = checksum_file_content("stable canonical bytes");
+        let (hex, rest) = line
+            .split_once("  ")
+            .expect("the digest and the path are separated by two spaces");
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "the digest must be 64 lowercase hex characters"
+        );
+        assert_eq!(rest, format!("{GOVERNANCE_VECTORS_ARTIFACT_PATH}\n"));
+        // The digest itself must be the artifact digest of THOSE bytes (not
+        // of the committed artifact): independently recomputed.
+        assert_eq!(
+            hex,
+            crate::sha256::to_hex(&crate::sha256::digest("stable canonical bytes".as_bytes()))
+        );
+    }
+
+    #[test]
+    fn cover_tag_as_str_matches_the_serde_wire_form_for_every_variant() {
+        // The closed rule set's tags travel on TWO surfaces — the `as_str`
+        // accessor and serde's kebab-case rename — and the verifier's
+        // `ALL_COVERS` match relies on them never drifting apart. Round-trip
+        // every wire form through BOTH surfaces for all nine variants.
+        for expected in [
+            "threshold-ge",
+            "latch-per-scope",
+            "latch-re-arm",
+            "token-before-dollar",
+            "integer-micros",
+            "round-half-up",
+            "saturation",
+            "no-retro-repricing",
+            "block-fence",
+        ] {
+            let tag: CoverTag = serde_json::from_str(&format!("\"{expected}\""))
+                .unwrap_or_else(|err| panic!("wire form must deserialize: {err}"));
+            assert_eq!(tag.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&tag).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
     fn every_committed_case_reruns_exactly_against_the_real_functions() {
         // VERIFIER (c) — the HOST'S PIN, executed by the engine itself:
         // parse the COMMITTED bytes and re-run every case against the real
