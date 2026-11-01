@@ -139,16 +139,33 @@ pub(crate) struct TableColumn {
     header: &'static str,
     min_width: usize,
     max_width: usize,
+    /// Grows only after every capped column reaches its desired width.
+    flexible: bool,
     align: Alignment,
 }
 
 impl TableColumn {
+    /// A column `min_width` to `max_width` display columns wide. The cap is
+    /// floored at the header's own display width, so a column never truncates
+    /// its header at a width where the table fits; only the shrink pass of a
+    /// table too wide for the terminal can clip a header.
     pub(crate) fn new(header: &'static str, min_width: usize, max_width: usize) -> Self {
         Self {
             header,
             min_width,
-            max_width,
+            max_width: max_width.max(measure_text_width(header)),
+            flexible: false,
             align: Alignment::Left,
+        }
+    }
+
+    /// A column that grows with the terminal: it takes the width the capped
+    /// columns leave (up to its longest cell) and shrinks only when the table
+    /// does not fit, truncating its cells with `…`.
+    pub(crate) fn flexible(header: &'static str, min_width: usize) -> Self {
+        Self {
+            flexible: true,
+            ..Self::new(header, min_width, MAX_TABLE_WIDTH)
         }
     }
 }
@@ -253,14 +270,20 @@ fn table_widths(
         widths[index] -= 1;
     }
 
+    // Capped columns grow first, in column order, each up to its desired width;
+    // only then the flexible ones, which take the width the capped columns leave
+    // (`sort_by_key` is stable, so each group keeps its column order).
+    let mut grow_order = (0..columns.len()).collect::<Vec<_>>();
+    grow_order.sort_by_key(|&index| columns[index].flexible);
+
     loop {
         let total = widths.iter().sum::<usize>();
         if total >= available {
             break;
         }
 
-        let Some(index) = columns.iter().enumerate().find_map(|(index, column)| {
-            (widths[index] < desired[index] && widths[index] < column.max_width).then_some(index)
+        let Some(index) = grow_order.iter().copied().find(|&index| {
+            widths[index] < desired[index] && widths[index] < columns[index].max_width
         }) else {
             break;
         };
@@ -418,6 +441,163 @@ mod tests {
 
         assert_eq!(widths.len(), columns.len());
         assert!(widths.iter().sum::<usize>() <= 20);
+    }
+
+    #[test]
+    fn test_table_column_cap_never_falls_below_its_header() {
+        // A cap below the header's display width is floored at the header; a cap
+        // at or above it is kept as given.
+        let header = "Support (current OS)";
+        let header_width = measure_text_width(header);
+        assert_eq!(TableColumn::new(header, 14, 16).max_width, header_width);
+        assert_eq!(TableColumn::new(header, 14, 24).max_width, 24);
+
+        // So the header renders whole at every width where the table fits.
+        let columns = [
+            TableColumn::new("Capability", 12, 24),
+            TableColumn::new(header, 14, 16),
+        ];
+        let rows = vec![vec![
+            TableCell::skill("pause"),
+            TableCell::status("guaranteed"),
+        ]];
+        for display_width in [MIN_TABLE_WIDTH, 80, 120, MAX_TABLE_WIDTH] {
+            let widths = table_widths(&columns, &rows, display_width);
+            assert!(widths[1] >= header_width, "{display_width}: {widths:?}");
+            let rendered = render_table("Capabilities", &columns, &rows, display_width);
+            assert!(rendered[1].contains(header), "{}", rendered[1]);
+            assert!(!rendered[1].contains(ELLIPSIS), "{}", rendered[1]);
+        }
+    }
+
+    #[test]
+    fn test_flexible_column_grows_with_the_terminal_up_to_its_longest_cell() {
+        // A Field/Value table like `hekma agent show`'s runtime status, with a
+        // 78-column value: whole at 120 columns, truncated at 80.
+        let value =
+            "cumulative in 153990 / out 14410; this run: in 153990 / out 14410 / cached 512";
+        let rows = vec![
+            vec![TableCell::plain("State"), TableCell::status("paused")],
+            vec![TableCell::plain("Usage (tokens)"), TableCell::plain(value)],
+        ];
+        let usage_row = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|line| line.starts_with("Usage (tokens)"))
+                .cloned()
+                .expect("the Usage row renders")
+        };
+        let flexible = [
+            TableColumn::new("Field", 14, 20),
+            TableColumn::flexible("Value", 14),
+        ];
+
+        // Room to spare: the column grows to its longest cell, and no further.
+        assert_eq!(
+            table_widths(&flexible, &rows, 120)[1],
+            measure_text_width(value)
+        );
+        let wide = render_table("Runtime status", &flexible, &rows, 120);
+        assert!(usage_row(&wide).contains(value), "{wide:#?}");
+
+        // Too narrow for the whole row: the cell truncates with the ellipsis and
+        // every line still fits the terminal.
+        let narrow = render_table("Runtime status", &flexible, &rows, 80);
+        let narrow_usage = usage_row(&narrow);
+        assert!(narrow_usage.ends_with(ELLIPSIS), "{narrow_usage}");
+        assert!(!narrow_usage.contains(value), "{narrow_usage}");
+        for line in &narrow {
+            assert!(measure_text_width(line) <= 80, "{line}");
+        }
+
+        // A fixed cap still stops at its cap with room to spare: growth is opt-in.
+        let capped = [
+            TableColumn::new("Field", 14, 20),
+            TableColumn::new("Value", 14, 48),
+        ];
+        assert_eq!(table_widths(&capped, &rows, 120)[1], 48);
+        let capped_usage = usage_row(&render_table("Runtime status", &capped, &rows, 120));
+        assert!(capped_usage.ends_with(ELLIPSIS), "{capped_usage}");
+    }
+
+    #[test]
+    fn test_flexible_column_still_lays_out_on_a_narrow_terminal() {
+        // At the display-width floor and below it, a table with a long header and
+        // a flexible column stays within the width without panicking. The header
+        // is whole where the table fits (40); below that the shrink pass may clip it.
+        let header = "Support (current OS)";
+        let columns = [
+            TableColumn::new(header, 14, 16),
+            TableColumn::flexible("Value", 14),
+        ];
+        let rows = vec![vec![
+            TableCell::status("guaranteed"),
+            TableCell::plain("cumulative in 153990 / out 14410; this run: in 153990 / out 14410"),
+        ]];
+        for display_width in [MIN_TABLE_WIDTH, 24] {
+            let rendered = render_table("Narrow", &columns, &rows, display_width);
+            assert_eq!(rendered.len(), 4, "{rendered:#?}");
+            for line in &rendered {
+                assert!(
+                    measure_text_width(line) <= display_width,
+                    "{display_width}: {line}"
+                );
+            }
+        }
+        let floor = render_table("Narrow", &columns, &rows, MIN_TABLE_WIDTH);
+        assert!(floor[1].contains(header), "{}", floor[1]);
+    }
+
+    #[test]
+    fn test_capped_columns_grow_before_a_flexible_one() {
+        // A `config get`-shaped table: the flexible Value column sits BEFORE two
+        // capped columns, and its 104-column value could take every column the
+        // table has. Capped columns grow first, so the Validated marker and the
+        // Source label render whole and the value takes the width they leave.
+        let value = "You are a careful payments triage assistant; route refunds to billing \
+                     and disputes to the disputes queue";
+        assert_eq!(measure_text_width(value), 104);
+        let columns = [
+            TableColumn::new("Key", 12, 40),
+            TableColumn::flexible("Value", 12),
+            TableColumn::new("Validated", 9, 12),
+            TableColumn::new("Source", 12, 20),
+        ];
+        let rows = vec![vec![
+            TableCell::plain("agent.system_prompt"),
+            TableCell::plain(value),
+            TableCell::plain("unvalidated"),
+            TableCell::plain("instance"),
+        ]];
+
+        // Left-to-right growth let the value take the room first, leaving the
+        // Validated column at its 9-column header ("unvalida…").
+        assert_eq!(
+            table_widths(&columns, &rows, 80)[2],
+            measure_text_width("unvalidated")
+        );
+        for display_width in [80, 120] {
+            // The flexible column takes exactly the rest of the table.
+            let widths = table_widths(&columns, &rows, display_width);
+            assert_eq!(
+                widths.iter().sum::<usize>() + TABLE_GAP.len() * 3,
+                display_width,
+                "{widths:?}"
+            );
+            let rendered = render_table("Effective config", &columns, &rows, display_width);
+            for line in &rendered {
+                assert!(
+                    measure_text_width(line) <= display_width,
+                    "{display_width}: {line}"
+                );
+            }
+            let row = &rendered[3];
+            assert!(
+                row.contains(&format!("{ELLIPSIS}  unvalidated  instance")),
+                "{display_width}: {row}"
+            );
+            assert!(!row.contains(value), "{display_width}: {row}");
+        }
     }
 
     #[test]
