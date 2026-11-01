@@ -1826,3 +1826,146 @@ fn drain_overrun_records_the_bound_as_the_ender_and_still_stops() {
         "the terminal cause records the honest overrun outcome: {cause}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bounded runner's STDERR TAIL — a chatty failing pause command rides the
+// rejection detail as a WINDOW (the last 4096 bytes), never the whole stream.
+// The subject is `fake_agent --stderr-blob 3×4096:3`: exactly 12288 bytes of
+// deterministic offset-stamped 64-byte records, then exit 3 — so the
+// survivor set is computable byte-exactly (the tail = the last 64 records,
+// covering bytes 8192..12287).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_command_failure_tail_is_window_truncated_with_survivors_named() {
+    // KILLER: the tail is a WINDOW, not the whole stream. The whole-stream
+    // mutant ships every record a chatty command ever printed into the
+    // rejection message (the unbounded blowup the window exists to prevent);
+    // the empty-tail mutant drops the adapter's own printed why entirely.
+    // Both survivors and evictions are asserted: the FINAL records ride the
+    // detail, the EARLIEST are gone — and the standalone pause leaves the
+    // durable state untouched (the (d1) contract with a noisy subject).
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        Some(&["--stderr-blob", "12288:3"]),
+        Some(&["--touch", "resume.sentinel"]),
+        None,
+        Some("guaranteed"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let result = facade.pause("svc");
+    let Err(EngineError::PauseCommandFailed { detail, .. }) = &result else {
+        panic!("the chatty failing pause command must reject: {result:?}");
+    };
+    assert!(
+        detail.contains("exited") && detail.contains("the lifecycle change was not performed"),
+        "the rejection still names the exit: {detail}"
+    );
+    assert!(
+        detail.contains("the command's stderr (last 4096 bytes)"),
+        "the detail announces its bounded tail: {detail}"
+    );
+    // SURVIVORS: the last window's records — the very last record and the
+    // first record of the surviving window (bytes 8192.. are the tail).
+    assert!(
+        detail.contains("blob 0000012224-0000012287"),
+        "the FINAL record survives: {detail}"
+    );
+    assert!(
+        detail.contains("blob 0000008192-0000008255"),
+        "the first record of the surviving window is present: {detail}"
+    );
+    // EVICTED: everything before the window is gone — the very first record
+    // and the record immediately before the window's start.
+    assert!(
+        !detail.contains("blob 0000000000-0000000063"),
+        "the FIRST record is evicted (the window is bounded): {detail}"
+    );
+    assert!(
+        !detail.contains("blob 0000008128-0000008191"),
+        "the record just before the window boundary is evicted: {detail}"
+    );
+
+    // The durable state is untouched — still running, no pause edge.
+    let status = facade.instance_status("svc").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "a rejected pause leaves the instance running"
+    );
+    let events = facade.transition_events("svc").unwrap();
+    assert!(
+        !events.iter().any(|e| e.new_state == LifecycleState::Paused),
+        "a rejected pause must not append a pause transition"
+    );
+
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
+
+#[test]
+fn drain_rejects_on_a_failing_pause_command_with_the_tail_riding_and_no_edges_committed() {
+    // KILLER: the drain's OWN Failed arm (step 5's rejection). A pause
+    // command that SPEAKS 3× the window and exits nonzero rejects the drain
+    // with the typed PauseCommandFailed — the captured tail riding the
+    // detail — while the durable state stays UNTOUCHED: no pause edge (never
+    // a fake pause), no stopping edge (the composite never reached its last
+    // step), the row still `running`. Distinct from the OVERRUN arm (g2,
+    // which kills and stops): the command SPOKE, so the drain refuses.
+    let state = TempDir::new().unwrap();
+    let manifest = TempDir::new().unwrap();
+    write_drain_manifest(
+        manifest.path(),
+        "svc",
+        &["--linger-ms", "600000"],
+        Some(&["--stderr-blob", "12288:3"]),
+        Some(&["--touch", "resume.sentinel"]),
+        Some("timeout_ms = 5000\nidle_file = \"idle.sentinel\""),
+        Some("guaranteed"),
+    );
+
+    let engine = open(&state);
+    let facade = engine.blocking();
+    register_and_start(&facade, &manifest, "svc");
+
+    let result = facade.drain("svc", None);
+    let Err(EngineError::PauseCommandFailed { name, detail, .. }) = &result else {
+        panic!("a failing pause command must reject the drain: {result:?}");
+    };
+    assert_eq!(name, "svc");
+    assert!(
+        detail.contains("the command's stderr (last 4096 bytes)"),
+        "the drain's rejection carries the bounded tail too: {detail}"
+    );
+    assert!(
+        detail.contains("blob 0000012224-0000012287")
+            && !detail.contains("blob 0000000000-0000000063"),
+        "the tail is window-truncated on the drain path as well: {detail}"
+    );
+
+    // NO edges at all: not the pause (never a fake pause), not the stopping
+    // (the rejection precedes the composite's unconditional last step).
+    let status = facade.instance_status("svc").unwrap();
+    assert_eq!(
+        status.instance.state,
+        LifecycleState::Running,
+        "a rejected drain leaves the instance running"
+    );
+    let events = facade.transition_events("svc").unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.new_state == LifecycleState::Paused
+                || e.new_state == LifecycleState::Stopping),
+        "a rejected drain commits no pause or stopping edge: {events:?}"
+    );
+
+    facade.stop("svc", Some(Duration::from_secs(5))).unwrap();
+}
