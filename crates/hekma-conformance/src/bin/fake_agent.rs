@@ -177,6 +177,21 @@
 //!   therefore cannot carry a cancel anchor; the fixture convention keeps
 //!   every anchor an Agent-Home-relative name). Pure `std`, NO OS-cfg.
 //!
+//! * `--stderr-blob <BYTES>:<CODE>`  (the bounded runner's stderr-tail
+//!   fixture)  write exactly `<BYTES>` bytes of DETERMINISTIC offset-stamped
+//!   64-byte records to stderr, then exit with `<CODE>` — the chatty-failure
+//!   subject for the bounded lifecycle-command runner's stderr tail: the
+//!   engine's concurrent reader keeps a rolling window, so a drill can assert
+//!   the SURVIVOR SET of the tail that rides the `PauseCommandFailed` detail
+//!   (the final records present, the earliest evicted — the bound that keeps
+//!   a hostile command from blowing up the rejection message). Each record is
+//!   one 64-byte line naming the byte range it covers (`blob
+//!   <start>-<end>` zero-padded to 10), so a `3×4096` blob's tail is exactly
+//!   the last 64 records. A `<BYTES>` that is not a positive multiple of 64
+//!   is refused with exit 2 (the fixed record width is the determinism — a
+//!   partial record would make the survivor set unpredictable). Pure `std`,
+//!   NO OS-cfg.
+//!
 //! The binary writes a small marker file (`--marker <path>`) on startup if asked,
 //! so a test can confirm it actually ran without racing on stdout capture.
 //!
@@ -465,6 +480,13 @@ struct Opts {
     /// pause→resume sections never dies under them. `None` = no anchored
     /// self-exit.
     exit_on_pause: Option<(u64, PathBuf, Option<PathBuf>)>,
+    /// Write exactly `BYTES` of deterministic offset-stamped 64-byte records
+    /// to stderr, then exit `CODE` (the stderr-tail fixture): the
+    /// chatty-failure subject for the bounded lifecycle-command runner — the
+    /// engine's concurrent reader keeps a rolling window, so a drill asserts
+    /// the SURVIVOR SET of the tail that rides the `PauseCommandFailed`
+    /// detail. `None` = not a blob invocation (the supervised-agent path).
+    stderr_blob: Option<(u64, i32)>,
 }
 
 /// The FIXED token sentinels every emitted usage event carries (story 3-1), so a
@@ -540,6 +562,7 @@ fn parse() -> Opts {
     let mut idle_after: Option<(PathBuf, u64)> = None;
     let mut idle_on_pause: Option<(u64, PathBuf, PathBuf)> = None;
     let mut exit_on_pause: Option<(u64, PathBuf, Option<PathBuf>)> = None;
+    let mut stderr_blob: Option<(u64, i32)> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -991,6 +1014,33 @@ fn parse() -> Opts {
                     }
                 }
             }
+            "--stderr-blob" => {
+                // BYTES:CODE — split on the FIRST colon (a number never
+                // contains one). The byte count must be a POSITIVE MULTIPLE
+                // of 64: the fixed 64-byte record width is the determinism a
+                // survivor-set drill depends on (a partial record would make
+                // the window's boundary unpredictable). FAIL FAST (the
+                // --touch posture): a silently-ignored blob would make a
+                // stderr-tail drill measure the empty-tail arm instead of
+                // the window truncation under test.
+                let parsed = args.next().as_deref().and_then(|v| {
+                    let (bytes, code) = v.split_once(':')?;
+                    let bytes = bytes.parse::<u64>().ok()?;
+                    let code = code.parse::<i32>().ok()?;
+                    (bytes > 0 && bytes % 64 == 0).then_some((bytes, code))
+                });
+                match parsed {
+                    Some(pair) => stderr_blob = Some(pair),
+                    None => {
+                        eprintln!(
+                            "fake_agent: --stderr-blob requires BYTES:CODE (a positive \
+                             multiple-of-64 byte count and an exit code, colon-separated; \
+                             got a missing or malformed value)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             "--dump" => {
                 if let Some(path) = args.next() {
                     dump = Some(PathBuf::from(path));
@@ -1129,7 +1179,31 @@ fn parse() -> Opts {
         idle_after,
         idle_on_pause,
         exit_on_pause,
+        stderr_blob,
     }
+}
+
+/// Format ONE deterministic 64-byte stderr-blob record covering the byte
+/// range `[start, start+64)`: `blob <start>-<end>` zero-padded to 10 digits,
+/// dot-padded to a fixed width, newline-terminated — EXACTLY 64 bytes (the
+/// assert is the fixture's contract with its drills: the record width is the
+/// determinism the survivor-set math depends on, so a format drift that
+/// changes the width must fail here, not corrupt a drill).
+#[cfg(not(tarpaulin_include))]
+fn stderr_blob_record(start: u64) -> String {
+    let header = format!("blob {start:010}-{end:010} ", end = start + 63);
+    let mut line = header;
+    while line.len() < 64 - 1 {
+        line.push('.');
+    }
+    line.push('\n');
+    assert_eq!(
+        line.len(),
+        64,
+        "the stderr-blob record width is the fixture's contract (got {})",
+        line.len()
+    );
+    line
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -1176,6 +1250,30 @@ fn main() {
     if let Some(hang) = opts.never_ready {
         sleep(hang);
         std::process::exit(0);
+    }
+
+    // The stderr-tail fixture (the bounded runner's chatty-failure subject):
+    // a `--stderr-blob` invocation's WHOLE job is the deterministic blob and
+    // the exit code — it runs as a plain engine lifecycle command (the
+    // `[lifecycle.pause]` shape a `PauseCommandFailed` drill declares), never
+    // as a supervised agent, so the readiness/heartbeat machinery below is
+    // meaningless for it. Each record is written-and-flushed as it is built
+    // (stderr is unbuffered; the flush is belt-and-braces) so the engine's
+    // concurrent reader observes progress whatever the pipe scheduling does.
+    if let Some((bytes, code)) = opts.stderr_blob {
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr();
+        let mut wrote = 0u64;
+        while wrote < bytes {
+            let record = stderr_blob_record(wrote);
+            if let Err(err) = stderr.write_all(record.as_bytes()) {
+                eprintln!("fake_agent: --stderr-blob could not write past {wrote} bytes ({err})");
+                std::process::exit(2);
+            }
+            let _ = stderr.flush();
+            wrote += record.len() as u64;
+        }
+        std::process::exit(code);
     }
 
     // Story 18-4 lifecycle-command fixtures: a `--touch` invocation's WHOLE
