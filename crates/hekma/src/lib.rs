@@ -102,6 +102,24 @@ Examples:
   hekma agent config get demo --reveal
   hekma agent remove demo --delete";
 
+const RUN_AFTER_HELP: &str = "\
+Details:
+  A Run is one unit of agent work with a stable run id, a Control Depth,
+  labels, budgets and a Run Status. Starting an agent creates its supervised
+  Run; a Restart Policy relaunch keeps it. open starts a child Run under a
+  Run (--parent <run-id>) or under an agent's open Run (--parent <agent>):
+  a Host's unit of work inside that agent's process. The child's usage
+  counts on every ancestor and every ancestor's ceilings apply; its own
+  ceilings (--token-budget, --dollar-cap) take the warn Breach Action.
+  --label key=value adds caller labels; --external-id makes a retried open
+  return the same Run. close ends a child Run; show prints any Run. All
+  three accept --json.
+
+Examples:
+  hekma run open --parent my-agent --label task=review --token-budget 20000
+  hekma run show run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+  hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json";
+
 #[derive(Parser)]
 #[command(
     name = "hekma",
@@ -131,6 +149,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Open, close and show Runs
+    #[command(about = "Open, close and show Runs", after_help = RUN_AFTER_HELP)]
+    Run {
+        #[command(subcommand)]
+        command: RunCommands,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -201,6 +225,50 @@ enum Commands {
             requires = "otlp_endpoint"
         )]
         otlp_flush_interval: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommands {
+    /// Open a child Run under a Run or an agent's open Run
+    Open {
+        /// The parent: a run id, or an agent name (its open Run)
+        #[arg(long, value_name = "RUN_ID|AGENT")]
+        parent: String,
+        /// A caller label, key=value (repeatable)
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// A per-run token ceiling over the child and its own children
+        #[arg(long, value_name = "TOKENS")]
+        token_budget: Option<u64>,
+        /// A per-run dollar cap over the child and its own children ("3.00")
+        #[arg(long, value_name = "DOLLARS")]
+        dollar_cap: Option<String>,
+        /// The Breach Action for the child's ceilings (warn)
+        #[arg(long, value_name = "ACTION")]
+        breach_action: Option<String>,
+        /// An id under which a retried open returns the same Run
+        #[arg(long, value_name = "ID")]
+        external_id: Option<String>,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a child Run
+    Close {
+        /// The run id
+        run_id: String,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Run
+    Show {
+        /// The run id
+        run_id: String,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -506,6 +574,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 MemoryCommands::Detach { name, json } => cli::agent::memory_detach(&name, json),
             },
             AgentCommands::GovernanceVectors { json } => cli::agent::governance_vectors(json),
+        },
+        Some(Commands::Run { command }) => match command {
+            RunCommands::Open {
+                parent,
+                labels,
+                token_budget,
+                dollar_cap,
+                breach_action,
+                external_id,
+                json,
+            } => cli::run::open(cli::run::OpenArgs {
+                parent,
+                labels,
+                token_budget,
+                dollar_cap,
+                breach_action,
+                external_id,
+                json,
+            }),
+            RunCommands::Close { run_id, json } => cli::run::close(&run_id, json),
+            RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
         },
         None => {
             Cli::command().print_help()?;

@@ -315,13 +315,19 @@ fn migrate_v12_body(
 /// Fold every existing usage row into the rollups, with the same per-row
 /// pricing and saturation the old scan-based totals used.
 fn backfill_rollups(conn: &Connection) -> Result<(), StoreError> {
-    fold_unfolded_rows(conn)
+    // The v12 step runs before `runs` exists (v13): no parent chain yet.
+    fold_rows(conn, false)
 }
 
 /// Fold every usage row above the `folded_through` watermark into both
 /// rollups and advance the watermark (story 21-1). The common case — called
 /// right after one insert — folds exactly that row.
 pub(super) fn fold_unfolded_rows(conn: &Connection) -> Result<(), StoreError> {
+    fold_rows(conn, true)
+}
+
+/// [`fold_unfolded_rows`], with the ancestor walk only once `runs` exists.
+fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
     let watermark: i64 = conn
         .query_row(
             "SELECT folded_through FROM usage_rollup_meta WHERE id = 1",
@@ -375,7 +381,30 @@ pub(super) fn fold_unfolded_rows(conn: &Connection) -> Result<(), StoreError> {
         rollup.merge(delta);
         write_instance_rollup(conn, *instance_id, &rollup)?;
     }
-    for ((instance_id, run_id), delta) in &by_run {
+    // Story 21-2: a Run's rollup is its subtree's — each row also folds into
+    // every ancestor through the parent chain (never by re-summing a
+    // subtree, AD-25). An instance-less ancestor has no rollup row yet.
+    let mut with_ancestors: HashMap<(i64, String), RollupRow> = HashMap::new();
+    for ((instance_id, run_id), delta) in by_run {
+        let chain = if ancestors {
+            super::runs_sqlite::ancestors_for_fold(conn, &run_id)?
+        } else {
+            Vec::new()
+        };
+        for (ancestor_instance, ancestor) in chain {
+            if let Some(ancestor_instance) = ancestor_instance {
+                with_ancestors
+                    .entry((ancestor_instance, ancestor))
+                    .or_default()
+                    .merge(&delta);
+            }
+        }
+        with_ancestors
+            .entry((instance_id, run_id))
+            .or_default()
+            .merge(&delta);
+    }
+    for ((instance_id, run_id), delta) in &with_ancestors {
         let mut rollup = read_run_rollup(conn, *instance_id, run_id)?;
         rollup.merge(delta);
         write_run_rollup(conn, *instance_id, run_id, &rollup)?;
@@ -1169,9 +1198,10 @@ mod tests {
         let run = RunId::from_wire("run-1");
         store
             .conn()
-            .execute(
-                "INSERT INTO run_latches VALUES ('run-1', 'tokens', 'sideways', 'pause', 'now')",
-                [],
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+                 VALUES ('run-1', 'supervised', 'ended', 'now', 'now'); \
+                 INSERT INTO run_latches VALUES ('run-1', 'tokens', 'sideways', 'pause', 'now');",
             )
             .unwrap();
         assert!(matches!(
@@ -1186,6 +1216,13 @@ mod tests {
             )
             .unwrap();
         assert!(store.transitions_page(&name("corrupt"), 0, 10).is_err());
+        // Story 21-2: a latch references its Run.
+        crate::ports::RunRecords::ensure_run_row(
+            &store,
+            &RunId::from_wire("run-2"),
+            &name("corrupt"),
+        )
+        .unwrap();
         store
             .latch(
                 &RunId::from_wire("run-2"),

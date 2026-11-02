@@ -242,6 +242,10 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // auth layer — no anonymous route.
         ("GET", format!("http://{addr}/v0/export")),
         ("POST", format!("http://{addr}/v0/export/ack")),
+        // Story 21-2: the Run routes.
+        ("POST", format!("http://{addr}/v0/runs")),
+        ("GET", format!("http://{addr}/v0/runs/run_ghost")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/close")),
     ]
 }
 
@@ -357,7 +361,10 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // body carries no `seq` — the Json extractor's 422 is the
         // handler-reached answer (auth passed, the request shape was wrong).
         let ack_wrong_body = method == "POST" && url.ends_with("/v0/export/ack");
-        let expected = match (register, identity) {
+        // The Run open POST reached its handler: the register-shaped body
+        // names no parent, so the exactly-one-parent rule answers 400.
+        let run_open = method == "POST" && url.ends_with("/v0/runs");
+        let expected = match (register || run_open, identity) {
             // The SSE stream answers 200 and STAYS OPEN — never drained
             // here (read_to_string would block until shutdown); dropping
             // the response closes the socket.
@@ -2823,4 +2830,132 @@ fn export_limit_parse_failures_are_versioned_400s_never_extractor_text() {
     }
 
     server.stop().unwrap();
+}
+
+#[test]
+fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let runs = format!("http://{}/v0/runs", server.addr);
+    let post = |url: &str, body: serde_json::Value| {
+        client
+            .post(url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+
+    // No open Run yet: 409 with the stable code.
+    let mut response = post(&runs, serde_json::json!({"parent_instance": "host"}));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "conflict");
+    assert_eq!(json["error"]["code"], "no-open-run");
+
+    let mut response = client
+        .post(format!("http://{}/v0/instances/host/start", server.addr))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+
+    // Exactly one parent.
+    let mut response = post(&runs, serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "breach_action": "explode"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "dollar_cap": "-1"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    // A `pause` on a child in a process with no wire path is refused.
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "breach_action": "pause"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "action-unavailable"
+    );
+
+    // Open: 201 + Location + the Run.
+    let mut response = post(
+        &runs,
+        serde_json::json!({
+            "parent_instance": "host",
+            "labels": {"task": "review"},
+            "token_budget": 500,
+            "dollar_cap": "1.50",
+            "breach_action": "warn",
+            "external_id": "job-1"
+        }),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let json = json_body(&mut response);
+    let run_id = json["run"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(location, format!("/v0/runs/{run_id}"));
+    assert_eq!(json["run"]["control_depth"], "announced");
+    assert_eq!(json["run"]["wire_path"], false);
+    assert_eq!(json["run"]["labels"][0]["source"], "caller");
+    assert_eq!(json["run"]["limits"]["token_per_run"], 500);
+    // A retried open with the same external id is the same Run.
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "external_id": "job-1"}),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(json_body(&mut response)["run"]["run_id"], run_id.as_str());
+
+    // Show it, and its parent through the parent id.
+    let mut response = get_ok(&client, &server.addr, &location);
+    let json = json_body(&mut response);
+    let parent = json["run"]["parent_run_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{parent}"));
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["control_depth"], "supervised");
+    assert_eq!(json["run"]["open_children"], 1);
+
+    // Close the child; closing the process-owning Run is a 409.
+    let mut response = post(&format!("{runs}/{run_id}/close"), serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["status"], "ended");
+    assert_eq!(json["run"]["end_cause"], "closed");
+    let mut response = post(&format!("{runs}/{parent}/close"), serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "owns-process");
+    let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ghost");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&mut response)["error"]["code"], "run-not-found");
+
+    let _ = client
+        .post(format!("http://{}/v0/instances/host/stop", server.addr))
+        .header("Authorization", &auth)
+        .send("");
 }

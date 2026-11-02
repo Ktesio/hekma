@@ -18,7 +18,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hekma_engine::{
-    AdapterRef, ConfigLayer, FleetListing, RegistryError, RemoveDisposition, ResyncCursor,
+    AdapterRef, BreachAction, ChildRunRequest, ConfigLayer, FleetListing, RegistryError,
+    RemoveDisposition, ResyncCursor, RunLimits, RunParent,
 };
 use serde::Deserialize;
 
@@ -45,6 +46,7 @@ pub(crate) async fn version(State(state): State<ApiState>) -> Json<dto::VersionD
             usage: hekma_engine::USAGE_SCHEMA_VERSION,
             budget: hekma_engine::BUDGET_SCHEMA_VERSION,
             log: hekma_engine::LOG_SCHEMA_VERSION,
+            run: hekma_engine::RUN_EVENT_SCHEMA_VERSION,
         },
         log_capture: log_capture.as_str(),
     })
@@ -497,5 +499,85 @@ pub(crate) async fn export_ack(
     Ok(Json(dto::ExportAckDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         seq: persisted,
+    }))
+}
+
+/// `POST /v0/runs` — open a child Run (story 21-2). `201` + `Location`
+/// with the new Run; a retried request carrying the same `external_id`
+/// answers `201` with the SAME Run (the open is idempotent by external id).
+pub(crate) async fn run_open(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<dto::RunOpenRequest>,
+) -> ApiResult<Response> {
+    let parent = match (request.parent_run_id, request.parent_instance) {
+        (Some(run_id), None) => RunParent::Run(hekma_engine::RunId::from_wire(run_id)),
+        (None, Some(instance)) => RunParent::Instance(instance),
+        _ => {
+            return Err(ApiError::invalid_body(
+                "exactly one parent is required: pass \"parent_run_id\" (a Run) or \
+                 \"parent_instance\" (an Agent Instance's open Run)",
+            ))
+        }
+    };
+    let breach_action = request
+        .breach_action
+        .as_deref()
+        .map(str::parse::<BreachAction>)
+        .transpose()
+        .map_err(|err| ApiError::invalid_body(format!("breach_action: {err}")))?;
+    let dollar_per_run_micros = request
+        .dollar_cap
+        .as_deref()
+        .map(hekma_engine::parse_dollars_to_micros)
+        .transpose()
+        .map_err(|reason| ApiError::invalid_body(format!("dollar_cap: {reason}")))?;
+    let view = state
+        .engine
+        .open_child_run(ChildRunRequest {
+            parent,
+            labels: request.labels.into_iter().collect(),
+            limits: RunLimits {
+                token_per_run: request.token_budget,
+                dollar_per_run_micros,
+                breach_action,
+            },
+            external_id: request.external_id,
+        })
+        .await?;
+    let location = format!("/v0/runs/{}", view.record.run_id);
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        Json(dto::RunDocument {
+            schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+            run: view,
+        }),
+    )
+        .into_response())
+}
+
+/// `GET /v0/runs/{id}` — one Run: its row, labels, limits, subtree usage
+/// and open children.
+pub(crate) async fn run_show(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunDocument>> {
+    let view = state.engine.run(&run_id).await?;
+    Ok(Json(dto::RunDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run: view,
+    }))
+}
+
+/// `POST /v0/runs/{id}/close` — close a child Run (idempotent; a Run that
+/// owns a process is a `409` naming the stop remediation).
+pub(crate) async fn run_close(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunDocument>> {
+    let view = state.engine.close_run(&run_id).await?;
+    Ok(Json(dto::RunDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run: view,
     }))
 }

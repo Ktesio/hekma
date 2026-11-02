@@ -6,6 +6,7 @@
 //! the public surface, the store is an internal collaborator.
 
 mod run_store_sqlite;
+mod runs_sqlite;
 mod sqlite;
 pub(crate) mod writer;
 

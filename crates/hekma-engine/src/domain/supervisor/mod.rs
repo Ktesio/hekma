@@ -81,6 +81,7 @@ use super::restart::{
     is_crash_loop, next_consecutive_failures, BackoffSchedule, RestartPolicy,
     MAX_CONSECUTIVE_FAILURES, STABLE_RUN_WINDOW,
 };
+use super::runs::ops::RunFate;
 use super::transition::{next_state, LifecycleCommand};
 use super::usage::{RunId, UsageUpdateEvent};
 
@@ -1693,7 +1694,15 @@ impl Supervisor {
         cause: TransitionCause,
     ) -> Result<TransitionEvent, EngineError> {
         let log_capture = self.log_capture_for(name);
-        self.transition_with_log_capture(registry, name, prior, new, cause, log_capture)
+        self.transition_with_log_capture(
+            registry,
+            name,
+            prior,
+            new,
+            cause,
+            log_capture,
+            RunFate::Terminal,
+        )
     }
 
     /// Like [`Supervisor::transition`], but the `engine`-attributed
@@ -1705,6 +1714,11 @@ impl Supervisor {
     /// the exact moment of the call, even though a live capture pipeline
     /// still exists (captured by the caller a few lines earlier, before the
     /// map mutation that would otherwise hide it).
+    ///
+    /// `fate` says how a `→ failed` edge leaves the instance's Run (story
+    /// 21-2): [`RunFate::Relaunching`] when the caller already planned a
+    /// Restart Policy relaunch, else the Run ends. Other edges ignore it.
+    #[allow(clippy::too_many_arguments)]
     fn transition_with_log_capture(
         &self,
         registry: &Registry,
@@ -1713,14 +1727,46 @@ impl Supervisor {
         new: LifecycleState,
         cause: TransitionCause,
         log_capture: Option<LogCapture>,
+        fate: RunFate,
     ) -> Result<TransitionEvent, EngineError> {
         self.transition_fault(name)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
-        let (_snapshot, append) =
-            commit::commit_transition(registry, name, commit::StateWrite::Plain, &event)
+        let committed =
+            commit::commit_transition(registry, name, commit::StateWrite::Plain, &event, fate)
                 .map_err(registry_to_engine)?;
-        self.after_transition_commit(registry, name, &event, &append, log_capture);
+        self.after_transition_commit(registry, name, &event, &committed.append, log_capture);
+        self.after_run_projection(name, committed.run_events, committed.projection_failed);
         Ok(event)
+    }
+
+    /// Publish a transition's Run projection, or surface why it failed (the
+    /// transition itself committed — Run bookkeeping never blocks it).
+    fn after_run_projection(
+        &self,
+        name: &InstanceName,
+        run_events: Vec<crate::domain::runs::ops::CommittedRunEvent>,
+        failed: Option<String>,
+    ) {
+        if let Some(err) = failed {
+            self.emit_diagnostic(&format!(
+                "{}: the transition is recorded, but its Run's status could not be updated \
+                 ({err}); the Run catches up at the next transition, start or adoption",
+                name.as_str(),
+            ));
+        }
+        self.publish_run_events(run_events);
+    }
+
+    /// Publish committed Run events on the bus, in commit order (after the
+    /// job's own events), noting any outbox eviction they caused.
+    pub(super) fn publish_run_events(
+        &self,
+        events: Vec<crate::domain::runs::ops::CommittedRunEvent>,
+    ) {
+        for (event, append) in events {
+            self.note_outbox_append(&append);
+            self.publish(EngineEvent::Run(event));
+        }
     }
 
     /// Story 15-6: the `→ starting` transition's TRANSACTIONAL shape — the
@@ -1750,7 +1796,7 @@ impl Supervisor {
     ) -> Result<Option<crate::ports::MemoryBacking>, EngineError> {
         self.transition_fault(name)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
-        let (snapshot, append) = commit::commit_transition(
+        let committed = commit::commit_transition(
             registry,
             name,
             commit::StateWrite::SnapshotBacking {
@@ -1758,13 +1804,15 @@ impl Supervisor {
                 expected_backing,
             },
             &event,
+            RunFate::Terminal,
         )
         .map_err(transition_snapshot_to_engine)?;
         // The capture lookup mirrors `transition`'s (the instance has no
         // `self.running` entry yet — the spawn comes after this transition).
         let log_capture = self.log_capture_for(name);
-        self.after_transition_commit(registry, name, &event, &append, log_capture);
-        Ok(snapshot)
+        self.after_transition_commit(registry, name, &event, &committed.append, log_capture);
+        self.after_run_projection(name, committed.run_events, committed.projection_failed);
+        Ok(committed.snapshot)
     }
 
     /// The CONDITIONAL transition (story 18-2 review round 1, P3): the
@@ -1784,6 +1832,7 @@ impl Supervisor {
     /// A refusal surfaces typed (`Err`) and the CALLER (the reaper) emits its
     /// ONE skip-diagnostic and declines the failure + the restart plan — the
     /// state moved, so someone else is driving this instance's lifecycle.
+    #[allow(clippy::too_many_arguments)]
     fn transition_if_prior(
         &self,
         registry: &Registry,
@@ -1792,6 +1841,7 @@ impl Supervisor {
         new: LifecycleState,
         cause: TransitionCause,
         log_capture: Option<LogCapture>,
+        fate: RunFate,
     ) -> Result<TransitionEvent, EngineError> {
         // cfg(test) fault seam (P3's test driver): the typed refusal the
         // concurrent-transition race produces, injected deterministically.
@@ -1807,10 +1857,16 @@ impl Supervisor {
         }
         self.transition_fault(name)?;
         let event = TransitionEvent::new(name.as_str(), prior, new, cause, now_rfc3339());
-        let (_snapshot, append) =
-            commit::commit_transition(registry, name, commit::StateWrite::IfPrior(prior), &event)
-                .map_err(registry_to_engine)?;
-        self.after_transition_commit(registry, name, &event, &append, log_capture);
+        let committed = commit::commit_transition(
+            registry,
+            name,
+            commit::StateWrite::IfPrior(prior),
+            &event,
+            fate,
+        )
+        .map_err(registry_to_engine)?;
+        self.after_transition_commit(registry, name, &event, &committed.append, log_capture);
+        self.after_run_projection(name, committed.run_events, committed.projection_failed);
         Ok(event)
     }
 
@@ -2382,5 +2438,6 @@ mod lifecycle;
 
 pub use drain::DrainOutcome;
 mod reaper;
+mod runs;
 mod spawn;
 mod usage;

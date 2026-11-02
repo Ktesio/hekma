@@ -95,6 +95,8 @@ pub(crate) struct EngineVersions {
     pub budget: u32,
     /// The instance-log line family's version (`LOG_SCHEMA_VERSION`).
     pub log: u32,
+    /// The Run event family's version (`RUN_EVENT_SCHEMA_VERSION`).
+    pub run: u32,
 }
 
 /// `GET /v0/instances/{name}` — the single-instance read. The SAME shape
@@ -330,6 +332,7 @@ mod tests {
                 usage: hekma_engine::USAGE_SCHEMA_VERSION,
                 budget: hekma_engine::BUDGET_SCHEMA_VERSION,
                 log: hekma_engine::LOG_SCHEMA_VERSION,
+                run: hekma_engine::RUN_EVENT_SCHEMA_VERSION,
             },
             log_capture: hekma_engine::LogCaptureMode::Full.as_str(),
         };
@@ -476,4 +479,39 @@ mod tests {
         });
         serde_json::from_value(json).expect("sample instance")
     }
+}
+
+/// `POST /v0/runs` — open a child Run (FR-43, FR-49). EXACTLY ONE parent:
+/// `parent_run_id` (any non-ended Run) or `parent_instance` (that instance's
+/// open supervised Run); both or neither is a 400. `labels` are caller
+/// labels; `dollar_cap` is a dollar string (`"3.00"`); `breach_action` is
+/// `warn` (the default) — `pause`, `stop` and `block` are refused for a
+/// child Run today. Unknown fields are tolerated (the 0.x additive posture).
+#[derive(Deserialize)]
+pub(crate) struct RunOpenRequest {
+    /// The parent Run's id.
+    pub parent_run_id: Option<String>,
+    /// The instance whose open Run is the parent.
+    pub parent_instance: Option<String>,
+    /// Caller labels.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// A per-run token ceiling over the child's subtree.
+    pub token_budget: Option<u64>,
+    /// A per-run dollar cap over the child's subtree (`"3.00"`).
+    pub dollar_cap: Option<String>,
+    /// The Breach Action for the child's ceilings.
+    pub breach_action: Option<String>,
+    /// An id under which a retried open returns the same Run.
+    pub external_id: Option<String>,
+}
+
+/// `GET /v0/runs/{id}` and the Run verbs' read-back: one Run under the
+/// Control API schema version.
+#[derive(Serialize)]
+pub(crate) struct RunDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run: hekma_engine::RunView,
 }

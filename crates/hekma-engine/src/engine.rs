@@ -71,6 +71,7 @@ use crate::domain::{
     RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor, Supervisor, TransitionCause,
     TransitionEvent,
 };
+use crate::domain::{ChildRunRequest, RunError, RunId, RunView};
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
 
@@ -1533,11 +1534,66 @@ impl Engine {
                 name: name.clone(),
                 reason: reason.to_string(),
             })?;
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let warnings = registry.set_config(&iname, &key, &value)?;
+            // Story 21-2: a `labels.*` write re-binds the open Run's labels
+            // (Registry → Supervisor, the fixed lock order).
+            if key.starts_with(crate::domain::runs::labels::LABELS_PREFIX) {
+                inner
+                    .supervisor
+                    .lock()
+                    .expect("supervisor mutex poisoned")
+                    .sync_run_labels(&registry, &iname);
+            }
+            Ok(warnings)
+        })
+        .await
+    }
+
+    /// Open a child Run under a supervised Run (story 21-2, PRD FR-43 /
+    /// FR-49): the Host's unit of work — the old Task scope. The child is
+    /// depth `announced`, hosted by its parent's process, and carries the
+    /// caller labels and per-run ceilings of `request`; its usage rolls up to
+    /// every ancestor and every ancestor's ceilings apply. Refused (typed)
+    /// under a missing or ended parent, past [`crate::MAX_RUN_NESTING`]
+    /// levels, or with a `pause` / `stop` / `block` Breach Action the child's
+    /// depth cannot execute. A retried request with the same external id
+    /// returns the same Run.
+    pub async fn open_child_run(&self, request: ChildRunRequest) -> Result<RunView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.open_child_run(&registry, request)
+        })
+        .await
+    }
+
+    /// Close a child Run (story 21-2). Idempotent on an ended child; a Run
+    /// that owns a supervised process is stopped, never closed. Its own
+    /// children keep running.
+    pub async fn close_run(&self, run_id: &str) -> Result<RunView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.close_run(&registry, &run_id)
+        })
+        .await
+    }
+
+    /// Read one Run (story 21-2): its row, labels, limits, subtree usage and
+    /// open children. Reads only (registry lock, read-only connection).
+    pub async fn run(&self, run_id: &str) -> Result<RunView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
             inner
                 .registry
                 .lock()
                 .expect("registry mutex poisoned")
-                .set_config(&iname, &key, &value)
+                .run_view(&run_id)
         })
         .await
     }
@@ -2234,6 +2290,21 @@ impl Blocking<'_> {
             .block_on(self.engine.set_config(name, key, value))
     }
 
+    /// Blocking twin of [`Engine::open_child_run`].
+    pub fn open_child_run(&self, request: ChildRunRequest) -> Result<RunView, RunError> {
+        self.engine.rt.block_on(self.engine.open_child_run(request))
+    }
+
+    /// Blocking twin of [`Engine::close_run`].
+    pub fn close_run(&self, run_id: &str) -> Result<RunView, RunError> {
+        self.engine.rt.block_on(self.engine.close_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::run`].
+    pub fn run(&self, run_id: &str) -> Result<RunView, RunError> {
+        self.engine.rt.block_on(self.engine.run(run_id))
+    }
+
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The
     /// `config get --reveal` un-mask uses this to fetch the resolved cleartext of
     /// the secret leaves.
@@ -2495,6 +2566,70 @@ mod tests {
                 detail: "disk full".into(),
             }),
             RegistryError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn the_run_facade_opens_closes_and_reads_runs_and_labels_rebind() {
+        // Story 21-2: the async + blocking Run facade end to end, over a
+        // supervised Run seeded through the registry (the builtin `mock`
+        // cannot start a process).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        // No open Run yet: a labels write has nothing to rebind, and a child
+        // has no parent.
+        facade.set_config("demo", "labels.team", "core").unwrap();
+        assert!(matches!(
+            facade.open_child_run(ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "demo".to_string()
+            ))),
+            Err(RunError::NoOpenRun { .. })
+        ));
+        assert!(matches!(
+            facade
+                .set_config("demo", "labels.team", "has space")
+                .unwrap_err(),
+            ConfigError::InvalidValue { .. }
+        ));
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: Vec::new(),
+                    fresh: true,
+                })
+                .unwrap();
+        }
+        // A labels write while the Run is open rebinds it.
+        facade
+            .set_config("demo", "labels.team", "payments")
+            .unwrap();
+        let run = facade.run(owner.as_str()).unwrap();
+        assert_eq!(
+            run.labels,
+            vec![crate::domain::Label::bound("team", "payments")]
+        );
+        let child = facade
+            .open_child_run(ChildRunRequest::under(crate::domain::RunParent::Run(
+                owner.clone(),
+            )))
+            .unwrap();
+        assert_eq!(child.record.parent_run_id, Some(owner.clone()));
+        let closed = facade.close_run(child.record.run_id.as_str()).unwrap();
+        assert_eq!(closed.record.end_cause.as_deref(), Some("closed"));
+        assert!(matches!(
+            facade.close_run(owner.as_str()),
+            Err(RunError::OwnsProcess { .. })
+        ));
+        assert!(matches!(
+            facade.run("run_none"),
+            Err(RunError::NotFound { .. })
         ));
     }
 }

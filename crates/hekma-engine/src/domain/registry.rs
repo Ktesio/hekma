@@ -264,6 +264,9 @@ pub struct Registry {
     /// Import notes from a v12 upgrade on this open, drained once by the
     /// engine onto its diagnostic surface.
     open_notes: std::sync::Mutex<Vec<String>>,
+    /// The published Run snapshot (story 21-2, AD-25). Only store-writer
+    /// post-commit hooks publish into it.
+    run_snapshot: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
 }
 
 impl Registry {
@@ -317,12 +320,84 @@ impl Registry {
         legacy.retire_outbox_files();
         let writer = StoreWriter::spawn(write_store)?;
         let store = SqliteStore::open_read_only(&paths.state_db())?;
+        // Story 21-2: the writer publishes the initial Run snapshot (every
+        // non-ended Run) before any other job runs.
+        let run_snapshot =
+            std::sync::Arc::new(crate::domain::runs::snapshot::SnapshotPublisher::default());
+        // An unreadable Run row degrades the snapshot to empty with a note
+        // rather than refusing the open (graceful degradation).
+        let publisher = std::sync::Arc::clone(&run_snapshot);
+        let mut notes = notes;
+        if let Err(err) = writer.call(move |ctx| {
+            let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
+            ctx.after_commit(move || publisher.publish(entries));
+            Ok(())
+        }) {
+            notes.push(format!(
+                "the open Runs could not be read into the published Run snapshot ({err}); it \
+                 starts empty and fills as Runs change"
+            ));
+        }
         Ok(Self {
             paths,
             store,
             writer,
             open_notes: std::sync::Mutex::new(notes),
+            run_snapshot,
         })
+    }
+
+    /// The Run snapshot publisher (story 21-2): writer jobs that change a
+    /// Run hand it to [`crate::domain::runs::ops::commit`].
+    pub(crate) fn run_publisher(
+        &self,
+    ) -> &std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher> {
+        &self.run_snapshot
+    }
+
+    /// The current published Run snapshot (story 21-2): the data path's
+    /// lock-free view of every non-ended Run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn run_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::domain::runs::snapshot::RunSnapshot> {
+        self.run_snapshot.current()
+    }
+
+    /// Run a Run-registry operation as one writer job and commit its changes
+    /// (outbox rows + the snapshot publish). A refusal that is not a store
+    /// error comes back as `Ok(Err(..))` from the job, so the writer commits
+    /// nothing for it.
+    pub(crate) fn run_job<R: Send + 'static>(
+        &self,
+        op: impl FnOnce(
+                &SqliteStore,
+            )
+                -> Result<(R, crate::domain::runs::ops::RunChanges), crate::domain::RunError>
+            + Send
+            + 'static,
+    ) -> Result<(R, Vec<crate::domain::runs::ops::CommittedRunEvent>), crate::domain::RunError>
+    {
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        self.writer
+            .call(move |ctx| match op(ctx.store()) {
+                Ok((value, changes)) => {
+                    let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
+                    Ok(Ok((value, events)))
+                }
+                Err(crate::domain::RunError::Store(err)) => Err(err),
+                Err(refusal) => Ok(Err(refusal)),
+            })
+            .map_err(crate::domain::RunError::Store)?
+    }
+
+    /// One Run's facade view, read on the read-only connection.
+    pub(crate) fn run_view(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::RunView, crate::domain::RunError> {
+        self.store
+            .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
     }
 
     /// Run `work` on the store writer and wait for its commit (story 21-1).
@@ -1010,11 +1085,40 @@ impl Registry {
     pub(crate) fn write_spawn_record_new_launch(
         &self,
         record: &SpawnRecord,
-    ) -> Result<u64, RegistryError> {
+        run: crate::domain::runs::ops::SupervisedRun,
+    ) -> Result<(u64, Vec<crate::domain::runs::ops::CommittedRunEvent>), RegistryError> {
+        // Story 21-2: the Run is created (fresh start) or kept (relaunch) in
+        // the same job as the record, so the durable Run identity and the
+        // process record commit together.
         let record = record.clone();
-        Ok(self.write(move |store| {
-            store.upsert_spawn_record(&record)?;
-            store.bump_launch_generation(&record.name)
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        Ok(self.writer.call(move |ctx| {
+            ctx.store().upsert_spawn_record(&record)?;
+            let generation = ctx.store().bump_launch_generation(&record.name)?;
+            let changes = crate::domain::runs::ops::ensure_supervised(
+                ctx.store(),
+                &run,
+                &crate::time::now_rfc3339(),
+            )?;
+            let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
+            Ok((generation, events))
+        })?)
+    }
+
+    /// Create or keep an instance's supervised Run outside a spawn (story
+    /// 21-2): adoption keeps the Run and re-syncs its depth and labels.
+    pub(crate) fn ensure_supervised_run(
+        &self,
+        run: crate::domain::runs::ops::SupervisedRun,
+    ) -> Result<Vec<crate::domain::runs::ops::CommittedRunEvent>, RegistryError> {
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        Ok(self.writer.call(move |ctx| {
+            let changes = crate::domain::runs::ops::ensure_supervised(
+                ctx.store(),
+                &run,
+                &crate::time::now_rfc3339(),
+            )?;
+            crate::domain::runs::ops::commit(ctx, &publisher, changes)
         })?)
     }
 

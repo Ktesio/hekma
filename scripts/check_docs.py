@@ -140,8 +140,11 @@ KT_COMMANDS = {
     "self-update",
     "help",
     "agent",
+    "run",
     "serve",
 }
+# `hekma run` owns its own subcommand tree (crates/hekma/src/lib.rs `RunCommands`).
+RUN_COMMANDS = {"open", "close", "show"}
 # `hekma agent` owns its own subcommand tree (crates/hekma/src/lib.rs `AgentCommands`).
 # Model it the same way as the top level — an allowlist per nesting level — so the
 # agent-runner surface validates without a blanket bypass.
@@ -321,6 +324,13 @@ def validate_command_examples(
             validate_agent_subcommands(
                 rel_path, fence_index, line_number, tokens[command_index + 2 :], errors
             )
+        if command == "run":
+            found = first_non_flag(tokens[command_index + 2 :])
+            if found is not None and found[1] not in RUN_COMMANDS:
+                errors.append(
+                    f"{rel_path}: shell fence #{fence_index}, line {line_number}: unknown "
+                    f"`kt run` subcommand `{found[1]}`"
+                )
 
 
 def first_non_flag(tokens: list[str]) -> tuple[int, str] | None:

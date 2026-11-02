@@ -1,0 +1,342 @@
+{
+  "fixture": "hekma-verb-depth",
+  "version": 1,
+  "cells": [
+    {
+      "verb": "list-usage",
+      "column": "observed",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "from its telemetry, estimated"
+    },
+    {
+      "verb": "list-usage",
+      "column": "wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "per-call records"
+    },
+    {
+      "verb": "list-usage",
+      "column": "announced",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "per-call records"
+    },
+    {
+      "verb": "list-usage",
+      "column": "announced-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "per-call records"
+    },
+    {
+      "verb": "list-usage",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "per-call records and process state"
+    },
+    {
+      "verb": "list-usage",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "per-call records and process state"
+    },
+    {
+      "verb": "logs",
+      "column": "observed",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "logs",
+      "column": "wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "per-call records"
+    },
+    {
+      "verb": "logs",
+      "column": "announced",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "per-call records"
+    },
+    {
+      "verb": "logs",
+      "column": "announced-no-wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "per-call records"
+    },
+    {
+      "verb": "logs",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "process output and per-call records"
+    },
+    {
+      "verb": "logs",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "process output and per-call records"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "observed",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "from its telemetry"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "honored"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "announced",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "honored"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "announced-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "honored"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "honored"
+    },
+    {
+      "verb": "budgets-warn",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "honored"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "observed",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "wire",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: holds / releases the Run's calls"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "announced",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: holds / releases the Run's calls"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "announced-no-wire",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: holds / releases the Run's calls"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "Adapter pause; a wire hold only as the FR-7 amendment allows"
+    },
+    {
+      "verb": "pause-resume",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "Adapter pause; a wire hold only as the FR-7 amendment allows"
+    },
+    {
+      "verb": "stop",
+      "column": "observed",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "stop",
+      "column": "wire",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: rejects further calls, the process keeps running"
+    },
+    {
+      "verb": "stop",
+      "column": "announced",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: rejects further calls and ends the Lease"
+    },
+    {
+      "verb": "stop",
+      "column": "announced-no-wire",
+      "behavior": "qualified",
+      "status": "pending",
+      "note": "qualified: rejects further calls and ends the Lease"
+    },
+    {
+      "verb": "stop",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "process stop"
+    },
+    {
+      "verb": "stop",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "process stop"
+    },
+    {
+      "verb": "send-attach",
+      "column": "observed",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "send-attach",
+      "column": "wire",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "send-attach",
+      "column": "announced",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "send-attach",
+      "column": "announced-no-wire",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "send-attach",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "per the Adapter's Capability Declaration; a child Run fails fast"
+    },
+    {
+      "verb": "send-attach",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "per the Adapter's Capability Declaration; a child Run fails fast"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "observed",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "honored"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "announced",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "honored"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "announced-no-wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "honored"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "honored"
+    },
+    {
+      "verb": "hold-release-reroute-reject",
+      "column": "supervised-no-wire",
+      "behavior": "fails-fast",
+      "status": "pending",
+      "note": "fails fast, naming the Metering Source"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "observed",
+      "behavior": "refused",
+      "status": "pending",
+      "note": "set directly: refused at configuration; from a Policy: the fallback to warn"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "wire",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "as the verbs above (block as reject), latched until the ceiling is raised or reset"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "announced",
+      "behavior": "honored",
+      "status": "pending",
+      "note": "as the verbs above (block as reject), latched until the ceiling is raised or reset"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "announced-no-wire",
+      "behavior": "refused",
+      "status": "tested",
+      "note": "set directly with no wire path: refused at configuration, naming the Metering Source"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "supervised",
+      "behavior": "honored",
+      "status": "covered",
+      "note": "as the verbs above, latched"
+    },
+    {
+      "verb": "breach-action-pause-stop-block",
+      "column": "supervised-no-wire",
+      "behavior": "honored",
+      "status": "tested",
+      "note": "pause and stop as the verbs above, latched; block refused at configuration"
+    }
+  ]
+}

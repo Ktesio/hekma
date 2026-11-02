@@ -290,3 +290,31 @@ pub struct AgentPauseCommandFailed {
 pub struct AgentDrainBoundInvalid {
     pub message: String,
 }
+
+/// Story 21-2: no Run has the id (exit `3`, the not-found class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::not_found))]
+pub struct RunNotFound {
+    pub message: String,
+}
+
+/// Story 21-2: the Run request cannot be honored as given — nesting past the
+/// cap, a Breach Action the child's depth cannot execute, a malformed label
+/// or limit (exit `2`, the usage class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::invalid))]
+pub struct RunInvalid {
+    pub message: String,
+}
+
+/// Story 21-2: the Run's (or its parent's) state forbids the request — no
+/// open Run on the instance, an ended parent, a process-owning Run closed
+/// (exit `4`, the invalid-state class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::invalid_state))]
+pub struct RunInvalidState {
+    pub message: String,
+}
