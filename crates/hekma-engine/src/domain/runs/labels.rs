@@ -16,8 +16,8 @@ pub(crate) const LABELS_PREFIX: &str = "labels.";
 /// The longest label value accepted.
 const VALUE_MAX: usize = 128;
 
-/// Validate a label key: a lowercase letter, then up to 62 of lowercase
-/// letters, digits, `_`, `.` and `-` (`^[a-z][a-z0-9_.-]{0,62}$`).
+/// Validate a label key: 1 to 63 characters, a lowercase letter first, then
+/// lowercase letters, digits, `_`, `.` or `-`.
 pub fn validate_label_key(key: &str) -> Result<(), String> {
     let mut chars = key.chars();
     match chars.next() {
