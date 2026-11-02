@@ -228,12 +228,16 @@ impl HostClient {
                     return None;
                 }
             }
+            // A connect that never completed — refused, or timed out (Windows
+            // retries a SYN to a closed loopback port instead of refusing at
+            // once): nothing listens there, the file is stale — absent.
+            Err(err) if never_sent(&err) => return None,
             // The host ACCEPTED the connection but has not answered within
             // the bound: it is alive and busy (its runtime serves a long
             // request) — never mistaken for an absent host, which would
             // start a second one that can only lose `host.lock`.
             Err(ureq::Error::Timeout(_)) => {}
-            // No file was stale-but-listening, refused, or garbled: absent.
+            // Garbled or otherwise broken: absent.
             Err(_) => return None,
         }
         Some(HostClient {
@@ -322,11 +326,7 @@ impl HostClient {
     }
 
     fn transport_error(&self, err: ureq::Error) -> CallError {
-        let not_sent = match &err {
-            ureq::Error::ConnectionFailed => true,
-            ureq::Error::Io(io) => io.kind() == std::io::ErrorKind::ConnectionRefused,
-            _ => false,
-        };
+        let not_sent = never_sent(&err);
         let message = format!(
             "the local Service Host (pid {}) stopped answering: {err}; see {}",
             self.pid,
@@ -337,6 +337,21 @@ impl HostClient {
         } else {
             CallError::Unavailable(message)
         }
+    }
+}
+
+/// Whether a transport failure happened before the request left this
+/// process: the connection was refused, failed, or did not complete within
+/// the connect bound (name resolution included). Such a request was never
+/// sent, so finding or starting the owner again and retrying is safe. A
+/// timeout AFTER the connect (sending, or waiting for the answer) is not:
+/// the host may have acted on it.
+fn never_sent(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::ConnectionFailed => true,
+        ureq::Error::Timeout(ureq::Timeout::Connect | ureq::Timeout::Resolve) => true,
+        ureq::Error::Io(io) => io.kind() == std::io::ErrorKind::ConnectionRefused,
+        _ => false,
     }
 }
 
@@ -595,6 +610,32 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn only_a_connect_phase_failure_counts_as_never_sent() {
+        // Refused, failed or timed out while connecting: never sent (the
+        // Windows shape of a closed loopback port is the connect timeout).
+        assert!(never_sent(&ureq::Error::ConnectionFailed));
+        assert!(never_sent(&ureq::Error::Timeout(ureq::Timeout::Connect)));
+        assert!(never_sent(&ureq::Error::Timeout(ureq::Timeout::Resolve)));
+        assert!(never_sent(&ureq::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        ))));
+        // After the connect the host may have acted: not retryable.
+        for timeout in [
+            ureq::Timeout::SendRequest,
+            ureq::Timeout::SendBody,
+            ureq::Timeout::RecvResponse,
+            ureq::Timeout::RecvBody,
+            ureq::Timeout::Global,
+            ureq::Timeout::PerCall,
+        ] {
+            assert!(!never_sent(&ureq::Error::Timeout(timeout)), "{timeout:?}");
+        }
+        assert!(!never_sent(&ureq::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
     }
 
     #[test]
