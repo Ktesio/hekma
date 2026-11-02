@@ -2,7 +2,7 @@
 title: 'The store writer and Run-scale storage'
 type: 'feature'
 created: '2026-10-31'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 1
 baseline_commit: 'add88aede32d8839b35cf522f56ef59ac70cf2a4'
 context:
