@@ -29,7 +29,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(
 
 [workspace.dependencies]
 # Internal crates
-hekma-engine = { path = "crates/hekma-engine", version = "0.10.0" }
+hekma-engine = { path = "crates/hekma-engine", version = "0.11.0" }
 # The long-running Service Host (story 17-2, AD-2 amendment 2026-10-19): the
 # `hekma` CLI's `serve` subcommand drives it; its ONLY normal dep is the
 # engine's public API (`cargo tree -p hekma-host -e normal` = engine + tokio).
@@ -92,7 +92,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "1"
 # Engine state store (AD-6): bundled SQLite, no system dependency.
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # Cross-platform data-dir resolution; keeps engine path code cfg-free (OS-cfg gate).
 directories = "6"
 console = "0.16"
@@ -125,7 +125,7 @@ tempfile = "3"
 # feature-gated even though process metrics are core) — the component/disk/
 # network/user probe features (and their windows/objc2 stacks) stay out of
 # the dev build.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # Story 12-3: the self-signed test root for the TLS upstream test (the in-crate
 # https+SSE composition test). DEV-DEPENDENCY ONLY — never a shipping artifact,
 # NFR-8's runtime-lean policy is untouched. rcgen's default `ring` backend is
