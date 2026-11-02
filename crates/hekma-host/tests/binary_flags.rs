@@ -201,3 +201,49 @@ fn the_log_capture_flag_lands_in_the_serving_engine_and_the_version_says_so() {
         "a signalled host drains and exits zero: {exit}"
     );
 }
+
+/// Story 21-4: the binary's TLS flags parse like `hekma serve`'s — a
+/// valueless flag (or one followed by another flag) is a usage refusal
+/// naming what it needs.
+#[test]
+fn a_tls_flag_without_its_path_is_a_usage_refusal() {
+    for (flag, needs) in [
+        ("--tls-cert", "--tls-cert needs a PEM certificate file path"),
+        ("--tls-key", "--tls-key needs a PEM private key file path"),
+    ] {
+        for args in [vec![flag], vec![flag, "--listen"]] {
+            let output = Command::new(hekma_host_bin())
+                .args(&args)
+                .output()
+                .expect("the binary must run");
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(needs), "{args:?}: {stderr}");
+        }
+    }
+}
+
+/// Story 21-4: the parsed TLS paths reach the host's option check — an
+/// unreadable certificate is refused (exit 2) naming the path, before
+/// anything is created in the state directory.
+#[test]
+fn the_tls_paths_reach_the_host_and_an_unreadable_cert_refuses_before_anything_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let cert = dir.path().join("missing-cert.pem");
+    let key = dir.path().join("missing-key.pem");
+    let output = Command::new(hekma_host_bin())
+        .arg("--state-dir")
+        .arg(&state)
+        .args(["--listen", "0.0.0.0:0", "--bearer-secret", "UNUSED_BEARER"])
+        .arg("--tls-cert")
+        .arg(&cert)
+        .arg("--tls-key")
+        .arg(&key)
+        .output()
+        .expect("the binary must run");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-cert.pem"), "{stderr}");
+    assert!(!state.exists(), "nothing was created: {state:?}");
+}

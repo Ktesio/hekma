@@ -74,6 +74,11 @@ fn force_state_running(state_dir: &Path, name: &str) {
 /// (guaranteed suspension; exit code `5`'s unsupported-capability route) the
 /// skipped test's comment says so.
 fn start_via_surviving_engine(state_dir: &Path, name: &str) {
+    // Story 21-4: a running Service Host only supervises what it started or
+    // adopted when it OPENED — stop the state root's host first, so the next
+    // CLI command's freshly auto-started host ADOPTS the helper's survivor
+    // (the cross-lifetime shape these tests exercise).
+    helpers::stop_host(state_dir);
     let exe = std::env::current_exe().expect("test exe");
     let status = std::process::Command::new(exe)
         .args([
@@ -610,16 +615,14 @@ fn start_prints_running_state_and_exits_zero() {
 }
 
 #[test]
-fn start_prints_single_lifetime_notice_to_stderr_only() {
-    // LOW-1, story-12-1 flip: the success path of a PLAIN `hekma agent start` is
-    // honest about single-lifetime supervision — a standalone `hekma agent start`
-    // kills the agent when the CLI exits cleanly, and the notice now names the
-    // shipped escape hatch (`--detach`) instead of the stale "future work"
-    // claim (detach EXISTS since 12-1; the plain path's behavior is unchanged).
-    // The caveat is printed as a one-line NOTICE to STDERR (AD-12: results →
-    // stdout, notices → stderr), and the stdout result line (`running`) is
-    // UNCHANGED. This asserts both halves so a future change that either drops
-    // the notice or leaks it onto stdout is caught.
+fn start_prints_the_service_host_notice_to_stderr_only() {
+    // Story 21-4 (AD-20's one data-path owner) replaces the single-lifetime
+    // notice: every start now runs under the local Service Host and OUTLIVES
+    // the command, so the notice names the host's pid and the stop command.
+    // The caveat stays a one-line NOTICE on STDERR (AD-12: results → stdout,
+    // notices → stderr), and the stdout result line (`running`) is UNCHANGED.
+    // This asserts both halves so a future change that either drops the
+    // notice or leaks it onto stdout is caught.
     let ctx = TestContext::new();
     let state = TestContext::new();
     let state_dir = state.project_dir.as_path();
@@ -640,44 +643,250 @@ fn start_prints_single_lifetime_notice_to_stderr_only() {
     assert!(run.success, "start should exit 0; stderr={}", run.stderr);
     // stdout result line is unchanged (still shows `running`).
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
-    // The notice is on stderr and states the honest boundary (supervised only for
-    // this engine session; stops when the command exits) and points at --detach.
+    let pid = helpers::host_pid(state_dir).expect("a host serves the state root");
+    // The notice is on stderr: it names the host and the honest lifetime
+    // (the agent keeps running after this command) and how to stop it.
     assert!(
+        run.stderr.contains(&format!(
+            "the agent runs under the local Service Host (pid {pid}) and keeps running \
+             after this command exits; stop it with: hekma agent stop svc"
+        )),
+        "the service-host notice must go to stderr; stderr={}",
         run.stderr
+    );
+    // The retired single-lifetime claim must NOT resurface.
+    assert!(
+        !run.stderr
             .contains("supervised only for this engine session"),
-        "single-lifetime notice must go to stderr; stderr={}",
-        run.stderr
-    );
-    assert!(
-        run.stderr.contains("stops when this command exits"),
-        "notice must state the clean-exit stop; stderr={}",
-        run.stderr
-    );
-    assert!(
-        run.stderr.contains("--detach"),
-        "notice must point at the shipped --detach escape hatch; stderr={}",
-        run.stderr
-    );
-    // The stale "future work" claim must NOT resurface (detach shipped in 12-1).
-    assert!(
-        !run.stderr.contains("future work"),
-        "notice must not claim durable supervision is future work anymore; stderr={}",
-        run.stderr
-    );
-    // It must NOT claim durable cross-CLI supervision for the PLAIN path
-    // (without --detach the agent still stops at exit).
-    assert!(
-        !run.stderr.contains("keeps running after this command"),
-        "the plain-start notice must not promise detached survival; stderr={}",
+        "stderr={}",
         run.stderr
     );
     // The notice must NOT leak onto stdout (AD-12: stdout is the result only).
     assert!(
-        !run.stdout
-            .contains("supervised only for this engine session"),
+        !run.stdout.contains("Service Host"),
         "notice must not appear on stdout; stdout={}",
         run.stdout
     );
+    let stop = run_hekma_agent(
+        &["agent", "stop", "svc", "--timeout", "5"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(stop.success, "stderr={}", stop.stderr);
+}
+
+#[test]
+fn an_agent_outlives_its_start_command_and_a_later_send_reaches_it() {
+    // Story 21-4 AC: `hekma agent start <name>` (no --detach) exits, and the
+    // agent keeps running supervised by the host; a separate `send` reaches
+    // its stdin (the host holds the pipe), and one host serves every command.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--echo-stdin", "--linger-ms", "600000"]);
+    let reg = run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "echo",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "stderr={}", reg.stderr);
+    let host = helpers::host_pid(state_dir).expect("the register auto-started a host");
+    let start = run_hekma_agent(&["agent", "start", "echo"], &ctx.project_dir, state_dir);
+    assert!(start.success, "stderr={}", start.stderr);
+    // The start command has exited; the agent is still running.
+    let pid = wait_for_agent_pid(state_dir, "echo");
+    assert!(pid_alive(pid), "the agent outlived its start command");
+    let send = run_hekma_agent(
+        &["agent", "send", "echo", "after-the-start"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(
+        send.success,
+        "the send reaches the host's pipe; stderr={}",
+        send.stderr
+    );
+    let log = state_dir
+        .join("agents")
+        .join("echo")
+        .join("logs")
+        .join("agent.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("stdin: after-the-start")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sent line never reached the agent"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        helpers::host_pid(state_dir),
+        Some(host),
+        "every command was served by the same host"
+    );
+    let stop = run_hekma_agent(
+        &["agent", "stop", "echo", "--timeout", "5"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(stop.success, "stderr={}", stop.stderr);
+}
+
+#[test]
+fn a_read_only_command_never_starts_a_host_and_creates_nothing() {
+    // Story 21-4 AC: on a fresh machine `hekma agent list` prints the
+    // empty-fleet hint and creates NOTHING — no state dir, no state.db, no
+    // host.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let fresh = state.project_dir.join("never-created");
+    for args in [
+        &["agent", "list"][..],
+        &["agent", "list", "--json"],
+        &["agent", "usage"],
+        &["agent", "show", "ghost"],
+    ] {
+        let run = run_hekma_agent(args, &ctx.project_dir, &fresh);
+        if args[1] == "show" {
+            assert_eq!(run.code, Some(3), "stderr={}", run.stderr);
+        } else {
+            assert!(run.success, "{args:?} stderr={}", run.stderr);
+        }
+        assert!(
+            !fresh.exists(),
+            "{args:?} must not create the state root: {}",
+            fresh.display()
+        );
+    }
+    let list = run_hekma_agent(&["agent", "list"], &ctx.project_dir, &fresh);
+    assert!(
+        list.stdout.contains("No Agent Instances registered yet")
+            || list.stderr.contains("No Agent Instances registered yet"),
+        "the empty-fleet hint; stdout={} stderr={}",
+        list.stdout,
+        list.stderr
+    );
+}
+
+#[test]
+fn a_read_only_command_never_writes_an_existing_state_db() {
+    // Story 21-4 AC: reads open state.db read-only — with no host running
+    // the database bytes are untouched and no host starts.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let reg = run_hekma_agent(
+        &["agent", "register", "quiet", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "stderr={}", reg.stderr);
+    helpers::stop_host(state_dir);
+    assert!(helpers::host_pid(state_dir).is_none(), "the host is gone");
+    let before = std::fs::read(state_db(state_dir)).unwrap();
+    for args in [
+        &["agent", "list"][..],
+        &["agent", "show", "quiet"],
+        &["agent", "show", "quiet", "--json"],
+        &["agent", "usage", "quiet"],
+        &["agent", "config", "get", "quiet"],
+    ] {
+        let run = run_hekma_agent(args, &ctx.project_dir, state_dir);
+        assert!(run.success, "{args:?} stderr={}", run.stderr);
+    }
+    assert_eq!(
+        std::fs::read(state_db(state_dir)).unwrap(),
+        before,
+        "state.db is byte-identical after the reads"
+    );
+    assert!(
+        helpers::host_pid(state_dir).is_none(),
+        "no read started a host"
+    );
+}
+
+#[test]
+fn concurrent_writes_share_one_host() {
+    // Story 21-4 AC: with a host running, concurrent CLI writes are all
+    // served by it and no second host starts.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.clone();
+    let first = run_hekma_agent(
+        &["agent", "register", "seed", "--kind", "mock"],
+        &ctx.project_dir,
+        &state_dir,
+    );
+    assert!(first.success, "stderr={}", first.stderr);
+    let host = helpers::host_pid(&state_dir).expect("a host");
+    let workers: Vec<_> = (0..6)
+        .map(|i| {
+            let project = ctx.project_dir.clone();
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || {
+                run_hekma_agent(
+                    &["agent", "register", &format!("c{i}"), "--kind", "mock"],
+                    &project,
+                    &state_dir,
+                )
+            })
+        })
+        .collect();
+    for worker in workers {
+        let run = worker.join().unwrap();
+        assert!(run.success, "stderr={}", run.stderr);
+    }
+    assert_eq!(
+        helpers::host_pid(&state_dir),
+        Some(host),
+        "one owner throughout"
+    );
+    let list = run_hekma_agent(&["agent", "list", "--json"], &ctx.project_dir, &state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(doc["instances"].as_array().unwrap().len(), 7);
+}
+
+#[test]
+fn racing_first_writes_converge_on_one_auto_started_host() {
+    // Story 21-4: with NO host, several first writes race to start one; one
+    // wins host.lock, the losers exit into serve.log, and every command is
+    // served by the winner.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.clone();
+    let workers: Vec<_> = (0..4)
+        .map(|i| {
+            let project = ctx.project_dir.clone();
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || {
+                run_hekma_agent(
+                    &["agent", "register", &format!("r{i}"), "--kind", "mock"],
+                    &project,
+                    &state_dir,
+                )
+            })
+        })
+        .collect();
+    for worker in workers {
+        let run = worker.join().unwrap();
+        assert!(run.success, "stderr={}", run.stderr);
+    }
+    let list = run_hekma_agent(&["agent", "list", "--json"], &ctx.project_dir, &state_dir);
+    let doc: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
+    assert_eq!(doc["instances"].as_array().unwrap().len(), 4);
+    let discovery = hekma_host::read_discovery(&state_dir).expect("the winner's control.json");
+    assert!(discovery.autostarted);
+    assert!(discovery.addr.ip().is_loopback());
+    assert!(helpers::process_alive(discovery.pid));
 }
 
 /// Whether a pid is alive — the data-driven, cfg-free liveness probe (the
@@ -985,7 +1194,7 @@ fn start_detach_survives_the_command_exit_and_the_next_command_stops_it() {
     assert!(
         run.run
             .stderr
-            .contains("keeps running after this command exits")
+            .contains("keeps running even if that host exits")
             && run.run.stderr.contains("re-adopts"),
         "the notice must state the survival + re-adoption; stderr={}",
         run.run.stderr
@@ -1378,15 +1587,14 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
     //      covers the restart cadence; HERE the terminal path keeps every
     //      assertion deterministic;
     //   3. `start --detach` — the child survives the command exit (12-1);
-    //   4. a background `logs --follow`: its engine ADOPTS the child with a
-    //      FRESH window (the ≤-one-extra-window honesty), the reaper expires
-    //      it, and the follow observes the failure and exits cleanly on its
-    //      own (AC-C) — the follow is the long-lived command whose engine
-    //      runs the reaper long enough for the window to expire at all;
+    //   4. a background `logs --follow` (story 21-4: read-only): the local
+    //      Service Host supervising the detached child runs the reaper, which
+    //      expires the window; the follow observes the failure and exits
+    //      cleanly on its own (AC-C);
     //   5. `show` names the check + the failing streak (the "no new verbs"
-    //      surface), and the follow's stderr carries the window diagnostics
-    //      SINGLE-SHOT (one first-failure note, one terminal policy
-    //      conclusion — never per-tick spam).
+    //      surface), and the host's stream (`serve.log`) carries the window
+    //      diagnostics SINGLE-SHOT (one first-failure note, one terminal
+    //      policy conclusion — never per-tick spam).
     //
     // Runs on all three OSes: `--detach` survival is the 12-1 mechanism that
     // works affirmatively everywhere (no `_unix` suffix).
@@ -1461,67 +1669,19 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
         start.stderr
     );
 
-    // Spawn the follow and RETRY until it adopts (V4, review round 1): the
-    // follow's engine can only adopt the child once the start command's
-    // engine has fully exited, and a blind sleep raced that teardown. A
-    // too-early follow refuses ("supervised by another live engine") and
-    // exits fast; the retry loop drains its stderr, checks the refusal
-    // marker, and spawns again — bounded, so a wedged start-engine fails
-    // the test loudly instead of the drift passing silently. The beat is
-    // 500ms: a refusal exits well inside it, while a LEGITIMATE follow exit
-    // (it observed the failure) needs adoption + a 600ms window + ticks —
-    // never under ~900ms — so the two are cleanly separable.
-    let adopt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut child = loop {
-        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
-            .args(["agent", "logs", "fading", "--follow"])
-            .current_dir(&ctx.project_dir)
-            .env("KTESIO_NO_UPDATE_CHECK", "1")
-            .env("KTESIO_STATE_DIR", state_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn hekma agent logs --follow");
-        // Poll the beat: still running at 500ms ⇒ it adopted; exited inside
-        // the beat ⇒ a refusal (or something unexpected — named loudly).
-        let beat_end = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut exited_early = false;
-        loop {
-            match child.try_wait().expect("poll the follow child") {
-                None => {
-                    if std::time::Instant::now() >= beat_end {
-                        break; // adopted — keep this child.
-                    }
-                }
-                Some(_) => {
-                    exited_early = true;
-                    break;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if !exited_early {
-            break child;
-        }
-        let mut early_stderr = String::new();
-        {
-            use std::io::Read;
-            let _ = child
-                .stderr
-                .take()
-                .expect("the follow's stderr pipe")
-                .read_to_string(&mut early_stderr);
-        }
-        assert!(
-            early_stderr.contains("supervised by another live engine"),
-            "the follow exited before adopting for an unexpected reason; \
-             stderr={early_stderr}"
-        );
-        assert!(
-            std::time::Instant::now() < adopt_deadline,
-            "the start engine never released the instance for adoption"
-        );
-    };
+    // Story 21-4: the detached agent runs under the local Service Host,
+    // whose reaper owns the liveness window; the follow is a READ-ONLY
+    // command (it never adopts, so it is never refused as "supervised by
+    // another live engine") that observes the failure and exits on its own.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_hekma"))
+        .args(["agent", "logs", "fading", "--follow"])
+        .current_dir(&ctx.project_dir)
+        .env("KTESIO_NO_UPDATE_CHECK", "1")
+        .env("KTESIO_STATE_DIR", state_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hekma agent logs --follow");
 
     // The failure needs the follow's adoption + a fresh window (600ms) +
     // reaper ticks. Poll `list` until the unresponsive edge has landed.
@@ -1595,9 +1755,14 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
         stderr.contains("is failed; no further output will arrive."),
         "an honest state-appropriate exit note must be printed; stderr={stderr}"
     );
+    // Story 21-4: the window diagnostics are the SUPERVISING engine's — the
+    // auto-started Service Host's stream (`serve.log`), where its reaper ran
+    // the window.
+    let host_log = std::fs::read_to_string(state_dir.join(hekma_host::SERVE_LOG_FILE))
+        .expect("the auto-started host's serve.log");
     assert!(
-        stderr.contains("hb.marker"),
-        "the window diagnostics must name the declared check's target; stderr={stderr}"
+        host_log.contains("hb.marker"),
+        "the window diagnostics must name the declared check's target; serve.log={host_log}"
     );
     // SINGLE-SHOT pins (surfaced, not silent — and never per-tick spam):
     // exactly ONE first-failure note when the window opened, and exactly ONE
@@ -1605,14 +1770,14 @@ fn unresponsive_liveness_failure_across_commands_and_show_names_the_check() {
     // verdict ALSO rides the persisted cause's detail — the `show` assert
     // above pins that durable surface; these pins stay console-only.)
     assert_eq!(
-        stderr.matches("declared liveness check failing").count(),
+        host_log.matches("declared liveness check failing").count(),
         1,
-        "exactly ONE first-failure diagnostic (single-shot, not per-tick); stderr={stderr}"
+        "exactly ONE first-failure diagnostic (single-shot, not per-tick); serve.log={host_log}"
     );
     assert_eq!(
-        stderr.matches("restart policy is 'never'").count(),
+        host_log.matches("restart policy is 'never'").count(),
         1,
-        "exactly ONE terminal policy conclusion; stderr={stderr}"
+        "exactly ONE terminal policy conclusion; serve.log={host_log}"
     );
 }
 
@@ -8413,10 +8578,12 @@ fn acp_e2e_register_start_refusal_handshake_and_honest_gap_surfaces() {
         start.stdout
     );
 
-    // (5) The next command reconciles the killed-at-drop child honestly
-    // (`failed`) — and the ADDITIVE Fleet surfaces are all there: the honest
-    // gap (no billing-grade usage anywhere), the honest context-usage
-    // absence, truthful zero ledger totals, and the acp metering default.
+    // (5) Story 21-4: the agent OUTLIVES the start command (it runs under the
+    // local Service Host), so the read sees it `running` — and the ADDITIVE
+    // Fleet surfaces are all there: the honest gap (no billing-grade usage
+    // anywhere), the honest context-usage absence (a read-only engine holds
+    // no live connection), truthful zero ledger totals, and the acp metering
+    // default.
     let show = run_hekma_agent(
         &["agent", "show", name, "--json"],
         &ctx.project_dir,
@@ -8427,7 +8594,7 @@ fn acp_e2e_register_start_refusal_handshake_and_honest_gap_surfaces() {
         .unwrap_or_else(|e| panic!("show --json stdout not JSON: {e}\n{}", show.stdout));
     let entry = &doc["instance"];
     assert_eq!(entry["kind"], serde_json::json!("acp"), "{entry}");
-    assert_eq!(entry["state"], serde_json::json!("failed"), "{entry}");
+    assert_eq!(entry["state"], serde_json::json!("running"), "{entry}");
     assert_eq!(
         entry["metering_source"],
         serde_json::json!("self-reported"),
@@ -8505,6 +8672,12 @@ fn acp_e2e_register_start_refusal_handshake_and_honest_gap_surfaces() {
         "the tier notice rides stderr as an instance-prefixed note; stderr={}",
         list.stderr
     );
+    let stop = run_hekma_agent(
+        &["agent", "stop", name, "--timeout", "5"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(stop.code, Some(0), "stderr={}", stop.stderr);
 }
 
 /// The re-exec entry for the ACP TURN helper (the
@@ -8678,27 +8851,38 @@ fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
     // id) and exit WITHOUT dropping the engine — the lingering agent survives.
     start_via_surviving_engine(state_dir, name);
 
-    // The real binary adopts the survivor: exit 0, the adopted-acp note on
-    // stderr (surfaced-not-silent), and the honest gap on the JSON surface.
+    // Story 21-4: the next WRITE auto-starts a Service Host, whose engine
+    // ADOPTS the survivor at open — and that command surfaces the adopted-acp
+    // note on its stderr (surfaced-not-silent; the host delivers its open
+    // notes to the command that started it). A harmless pass-through config
+    // write is the adopting command here.
+    let adopt = run_hekma_agent(
+        &["agent", "config", "set", name, "agent.adoption_probe", "1"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(adopt.code, Some(0), "stderr={}", adopt.stderr);
+    assert!(
+        adopt.stderr.contains("adopted an acp instance"),
+        "the adoption note must surface; stderr={}",
+        adopt.stderr
+    );
+    assert!(
+        adopt.stderr.contains(
+            "a previous session is on record and will be \
+                       offered via session/load at the next start"
+        ),
+        "the resume-at-next-start promise names the persisted session; stderr={}",
+        adopt.stderr
+    );
+    // The read sees the adopted instance and the honest gap on the JSON
+    // surface.
     let show = run_hekma_agent(
         &["agent", "show", name, "--json"],
         &ctx.project_dir,
         state_dir,
     );
     assert_eq!(show.code, Some(0), "stderr={}", show.stderr);
-    assert!(
-        show.stderr.contains("adopted an acp instance"),
-        "the adoption note must surface; stderr={}",
-        show.stderr
-    );
-    assert!(
-        show.stderr.contains(
-            "a previous session is on record and will be \
-                       offered via session/load at the next start"
-        ),
-        "the resume-at-next-start promise names the persisted session; stderr={}",
-        show.stderr
-    );
     let doc: serde_json::Value = serde_json::from_str(&show.stdout)
         .unwrap_or_else(|e| panic!("show --json stdout not JSON: {e}\n{}", show.stdout));
     let entry = &doc["instance"];
@@ -8712,21 +8896,18 @@ fn acp_e2e_adopted_survivor_surfaces_the_resume_note_and_gap_cells_unix() {
         "an adopted instance holds no live connection — no context figure: {entry}"
     );
 
-    // This command's exit killed the adopted (non-detached) lingering agent;
-    // the trailing command reconciles the row honestly so no phantom `running`
-    // row or orphan survives the test.
+    // Story 21-4: the adopted lingering agent is supervised by the host now
+    // (it no longer dies with a command) — stop it so no orphan survives the
+    // test.
     let settle = run_hekma_agent(
-        &["agent", "show", name, "--json"],
+        &["agent", "stop", name, "--timeout", "5"],
         &ctx.project_dir,
         state_dir,
     );
     assert_eq!(settle.code, Some(0), "stderr={}", settle.stderr);
-    let settle_doc: serde_json::Value = serde_json::from_str(&settle.stdout)
-        .unwrap_or_else(|e| panic!("settle stdout not JSON: {e}\n{}", settle.stdout));
-    assert_eq!(
-        settle_doc["instance"]["state"],
-        serde_json::json!("failed"),
-        "the killed survivor reconciles honestly: {}",
+    assert!(
+        settle.stdout.contains("stopped"),
+        "the adopted survivor stops through the host: {}",
         settle.stdout
     );
 }
@@ -9133,6 +9314,10 @@ fn logs_follow_streams_raw_fallback_lines_with_the_once_per_session_qualifier() 
         assert!(!started.timed_out, "the detached start leg hung");
         assert!(started.run.success, "stderr={}", started.run.stderr);
         wait_for_agent_pid(state_dir, &name);
+        // Story 21-4: the "between commands" window is now the window
+        // between HOSTS — kill the supervising host abruptly (the detached
+        // agent survives), so no engine tailer attributes the raw output.
+        helpers::kill_host(state_dir);
 
         // The backlog exists BEFORE the follow command starts: the bounded
         // window (default 200) covers this small gap, so it STREAMS at
@@ -9280,6 +9465,9 @@ fn logs_follow_primes_only_the_bounded_backlog_window_and_names_the_skipped_coun
     assert!(!started.timed_out, "the detached start leg hung");
     assert!(started.run.success, "stderr={}", started.run.stderr);
     wait_for_agent_pid(state_dir, name);
+    // Story 21-4: no engine holds the instance only BETWEEN hosts — kill the
+    // supervising host abruptly (the detached agent survives).
+    helpers::kill_host(state_dir);
 
     // The PRE-FOLLOW GAP: four complete lines appended while NO engine
     // session holds the instance (the detached agent only idles) — a gap

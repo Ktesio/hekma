@@ -1,6 +1,16 @@
 //! `hekma agent register | remove | list` — thin CLI over the engine's
 //! synchronous registration API (spine AD-2, CLI-first gate).
 //!
+//! Story 21-4 (AD-20's one data-path owner): every WRITE (`register`,
+//! `remove`, `start`, `stop`, `pause`, `resume`, `drain`, `send`, `config
+//! set`, `memory attach|detach`) is one Control API call to the local Service
+//! Host that owns the state root — found through `control.json`, or started
+//! in the background ([`super::host_client`]). Every READ (`list`, `show`,
+//! `usage`, `logs`, `config get`) opens state.db READ-ONLY
+//! ([`Engine::open_read_only`]) and never starts a host. The host carries the
+//! engine's typed error on the wire, so each command renders the same
+//! diagnostic and exit code as before through the mappers below.
+//!
 //! This module holds NO domain logic and constructs NO paths: the engine is
 //! the sole path authority (it computes and returns the Agent Home path, which
 //! we merely display). Every capability is reachable here (register, remove
@@ -12,17 +22,19 @@
 //! only — conventions). Output discipline (AD-12): command results to stdout,
 //! diagnostics/notices to stderr.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hekma_engine::{
-    render_dollars, render_dollars_bare, AdapterRef, BudgetView, Capability, ConfigError,
-    ConfigLayer, EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel,
-    FleetEntry, FleetListing, FleetTotals, GuaranteeLevel, LifecycleState, LogLine,
-    MemoryBackingKind, Micros, RegistryError, RemoveDisposition, SupportLevel, UsageView,
-    FLEET_SCHEMA_VERSION,
+    render_dollars, render_dollars_bare, BudgetView, Capability, ConfigError, ConfigLayer,
+    EffectiveCapabilities, EffectiveConfig, Engine, EngineError, EstimateLabel, FleetEntry,
+    FleetListing, FleetTotals, GuaranteeLevel, LifecycleState, LogLine, MemoryBackingKind, Micros,
+    RegistryError, RemoveDisposition, SupportLevel, UsageView, FLEET_SCHEMA_VERSION,
 };
 use serde::Serialize;
+use serde_json::{json, Value};
 
+use super::host_client::{segment, CallError, HostClient};
 use crate::error::{
     AgentAcpTurnInFlight, AgentCapabilityUnsupported, AgentConfig, AgentContractIncompatible,
     AgentDetachRefused, AgentDuplicateName, AgentInteractionTimedOut, AgentInteractionUnavailable,
@@ -157,7 +169,7 @@ impl DispositionArg {
 ///
 /// `--kind` and `--manifest` are mutually exclusive at the clap layer, and at
 /// least one is required; this enum resolves the parsed flags into the engine's
-/// [`AdapterRef`]. `[ASSUMPTION]` on the mutually-exclusive-required shape.
+/// [`hekma_engine::AdapterRef`]. `[ASSUMPTION]` on the mutually-exclusive-required shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdapterArg {
     /// `--kind <kind>` — a native builtin adapter by kind.
@@ -185,49 +197,136 @@ impl AdapterArg {
         }
     }
 
-    /// Translate into the engine's [`AdapterRef`].
-    fn to_ref(&self) -> AdapterRef {
+    /// Translate into the engine's [`hekma_engine::AdapterRef`] (the in-process form; the
+    /// routed register sends the same choice as the Control API body).
+    #[cfg(test)]
+    fn to_ref(&self) -> hekma_engine::AdapterRef {
         match self {
-            AdapterArg::Kind(k) => AdapterRef::Native(k.clone()),
-            AdapterArg::Manifest(p) => AdapterRef::Manifest(std::path::PathBuf::from(p)),
+            AdapterArg::Kind(k) => hekma_engine::AdapterRef::Native(k.clone()),
+            AdapterArg::Manifest(p) => {
+                hekma_engine::AdapterRef::Manifest(std::path::PathBuf::from(p))
+            }
         }
     }
 }
 
 /// `hekma agent register <name> (--kind <kind> | --manifest <path>)`.
 ///
-/// Opens the engine (default state dir, or `KTESIO_STATE_DIR`), resolves +
-/// validates the adapter, registers the instance, and prints the engine-computed
+/// Asks the local Service Host (story 21-4) to resolve + validate the adapter
+/// and register the instance, then prints the engine-computed
 /// Agent Home path plus the effective (current-OS) Capability Declaration to
 /// stdout. On an adapter/validation failure, nothing is written and a miette
 /// diagnostic naming the problem goes to stderr.
 pub fn register(name: &str, adapter: &AdapterArg) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let engine = engine.blocking();
-    match engine.register_with_adapter(name, &adapter.to_ref()) {
-        Ok(instance) => {
-            ui::success(format!(
-                "Registered Agent Instance {} ({})",
-                ui::skill_name(instance.name.as_str()),
-                instance.kind
-            ));
-            // Command result to stdout: the created Agent Home path.
-            println!("{}", instance.agent_home);
-
-            // Surface the effective per-OS Capability Declaration (AC1). Read it
-            // back from the just-persisted snapshot so what we print is exactly
-            // what `hekma agent show` will render.
-            match engine.effective_capabilities(instance.name.as_str()) {
-                Ok(caps) => render_capabilities(instance.name.as_str(), &caps),
-                // A render read-back failure must not fail a successful
-                // registration; note it to stderr and move on.
-                Err(err) => ui::warning(format!(
-                    "Registered, but could not read back the Capability Declaration: {err}"
-                )),
-            }
-            Ok(())
+    // A relative `--manifest` resolves against THIS command's working
+    // directory (the host's would be an invisible dependency): the CLI makes
+    // it absolute first, and maps the absolute path back to the typed one in
+    // any manifest diagnostic, so the text is the operator's own.
+    let (body, typed_manifest) = match adapter {
+        AdapterArg::Kind(kind) => (json!({ "name": name, "kind": kind }), None),
+        AdapterArg::Manifest(path) => {
+            let absolute = absolute_manifest(path)?;
+            let shown = absolute.to_string_lossy().into_owned();
+            (
+                json!({ "name": name, "manifest": shown }),
+                Some((shown, path.clone())),
+            )
         }
-        Err(err) => Err(map_error(err)),
+    };
+    let routed = match route("POST", "/v0/instances", Some(body)) {
+        Ok(routed) => routed,
+        Err(RoutedError::Call(CallError::Registry(err))) => {
+            let err = match &typed_manifest {
+                Some((absolute, typed)) => relativize_manifest_error(err, absolute, typed),
+                None => err,
+            };
+            return Err(map_error(err));
+        }
+        Err(err) => return Err(err.into_diagnostic()),
+    };
+    // The `201` read-back (the Fleet row); in the rare race where the
+    // instance was removed between the commit and the read-back the body is
+    // empty — read the row locally then.
+    let entry = match routed.instance() {
+        Some(entry) => entry,
+        None => open_read_only_engine()?
+            .blocking()
+            .fleet_entry(name)
+            .map_err(map_error)?,
+    };
+    ui::success(format!(
+        "Registered Agent Instance {} ({})",
+        ui::skill_name(entry.name.as_str()),
+        entry.kind
+    ));
+    // Command result to stdout: the created Agent Home path.
+    println!("{}", entry.agent_home);
+
+    // Surface the effective per-OS Capability Declaration (AC1). Read it
+    // back from the just-persisted snapshot so what we print is exactly
+    // what `hekma agent show` will render.
+    let caps = open_read_only_engine()
+        .map_err(|err| err.to_string())
+        .and_then(|engine| {
+            engine
+                .blocking()
+                .effective_capabilities(entry.name.as_str())
+                .map_err(|err| err.to_string())
+        });
+    match caps {
+        Ok(caps) => render_capabilities(entry.name.as_str(), &caps),
+        // A render read-back failure must not fail a successful
+        // registration; note it to stderr and move on.
+        Err(err) => ui::warning(format!(
+            "Registered, but could not read back the Capability Declaration: {err}"
+        )),
+    }
+    Ok(())
+}
+
+/// Make a `--manifest` path absolute against this command's working
+/// directory (story 21-4: the Control API refuses a relative one — it would
+/// resolve against the host's directory).
+fn absolute_manifest(path: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let raw = PathBuf::from(path);
+    if raw.is_absolute() {
+        return Ok(raw);
+    }
+    let cwd = std::env::current_dir().map_err(|err| AgentIo {
+        message: format!(
+            "Could not read the current directory to resolve the manifest path '{path}': {err}."
+        ),
+    })?;
+    Ok(cwd.join(raw))
+}
+
+/// Map the absolute manifest path the host saw back to the path the operator
+/// typed, in a manifest diagnostic's path and detail (story 21-4 — the text
+/// stays the operator's own).
+fn relativize_manifest_error(err: RegistryError, absolute: &str, typed: &str) -> RegistryError {
+    if absolute == typed {
+        return err;
+    }
+    let back = |text: String| text.replace(absolute, typed);
+    match err {
+        RegistryError::ManifestNotFound { path } => {
+            RegistryError::ManifestNotFound { path: back(path) }
+        }
+        RegistryError::ManifestUnreadable { path, detail } => RegistryError::ManifestUnreadable {
+            path: back(path),
+            detail: back(detail),
+        },
+        RegistryError::ManifestInvalid { path, detail } => RegistryError::ManifestInvalid {
+            path: back(path),
+            detail: back(detail),
+        },
+        RegistryError::ContractIncompatible { path, detail } => {
+            RegistryError::ContractIncompatible {
+                path: back(path),
+                detail: back(detail),
+            }
+        }
+        other => other,
     }
 }
 
@@ -480,7 +579,7 @@ fn serialize_error(what: &str, err: serde_json::Error) -> Box<dyn std::error::Er
 /// Dev Agent Record). Output discipline (AD-12): result → stdout; the Epic-3
 /// metering note + any read-back diagnostic → stderr.
 pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let facade = engine.blocking();
 
     if json {
@@ -686,18 +785,27 @@ pub fn remove(
     // `--force` is only meaningful for a running instance. If the caller did
     // not choose a disposition we default to retain (safe — never destroys data
     // silently); see DispositionArg docs.
-    let engine = open_engine()?;
-    match engine.blocking().remove(name, disposition.resolve(), force) {
-        Ok(()) => {
-            let verb = match disposition.resolve() {
-                RemoveDisposition::Delete => "removed (Agent Home deleted)",
-                RemoveDisposition::Retain => "removed (Agent Home retained)",
-            };
-            ui::success(format!("Agent Instance {} {}", ui::skill_name(name), verb));
-            Ok(())
-        }
-        Err(err) => Err(map_error(err)),
-    }
+    validate_instance_name(name)?;
+    let resolved = disposition.resolve();
+    let wire = match resolved {
+        RemoveDisposition::Delete => "delete",
+        RemoveDisposition::Retain => "retain",
+    };
+    route(
+        "DELETE",
+        &format!(
+            "/v0/instances/{}?disposition={wire}&force={force}",
+            segment(name)
+        ),
+        None,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let verb = match resolved {
+        RemoveDisposition::Delete => "removed (Agent Home deleted)",
+        RemoveDisposition::Retain => "removed (Agent Home retained)",
+    };
+    ui::success(format!("Agent Instance {} {}", ui::skill_name(name), verb));
+    Ok(())
 }
 
 /// The one-line stderr NOTE (AD-12: notices → stderr) about the honest metering
@@ -1010,7 +1118,7 @@ fn fleet_total_footer(totals: &FleetTotals) -> String {
 /// persisted state via [`hekma_engine::Engine::fleet`] — there is no cache, so
 /// any committed transition is reflected on the next listing (a single DB read).
 pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let facade = engine.blocking();
     let entries = facade.fleet().map_err(map_error)?;
     // Compose the versioned document ONCE (story 1-7 + 3-5): it carries the rows AND
@@ -1160,7 +1268,7 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// result → stdout, the metering note → stderr. No secret reaches either surface
 /// (AD-10 — this reads ledger counters only).
 pub fn usage(name: Option<&str>, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let facade = engine.blocking();
     let entries = facade.fleet().map_err(map_error)?;
 
@@ -1280,100 +1388,113 @@ fn render_usage_instance(entry: &FleetEntry) {
 /// `hekma agent start <name> [--detach]` — start a registered Agent Instance
 /// (AC1/AC2).
 ///
-/// Opens the engine, drives `start` through the blocking facade, and prints the
+/// Asks the local Service Host to start the instance and prints the
 /// new Lifecycle State (`running`) to stdout on success. On a launch failure the
 /// instance lands in `failed`, and a miette diagnostic preserving the adapter's
 /// diagnostic goes to stderr (AC2). Output discipline (AD-12): result → stdout,
 /// diagnostics/notices → stderr.
 ///
-/// SINGLE-LIFETIME SUPERVISION BOUNDARY (honest notice, AD-5): without
-/// `--detach`, the engine supervises the started process only for the lifetime
-/// of THIS engine session. Because the backend kills the process group / job on
-/// handle drop, a standalone `hekma agent start <name>` stops the agent when this
-/// CLI process exits cleanly — the persisted `running` row then outlives the
-/// live process. Story 1-6 delivers CRASH recovery: if the engine CRASHES (no
-/// clean drop), a surviving process is re-adopted on the next `Engine::open`
-/// (by pid + start-time fingerprint) and crashes are detected + handled by the
-/// Restart Policy. The stderr notice states this and points at `--detach`.
+/// SUPERVISION (story 21-4, AD-20): the start runs under the local Service
+/// Host that owns the state root (found, or auto-started in the background),
+/// so the agent OUTLIVES this command and its terminal and stays supervised —
+/// crash detection, budget enforcement and event delivery continue — until
+/// `hekma agent stop` (or the host's own drain). The stderr notice names the
+/// host's pid and the stop command.
 ///
 /// DETACHED START (`--detach`, story 12-1): the child's handle is disarmed at
-/// spawn, so it survives this command's exit and the next `hekma` command
-/// re-adopts it via the existing fingerprint path. The notice flips to the
-/// ratified ENFORCEMENT-WINDOW honesty (a hard AC): between commands there is
-/// NO crash detection, NO budget enforcement, and NO event delivery. An
-/// `engine-observed` instance is refused by the engine before any side effect
-/// ([`EngineError::DetachRefused`] → `AgentDetachRefused`).
+/// spawn, so the agent also survives the HOST's exit; while the host runs it
+/// is supervised, and a later host re-adopts it. An `engine-observed`
+/// instance is still refused before any side effect (its metering listener
+/// lives in the host and a host exit would strand it —
+/// [`EngineError::DetachRefused`] → `AgentDetachRefused`).
 pub fn start(name: &str, detach: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let attempt = if detach {
-        engine.blocking().start_detached(name)
+    validate_instance_name(name)?;
+    let body = detach.then(|| json!({ "detach": true }));
+    let routed = route(
+        "POST",
+        &format!("/v0/instances/{}/start", segment(name)),
+        body,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let entry = routed.instance_or_err(name)?;
+    ui::success(format!(
+        "Started Agent Instance {}",
+        ui::skill_name(entry.name.as_str())
+    ));
+    // Command result to stdout: the new Lifecycle State.
+    println!("{}", entry.state);
+    if detach {
+        // Story 12-1, reworded by 21-4 — the detached notice to STDERR
+        // (AD-12): the handle is disarmed, so the agent survives even the
+        // host's exit; supervised while the host runs.
+        ui::note(format!(
+            "detached: the agent's process is not tied to the local Service Host (pid {pid}) \
+             and keeps running even if that host exits. While the host runs it is supervised; \
+             after a host exit the next hekma command's host re-adopts it, and until then \
+             there is no crash detection, no budget enforcement and no usage/event delivery. \
+             Stop it with: hekma agent stop {name}",
+            pid = routed.host_pid,
+        ));
     } else {
-        engine.blocking().start(name)
-    };
-    match attempt {
-        Ok(instance) => {
-            ui::success(format!(
-                "Started Agent Instance {}",
-                ui::skill_name(instance.name.as_str())
-            ));
-            // Command result to stdout: the new Lifecycle State.
-            println!("{}", instance.state);
-            if detach {
-                // Story 12-1 — the detached enforcement-window notice to
-                // STDERR (AD-12: notices → stderr, never stdout). States what
-                // is NOT supervised between commands (crash detection, budget
-                // enforcement, event delivery) and how the next command
-                // reattaches — the same honesty `--help` carries.
-                ui::note(
-                    "detached: the agent keeps running after this command exits, and the \
-                     next `hekma` command re-adopts it. Until then it is NOT supervised: no \
-                     crash detection, no budget enforcement, and no usage/event delivery \
-                     happen between commands (supervision is command-scoped).",
-                );
-            } else {
-                // Honest single-lifetime notice to STDERR (AD-12: notices →
-                // stderr, never stdout). A clean CLI exit stops the agent;
-                // `--detach` is the way to keep it running across commands.
-                ui::note(
-                    "the started process is supervised only for this engine session \
-                     and stops when this command exits; start it with --detach to keep \
-                     it running across commands.",
-                );
-            }
-            Ok(())
-        }
-        Err(err) => Err(map_engine_error(err)),
+        // Story 21-4 — the agent runs under the host and outlives this
+        // command (AD-12: notices → stderr, never stdout).
+        ui::note(format!(
+            "the agent runs under the local Service Host (pid {pid}) and keeps running after \
+             this command exits; stop it with: hekma agent stop {name}",
+            pid = routed.host_pid,
+        ));
     }
+    Ok(())
 }
+
+/// The Service Host's stop-window bounds (the Control API's `window_secs`
+/// range — the same bounds as `hekma serve --stop-window`).
+const STOP_WINDOW_MIN_SECS: u64 = hekma_host::MIN_STOP_WINDOW_SECS;
+const STOP_WINDOW_MAX_SECS: u64 = hekma_host::MAX_STOP_WINDOW_SECS;
 
 /// `hekma agent stop <name> [--timeout <secs>]` — stop a running Agent Instance
 /// (AC3/AC4).
 ///
-/// Opens the engine and drives `stop` through the blocking facade with the
-/// graceful window (default 30s, or `--timeout <secs>`). Prints the final state
+/// Asks the local Service Host to stop the instance with the graceful window
+/// (default 30s, or `--timeout <secs>`, served within the host's bounds). Prints the final state
 /// (`stopped`) to stdout, or the uniform invalid-transition diagnostic (e.g.
 /// stop on `stopped`, AC4) to stderr.
 pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let window = timeout_secs.map(Duration::from_secs);
-    match engine.blocking().stop(name, window) {
-        Ok(instance) => {
-            ui::success(format!(
-                "Stopped Agent Instance {}",
-                ui::skill_name(instance.name.as_str())
+    validate_instance_name(name)?;
+    // The Service Host serves a stop window within 1..=86400 s (a zero
+    // window would be an instant kill, a longer one a lifetime): a value
+    // outside it is served at the nearest bound — and said so (AI-18).
+    let window = timeout_secs.map(|secs| {
+        let served = secs.clamp(STOP_WINDOW_MIN_SECS, STOP_WINDOW_MAX_SECS);
+        if served != secs {
+            ui::note(format!(
+                "--timeout {secs} is served as a {served}s window (the stop window is bounded \
+                 to {STOP_WINDOW_MIN_SECS}..={STOP_WINDOW_MAX_SECS} seconds)"
             ));
-            // Command result to stdout: the final Lifecycle State.
-            println!("{}", instance.state);
-            Ok(())
         }
-        Err(err) => Err(map_engine_error(err)),
-    }
+        served
+    });
+    let body = window.map(|secs| json!({ "window_secs": secs }));
+    let routed = route(
+        "POST",
+        &format!("/v0/instances/{}/stop", segment(name)),
+        body,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let entry = routed.instance_or_err(name)?;
+    ui::success(format!(
+        "Stopped Agent Instance {}",
+        ui::skill_name(entry.name.as_str())
+    ));
+    // Command result to stdout: the final Lifecycle State.
+    println!("{}", entry.state);
+    Ok(())
 }
 
 /// `hekma agent pause <name>` — pause a running Agent Instance with honest, per-OS
 /// semantics (AC2/AC3/AC6 — "surfaced not silent").
 ///
-/// Drives `pause` through the blocking facade. On success prints the new state
+/// Asks the local Service Host to pause the instance. On success prints the new state
 /// (`paused`) to stdout; then — per the AC2 honesty contract — re-reads the
 /// effective Capability Declaration and, if pause is `BestEffort` on this OS,
 /// emits a VISIBLE qualifier NOTE to STDERR (never a silent success; the
@@ -1383,23 +1504,24 @@ pub fn stop(name: &str, timeout_secs: Option<u64>) -> Result<(), Box<dyn std::er
 /// non-zero exit (AC3). Output discipline (AD-12): result → stdout, the
 /// qualifier note/diagnostics → stderr.
 pub fn pause(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let facade = engine.blocking();
-    match facade.pause(name) {
-        Ok(instance) => {
-            ui::success(format!(
-                "Paused Agent Instance {}",
-                ui::skill_name(instance.name.as_str())
-            ));
-            // Command result to stdout: the new Lifecycle State.
-            println!("{}", instance.state);
-            // AC2 honesty: if pause is best-effort on this OS, surface the
-            // qualifier to STDERR (the human half of "surfaced not silent").
-            note_if_best_effort(&facade, name, "pause");
-            Ok(())
-        }
-        Err(err) => Err(map_engine_error(err)),
-    }
+    validate_instance_name(name)?;
+    let routed = route(
+        "POST",
+        &format!("/v0/instances/{}/pause", segment(name)),
+        None,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let entry = routed.instance_or_err(name)?;
+    ui::success(format!(
+        "Paused Agent Instance {}",
+        ui::skill_name(entry.name.as_str())
+    ));
+    // Command result to stdout: the new Lifecycle State.
+    println!("{}", entry.state);
+    // AC2 honesty: if pause is best-effort on this OS, surface the
+    // qualifier to STDERR (the human half of "surfaced not silent").
+    note_if_best_effort(name, "pause");
+    Ok(())
 }
 
 /// `hekma agent resume <name>` — resume a paused Agent Instance (AC2/AC6).
@@ -1408,21 +1530,22 @@ pub fn pause(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// stdout, and if pause is best-effort on this OS emits the resume qualifier note
 /// to stderr.
 pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let facade = engine.blocking();
-    match facade.resume(name) {
-        Ok(instance) => {
-            ui::success(format!(
-                "Resumed Agent Instance {}",
-                ui::skill_name(instance.name.as_str())
-            ));
-            // Command result to stdout: the new Lifecycle State.
-            println!("{}", instance.state);
-            note_if_best_effort(&facade, name, "resume");
-            Ok(())
-        }
-        Err(err) => Err(map_engine_error(err)),
-    }
+    validate_instance_name(name)?;
+    let routed = route(
+        "POST",
+        &format!("/v0/instances/{}/resume", segment(name)),
+        None,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let entry = routed.instance_or_err(name)?;
+    ui::success(format!(
+        "Resumed Agent Instance {}",
+        ui::skill_name(entry.name.as_str())
+    ));
+    // Command result to stdout: the new Lifecycle State.
+    println!("{}", entry.state);
+    note_if_best_effort(name, "resume");
+    Ok(())
 }
 
 /// `hekma agent drain <name> [--timeout-ms <ms>]` — the DRAIN composite
@@ -1439,59 +1562,65 @@ pub fn resume(name: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// is the three-tier rule: `--timeout-ms` > the manifest's
 /// `[drain].timeout_ms` > the engine default (30s).
 pub fn drain(name: &str, timeout_ms: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let bound = timeout_ms.map(Duration::from_millis);
-    match engine.blocking().drain(name, bound) {
-        Ok(report) => {
-            ui::success(format!(
-                "Drained Agent Instance {}",
-                ui::skill_name(report.instance.name.as_str())
-            ));
-            // Command result to stdout: the final Lifecycle State.
-            println!("{}", report.instance.state);
-            if !report.outcome.completed {
-                // Timed-out honesty (surfaced, not silent — AI-18): the
-                // bound burned before the declared wait completed. The
-                // instance WAS stopped anyway, and the engine recorded the
-                // outcome on its final transition — this note makes sure the
-                // operator sees it, never a silent success.
-                ui::note(format!(
-                    "the drain's bounded wait did NOT complete within {}ms (timed out); the \
-                     instance was stopped anyway and the outcome is recorded on its final \
-                     transition",
-                    report.outcome.waited_ms
-                ));
-            }
-            Ok(())
-        }
-        Err(err) => Err(map_engine_error(err)),
+    validate_instance_name(name)?;
+    let body = timeout_ms.map(|ms| json!({ "timeout_ms": ms }));
+    let routed = route(
+        "POST",
+        &format!("/v0/instances/{}/drain", segment(name)),
+        body,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    let entry = routed.instance_or_err(name)?;
+    let document = routed.value.unwrap_or(Value::Null);
+    let completed = document["completed"].as_bool().unwrap_or(true);
+    let waited_ms = document["waited_ms"].as_u64().unwrap_or(0);
+    ui::success(format!(
+        "Drained Agent Instance {}",
+        ui::skill_name(entry.name.as_str())
+    ));
+    // Command result to stdout: the final Lifecycle State.
+    println!("{}", entry.state);
+    if !completed {
+        // Timed-out honesty (surfaced, not silent — AI-18): the bound burned
+        // before the declared wait completed. The instance WAS stopped
+        // anyway, and the engine recorded the outcome on its final
+        // transition — this note makes sure the operator sees it, never a
+        // silent success.
+        ui::note(format!(
+            "the drain's bounded wait did NOT complete within {waited_ms}ms (timed out); the \
+             instance was stopped anyway and the outcome is recorded on its final transition"
+        ));
     }
+    Ok(())
 }
 
 /// `hekma agent send <name> <text>` — send text input to a running Agent
 /// Instance's native input channel (story 4.1, FR-24).
 ///
-/// Drives `send_input` through the blocking facade. Unlike `pause`/`resume`,
+/// Asks the local Service Host to write the text to the agent's input. Unlike `pause`/`resume`,
 /// `send` is not a lifecycle transition, so there is no new Lifecycle State to
 /// print — on success only a confirmation goes to stdout. Failure modes,
 /// mapped by [`map_engine_error`]: the instance is not `running`
 /// ([`AgentNotRunning`]); interaction is `unsupported` on this OS, quoting the
 /// Capability Declaration ([`AgentCapabilityUnsupported`]); or the instance is
-/// running but this engine session holds no live stdin pipe for it, e.g. an
-/// ADOPTED instance ([`AgentInteractionUnavailable`]).
+/// running but the host holds no live stdin pipe for it, e.g. an instance the
+/// host ADOPTED rather than started ([`AgentInteractionUnavailable`]). Story
+/// 21-4: the send goes through the local Service Host, which holds the pipe
+/// of every agent it started — so it reaches an agent a separate `start`
+/// command started.
 pub fn send(name: &str, text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let facade = engine.blocking();
-    match facade.send_input(name, text) {
-        Ok(()) => {
-            ui::success(format!(
-                "Sent input to Agent Instance {}",
-                ui::skill_name(name)
-            ));
-            Ok(())
-        }
-        Err(err) => Err(map_engine_error(err)),
-    }
+    validate_instance_name(name)?;
+    route(
+        "POST",
+        &format!("/v0/instances/{}/send", segment(name)),
+        Some(json!({ "text": text })),
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    ui::success(format!(
+        "Sent input to Agent Instance {}",
+        ui::skill_name(name)
+    ));
+    Ok(())
 }
 
 /// How often `hekma agent logs --follow` polls for new output (story 4-2,
@@ -1650,7 +1779,7 @@ fn raw_fallback_qualifier(skipped_beyond: u64) -> String {
 /// consumer got what it asked for, and a `--follow` loop stops rather than
 /// spinning against a dead pipe.
 pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let facade = engine.blocking();
 
     // Fix pass (M1, review of #80): `read_agent_log` returns the byte-cursor
@@ -1675,11 +1804,21 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
     // gap exceeded the window). A live tailer in THIS session makes the
     // prime a no-op at the current end, so a fresh attributed capture stays
     // byte-identical to the un-primed behavior.
-    let (mut raw_cursor, skipped_beyond) = {
+    //
+    // Story 21-4: this command is READ-ONLY; the live tailer belongs to the
+    // local Service Host that supervises the instance. When the host holds a
+    // live capture for THIS instance (one it spawned) it attributes the raw
+    // output itself, so the raw fallback is off (it would stream every line
+    // twice). With no host, or for an instance the host only ADOPTED (no
+    // tailer), the fallback streams as it always did.
+    let raw_fallback = !host_holds_live_capture(name);
+    let (mut raw_cursor, skipped_beyond) = if raw_fallback {
         let backlog_lines = backlog_lines_from_env();
         facade
             .prime_raw_backlog(name, backlog_lines)
             .map_err(map_engine_error)?
+    } else {
+        (0, 0)
     };
     let raw_qualifier = raw_fallback_qualifier(skipped_beyond);
     // The un-attributed qualifier is surfaced ONCE PER SESSION (never per
@@ -1701,9 +1840,13 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
         // window content included, on this first pass). The engine's
         // live-capture guard makes this a no-op while a real tailer is
         // attributing the same bytes.
-        let (raw_lines, next_raw_cursor) = facade
-            .read_raw_output_since(name, Some(raw_cursor))
-            .map_err(map_engine_error)?;
+        let (raw_lines, next_raw_cursor) = if raw_fallback {
+            facade
+                .read_raw_output_since(name, Some(raw_cursor))
+                .map_err(map_engine_error)?
+        } else {
+            (Vec::new(), raw_cursor)
+        };
         note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
         if !raw_lines.is_empty() && !raw_qualifier_shown {
             raw_qualifier_shown = true;
@@ -1734,9 +1877,13 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                     return Ok(());
                 }
                 cursor = next_cursor;
-                let (raw_more, next_raw_cursor) = facade
-                    .read_raw_output_since(name, Some(raw_cursor))
-                    .map_err(map_engine_error)?;
+                let (raw_more, next_raw_cursor) = if raw_fallback {
+                    facade
+                        .read_raw_output_since(name, Some(raw_cursor))
+                        .map_err(map_engine_error)?
+                } else {
+                    (Vec::new(), raw_cursor)
+                };
                 note_if_raw_shrunk(next_raw_cursor, raw_cursor, name);
                 if !raw_more.is_empty() && !raw_qualifier_shown {
                     raw_qualifier_shown = true;
@@ -1897,8 +2044,11 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
-fn note_if_best_effort(facade: &hekma_engine::Blocking<'_>, name: &str, op: &str) {
-    let Ok(caps) = facade.effective_capabilities(name) else {
+fn note_if_best_effort(name: &str, op: &str) {
+    let Ok(engine) = open_read_only_engine() else {
+        return;
+    };
+    let Ok(caps) = engine.blocking().effective_capabilities(name) else {
         return;
     };
     let pause_level = caps
@@ -1933,25 +2083,33 @@ fn note_if_best_effort(facade: &hekma_engine::Blocking<'_>, name: &str, op: &str
 /// resolves + masks it at start/read, FR-14; this write neither resolves nor
 /// echoes a secret).
 pub fn config_set(name: &str, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    match engine.blocking().set_config(name, key, value) {
-        Ok(warnings) => {
-            // Story 11-2 (AI-33): the WARN-ONLY secret→flag steering rides the
-            // engine's return value (the registry has no diagnostic sink, and
-            // this synchronous CLI path prints it directly). stderr; exit 0.
-            for warning in warnings {
-                ui::warning(warning);
-            }
-            ui::success(format!(
-                "Set {} = {} on Agent Instance {} (instance layer)",
-                key,
-                value,
-                ui::skill_name(name)
-            ));
-            Ok(())
+    validate_instance_name(name)?;
+    let routed = route(
+        "PUT",
+        &format!("/v0/instances/{}/config", segment(name)),
+        Some(json!({ "key": key, "value": value })),
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    // Story 11-2 (AI-33): the WARN-ONLY secret→flag steering rides the
+    // engine's return value — on the wire, the acknowledgment's `warnings`.
+    // stderr; exit 0.
+    let warnings = routed
+        .value
+        .as_ref()
+        .and_then(|document| document["warnings"].as_array().cloned())
+        .unwrap_or_default();
+    for warning in warnings {
+        if let Some(text) = warning.as_str() {
+            ui::warning(text);
         }
-        Err(err) => Err(map_config_error(err)),
     }
+    ui::success(format!(
+        "Set {} = {} on Agent Instance {} (instance layer)",
+        key,
+        value,
+        ui::skill_name(name)
+    ));
+    Ok(())
 }
 
 /// `hekma agent config get <name> [<key>] [--json]` — read the EFFECTIVE (resolved)
@@ -1990,7 +2148,7 @@ pub fn config_get(
     json: bool,
     reveal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let blocking = engine.blocking();
     let effective = blocking
         .effective_config(name, ConfigLayer::empty())
@@ -2312,11 +2470,21 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
             .into())
         }
     };
-    let engine = open_engine()?;
-    let dir = match engine.blocking().attach_memory(name, backing_kind) {
-        Ok(dir) => dir,
-        Err(err) => return Err(map_error(err)),
-    };
+    let routed = route(
+        "PUT",
+        &format!("/v0/instances/{}/memory", segment(name)),
+        Some(json!({ "kind": backing_kind.as_str() })),
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    // The managed directory the attach returned — computed by the engine in
+    // the host (DC-1), never constructed here.
+    let dir = PathBuf::from(
+        routed
+            .value
+            .as_ref()
+            .and_then(|document| document["dir"].as_str())
+            .unwrap_or_default(),
+    );
     if json {
         // The DC-10 delivery fact + the typed guarantee, read back from the
         // engine (hekma re-derives neither — AD-2). JSON-only: the human path
@@ -2324,7 +2492,11 @@ pub fn memory_attach(name: &str, kind: &str, json: bool) -> Result<(), Box<dyn s
         // mode) just because the wire surface exists. Right after a
         // successful attach the backing exists, so `None` is unreachable in
         // practice; it is an error, not a panic.
-        let status = match engine.blocking().memory_status(name) {
+        // The attach was committed by the host; this read-back runs on a
+        // read-only engine over the same state.db.
+        let read_back =
+            Engine::open_read_only(None).and_then(|engine| engine.blocking().memory_status(name));
+        let status = match read_back {
             Ok(Some(status)) => status,
             Ok(None) => {
                 return Err(AgentIo {
@@ -2411,23 +2583,23 @@ fn attach_readback_failed(name: &str, kind: &str, err: &RegistryError) -> AgentI
 /// [`MemoryDetachDocument`] and nothing else on stdout (AD-14).
 pub fn memory_detach(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     validate_instance_name(name)?;
-    let engine = open_engine()?;
-    match engine.blocking().detach_memory(name) {
-        Ok(()) => {
-            if json {
-                let document = memory_detach_json(name.to_string())?;
-                println!("{document}");
-                return Ok(());
-            }
-            ui::success(format!(
-                "Detached the Memory Backing from Agent Instance {} (the managed directory \
-                 and its contents remain on disk)",
-                ui::skill_name(name)
-            ));
-            Ok(())
-        }
-        Err(err) => Err(map_error(err)),
+    route(
+        "DELETE",
+        &format!("/v0/instances/{}/memory", segment(name)),
+        None,
+    )
+    .map_err(RoutedError::into_diagnostic)?;
+    if json {
+        let document = memory_detach_json(name.to_string())?;
+        println!("{document}");
+        return Ok(());
     }
+    ui::success(format!(
+        "Detached the Memory Backing from Agent Instance {} (the managed directory \
+         and its contents remain on disk)",
+        ui::skill_name(name)
+    ));
+    Ok(())
 }
 
 /// Translate a [`ConfigError`] (story 2-1) into a `miette` diagnostic with a
@@ -2616,13 +2788,159 @@ fn governance_vectors_summary(
     ))
 }
 
-/// Open the engine using the default (or env-overridden) state dir.
+/// Open the engine READ-ONLY using the default (or env-overridden) state dir
+/// (story 21-4: every CLI read). Passing `None` lets the engine resolve the
+/// base via `HEKMA_STATE_DIR`/`KTESIO_STATE_DIR` then the platform data dir —
+/// the engine remains the sole path authority. The engine owns its tokio
+/// runtime; `hekma` drives it through the blocking facade.
 ///
-/// Passing `None` lets the engine resolve the base via `KTESIO_STATE_DIR` then
-/// the platform data dir — the engine remains the sole path authority. The
-/// engine owns its tokio runtime; `hekma` drives it through the blocking facade.
-fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
-    Engine::open(None).map_err(map_error)
+/// Nothing is created and no host is started — except when the state.db is
+/// at an OLDER schema: the migration is a write, so the command finds or
+/// starts the local Service Host (which migrates on open) and reads again.
+fn open_read_only_engine() -> Result<Engine, Box<dyn std::error::Error>> {
+    match Engine::open_read_only(None) {
+        Err(RegistryError::Store(hekma_engine::ports::StoreError::NeedsMigration { .. })) => {
+            let root = state_root()?;
+            let host = HostClient::connect(&root)
+                .map_err(|err| RoutedError::Call(err).into_diagnostic())?;
+            match Engine::open_read_only(None) {
+                // A host from an OLDER build serves the directory: it opened
+                // (and keeps) the old schema, so no write through it will
+                // migrate — that host must be restarted, not "a write run".
+                Err(RegistryError::Store(hekma_engine::ports::StoreError::NeedsMigration {
+                    found,
+                    current,
+                })) if host.skewed_version().is_some() => Err(CallError::host_diagnostic(
+                    format!(
+                        "the state database is at schema v{found} and this build reads \
+                         v{current}; the local Service Host (pid {}) is from hekma {} and \
+                         does not migrate it — stop its agents and restart it (end pid {}), \
+                         then run the command again",
+                        host.pid,
+                        host.skewed_version().unwrap_or_default(),
+                        host.pid
+                    ),
+                    false,
+                )),
+                other => other.map_err(map_error),
+            }
+        }
+        other => other.map_err(map_error),
+    }
+}
+
+/// Whether the state root's Service Host (if one answers — never started
+/// here) holds a live attributed capture for `name` (story 21-4). Any doubt
+/// — no host, an older host without the field, a failed read — is `false`,
+/// which keeps the raw fallback on (a duplicate line beats a silent follow).
+fn host_holds_live_capture(name: &str) -> bool {
+    let Ok(root) = state_root() else {
+        return false;
+    };
+    let Some(host) = HostClient::find(&root) else {
+        return false;
+    };
+    host.call(
+        "GET",
+        &format!("/v0/instances/{}/status", segment(name)),
+        None,
+    )
+    .ok()
+    .flatten()
+    .and_then(|status| status["live_capture"].as_bool())
+    .unwrap_or(false)
+}
+
+/// The state root every routed write targets — resolved through the engine's
+/// path authority (a bad `HEKMA_STATE_DIR` is the same typed diagnostic an
+/// engine open raises), never constructed here.
+fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let paths = hekma_engine::Registry::resolve_state_paths(None).map_err(map_error)?;
+    Ok(paths.state_base().to_path_buf())
+}
+
+/// A routed write's answer (story 21-4): the response document and the pid
+/// of the Service Host that served it.
+struct Routed {
+    /// The 2xx body, when there was one.
+    value: Option<Value>,
+    /// The serving host's process id.
+    host_pid: u32,
+}
+
+impl Routed {
+    /// The response's `instance` Fleet row (the lifecycle verbs' and
+    /// registration's read-back).
+    fn instance(&self) -> Option<FleetEntry> {
+        let document = self.value.as_ref()?;
+        serde_json::from_value(document.get("instance")?.clone()).ok()
+    }
+
+    /// [`Routed::instance`], or a named diagnostic when the host's read-back
+    /// is missing (never a fabricated state).
+    fn instance_or_err(&self, name: &str) -> Result<FleetEntry, Box<dyn std::error::Error>> {
+        self.instance().ok_or_else(|| {
+            AgentIo {
+                message: format!(
+                    "The local Service Host (pid {}) applied the command to '{name}' but sent \
+                     no read-back of the instance; check it with: hekma agent show {name}",
+                    self.host_pid
+                ),
+            }
+            .into()
+        })
+    }
+}
+
+/// Why a routed write failed: a state-root resolution failure (already a
+/// diagnostic), or a call failure still to be mapped.
+enum RoutedError {
+    /// A ready diagnostic.
+    Diagnostic(Box<dyn std::error::Error>),
+    /// A Control API call failure.
+    Call(CallError),
+}
+
+impl RoutedError {
+    /// Render through the command's usual mappers: the engine families keep
+    /// their exact diagnostics and exit codes; host failures are exit 1.
+    fn into_diagnostic(self) -> Box<dyn std::error::Error> {
+        match self {
+            RoutedError::Diagnostic(err) => err,
+            RoutedError::Call(CallError::Engine(err)) => map_engine_error(err),
+            RoutedError::Call(CallError::Registry(err)) => map_error(err),
+            RoutedError::Call(CallError::Config(err)) => map_config_error(err),
+            RoutedError::Call(CallError::Refused(message)) => {
+                CallError::host_diagnostic(message, true)
+            }
+            RoutedError::Call(CallError::Unavailable(message))
+            | RoutedError::Call(CallError::NotSent(message)) => {
+                CallError::host_diagnostic(message, false)
+            }
+        }
+    }
+}
+
+/// Route one write to the state root's Service Host (story 21-4): find or
+/// start the owner, make the call. A call refused BEFORE anything was sent
+/// (the host had just exited) finds or starts the owner again and retries
+/// once — a refused connection never applied anything.
+fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
+    let root = state_root().map_err(RoutedError::Diagnostic)?;
+    let mut retried = false;
+    loop {
+        let client = HostClient::connect(&root).map_err(RoutedError::Call)?;
+        match client.call(method, path, body.as_ref()) {
+            Ok(value) => {
+                return Ok(Routed {
+                    value,
+                    host_pid: client.pid,
+                })
+            }
+            Err(CallError::NotSent(_)) if !retried => retried = true,
+            Err(err) => return Err(RoutedError::Call(err)),
+        }
+    }
 }
 
 /// Translate a [`RegistryError`] into a `miette` diagnostic carrying a
@@ -3150,6 +3468,7 @@ fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hekma_engine::AdapterRef;
 
     /// Serializes the in-process engine-driver tests that mutate the shared
     /// `KTESIO_STATE_DIR` process env var (`config_get_*` + `list_and_show_*`), so
@@ -5290,5 +5609,133 @@ mod tests {
             std::env::remove_var("KTESIO_STATE_DIR");
         }
         followed.expect("the follow must end cleanly on the stopped instance");
+    }
+
+    // ---- Story 21-4: the routed-write helpers ----
+
+    #[test]
+    fn a_relative_manifest_is_made_absolute_and_mapped_back_in_diagnostics() {
+        let absolute = absolute_manifest("rel/agent").unwrap();
+        assert!(absolute.is_absolute());
+        assert!(absolute.ends_with("rel/agent"));
+        let already = std::env::temp_dir().join("x");
+        assert_eq!(
+            absolute_manifest(already.to_str().unwrap()).unwrap(),
+            already
+        );
+
+        let shown = absolute.to_string_lossy().into_owned();
+        let back = |err| relativize_manifest_error(err, &shown, "rel/agent");
+        match back(RegistryError::ManifestNotFound {
+            path: format!("{shown}/adapter.toml"),
+        }) {
+            RegistryError::ManifestNotFound { path } => assert_eq!(path, "rel/agent/adapter.toml"),
+            other => panic!("{other:?}"),
+        }
+        for err in [
+            RegistryError::ManifestUnreadable {
+                path: shown.clone(),
+                detail: format!("{shown} is a directory"),
+            },
+            RegistryError::ManifestInvalid {
+                path: shown.clone(),
+                detail: "bad".into(),
+            },
+            RegistryError::ContractIncompatible {
+                path: shown.clone(),
+                detail: "v2".into(),
+            },
+        ] {
+            let mapped = back(err).to_string();
+            assert!(mapped.contains("rel/agent"), "{mapped}");
+            assert!(!mapped.contains(&shown), "{mapped}");
+        }
+        // Other variants and an already-absolute path pass through.
+        assert!(matches!(
+            back(RegistryError::DuplicateName { name: "a".into() }),
+            RegistryError::DuplicateName { .. }
+        ));
+        assert!(matches!(
+            relativize_manifest_error(
+                RegistryError::ManifestNotFound { path: "/a".into() },
+                "/a",
+                "/a"
+            ),
+            RegistryError::ManifestNotFound { path } if path == "/a"
+        ));
+    }
+
+    #[test]
+    fn a_routed_failure_renders_through_the_same_mappers_and_exit_codes() {
+        use crate::exit_code::{classify, ExitCode};
+        let code = |err: RoutedError| classify(err.into_diagnostic().as_ref());
+        assert_eq!(
+            code(RoutedError::Call(CallError::Engine(
+                EngineError::NotFound { name: "w".into() }
+            ))),
+            ExitCode::NotFound
+        );
+        assert_eq!(
+            code(RoutedError::Call(CallError::Registry(
+                RegistryError::DuplicateName { name: "w".into() }
+            ))),
+            ExitCode::Usage
+        );
+        assert_eq!(
+            code(RoutedError::Call(CallError::Config(
+                ConfigError::NotFound { name: "w".into() }
+            ))),
+            ExitCode::NotFound
+        );
+        for host_failure in [
+            CallError::Refused("bad body".into()),
+            CallError::Unavailable("gone".into()),
+            CallError::NotSent("refused".into()),
+        ] {
+            assert_eq!(
+                code(RoutedError::Call(host_failure)),
+                ExitCode::General,
+                "a host-level failure is exit 1"
+            );
+        }
+        let ready: Box<dyn std::error::Error> = AgentIo {
+            message: "x".into(),
+        }
+        .into();
+        assert_eq!(code(RoutedError::Diagnostic(ready)), ExitCode::General);
+    }
+
+    #[test]
+    fn a_routed_answer_yields_its_fleet_row_or_a_named_diagnostic() {
+        let entry = FleetEntry {
+            name: hekma_engine::InstanceName::new("w").unwrap(),
+            kind: "mock".into(),
+            state: LifecycleState::Running,
+            restart_count: 0,
+            restart_policy: Default::default(),
+            failed_cause: None,
+            budget: None,
+            usage: UsageView::new(Default::default(), Default::default()),
+            metering_source: "self-reported".into(),
+            acp_context_usage: None,
+            usage_gap: None,
+            supervision: None,
+            agent_home: "/h".into(),
+        };
+        let routed = Routed {
+            value: Some(serde_json::json!({
+                "schema_version": FLEET_SCHEMA_VERSION,
+                "instance": serde_json::to_value(&entry).unwrap(),
+            })),
+            host_pid: 9,
+        };
+        assert_eq!(routed.instance_or_err("w").unwrap(), entry);
+        let empty = Routed {
+            value: None,
+            host_pid: 9,
+        };
+        let err = empty.instance_or_err("w").unwrap_err();
+        assert!(err.to_string().contains("pid 9"), "{err}");
+        assert!(err.downcast_ref::<AgentIo>().is_some());
     }
 }

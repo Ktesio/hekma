@@ -105,6 +105,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | Facade | Purpose |
 |--------|---------|
 | `Engine::open(base)` | Open (or create) an engine rooted at a state directory; `None` uses the OS default. |
+| `Engine::open_read_only(base)` | Open a READ-ONLY engine over the same facade: a `query_only` connection, a closed store writer (every write returns a typed error, never a panic), no orphan adoption and no crash-detection reaper — it never touches a process another engine supervises and never writes `state.db`. A missing `state.db` reads as an empty fleet and creates nothing; a `state.db` below the current schema answers `StoreError::NeedsMigration` (a writer must open it first). A live instance's current-Run totals come from its persisted Run id. This is how `hekma`'s read commands open the state while a Service Host owns the writes. |
 | `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
@@ -119,6 +120,17 @@ surface `hekma` uses. The capabilities you will reach for first:
 
 Every method returns a typed `Result` — the engine reports partial failures
 with a reason and a remediation instead of panicking.
+
+**One writer per process — and the CLI's Service Host.** Each engine you open
+runs its own store writer. The `hekma` CLI never opens a
+writing engine: while a Service Host serves a state directory, every CLI
+write goes through it, and the CLI auto-starts one when none runs. If your
+program opens its own (writing) engine on a directory a `hekma serve` — or an
+auto-started host — also serves, the two serialize through SQLite's write
+lock (the 5 s busy timeout), and each supervises only the agents it started
+or adopted. Prefer one owner per state directory: drive the host's Control
+API (see [the Control API](control-api.md)), or give your engine its own
+state directory.
 
 ### The detached-start host duty
 

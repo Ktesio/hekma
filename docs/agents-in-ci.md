@@ -94,9 +94,10 @@ Agents that speak the Agent Client Protocol — most coding agents — can skip
 the manifest: register with `--kind acp` and set `acp.command` (and optionally
 `acp.args`) instead. Lifecycle, budgets, and usage work the same way — with
 ONE CI-shaped exception: `start --detach` is refused for `acp` instances
-(exit 5 — the protocol transport dies with the command that spawned it), so
-an ACP agent in CI runs attached inside a step, or behind a manifest adapter
-that detaches cleanly.
+(exit 5 — the protocol transport lives in the engine that spawned it, the
+local Service Host the CLI starts, and would die with it), so an ACP agent in
+CI starts without `--detach` — it still outlives the step's command, under the
+host — or runs behind a manifest adapter that detaches cleanly.
 
 Optionally set prices so the ledger derives dollars:
 

@@ -15,7 +15,10 @@
 //! half-configured API is a usage error, and an unparseable address is too).
 //! Story 17-4 (review finding 17): `--log-capture <full|metadata|off>` —
 //! the SAME flag and values as `hekma serve`, so the container binary can
-//! reach every capture posture.
+//! reach every capture posture. Story 21-4: `--tls-cert <pem>` + `--tls-key
+//! <pem>` (both or neither) serve `--listen` over HTTPS — REQUIRED for a
+//! non-loopback `--listen` (refused with exit 2 before anything binds). The
+//! binary has no auto mode (`--autostart` is the `hekma` CLI's).
 //! Anything else is a usage error:
 //! the message AND the usage text go to STDERR (help is the only stdout
 //! product; finding 19), exit 2. `ServeError` variants map onto the same
@@ -44,6 +47,8 @@ fn main() {
     let mut otlp_endpoint: Option<String> = None;
     let mut otlp_headers: Option<String> = None;
     let mut otlp_flush_interval: Option<u64> = None;
+    let mut tls_cert: Option<std::path::PathBuf> = None;
+    let mut tls_key: Option<std::path::PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -167,6 +172,24 @@ fn main() {
                     None => usage_error("--otlp-flush-interval needs a whole number of seconds"),
                 }
             }
+            "--tls-cert" => {
+                i += 1;
+                match args.get(i) {
+                    Some(path) if !path.starts_with('-') => {
+                        tls_cert = Some(std::path::PathBuf::from(path))
+                    }
+                    _ => usage_error("--tls-cert needs a PEM certificate file path"),
+                }
+            }
+            "--tls-key" => {
+                i += 1;
+                match args.get(i) {
+                    Some(path) if !path.starts_with('-') => {
+                        tls_key = Some(std::path::PathBuf::from(path))
+                    }
+                    _ => usage_error("--tls-key needs a PEM private key file path"),
+                }
+            }
             other => usage_error(&format!("unknown argument {other:?}")),
         }
         i += 1;
@@ -194,6 +217,9 @@ fn main() {
         log_capture: log_capture.unwrap_or_default(),
         diagnostics: None,
         otlp,
+        tls_cert,
+        tls_key,
+        ..hekma_host::ServeOptions::default()
     };
     match hekma_host::serve(options) {
         Ok(()) => std::process::exit(0),
@@ -241,6 +267,10 @@ fn usage_text() -> String {
                                   Control API (an env var, or a key in the\n    \
                                   state dir's secrets file). Required with\n    \
                                   --listen; the API never serves unauthenticated\n    \
+         --tls-cert <pem>         Serve --listen over HTTPS with this PEM\n    \
+                                  certificate chain (with --tls-key). Required\n    \
+                                  for a non-loopback --listen\n    \
+         --tls-key <pem>          The PEM private key for --tls-cert\n    \
          --log-capture <mode>     The capture posture: full (default),\n    \
                                   metadata (hashed records at rest), or off\n    \
                                   (nothing captured). Same flag and values\n    \

@@ -24,8 +24,9 @@
 //! * Windows: the console Ctrl+C handler stream (there is no SIGTERM — the
 //!   documented OS asymmetry, matching the engine's own signal story).
 //!
-//! This file is the crate's ONLY OS-conditional code (the OS-cfg gate's
-//! allowlist names it); every other module is cfg-free.
+//! This file and `local.rs` (the owner-only discovery file and the detached
+//! auto-start, story 21-4) are the crate's ONLY OS-conditional code (the
+//! OS-cfg gate's allowlist names both); every other module is cfg-free.
 
 use hekma_engine::DiagnosticSink;
 
@@ -115,6 +116,23 @@ pub(crate) async fn arm(sink: DiagnosticSink) -> Result<ArmedSignals, String> {
         });
         Ok(ArmedSignals { received: rx })
     }
+}
+
+/// Story 21-4: the AUTO-STARTED host ignores SIGHUP, so closing the terminal
+/// whose command started it does not end it (the tmux-server pattern). The
+/// stream's handler replaces the default (terminate) disposition and a
+/// detached task drains it for the rest of the process. MUST run inside the
+/// host's runtime. Windows has no SIGHUP: the detached, console-less process
+/// group already isolates the host there, so this is a no-op.
+pub(crate) async fn ignore_hangup() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut hangup = signal(SignalKind::hangup())
+            .map_err(|err| format!("could not register the SIGHUP stream: {err}"))?;
+        tokio::spawn(async move { while hangup.recv().await.is_some() {} });
+    }
+    Ok(())
 }
 
 fn note_repeat(sink: &DiagnosticSink, name: &'static str) {

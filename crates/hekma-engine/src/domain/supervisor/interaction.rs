@@ -152,8 +152,9 @@ impl Supervisor {
             return Err(EngineError::InteractionUnavailable {
                 name: name.as_str().to_string(),
                 detail: "no live stdin pipe is held for this instance in this engine session \
-                         (an adopted instance has no input pipe; send input from the program \
-                         that started the agent, which must still hold the engine)"
+                         (a --detach start closes the agent's input, and an adopted instance \
+                         has no input pipe; to send input, stop it and start it again without \
+                         --detach)"
                     .to_string(),
             });
         }
@@ -354,6 +355,17 @@ impl Supervisor {
         }
     }
 
+    /// Whether THIS supervisor holds a live attributed capture (a tailer)
+    /// for `name` — true for an instance it spawned; false for an adopted
+    /// handle (`log_capture: None`) or one it does not hold (story 21-4: the
+    /// CLI's read-only `logs --follow` asks the Service Host this to decide
+    /// whether the raw fallback would double-report).
+    pub(crate) fn has_live_capture(&self, name: &InstanceName) -> bool {
+        self.running
+            .get(name)
+            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some())
+    }
+
     /// The RAW `agent.log` FALLBACK read (story 15-2, Fibery 207) — honest
     /// un-attributed passthrough for the between-commands window.
     ///
@@ -429,10 +441,7 @@ impl Supervisor {
         // end. The guard MUST advance the cursor too — otherwise the moment
         // the tailer dies the next poll would dump the whole attributed
         // backlog as raw lines.
-        let live_capture = self
-            .running
-            .get(&name)
-            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some());
+        let live_capture = self.has_live_capture(&name);
         let cursor = match cursor {
             None => return Ok((Vec::new(), len)),
             Some(_) if live_capture => return Ok((Vec::new(), len)),
@@ -550,10 +559,7 @@ impl Supervisor {
         // `read_raw_output_since`: a tailer already attributing these bytes
         // makes a backlog prime a DOUBLE-report. Prime at the current end
         // with nothing skipped — the exact shape of the un-primed cursor.
-        let live_capture = self
-            .running
-            .get(&name)
-            .is_some_and(|supervised| self.backend.log_capture(&supervised.handle).is_some());
+        let live_capture = self.has_live_capture(&name);
         if live_capture {
             let len = match std::fs::metadata(&path) {
                 Ok(meta) => meta.len(),
