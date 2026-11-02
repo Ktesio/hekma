@@ -77,6 +77,23 @@ fn usage_entry_cell_show(entry: &FleetEntry) -> String {
     }
 }
 
+/// Story 21-4: the stderr note for a row a read shows differently from its
+/// record — a `running`/`paused` row whose process is gone reads `failed`
+/// (reads write nothing; the next write records it). `None` for every other
+/// row.
+fn recorded_state_note(entry: &FleetEntry) -> Option<String> {
+    entry.recorded_state.map(|recorded| {
+        format!(
+            "{}: its process is gone, so it is shown as {} although the record still says \
+             {recorded} (reads write nothing; the next hekma write records it). Start it \
+             again with: hekma agent start {}",
+            entry.name.as_str(),
+            entry.state,
+            entry.name.as_str(),
+        )
+    })
+}
+
 /// The stderr gap NOTE for one gapped entry (story 14-3, AI-18 — the narrow
 /// `list` cell truncates to the bare `—`, so the full tier breakdown rides
 /// the stderr note channel, AD-12). Composed from the engine's structured
@@ -599,8 +616,12 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         // the SAME uniform not-found diagnostic (to stderr) the old path
         // synthesized.
         let entry = facade.fleet_entry(name).map_err(map_error)?;
+        let gone_note = recorded_state_note(&entry);
         let json = show_json(entry)?;
         println!("{json}");
+        if let Some(note) = gone_note {
+            ui::note(note);
+        }
         // The metering note rides on stderr (AD-12), keeping stdout pure JSON.
         ui::note(METERING_NOTE);
         return Ok(());
@@ -620,6 +641,9 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|f| f.into_iter().find(|e| e.name.as_str() == name));
             render_runtime_status(&status, entry.as_ref());
+            if let Some(note) = entry.as_ref().and_then(recorded_state_note) {
+                ui::note(note);
+            }
             // One stderr note (AD-12): usage is real tokens; budget/dollars are later.
             ui::note(METERING_NOTE);
         }
@@ -1135,6 +1159,9 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let empty = listing.instances.is_empty();
         let document = fleet_json(&listing)?;
         println!("{document}");
+        for note in listing.instances.iter().filter_map(recorded_state_note) {
+            ui::note(note);
+        }
         if empty {
             ui::note(EMPTY_FLEET_HINT);
         }
@@ -1242,6 +1269,9 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     // through the established note channel (AD-12).
     for entry in entries.iter().filter(|e| e.usage_gap.is_some()) {
         ui::note(usage_gap_note(entry));
+    }
+    for note in entries.iter().filter_map(recorded_state_note) {
+        ui::note(note);
     }
     // One stderr note (AD-12): usage is real tokens; dollars appear with a Rate.
     ui::note(METERING_NOTE);
@@ -4209,6 +4239,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_row_shown_differently_from_its_record_gets_a_note_and_others_do_not() {
+        let mut entry = sample_fleet_entry("ghost");
+        assert_eq!(recorded_state_note(&entry), None);
+        entry.state = hekma_engine::LifecycleState::Failed;
+        entry.recorded_state = Some(hekma_engine::LifecycleState::Running);
+        let note = recorded_state_note(&entry).expect("a note");
+        assert!(note.starts_with("ghost: its process is gone"), "{note}");
+        assert!(note.contains("shown as failed"), "{note}");
+        assert!(note.contains("still says running"), "{note}");
+        assert!(note.contains("hekma agent start ghost"), "{note}");
+    }
+
     fn sample_fleet_entry(name: &str) -> FleetEntry {
         FleetEntry {
             name: hekma_engine::InstanceName::new(name).unwrap(),
@@ -4228,6 +4271,7 @@ mod tests {
             // Story 15-2: the honest absence — a registered instance has no
             // live spawn record, so it is not supervised.
             supervision: None,
+            recorded_state: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }
@@ -5720,6 +5764,7 @@ mod tests {
             acp_context_usage: None,
             usage_gap: None,
             supervision: None,
+            recorded_state: None,
             agent_home: "/h".into(),
         };
         let routed = Routed {

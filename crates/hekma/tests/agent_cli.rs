@@ -778,6 +778,110 @@ fn a_read_only_command_never_starts_a_host_and_creates_nothing() {
 }
 
 #[test]
+fn a_read_shows_a_dead_recorded_process_as_failed_and_writes_nothing() {
+    // Story 21-4: reads reconcile nothing, so a `running` row whose process
+    // died with no host to record it (the host and the agent both killed
+    // hard — a crash, a power loss; on Windows the host's job also takes its
+    // session agent) is SHOWN as `failed`, with the stored state kept in
+    // `recorded_state` and a stderr note, and state.db stays untouched. The
+    // next write's host reconciles the row for real. Runs on every OS.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let m = fake_agent_manifest(&ctx.project_dir, &["--linger-ms", "600000"]);
+    let reg = run_hekma_agent(
+        &[
+            "agent",
+            "register",
+            "ghost",
+            "--manifest",
+            m.to_str().unwrap(),
+        ],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(reg.success, "stderr={}", reg.stderr);
+    let start = run_hekma_agent(&["agent", "start", "ghost"], &ctx.project_dir, state_dir);
+    assert!(start.success, "stderr={}", start.stderr);
+    let agent = wait_for_agent_pid(state_dir, "ghost");
+    helpers::kill_host(state_dir);
+    if pid_alive(agent) {
+        helpers::kill_pid(agent);
+    }
+    let before = std::fs::read(state_db(state_dir)).unwrap();
+
+    let list = run_hekma_agent_with_env(
+        &["agent", "list"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "160")],
+    );
+    assert!(list.success, "stderr={}", list.stderr);
+    let row = list
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("ghost"))
+        .unwrap_or_else(|| panic!("a ghost row: {}", list.stdout));
+    assert!(row.contains("failed"), "shown as failed: {row}");
+    assert!(
+        !row.contains("session"),
+        "a dead process is not supervised: {row}"
+    );
+    assert!(
+        list.stderr.contains("ghost: its process is gone")
+            && list.stderr.contains("still says running"),
+        "the difference is surfaced on stderr: {}",
+        list.stderr
+    );
+    let shown = run_hekma_agent(
+        &["agent", "show", "ghost", "--json"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(shown.success, "stderr={}", shown.stderr);
+    let doc: serde_json::Value = serde_json::from_str(&shown.stdout).expect("pure JSON");
+    assert_eq!(doc["instance"]["state"], "failed", "{doc}");
+    assert_eq!(doc["instance"]["recorded_state"], "running", "{doc}");
+    assert!(doc["instance"].get("supervision").is_none(), "{doc}");
+    let cause = doc["instance"]["failed_cause"].as_str().unwrap_or_default();
+    assert!(cause.contains(&format!("pid {agent} is gone")), "{doc}");
+    let human = run_hekma_agent(&["agent", "show", "ghost"], &ctx.project_dir, state_dir);
+    assert!(human.success, "stderr={}", human.stderr);
+    assert!(
+        human.stderr.contains("ghost: its process is gone"),
+        "{}",
+        human.stderr
+    );
+    assert_eq!(
+        std::fs::read(state_db(state_dir)).unwrap(),
+        before,
+        "the reads wrote nothing"
+    );
+    assert!(
+        helpers::host_pid(state_dir).is_none(),
+        "no read started a host"
+    );
+
+    // A write starts a host, whose open reconciles the row for real: the
+    // stored state is now `failed` and the read shows no difference.
+    let restart = run_hekma_agent(&["agent", "start", "ghost"], &ctx.project_dir, state_dir);
+    assert!(restart.success, "stderr={}", restart.stderr);
+    let stop = run_hekma_agent(&["agent", "stop", "ghost"], &ctx.project_dir, state_dir);
+    assert!(stop.success, "stderr={}", stop.stderr);
+    let after: serde_json::Value = serde_json::from_str(
+        &run_hekma_agent(
+            &["agent", "show", "ghost", "--json"],
+            &ctx.project_dir,
+            state_dir,
+        )
+        .stdout,
+    )
+    .expect("pure JSON");
+    assert_eq!(after["instance"]["state"], "stopped", "{after}");
+    assert!(after["instance"].get("recorded_state").is_none(), "{after}");
+}
+
+#[test]
 fn a_read_only_command_never_writes_an_existing_state_db() {
     // Story 21-4 AC: reads open state.db read-only — with no host running
     // the database bytes are untouched and no host starts.
@@ -9069,8 +9173,9 @@ fn list_and_show_surface_the_supervision_indicator() {
         if windows {
             // The kill is asynchronous relative to the helper's exit — wait
             // it out (the pause family's `wait_until_gone` discipline) so
-            // the adopting command below reconciles deterministically
-            // instead of racing a still-dying pid.
+            // the read below sees a provably dead pid. Story 21-4: reads
+            // reconcile nothing — the read-only engine SHOWS the row as
+            // `failed` (its record still says running) and writes nothing.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while pid_alive(pid) {
                 assert!(

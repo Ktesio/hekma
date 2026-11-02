@@ -129,6 +129,29 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Kill a process hard (`kill -KILL` on Unix, `taskkill /F` on Windows —
+/// data-driven, no OS cfg) and wait for it to be gone.
+#[allow(dead_code)]
+pub fn kill_pid(pid: u32) {
+    if hekma_conformance::test_support::current_os_key() == "windows" {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output();
+    } else {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while process_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} did not die after a hard kill"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Story 21-4: stop the state root's auto-started Service Host — SIGTERM (its
 /// normal drain) on Unix, `taskkill` on Windows — and wait for it to exit.
 /// The NEXT CLI write then starts a fresh host, whose engine ADOPTS whatever a

@@ -113,6 +113,17 @@ pub struct DrainReport {
     pub outcome: crate::domain::DrainOutcome,
 }
 
+/// Story 21-4: the failed cause a READ-ONLY read shows for a `running` or
+/// `paused` row whose recorded process is gone — the fact adoption's
+/// reconciliation records, plus that nothing has recorded it yet.
+fn gone_cause(pid: u32, last_known: Option<&str>) -> String {
+    format!(
+        "process pid {pid} is gone (not recorded yet: the next hekma write reconciles the \
+         row to failed); last known: {}",
+        last_known.unwrap_or("no prior cause recorded")
+    )
+}
+
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
 /// for the failure-bearing causes (a launch error, a crash — the 18-3 charged
@@ -1022,7 +1033,25 @@ impl Engine {
         // `None` (the honest absence a human cell renders as `—`), so a
         // stopped row can never imply supervised. Computed BEFORE the
         // `failed_cause` fold below consumes the record.
-        let supervision = record.as_ref().and_then(|record| {
+        // Story 21-4: a READ-ONLY engine reconciles nothing, so a
+        // `running`/`paused` row whose recorded process is provably gone is
+        // SHOWN as what the next write's reconciliation records (`failed`,
+        // no supervision, the cause naming the pid), with the stored state
+        // kept in `recorded_state` — written nowhere.
+        let gone = read_only
+            && matches!(
+                instance.state,
+                LifecycleState::Running | LifecycleState::Paused
+            )
+            && record
+                .as_ref()
+                .is_some_and(|record| supervisor.record_process_gone(record));
+        let recorded_state = gone.then_some(instance.state);
+        let mut instance = instance;
+        if gone {
+            instance.state = LifecycleState::Failed;
+        }
+        let supervision = record.as_ref().filter(|_| !gone).and_then(|record| {
             (record.fingerprint.pid != 0).then_some(if record.detach {
                 crate::domain::Supervision::Detached
             } else {
@@ -1049,7 +1078,14 @@ impl Engine {
             .map(|r| r.restart_policy)
             .unwrap_or_default();
         let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
-        let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+        let gone_pid = record.as_ref().map(|r| r.fingerprint.pid);
+        let failed_cause = record.and_then(|r| r.last_known_cause);
+        let failed_cause = if gone {
+            Some(gone_cause(gone_pid.unwrap_or(0), failed_cause.as_deref()))
+        } else {
+            failed_cause
+        };
+        let failed_cause = failed_cause.or_else(|| {
             // No record cause. For a `failed` instance, fall back to the last
             // event-log cause (a launch-error / cleared-terminal crash) — the same
             // fallback `instance_status` uses (AC9).
@@ -1228,6 +1264,7 @@ impl Engine {
             // Story 15-2: detached vs session-bound (from the spawn record;
             // `None` — omitted — for a stopped / never-started instance).
             supervision,
+            recorded_state,
             agent_home: instance.agent_home,
         }
     }
@@ -1481,18 +1518,43 @@ impl Engine {
                 name: name.clone(),
                 reason,
             })?;
-            let instance = registry
+            let mut instance = registry
                 .lookup(&iname)
                 .map_err(crate::domain::registry_error_to_engine)?;
             let record = registry
                 .spawn_record(&iname)
                 .map_err(crate::domain::registry_error_to_engine)?;
+            // Story 21-4: the read-only view of a provably-dead process (the
+            // Fleet read's rule, [`Engine::fleet_entry_for`]) — shown
+            // `failed`, nothing written.
+            let gone = inner.read_only
+                && matches!(
+                    instance.state,
+                    LifecycleState::Running | LifecycleState::Paused
+                )
+                && record.as_ref().is_some_and(|record| {
+                    inner
+                        .supervisor
+                        .lock()
+                        .expect("supervisor mutex poisoned")
+                        .record_process_gone(record)
+                });
+            if gone {
+                instance.state = LifecycleState::Failed;
+            }
             let restart_policy = record
                 .as_ref()
                 .map(|r| r.restart_policy)
                 .unwrap_or_default();
             let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
-            let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+            let gone_pid = record.as_ref().map(|r| r.fingerprint.pid).unwrap_or(0);
+            let failed_cause = record.and_then(|r| r.last_known_cause);
+            let failed_cause = if gone {
+                Some(gone_cause(gone_pid, failed_cause.as_deref()))
+            } else {
+                failed_cause
+            };
+            let failed_cause = failed_cause.or_else(|| {
                 // No record cause. For a `failed` instance, fall back to the last
                 // event-log cause so a launch-error or a cleared-terminal crash
                 // still surfaces a reason (AC9).
@@ -2718,20 +2780,28 @@ mod tests {
     fn a_read_only_fleet_reads_the_current_run_from_the_persisted_spawn_record() {
         // The live supervisor's only Fleet input — the current Run id — comes
         // from the persisted spawn record for a live instance in a read-only
-        // engine, so its current-run totals match the owning host's.
+        // engine, so its current-run totals match the owning host's. The
+        // "live" record carries THIS test process's own fingerprint (a
+        // process that is provably alive); the "ghost" record a pid whose
+        // start time can never match, so the read shows it `failed` with the
+        // stored state kept in `recorded_state` — and writes nothing.
+        use crate::ports::ProcessBackend;
+        let me = crate::backends::current()
+            .self_fingerprint()
+            .expect("this process's own fingerprint");
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().to_path_buf();
         {
             let writer = Engine::open(Some(base.clone())).unwrap();
             writer.blocking().register("live", "mock").unwrap();
+            writer.blocking().register("ghost", "mock").unwrap();
         }
         let db = base.join(crate::paths::STATE_DB_FILE);
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
+        let seed = |conn: &rusqlite::Connection, name: &str, pid: u32, start: u64, run: &str| {
             let id: i64 = conn
                 .query_row(
-                    "SELECT id FROM agent_instances WHERE name = 'live'",
-                    [],
+                    "SELECT id FROM agent_instances WHERE name = ?1",
+                    [name],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -2743,23 +2813,56 @@ mod tests {
             conn.execute(
                 "INSERT INTO agent_runtime \
                  (instance_id, pid, start_time, restart_policy, restart_count, run_id) \
-                 VALUES (?1, 4242, 1, 'on-failure', 0, 'run-persisted')",
-                [id],
+                 VALUES (?1, ?2, ?3, 'on-failure', 0, ?4)",
+                rusqlite::params![id, pid, start as i64, run],
             )
             .unwrap();
             // The per-Run rollup is what the Fleet's current-run totals read.
             conn.execute(
                 "INSERT INTO usage_rollup_run \
                  (instance_id, run_id, events, input_tokens, output_tokens) \
-                 VALUES (?1, 'run-persisted', 1, 7, 3)",
-                [id],
+                 VALUES (?1, ?2, 1, 7, 3)",
+                rusqlite::params![id, run],
             )
             .unwrap();
+        };
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            seed(&conn, "live", me.pid, me.start_time, "run-persisted");
+            seed(
+                &conn,
+                "ghost",
+                me.pid,
+                me.start_time.wrapping_add(1),
+                "run-ghost",
+            );
         }
+        let before = std::fs::read(&db).unwrap();
         let engine = Engine::open_read_only(Some(base)).unwrap();
         let entry = engine.blocking().fleet_entry("live").unwrap();
         assert_eq!(entry.state, LifecycleState::Running);
+        assert_eq!(entry.recorded_state, None, "{entry:?}");
         assert_eq!(entry.usage.current_run_input_tokens, 7, "{entry:?}");
         assert_eq!(entry.usage.current_run_output_tokens, 3, "{entry:?}");
+
+        let ghost = engine.blocking().fleet_entry("ghost").unwrap();
+        assert_eq!(ghost.state, LifecycleState::Failed, "{ghost:?}");
+        assert_eq!(ghost.recorded_state, Some(LifecycleState::Running));
+        assert_eq!(ghost.supervision, None, "a dead process is not supervised");
+        assert_eq!(ghost.usage.current_run_input_tokens, 0, "its Run ended");
+        let cause = ghost.failed_cause.clone().unwrap_or_default();
+        assert!(
+            cause.contains(&format!("pid {} is gone", me.pid)),
+            "{cause}"
+        );
+        let status = engine.blocking().instance_status("ghost").unwrap();
+        assert_eq!(status.instance.state, LifecycleState::Failed);
+        assert_eq!(status.failed_cause.as_deref(), Some(cause.as_str()));
+        drop(engine);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the reads wrote nothing"
+        );
     }
 }

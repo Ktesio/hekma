@@ -188,6 +188,16 @@ impl Supervisor {
         }
     }
 
+    /// Story 21-4: whether a spawn record's process is PROVABLY gone — the
+    /// backend's adoption-grade identity probe (pid + start time, so a reused
+    /// pid reads as gone) with no handle re-held and nothing written. `false`
+    /// for a pid-0 seed (no process), a live match, or an indeterminate probe
+    /// (never claims a death it cannot prove). The read-only engine uses it
+    /// to show what adoption would record.
+    pub(crate) fn record_process_gone(&self, record: &crate::ports::SpawnRecord) -> bool {
+        record.fingerprint.pid != 0 && self.backend.probe_alive(&record.fingerprint) == Some(false)
+    }
+
     /// The current [`RunId`] for a supervised instance (story 3-1), or `None` if
     /// this engine holds no live handle for it (never started this lifetime, or
     /// already stopped/crashed). The Fleet read uses it to scope the current-Run

@@ -513,7 +513,9 @@ pub struct FleetEntry {
     /// process probe (review round 1): composed from the ALREADY-LOADED
     /// spawn record — the same source adoption reads — and a record whose
     /// process is gone is reconciled away at `Engine::open`, so a stale
-    /// record never outlives the read that surfaces it. `Some(...)`
+    /// record never outlives the read that surfaces it (story 21-4: a
+    /// READ-ONLY read reconciles nothing, so it omits the field for a record
+    /// whose process it finds gone — see [`FleetEntry::recorded_state`]). `Some(...)`
     /// exactly when a live-process record exists (a pid-0 policy/settle
     /// seed is not supervision), `None` (field omitted) when the record is
     /// cleared — a stopped or never-started instance never implies
@@ -522,6 +524,15 @@ pub struct FleetEntry {
     /// `acp_context_usage` pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Supervision>,
+    /// Story 21-4: the Lifecycle State the record still holds when it differs
+    /// from [`FleetEntry::state`]. A READ-ONLY engine
+    /// ([`crate::Engine::open_read_only`]) writes nothing, so when it finds a
+    /// `running`/`paused` row's recorded process gone it shows `state` as
+    /// `failed` — what the next write's reconciliation records — and keeps
+    /// the stored state here, so the difference is visible, never silent.
+    /// ADDITIVE + absent-when-none: every other read omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_state: Option<LifecycleState>,
     /// Absolute Agent Home path (engine-computed; the path authority).
     pub agent_home: String,
 }
@@ -813,6 +824,7 @@ mod tests {
             // Story 15-2: no spawn record in this fixture — the honest absence
             // (a registered instance is not supervised).
             supervision: None,
+            recorded_state: None,
             agent_home: format!("/x/agents/{name}"),
         }
     }
