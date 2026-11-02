@@ -4107,7 +4107,8 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
         "the Cost row must show a labeled dollar figure; stdout={}",
         show.stdout
     );
-    // The `show` Value column is WIDE (no truncation), so its Budget row labels the
+    // The `show` Value column is WIDE (flexible: the whole cell renders wherever the
+    // table has room for its row, as it does here), so its Budget row labels the
     // dollar Cost Cap INLINE (DollarLabel::Inline) — the full `remaining/cap (estimated)`
     // pair. At zero usage the remaining equals the $5.00 cap, so the pair is
     // `$5.00/$5.00 (estimated)`. This is the un-truncated companion to the `list`
@@ -4117,6 +4118,106 @@ fn show_of_a_rated_instance_surfaces_a_labeled_cost_row() {
         "the `show` Budget row must render the inline-labeled dollar cap pair; \
          stdout={}",
         show.stdout
+    );
+}
+
+#[test]
+fn show_and_config_get_render_whole_headers_and_grow_value_cells_with_the_terminal() {
+    // The unit tests in `crates/hekma/src/ui.rs` pin the layout rules (the header
+    // floor, capped-before-flexible growth); this test pins the call sites:
+    // `show`'s "Support (current OS)" header renders whole (its cap is 20, the
+    // header's width), and the `show` + `config get` Value columns are flexible —
+    // they grow with the terminal up to their longest cell, taking the width the
+    // capped columns leave, instead of stopping at a fixed 48 columns. The tokens +
+    // dollars budget below makes a 58-column Budget cell whose INLINE estimate
+    // label that 48-column cap chopped (`(estimat…`) however wide the terminal was.
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    run_hekma_agent(
+        &["agent", "register", "wide", "--kind", "mock"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    // A 59-column pass-through value for the `config get` Value column.
+    let note = "route refunds to billing and disputes to the disputes queue";
+    for (key, value) in [
+        ("cost.rate.input", "3.00"),
+        ("cost.rate.output", "15.00"),
+        ("budget.tokens.cumulative", "150000"),
+        ("budget.dollars.cumulative", "5.00"),
+        ("agent.note", note),
+    ] {
+        let set = run_hekma_agent(
+            &["agent", "config", "set", "wide", key, value],
+            &ctx.project_dir,
+            state_dir,
+        );
+        assert!(set.success, "config set {key}; stderr={}", set.stderr);
+    }
+
+    let show = run_hekma_agent_with_env(
+        &["agent", "show", "wide"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "100")],
+    );
+    assert!(show.success, "show should exit 0; stderr={}", show.stderr);
+    assert!(
+        show.stdout.contains("Support (current OS)"),
+        "the Capabilities header must render whole; stdout=\n{}",
+        show.stdout
+    );
+    assert!(
+        show.stdout
+            .contains("cum 150000/150000 tok, cum $5.00/$5.00 (estimated) (pause)"),
+        "the Budget cell must render whole, its inline estimate label intact; \
+         stdout=\n{}",
+        show.stdout
+    );
+
+    let config = run_hekma_agent_with_env(
+        &["agent", "config", "get", "wide"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "120")],
+    );
+    assert!(
+        config.success,
+        "config get should exit 0; stderr={}",
+        config.stderr
+    );
+    let note_row = config
+        .stdout
+        .lines()
+        .find(|line| line.contains("agent.note"))
+        .unwrap_or_else(|| panic!("the agent.note row renders; stdout=\n{}", config.stdout));
+    assert!(
+        note_row.contains(note) && note_row.contains("unvalidated"),
+        "the whole value and the whole Validated marker must render; row: {note_row}"
+    );
+
+    // Too narrow for the whole value: the capped columns still grow first, so the
+    // Validated marker renders whole and only the value cell truncates.
+    let narrow = run_hekma_agent_with_env(
+        &["agent", "config", "get", "wide"],
+        &ctx.project_dir,
+        state_dir,
+        &[("COLUMNS", "80")],
+    );
+    assert!(
+        narrow.success,
+        "config get should exit 0; stderr={}",
+        narrow.stderr
+    );
+    let narrow_row = narrow
+        .stdout
+        .lines()
+        .find(|line| line.contains("agent.note"))
+        .unwrap_or_else(|| panic!("the agent.note row renders; stdout=\n{}", narrow.stdout));
+    assert!(
+        narrow_row.contains("unvalidated") && !narrow_row.contains(note),
+        "the Validated marker must render whole while the value truncates; row: {narrow_row}"
     );
 }
 

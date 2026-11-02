@@ -43,6 +43,12 @@ jobs:
         # actually needs it; if outside work ever starts arriving via
         # owner-opened PRs, this guard must be revisited.
         #
+        # NB this repo lives under the Ktesio ORG, so
+        # `github.repository_owner` is "Ktesio", never the owner login — compared
+        # against that, the exemption below NEVER skipped anything (it only
+        # appeared to work because `iMagdy` is allowlisted anyway). Key on the
+        # owner LOGIN literally to implement the documented intent above.
+        #
         # The step is skipped, not the job, so the `cla` check still reports and
         # reports GREEN instead of vanishing from the PR's status list.
         #
@@ -50,7 +56,7 @@ jobs:
         # so this takes effect for pull requests opened AFTER it merges — not for
         # the pull request that introduces it.
         if: >-
-          github.event.pull_request.user.login != github.repository_owner &&
+          github.event.pull_request.user.login != 'iMagdy' &&
           (
             github.event.comment.body == 'recheck' ||
             github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA' ||
@@ -67,4 +73,12 @@ jobs:
           branch: "cla-signatures"
           # NB: entries are matched as patterns, so "[bot]" would be read as a
           # regex character class — use the owner login + prefix wildcards.
-          allowlist: "iMagdy,dependabot*,github-actions*"
+          #
+          # `heronis-run` is the org's own agent account (the Heronis
+          # attribution identity): its commits are produced by the owner's
+          # authorized automation on the owner's machine, and its GitHub web
+          # actions ("Update branch" merge commits, authored as
+          # `Heronis <app@heronis.run>`) otherwise fail the committer check on
+          # PRs the owner opened — same bot class as `dependabot*` /
+          # `github-actions*`, which are allowlisted for exactly that reason.
+          allowlist: "iMagdy,heronis-run,dependabot*,github-actions*"

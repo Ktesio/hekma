@@ -50,10 +50,14 @@ fn usage_entry_cell(entry: &FleetEntry, dollar_label: DollarLabel) -> String {
 
 /// The WIDE `show` Usage cell for one Fleet entry (story 14-3): a gapped acp
 /// entry carries the FULL gap notice INLINE (`— (no billing-grade usage —
-/// tiers attempted: …)`) — the wide Value column never truncates, the same
-/// treatment as [`cost_row_value`]'s inert-dollar note — so the tiers
-/// attempted are legible where the operator reads detail. Everyone else gets
-/// [`usage_cell_show`].
+/// tiers attempted: …)`), the same treatment as [`cost_row_value`]'s
+/// inert-dollar note. The human cell is cut at the table width
+/// (`ui::TableColumn::flexible`), and the notice is longer than the widest table
+/// (132 columns), so it always ends in `…`: both tiers attempted show only from
+/// roughly 121–128 columns, depending on the tier values (at 80 it reads
+/// `tiers attempted: o…`), and human `show` emits no stderr gap note (`list`
+/// does). The whole notice is `show --json`'s `usage_gap.notice`. Everyone else
+/// gets [`usage_cell_show`].
 fn usage_entry_cell_show(entry: &FleetEntry) -> String {
     match &entry.usage_gap {
         Some(gap) => format!("{} ({})", FleetEntry::METERING_SEED_CELL, gap.notice),
@@ -539,13 +543,17 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     let title = format!("Runtime status for {}", status.instance.name.as_str());
     let columns = [
         ui::TableColumn::new("Field", 14, 20),
-        ui::TableColumn::new("Value", 14, 48),
+        // Flexible: the Value column grows with the terminal (a table is at most
+        // 132 columns wide) up to its longest cell, so a cell renders whole
+        // wherever the table has room for its row and truncates with `…` only
+        // where it does not.
+        ui::TableColumn::flexible("Value", 14),
     ];
     // Usage + Metering Source from the Fleet entry (story 3-1); a degraded read
     // falls back to zero usage / "unknown" source so `show` never fails on it.
     // Story 14-3: the Usage cell routes through the gap-aware helper — a gapped
-    // acp instance shows the honest `—` + the full tier notice INLINE (the wide
-    // Value column never truncates).
+    // acp instance shows the honest `—` + the full tier notice INLINE (longer
+    // than the widest table, so it ends in `…`; `show --json` carries it whole).
     let usage_value = entry
         .map(usage_entry_cell_show)
         .unwrap_or_else(|| "in 0 / out 0".to_string());
@@ -555,8 +563,11 @@ fn render_runtime_status(status: &hekma_engine::InstanceStatus, entry: Option<&F
     // Budget from the Fleet entry (story 3-2 tokens + story 3-3 dollar cap): the
     // token ceiling(s) + remaining, the dollar Cost Cap + remaining (WHEN a Rate is
     // configured), and the Breach Action — or the honest `—` absence when nothing is
-    // configured (or the read degraded). The `show` Value column is wide (no
-    // truncation), so the estimate qualifier is labeled INLINE in the cell.
+    // configured (or the read degraded). The estimate qualifier is labeled INLINE
+    // in the cell. The flexible Value column renders the whole cell only where the
+    // table has room for its row; on a narrower terminal (80 columns is the piped
+    // default) the cell is cut at the width, and the cut can land inside a dollar
+    // label. `show --json` carries every labeled figure whole.
     let budget_value = budget_cell(entry.and_then(|e| e.budget.as_ref()), DollarLabel::Inline);
     // Cost from the Fleet entry (story 3-3): the DERIVED cumulative dollar cost,
     // rendered THROUGH the single currency module + labeled (AD-8), or the honest
@@ -651,7 +662,7 @@ fn render_capabilities(name: &str, caps: &EffectiveCapabilities) {
     }
     let columns = [
         ui::TableColumn::new("Capability", 12, 24),
-        ui::TableColumn::new("Support (current OS)", 14, 16),
+        ui::TableColumn::new("Support (current OS)", 14, 20),
     ];
     let rows: Vec<Vec<ui::TableCell>> = caps
         .entries
@@ -782,11 +793,13 @@ fn usage_cell(usage: &UsageView, dollar_label: DollarLabel) -> String {
 
 /// The `show` "Usage (tokens)" cell (story 3-5, AC8 — tokens BY SCOPE on the wide
 /// detail surface). Renders the CUMULATIVE scope (via [`usage_cell`], including the
-/// LABELED dollar cost when a Rate exists — the wide `show` column never truncates,
-/// so the inline estimate label is safe here, [`DollarLabel::Inline`]) AND — when
-/// the instance has a current Run with usage — the CURRENT-RUN token scope, so
-/// BOTH scopes the AC names are legible in human `show` detail (the `--json`
-/// `FleetEntry` already carries all four token fields). A non-running /
+/// LABELED dollar cost when a Rate exists, labeled inline — [`DollarLabel::Inline`])
+/// AND — when the instance has a current Run with usage — the CURRENT-RUN token
+/// scope. The flexible `show` Value column renders the whole cell only where the
+/// table has room for its row; on a narrower terminal (80 columns is the piped
+/// default) the cell is cut at the width, which can drop current-run figures or
+/// land inside the dollar label. `show --json` (the `FleetEntry`) carries all four
+/// token fields and every labeled figure whole. A non-running /
 /// zero-current-run instance shows only the cumulative scope (the current-Run
 /// scope is an honest absence, not a fabricated `run: in 0 / out 0`).
 fn usage_cell_show(usage: &UsageView) -> String {
@@ -822,13 +835,16 @@ fn cached_suffix(cached: Option<u64>) -> String {
 /// Where the estimate qualifier (`(estimated)`) for a rendered dollar figure lives
 /// on a given surface (FR-23/AD-8 — every rendered dollar MUST stay labeled).
 ///
-/// The `show` "Value" column is WIDE (no truncation), so it carries the label
-/// INLINE in the cell (`… $0.20/$0.50 (estimated) …`). The `list` "Budget" column
-/// is NARROW and TRUNCATES with `…`, which could CHOP an inline `(estimated)` off a
-/// real dollar figure and leave a bare, unlabeled dollar (the FR-23 violation this
-/// fixes). So on `list` the qualifier lives in the COLUMN HEADER ([`BUDGET_LIST_HEADER`])
-/// and the cell renders the dollar value BARE — the label can never be truncated
-/// because it is not in the cell.
+/// The `show` "Value" column carries the label INLINE in the cell
+/// (`… $0.20/$0.50 (estimated) …`). It is flexible: the whole cell renders only
+/// where the table has room for its row; on a narrower terminal (80 columns is the
+/// piped default) the cell is cut at the width, and the cut can land inside a
+/// dollar label — `show --json` carries every labeled figure whole. The `list`
+/// "Budget" column is NARROW and TRUNCATES with `…`, which could CHOP an inline
+/// `(estimated)` off a real dollar figure and leave a bare, unlabeled dollar (the
+/// FR-23 violation this fixes). So on `list` the qualifier lives in the COLUMN
+/// HEADER ([`BUDGET_LIST_HEADER`]) and the cell renders the dollar value BARE — the
+/// label can never be truncated because it is not in the cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DollarLabel {
     /// Append `(estimated)` inline in the cell (the wide `show` Value column).
@@ -1210,15 +1226,17 @@ pub fn usage(name: Option<&str>, json: bool) -> Result<(), Box<dyn std::error::E
 /// Every dollar figure routes through the SINGLE currency module via the shared
 /// [`cost_row_value`] (AD-8) and therefore always carries its
 /// `estimated`/`reconciled` label (FR-23); with no Rate configured it renders the
-/// honest inert note instead of a fabricated `$0.00` (AC-B). The `Value` column is
-/// wide (no truncation), so — as in `show` — the label rides INLINE in the cell.
-/// Result → stdout (AD-12).
+/// honest inert note instead of a fabricated `$0.00` (AC-B). As in `show`, the
+/// label rides INLINE in the cell: the flexible `Value` column renders the whole
+/// cell only where the table has room for its row, a narrower terminal cuts it at
+/// the width (possibly inside a label), and `usage --json` carries every figure
+/// whole. Result → stdout (AD-12).
 fn render_usage_instance(entry: &FleetEntry) {
     let usage = &entry.usage;
     let title = format!("Usage for {}", entry.name.as_str());
     let columns = [
         ui::TableColumn::new("Field", 14, 22),
-        ui::TableColumn::new("Value", 14, 48),
+        ui::TableColumn::flexible("Value", 14),
     ];
     let rows = vec![
         vec![
@@ -2211,7 +2229,7 @@ fn render_effective_config(
     }
     let columns = [
         ui::TableColumn::new("Key", 12, 40),
-        ui::TableColumn::new("Value", 12, 48),
+        ui::TableColumn::flexible("Value", 12),
         ui::TableColumn::new("Validated", 9, 12),
         ui::TableColumn::new("Source", 12, 20),
     ];
