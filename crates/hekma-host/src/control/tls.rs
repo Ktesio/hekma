@@ -175,7 +175,9 @@ mod tests {
         std::fs::write(&other_key, two.signing_key.serialize_pem()).unwrap();
         assert!(load_server_config(&cert, &key).is_ok());
         let err = load_server_config(&cert, &other_key).unwrap_err();
-        assert!(err.contains("does not fit"), "{err}");
+        // The message is not echoed: it names the key file (a test fixture,
+        // but the assertion has no need to print it).
+        assert!(err.contains("does not fit"), "a mismatched key is refused");
         // A key file in the cert slot holds no certificate.
         let err = load_server_config(&key, &key).unwrap_err();
         assert!(err.contains("no PEM certificate"), "{err}");
