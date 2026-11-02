@@ -186,8 +186,8 @@ The contract, in five rules:
    the query APIs return — the bus is untouched. An event whose append failed
    never appears in a backfill either.
 2. **Ordering is exact per family; the combined order is your choice, with
-   named tradeoffs.** Transitions come in `instance.log` order, breaches in
-   `breaches.log` order, usage updates in ledger commit order — the same
+   named tradeoffs.** Transitions, breaches and usage updates each come in
+   commit order — the same
    orders the stream guarantees. Across families the batch is family-major
    (transitions, then breaches, then usage): the durable record carries no
    global cross-family sequence, and the engine does not fabricate one.
@@ -211,27 +211,17 @@ The contract, in five rules:
    the family and both counts — never a silent clamp, which would re-deliver
    from zero or silently skip records. Resetting to `ResyncCursor::START` is
    your deliberate choice.
-4. **Crash-recovery read posture, with the skip surfaced.** The helper is
-   called most often right after the crash it heals — and that crash can tear
-   the log's trailing append. One unparseable trailing line per log is
-   skipped — and only when it carries the torn-append signature (the file
-   does not end with a newline, the mark of a write cut mid-append) — and the
-   skip is never silent: the batch's `torn_tail_skipped` flag is set,
-   because the engine's next append fuses onto the torn fragment and the
-   skipped line may be carrying a good post-crash record you did not
-   receive. Every other malformed line is a typed error worth investigating:
-   an interior line, a newline-terminated trailing line (corruption, or
-   exactly that fused line), or a trailing line that is valid JSON of the
-   wrong shape (the wrong file).
+4. **The record is the state database.** Transitions, breaches and usage
+   are rows in `state.db`, each committed in one transaction with its outbox
+   entry, so a crash can no longer tear a record in half. The batch's
+   `torn_tail_skipped` field stays on the wire for compatibility and is
+   always `false`. (`instance.log` and `breaches.log` are still written, after
+   each commit, as human-readable mirrors; the helper does not read them.)
 5. **Per-instance — and per-family honest.** `name` scopes the read; a
    Fleet-wide backfill is your loop over instances. An unregistered name
    fails `NotFound` rather than reading as a silent empty backfill. And the
-   batch is per-family exact, not a cross-family snapshot: the three family
-   reads (transitions, breaches, ledger) are sequential, so a commit landing
-   between them skews the families relative to each other. Each family's
-   slice stays exact and cursor-lossless — the next call picks up exactly the
-   stragglers — but if you need one coherent point-in-time view, make the
-   agent quiescent (stop/pause) across the read.
+   batch is one point-in-time view: the three families are read from one
+   database snapshot, so they are consistent with each other.
 
 ## The diagnostic sink
 

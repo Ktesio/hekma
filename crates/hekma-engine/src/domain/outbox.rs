@@ -70,14 +70,14 @@
 //! [`crate::Engine::export_events`] (async) and
 //! [`crate::Blocking::export_events`] (sync), plus their ack siblings.
 
-use std::io::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::bus::EngineEvent;
+use super::registry::Registry;
 use super::EngineError;
-use crate::paths::write_atomically;
+use crate::ports::RunStore;
 use crate::ports::{LOG_ROTATE_GENERATIONS, LOG_ROTATE_MAX_BYTES};
 
 /// The outbox payload family's schema version (story 17-4, AD-14's
@@ -342,254 +342,6 @@ pub(crate) fn read_journal_tolerant(path: &Path) -> Result<JournalView, String> 
     })
 }
 
-/// REPAIR a torn trailing fragment before an append (story 17-4): if the
-/// journal's raw text does not end with a newline, a previous crash cut its
-/// last write mid-line, and appending now would FUSE the new record onto the
-/// fragment (the resync readers would then surface it as a corrupt fused
-/// line). Truncate back to (and including) the last newline — dropping only
-/// the torn fragment — so the journal stays line-structured. An absent or
-/// clean file is a no-op. The dropped fragment was a partial record the
-/// tolerant readers already skip; nothing parseable is lost.
-///
-/// Returns whether a repair TRUNCATED the file (the caller's byte-size
-/// cache must re-derive in that case). O(1) on the clean-tail fast path —
-/// only the last byte is read — so the hot append does not pay a
-/// whole-journal read per record (review finding 7); the torn path reads a
-/// bounded trailing window (falling back to a whole-file scan only for a
-/// pathological fragment larger than the window).
-pub(crate) fn repair_torn_tail(path: &Path) -> Result<bool, String> {
-    use std::io::{Read, Seek, SeekFrom};
-    // `Some(cut)` = a torn tail that must be truncated at byte `cut`;
-    // `None` = clean (absent, empty, or newline-terminated) — no repair.
-    let cut = (|| -> Result<Option<u64>, String> {
-        let mut file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            // Names the path: on Windows a directory at the journal path
-            // fails HERE (ERROR_ACCESS_DENIED) — before the regular-file
-            // guard below ever runs — and a bare OS detail names nothing.
-            Err(e) => {
-                return Err(format!(
-                    "could not open the outbox journal for repair: {}: {e}",
-                    path.display()
-                ))
-            }
-        };
-        let meta = file.metadata().map_err(|e| {
-            format!(
-                "could not stat the outbox journal for repair: {}: {e}",
-                path.display()
-            )
-        })?;
-        // The journal path must be a REGULAR file. `File::open` happily
-        // opens a directory, and when that directory is empty its
-        // `st_size` is 0 on filesystems that size empty directories at
-        // zero (btrfs) — so the `len == 0` clean shortcut below returned
-        // "clean" without a single read ever erroring (the unreadable-
-        // journal red only showed on btrfs boxes; ext4/tmpfs dirs carry a
-        // nonzero size and fail later at the EISDIR read). A FIFO would
-        // hang the reads instead of erroring at all. The unreadable-
-        // journal contract: surface it, never serve a false caught-up
-        // read.
-        if !meta.is_file() {
-            return Err(format!(
-                "the outbox journal is not a regular file: {}",
-                path.display()
-            ));
-        }
-        let len = meta.len();
-        if len == 0 {
-            return Ok(None);
-        }
-        // Fast path: a newline-terminated journal has no torn tail — one
-        // byte decides it, and the hot append path never reads the body.
-        file.seek(SeekFrom::Start(len - 1))
-            .map_err(|e| e.to_string())?;
-        let mut last = [0u8; 1];
-        file.read_exact(&mut last).map_err(|e| e.to_string())?;
-        if last[0] == b'\n' {
-            return Ok(None);
-        }
-        // Torn tail: find the cut inside a bounded trailing window.
-        const WINDOW: u64 = 64 * 1024;
-        let window_len = len.min(WINDOW);
-        let window_start = len - window_len;
-        file.seek(SeekFrom::Start(window_start))
-            .map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; window_len as usize];
-        file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-        let cut_in_buf = buf
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |idx| idx + 1);
-        if cut_in_buf > 0 || window_len == len {
-            // A newline inside the window (or the window IS the whole file:
-            // no newline anywhere → cut to 0).
-            return Ok(Some(window_start + cut_in_buf as u64));
-        }
-        // No newline in the window and the file is bigger: the fragment
-        // itself is larger than the window (pathological) — fall back to a
-        // whole-file scan so the cut stays exact.
-        drop(file);
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        Ok(Some(text.rfind('\n').map_or(0, |idx| idx as u64 + 1)))
-    })()?;
-    let Some(cut) = cut else {
-        return Ok(false);
-    };
-    let writer = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("could not open the outbox journal for repair: {e}"))?;
-    writer
-        .set_len(cut)
-        .map_err(|e| format!("could not repair the outbox journal's torn tail: {e}"))?;
-    Ok(true)
-}
-
-/// What one compaction pass did (all counts SURFACED by the caller).
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct CompactionOutcome {
-    /// How many ACKED entries (seq ≤ ack cursor) were dropped — safe, silent
-    /// by design (that is what ack means).
-    pub dropped_acked: u64,
-    /// How many UN-ACKED entries were dropped to get under the cap — the
-    /// honest-degradation case; the caller emits a diagnostic naming the loss.
-    pub dropped_unacked: u64,
-}
-
-/// The PURE compaction decision (unit-tested without I/O): given the entries
-/// and their byte costs, the ack cursor, the incoming line's size, and the
-/// cap, decide which PREFIX of entries to drop. Rules, in order:
-/// 1. If current + incoming fits the cap, drop nothing.
-/// 2. Drop the ACKED prefix first (seq ≤ ack) — acked means consumed.
-/// 3. If STILL over, drop the oldest UN-ACKED entries too — but NEVER the
-///    very last entry (the journal's high-water seq and `retained_from`
-///    survive even under an acking-absent Host's flood).
-///
-/// Returns the keep-from index into `byte_costs` plus both drop counts.
-pub(crate) fn compaction_plan(
-    byte_costs: &[u64],
-    seqs: &[u64],
-    ack: Option<u64>,
-    incoming_bytes: u64,
-    cap: u64,
-) -> (usize, CompactionOutcome) {
-    let current: u64 = byte_costs.iter().sum();
-    let mut outcome = CompactionOutcome::default();
-    if current + incoming_bytes <= cap || byte_costs.is_empty() {
-        return (0, outcome);
-    }
-    let mut freed = 0u64;
-    let mut keep_from = 0usize;
-    // Phase 1: the acked prefix is free to drop — but NEVER the very last
-    // entry (review finding 3): a journal emptied by compaction, followed by
-    // a crash before the next append, would restart the seq sequence at 1 on
-    // the next open and silently fork the delivery range. Keeping the final
-    // entry preserves the high-water seq through any crash window.
-    while keep_from + 1 < seqs.len() {
-        let is_acked = ack.is_some_and(|ack| seqs[keep_from] <= ack);
-        if !is_acked {
-            break;
-        }
-        freed += byte_costs[keep_from];
-        outcome.dropped_acked += 1;
-        keep_from += 1;
-    }
-    if freed >= current + incoming_bytes - cap {
-        return (keep_from, outcome);
-    }
-    // Phase 2: still over — drop un-acked entries from the front, but never
-    // the very last entry (keep at least one; the journal's tail survives).
-    while keep_from + 1 < seqs.len() && freed < current + incoming_bytes - cap {
-        freed += byte_costs[keep_from];
-        outcome.dropped_unacked += 1;
-        keep_from += 1;
-    }
-    (keep_from, outcome)
-}
-
-/// Append one entry to the journal, compacting first when the cap would be
-/// crossed (the check-before-write approximation). Returns the compaction
-/// outcome (the caller surfaces any un-acked eviction) AND the journal's
-/// post-append byte size (the caller's O(1) size cache — review finding 7).
-/// The append is ONE `write_all` of `line + '\n'` in append mode — a crash
-/// cuts it to a torn fragment the next append repairs (see
-/// [`repair_torn_tail`]) and tolerant readers skip.
-///
-/// `ack` is the CURRENT durable ack cursor (read before this call); `cap` is
-/// [`OUTBOX_MAX_BYTES`] in production and a parameter so tests can drive the
-/// eviction path at toy sizes. `cached_bytes` is the caller's CACHED journal
-/// size (`None` = stat the file): the hot path needs no whole-journal read —
-/// `repair_torn_tail` decides from one byte, the cap check compares cached
-/// size + incoming, and only an actual compaction pays the O(journal) read.
-/// A `Some` cache is re-derived automatically when the repair truncated (its
-/// return says so) — the cache is trusted ONLY between the caller's own
-/// writes (the supervisor holds the lock across both).
-pub(crate) fn append_with_retention(
-    journal: &Path,
-    ack: Option<u64>,
-    entry: &OutboxEntry,
-    cap: u64,
-    cached_bytes: Option<u64>,
-) -> Result<(CompactionOutcome, u64), String> {
-    // Torn fragment first: never fuse a new record onto a torn tail.
-    let repaired = repair_torn_tail(journal)?;
-    let mut current_bytes = if repaired || cached_bytes.is_none() {
-        // The repair may have truncated (stale cache), or the caller had no
-        // cache: stat the file (O(1)); an absent file is an empty journal.
-        std::fs::metadata(journal).map(|m| m.len()).unwrap_or(0)
-    } else {
-        cached_bytes.unwrap_or_default()
-    };
-    let line = serde_json::to_string(entry)
-        .map_err(|e| format!("could not serialize the outbox entry: {e}"))?;
-    let incoming_bytes = line.len() as u64 + 1;
-    let mut outcome = CompactionOutcome::default();
-    // Compact only when the cap would be crossed.
-    if current_bytes + incoming_bytes > cap {
-        let view = read_journal_tolerant(journal)?;
-        let byte_costs: Vec<u64> = view
-            .entries
-            .iter()
-            .map(|e| serde_json::to_string(e).map_or(0, |l| l.len() as u64 + 1))
-            .collect();
-        let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
-        let (keep_from, plan) = compaction_plan(&byte_costs, &seqs, ack, incoming_bytes, cap);
-        if keep_from > 0 {
-            let kept: Vec<OutboxEntry> = view.entries[keep_from..].to_vec();
-            let mut rewritten = String::new();
-            for kept_entry in &kept {
-                let kept_line = serde_json::to_string(kept_entry)
-                    .map_err(|e| format!("could not serialize the outbox entry: {e}"))?;
-                rewritten.push_str(&kept_line);
-                rewritten.push('\n');
-            }
-            write_atomically(journal, rewritten.as_bytes())
-                .map_err(|e| format!("could not compact the outbox journal: {e}"))?;
-            outcome = plan;
-            current_bytes = rewritten.len() as u64;
-        }
-    }
-    if let Some(parent) = journal.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create the outbox directory: {e}"))?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(journal)
-        .map_err(|e| format!("could not open the outbox journal: {e}"))?;
-    file.write_all(format!("{line}\n").as_bytes())
-        .map_err(|e| format!("could not append to the outbox journal: {e}"))?;
-    // The authoritative post-append size (O(1) stat — kills accumulation
-    // drift; a stat failure degrades to the computed accounting).
-    let new_size = std::fs::metadata(journal)
-        .map(|m| m.len())
-        .unwrap_or(current_bytes + incoming_bytes);
-    Ok((outcome, new_size))
-}
-
 /// The PURE export selection (unit-tested without I/O): from a journal view,
 /// select the entries with seq strictly greater than `after` (bounded by
 /// `max`), and compute the batch. A cursor below the retained floor (it would
@@ -652,97 +404,84 @@ pub(crate) fn read_ack(path: &Path) -> Result<Option<u64>, String> {
     Ok(Some(doc.seq))
 }
 
-/// Persist the durable ack cursor atomically (`write_atomically` — the
-/// crash-safety contract every durable engine write keeps).
-pub(crate) fn write_ack(path: &Path, seq: u64) -> Result<(), String> {
-    let body = format!("{{\"schema_version\":{OUTBOX_SCHEMA_VERSION},\"seq\":{seq}}}\n");
-    write_atomically(path, body.as_bytes())
-        .map_err(|e| format!("could not persist the outbox ack cursor: {e}"))
-}
-
-/// The facade-facing export core: read the journal, resolve the request
-/// cursor (explicit, or the durable ack), select the batch. `max == 0` takes
-/// [`EXPORT_BATCH_DEFAULT_MAX`]; anything above [`EXPORT_BATCH_MAX_CAP`] is
-/// clamped to the cap. Errors ride [`EngineError::Log`] naming the journal —
-/// the refusal details carry the STABLE marker sentences the Control API maps
-/// to 409 `cursor_invalid`.
+/// The facade-facing export core (story 21-1: served from state.db's
+/// `outbox` table): resolve the request cursor (explicit, or the durable
+/// ack), check it against the retained floor and the committed tail, and
+/// read the bounded batch. Bounds and page come from ONE read snapshot, so a
+/// concurrent eviction can never slide the floor between the check and the
+/// read (a cursor that passed the check is served losslessly). `max == 0`
+/// takes [`EXPORT_BATCH_DEFAULT_MAX`]; anything above
+/// [`EXPORT_BATCH_MAX_CAP`] is clamped. Errors ride [`EngineError::Log`]
+/// naming state.db — the refusal details carry the STABLE marker sentences
+/// the Control API maps to 409 `cursor_invalid`.
 pub(crate) fn export_core(
-    journal: &Path,
-    ack_file: &Path,
+    registry: &Registry,
     after: Option<OutboxCursor>,
     max: u32,
 ) -> Result<ExportBatch, EngineError> {
-    let journal_path = journal.to_string_lossy().into_owned();
-    let after_seq = match after {
-        Some(cursor) => cursor.seq,
-        None => read_ack(ack_file)
-            .map_err(|detail| EngineError::Log {
-                name: "<outbox>".to_string(),
-                path: ack_file.to_string_lossy().into_owned(),
-                detail,
-            })?
-            .unwrap_or(0),
-    };
-    let view = read_journal_tolerant(journal).map_err(|detail| EngineError::Log {
-        name: "<outbox>".to_string(),
-        path: journal_path.clone(),
-        detail,
-    })?;
     let max = if max == 0 {
         EXPORT_BATCH_DEFAULT_MAX as usize
     } else {
         (max.min(EXPORT_BATCH_MAX_CAP)) as usize
     };
-    select_batch(&view, after_seq, max).map_err(|detail| EngineError::Log {
-        name: "<outbox>".to_string(),
-        path: journal_path,
-        detail,
-    })
+    let (bounds, page) = registry
+        .reader()
+        .snapshot(|store| {
+            let bounds = store.outbox_bounds()?;
+            let after_seq = after.map_or(bounds.ack.unwrap_or(0), |cursor| cursor.seq);
+            let page = store.outbox_page(after_seq, max)?;
+            Ok((bounds, (after_seq, page)))
+        })
+        .map_err(|err| outbox_error(registry, err.to_string()))?;
+    let (after_seq, page) = page;
+    let view = JournalView {
+        entries: page.items,
+        torn_tail_skipped: false,
+        blank_lines_skipped: 0,
+        retained_from: bounds.retained_from,
+        tail: bounds.tail,
+    };
+    select_batch(&view, after_seq, max).map_err(|detail| outbox_error(registry, detail))
 }
 
-/// The facade-facing ack core (story 17-4): MONOTONICALLY advance the
-/// durable ack cursor to `max(current, given)` and return the persisted
-/// value — a re-ack or a backward ack is the current cursor (idempotent),
-/// never a rewind. The target is validated against the journal's committed
-/// tail (`check_ack`): a cursor PAST the tail names the stable
-/// [`PAST_TAIL_SENTENCE`] refusal (the Control API maps it to 409
-/// `cursor_invalid`) — an ack is a claim about entries that exist. The
-/// caller holds the SUPERVISOR lock, so this cannot race an append's
-/// compaction (a compaction deciding what to keep against a MOVING ack
-/// cursor would be the one unsound interleaving).
-pub(crate) fn ack_core(journal: &Path, ack_file: &Path, given: u64) -> Result<u64, EngineError> {
-    let ack_path = ack_file.to_string_lossy().into_owned();
-    let current = read_ack(ack_file)
-        .map_err(|detail| EngineError::Log {
-            name: "<outbox>".to_string(),
-            path: ack_path.clone(),
-            detail,
-        })?
-        .unwrap_or(0);
-    let target = current.max(given);
-    let view = read_journal_tolerant(journal).map_err(|detail| EngineError::Log {
+/// The facade-facing ack core (story 17-4; since story 21-1 one store-writer
+/// job): MONOTONICALLY advance the durable ack cursor to `max(current,
+/// given)` and return the persisted value — a re-ack or a backward ack is the
+/// current cursor (idempotent), never a rewind. The target is validated
+/// against the committed tail inside the same transaction (`check_ack`): a
+/// cursor PAST the tail names the stable [`PAST_TAIL_SENTENCE`] refusal (the
+/// Control API maps it to 409 `cursor_invalid`). The writer serializes the
+/// ack against every append's eviction, so compaction never decides against a
+/// moving cursor.
+pub(crate) fn ack_core(registry: &Registry, given: u64) -> Result<u64, EngineError> {
+    let outcome = registry
+        .writer()
+        .call(move |ctx| {
+            let store = ctx.store();
+            let bounds = store.outbox_bounds()?;
+            let current = bounds.ack.unwrap_or(0);
+            let target = current.max(given);
+            if let Err(detail) = check_ack(target, bounds.tail) {
+                return Ok(Err(detail));
+            }
+            // No-op acks write nothing (review finding 20): only a real
+            // ADVANCE touches the row.
+            if target > current {
+                store.set_outbox_ack(target)?;
+            }
+            Ok(Ok(target))
+        })
+        .map_err(|err| outbox_error(registry, err.to_string()))?;
+    outcome.map_err(|detail| outbox_error(registry, detail))
+}
+
+/// A typed outbox error naming state.db (the outbox's home since 21-1).
+fn outbox_error(registry: &Registry, detail: String) -> EngineError {
+    EngineError::Log {
         name: "<outbox>".to_string(),
-        path: journal.to_string_lossy().into_owned(),
+        path: registry.state_db_path().to_string_lossy().into_owned(),
         detail,
-    })?;
-    check_ack(target, view.tail).map_err(|detail| EngineError::Log {
-        name: "<outbox>".to_string(),
-        path: ack_path.clone(),
-        detail,
-    })?;
-    // No-op acks do not touch the disk (review finding 20): a re-ack at or
-    // below the current cursor — including an ack of 0 on a fresh journal,
-    // where `current` is the absence-derived 0 — is already durable; only a
-    // real ADVANCE rewrites the file. Rewriting the same value would be pure
-    // churn on the Host's polling path.
-    if target > current {
-        write_ack(ack_file, target).map_err(|detail| EngineError::Log {
-            name: "<outbox>".to_string(),
-            path: ack_path,
-            detail,
-        })?;
     }
-    Ok(target)
 }
 
 #[cfg(test)]
@@ -780,6 +519,18 @@ mod tests {
             retained_from,
             tail,
         }
+    }
+
+    /// Write one journal line the way the pre-21-1 engine appended it (the
+    /// import's input format).
+    fn append_line(journal: &std::path::Path, entry: &OutboxEntry) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal)
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
     }
 
     fn batch_event(batch: &ExportBatch, idx: usize) -> u64 {
@@ -890,53 +641,6 @@ mod tests {
 
     // ---- the pure compaction plan ----
 
-    fn costs(entries: &[usize]) -> Vec<u64> {
-        entries.iter().map(|n| *n as u64).collect()
-    }
-
-    #[test]
-    fn compaction_is_skipped_while_the_cap_holds() {
-        let (keep_from, outcome) = compaction_plan(&costs(&[10, 10]), &[1, 2], Some(0), 5, 100);
-        assert_eq!(keep_from, 0);
-        assert_eq!(outcome, CompactionOutcome::default());
-    }
-
-    #[test]
-    fn compaction_drops_the_acked_prefix_first() {
-        // 10 + 10 + incoming 5 = 25 > cap 18: drop the acked prefix (10) → 15 ≤ 18.
-        let (keep_from, outcome) = compaction_plan(&costs(&[10, 10]), &[1, 2], Some(1), 5, 18);
-        assert_eq!(keep_from, 1);
-        assert_eq!(outcome.dropped_acked, 1);
-        assert_eq!(
-            outcome.dropped_unacked, 0,
-            "acked drops are free, not losses"
-        );
-    }
-
-    #[test]
-    fn compaction_evicts_unacked_entries_only_when_still_over_the_cap() {
-        // Nothing acked, cap forces an un-acked eviction.
-        let (keep_from, outcome) = compaction_plan(&costs(&[10, 10, 10]), &[1, 2, 3], None, 5, 12);
-        assert!(keep_from > 0);
-        assert_eq!(outcome.dropped_acked, 0);
-        assert_eq!(outcome.dropped_unacked, keep_from as u64);
-    }
-
-    #[test]
-    fn compaction_never_drops_the_very_last_entry() {
-        // One huge entry over the cap alone, nothing acked: it STAYS.
-        let (keep_from, outcome) = compaction_plan(&costs(&[100]), &[1], None, 5, 50);
-        assert_eq!(keep_from, 0, "the last entry survives even over cap");
-        assert_eq!(outcome.dropped_unacked, 0);
-    }
-
-    #[test]
-    fn compaction_of_an_empty_journal_is_a_no_op() {
-        let (keep_from, outcome) = compaction_plan(&[], &[], Some(3), 5, 1);
-        assert_eq!(keep_from, 0);
-        assert_eq!(outcome, CompactionOutcome::default());
-    }
-
     // ---- the journal I/O ----
 
     #[test]
@@ -944,8 +648,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = dir.path().join("outbox.jsonl");
         for seq in 1..=3u64 {
-            let _ = append_with_retention(&journal, None, &entry(seq), OUTBOX_MAX_BYTES, None)
-                .expect("append succeeds");
+            append_line(&journal, &entry(seq));
         }
         let view = read_journal_tolerant(&journal).expect("the journal reads back");
         let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
@@ -956,76 +659,16 @@ mod tests {
     }
 
     #[test]
-    fn append_repairs_a_torn_tail_instead_of_fusing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
-        let _ = append_with_retention(&journal, None, &entry(2), OUTBOX_MAX_BYTES, None).unwrap();
-        // Simulate a crash mid-append: the LAST record's write was cut
-        // mid-line (chop its tail off, leaving it newline-less). Entry 2's
-        // torn write never committed — the repair drops it; the point is
-        // the journal stays line-structured, not that torn bytes survive.
-        let text = std::fs::read_to_string(&journal).unwrap();
-        std::fs::write(&journal, &text[..text.len() - 10]).unwrap();
-        // The next append repairs before writing.
-        let _ = append_with_retention(&journal, None, &entry(3), OUTBOX_MAX_BYTES, None).unwrap();
-        let view = read_journal_tolerant(&journal).expect("repaired journal reads clean");
-        let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
-        assert_eq!(
-            seqs,
-            vec![1, 3],
-            "the torn fragment was dropped, not fused onto the new record"
-        );
-        assert!(!view.torn_tail_skipped);
-    }
-
-    #[test]
     fn a_torn_tail_read_is_surfaced() {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
-        let _ = append_with_retention(&journal, None, &entry(2), OUTBOX_MAX_BYTES, None).unwrap();
+        append_line(&journal, &entry(1));
+        append_line(&journal, &entry(2));
         let text = std::fs::read_to_string(&journal).unwrap();
         std::fs::write(&journal, &text[..text.len() - 5]).unwrap();
         let view = read_journal_tolerant(&journal).expect("torn tail tolerated");
         assert_eq!(view.entries.len(), 1, "the complete prefix survives");
         assert!(view.torn_tail_skipped, "the skip is surfaced, never silent");
-    }
-
-    #[test]
-    fn append_compacts_the_acked_prefix_at_the_cap() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        // Toy cap: each entry line is well over 100 bytes here, so three
-        // entries cross a 400-byte cap; seqs 1-2 are acked.
-        let _ = append_with_retention(&journal, Some(0), &entry(1), 400, None).unwrap();
-        let _ = append_with_retention(&journal, Some(0), &entry(2), 400, None).unwrap();
-        let _ = append_with_retention(&journal, Some(2), &entry(3), 400, None).unwrap();
-        let view = read_journal_tolerant(&journal).unwrap();
-        let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
-        assert!(
-            seqs.len() < 3 || seqs[0] > 1,
-            "the acked prefix was eligible for compaction: {seqs:?}"
-        );
-    }
-
-    #[test]
-    fn append_evicts_unacked_entries_at_the_cap_and_never_the_last_entry() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        // Cap 300 bytes; each line ~180-200. Nothing is acked: the FIRST
-        // entry must be evicted (surfaced), never the last.
-        let (outcome1, _) = append_with_retention(&journal, None, &entry(1), 300, None).unwrap();
-        assert_eq!(outcome1.dropped_unacked, 0);
-        let (outcome2, _) = append_with_retention(&journal, None, &entry(2), 300, None).unwrap();
-        let view = read_journal_tolerant(&journal).unwrap();
-        let seqs: Vec<u64> = view.entries.iter().map(|e| e.seq).collect();
-        if outcome2.dropped_unacked > 0 {
-            assert_eq!(seqs, vec![2], "the oldest un-acked entry was evicted");
-        } else {
-            assert_eq!(seqs, vec![1, 2], "under the toy cap this append fit");
-        }
-        assert_eq!(seqs.last(), Some(&2), "the LAST entry always survives");
     }
 
     #[test]
@@ -1041,7 +684,7 @@ mod tests {
     fn a_valid_json_wrong_shape_trailing_line_is_the_wrong_file_not_a_tear() {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
+        append_line(&journal, &entry(1));
         let text = std::fs::read_to_string(&journal).unwrap();
         std::fs::write(&journal, format!("{text}{{\"nope\":1}}\n")).unwrap();
         let err = read_journal_tolerant(&journal).unwrap_err();
@@ -1052,7 +695,7 @@ mod tests {
     fn a_newline_terminated_unparseable_trailing_line_is_an_error_not_a_skip() {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
+        append_line(&journal, &entry(1));
         let text = std::fs::read_to_string(&journal).unwrap();
         let torn = "not json at all";
         std::fs::write(&journal, format!("{text}{torn}\n")).unwrap();
@@ -1064,8 +707,8 @@ mod tests {
     fn an_interior_error_reports_the_physical_line_number() {
         let dir = tempfile::TempDir::new().unwrap();
         let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
-        let _ = append_with_retention(&journal, None, &entry(2), OUTBOX_MAX_BYTES, None).unwrap();
+        append_line(&journal, &entry(1));
+        append_line(&journal, &entry(2));
         let text = std::fs::read_to_string(&journal).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         let mangled = format!("{}\n{{\"not\":\"an entry\"}}\n{}", lines[0], lines[1]);
@@ -1080,28 +723,6 @@ mod tests {
     // ---- the ack file ----
 
     #[test]
-    fn the_ack_cursor_round_trips_atomically_and_reads_absent_as_none() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let ack = dir.path().join("outbox-ack.json");
-        assert_eq!(read_ack(&ack).unwrap(), None, "absent = no ack yet");
-        write_ack(&ack, 42).unwrap();
-        assert_eq!(read_ack(&ack).unwrap(), Some(42));
-        write_ack(&ack, 7).unwrap();
-        assert_eq!(
-            read_ack(&ack).unwrap(),
-            Some(7),
-            "the file is overwritten verbatim; the max() lives at the caller"
-        );
-        // The residue discipline: an atomic write leaves no temp litter.
-        let residue: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".tmp-"))
-            .collect();
-        assert!(residue.is_empty(), "no temp residue: {residue:?}");
-    }
-
-    #[test]
     fn a_corrupt_ack_file_is_an_error_not_a_silent_reset() {
         let dir = tempfile::TempDir::new().unwrap();
         let ack = dir.path().join("outbox-ack.json");
@@ -1111,63 +732,6 @@ mod tests {
     }
 
     // ---- the facade core ----
-
-    #[test]
-    fn export_core_resumes_from_the_durable_ack_cursor_by_default() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        for seq in 1..=3u64 {
-            let _ =
-                append_with_retention(&journal, None, &entry(seq), OUTBOX_MAX_BYTES, None).unwrap();
-        }
-        write_ack(&ack, 2).unwrap();
-        let batch = export_core(&journal, &ack, None, 0).expect("default pull resumes");
-        let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, vec![3], "everything through the ack is skipped");
-        assert_eq!(batch.cursor, OutboxCursor { seq: 3 });
-    }
-
-    #[test]
-    fn export_core_with_an_explicit_cursor_re_pulls_and_max_zero_takes_the_default() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        for seq in 1..=3u64 {
-            let _ =
-                append_with_retention(&journal, None, &entry(seq), OUTBOX_MAX_BYTES, None).unwrap();
-        }
-        let batch = export_core(&journal, &ack, Some(OutboxCursor { seq: 0 }), 2).unwrap();
-        assert_eq!(batch.events.len(), 2, "the explicit max bounds the batch");
-        assert_eq!(batch.cursor, OutboxCursor { seq: 2 });
-    }
-
-    #[test]
-    fn export_core_maps_the_refusals_to_typed_log_errors_with_stable_sentences() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        for seq in 1..=2u64 {
-            let _ =
-                append_with_retention(&journal, None, &entry(seq), OUTBOX_MAX_BYTES, None).unwrap();
-        }
-        let above = export_core(&journal, &ack, Some(OutboxCursor { seq: 9 }), 0).unwrap_err();
-        assert!(
-            matches!(&above, EngineError::Log { detail, .. }
-                if detail.contains(PAST_TAIL_SENTENCE)),
-            "{above:?}"
-        );
-        // Stage a rotated-away floor: keep only seq 2 in the file.
-        let text = std::fs::read_to_string(&journal).unwrap();
-        let last_line = text.lines().last().unwrap();
-        std::fs::write(&journal, format!("{last_line}\n")).unwrap();
-        let below = export_core(&journal, &ack, Some(OutboxCursor { seq: 0 }), 0).unwrap_err();
-        assert!(
-            matches!(&below, EngineError::Log { detail, .. }
-                if detail.contains(BELOW_FLOOR_SENTENCE)),
-            "{below:?}"
-        );
-    }
 
     // ---- the I/O error arms: every typed EngineError::Log constructor ----
     //
@@ -1188,19 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn repair_surfaces_an_unreadable_journal_instead_of_appending_blindly() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        std::fs::create_dir(&journal).unwrap();
-        let err = repair_torn_tail(&journal).unwrap_err();
-        assert!(!err.is_empty(), "the OS detail is preserved: {err}");
-        assert!(
-            err.contains("outbox.jsonl"),
-            "the error names the non-file journal path: {err}"
-        );
-    }
-
-    #[test]
     fn an_unreadable_ack_file_is_an_error_not_a_fresh_cursor() {
         let dir = tempfile::TempDir::new().unwrap();
         let ack = dir.path().join("outbox-ack.json");
@@ -1209,83 +760,7 @@ mod tests {
         assert!(!err.is_empty(), "the OS detail is preserved: {err}");
     }
 
-    #[test]
-    fn export_core_surfaces_an_unreadable_ack_file_as_a_typed_log_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        std::fs::create_dir(&ack).unwrap();
-        let err = export_core(&journal, &ack, None, 0).unwrap_err();
-        assert!(
-            matches!(&err, EngineError::Log { path, detail, .. }
-                if path.contains("outbox-ack.json") && !detail.is_empty()),
-            "the ack file is named with its detail: {err:?}"
-        );
-    }
-
-    #[test]
-    fn export_core_surfaces_an_unreadable_journal_as_a_typed_log_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        std::fs::create_dir(&journal).unwrap();
-        let err = export_core(&journal, &ack, Some(OutboxCursor::START), 0).unwrap_err();
-        assert!(
-            matches!(&err, EngineError::Log { path, detail, .. }
-                if path.contains("outbox.jsonl") && !detail.is_empty()),
-            "the journal is named with its detail: {err:?}"
-        );
-    }
-
-    #[test]
-    fn ack_core_surfaces_an_unreadable_ack_file_as_a_typed_log_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        std::fs::create_dir(&ack).unwrap();
-        let err = ack_core(&journal, &ack, 1).unwrap_err();
-        assert!(
-            matches!(&err, EngineError::Log { path, detail, .. }
-                if path.contains("outbox-ack.json") && !detail.is_empty()),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn ack_core_surfaces_an_unreadable_journal_as_a_typed_log_error() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        std::fs::create_dir(&journal).unwrap();
-        let err = ack_core(&journal, &ack, 0).unwrap_err();
-        assert!(
-            matches!(&err, EngineError::Log { path, detail, .. }
-                if path.contains("outbox.jsonl") && !detail.is_empty()),
-            "{err:?}"
-        );
-    }
-
     // ---- review-finding pins (17-4 review pass) ----
-
-    #[test]
-    fn an_interior_blank_line_is_counted_and_surfaced_not_silent() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
-        // Interior blank + whitespace-only lines (an external edit or a
-        // partial-corruption signature): never a silent drop, never a hard
-        // error — counted on the batch.
-        let text = std::fs::read_to_string(&journal).unwrap();
-        std::fs::write(&journal, format!("{text}\n   \n")).unwrap();
-        let _ = append_with_retention(&journal, None, &entry(2), OUTBOX_MAX_BYTES, None).unwrap();
-        let batch = export_core(&journal, &ack, Some(OutboxCursor::START), 0).unwrap();
-        assert_eq!(batch.events.len(), 2, "both records still serve");
-        assert_eq!(
-            batch.blank_lines_skipped, 2,
-            "the interior blanks are counted on the batch"
-        );
-    }
 
     #[test]
     fn a_duplicate_or_decreasing_seq_is_a_typed_error_naming_both_seqs() {
@@ -1315,84 +790,139 @@ mod tests {
         assert!(err.contains("duplicate or decreasing sequence"), "{err}");
     }
 
-    #[test]
-    fn compaction_never_empties_the_journal_even_when_everything_is_acked() {
-        // Review finding 3: phase 1 (the acked prefix) must stop at the
-        // last entry — a journal emptied by compaction, followed by a crash
-        // before the next append, would restart seqs at 1 on the next open
-        // and silently fork the delivery range.
-        let plan = compaction_plan(
-            &[10, 10, 10],
-            &[1, 2, 3],
-            Some(3), // everything acked
-            100,     // incoming
-            25,      // cap: needs 85+ freed, but only two entries may drop
-        );
-        assert_eq!(plan.0, 2, "phase 1 stops before the last entry");
-        assert_eq!(plan.1.dropped_acked, 2);
-        assert_eq!(plan.1.dropped_unacked, 0);
-        // End-to-end at the file level: all-acked journal + a cap-crossing
-        // append leaves ONE entry (the high-water seq survives).
+    // ---- the state.db outbox (story 21-1) ----
+
+    fn registry() -> (tempfile::TempDir, Registry) {
         let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        for seq in 1..=2u64 {
-            let _ = append_with_retention(&journal, None, &entry(seq), 10_000, None).unwrap();
+        let registry = Registry::open(Some(dir.path().to_path_buf())).unwrap();
+        (dir, registry)
+    }
+
+    fn append_db(registry: &Registry, n: u64, cap: u64) -> crate::ports::OutboxAppend {
+        registry
+            .writer()
+            .call(move |ctx| {
+                ctx.store()
+                    .append_outbox(&EngineEvent::Transition(transition(n as usize)), cap)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn export_core_resumes_from_the_durable_ack_cursor_by_default() {
+        let (_dir, registry) = registry();
+        for n in 1..=3 {
+            assert_eq!(append_db(&registry, n, OUTBOX_MAX_BYTES).seq, n);
         }
-        let (outcome, _) = append_with_retention(&journal, Some(2), &entry(3), 100, None).unwrap();
-        let view = read_journal_tolerant(&journal).unwrap();
-        assert_eq!(view.tail, 3, "the high-water seq survives any crash");
-        assert_eq!(
-            view.retained_from, 2,
-            "the acked prefix was dropped up to (never past) the last entry"
-        );
-        assert_eq!(outcome.dropped_acked, 1);
+        assert_eq!(ack_core(&registry, 2).unwrap(), 2);
+        let batch = export_core(&registry, None, 0).expect("default pull resumes");
+        let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3], "everything through the ack is skipped");
+        assert_eq!(batch.cursor, OutboxCursor { seq: 3 });
+        assert!(!batch.torn_tail_skipped);
+        assert_eq!(batch.blank_lines_skipped, 0);
     }
 
     #[test]
-    fn an_ack_that_does_not_advance_the_cursor_writes_nothing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let ack = dir.path().join("outbox-ack.json");
-        let _ = append_with_retention(&journal, None, &entry(1), OUTBOX_MAX_BYTES, None).unwrap();
-        let _ = append_with_retention(&journal, None, &entry(2), OUTBOX_MAX_BYTES, None).unwrap();
-        // Anchor: a real advance writes the file.
-        assert_eq!(ack_core(&journal, &ack, 1).unwrap(), 1);
-        assert!(ack.exists(), "the first real advance persists the cursor");
-        // A re-ack BELOW the cursor is idempotent AND churn-free: make the
-        // file read-only — a write attempt would FAIL, so success proves no
-        // write happened (cross-OS: both platforms honor the read-only bit).
-        let mut perms = std::fs::metadata(&ack).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&ack, perms).unwrap();
-        let persisted = ack_core(&journal, &ack, 0).expect("regressive ack is a no-op");
-        assert_eq!(persisted, 1, "the cursor stays at its durable value");
-        // A fresh journal's ack of 0 writes nothing at all (no file is born).
-        let fresh_ack = dir.path().join("fresh-ack.json");
-        let _ = append_with_retention(&journal, None, &entry(3), OUTBOX_MAX_BYTES, None).unwrap();
-        assert_eq!(ack_core(&journal, &fresh_ack, 0).unwrap(), 0);
+    fn export_core_with_an_explicit_cursor_re_pulls_and_max_bounds_the_batch() {
+        let (_dir, registry) = registry();
+        for n in 1..=3 {
+            append_db(&registry, n, OUTBOX_MAX_BYTES);
+        }
+        let batch = export_core(&registry, Some(OutboxCursor { seq: 0 }), 2).unwrap();
+        assert_eq!(batch.events.len(), 2, "the explicit max bounds the batch");
+        assert_eq!(batch.cursor, OutboxCursor { seq: 2 });
+        let all = export_core(&registry, Some(OutboxCursor::START), 0).unwrap();
+        assert_eq!(all.events.len(), 3, "max 0 takes the default");
+    }
+
+    #[test]
+    fn export_core_refuses_past_the_tail_and_below_the_floor() {
+        let (_dir, registry) = registry();
+        let one = serde_json::to_string(&EngineEvent::Transition(transition(1)))
+            .unwrap()
+            .len() as u64;
+        append_db(&registry, 1, OUTBOX_MAX_BYTES);
+        append_db(&registry, 2, OUTBOX_MAX_BYTES);
+        // A toy cap: the third append evicts the oldest un-acked row.
+        let third = append_db(&registry, 3, 3 * one - 1);
+        assert_eq!(third.seq, 3);
+        assert_eq!(third.dropped_unacked, 1, "the cap evicted seq 1, un-acked");
+        let above = export_core(&registry, Some(OutboxCursor { seq: 9 }), 0).unwrap_err();
         assert!(
-            !fresh_ack.exists(),
-            "an ack of 0 on a fresh journal must not create the ack file"
+            matches!(&above, EngineError::Log { detail, .. } if detail.contains(PAST_TAIL_SENTENCE)),
+            "{above:?}"
+        );
+        let below = export_core(&registry, Some(OutboxCursor { seq: 0 }), 0).unwrap_err();
+        assert!(
+            matches!(&below, EngineError::Log { detail, .. }
+                if detail.contains(BELOW_FLOOR_SENTENCE)),
+            "{below:?}"
+        );
+        let served = export_core(&registry, Some(OutboxCursor { seq: 1 }), 0).unwrap();
+        assert_eq!(served.retained_from, 2);
+        assert_eq!(
+            served.events.len(),
+            2,
+            "a cursor at the floor - 1 is lossless"
         );
     }
 
     #[test]
-    fn the_cached_size_path_stays_correct_when_the_cache_is_stale() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let journal = dir.path().join("outbox.jsonl");
-        let _ = append_with_retention(&journal, None, &entry(1), 10_000, None).unwrap();
-        // Stale-LOW cache (says the journal is empty): the append still
-        // lands, and the RETURNED size is the file's real truth.
-        let (_, size) = append_with_retention(&journal, None, &entry(2), 10_000, Some(0)).unwrap();
-        let real = std::fs::metadata(&journal).unwrap().len();
-        assert_eq!(size, real, "the returned size is the file's truth");
-        // Stale-HIGH cache (over-triggers the compaction check): the plan
-        // reads REAL costs and drops nothing (the journal actually fits).
-        let (outcome, _) =
-            append_with_retention(&journal, None, &entry(3), 10_000, Some(u32::MAX as u64))
-                .unwrap();
-        assert_eq!(outcome, CompactionOutcome::default());
-        let view = read_journal_tolerant(&journal).unwrap();
-        assert_eq!(view.entries.len(), 3, "nothing was dropped");
+    fn the_acked_prefix_is_evicted_first_and_silently() {
+        let (_dir, registry) = registry();
+        for n in 1..=3 {
+            append_db(&registry, n, OUTBOX_MAX_BYTES);
+        }
+        ack_core(&registry, 2).unwrap();
+        let one = serde_json::to_string(&EngineEvent::Transition(transition(1)))
+            .unwrap()
+            .len() as u64;
+        let append = append_db(&registry, 4, 3 * one);
+        assert_eq!(append.dropped_acked, 2, "the whole acked prefix goes");
+        assert_eq!(append.dropped_unacked, 0);
+        let batch = export_core(&registry, Some(OutboxCursor { seq: 2 }), 0).unwrap();
+        let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![3, 4]);
+    }
+
+    #[test]
+    fn the_outbox_never_evicts_its_last_entry() {
+        let (_dir, registry) = registry();
+        append_db(&registry, 1, OUTBOX_MAX_BYTES);
+        append_db(&registry, 2, OUTBOX_MAX_BYTES);
+        let append = append_db(&registry, 3, 1);
+        assert_eq!(append.dropped_unacked, 1, "only the older row can go");
+        let batch = export_core(&registry, Some(OutboxCursor { seq: 1 }), 0).unwrap();
+        let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 3],
+            "the last existing row survives a 1-byte cap"
+        );
+        assert_eq!(batch.retained_from, 2);
+    }
+
+    #[test]
+    fn ack_is_monotonic_and_refuses_past_the_tail() {
+        let (_dir, registry) = registry();
+        assert_eq!(
+            ack_core(&registry, 0).unwrap(),
+            0,
+            "a zero ack on an empty outbox"
+        );
+        append_db(&registry, 1, OUTBOX_MAX_BYTES);
+        append_db(&registry, 2, OUTBOX_MAX_BYTES);
+        assert_eq!(ack_core(&registry, 2).unwrap(), 2);
+        assert_eq!(
+            ack_core(&registry, 1).unwrap(),
+            2,
+            "a backward ack is a no-op"
+        );
+        let err = ack_core(&registry, 3).unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Log { detail, .. } if detail.contains(PAST_TAIL_SENTENCE)),
+            "{err:?}"
+        );
     }
 }

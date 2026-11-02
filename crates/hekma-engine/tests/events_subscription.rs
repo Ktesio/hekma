@@ -357,11 +357,11 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     assert_usage_matches_rows(&usage, &rows, "the uj3 flow");
 
     // The commit-order interleaving inside the pre-stop phase: the first two
-    // events are the start transitions; then usage flows; the TOKEN breach
-    // lands right after the crossing usage commit (the durable order is
-    // usage -> token breach -> pause -> dollar breach); the pause transition
-    // follows; then the DOLLAR breach. Any post-pause usage commits (events
-    // racing the suspension) come after all of those.
+    // events are the start transitions; then usage flows; the crossing usage
+    // event and BOTH breaches it fires commit in one transaction (the store
+    // writer's pipeline job), so the durable order is usage -> token breach
+    // -> dollar breach -> pause. Any post-pause usage commits (events racing
+    // the suspension) come after all of those.
     let first_breach = phase1
         .iter()
         .position(|e| matches!(e, EngineEvent::BudgetBreach(_)))
@@ -387,6 +387,12 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
         other => panic!("expected the token breach, got {other:?}"),
     }
     match &phase1[first_breach + 1] {
+        EngineEvent::BudgetBreach(b) => {
+            assert_eq!(b.dimension, BreachDimension::Dollars);
+        }
+        other => panic!("expected the dollar breach, got {other:?}"),
+    }
+    match &phase1[first_breach + 2] {
         EngineEvent::Transition(t) => {
             assert_eq!(t.new_state, hekma_engine::LifecycleState::Paused);
             assert!(
@@ -395,12 +401,6 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             );
         }
         other => panic!("expected the paused transition, got {other:?}"),
-    }
-    match &phase1[first_breach + 2] {
-        EngineEvent::BudgetBreach(b) => {
-            assert_eq!(b.dimension, BreachDimension::Dollars);
-        }
-        other => panic!("expected the dollar breach, got {other:?}"),
     }
 }
 
@@ -865,16 +865,18 @@ fn interleaved_instances_keep_per_instance_fifo() {
 }
 
 // ---------------------------------------------------------------------------
-// VG1: a failed durable append publishes NOTHING
+// VG1: the log files are mirrors — a failed mirror append never loses a
+// committed event (state.db is the record)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
-    // "Never publishes what did not commit", mutation-killed: if the publish
-    // were hoisted above the append gate (or fired on the error arm), the
-    // obstructed pause WOULD reach the bus. The obstruction — the instance's
-    // transition-log file replaced by a DIRECTORY — makes every append fail on
-    // every OS (opening a directory for append is an error, no OS cfg here).
+fn a_failed_instance_log_mirror_still_commits_and_publishes_the_transition() {
+    // The transition commits to state.db (state, event row, outbox row in one
+    // transaction) and only THEN is mirrored to `instance.log`. With the
+    // mirror obstructed — the file replaced by a DIRECTORY, so every append
+    // fails on every OS — the pause still lands, is published, and the query
+    // API holds it: the bus never publishes what did not commit, and never
+    // drops what did.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     ManifestFixture::lingering("sub-silent").write(manifest.path());
@@ -900,108 +902,52 @@ fn a_failed_transition_append_publishes_nothing_and_the_next_commit_delivers() {
     barrier(&facade);
     let (baseline, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
-    assert_eq!(
-        transitions_of(&baseline).len(),
-        2,
-        "the start edges delivered before the obstruction"
-    );
+    assert_eq!(transitions_of(&baseline).len(), 2, "the start edges");
 
-    // Obstruct: replace the transition log with a directory (append → error).
     let log: PathBuf = state
         .path()
         .join("agents")
         .join("sub-silent")
         .join("logs")
         .join("instance.log");
-    std::fs::remove_file(&log).expect("remove the transition log");
+    std::fs::remove_file(&log).expect("remove the transition log mirror");
     std::fs::create_dir(&log).expect("replace it with a directory");
 
-    // The transition fails at its durable append — and publishes nothing.
-    assert!(
-        facade.pause("sub-silent").is_err(),
-        "the obstructed append must fail the transition"
-    );
-    let (quiet, lagged) = test_support::drain_subscription(&mut sub);
-    assert!(lagged.is_none());
-    assert!(
-        quiet.is_empty(),
-        "a failed commit must publish NOTHING, got {quiet:?}"
-    );
-
-    // Clear the obstruction: story 16-3 compensated the failed pause's row
-    // back to `running`, so the honest post-clear remediation is a REAL
-    // pause (delivers Paused) followed by a resume (delivers Running) —
-    // both commits land durably AND deliver.
-    std::fs::remove_dir(&log).expect("clear the obstruction");
-    assert_eq!(
-        facade
-            .instance_status("sub-silent")
-            .expect("status after the compensated pause")
-            .instance
-            .state,
-        hekma_engine::LifecycleState::Running,
-        "16-3: the failed pause was compensated — the row reads running"
-    );
-    facade.pause("sub-silent").expect("pause after clearing");
     facade
-        .resume("sub-silent")
-        .expect("resume after the real pause");
+        .pause("sub-silent")
+        .expect("a failed mirror never fails the transition");
     barrier(&facade);
     let (after, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
-    let resumed = transitions_of(&after);
+    let paused = transitions_of(&after);
     assert_eq!(
-        resumed.len(),
-        2,
-        "exactly the two post-clear commits delivered: {after:?}"
+        paused.len(),
+        1,
+        "the committed pause is published: {after:?}"
     );
+    assert_eq!(paused[0].new_state, hekma_engine::LifecycleState::Paused);
+    let committed = committed_transitions(&facade, "sub-silent");
+    let mut delivered: Vec<TransitionEvent> =
+        transitions_of(&baseline).into_iter().cloned().collect();
+    delivered.extend(paused.into_iter().cloned());
     assert_eq!(
-        resumed[0].new_state,
-        hekma_engine::LifecycleState::Paused,
-        "the first post-clear delivery is the successful pause"
-    );
-    assert_eq!(
-        resumed[1].new_state,
-        hekma_engine::LifecycleState::Running,
-        "the second post-clear delivery is the successful resume"
+        committed, delivered,
+        "the durable record and the stream agree, mirror or no mirror"
     );
 
-    // The failed event is on NEITHER surface: no paused edge ever published
-    // during the obstruction window (baseline + the quiet drain above), and
-    // the durable log — recreated by the first post-clear append — holds
-    // EXACTLY what was delivered since the obstruction (both post-clear
-    // events, the real pause's Paused edge included; the obstruction itself
-    // destroyed the pre-existing log lines, which is the file's loss, not
-    // the bus's).
-    assert!(
-        transitions_of(&baseline)
-            .iter()
-            .all(|t| t.new_state != hekma_engine::LifecycleState::Paused),
-        "no paused edge delivered before the obstruction"
-    );
-    assert_eq!(
-        committed_transitions(&facade, "sub-silent"),
-        resumed.into_iter().cloned().collect::<Vec<_>>(),
-        "the post-clear durable log equals exactly what was delivered"
-    );
-
+    std::fs::remove_dir(&log).expect("clear the obstruction");
     let _ = facade.stop("sub-silent", Some(Duration::from_secs(5)));
 }
 
 #[test]
-fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
-    // VG1 (the breach arm): with breaches.log obstructed, the breach record
-    // fails to append (surfaced as the FR-21 diagnostic) while enforcement
-    // STILL pauses. The bus must deliver the paused TRANSITION (which committed
-    // to the healthy transition log) and never a BudgetBreach for the record
-    // that failed — killing the "publish on the append error arm" mutation.
+fn a_failed_breach_log_mirror_still_records_enforces_and_publishes_the_breach() {
+    // VG1 (the breach arm): with `breaches.log` obstructed, the breach still
+    // commits to state.db with its usage event, is published, and the pause
+    // still lands; only the human-readable mirror stays empty.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     let manifest_dir = uj3::write_flow_manifest(manifest.path());
 
-    // Obstruct BEFORE start: pre-create the logs dir with breaches.log as a
-    // directory (the engine's own dir-create is idempotent; only the append
-    // to the directory fails).
     let breaches_log: PathBuf = state
         .path()
         .join("agents")
@@ -1009,7 +955,7 @@ fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
         .join("logs")
         .join("breaches.log");
     std::fs::create_dir_all(breaches_log.parent().unwrap()).expect("create the logs dir");
-    std::fs::create_dir(&breaches_log).expect("obstruct the breach log");
+    std::fs::create_dir(&breaches_log).expect("obstruct the breach log mirror");
 
     let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
     let facade = engine.blocking();
@@ -1025,7 +971,6 @@ fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
     }
     facade.start(uj3::FLOW_INSTANCE).expect("start");
 
-    // Enforcement proceeds despite the failed breach record: the pause lands.
     uj3::wait_for_state(
         state.path(),
         uj3::FLOW_INSTANCE,
@@ -1036,11 +981,22 @@ fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
     let (events, lagged) = test_support::drain_subscription(&mut sub);
     assert!(lagged.is_none());
 
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, EngineEvent::BudgetBreach(_))),
-        "NO breach event may publish for a failed breach append: {events:?}"
+    let recorded_of = |facade: &hekma_engine::Blocking<'_>| {
+        facade
+            .budget_breach_events(uj3::FLOW_INSTANCE)
+            .expect("the breach record reads")
+    };
+    let published: Vec<&hekma_engine::BudgetBreachEvent> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::BudgetBreach(b) => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded_of(&facade).iter().collect::<Vec<_>>(),
+        published,
+        "every recorded breach was published, in commit order: {events:?}"
     );
     let committed = committed_transitions(&facade, uj3::FLOW_INSTANCE);
     let received: Vec<TransitionEvent> = transitions_of(&events).into_iter().cloned().collect();
@@ -1052,12 +1008,11 @@ fn a_failed_breach_append_still_enforces_but_publishes_no_breach() {
         committed
             .iter()
             .any(|e| e.new_state == hekma_engine::LifecycleState::Paused),
-        "enforcement still paused the instance"
+        "enforcement paused the instance"
     );
-    // The durable breach record failed too — neither surface carries it.
     assert!(
         uj3::read_breach_events(state.path(), uj3::FLOW_INSTANCE).is_empty(),
-        "the obstructed breach log must hold no record"
+        "only the obstructed mirror is empty"
     );
 
     let _ = facade.stop(uj3::FLOW_INSTANCE, Some(uj3::STOP_WINDOW));
