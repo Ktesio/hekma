@@ -1011,4 +1011,79 @@ mod tests {
         reaped.disarm();
         drop(reaped);
     }
+
+    // -- collect_stderr_tail: the window and the grace-poll wait (the
+    // stderr-tail path's own seams, pinned without staging a command) --
+
+    /// An already-finished reader over a buffer LARGER than the window: the
+    /// collected tail is EXACTLY the last [`STDERR_TAIL_BYTES`] (lossy
+    /// UTF-8), and a buffer within the window passes through whole. The
+    /// whole-stream mutant ships every byte a chatty command ever printed
+    /// into the rejection detail; the always-truncate mutant mangles short
+    /// honest whys.
+    #[test]
+    fn collect_stderr_tail_keeps_exactly_the_last_window_and_passes_short_buffers() {
+        let big: Vec<u8> = (0..STDERR_TAIL_BYTES + 512)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(big.clone()));
+        let tail = collect_stderr_tail(&buffer, std::thread::spawn(|| {}));
+        assert_eq!(
+            tail.len(),
+            STDERR_TAIL_BYTES,
+            "an over-window buffer yields exactly the window: {} bytes",
+            tail.len()
+        );
+        assert_eq!(
+            tail.as_bytes(),
+            &big[big.len() - STDERR_TAIL_BYTES..],
+            "the surviving window is the LAST bytes"
+        );
+
+        let small = b"the pause command's own printed why".to_vec();
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(small.clone()));
+        let tail = collect_stderr_tail(&buffer, std::thread::spawn(|| {}));
+        assert_eq!(
+            tail.as_bytes(),
+            &small[..],
+            "a within-window buffer passes through whole"
+        );
+    }
+
+    /// A reader that lands its write a little AFTER collection begins (the
+    /// child died with the write still in flight, or a grandchild held the
+    /// pipe briefly): the collector polls until the reader finishes within
+    /// its grace, so the tail carries the write — never the empty pre-write
+    /// buffer the read-immediately mutant would return.
+    #[test]
+    fn collect_stderr_tail_waits_out_a_reader_that_finishes_within_the_grace() {
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Clock anchored BEFORE the spawn: the reader's 120 ms sleep begins
+        // the moment that thread is scheduled, so a clock started after
+        // `spawn` returns can shave the scheduling gap off the elapsed time
+        // (preemption on a loaded runner makes the margin vanish). From here
+        // `elapsed >= 120ms` holds by construction and the 100 ms bound
+        // below is a real margin.
+        let started = Instant::now();
+        let reader = {
+            let buffer = std::sync::Arc::clone(&buffer);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                buffer
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(b"late but within the grace");
+            })
+        };
+        let tail = collect_stderr_tail(&buffer, reader);
+        assert_eq!(
+            tail, "late but within the grace",
+            "the grace-wait collected the reader's post-sleep write"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the collector polled until the reader finished (returned after {:?})",
+            started.elapsed()
+        );
+    }
 }
