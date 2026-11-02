@@ -750,35 +750,20 @@ where
     if let Some(addr) = control_addr(control_listen, &tls_config) {
         specs.push(addr);
     }
-    let bound = rt.block_on(control::ControlApi::bind(
-        specs,
-        Arc::clone(&engine),
-        resolver,
-        note_tap,
-        notifier.sink.clone(),
-    ));
-    let api = match bound {
-        Ok(api) => api,
+    // Bind every socket FIRST, record the local endpoint in `control.json`,
+    // and only THEN start serving and print the listening notices: a client
+    // that gets an answer, or reads a notice, always finds the discovery
+    // file on disk (a connection that arrives in between waits in the accept
+    // queue).
+    let bound = match rt.block_on(control::BoundListeners::bind(specs)) {
+        Ok(bound) => bound,
         Err(message) => {
             let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
             return Err(refuse(ServeError::Startup { message }));
         }
     };
-    let local_addr = api.local_addrs()[0];
-    notifier.note(&format!(
-        "local control endpoint on {local_addr} (loopback, for the hekma CLI; recorded in {})",
-        local::control_file(&state_root).display()
-    ));
-    if let Some(addr) = api.local_addrs().get(1) {
-        let scheme = if tls_config.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        notifier.note(&format!(
-            "control api listening on {addr} (v0, unstable — bearer required; {scheme})"
-        ));
-    }
+    let addrs = bound.local_addrs();
+    let local_addr = addrs[0];
     let discovery = local::Discovery {
         schema_version: local::DISCOVERY_SCHEMA_VERSION,
         pid: std::process::id(),
@@ -788,7 +773,7 @@ where
         autostarted: autostart,
     };
     if let Err(err) = local::write_discovery(&state_root, &discovery) {
-        let _ = rt.block_on(api.shutdown());
+        drop(bound);
         let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
         return Err(refuse(ServeError::Startup {
             message: format!(
@@ -798,6 +783,33 @@ where
         }));
     }
     drop(discovery);
+    let api = match rt.block_on(bound.serve(
+        Arc::clone(&engine),
+        resolver,
+        note_tap,
+        notifier.sink.clone(),
+    )) {
+        Ok(api) => api,
+        Err(message) => {
+            local::remove_discovery(&state_root, std::process::id());
+            let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+            return Err(refuse(ServeError::Startup { message }));
+        }
+    };
+    notifier.note(&format!(
+        "local control endpoint on {local_addr} (loopback, for the hekma CLI; recorded in {})",
+        local::control_file(&state_root).display()
+    ));
+    if let Some(addr) = addrs.get(1) {
+        let scheme = if tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        notifier.note(&format!(
+            "control api listening on {addr} (v0, unstable — bearer required; {scheme})"
+        ));
+    }
 
     // (5.6) The OTLP telemetry exporter mounts here (AD-21) — the SAME
     // mount shape as the Control API: AFTER the engine opens, BEFORE the

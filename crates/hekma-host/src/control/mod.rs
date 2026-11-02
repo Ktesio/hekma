@@ -247,12 +247,9 @@ pub(crate) enum ListenerSpec {
     Tls(SocketAddr, Arc<rustls::ServerConfig>),
 }
 
-/// The running Control API: the bound addresses (OS-chosen ports resolved),
-/// the shutdown signal, and the serve tasks.
+/// The running Control API: the shutdown signal and the serve tasks (the
+/// bound addresses are [`BoundListeners::local_addrs`]).
 pub(crate) struct ControlApi {
-    /// The addresses the API answers on, in the order of the specs given to
-    /// [`ControlApi::bind`].
-    local_addrs: Vec<SocketAddr>,
     /// The shutdown signal the host fires on its own shutdown path.
     shutdown_tx: watch::Sender<bool>,
     /// The axum serve tasks, one per listener.
@@ -263,24 +260,24 @@ pub(crate) struct ControlApi {
     activity: Activity,
 }
 
-impl ControlApi {
-    /// Bind the API on the host's runtime, one listener per spec, all sharing
-    /// one router and one resolver. MUST be polled on that runtime (the host
-    /// does `rt.block_on(ControlApi::bind(...))`); the serve tasks then live
-    /// on the same runtime. A bind failure (address in use, no permission)
-    /// is the caller's surfaced `Startup` error — the message NAMES the
-    /// address (AI-18) — and nothing serves. The diagnostic `sink` is the
-    /// host's notice stream: a serve task writes through it if it ends
-    /// BEFORE the shutdown signal — the API is down for the rest of the
-    /// host's life and that must be VISIBLE, not silent (AI-18).
-    pub(crate) async fn bind(
-        specs: Vec<ListenerSpec>,
-        engine: Arc<hekma_engine::Engine>,
-        resolver: CredentialResolver,
-        notes: NoteTap,
-        sink: DiagnosticSink,
-    ) -> Result<Self, String> {
-        // Bind EVERY socket first: a failure leaves nothing serving.
+/// The Control API's sockets, BOUND but not yet serving (story 21-4): the
+/// host records the local endpoint in `control.json` between
+/// [`BoundListeners::bind`] and [`BoundListeners::serve`], so no request is
+/// ever answered — and no "listening" notice printed — before the discovery
+/// file is on disk. A connection that arrives in between waits in the
+/// accept queue.
+pub(crate) struct BoundListeners {
+    bound: Vec<(
+        tokio::net::TcpListener,
+        SocketAddr,
+        Option<Arc<rustls::ServerConfig>>,
+    )>,
+}
+
+impl BoundListeners {
+    /// Bind EVERY socket (one per spec) on the host's runtime; a failure
+    /// leaves nothing bound. The message NAMES the address (AI-18).
+    pub(crate) async fn bind(specs: Vec<ListenerSpec>) -> Result<Self, String> {
         let mut bound = Vec::with_capacity(specs.len());
         for spec in specs {
             let (addr, tls) = match spec {
@@ -295,6 +292,27 @@ impl ControlApi {
             })?;
             bound.push((listener, local_addr, tls));
         }
+        Ok(BoundListeners { bound })
+    }
+
+    /// The bound addresses, in spec order.
+    pub(crate) fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.bound.iter().map(|(_, addr, _)| *addr).collect()
+    }
+
+    /// Start serving every bound socket, all sharing one router and one
+    /// resolver. MUST be polled on the host runtime (the serve tasks live
+    /// on it). The diagnostic `sink` is the host's notice stream: a serve
+    /// task writes through it if it ends BEFORE the shutdown signal — the
+    /// API is down for the rest of the host's life and that must be
+    /// VISIBLE, not silent (AI-18).
+    pub(crate) async fn serve(
+        self,
+        engine: Arc<hekma_engine::Engine>,
+        resolver: CredentialResolver,
+        notes: NoteTap,
+        sink: DiagnosticSink,
+    ) -> Result<ControlApi, String> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let activity = Activity::new();
         let log_capture = engine.log_capture_mode().await;
@@ -307,11 +325,9 @@ impl ControlApi {
             notes,
             log_capture,
         });
-        let mut local_addrs = Vec::with_capacity(bound.len());
-        let mut tasks = Vec::with_capacity(bound.len());
+        let mut tasks = Vec::with_capacity(self.bound.len());
         let mut accept_tasks = Vec::new();
-        for (listener, local_addr, tls) in bound {
-            local_addrs.push(local_addr);
+        for (listener, local_addr, tls) in self.bound {
             let notifier = Notifier::over(sink.clone());
             let task = match tls {
                 None => spawn_serve(listener, app.clone(), shutdown_rx.clone(), notifier),
@@ -327,20 +343,15 @@ impl ControlApi {
             tasks.push(task);
         }
         Ok(ControlApi {
-            local_addrs,
             shutdown_tx,
             tasks,
             accept_tasks,
             activity,
         })
     }
+}
 
-    /// The addresses clients use, in spec order (the notices' addresses of
-    /// record).
-    pub(crate) fn local_addrs(&self) -> &[SocketAddr] {
-        &self.local_addrs
-    }
-
+impl ControlApi {
     /// The request activity clock (the auto-started host's idle exit).
     pub(crate) fn activity(&self) -> Activity {
         self.activity.clone()
