@@ -96,12 +96,37 @@ pub fn write_discovery(state_base: &Path, discovery: &Discovery) -> std::io::Res
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, &target)
+        rename_with_retry(&temp, &target)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// How many times [`write_discovery`] tries the rename into place.
+const RENAME_ATTEMPTS: u32 = 20;
+
+/// The pause between rename attempts.
+const RENAME_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Rename `temp` over `target`, retrying a failure for up to ~0.5 s. On
+/// Windows a rename over a file another process holds open fails with a
+/// sharing violation — and a CLI command waiting for an auto-started host
+/// reads `control.json` every 50 ms, so the host's first write can collide
+/// with that read. Elsewhere the first attempt succeeds.
+fn rename_with_retry(temp: &Path, target: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::rename(temp, target) {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt >= RENAME_ATTEMPTS => return Err(err),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(RENAME_RETRY_PAUSE);
+            }
+        }
+    }
 }
 
 /// Read the discovery file. `Err` when it is absent, unreadable or not a
@@ -203,6 +228,15 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "control.json is owner-only");
         }
+    }
+
+    #[test]
+    fn a_rename_that_keeps_failing_gives_up_with_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A missing source fails every attempt: the last error comes back.
+        let err =
+            rename_with_retry(&dir.path().join("absent"), &dir.path().join("target")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

@@ -82,10 +82,16 @@ pub fn run_hekma_agent_with_env(
 }
 
 /// The pid of the Service Host serving `state_dir` (from its `control.json`),
-/// when one is recorded (story 21-4).
+/// when one is recorded AND that process is alive (story 21-4). A host ended
+/// hard — `taskkill /F` on Windows, a crash — never removes its file, and the
+/// CLI treats such a stale file as no host (its endpoint refuses), so this
+/// helper does too.
 #[allow(dead_code)]
 pub fn host_pid(state_dir: &Path) -> Option<u32> {
-    hekma_host::read_discovery(state_dir).ok().map(|d| d.pid)
+    hekma_host::read_discovery(state_dir)
+        .ok()
+        .map(|d| d.pid)
+        .filter(|pid| process_alive(*pid))
 }
 
 /// The pid of the Service Host serving `state_dir`, or a panic naming `what`
