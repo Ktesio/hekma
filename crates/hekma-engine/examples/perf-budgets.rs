@@ -3311,7 +3311,7 @@ fn measure_steady_state(config: &HarnessConfig) -> SteadyMeasurements {
 /// subscriber-overhead addendum passes ONE window.
 fn measure_steady_windows(config: &HarnessConfig, window_count: usize) -> SteadyMeasurements {
     let pid = Pid::from_u32(std::process::id());
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo system handle");
     let mut windows = Vec::with_capacity(window_count);
     for window_index in 0..window_count {
         if window_index > 0 {
@@ -3872,7 +3872,7 @@ fn on_github_runner() -> bool {
 
 /// The host CPU's brand string, for the report's environment block.
 fn host_cpu_model() -> String {
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo system handle");
     sys.refresh_cpu_all();
     sys.cpus()
         .first()
@@ -3883,7 +3883,7 @@ fn host_cpu_model() -> String {
 
 /// The host's logical core count, for the report's environment block.
 fn host_logical_cores() -> usize {
-    let mut sys = System::new();
+    let mut sys = System::new().expect("sysinfo system handle");
     sys.refresh_cpu_all();
     sys.cpus().len()
 }
