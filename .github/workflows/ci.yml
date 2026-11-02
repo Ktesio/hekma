@@ -119,6 +119,7 @@ jobs:
           - os: macos-latest
             nextest_profile: default
           - os: windows-latest
+            test_job_timeout_minutes: 65
             nextest_profile: parallel-heavy
     runs-on: ${{ matrix.os }}
     # ubuntu is a genuine 2-core runner and Windows' bundled-SQLite/tokio first
@@ -158,6 +159,20 @@ jobs:
     # fast visible cancel rather than a silent three-quarter-hour burn; it
     # stays strictly under the 30m in-step supervisor cap, preserving the
     # class-1 quarantine's role.
+    # WINDOWS RECALIBRATED 50→65 (2026-11-02, tracking #370): two
+    # consecutive scheduled runs hit the 50m default mid-suite under a
+    # uniform ~3x runner degradation (runs 40509909814/40701814207,
+    # killed at 50m07s/50m20s with SLOW-marker gaps of 11-13m between
+    # test completions across unrelated crates — starvation, not one
+    # wedged test; green legs run 12-16m since the parallel-heavy
+    # profile + the pinned nextest install), and the job-timeout cancel
+    # took the whole scheduled run down with coverage skipped
+    # (needs: test) — no CI verdict at all those days. The windows leg
+    # carries its own 65-minute job-timeout override as matrix data
+    # (~4x normal headroom, ubuntu's 25m mechanism): a degraded-but-progressing
+    # run completes instead of cancelling, while a genuinely dead leg
+    # still surfaces as a visible cancel. macOS keeps the 50 default
+    # (no degradation events observed).
     timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}
     steps:
       - name: Checkout

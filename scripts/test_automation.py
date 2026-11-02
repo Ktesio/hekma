@@ -602,7 +602,10 @@ class ReleaseDocsTests(unittest.TestCase):
         # mid-run. 50 keeps cold-cache headroom; ubuntu rides 25m via the
         # matrix include above (recalibrated from 15m on 2026-10-31 — green
         # runs had reached 653–818s of job time and run 41193980277 capped
-        # out at 15m mid-suite with a healthy runner).
+        # out at 15m mid-suite with a healthy runner). Windows rides 65m
+        # via the same include (recalibrated from the 50 default on
+        # 2026-11-02, tracking #370 — pinned in the windows-profile test
+        # below with the measured history).
         self.assertIn(
             "timeout-minutes: ${{ matrix.test_job_timeout_minutes || 50 }}", ci
         )
@@ -665,6 +668,23 @@ class ReleaseDocsTests(unittest.TestCase):
         self.assertIn("nextest_profile: parallel-heavy", ci)
         self.assertEqual(ci.count("nextest_profile: parallel-heavy"), 1)
         self.assertIn('PROFILE="${{ matrix.nextest_profile }}"', ci)
+        # Job-timeout recalibration (2026-11-02, tracking #370): two
+        # consecutive scheduled runs (40509909814/40701814207, Oct 27/28)
+        # hit the 50m default mid-suite under a uniform ~3x runner
+        # degradation — SLOW-marker gaps of 11-13m between completions
+        # across unrelated crates (starvation, not one wedged test), the
+        # same four heavyweight tests the only ones crossing 60s in both
+        # runs — while green legs run 12-16m since the parallel-heavy
+        # profile + the pinned nextest install. The cancel killed the
+        # whole scheduled run and skipped coverage (needs: test), leaving
+        # no CI verdict those days. The leg now carries
+        # `test_job_timeout_minutes: 65` as matrix data (~4x normal
+        # headroom, ubuntu's 25m mechanism): a degraded-but-progressing
+        # run completes, a dead leg still cancels visibly. Exactly the
+        # two per-leg overrides exist (ubuntu + windows) — macOS keeps
+        # the 50 default (no degradation events observed).
+        self.assertIn("test_job_timeout_minutes: 65", ci)
+        self.assertEqual(ci.count("test_job_timeout_minutes:"), 2)
         # The run step stays ONE uniform invocation for all OSes: both the
         # capped and uncapped paths read the same matrix var, and no step
         # branches on matrix.os (the bisect-era guards above).
