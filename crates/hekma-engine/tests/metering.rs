@@ -391,28 +391,26 @@ fn a_never_metered_instance_reports_zero_not_absent() {
 #[test]
 fn only_the_commit_choke_point_writes_the_usage_ledger() {
     // AC8 / AD-7 single-writer invariant (Task 8 audit guard): NO code path other
-    // than the supervisor's ONE ingestion→commit choke point may write the Usage
-    // Ledger. A grep-style source guard over the engine `src/` proves that every
-    // CALL to `record_usage_event(` (excluding its trait declaration, the SQLite
-    // impl `fn record_usage_event`, and the Registry pass-through that funnels to
-    // the store) lives ONLY in `domain/supervisor/usage.rs`. If a future change scatters a
-    // second writer, this fails — the exact invariant story 3-2's enforcement relies
-    // on. Pure source scan (no OS cfg); runs on every OS.
+    // than the ONE ingestion→commit choke point may write the Usage Ledger. Since
+    // the store writer (story 21-1) that choke point is the pipeline job
+    // (`domain/pipeline.rs`, run inside the writer's transaction); the store
+    // module defines the insert and the frozen `StateStore::record_usage_event`
+    // delegates to it. A grep-style source guard over the engine `src/` proves
+    // every CALL to `insert_usage(` or `record_usage_event(` (definitions and
+    // comments excluded) lives only there. If a future change scatters a second
+    // writer, this fails. Pure source scan (no OS cfg); runs on every OS.
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut writer_files = std::collections::BTreeSet::new();
     visit_rs(&src, &mut |path, text| {
         for line in text.lines() {
             let trimmed = line.trim_start();
-            // Skip declarations / definitions / doc comments — we only care about
-            // actual invocations of the method as a WRITE.
             if trimmed.starts_with("//")
-                || trimmed.starts_with("///")
-                || trimmed.starts_with("fn record_usage_event")
                 || trimmed.contains("fn record_usage_event(")
+                || trimmed.contains("fn insert_usage(")
             {
                 continue;
             }
-            if line.contains("record_usage_event(") {
+            if line.contains("record_usage_event(") || line.contains("insert_usage(") {
                 writer_files.insert(
                     path.strip_prefix(&src)
                         .unwrap_or(path)
@@ -422,27 +420,18 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
             }
         }
     });
-    // The ONLY files that may CALL record_usage_event: the supervisor choke point,
-    // and the Registry pass-through (which the choke point calls; it is not an
-    // independent writer — it just forwards to the store in one place). The store
-    // impl + the port trait are excluded above (they DEFINE the method).
-    let allowed: std::collections::BTreeSet<String> = [
-        "domain/supervisor/usage.rs",
-        "domain/registry.rs",
-        "store/sqlite.rs",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    let allowed: std::collections::BTreeSet<String> = ["domain/pipeline.rs", "store/sqlite.rs"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let violations: Vec<&String> = writer_files.difference(&allowed).collect();
     assert!(
         violations.is_empty(),
-        "record_usage_event is called outside the allowed ledger-commit path: {violations:?}"
+        "the Usage Ledger is written outside the pipeline job: {violations:?}"
     );
-    // And it MUST be present in the supervisor (the choke point exists).
     assert!(
-        writer_files.contains("domain/supervisor/usage.rs"),
-        "the commit choke point must call record_usage_event; callers found: {writer_files:?}"
+        writer_files.contains("domain/pipeline.rs"),
+        "the pipeline job must commit the usage row; callers found: {writer_files:?}"
     );
 }
 

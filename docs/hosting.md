@@ -136,7 +136,8 @@ does not.
 Point `--state-dir` (or the `HEKMA_STATE_DIR` environment variable) at a
 mounted volume. Everything durable lives there: the single-writer lock
 (`host.lock`), the secrets file, the state database, the per-agent log
-families, and the outbox pair (`outbox.jsonl` + `outbox-ack.json`). Nothing of
+families (whose event logs are human-readable mirrors of the database), and the
+export outbox inside the database. Nothing of
 consequence stays behind on the platform default.
 
 Use a **local or block-backed volume**. The single-writer lock is a kernel

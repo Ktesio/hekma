@@ -20,11 +20,12 @@ use hekma_adapter_api::{
 
 use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
 use crate::paths::EnginePaths;
+use crate::ports::RunStore;
 use crate::ports::{
     CompositeSecretResolver, GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus,
     SecretError, SpawnRecord, StateStore, StoreError,
 };
-use crate::store::SqliteStore;
+use crate::store::{LegacyLogs, LegacyOutbox, LegacySource, SqliteStore, StoreWriter};
 use crate::time::now_rfc3339;
 
 use super::budget::BreachAction;
@@ -255,7 +256,14 @@ pub enum RemoveDisposition {
 /// one with [`Registry::open`]; each call is self-contained.
 pub struct Registry {
     paths: EnginePaths,
+    /// The READ-ONLY connection (story 21-1, AD-27): every read the registry
+    /// and the supervisor do. SQLite refuses a write on it (`query_only`).
     store: SqliteStore,
+    /// The store writer: the only state.db writer in this engine process.
+    writer: StoreWriter,
+    /// Import notes from a v12 upgrade on this open, drained once by the
+    /// engine onto its diagnostic surface.
+    open_notes: std::sync::Mutex<Vec<String>>,
 }
 
 impl Registry {
@@ -295,8 +303,89 @@ impl Registry {
         // Create the state base (and thus its parent chain) before opening the
         // DB — a fresh install has no directory yet (AC1 "fresh state").
         ensure_dir(paths.state_base(), "<state-dir>")?;
-        let store = SqliteStore::open(&paths.state_db())?;
-        Ok(Self { paths, store })
+        // Story 21-1: the writer opens (and migrates) FIRST, importing the
+        // pre-v12 event files once; then the read-only connection opens on
+        // the migrated database.
+        let legacy = LegacyFiles { paths: &paths };
+        let (write_store, notes) = SqliteStore::open_with_legacy(&paths.state_db(), &legacy)
+            .map_err(|err| match err {
+                StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
+                    RegistryError::OutboxOpenRefused { detail }
+                }
+                other => RegistryError::Store(other),
+            })?;
+        legacy.retire_outbox_files();
+        let writer = StoreWriter::spawn(write_store)?;
+        let store = SqliteStore::open_read_only(&paths.state_db())?;
+        Ok(Self {
+            paths,
+            store,
+            writer,
+            open_notes: std::sync::Mutex::new(notes),
+        })
+    }
+
+    /// Run `work` on the store writer and wait for its commit (story 21-1).
+    fn write<R: Send + 'static>(
+        &self,
+        work: impl FnOnce(&SqliteStore) -> Result<R, StoreError> + Send + 'static,
+    ) -> Result<R, StoreError> {
+        self.writer.call(move |ctx| work(ctx.store()))
+    }
+
+    /// The store writer, for the supervisor's pipeline and transition jobs.
+    pub(crate) fn writer(&self) -> &StoreWriter {
+        &self.writer
+    }
+
+    /// The read-only store, for the Run-scale reads ([`RunStore`]).
+    pub(crate) fn reader(&self) -> &SqliteStore {
+        &self.store
+    }
+
+    /// Every transition event recorded for an instance, in commit order
+    /// (story 21-1: read from `transition_events`, keyset-paged).
+    pub(crate) fn transition_events(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Vec<super::event::TransitionEvent>, RegistryError> {
+        let mut events = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self
+                .store
+                .transitions_page(name, after, crate::ports::PAGE_MAX)?;
+            events.extend(page.items);
+            match page.next {
+                Some(next) => after = next,
+                None => return Ok(events),
+            }
+        }
+    }
+
+    /// Every breach event recorded for an instance, in commit order (story
+    /// 21-1: read from `breach_events`, keyset-paged).
+    pub(crate) fn breach_events(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Vec<super::event::BudgetBreachEvent>, RegistryError> {
+        let mut events = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self
+                .store
+                .breaches_page(name, after, crate::ports::PAGE_MAX)?;
+            events.extend(page.items);
+            match page.next {
+                Some(next) => after = next,
+                None => return Ok(events),
+            }
+        }
+    }
+
+    /// Take the v12 import notes (empty after the first call).
+    pub(crate) fn take_open_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.open_notes.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// The engine-computed Agent Home path for `name` (path authority helper
@@ -367,10 +456,12 @@ impl Registry {
         };
 
         // (3) Insert the row. Duplicate -> DuplicateName, nothing on disk yet.
-        self.store.create_instance(&instance).map_err(|e| match e {
-            StoreError::DuplicateName { name } => RegistryError::DuplicateName { name },
-            other => RegistryError::Store(other),
-        })?;
+        let row = instance.clone();
+        self.write(move |store| store.create_instance(&row))
+            .map_err(|e| match e {
+                StoreError::DuplicateName { name } => RegistryError::DuplicateName { name },
+                other => RegistryError::Store(other),
+            })?;
 
         // (4) Create the Agent Home + config + adapter snapshot; (5) roll back
         // on failure.
@@ -381,7 +472,10 @@ impl Registry {
             // breaking the atomicity contract, so we surface that distinctly
             // (naming the orphaned row + remediation, NFR-1). The partial
             // directory cleanup is best-effort.
-            if let Err(rollback_err) = self.store.delete_instance(&name) {
+            let rollback_name = name.clone();
+            if let Err(rollback_err) =
+                self.write(move |store| store.delete_instance(&rollback_name))
+            {
                 let _ = std::fs::remove_dir_all(&home);
                 return Err(RegistryError::RegisterOrphanRow {
                     name: name.as_str().to_string(),
@@ -572,7 +666,8 @@ impl Registry {
         }
 
         // Always delete the row first.
-        self.store.delete_instance(&name)?;
+        let row = name.clone();
+        self.write(move |store| store.delete_instance(&row))?;
 
         // Then handle the Agent Home per disposition.
         if disposition == RemoveDisposition::Delete {
@@ -684,9 +779,11 @@ impl Registry {
         // (4) THE TRANSACTION: guard + conflict/idempotence + row write in
         // one BEGIN IMMEDIATE (story 15-6). Every refusal inside rolls back
         // with the row byte-unchanged.
-        self.store
-            .attach_memory_backing_txn(&name, kind, TERMINAL_MEMORY_BACKING_STATES)
-            .map_err(memory_store_error)?;
+        let row = name.clone();
+        self.write(move |store| {
+            store.attach_memory_backing_txn(&row, kind, TERMINAL_MEMORY_BACKING_STATES)
+        })
+        .map_err(memory_store_error)?;
 
         // (5) The managed directory, created only after the row commits
         // (idempotent + self-healing; the symlink refusal re-fires here for
@@ -732,31 +829,12 @@ impl Registry {
         })?;
         let instance = self.lookup(&name)?;
         ensure_terminal_for_memory_backing(&name, &instance.state)?;
-        self.store
-            .detach_memory_backing_txn(&name, TERMINAL_MEMORY_BACKING_STATES)
-            .map_err(memory_store_error)?;
+        let row = name.clone();
+        self.write(move |store| {
+            store.detach_memory_backing_txn(&row, TERMINAL_MEMORY_BACKING_STATES)
+        })
+        .map_err(memory_store_error)?;
         Ok(())
-    }
-
-    /// Persist a lifecycle transition and snapshot the memory backing in ONE
-    /// store transaction (story 15-6) — the supervisor's `→ starting`
-    /// transition's new shape. The store refuses (typed, transaction rolled
-    /// back) when another process moved the instance's state or its backing
-    /// row between this start's pre-check reads and the transition; see
-    /// [`StateStore::set_state_snapshotting_memory_backing`].
-    pub(crate) fn set_state_snapshotting_memory_backing(
-        &self,
-        name: &InstanceName,
-        expected_prior: LifecycleState,
-        new_state: LifecycleState,
-        expected_backing: Option<MemoryBacking>,
-    ) -> Result<Option<MemoryBacking>, RegistryError> {
-        Ok(self.store.set_state_snapshotting_memory_backing(
-            name,
-            expected_prior,
-            new_state,
-            expected_backing,
-        )?)
     }
 
     /// Read the instance's Memory Backing through the public API (story 5-1,
@@ -838,30 +916,14 @@ impl Registry {
 
     /// Persist a Lifecycle State change (supervisor transition). Bumps
     /// `updated_at` in the store.
+    #[cfg(test)]
     pub(crate) fn set_state(
         &self,
         name: &InstanceName,
         state: LifecycleState,
     ) -> Result<(), RegistryError> {
-        self.store.set_state(name, state)?;
-        Ok(())
-    }
-
-    /// Persist a Lifecycle State change CONDITIONALLY (story 18-2 review
-    /// round 1, P3): the guarded liveness expiry's commit. The write commits
-    /// only when the persisted state still equals `expected_prior`; a
-    /// concurrent transition refuses typed
-    /// ([`StoreError::StateConflict`] → [`RegistryError::Store`]) with
-    /// nothing persisted. The reaper declines to fail the instance on that
-    /// refusal (the state moved — someone else is driving).
-    pub(crate) fn set_state_if_prior(
-        &self,
-        name: &InstanceName,
-        expected_prior: LifecycleState,
-        new_state: LifecycleState,
-    ) -> Result<(), RegistryError> {
-        self.store
-            .set_state_if_prior(name, expected_prior, new_state)?;
+        let row = name.clone();
+        self.write(move |store| store.set_state(&row, state))?;
         Ok(())
     }
 
@@ -933,15 +995,45 @@ impl Registry {
 
     /// Commit a write-ahead spawn record (AD-5) — one transaction. Called by the
     /// supervisor between `spawn` and declaring the instance `running`.
+    #[cfg(test)]
     pub(crate) fn write_spawn_record(&self, record: &SpawnRecord) -> Result<(), RegistryError> {
-        self.store.upsert_spawn_record(record)?;
+        let record = record.clone();
+        self.write(move |store| store.upsert_spawn_record(&record))?;
         Ok(())
     }
 
     /// Clear an instance's write-ahead spawn record (a clean stop, so it is not
     /// later adopted/failed as an orphan). Idempotent.
+    /// Commit a fresh spawn's write-ahead record AND bump the instance's
+    /// launch generation in one writer job (story 21-1): the generation names
+    /// this launch in every usage row's dedup key. Returns the new generation.
+    pub(crate) fn write_spawn_record_new_launch(
+        &self,
+        record: &SpawnRecord,
+    ) -> Result<u64, RegistryError> {
+        let record = record.clone();
+        Ok(self.write(move |store| {
+            store.upsert_spawn_record(&record)?;
+            store.bump_launch_generation(&record.name)
+        })?)
+    }
+
+    /// Bump the instance's launch generation (story 21-1: an adoption is a
+    /// new attach, so an engine-minted sequence that restarts never collides
+    /// with the previous attach's rows). Returns the new generation.
+    pub(crate) fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, RegistryError> {
+        let row = name.clone();
+        Ok(self.write(move |store| store.bump_launch_generation(&row))?)
+    }
+
+    /// The instance's current launch generation (0 before its first launch).
+    pub(crate) fn launch_generation(&self, name: &InstanceName) -> Result<u64, RegistryError> {
+        Ok(self.store.launch_generation(name)?)
+    }
+
     pub(crate) fn clear_spawn_record(&self, name: &InstanceName) -> Result<(), RegistryError> {
-        self.store.clear_spawn_record(name)?;
+        let row = name.clone();
+        self.write(move |store| store.clear_spawn_record(&row))?;
         Ok(())
     }
 
@@ -953,7 +1045,9 @@ impl Registry {
         name: &InstanceName,
         session_id: Option<&str>,
     ) -> Result<(), RegistryError> {
-        self.store.set_acp_session_id(name, session_id)?;
+        let row = name.clone();
+        let session_id = session_id.map(str::to_string);
+        self.write(move |store| store.set_acp_session_id(&row, session_id.as_deref()))?;
         Ok(())
     }
 
@@ -968,7 +1062,8 @@ impl Registry {
         run_id: &crate::domain::RunId,
         fingerprint: &crate::ports::ProcessFingerprint,
     ) -> Result<(), RegistryError> {
-        self.store.set_spawn_run_id(name, run_id, fingerprint)?;
+        let (row, run_id, fingerprint) = (name.clone(), run_id.clone(), *fingerprint);
+        self.write(move |store| store.set_spawn_run_id(&row, &run_id, &fingerprint))?;
         Ok(())
     }
 
@@ -984,9 +1079,8 @@ impl Registry {
         expected: Option<crate::ports::ProcessFingerprint>,
         leaseholder: crate::ports::ProcessFingerprint,
     ) -> Result<bool, RegistryError> {
-        Ok(self
-            .store
-            .try_acquire_adoption_lease(name, expected, leaseholder)?)
+        let row = name.clone();
+        Ok(self.write(move |store| store.try_acquire_adoption_lease(&row, expected, leaseholder))?)
     }
 
     /// Settle the write-ahead spawn record (story 14-2): clear it while
@@ -994,7 +1088,8 @@ impl Registry {
     /// next start can offer it back via `session/load`. Returns whether an id
     /// was retained. Idempotent.
     pub(crate) fn settle_spawn_record(&self, name: &InstanceName) -> Result<bool, RegistryError> {
-        Ok(self.store.settle_spawn_record(name)?)
+        let row = name.clone();
+        Ok(self.write(move |store| store.settle_spawn_record(&row))?)
     }
 
     /// Read an instance's write-ahead spawn record, or `None` if absent.
@@ -1019,8 +1114,9 @@ impl Registry {
         restart_count: u32,
         last_known_cause: Option<&str>,
     ) -> Result<(), RegistryError> {
-        self.store
-            .set_restart_count(name, restart_count, last_known_cause)?;
+        let row = name.clone();
+        let cause = last_known_cause.map(str::to_string);
+        self.write(move |store| store.set_restart_count(&row, restart_count, cause.as_deref()))?;
         Ok(())
     }
 
@@ -1033,7 +1129,8 @@ impl Registry {
         name: &InstanceName,
         policy: RestartPolicy,
     ) -> Result<(), RegistryError> {
-        self.store.set_restart_policy(name, policy)?;
+        let row = name.clone();
+        self.write(move |store| store.set_restart_policy(&row, policy))?;
         Ok(())
     }
 
@@ -1581,22 +1678,6 @@ impl Registry {
             .join(format!("output.log.{generation}"))
     }
 
-    /// The engine-GLOBAL outbox journal FILE (story 17-4, the AD-14
-    /// amendment) — the append-only JSON-Lines journal at the STATE BASE (not
-    /// per-Agent-Home: the whole point is the cross-instance global order).
-    /// The engine is the SOLE writer, at the three family commit sites under
-    /// the supervisor lock; Hosts read it only through `Engine::export_events`.
-    pub(crate) fn outbox_journal_path(&self) -> std::path::PathBuf {
-        self.paths.outbox_journal()
-    }
-
-    /// The outbox's durable consumer-cursor FILE (story 17-4) — the
-    /// atomically-written ack record beside the journal. Written only through
-    /// the export-ack path.
-    pub(crate) fn outbox_ack_path(&self) -> std::path::PathBuf {
-        self.paths.outbox_ack()
-    }
-
     /// Count Usage Ledger events for an instance (Epic 1's empty-ledger proof;
     /// story 3-1 populates the table so this returns a real count).
     pub fn usage_event_count(&self, name: &InstanceName) -> Result<u64, RegistryError> {
@@ -1609,28 +1690,6 @@ impl Registry {
     // pattern as `set_state` → `store.set_state`). The commit choke point in the
     // supervisor is the SOLE caller of `record_usage_event` (the AD-7 single-writer
     // invariant); the Fleet read is the sole caller of the total reads.
-
-    /// Append ONE [`UsageEvent`] to the Usage Ledger in its own transaction (AD-6),
-    /// returning whether it was inserted or was a recognized replay (AC-A dedup).
-    /// The supervisor's ingestion choke point is the only caller.
-    pub(crate) fn record_usage_event(
-        &self,
-        event: &crate::domain::UsageEvent,
-        rate: Option<crate::domain::Rate>,
-    ) -> Result<crate::domain::RecordOutcome, RegistryError> {
-        Ok(self.store.record_usage_event(event, rate)?)
-    }
-
-    /// The committed [`UsageEvent`] ROWS for an instance in commit order
-    /// (story 10-3: the resync helper's ledger read) — one struct per
-    /// `usage_events` row, `rowid`-ordered (insertion order). An absent
-    /// instance / empty ledger reads as an empty vec.
-    pub(crate) fn usage_rows(
-        &self,
-        name: &InstanceName,
-    ) -> Result<Vec<crate::domain::UsageEvent>, RegistryError> {
-        Ok(self.store.usage_events(name)?)
-    }
 
     /// The CUMULATIVE token totals for an instance (sum over all its Runs) — the
     /// Fleet-detail `usage` read (AC-C/AC11). An absent instance totals zero.
@@ -1676,7 +1735,8 @@ impl Registry {
     /// supervision core (which does not exist until story 1.4).
     #[cfg(test)]
     pub(crate) fn seed_instance(&self, instance: &AgentInstance) -> Result<(), RegistryError> {
-        self.store.create_instance(instance)?;
+        let row = instance.clone();
+        self.write(move |store| store.create_instance(&row))?;
         Ok(())
     }
 
@@ -1713,6 +1773,110 @@ impl Registry {
 }
 
 /// Create `dir` (and parents) if absent, mapping failures to [`RegistryError::Io`].
+/// The pre-v12 event files the v12 upgrade imports once (story 21-1, D1):
+/// each instance's `instance.log` and `breaches.log`, and the global outbox
+/// journal plus its ack file. Read tolerantly: a line that does not parse is
+/// skipped and named in a note (the file itself stays in place as the
+/// mirror), never a refused open — except the outbox, whose seqs must not be
+/// minted from an unverified journal (17-4).
+struct LegacyFiles<'a> {
+    paths: &'a EnginePaths,
+}
+
+impl LegacyFiles<'_> {
+    fn log_path(&self, instance: &str, file: &str) -> Option<std::path::PathBuf> {
+        let name = InstanceName::new(instance).ok()?;
+        Some(self.paths.agent_home(&name).join("logs").join(file))
+    }
+
+    fn read_lines<T: serde::de::DeserializeOwned>(
+        &self,
+        instance: &str,
+        file: &str,
+    ) -> LegacyLogs<T> {
+        let mut logs = LegacyLogs {
+            records: Vec::new(),
+            notes: Vec::new(),
+        };
+        let Some(path) = self.log_path(instance, file) else {
+            return logs;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return logs,
+            Err(e) => {
+                logs.notes.push(format!(
+                    "{instance}: the upgrade could not read {} ({e}); its records were not \
+                     imported into state.db, and the file is left in place",
+                    path.display()
+                ));
+                return logs;
+            }
+        };
+        let mut skipped = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<T>(line) {
+                Ok(record) => logs.records.push(record),
+                Err(_) => skipped.push(index + 1),
+            }
+        }
+        if !skipped.is_empty() {
+            logs.notes.push(format!(
+                "{instance}: the upgrade skipped {} unreadable line(s) of {} (line {}) while \
+                 importing it into state.db — a torn crash tail or corruption; the file is \
+                 left in place",
+                skipped.len(),
+                path.display(),
+                skipped
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+        logs
+    }
+
+    /// After the v12 step committed, rename the imported outbox files to
+    /// `*.migrated` so nothing reads or appends them again. Best-effort: a
+    /// file left behind is never read by this engine.
+    fn retire_outbox_files(&self) {
+        for path in [self.paths.outbox_journal(), self.paths.outbox_ack()] {
+            if path.exists() {
+                let mut migrated = path.clone().into_os_string();
+                migrated.push(".migrated");
+                // Never overwrite the first backup (an older engine still
+                // running may recreate the file after the upgrade).
+                if !std::path::Path::new(&migrated).exists() {
+                    let _ = std::fs::rename(&path, migrated);
+                }
+            }
+        }
+    }
+}
+
+impl LegacySource for LegacyFiles<'_> {
+    fn transitions(&self, instance: &str) -> LegacyLogs<super::event::TransitionEvent> {
+        self.read_lines(instance, "instance.log")
+    }
+
+    fn breaches(&self, instance: &str) -> LegacyLogs<super::event::BudgetBreachEvent> {
+        self.read_lines(instance, "breaches.log")
+    }
+
+    fn outbox(&self) -> Result<LegacyOutbox, String> {
+        let view = super::outbox::read_journal_tolerant(&self.paths.outbox_journal())?;
+        let ack = super::outbox::read_ack(&self.paths.outbox_ack())?;
+        Ok(LegacyOutbox {
+            entries: view.entries,
+            ack,
+        })
+    }
+}
+
 fn ensure_dir(dir: &Path, name: &str) -> Result<(), RegistryError> {
     std::fs::create_dir_all(dir).map_err(|source| RegistryError::Io {
         name: name.to_string(),
@@ -2222,7 +2386,11 @@ mod tests {
         let agents = reg.paths().agents_dir();
         std::fs::write(&agents, b"not a dir").unwrap();
         // (b) make the compensating delete fail deterministically.
-        reg.store.break_deletes_for_test();
+        reg.write(|store| {
+            store.break_deletes_for_test();
+            Ok(())
+        })
+        .unwrap();
 
         let err = reg.register("demo", "mock").unwrap_err();
         match err {
@@ -3481,7 +3649,11 @@ source = "self-reported"
         let (_tmp, reg) = open_temp();
         reg.register("demo", "mock").unwrap();
         let name = InstanceName::new("demo").unwrap();
-        reg.store.break_instance_reads_for_test();
+        reg.write(|store| {
+            store.break_instance_reads_for_test();
+            Ok(())
+        })
+        .unwrap();
 
         assert!(matches!(
             reg.effective_config(&name, ConfigLayer::empty()).unwrap_err(),
@@ -4082,5 +4254,202 @@ source = "self-reported"
             .unwrap();
         let status = reg.memory_status("m").unwrap().unwrap();
         assert!(!status.declared, "no declared target ⇒ not delivered");
+    }
+
+    // ---- Story 21-1: the one-time v12 import of the legacy event files ----
+
+    fn legacy_state_dir() -> (TempDir, EnginePaths) {
+        use crate::domain::{
+            BreachAction, BreachScope, BudgetBreachEvent, EngineEvent, OutboxEntry,
+            TransitionCause, TransitionEvent, OUTBOX_SCHEMA_VERSION,
+        };
+        let tmp = TempDir::new().unwrap();
+        let paths = EnginePaths::new(Some(tmp.path().to_path_buf())).unwrap();
+        std::fs::create_dir_all(paths.state_base()).unwrap();
+        let name = InstanceName::new("legacy").unwrap();
+        let home = paths.agent_home(&name);
+        let conn = crate::store::create_v11_for_test(&paths.state_db());
+        conn.execute(
+            "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) \
+             VALUES ('legacy', 'mock', 'running', ?1, '2026-10-30T00:00:00Z', '2026-10-30T00:00:00Z')",
+            [home.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, run_id) \
+             VALUES (1, 4242, 77, 'never', 'run-live')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let logs = home.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let transition = |prior, new, at: &str| {
+            TransitionEvent::new("legacy", prior, new, TransitionCause::AdapterReady, at)
+        };
+        let t1 = transition(
+            LifecycleState::Registered,
+            LifecycleState::Starting,
+            "2026-10-30T00:00:01Z",
+        );
+        let t2 = transition(
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            "2026-10-30T00:00:02Z",
+        );
+        std::fs::write(
+            logs.join("instance.log"),
+            format!(
+                "{}\n{}\n{{\"schema_version\":1,\"inst",
+                serde_json::to_string(&t1).unwrap(),
+                serde_json::to_string(&t2).unwrap()
+            ),
+        )
+        .unwrap();
+        let breach = |run: &str| {
+            BudgetBreachEvent::new(
+                "legacy",
+                run,
+                BreachScope::PerRun,
+                100,
+                120,
+                BreachAction::Pause,
+                "self-reported",
+                "2026-10-30T00:00:03Z",
+            )
+        };
+        std::fs::write(
+            logs.join("breaches.log"),
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&breach("run-old")).unwrap(),
+                serde_json::to_string(&breach("run-live")).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut journal = String::new();
+        for seq in 5..=7u64 {
+            let entry = OutboxEntry {
+                schema_version: OUTBOX_SCHEMA_VERSION,
+                seq,
+                event: EngineEvent::Transition(t1.clone()),
+            };
+            journal.push_str(&serde_json::to_string(&entry).unwrap());
+            journal.push('\n');
+        }
+        std::fs::write(paths.outbox_journal(), journal).unwrap();
+        std::fs::write(paths.outbox_ack(), "{\"schema_version\":1,\"seq\":6}\n").unwrap();
+        (tmp, paths)
+    }
+
+    #[test]
+    fn the_v12_upgrade_imports_the_legacy_event_files_once() {
+        use crate::domain::{BreachAction, BreachDimension, BreachScope, EngineEvent, LatchKey};
+        let (tmp, paths) = legacy_state_dir();
+        let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
+        let name = InstanceName::new("legacy").unwrap();
+
+        // Transitions and breaches, in file order; the torn tail is named.
+        let transitions = reg.transition_events(&name).unwrap();
+        assert_eq!(transitions.len(), 2);
+        assert_eq!(transitions[1].new_state, LifecycleState::Running);
+        let breaches = reg.breach_events(&name).unwrap();
+        let runs: Vec<&str> = breaches.iter().map(|b| b.run_id.as_str()).collect();
+        assert_eq!(runs, vec!["run-old", "run-live"]);
+        let notes = reg.take_open_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("skipped 1 unreadable line(s)")),
+            "{notes:?}"
+        );
+        assert!(reg.take_open_notes().is_empty(), "the notes drain once");
+
+        // The latch is seeded for the live instance's CURRENT run only.
+        let latched = |run: &str| {
+            reg.reader()
+                .latches(&crate::domain::RunId::from_wire(run))
+                .unwrap()
+        };
+        assert_eq!(
+            latched("run-live"),
+            vec![(
+                LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun),
+                BreachAction::Pause
+            )]
+        );
+        assert!(latched("run-old").is_empty());
+
+        // The outbox: seqs and the ack carry over; the next seq continues.
+        let batch = crate::domain::export_core(&reg, None, 0).unwrap();
+        let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![7],
+            "the default pull resumes after the imported ack"
+        );
+        assert_eq!(batch.retained_from, 5);
+        let event = batch.events[0].event.clone();
+        let next = reg
+            .writer()
+            .call(move |ctx| {
+                ctx.store()
+                    .append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES)
+            })
+            .unwrap();
+        assert_eq!(next.seq, 8);
+        assert!(matches!(batch.events[0].event, EngineEvent::Transition(_)));
+
+        // The journal pair is retired; the log files stay as mirrors.
+        assert!(!paths.outbox_journal().exists());
+        assert!(tmp.path().join("outbox.jsonl.migrated").exists());
+        assert!(tmp.path().join("outbox-ack.json.migrated").exists());
+        assert!(reg.instance_log_path(&name).exists());
+
+        // A reopen imports nothing again.
+        drop(reg);
+        let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
+        assert_eq!(reg.transition_events(&name).unwrap().len(), 2);
+        assert_eq!(reg.breach_events(&name).unwrap().len(), 2);
+        assert!(reg.take_open_notes().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_legacy_journal_refuses_the_open_and_leaves_v11() {
+        let (tmp, paths) = legacy_state_dir();
+        std::fs::write(paths.outbox_journal(), "{\"seq\":\"not a record\"}\n").unwrap();
+        let err = match Registry::open(Some(tmp.path().to_path_buf())) {
+            Err(err) => err,
+            Ok(_) => panic!("an unverifiable journal must refuse the open"),
+        };
+        assert!(
+            matches!(err, RegistryError::OutboxOpenRefused { .. }),
+            "{err:?}"
+        );
+        let conn = rusqlite::Connection::open(paths.state_db()).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11, "nothing of the v12 step committed");
+        assert!(paths.outbox_journal().exists(), "the journal is untouched");
+    }
+
+    #[test]
+    fn an_unreadable_legacy_log_is_named_and_the_upgrade_still_opens() {
+        let (tmp, paths) = legacy_state_dir();
+        let name = InstanceName::new("legacy").unwrap();
+        let breaches = paths.agent_home(&name).join("logs").join("breaches.log");
+        std::fs::remove_file(&breaches).unwrap();
+        std::fs::create_dir(&breaches).unwrap();
+        let reg = Registry::open(Some(tmp.path().to_path_buf())).unwrap();
+        let notes = reg.take_open_notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("could not read") && n.contains("breaches.log")),
+            "{notes:?}"
+        );
+        assert!(reg.breach_events(&name).unwrap().is_empty());
+        assert_eq!(reg.transition_events(&name).unwrap().len(), 2);
     }
 }
