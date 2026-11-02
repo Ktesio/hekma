@@ -643,7 +643,7 @@ fn start_prints_the_service_host_notice_to_stderr_only() {
     assert!(run.success, "start should exit 0; stderr={}", run.stderr);
     // stdout result line is unchanged (still shows `running`).
     assert!(run.stdout.contains("running"), "stdout={}", run.stdout);
-    let pid = helpers::host_pid(state_dir).expect("a host serves the state root");
+    let pid = helpers::expect_host_pid(state_dir, "a host serves the state root");
     // The notice is on stderr: it names the host and the honest lifetime
     // (the agent keeps running after this command) and how to stop it.
     assert!(
@@ -696,7 +696,7 @@ fn an_agent_outlives_its_start_command_and_a_later_send_reaches_it() {
         state_dir,
     );
     assert!(reg.success, "stderr={}", reg.stderr);
-    let host = helpers::host_pid(state_dir).expect("the register auto-started a host");
+    let host = helpers::expect_host_pid(state_dir, "the register auto-started a host");
     let start = run_hekma_agent(&["agent", "start", "echo"], &ctx.project_dir, state_dir);
     assert!(start.success, "stderr={}", start.stderr);
     // The start command has exited; the agent is still running.
@@ -827,7 +827,7 @@ fn concurrent_writes_share_one_host() {
         &state_dir,
     );
     assert!(first.success, "stderr={}", first.stderr);
-    let host = helpers::host_pid(&state_dir).expect("a host");
+    let host = helpers::expect_host_pid(&state_dir, "a host");
     let workers: Vec<_> = (0..6)
         .map(|i| {
             let project = ctx.project_dir.clone();

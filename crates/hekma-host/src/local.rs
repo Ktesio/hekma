@@ -11,13 +11,11 @@
 //! resolver keeps its SHA-256) — the same trust boundary as `secrets.toml`.
 //!
 //! [`spawn_detached`] is the CLI's auto-start: `<exe> serve --autostart …`
-//! in its own process group (Unix) or a detached new process group without
-//! a console (Windows), stdin null, stdout/stderr appended to
-//! `<state-root>/serve.log`.
+//! detached, stdin null, stdout/stderr appended to `<state-root>/serve.log`
+//! — the per-OS spawn is the engine's ([`hekma_engine::spawn_detached_process`]).
 //!
 //! This file joins `signals.rs` on the OS-cfg allowlist: the owner-only file
-//! mode and the detached-spawn flags are per-OS std APIs (there is no
-//! data-driven form for a creation flag or a Unix mode).
+//! mode is a per-OS std API (there is no data-driven form for a Unix mode).
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -159,48 +157,15 @@ fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Spawn `exe args…` DETACHED from the calling terminal: Unix — its own
-/// process group; Windows — `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
-/// CREATE_NO_WINDOW`. stdin is null; stdout and stderr append to `log`.
-/// Returns the child's pid; the child is never waited on (it outlives the
-/// caller by design).
+/// Spawn `exe args…` DETACHED from the calling terminal, stdin null,
+/// stdout and stderr appended to `log`; returns the child's pid. The engine
+/// owns the per-OS spawn ([`hekma_engine::spawn_detached_process`]: its own
+/// process group on Unix; a detached new process group without a console on
+/// Windows, with the caller's own stdio kept out of the child's handle
+/// inheritance so a script capturing `hekma` never waits on the host).
 pub fn spawn_detached(exe: &Path, args: &[std::ffi::OsString], log: &Path) -> std::io::Result<u32> {
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)?;
-    let err = out.try_clone()?;
-    let mut command = std::process::Command::new(exe);
-    command
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    detach(&mut command);
-    let child = command.spawn()?;
-    Ok(child.id())
+    hekma_engine::spawn_detached_process(exe, args, log)
 }
-
-#[cfg(unix)]
-fn detach(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-    // A new process group: the terminal's job-control signals (Ctrl+C,
-    // Ctrl+Z) target the CLI's foreground group, never the host. The host
-    // also ignores SIGHUP in auto mode.
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn detach(command: &mut std::process::Command) {
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach(_command: &mut std::process::Command) {}
 
 #[cfg(test)]
 mod tests {

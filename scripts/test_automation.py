@@ -734,9 +734,8 @@ class ReleaseDocsTests(unittest.TestCase):
         # --log-capture e2e writes the SAME 0600 secrets file — the
         # identical sanctioned class; the leg's Windows skip stays
         # data-driven OsId::current, never cfg). Story 21-4 added the
-        # hekma-host local.rs entry (the owner-only control.json write and
-        # the detached auto-start spawn — per-OS std traits, justified in
-        # the step comment).
+        # hekma-host local.rs entry (the owner-only control.json write — a
+        # per-OS std trait, justified in the step comment).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"

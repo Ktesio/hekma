@@ -110,6 +110,10 @@ mod time;
 // and its `blocking()` facade (AD-13); `Registry` stays public for in-workspace
 // collaborators + tests but is no longer what `kt` uses directly.
 pub use adapter::{AdapterRef, ResolvedAdapter};
+/// Story 21-4: the detached spawn the `hekma` CLI uses to auto-start its
+/// Service Host (the engine owns process control; the OS parts live in
+/// `backends/`).
+pub use backends::spawn_detached_process;
 pub use domain::{
     broadcast, is_pass_through, render_dollars, render_dollars_bare, resolve, AcpContextCostView,
     AcpContextUsageView, AgentInstance, BreachAction, BreachDimension, BreachScope,

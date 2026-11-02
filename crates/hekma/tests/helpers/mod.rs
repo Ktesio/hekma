@@ -88,6 +88,21 @@ pub fn host_pid(state_dir: &Path) -> Option<u32> {
     hekma_host::read_discovery(state_dir).ok().map(|d| d.pid)
 }
 
+/// The pid of the Service Host serving `state_dir`, or a panic naming `what`
+/// with the host's `serve.log` (an auto-started host's whole output), so a
+/// CI failure shows why no host was recorded.
+#[allow(dead_code)]
+pub fn expect_host_pid(state_dir: &Path, what: &str) -> u32 {
+    host_pid(state_dir).unwrap_or_else(|| {
+        let log = std::fs::read_to_string(hekma_host::serve_log_file(state_dir))
+            .unwrap_or_else(|err| format!("<no serve.log: {err}>"));
+        panic!(
+            "{what}: no control.json in {}; serve.log:\n{log}",
+            state_dir.display()
+        )
+    })
+}
+
 /// Whether a process with `pid` is still alive (`kill -0` on Unix,
 /// `tasklist` on Windows — data-driven, no OS cfg).
 #[allow(dead_code)]

@@ -1089,13 +1089,10 @@ jobs:
           #     signal stream; a no-op on Windows).
           #   * hekma-host local.rs — story 21-4: the local endpoint's
           #     `control.json` is written OWNER-ONLY (`0600` through
-          #     OpenOptionsExt on Unix — the secrets-file class) and the
-          #     CLI's auto-start spawns the host DETACHED (a new process
-          #     group through CommandExt::process_group on Unix,
-          #     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
-          #     CREATE_NO_WINDOW through CommandExt::creation_flags on
-          #     Windows). Both are per-OS std traits with no data-driven
-          #     form (the "the API is the OS boundary" class).
+          #     OpenOptionsExt on Unix — the secrets-file class), a per-OS
+          #     std trait with no data-driven form (the "the API is the OS
+          #     boundary" class). The auto-start's detached spawn is the
+          #     engine's (backends/, `spawn_detached_process`).
           #   * hekma-host tests/control_api.rs — story 17-3: the suite's
           #     bearer resolves through the engine's SECRETS-FILE leg, whose
           #     0600 refusal is a unix permission-model check (PermissionsExt),
@@ -1132,7 +1129,7 @@ jobs:
           fi
           if [ -n "$violations" ]; then
             echo "$violations"
-            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs), hekma-host's signals.rs (the host's shutdown-signal wait), hekma-host's local.rs (the owner-only control.json and the detached auto-start), hekma-host's control_api.rs (the secrets-file 0600 write), hekma-host's binary_flags.rs (the same 0600 write, the --log-capture binary leg), and hekma's serve_cli.rs (the same 0600 write, real-binary leg). A new cfg use in any other file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
+            echo "::error::OS-conditional cfg is allowed only under crates/hekma-engine/src/backends/, the grandfathered legacy kt self-update files, the ENUMERATED engine test files (atomic_config_writes.rs, memory.rs), hekma-host's signals.rs (the host's shutdown-signal wait), hekma-host's local.rs (the owner-only control.json), hekma-host's control_api.rs (the secrets-file 0600 write), hekma-host's binary_flags.rs (the same 0600 write, the --log-capture binary leg), and hekma's serve_cli.rs (the same 0600 write, real-binary leg). A new cfg use in any other file must either go data-driven (OsId::current) or join this allowlist with a justification in the step comment."
             exit 1
           fi
           echo "OS-cfg gate green: hits only in the backends home / grandfathered legacy files / the two enumerated test suites / the host's signals.rs / the host's local.rs / the host's control_api.rs / the host's binary_flags.rs / the hekma serve_cli.rs secrets write."
