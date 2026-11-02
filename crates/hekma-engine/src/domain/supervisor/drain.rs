@@ -1058,6 +1058,13 @@ mod tests {
     #[test]
     fn collect_stderr_tail_waits_out_a_reader_that_finishes_within_the_grace() {
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Clock anchored BEFORE the spawn: the reader's 120 ms sleep begins
+        // the moment that thread is scheduled, so a clock started after
+        // `spawn` returns can shave the scheduling gap off the elapsed time
+        // (preemption on a loaded runner makes the margin vanish). From here
+        // `elapsed >= 120ms` holds by construction and the 100 ms bound
+        // below is a real margin.
+        let started = Instant::now();
         let reader = {
             let buffer = std::sync::Arc::clone(&buffer);
             std::thread::spawn(move || {
@@ -1068,7 +1075,6 @@ mod tests {
                     .extend_from_slice(b"late but within the grace");
             })
         };
-        let started = Instant::now();
         let tail = collect_stderr_tail(&buffer, reader);
         assert_eq!(
             tail, "late but within the grace",

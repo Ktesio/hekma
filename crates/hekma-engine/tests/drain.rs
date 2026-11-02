@@ -1830,8 +1830,8 @@ fn drain_overrun_records_the_bound_as_the_ender_and_still_stops() {
 // ---------------------------------------------------------------------------
 // The bounded runner's STDERR TAIL — a chatty failing pause command rides the
 // rejection detail as a WINDOW (the last 4096 bytes), never the whole stream.
-// The subject is `fake_agent --stderr-blob 3×4096:3`: exactly 12288 bytes of
-// deterministic offset-stamped 64-byte records, then exit 3 — so the
+// The subject is `fake_agent --stderr-blob 12288:3` — 12288 bytes (3×4096)
+// of deterministic offset-stamped 64-byte records, then exit 3 — so the
 // survivor set is computable byte-exactly (the tail = the last 64 records,
 // covering bytes 8192..12287).
 // ---------------------------------------------------------------------------
@@ -1912,13 +1912,18 @@ fn pause_command_failure_tail_is_window_truncated_with_survivors_named() {
 
 #[test]
 fn drain_rejects_on_a_failing_pause_command_with_the_tail_riding_and_no_edges_committed() {
-    // KILLER: the drain's OWN Failed arm (step 5's rejection). A pause
-    // command that SPEAKS 3× the window and exits nonzero rejects the drain
-    // with the typed PauseCommandFailed — the captured tail riding the
-    // detail — while the durable state stays UNTOUCHED: no pause edge (never
-    // a fake pause), no stopping edge (the composite never reached its last
-    // step), the row still `running`. Distinct from the OVERRUN arm (g2,
-    // which kills and stops): the command SPOKE, so the drain refuses.
+    // KILLER: the drain's Failed arm (step 5's rejection) in its RUNTIME
+    // shape. Main's drain_rejects_when_the_pause_command_cannot_run_and_
+    // touches_nothing already reaches this arm end-to-end through a SPAWN
+    // failure; this pin adds what that one cannot see: a command that RUNS
+    // and exits nonzero after speaking 3× the window, the WINDOW-TRUNCATED
+    // stderr tail riding the drain path, and the explicit transition-EDGE
+    // check (the older test asserts only the current state, not the edges).
+    // The typed PauseCommandFailed rejects the drain while the durable state
+    // stays UNTOUCHED: no pause edge (never a fake pause), no stopping edge
+    // (the composite never reached its last step), the row still `running`.
+    // Distinct from the OVERRUN arm (g2, which kills and stops): the
+    // command SPOKE, so the drain refuses.
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_drain_manifest(

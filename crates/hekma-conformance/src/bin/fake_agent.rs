@@ -177,9 +177,6 @@
 //!   therefore cannot carry a cancel anchor; the fixture convention keeps
 //!   every anchor an Agent-Home-relative name). Pure `std`, NO OS-cfg.
 //!
-//! The binary writes a small marker file (`--marker <path>`) on startup if asked,
-//! so a test can confirm it actually ran without racing on stdout capture.
-//!
 //! * `--stderr-blob <BYTES>:<CODE>`  (the bounded runner's stderr-tail
 //!   fixture)  write exactly `<BYTES>` bytes of DETERMINISTIC offset-stamped
 //!   64-byte records to stderr, then exit with `<CODE>` — the chatty-failure
@@ -194,6 +191,9 @@
 //!   is refused with exit 2 (the fixed record width is the determinism — a
 //!   partial record would make the survivor set unpredictable). Pure `std`,
 //!   NO OS-cfg.
+//!
+//! The binary writes a small marker file (`--marker <path>`) on startup if asked,
+//! so a test can confirm it actually ran without racing on stdout capture.
 //!
 //! * `--drop-env <NAME>` (repeatable)  a LYING-SUBJECT mode for the conformance
 //!   kit's declared-but-failing row: the process still RECEIVES the named env
