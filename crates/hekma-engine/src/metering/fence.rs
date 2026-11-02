@@ -64,11 +64,6 @@ impl WireFence {
         self.0.fetch_or(reason_bit(reason), Ordering::Release);
     }
 
-    /// Whether `reason` is raised.
-    pub(crate) fn is_raised(&self, reason: LatchKey) -> bool {
-        self.0.load(Ordering::Acquire) & reason_bit(reason) != 0
-    }
-
     /// The raised reasons, in [`FENCE_REASON_ORDER`] (the tests' view; the
     /// request path goes through [`Self::refusal`]).
     #[cfg(test)]
