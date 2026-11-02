@@ -3392,14 +3392,27 @@ source = "self-reported"
         let config_path = reg.paths().instance_config(&name);
         let before = std::fs::read(&config_path).unwrap();
 
+        // Pin the TIMEOUT arm exactly (not any lock-flavored detail) and that
+        // the engine WAITED on the holder instead of failing fast: the
+        // WouldBlock retry loop must run out its BUSY_TIMEOUT_MS deadline
+        // (the timeout wording is engine-written, identical on every OS —
+        // no errno reaches it). Lower bound only: a slow runner stretches
+        // the wait, never shrinks it below half the budget.
+        let started = std::time::Instant::now();
         let err = reg.set_config(&name, "model", "claude-op").unwrap_err();
+        let waited = started.elapsed();
         assert!(
             matches!(
                 &err,
                 ConfigError::Store { name, detail, .. }
-                    if name == "lockheld" && detail.contains("config write lock")
+                    if name == "lockheld"
+                        && detail.contains("timed out waiting for the config write lock")
             ),
             "a held lock must time out with the typed Store error naming the lock"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(crate::store::BUSY_TIMEOUT_MS / 2),
+            "the held lock must be waited on, not failed fast (waited {waited:?})"
         );
         assert_eq!(
             std::fs::read(&config_path).unwrap(),
@@ -3418,6 +3431,14 @@ source = "self-reported"
         );
     }
 
+    // ---- Story 19-2 (FR-49): block refusal on an unreadable metering source ----
+    // Deliberately its own banner, outside the write-lock section above: this
+    // is the fail-closed money-config refusal, not a lock fault (it never
+    // touches the lock and asserts `ConfigError::InvalidValue`). Sibling
+    // block-refusal pins: `the_config_write_refuses_block_on_an_instance_
+    // without_a_listener` (domain/supervisor/tests.rs) and the CLI-level
+    // `config_set_refuses_block_on_a_self_reported_instance_naming_the_source`
+    // (crates/hekma/tests/agent_cli.rs).
     #[test]
     fn set_config_refuses_block_when_the_metering_source_cannot_be_read() {
         // FR-49 fail-closed leg: `budget.breach_action = block` on an instance
