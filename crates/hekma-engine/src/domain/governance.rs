@@ -1759,30 +1759,49 @@ mod tests {
         );
     }
 
+    /// The wire form every `CoverTag` variant must render on BOTH surfaces.
+    /// The exhaustive `match` ties this table to the enum itself: a variant
+    /// added later fails THIS compilation until it is mapped, so the sweep
+    /// below can never silently skip a member of the closed set.
+    fn exhaustive_wire_form(tag: &CoverTag) -> &'static str {
+        match tag {
+            CoverTag::ThresholdGe => "threshold-ge",
+            CoverTag::LatchPerScope => "latch-per-scope",
+            CoverTag::LatchReArm => "latch-re-arm",
+            CoverTag::TokenBeforeDollar => "token-before-dollar",
+            CoverTag::IntegerMicros => "integer-micros",
+            CoverTag::RoundHalfUp => "round-half-up",
+            CoverTag::Saturation => "saturation",
+            CoverTag::NoRetroRepricing => "no-retro-repricing",
+            CoverTag::BlockFence => "block-fence",
+        }
+    }
+
     #[test]
     fn cover_tag_as_str_matches_the_serde_wire_form_for_every_variant() {
         // The closed rule set's tags travel on TWO surfaces — the `as_str`
         // accessor and serde's kebab-case rename — and the verifier's
-        // `ALL_COVERS` match relies on them never drifting apart. Round-trip
-        // every wire form through BOTH surfaces for all nine variants.
-        for expected in [
-            "threshold-ge",
-            "latch-per-scope",
-            "latch-re-arm",
-            "token-before-dollar",
-            "integer-micros",
-            "round-half-up",
-            "saturation",
-            "no-retro-repricing",
-            "block-fence",
-        ] {
-            let tag: CoverTag = serde_json::from_str(&format!("\"{expected}\""))
-                .unwrap_or_else(|err| panic!("wire form must deserialize: {err}"));
+        // `ALL_COVERS` match relies on them never drifting apart. The
+        // enumeration is the exhaustive map above (compiler-tied to the
+        // enum), swept through the canonical `ALL_COVERS` set so the closed
+        // set and both renderings are checked together: every member
+        // round-trips wire form → tag → wire form on BOTH surfaces. The
+        // length pin keeps the two ties honest — a variant that joins the
+        // enum (compile-forcing its map arm) or `ALL_COVERS` without the
+        // other lands here as a red count.
+        assert_eq!(
+            ALL_COVERS.len(),
+            9,
+            "the closed set grew: extend exhaustive_wire_form and ALL_COVERS together"
+        );
+        for tag in ALL_COVERS {
+            let expected = exhaustive_wire_form(tag);
             assert_eq!(tag.as_str(), expected);
-            assert_eq!(
-                serde_json::to_string(&tag).unwrap(),
-                format!("\"{expected}\"")
-            );
+            let json = serde_json::to_string(tag).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+            let back: CoverTag = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("wire form must deserialize: {err}"));
+            assert_eq!(back, *tag);
         }
     }
 
