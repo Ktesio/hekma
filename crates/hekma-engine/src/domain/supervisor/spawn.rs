@@ -184,11 +184,11 @@ impl Supervisor {
             return Err(EngineError::DetachRefused {
                 name: name.as_str().to_string(),
                 detail: "the instance meters via the engine-observed channel, whose loopback \
-                         forward listener lives inside the starting command — detaching would \
-                         leave the agent pointed at a listener that dies with the command. \
-                         Start it without --detach (the in-command supervision keeps the \
-                         listener alive), or switch the adapter's metering source to \
-                         self-reported."
+                         forward listener lives inside the engine that starts it (for the hekma \
+                         CLI, the local Service Host) — detaching would leave the agent pointed \
+                         at a listener that dies with the command or host that started it. \
+                         Start it without --detach (the supervising engine keeps the listener \
+                         alive), or switch the adapter's metering source to self-reported."
                     .to_string(),
             });
         }

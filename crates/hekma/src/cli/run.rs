@@ -5,13 +5,20 @@
 //!
 //! Results go to stdout (a table, or the `--json` document), diagnostics to
 //! stderr (AD-12). Listing every Run is `hekma ps`'s job.
+//!
+//! One data-path owner (AD-20): `open` and `close` are writes, routed to the
+//! state root's local Service Host (`POST /v0/runs`,
+//! `POST /v0/runs/{id}/close`), found or started as every `hekma agent`
+//! write is; `show` reads `state.db` read-only and starts nothing.
 
 use hekma_engine::{
-    BreachAction, ChildRunRequest, Engine, Label, LabelSource, RunError, RunLimits, RunParent,
-    RunView,
+    BreachAction, ChildRunRequest, Label, LabelSource, RunError, RunLimits, RunParent, RunView,
 };
 use serde::Serialize;
+use serde_json::{json, Value};
 
+use super::agent::{open_read_only_engine, route, RoutedError};
+use super::host_client::{segment, CallError};
 use crate::error::{AgentIo, AgentStore, RunInvalid, RunInvalidState, RunNotFound};
 use crate::ui;
 
@@ -39,26 +46,94 @@ pub struct OpenArgs {
 /// `hekma run open --parent <run-id|instance> …` — open a child Run.
 pub fn open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
     let request = open_request(&args)?;
-    let engine = open_engine()?;
-    let view = engine
-        .blocking()
-        .open_child_run(request)
-        .map_err(map_run_error)?;
+    let mut body = json!({
+        "labels": request
+            .labels
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<String, String>>(),
+    });
+    match &request.parent {
+        RunParent::Run(id) => body["parent_run_id"] = json!(id.as_str()),
+        RunParent::Instance(name) => body["parent_instance"] = json!(name),
+    }
+    if let Some(tokens) = args.token_budget {
+        body["token_budget"] = json!(tokens);
+    }
+    if let Some(cap) = &args.dollar_cap {
+        body["dollar_cap"] = json!(cap);
+    }
+    if let Some(action) = request.limits.breach_action {
+        body["breach_action"] = json!(action.as_str());
+    }
+    if let Some(external) = &args.external_id {
+        body["external_id"] = json!(external);
+    }
+    let view = routed_run(route("POST", "/v0/runs", Some(body)))?;
     render(&view, args.json, "opened")
 }
 
 /// `hekma run close <run-id>` — close a child Run.
 pub fn close(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
-    let view = engine.blocking().close_run(run_id).map_err(map_run_error)?;
+    let view = routed_run(route(
+        "POST",
+        &format!("/v0/runs/{}/close", segment(run_id)),
+        None,
+    ))?;
     render(&view, json, "closed")
 }
 
-/// `hekma run show <run-id>` — one Run.
+/// `hekma run show <run-id>` — one Run, read-only.
 pub fn show(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let view = engine.blocking().run(run_id).map_err(map_run_error)?;
     render(&view, json, "")
+}
+
+/// The Run in a routed write's answer (`{"run": …}`), or the refusal mapped
+/// onto the documented exit classes.
+fn routed_run(
+    routed: Result<super::agent::Routed, RoutedError>,
+) -> Result<RunView, Box<dyn std::error::Error>> {
+    let routed = match routed {
+        Ok(routed) => routed,
+        Err(RoutedError::Call(CallError::Coded { code, message })) => {
+            return Err(map_run_code(&code, message))
+        }
+        Err(err) => return Err(err.into_diagnostic()),
+    };
+    routed
+        .value
+        .as_ref()
+        .and_then(|document| document.get("run"))
+        .cloned()
+        .and_then(|run: Value| serde_json::from_value(run).ok())
+        .ok_or_else(|| {
+            AgentIo {
+                message: format!(
+                    "The local Service Host (pid {}) applied the command but sent no Run in \
+                     its answer; check it with: hekma run show <run-id>",
+                    routed.host_pid
+                ),
+            }
+            .into()
+        })
+}
+
+/// Map a Run route's `error.code` onto the exit classes [`map_run_error`]
+/// uses in-process.
+fn map_run_code(code: &str, message: String) -> Box<dyn std::error::Error> {
+    match code {
+        "run-not-found" => RunNotFound {
+            message: format!("{message}. Check the id with `hekma run show <run-id>`."),
+        }
+        .into(),
+        "nesting-too-deep" | "action-unavailable" | "invalid-request" => {
+            RunInvalid { message }.into()
+        }
+        "no-open-run" | "parent-ended" | "owns-process" => RunInvalidState { message }.into(),
+        _ => AgentStore { message }.into(),
+    }
 }
 
 /// Build the engine request from the flags (no engine needed, so a bad flag
@@ -121,15 +196,6 @@ fn looks_like_run_id(raw: &str) -> bool {
 
 fn invalid(message: String) -> Box<dyn std::error::Error> {
     RunInvalid { message }.into()
-}
-
-fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
-    Engine::open(None).map_err(|err| {
-        AgentIo {
-            message: format!("Could not open the hekma state directory: {err}"),
-        }
-        .into()
-    })
 }
 
 /// Map a [`RunError`] to the documented exit classes: not found `3`, a
@@ -315,6 +381,31 @@ mod tests {
         let mut bad = args("a");
         bad.dollar_cap = Some("-1".to_string());
         assert!(open_request(&bad).unwrap_err().is::<RunInvalid>());
+    }
+
+    #[test]
+    fn host_codes_map_like_the_engine_errors() {
+        assert!(map_run_code("run-not-found", "x".into()).is::<RunNotFound>());
+        for code in ["nesting-too-deep", "action-unavailable", "invalid-request"] {
+            assert!(map_run_code(code, "x".into()).is::<RunInvalid>(), "{code}");
+        }
+        for code in ["no-open-run", "parent-ended", "owns-process"] {
+            assert!(
+                map_run_code(code, "x".into()).is::<RunInvalidState>(),
+                "{code}"
+            );
+        }
+        assert!(map_run_code("store", "x".into()).is::<AgentStore>());
+        let missing = routed_run(Ok(super::super::agent::Routed {
+            value: Some(json!({"schema_version": 1})),
+            host_pid: 7,
+        }));
+        assert!(missing.unwrap_err().is::<AgentIo>());
+        let coded = routed_run(Err(RoutedError::Call(CallError::Coded {
+            code: "parent-ended".into(),
+            message: "ended".into(),
+        })));
+        assert!(coded.unwrap_err().is::<RunInvalidState>());
     }
 
     #[test]

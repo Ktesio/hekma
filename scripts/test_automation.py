@@ -733,7 +733,9 @@ class ReleaseDocsTests(unittest.TestCase):
         # added the hekma-host binary_flags.rs entry (the binary's
         # --log-capture e2e writes the SAME 0600 secrets file — the
         # identical sanctioned class; the leg's Windows skip stays
-        # data-driven OsId::current, never cfg).
+        # data-driven OsId::current, never cfg). Story 21-4 added the
+        # hekma-host local.rs entry (the owner-only control.json write — a
+        # per-OS std trait, justified in the step comment).
         self.assertIn(
             r"allowlist='^crates/hekma-engine/src/backends/"
             r"|^crates/hekma/src/update_check\.rs:"
@@ -744,6 +746,7 @@ class ReleaseDocsTests(unittest.TestCase):
             r"|^crates/hekma-conformance/src/test_notes\.rs:"
             r"|^crates/hekma-conformance/src/test_support\.rs:"
             r"|^crates/hekma-host/src/signals\.rs:"
+            r"|^crates/hekma-host/src/local\.rs:"
             r"|^crates/hekma-host/tests/control_api\.rs:"
             r"|^crates/hekma-host/tests/binary_flags\.rs:"
             r"|^crates/hekma/tests/serve_cli\.rs:'",

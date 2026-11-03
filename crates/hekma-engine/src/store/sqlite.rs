@@ -41,7 +41,6 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::run_store_sqlite::LegacySource;
-#[cfg(test)]
 use super::run_store_sqlite::NoLegacy;
 use crate::domain::{
     AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome, RestartPolicy, RunId,
@@ -412,6 +411,51 @@ impl SqliteStore {
     pub(crate) fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         Self::configure(&conn)?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(backend)?;
+        Ok(Self { conn })
+    }
+
+    /// Open a database for a READ-ONLY engine (story 21-4,
+    /// [`crate::Engine::open_read_only`]): `SQLITE_OPEN_READ_ONLY` (the file is
+    /// never created) plus `query_only`, and no pragma that writes (the WAL
+    /// switch is a writer's job). The schema is checked, never migrated: a
+    /// database below [`SCHEMA_VERSION`] answers [`StoreError::NeedsMigration`]
+    /// and one above it [`StoreError::SchemaTooNew`].
+    pub(crate) fn open_existing_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(backend)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
+            .map_err(backend)?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(backend)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version < SCHEMA_VERSION {
+            return Err(StoreError::NeedsMigration {
+                found: version,
+                current: SCHEMA_VERSION,
+            });
+        }
+        Ok(Self { conn })
+    }
+
+    /// The empty fleet a READ-ONLY engine reads when no state database exists
+    /// yet (story 21-4): an in-memory database at the current schema, then
+    /// `query_only` — nothing is created on disk.
+    pub(crate) fn open_empty_read_only() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory().map_err(backend)?;
+        migrate(&conn, &NoLegacy)?;
         conn.pragma_update(None, "query_only", "ON")
             .map_err(backend)?;
         Ok(Self { conn })

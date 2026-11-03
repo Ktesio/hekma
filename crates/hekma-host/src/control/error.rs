@@ -56,6 +56,12 @@ pub(crate) enum ApiErrorKind {
     MethodNotAllowed,
     /// Missing or wrong bearer token.
     Unauthorized,
+    /// Story 21-4 (AD-20's authority matrix): a VALID credential whose class
+    /// the surface does not allow. RESERVED: the operator/Host bearer is the
+    /// only class issued today and it is allowed everywhere, so nothing
+    /// answers it yet — the classes that can be refused land with their
+    /// stories (22-1, 22-3, 24-2, the Hub story).
+    Forbidden,
 }
 
 impl ApiErrorKind {
@@ -70,6 +76,7 @@ impl ApiErrorKind {
             ApiErrorKind::Internal => "internal",
             ApiErrorKind::MethodNotAllowed => "method_not_allowed",
             ApiErrorKind::Unauthorized => "unauthorized",
+            ApiErrorKind::Forbidden => "forbidden",
         }
     }
 
@@ -82,6 +89,7 @@ impl ApiErrorKind {
             ApiErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             ApiErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiErrorKind::Forbidden => StatusCode::FORBIDDEN,
         }
     }
 }
@@ -103,6 +111,11 @@ pub(crate) struct ApiError {
     /// beside the frozen `kind`. `None` everywhere else (the field is then
     /// omitted — additive).
     code: Option<&'static str>,
+    /// Story 21-4: the engine's TYPED error, encoded by [`crate::wire`],
+    /// whenever the failure is an engine error — the additive
+    /// `error.engine_error` field a linking client decodes back into the
+    /// engine's own value (so the CLI's text and exit codes never drift).
+    engine_error: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -113,7 +126,23 @@ impl ApiError {
             message: message.into(),
             status_override: None,
             code: None,
+            engine_error: None,
         }
+    }
+
+    /// Attach the encoded engine error (the `From` impls' builder).
+    fn with_engine_error(mut self, encoded: serde_json::Value) -> Self {
+        self.engine_error = Some(encoded);
+        self
+    }
+
+    /// The credential-class refusal (story 21-4, reserved — see
+    /// [`ApiErrorKind::Forbidden`]). Static: it never echoes the credential.
+    pub(crate) fn forbidden() -> Self {
+        Self::new(
+            ApiErrorKind::Forbidden,
+            "this credential's class is not allowed on this surface",
+        )
     }
 
     /// A request-body rejection (bad JSON / violated exactly-one-of / an
@@ -168,6 +197,7 @@ impl ApiError {
                 kind: self.kind.as_str(),
                 message: self.message.clone(),
                 code: self.code,
+                engine_error: self.engine_error.clone(),
             },
         }
     }
@@ -175,6 +205,14 @@ impl ApiError {
 
 impl From<EngineError> for ApiError {
     fn from(err: EngineError) -> Self {
+        let encoded = crate::wire::encode_engine(&err);
+        Self::classify_engine(err).with_engine_error(encoded)
+    }
+}
+
+impl ApiError {
+    /// The engine-error → status/kind table (the 17-3 mapper, unchanged).
+    fn classify_engine(err: EngineError) -> Self {
         let message = err.to_string();
         match err {
             EngineError::NotFound { .. } => Self::new(ApiErrorKind::NotFound, message),
@@ -228,6 +266,14 @@ impl From<EngineError> for ApiError {
 
 impl From<RegistryError> for ApiError {
     fn from(err: RegistryError) -> Self {
+        let encoded = crate::wire::encode_registry(&err);
+        Self::classify_registry(err).with_engine_error(encoded)
+    }
+}
+
+impl ApiError {
+    /// The registry-error → status/kind table (the 17-3 mapper, unchanged).
+    fn classify_registry(err: RegistryError) -> Self {
         let message = err.to_string();
         match err {
             RegistryError::NotFound { .. } => Self::new(ApiErrorKind::NotFound, message),
@@ -279,6 +325,14 @@ impl From<RunError> for ApiError {
 
 impl From<ConfigError> for ApiError {
     fn from(err: ConfigError) -> Self {
+        let encoded = crate::wire::encode_config(&err);
+        Self::classify_config(err).with_engine_error(encoded)
+    }
+}
+
+impl ApiError {
+    /// The config-error → status/kind table (the 17-3 mapper, unchanged).
+    fn classify_config(err: ConfigError) -> Self {
         let message = err.to_string();
         match err {
             // The write-side rejections: unknown key / invalid value / shape
@@ -313,6 +367,10 @@ struct ErrorDetail {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'static str>,
+    /// Story 21-4: the encoded engine error (additive; absent when the
+    /// failure is not an engine error — a routing or body rejection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine_error: Option<serde_json::Value>,
 }
 
 impl IntoResponse for ApiError {
@@ -370,6 +428,7 @@ where
                 // The rejection's status IS the more precise class.
                 status_override: Some(rejection.status()),
                 code: None,
+                engine_error: None,
             }),
         }
     }
@@ -643,6 +702,37 @@ mod tests {
         assert_eq!(json["schema_version"], dto::CONTROL_API_SCHEMA_VERSION);
         assert_eq!(json["error"]["kind"], "internal");
         assert_eq!(json["error"]["message"], "boom");
+    }
+
+    #[test]
+    fn an_engine_error_body_carries_the_encoded_engine_error() {
+        // Story 21-4: the additive `engine_error` field rides every engine
+        // failure, in all three families, and decodes back to the value.
+        let api: ApiError = EngineError::NotFound { name: "w".into() }.into();
+        let json = serde_json::to_value(api.body_json()).unwrap();
+        assert_eq!(json["error"]["kind"], "not_found");
+        assert_eq!(json["error"]["engine_error"]["family"], "engine");
+        assert!(matches!(
+            crate::wire::decode(&json["error"]["engine_error"]),
+            Some(crate::wire::WireError::Engine(EngineError::NotFound { .. }))
+        ));
+        let api: ApiError = RegistryError::DuplicateName { name: "w".into() }.into();
+        let json = serde_json::to_value(api.body_json()).unwrap();
+        assert_eq!(json["error"]["engine_error"]["family"], "registry");
+        let api: ApiError = ConfigError::NotFound { name: "w".into() }.into();
+        let json = serde_json::to_value(api.body_json()).unwrap();
+        assert_eq!(json["error"]["engine_error"]["family"], "config");
+        // A non-engine failure carries none (the field is absent).
+        let json = serde_json::to_value(ApiError::invalid_body("x").body_json()).unwrap();
+        assert!(json["error"].get("engine_error").is_none());
+    }
+
+    #[test]
+    fn the_forbidden_body_is_static_and_maps_403() {
+        let api = ApiError::forbidden();
+        assert_eq!(api.kind.status(), StatusCode::FORBIDDEN);
+        let json = serde_json::to_value(api.body_json()).unwrap();
+        assert_eq!(json["error"]["kind"], "forbidden");
     }
 
     #[test]

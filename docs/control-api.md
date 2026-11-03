@@ -1,57 +1,114 @@
 ---
 title: Control API (v0)
-description: The HTTP/JSON surface served from `hekma serve` — routes, bearer auth, the SSE and cursor-pull event contracts, and the v0 stability marker.
+description: The HTTP/JSON surface served from `hekma serve` — the local endpoint the CLI routes through, the operator listener and its TLS rule, bearer auth, routes, the SSE and cursor-pull event contracts, and the v0 stability marker.
 ---
 
 # Control API (v0)
 
-The Service Host can expose a local HTTP/JSON surface over the agents it
+The Service Host serves a local HTTP/JSON surface over the agents it
 supervises: registration, lifecycle, configuration, budgets and usage (through
-the Fleet row), and live events. It exists **only** when you configure it, it
-requires a bearer token on **every** route, and it is versioned `/v0` and
-marked **unstable** — the surface freezes only after a second hosting platform
-validates it, so fields and error wording are additive-only until then and may
-still change.
+the Fleet row), input, memory, and live events. It requires a bearer token on
+**every** route, and it is versioned `/v0` and marked **unstable** — the
+surface freezes only after a second hosting platform validates it, so fields
+and error wording are additive-only until then and may still change.
 
-## Turning it on
+## The local endpoint (every serve)
+
+Every `hekma serve` binds a **loopback local endpoint** — `127.0.0.1`, an
+OS-chosen port, plain HTTP — and records it in `<state-dir>/control.json`:
+
+```json
+{
+  "schema_version": 1,
+  "pid": 4242,
+  "addr": "127.0.0.1:53113",
+  "token": "<64 hex digits>",
+  "hekma_version": "0.11.0",
+  "autostarted": false
+}
+```
+
+The `token` is a fresh 256-bit operator token minted from the OS random source
+for each serve. The file is written owner-only (`0600` on Unix; on Windows it
+inherits the state directory's ACL — the same trust boundary as
+`secrets.toml`), written to a temporary file and renamed into place after the
+bind, and removed when the API stops at shutdown. The host prints a
+`local control endpoint on <addr> …` notice on stderr.
+
+This is how the `hekma` CLI reaches the host that owns a state directory:
+every `hekma agent` write is one call to this endpoint, and when no host
+serves the directory the first write starts one in the background (see
+[how the CLI reaches the Service Host](commands.md#how-the-cli-reaches-the-service-host)).
+A host started that way is an **auto-started** host (`"autostarted": true`):
+it serves only the local endpoint, ignores SIGHUP (closing the terminal does
+not end it), and drains and exits once no agent is `starting`, `running`,
+`paused` or `stopping` and no request has arrived for 30 seconds — or when
+its state directory is deleted. An explicit `hekma serve` never idle-exits.
+
+## The operator listener (`--listen`)
 
 ```bash
 CONTROL_BEARER="s3cret" hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
 ```
 
-- `--listen <addr>` — the address to bind (a socket address like
-  `127.0.0.1:8477`). Default: off — with no flag there is no API and `serve`
-  behaves exactly as before.
-- `--bearer-secret <name>` — the NAME of the bearer secret guarding the API.
+- `--listen <addr>` — an additional address to serve the API on (a socket
+  address like `127.0.0.1:8477`). Default: off — only the local endpoint
+  exists.
+- `--bearer-secret <name>` — the NAME of the operator's bearer secret.
+- `--tls-cert <pem>` + `--tls-key <pem>` — serve `--listen` over **HTTPS**
+  with this PEM certificate chain and private key. **Required for a
+  non-loopback address.**
 
-The pair is validated together: **both or neither** — a half-configured API is
-a usage error before anything starts, and so is an unparseable address. The
-secret NAME resolves at startup through the same composite resolver every
-Hekma secret uses: the environment variable with that exact name first, then a
-key in the state root's `secrets.toml` (which must not be group/other
-readable). Two resolved shapes refuse the startup with a typed error before
-anything binds or opens: an **unresolvable** name (the API never serves
-unauthenticated) and a secret that resolved to an **empty value** (an empty
-bearer could never authenticate — the error names the reference to fix). When
-the API is up, the host prints a
-`control api listening on <addr> (v0, unstable — bearer required)` notice on
-stderr; that notice is the address of record (with port `0`, it carries the
-OS-chosen port). A **non-loopback** bind works (container recipes legitimately
-bind `0.0.0.0`) but warns loudly: this surface has no TLS and bearer-only
-auth — do not expose it on an untrusted network. For the full container
-posture — the static build, the stop-grace mapping, the volume-backed state —
-see [Running Hekma as a container supervisor](hosting.md).
+`--listen` and `--bearer-secret` are validated together: **both or neither** —
+a half-configured API is a usage error before anything starts, and so is an
+unparseable address. The secret NAME resolves at startup through the same
+composite resolver every Hekma secret uses: the environment variable with
+that exact name first, then a key in the state root's `secrets.toml` (which
+must not be group/other readable). Two resolved shapes refuse the startup
+with a typed error before anything binds or opens: an **unresolvable** name
+(the API never serves unauthenticated) and a secret that resolved to an
+**empty value** (an empty bearer could never authenticate — the error names
+the reference to fix). When the listener is up, the host prints a
+`control api listening on <addr> (v0, unstable — bearer required; http|https)`
+notice on stderr; that notice is the address of record (with port `0`, it
+carries the OS-chosen port).
+
+**Beyond loopback, TLS is required.** A `--listen` address that is not
+loopback (for example `0.0.0.0:8477`, the container recipe) without
+`--tls-cert` and `--tls-key` is refused with exit code `2` before the host
+takes its lock, binds or opens anything. The two TLS flags go together (one
+alone is a usage error) and need `--listen`; the PEM files are read when the
+host starts, and an unreadable file or a key that does not match the
+certificate is refused the same way, naming the path. With both, the listener
+answers HTTPS only — a plain-HTTP request on it fails the TLS handshake and is
+never served. A loopback `--listen` may use TLS too; the local endpoint never
+does. The TLS stack is the vendored rustls + ring pair the engine already
+ships — no system TLS library. For the full container posture — the static
+build, the stop-grace mapping, the volume-backed state — see
+[Running Hekma as a container supervisor](hosting.md).
 
 ## Auth
 
-Every route — `/v0/version` included — requires
-`Authorization: Bearer <token>`. The check is a constant-time comparison; a
-missing or wrong token answers `401` with a `WWW-Authenticate: Bearer`
-challenge and a static refusal body that never echoes the presented token. No
-handler runs for an unauthenticated request, and no secret VALUE ever enters a
-response, a log line, or an SSE frame — the API projects no secret reveal at
-all (a `secret:NAME` config value renders masked, exactly as the CLI displays
-it).
+Every route on every listener — `/v0/version` included — requires
+`Authorization: Bearer <token>`. Credentials go through one **credential
+resolver**: it holds the SHA-256 of each credential with its **class**, hashes
+the presented value and compares it in constant time against every entry, then
+checks the class against the authority matrix for the surface. Today one class
+is issued — the **operator/Host bearer** — and it carries two credentials: the
+local endpoint's token (from `control.json`) and the `--bearer-secret` value.
+Both work on both listeners and on every route. The other credential classes
+(announce-scoped credentials, Run Keys, refresh credentials, Node
+credentials) arrive with their stories; a credential whose class a surface
+does not allow will answer a typed `403 forbidden` (reserved — no issued
+class can reach it yet).
+
+A missing or wrong credential — including several `Authorization` fields, a
+scheme other than `Bearer`, or an empty value — answers `401` with a
+`WWW-Authenticate: Bearer` challenge and a static refusal body that never
+echoes the presented token. No handler runs for an unauthenticated request,
+and no secret VALUE ever enters a response, a log line, or an SSE frame — the
+API projects no secret reveal at all (a `secret:NAME` config value renders
+masked, exactly as the CLI displays it).
 
 ## Routes
 
@@ -61,17 +118,21 @@ it).
 | `GET` | `/v0/fleet` | Every instance's Fleet row (the `list --json` document, verbatim) | 200 |
 | `POST` | `/v0/instances` | Register from exactly one adapter source: `{"name","kind"}` or `{"name","manifest"}` (an ABSOLUTE `adapter.toml` directory path) — both or neither is a 400 | 201 + `Location: /v0/instances/{name}` + read-back |
 | `GET` | `/v0/instances/{name}` | One instance's Fleet row (the `show --json` document) | 200 |
-| `DELETE` | `/v0/instances/{name}` | Remove a STOPPED instance (a running one is a 409; stop it first) | 204, empty |
+| `DELETE` | `/v0/instances/{name}?disposition=&force=` | Remove an instance. `disposition` is `retain` (default — the Agent Home stays on disk) or `delete`; `force=true` removes a running instance (without it a running one is a 409 — stop it first): the instance is first stopped through the bounded stop ladder with the default 30 s window, so the request can take that long. On Windows, where no graceful signal is sent yet, the whole window elapses before the forced kill. Any other value is a 400 | 204, empty |
 | `GET` | `/v0/instances/{name}/status` | Runtime status: the registry row, effective restart policy, restart count, failure cause | 200 |
 | `GET` | `/v0/instances/{name}/capabilities` | The effective Capability Declaration projected onto this OS | 200 |
 | `GET` | `/v0/instances/{name}/config` | The effective config (the `config get --json` document; values masked) | 200 |
 | `PUT` | `/v0/instances/{name}/config` | Set one key: `{"key","value"}` — acknowledged with the post-write read-back plus the engine's warn-only steering warnings | 200 |
 | `GET` | `/v0/instances/{name}/events` | Cursor pull: the engine's resync batch for one instance (lossless + idempotent) | 200 |
-| `POST` | `/v0/instances/{name}/start` | Start the agent | 200 + read-back |
+| `POST` | `/v0/instances/{name}/start` | Start the agent. Optional body `{"detach": true}`: the handle is disarmed at spawn, so the agent also survives this host's exit (an `engine-observed` instance is refused). A PRESENT body must parse | 200 + read-back |
 | `POST` | `/v0/instances/{name}/stop` | Stop through the bounded ladder; optional body `{"window_secs": N}` (1..=86400, out-of-bounds is a 400). A PRESENT body must parse — only a truly ABSENT body means the engine's default window | 200 + read-back |
 | `POST` | `/v0/instances/{name}/pause` | Pause the agent | 200 + read-back |
 | `POST` | `/v0/instances/{name}/resume` | Resume a paused agent | 200 + read-back |
 | `POST` | `/v0/instances/{name}/drain` | Drain the agent (pause command → bounded idle wait → stop); optional body `{"timeout_ms": N}` (`1..=600000`, out-of-bounds is a 400; a truly absent body means the manifest tier, else the engine default). BOTH outcomes are `200` — a timed-out drain still stopped the agent, and the document reports it honestly (`completed: false`, with `waited_ms` the measured wait) rather than as an error. Draining a non-running instance is refused with the lifecycle verbs' 409 conflict, and so is a declared pause command that fails (nonzero exit / spawn failure / overrun — the adapter refused the verb, the agent is untouched, so it is a retryable 409 `conflict` carrying the rendered command, never a 500). The response is `{"schema_version", "instance", "completed", "waited_ms"}` | 200 + read-back + outcome |
+| `POST` | `/v0/instances/{name}/send` | Send `{"text": "…"}` to the running agent's input channel. The host holds the input pipe of every agent it started, so this reaches an agent another client started | 204, empty |
+| `PUT` | `/v0/instances/{name}/memory` | Attach a Memory Backing: `{"kind": "filesystem"}` or `{"kind": "native"}` (terminal states only). The response is `{"schema_version","instance","dir","kind","guarantee","declared"}`; if the read-back fails after the attach committed, it is still a `200` with the three read-back fields `null` and `readback_error` naming the failure | 200 |
+| `DELETE` | `/v0/instances/{name}/memory` | Detach the Memory Backing (metadata only — the managed directory stays on disk) | 204, empty |
+| `PUT` | `/v0/instances/{name}/restart-policy` | Set the Restart Policy: `{"policy": "never"}` or `{"policy": "on-failure"}` — acknowledged with the runtime status read-back | 200 |
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
@@ -180,6 +241,32 @@ class:
 The Run routes add a finer `"code"` inside `error` (see [Runs](#runs)); every
 other route omits it.
 
+When the failure is an engine error, the `error` object also carries the
+engine's **typed** error — the additive `engine_error` field — so a client
+that links the engine (the `hekma` CLI does) rebuilds the engine's own error
+value and renders exactly what it would have rendered in-process:
+
+```json
+{
+  "schema_version": 1,
+  "error": {
+    "kind": "not_found",
+    "message": "no Agent Instance named 'ghost' is registered",
+    "engine_error": {
+      "schema_version": 1,
+      "family": "engine",
+      "variant": "NotFound",
+      "fields": { "name": "ghost" }
+    }
+  }
+}
+```
+
+`family` is `engine`, `registry` or `config`; `variant` and `fields` mirror
+the engine's error type (nested parts — a store or process-control cause —
+are `{"variant","fields"}` objects; an I/O cause is carried as its message).
+A client that does not know a variant falls back to `kind` and `message`.
+
 That promise covers the ROUTING and EXTRACTION failures too: an unmatched path
 is an envelope `404` (`not_found`), a known path with an unsupported method is
 an envelope `405` (`method_not_allowed`), and a body the extractors reject
@@ -191,7 +278,8 @@ layer: without a valid bearer, any path answers `401` first.
 | `kind` | Status | When |
 |--------|--------|------|
 | `unauthorized` | 401 | Missing or wrong bearer (with the `WWW-Authenticate: Bearer` challenge) — including an ambiguous request carrying MULTIPLE `Authorization` headers (refused, never first-wins; the scheme itself is case-insensitive per RFC 9110) |
-| `invalid_body` | 400 | A body/query failed validation: malformed JSON, `kind`+`manifest` together, `window_secs` out of bounds, malformed cursor, a RELATIVE `manifest` path |
+| `forbidden` | 403 | Reserved: a valid credential whose class the surface does not allow (no issued class reaches it today) |
+| `invalid_body` | 400 | A body/query failed validation: malformed JSON, `kind`+`manifest` together, `window_secs` out of bounds, malformed cursor, a RELATIVE `manifest` path, an unknown memory kind or restart policy, a `disposition`/`force` value outside its set |
 | `invalid_body` | 415 / 422 | A body the extractors reject: no usable content-type (415), or JSON that does not fit the route's type (422) |
 | `invalid_name` | 400 | The instance name is not a legal name |
 | `not_found` | 404 | The instance does not exist — or the path matches no route |
@@ -344,9 +432,10 @@ across the upgrade stays valid.
 The API is served **from the host process itself**: every request runs on the
 host's runtime, next to the supervision loop and the shutdown drain. A slow or
 stalled client can hold host work the same way a slow CLI invocation can. v0
-is loopback tooling for a trusted operator or a local dashboard — **not** a
-multi-tenant service. Do not expose it on a public interface; there is no TLS,
-no rate limiting, and no request isolation in v0.
+is operator tooling for a trusted operator or a local dashboard — **not** a
+multi-tenant service. Beyond loopback it requires TLS, but there is still no
+rate limiting and no request isolation in v0: do not expose it on a public
+interface.
 
 Two capabilities deserve to be spelled out:
 
@@ -376,7 +465,8 @@ host's stderr — never a silent hang.
 ## A two-terminal smoke
 
 ```bash
-# Terminal 1: the host (secret via env; or put CONTROL_BEARER in secrets.toml)
+# Terminal 1: the host (secret via env; or put CONTROL_BEARER in secrets.toml).
+# The local endpoint and its token are in <state-dir>/control.json as well.
 CONTROL_BEARER="s3cret" hekma serve --listen 127.0.0.1:8477 --bearer-secret CONTROL_BEARER
 
 # Terminal 2: drive it

@@ -35,14 +35,26 @@
 
 mod control;
 mod drain;
+mod local;
 mod lock;
 mod otlp;
 mod signals;
+pub mod wire;
+
+/// The response header that carries a write request's engine notes, and its
+/// codec (story 21-4): the `hekma` CLI writes the decoded bytes to its stderr.
+pub mod engine_notes {
+    pub use crate::control::notes::{decode, encode, ENGINE_NOTES_HEADER};
+}
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub use drain::{drain_and_stop, drain_plan, DrainOutcome, StopResult};
+pub use local::{
+    control_file, read_discovery, serve_log_file, spawn_detached, write_discovery, Discovery,
+    CONTROL_FILE, DISCOVERY_SCHEMA_VERSION, SERVE_LOG_FILE,
+};
 pub use lock::{read_holder_pid, HostLock, LockRefusal};
 // The exporter's operator-facing configuration types (AD-21): ServeOptions
 // carries the parsed flags; the parse itself lives on ONE site
@@ -104,7 +116,38 @@ pub struct ServeOptions {
     /// test-proven). Header values may be `secret:NAME` references; their
     /// Debug (and this struct's) never shows one.
     pub otlp: OtlpOptions,
+    /// Story 21-4: the PEM certificate chain for the `--listen` listener's
+    /// TLS. Goes with [`ServeOptions::tls_key`] (one alone is
+    /// [`ServeError::InvalidOptions`]); required for a NON-loopback
+    /// `control_listen`. The local endpoint never uses TLS.
+    pub tls_cert: Option<PathBuf>,
+    /// Story 21-4: the PEM private key for [`ServeOptions::tls_cert`].
+    pub tls_key: Option<PathBuf>,
+    /// Story 21-4: AUTO mode — the host a `hekma` CLI command starts in the
+    /// background when no host serves the state root. It refuses the
+    /// explicit-listener flags (`control_listen`, `bearer_secret`, TLS),
+    /// ignores SIGHUP, passes the starting command's environment to agents
+    /// (no child-environment allowlist), and exits through the normal drain
+    /// when no agent is live and no request arrived for
+    /// [`AUTOSTART_IDLE_WINDOW`], or when its state root disappears.
+    pub autostart: bool,
+    /// Story 21-4: the build version `control.json` records (the CLI notes a
+    /// host from another build). `None` records this crate's version.
+    pub build_version: Option<String>,
+    /// Story 21-4's TEST SCALING SEAM for the auto mode's idle window:
+    /// `Some(window)` overrides [`AUTOSTART_IDLE_WINDOW`]. `None` (every
+    /// production caller) keeps the 30 s window. Not an operator surface.
+    #[doc(hidden)]
+    pub autostart_idle_override: Option<std::time::Duration>,
 }
+
+/// Story 21-4: how long an AUTO-STARTED host waits with no live agent and no
+/// request before it drains and exits (the tmux-server pattern).
+pub const AUTOSTART_IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often the auto-started host checks for idleness and for its state
+/// root.
+const AUTOSTART_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The inclusive lower bound of every stop-window option (whole seconds):
 /// `0` would make the graceful ladder an instant kill — refused everywhere
@@ -134,6 +177,11 @@ impl std::fmt::Debug for ServeOptions {
             // The OtlpOptions Debug redacts header VALUES (the no-leak
             // discipline: a literal header value IS secret material).
             .field("otlp", &self.otlp)
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("autostart", &self.autostart)
+            .field("build_version", &self.build_version)
+            .field("autostart_idle_override", &self.autostart_idle_override)
             .finish()
     }
 }
@@ -290,15 +338,21 @@ impl Notifier {
 /// 7. Emit the shutdown-complete notice (naming the received signal) and
 ///    return.
 ///
-/// With the Control API configured (`control_listen` + `bearer_secret`,
-/// story 17-3) two extra steps interleave: the bearer secret resolves
-/// through the engine's composite AFTER the lock and BEFORE the runtime
-/// (an unresolvable reference is a typed [`ServeError::Startup`] — nothing
-/// binds, nothing opens), and the API binds on the host runtime right
-/// after the started notice (a bind failure is a surfaced `Startup` naming
-/// the address). On shutdown the API stops accepting FIRST — graceful, a
-/// bounded grace, then the SSE streams abort — and only then does step 6
-/// run.
+/// The Control API (story 17-3; story 21-4 made it every serve's): right
+/// after the started notice the API binds its LOOPBACK LOCAL ENDPOINT
+/// (127.0.0.1, an OS-chosen port, a fresh 256-bit operator token) and —
+/// with `control_listen` + `bearer_secret` — the operator's listener too
+/// (TLS with `tls_cert` + `tls_key`; a non-loopback address without them is
+/// [`ServeError::InvalidOptions`] before anything binds or opens). Then
+/// `control.json` records the local endpoint for the CLI. The bearer secret
+/// resolves through the engine's composite AFTER the lock and BEFORE the
+/// runtime (an unresolvable reference is a typed [`ServeError::Startup`] —
+/// nothing binds, nothing opens); a bind failure is a surfaced `Startup`
+/// naming the address. On shutdown the API stops accepting FIRST —
+/// graceful, a bounded grace, then the SSE streams abort — `control.json`
+/// is removed, and only then does step 6 run. In AUTO mode
+/// ([`ServeOptions::autostart`]) step 5 also ends when the host is idle or
+/// its state root disappears.
 ///
 /// Errors: [`ServeError::StateDirLocked`] / [`ServeError::InvalidOptions`] /
 /// [`ServeError::Startup`] — the first two BEFORE any supervision work, so
@@ -331,11 +385,25 @@ where
         log_capture,
         diagnostics,
         otlp,
+        tls_cert,
+        tls_key,
+        autostart,
+        build_version,
+        autostart_idle_override,
     } = options;
     let has_caller_sink = diagnostics.is_some();
     let notifier = match diagnostics {
         Some(sink) => Notifier::over(sink.clone()),
         None => Notifier::stderr(),
+    };
+    // Every pre-start refusal: noted through a caller sink (AI-18) AND
+    // returned; with no caller sink the caller's own print is the single
+    // surfacing.
+    let refuse = |err: ServeError| -> ServeError {
+        if has_caller_sink {
+            notifier.note(&err.to_string());
+        }
+        err
     };
 
     // (0) The options, validated BEFORE anything is touched (review finding
@@ -349,49 +417,89 @@ where
         None => hekma_engine::domain::DEFAULT_STOP_WINDOW.as_secs(),
         Some(secs) if (MIN_STOP_WINDOW_SECS..=MAX_STOP_WINDOW_SECS).contains(&secs) => secs,
         Some(secs) => {
-            let err = ServeError::InvalidOptions {
+            return Err(refuse(ServeError::InvalidOptions {
                 message: format!(
                     "invalid stop window {secs}: the graceful window must be a whole \
                      number of seconds from {MIN_STOP_WINDOW_SECS} to \
                      {MAX_STOP_WINDOW_SECS}"
                 ),
-            };
-            if has_caller_sink {
-                notifier.note(&err.to_string());
-            }
-            return Err(err);
+            }));
         }
     });
+    if autostart
+        && (control_listen.is_some()
+            || bearer_secret.is_some()
+            || tls_cert.is_some()
+            || tls_key.is_some())
+    {
+        return Err(refuse(ServeError::InvalidOptions {
+            message: "--autostart refuses the explicit-listener flags (--listen, \
+                      --bearer-secret, --tls-cert, --tls-key): an auto-started host serves \
+                      only its loopback local endpoint"
+                .to_string(),
+        }));
+    }
     match (&control_listen, &bearer_secret) {
         (None, None) => {}
         (Some(_), Some(_)) => {}
         (Some(addr), None) => {
-            let err = ServeError::InvalidOptions {
+            return Err(refuse(ServeError::InvalidOptions {
                 message: format!(
                     "--listen {addr} requires --bearer-secret: the Control API never \
                      serves unauthenticated; pass both flags (or neither, to keep the \
                      API off)"
                 ),
-            };
-            if has_caller_sink {
-                notifier.note(&err.to_string());
-            }
-            return Err(err);
+            }));
         }
         (None, Some(_)) => {
-            let err = ServeError::InvalidOptions {
+            return Err(refuse(ServeError::InvalidOptions {
                 message: "--bearer-secret requires --listen: there is no API to guard \
                           while the Control API is off; pass both flags (or neither, to \
                           keep the API off)"
                     .to_string(),
-            };
-            if has_caller_sink {
-                notifier.note(&err.to_string());
-            }
-            return Err(err);
+            }));
         }
     }
-    let control_addr = control_listen;
+    // (0.2) TLS (story 21-4, AD-20 amended 2026-10-30): the pair goes
+    // together, applies to the explicit listener only, and is REQUIRED
+    // beyond loopback. The PEM files are read and the server config built
+    // HERE — before the lock — so an unreadable file or a bad key is a typed
+    // usage refusal naming the path, and nothing binds or opens.
+    let tls_config = match (&tls_cert, &tls_key) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(refuse(ServeError::InvalidOptions {
+                message: "--tls-cert and --tls-key go together: pass both PEM files (or \
+                          neither, for a loopback plain-HTTP listener)"
+                    .to_string(),
+            }));
+        }
+        (Some(cert), Some(key)) => {
+            if control_listen.is_none() {
+                return Err(refuse(ServeError::InvalidOptions {
+                    message: "--tls-cert/--tls-key require --listen: TLS applies to the \
+                              operator's listener (the local endpoint is loopback plain \
+                              HTTP)"
+                        .to_string(),
+                }));
+            }
+            match control::tls::load_server_config(cert, key) {
+                Ok(config) => Some(config),
+                Err(message) => return Err(refuse(ServeError::InvalidOptions { message })),
+            }
+        }
+    };
+    if let Some(addr) = control_listen {
+        if !addr.ip().is_loopback() && tls_config.is_none() {
+            return Err(refuse(ServeError::InvalidOptions {
+                message: format!(
+                    "--listen {addr} is not a loopback address: beyond loopback the Control \
+                     API requires TLS — pass --tls-cert <pem> and --tls-key <pem> (or bind \
+                     127.0.0.1)"
+                ),
+            }));
+        }
+    }
 
     // (0.5) The OTLP exporter's options, validated BEFORE anything is
     // touched (the same rejected-INVOCATION class): a non-http endpoint,
@@ -401,11 +509,7 @@ where
     // exporter simply does not exist.
     let otlp_options = otlp;
     if let Err(message) = otlp_options.validate() {
-        let err = ServeError::InvalidOptions { message };
-        if has_caller_sink {
-            notifier.note(&err.to_string());
-        }
-        return Err(err);
+        return Err(refuse(ServeError::InvalidOptions { message }));
     }
 
     // (1) The state root, via the engine's path authority (the host NEVER
@@ -416,13 +520,14 @@ where
             message: err.to_string(),
         }
     })?;
-    let lock_path = paths.state_base().join(hekma_engine::paths::HOST_LOCK_FILE);
+    let state_root = paths.state_base().to_path_buf();
+    let lock_path = state_root.join(hekma_engine::paths::HOST_LOCK_FILE);
     // The host lock runs BEFORE Engine::open, and Engine::open is what would
     // otherwise create the directory — create it here, idempotently.
-    std::fs::create_dir_all(paths.state_base()).map_err(|err| ServeError::Startup {
+    std::fs::create_dir_all(&state_root).map_err(|err| ServeError::Startup {
         message: format!(
             "could not create the state directory {}: {err}",
-            paths.state_base().display()
+            state_root.display()
         ),
     })?;
 
@@ -432,26 +537,18 @@ where
     let _lock = match HostLock::acquire(&lock_path) {
         Ok(lock) => lock,
         Err(LockRefusal::Held { holder }) => {
-            let err = ServeError::StateDirLocked {
+            return Err(refuse(ServeError::StateDirLocked {
                 lock_path: lock_path.clone(),
                 holder,
-            };
-            if has_caller_sink {
-                notifier.note(&err.to_string());
-            }
-            return Err(err);
+            }));
         }
         Err(LockRefusal::Io(err)) => {
-            let err = ServeError::Startup {
+            return Err(refuse(ServeError::Startup {
                 message: format!(
                     "could not acquire the host lock {}: {err}",
                     lock_path.display()
                 ),
-            };
-            if has_caller_sink {
-                notifier.note(&err.to_string());
-            }
-            return Err(err);
+            }));
         }
     };
 
@@ -459,9 +556,8 @@ where
     // engine's composite (env first, then the state-dir secrets file — the
     // host never builds a second resolution mechanism, AD-10), AFTER the
     // lock and BEFORE the runtime/engine open: an unresolvable reference is
-    // a typed `Startup` refusal and NOTHING binds, NOTHING opens (the I/O
-    // matrix's "no engine work done"). A half-configured pair was already
-    // refused above; reaching here with a name means `--listen` is set.
+    // a typed `Startup` refusal and NOTHING binds, NOTHING opens. A
+    // half-configured pair was already refused above.
     let bearer = match &bearer_secret {
         None => None,
         Some(name) => {
@@ -473,33 +569,24 @@ where
                     // empty presented bearer is refused by construction), so
                     // binding would mint an API that 401s every request
                     // forever with no diagnosis. Refuse NOW, typed, naming
-                    // the reference (review item 2) — the I/O matrix's
-                    // "refuse before anything binds or opens".
+                    // the reference (review item 2).
                     if secret.expose_secret().is_empty() {
-                        let err = ServeError::Startup {
+                        return Err(refuse(ServeError::Startup {
                             message: format!(
                                 "the control API's bearer secret {name:?} resolved to an \
                                  EMPTY value — an empty bearer can never authenticate; set \
                                  a non-empty value for it (env or the secrets file)"
                             ),
-                        };
-                        if has_caller_sink {
-                            notifier.note(&err.to_string());
-                        }
-                        return Err(err);
+                        }));
                     }
-                    Some(control::BearerToken::new(secret))
+                    Some(secret)
                 }
                 Err(err) => {
-                    let err = ServeError::Startup {
+                    return Err(refuse(ServeError::Startup {
                         message: format!(
                             "the control API's bearer secret could not be resolved: {err}"
                         ),
-                    };
-                    if has_caller_sink {
-                        notifier.note(&err.to_string());
-                    }
-                    return Err(err);
+                    }));
                 }
             }
         }
@@ -508,26 +595,39 @@ where
     // (2.6) The OTLP exporter's secret header references — resolved ONCE,
     // through the same composite the bearer uses (env, then the state-dir
     // secrets file — AD-10), AFTER the lock and BEFORE the runtime: an
-    // unresolvable reference is a typed refusal NAMING the secret (the
-    // `--bearer-secret` rule; the I/O matrix's exit-2 class) and NOTHING
-    // binds, NOTHING opens. The RESOLVED values are consumed only by the
-    // HTTP client — never options, notices, or logs.
+    // unresolvable reference is a typed refusal NAMING the secret and
+    // NOTHING binds, NOTHING opens. The RESOLVED values are consumed only by
+    // the HTTP client — never options, notices, or logs.
     let otlp_headers_resolved = if otlp_options.configured() {
         let resolver =
             hekma_engine::ports::CompositeSecretResolver::env_then_file(paths.secrets_file());
         match otlp_options.resolve_headers(&resolver) {
             Ok(headers) => Some(headers),
-            Err(message) => {
-                let err = ServeError::InvalidOptions { message };
-                if has_caller_sink {
-                    notifier.note(&err.to_string());
-                }
-                return Err(err);
-            }
+            Err(message) => return Err(refuse(ServeError::InvalidOptions { message })),
         }
     } else {
         None
     };
+
+    // (2.7) The local operator token (story 21-4): 256 bits from the OS
+    // CSPRNG, minted per serve. Its plaintext lives only in `control.json`
+    // and in the CLI's request; the resolver keeps its SHA-256.
+    let local_token =
+        local::mint_token().map_err(|message| refuse(ServeError::Startup { message }))?;
+    let resolver = {
+        let mut credentials = vec![(
+            local_token.as_str(),
+            control::CredentialClass::OperatorBearer,
+        )];
+        if let Some(secret) = &bearer {
+            credentials.push((
+                secret.expose_secret(),
+                control::CredentialClass::OperatorBearer,
+            ));
+        }
+        control::CredentialResolver::new(credentials)
+    };
+    drop(bearer);
 
     // (3) The host runtime — built BEFORE the engine opens (review finding
     // 1): a runtime-build failure must not kill an engine that already
@@ -539,6 +639,13 @@ where
         .map_err(|err| ServeError::Startup {
             message: format!("could not start the host runtime: {err}"),
         })?;
+
+    // (3.5) AUTO mode ignores SIGHUP (story 21-4): closing the terminal whose
+    // command started this host must not end it.
+    if autostart {
+        rt.block_on(signals::ignore_hangup())
+            .map_err(|message| ServeError::Startup { message })?;
+    }
 
     // (4) ARM the shutdown signals BEFORE the engine opens (review finding
     // 1): the factory runs INSIDE the runtime NOW, so the real OS streams
@@ -552,7 +659,7 @@ where
     // hanging the host; even at zero completed hops the wait task is live
     // on the runtime, so the open below never runs without an armed wait.
     let sink_for_signals = notifier.sink.clone();
-    let (wait_task, early_signal, arming_failure) = rt.block_on(async {
+    let (mut wait_task, early_signal, arming_failure) = rt.block_on(async {
         let mut task = tokio::spawn(signal(sink_for_signals));
         let mut early: Option<&'static str> = None;
         let mut failure: Option<ServeError> = None;
@@ -584,16 +691,27 @@ where
     // (5) The engine, with the Host serve options from the FIRST moment —
     // before adoption, so an adopted observed instance re-binds the fixed
     // port on this very open. The child-env allowlist is NOT a flag: under
-    // serve it is always on (a hosted agent inherits ONLY its declared env
-    // plus the documented OS-baseline floor). `Arc` because the drain's
-    // concurrent stop tasks share it (review finding 4). Opened OUTSIDE any
-    // `block_on` — it builds its own internal runtime, exactly as before.
+    // an explicit serve it is always on (a hosted agent inherits ONLY its
+    // declared env plus the documented OS-baseline floor). An AUTO-STARTED
+    // host (story 21-4) passes the starting command's environment through,
+    // exactly as the CLI's own engine did — `export KEY=…; hekma agent start
+    // x` keeps working in that shell. `Arc` because the drain's concurrent
+    // stop tasks share it (review finding 4). Opened OUTSIDE any `block_on` —
+    // it builds its own internal runtime, exactly as before. The engine's
+    // diagnostics go through the note tap (story 21-4): every line still
+    // reaches the host's stream, and a write request's lines also ride back
+    // to its client.
+    let note_tap = if autostart {
+        control::NoteTap::keeping_startup_notes()
+    } else {
+        control::NoteTap::default()
+    };
     let engine = Arc::new(
         hekma_engine::Engine::open_with_options(
             state_base.clone(),
             hekma_engine::EngineOptions {
                 metering_listen_port,
-                child_env_allowlist: true,
+                child_env_allowlist: !autostart,
                 // Story 17-4: the engine's log-capture posture — every spawn
                 // this host supervises resolves the SAME mode (open-time
                 // only, the metering-port thread).
@@ -608,7 +726,7 @@ where
                 // Route the ENGINE's own diagnostics (adoption notes, the
                 // re-bind notes, enforcement breadcrumbs) through the SAME
                 // sink the host notices use — one interleaved, honest stream.
-                diagnostics: Some(notifier.sink.clone()),
+                diagnostics: Some(note_tap.sink_over(notifier.sink.clone())),
             },
         )
         .map_err(|err| ServeError::Startup {
@@ -617,63 +735,81 @@ where
     );
     notifier.note(&format!(
         "host started; state root {} — supervising agents until SIGTERM/SIGINT",
-        paths.state_base().display()
+        state_root.display()
     ));
 
-    // (5.5) The Control API mounts here (story 17-3): AFTER the engine opens
-    // and the started notice lands, BEFORE the signal wait. `None` (the
-    // default) skips the whole block — serve stays byte-identical to 17-2.
-    // A bind failure is a surfaced `Startup` error NAMING the address and
-    // the host ABORTS (the frozen I/O matrix's system class — exit nonzero;
-    // review item 1: an earlier comment here wrongly claimed the host
-    // continues). Because the engine has OPENED by now and may have ADOPTED
-    // agents, the failure path first runs the SAME bounded drain the signal
-    // path runs — no adopted agent dies uncounted — and only then does the
-    // error return.
-    let api = match (control_addr, bearer) {
-        (Some(addr), Some(bearer)) => {
-            let engine_for_api = Arc::clone(&engine);
-            let sink_for_api = notifier.sink.clone();
-            match rt.block_on(control::ControlApi::bind(
-                addr,
-                engine_for_api,
-                bearer,
-                sink_for_api,
-            )) {
-                Ok(api) => {
-                    // A NON-LOOPBACK bind is legitimate (17-5's container
-                    // recipe binds 0.0.0.0) but it must WARN (review item
-                    // 15): this surface has no TLS and bearer-only auth.
-                    if !api.is_loopback() {
-                        notifier.note(&format!(
-                            "warning: the control api is bound on a NON-LOOPBACK address \
-                             {} — it has no TLS and bearer-only auth; do not expose it on \
-                             an untrusted network",
-                            api.local_addr()
-                        ));
-                    }
-                    notifier.note(&format!(
-                        "control api listening on {} (v0, unstable — bearer required)",
-                        api.local_addr()
-                    ));
-                    Some(api)
-                }
-                Err(message) => {
-                    // Bounded drain FIRST (the adopted-agent ladder), then
-                    // the surfaced abort.
-                    let _outcomes =
-                        rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
-                    let err = ServeError::Startup { message };
-                    if has_caller_sink {
-                        notifier.note(&err.to_string());
-                    }
-                    return Err(err);
-                }
-            }
+    // (5.5) The Control API mounts here: AFTER the engine opens and the
+    // started notice lands, BEFORE the signal wait. The LOCAL endpoint
+    // (story 21-4) always binds; the operator's `--listen` joins it when
+    // configured — one router, one resolver. A bind failure (or a failed
+    // `control.json` write) is a surfaced `Startup` error and the host
+    // ABORTS — after the SAME bounded drain the signal path runs, because
+    // the engine has OPENED and may have ADOPTED agents.
+    let local_endpoint = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut specs = vec![control::ListenerSpec::Plain(local_endpoint)];
+    if let Some(addr) = control_addr(control_listen, &tls_config) {
+        specs.push(addr);
+    }
+    // Bind every socket FIRST, record the local endpoint in `control.json`,
+    // and only THEN start serving and print the listening notices: a client
+    // that gets an answer, or reads a notice, always finds the discovery
+    // file on disk (a connection that arrives in between waits in the accept
+    // queue).
+    let bound = match rt.block_on(control::BoundListeners::bind(specs)) {
+        Ok(bound) => bound,
+        Err(message) => {
+            let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+            return Err(refuse(ServeError::Startup { message }));
         }
-        // The pair was validated together at step (0); this arm is unreachable.
-        _ => None,
     };
+    let addrs = bound.local_addrs();
+    let local_addr = addrs[0];
+    let discovery = local::Discovery {
+        schema_version: local::DISCOVERY_SCHEMA_VERSION,
+        pid: std::process::id(),
+        addr: local_addr,
+        token: local_token,
+        hekma_version: build_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        autostarted: autostart,
+    };
+    if let Err(err) = local::write_discovery(&state_root, &discovery) {
+        drop(bound);
+        let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+        return Err(refuse(ServeError::Startup {
+            message: format!(
+                "could not write the discovery file {}: {err}",
+                local::control_file(&state_root).display()
+            ),
+        }));
+    }
+    drop(discovery);
+    let api = match rt.block_on(bound.serve(
+        Arc::clone(&engine),
+        resolver,
+        note_tap,
+        notifier.sink.clone(),
+    )) {
+        Ok(api) => api,
+        Err(message) => {
+            local::remove_discovery(&state_root, std::process::id());
+            let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
+            return Err(refuse(ServeError::Startup { message }));
+        }
+    };
+    notifier.note(&format!(
+        "local control endpoint on {local_addr} (loopback, for the hekma CLI; recorded in {})",
+        local::control_file(&state_root).display()
+    ));
+    if let Some(addr) = addrs.get(1) {
+        let scheme = if tls_config.is_some() {
+            "https"
+        } else {
+            "http"
+        };
+        notifier.note(&format!(
+            "control api listening on {addr} (v0, unstable — bearer required; {scheme})"
+        ));
+    }
 
     // (5.6) The OTLP telemetry exporter mounts here (AD-21) — the SAME
     // mount shape as the Control API: AFTER the engine opens, BEFORE the
@@ -698,7 +834,7 @@ where
                 flush_interval: std::time::Duration::from_secs(
                     otlp_options.effective_flush_interval(),
                 ),
-                service_instance_id: otlp::service_instance_id(paths.state_base()),
+                service_instance_id: otlp::service_instance_id(&state_root),
             };
             let rx = engine.subscribe();
             let exporter =
@@ -707,31 +843,63 @@ where
         }
     };
 
-    // (6) Resolve the received signal's name — either it already arrived
-    // during the arming window or the open (held by the armed streams), or
-    // we wait for it now. The streams stay armed through the whole drain
-    // (the holder task inside the signal source; review finding 3): a
-    // second SIGTERM mid-drain is swallowed and noted, never lethal.
-    let received = match early_signal {
-        Some(name) => name,
-        None => match rt.block_on(wait_task) {
-            Ok(Ok(name)) => name,
-            Ok(Err(registration)) => {
-                return Err(ServeError::Startup {
-                    message: registration,
-                });
+    // (6) Resolve why the host ends — the received signal (it may already
+    // have arrived during the arming window or the open, held by the armed
+    // streams), or, in AUTO mode, idleness / a vanished state root. The
+    // streams stay armed through the whole drain (the holder task inside the
+    // signal source; review finding 3): a second SIGTERM mid-drain is
+    // swallowed and noted, never lethal.
+    let ending: Ending = match early_signal {
+        Some(name) => Ending::Signal(name),
+        None => {
+            let signal_wait = async {
+                match (&mut wait_task).await {
+                    Ok(Ok(name)) => Ok(Ending::Signal(name)),
+                    Ok(Err(registration)) => Err(ServeError::Startup {
+                        message: registration,
+                    }),
+                    Err(join) => Err(ServeError::Startup {
+                        message: format!("the shutdown-signal wait task failed: {join}"),
+                    }),
+                }
+            };
+            let outcome = if autostart {
+                let idle = autostart_idle_exit(
+                    Arc::clone(&engine),
+                    api.activity(),
+                    state_root.clone(),
+                    autostart_idle_override.unwrap_or(AUTOSTART_IDLE_WINDOW),
+                );
+                rt.block_on(async {
+                    tokio::select! {
+                        signaled = signal_wait => signaled,
+                        reason = idle => Ok(Ending::Auto(reason)),
+                    }
+                })
+            } else {
+                rt.block_on(signal_wait)
+            };
+            match outcome {
+                Ok(ending) => ending,
+                Err(err) => {
+                    let _ = rt.block_on(api.shutdown());
+                    local::remove_discovery(&state_root, std::process::id());
+                    return Err(err);
+                }
             }
-            Err(join) => {
-                return Err(ServeError::Startup {
-                    message: format!("the shutdown-signal wait task failed: {join}"),
-                });
-            }
-        },
+        }
     };
-    notifier.note(&format!(
-        "{received} received; stopping running and paused agents (graceful window {}s) ...",
-        window.as_secs_f32()
-    ));
+    match ending {
+        Ending::Signal(name) => notifier.note(&format!(
+            "{name} received; stopping running and paused agents (graceful window {}s) ...",
+            window.as_secs_f32()
+        )),
+        Ending::Auto(reason) => notifier.note(&format!(
+            "auto-started host exiting ({reason}); stopping running and paused agents \
+             (graceful window {}s) ...",
+            window.as_secs_f32()
+        )),
+    }
 
     // (6.4) The OTLP exporter stops BEFORE/WITH the Control API (the AD-21
     // shutdown order): fire the handshake, await the bounded final flush
@@ -757,23 +925,21 @@ where
     }
 
     // (6.5) The API stops accepting FIRST (the frozen mount order): graceful
-    // shutdown of the accept loop and a bounded grace for in-flight requests.
+    // shutdown of every listener and a bounded grace for in-flight requests.
     // The open SSE streams end ON the signal (the cooperative close), so the
     // grace normally suffices; a client that STILL holds a connection past
-    // it — a stalled request body, a non-cooperative client — is ABORTED at
-    // the grace, and the abort is surfaced (review item 16 / AI-18). The
-    // down-notice keeps the stream honest: a client can see the API go away
-    // BEFORE agents stop.
-    if let Some(api) = api {
-        let aborted = rt.block_on(api.shutdown());
-        notifier.note("control api stopped; no requests are accepted for the rest of the shutdown");
-        if aborted {
-            notifier.note(
-                "control api: a client still held a connection past the graceful window — \
-                 the connection was aborted (the drain re-issues any interrupted stop, so \
-                 outcomes converge)",
-            );
-        }
+    // it is ABORTED at the grace, and the abort is surfaced (review item 16 /
+    // AI-18). The discovery file goes with it (story 21-4): a CLI that reads
+    // it from now on starts a new host instead of calling a dead one.
+    let aborted = rt.block_on(api.shutdown());
+    local::remove_discovery(&state_root, std::process::id());
+    notifier.note("control api stopped; no requests are accepted for the rest of the shutdown");
+    if aborted {
+        notifier.note(
+            "control api: a client still held a connection past the graceful window — \
+             the connection was aborted (the drain re-issues any interrupted stop, so \
+             outcomes converge)",
+        );
     }
 
     // (7) The drain — every RUNNING agent through the bounded ladder, stops
@@ -782,12 +948,78 @@ where
     // the drain itself (AI-18) AND returned (the vec is the API return for
     // programmatic callers).
     let _outcomes = rt.block_on(drain::drain_and_stop(&engine, window, &notifier.sink));
-    // Review finding 20: the completion notice names the signal that ended
-    // the host — the stream reads as one story (X received → ... → complete).
-    notifier.note(&format!("shutdown complete ({received})"));
+    // Review finding 20: the completion notice names what ended the host —
+    // the stream reads as one story (X received → ... → complete).
+    let label = match ending {
+        Ending::Signal(name) => name,
+        Ending::Auto(reason) => reason,
+    };
+    notifier.note(&format!("shutdown complete ({label})"));
     // The engine drops HERE (after the block_on joined): the Drop teardown
     // never races a still-running stop.
     drop(engine);
     drop(rt);
     Ok(())
+}
+
+/// Why the host's serve wait ended.
+#[derive(Clone, Copy)]
+enum Ending {
+    /// An OS shutdown signal (its name).
+    Signal(&'static str),
+    /// The auto-started host's own exit (story 21-4): idle, or the state
+    /// root disappeared.
+    Auto(&'static str),
+}
+
+/// The explicit `--listen` listener's spec, when configured.
+fn control_addr(
+    listen: Option<std::net::SocketAddr>,
+    tls: &Option<Arc<rustls::ServerConfig>>,
+) -> Option<control::ListenerSpec> {
+    let addr = listen?;
+    Some(match tls {
+        Some(config) => control::ListenerSpec::Tls(addr, Arc::clone(config)),
+        None => control::ListenerSpec::Plain(addr),
+    })
+}
+
+/// The auto-started host's exit condition (story 21-4, the tmux-server
+/// pattern), checked every [`AUTOSTART_CHECK_INTERVAL`]: the state root is
+/// gone (a deleted directory — nothing left to serve), or no instance is
+/// `starting`/`running`/`paused`/`stopping` AND no request has been in flight
+/// or arrived for `window`. A failed fleet read counts as "not idle" — the
+/// host never exits on a guess.
+async fn autostart_idle_exit(
+    engine: Arc<hekma_engine::Engine>,
+    activity: control::Activity,
+    state_root: PathBuf,
+    window: std::time::Duration,
+) -> &'static str {
+    let mut ticker = tokio::time::interval(AUTOSTART_CHECK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if !state_root.exists() {
+            return "its state root was removed";
+        }
+        let live = match engine.list().await {
+            Ok(instances) => instances.iter().any(|instance| {
+                matches!(
+                    instance.state,
+                    hekma_engine::LifecycleState::Starting
+                        | hekma_engine::LifecycleState::Running
+                        | hekma_engine::LifecycleState::Paused
+                        | hekma_engine::LifecycleState::Stopping
+                )
+            }),
+            Err(_) => true,
+        };
+        if live {
+            continue;
+        }
+        if matches!(activity.idle_for(), Some(idle) if idle >= window) {
+            return "idle: no live agent and no request";
+        }
+    }
 }

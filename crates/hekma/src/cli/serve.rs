@@ -29,52 +29,86 @@ use std::path::PathBuf;
 
 use crate::error::{ServeOptionsInvalid, ServeStartupFailed, ServeStateDirBusy};
 
+/// The parsed `hekma serve` flags (story 21-4 grew the list past a plain
+/// argument list: TLS, the hidden auto mode).
+#[derive(Default)]
+pub struct ServeFlags {
+    /// `--stop-window <secs>`.
+    pub stop_window: Option<u64>,
+    /// `--metering-listen <port>`.
+    pub metering_listen: u16,
+    /// `--state-dir <dir>`.
+    pub state_dir: Option<String>,
+    /// `--listen <addr>`.
+    pub listen: Option<std::net::SocketAddr>,
+    /// `--bearer-secret <name>`.
+    pub bearer_secret: Option<String>,
+    /// `--log-capture <mode>`.
+    pub log_capture: Option<hekma_engine::LogCaptureMode>,
+    /// `--otlp-endpoint <url>`.
+    pub otlp_endpoint: Option<String>,
+    /// `--otlp-headers <spec>`.
+    pub otlp_headers: Option<String>,
+    /// `--otlp-flush-interval <secs>`.
+    pub otlp_flush_interval: Option<u64>,
+    /// `--tls-cert <pem>` (story 21-4).
+    pub tls_cert: Option<String>,
+    /// `--tls-key <pem>` (story 21-4).
+    pub tls_key: Option<String>,
+    /// The hidden `--autostart` (story 21-4): the background host a CLI
+    /// write starts.
+    pub autostart: bool,
+    /// The hidden `--idle-window <secs>` (story 21-4).
+    pub idle_window: Option<u64>,
+}
+
 /// `hekma serve [--stop-window <secs>] [--metering-listen <port>]
-/// [--state-dir <dir>] [--listen <addr> --bearer-secret <name>]` — serve
-/// until SIGTERM/SIGINT, then drain.
+/// [--state-dir <dir>] [--listen <addr> --bearer-secret <name>
+/// [--tls-cert <pem> --tls-key <pem>]]` — serve until SIGTERM/SIGINT, then
+/// drain.
 ///
 /// The Control-API flags pass the parsed address + the secret NAME straight
 /// through (the host owns the resolution; this file stays sync and free of
 /// async/secret tokens — the embed-clean audit holds). The mutual
 /// requires-between-flags is ALSO enforced in the host (`ServeError::
 /// InvalidOptions`) so a library caller gets the same typed refusal a CLI
-/// user gets from clap.
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    stop_window: Option<u64>,
-    metering_listen: u16,
-    state_dir: Option<String>,
-    listen: Option<std::net::SocketAddr>,
-    bearer_secret: Option<String>,
-    log_capture: Option<hekma_engine::LogCaptureMode>,
-    otlp_endpoint: Option<String>,
-    otlp_headers: Option<&str>,
-    otlp_flush_interval: Option<u64>,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// user gets from clap — and the host alone refuses a non-loopback `--listen`
+/// without TLS (exit 2, before anything binds).
+pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
     // The OTLP flags parse through the ONE site both surfaces share (the
     // host bin's hand-rolled loop calls the same `OtlpOptions::from_flags`);
     // a malformed combination (bad scheme, out-of-bounds interval, headers
     // without an endpoint) is the Usage-class refusal, same as any bad flag
     // value. Header VALUES never enter an error or a log (the redacting
     // newtype holds them).
-    let otlp =
-        hekma_host::OtlpOptions::from_flags(otlp_endpoint, otlp_headers, otlp_flush_interval)
-            .map_err(|message| ServeOptionsInvalid { message })?;
+    let otlp = hekma_host::OtlpOptions::from_flags(
+        flags.otlp_endpoint,
+        flags.otlp_headers.as_deref(),
+        flags.otlp_flush_interval,
+    )
+    .map_err(|message| ServeOptionsInvalid { message })?;
     let options = hekma_host::ServeOptions {
-        state_base: state_dir.map(PathBuf::from),
-        stop_window,
-        metering_listen_port: metering_listen,
-        control_listen: listen,
-        bearer_secret,
+        state_base: flags.state_dir.map(PathBuf::from),
+        stop_window: flags.stop_window,
+        metering_listen_port: flags.metering_listen,
+        control_listen: flags.listen,
+        bearer_secret: flags.bearer_secret,
         // Story 17-4: the capture posture — `None` (no flag) means the
         // engine default (`full`, byte-identical to 17-3); the parsed flag
         // value overrides. An UNPARSEABLE value never reaches here: clap's
         // value parser refused at parse time.
-        log_capture: log_capture.unwrap_or_default(),
+        log_capture: flags.log_capture.unwrap_or_default(),
         // The stderr default: host + engine notices interleave on stderr,
         // byte-compatible with every other diagnostic surface.
         diagnostics: None,
         otlp,
+        tls_cert: flags.tls_cert.map(PathBuf::from),
+        tls_key: flags.tls_key.map(PathBuf::from),
+        autostart: flags.autostart,
+        // `control.json` records THIS build's version, so a CLI from another
+        // build notes the skew.
+        build_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        autostart_idle_override: flags.idle_window.map(std::time::Duration::from_secs),
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text
@@ -108,17 +142,12 @@ mod tests {
         // returns immediately — `--listen` without its bearer secret is the
         // ServeOptionsInvalid arm (Usage class, exit 2 at the classifier),
         // never a startup failure, and the remediation is named verbatim.
-        let err = run(
-            None,
-            0,
-            None, // the state base is never reached: validation fires first
-            Some("127.0.0.1:18499".parse().unwrap()),
-            None, // the bearer secret — deliberately absent
-            None,
-            None,
-            None,
-            None,
-        )
+        let err = run(ServeFlags {
+            // The state base is never reached: validation fires first.
+            listen: Some("127.0.0.1:18499".parse().unwrap()),
+            // The bearer secret — deliberately absent.
+            ..ServeFlags::default()
+        })
         .expect_err("a half-configured API refuses");
         let mapped = err
             .downcast_ref::<ServeOptionsInvalid>()
@@ -128,5 +157,21 @@ mod tests {
             "the remediation is named: {}",
             mapped.message
         );
+    }
+
+    #[test]
+    fn a_non_loopback_listen_without_tls_is_the_usage_class_refusal() {
+        // Story 21-4 (AD-20 amended 2026-10-30): beyond loopback the Control
+        // API requires TLS — refused before anything binds or opens.
+        let err = run(ServeFlags {
+            listen: Some("0.0.0.0:18499".parse().unwrap()),
+            bearer_secret: Some("NEVER_RESOLVED".into()),
+            ..ServeFlags::default()
+        })
+        .expect_err("a non-loopback listen without TLS refuses");
+        let mapped = err
+            .downcast_ref::<ServeOptionsInvalid>()
+            .expect("the InvalidOptions arm maps to the Usage class");
+        assert!(mapped.message.contains("--tls-cert"), "{}", mapped.message);
     }
 }
