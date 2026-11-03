@@ -279,30 +279,7 @@ impl Registry {
     ///
     /// Ensures the state dir exists and opens (creating + migrating) the DB.
     pub fn open(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
-        let paths = EnginePaths::new(base).map_err(|e| {
-            // AI-4: name the ACTUAL path that failed. A rejected relative
-            // `KTESIO_STATE_DIR` carries the offending value itself — not the
-            // `<default via …>` placeholder, which describes a resolution mode,
-            // not the path the operator typed. Only the genuinely path-less
-            // failure (no env var and no platform data dir) keeps the
-            // placeholder, because there is no concrete path to name.
-            let path = match &e {
-                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
-                crate::paths::PathError::ConflictingStateDir { alias, .. } => {
-                    // Both env names set with different values: name the
-                    // alias value (the message itself quotes both).
-                    alias.to_string_lossy().into_owned()
-                }
-                crate::paths::PathError::NoStateDir => {
-                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
-                }
-            };
-            RegistryError::Io {
-                name: "<state-dir>".to_string(),
-                path,
-                source: std::io::Error::other(e.to_string()),
-            }
-        })?;
+        let paths = Self::resolve_paths(base)?;
         // Create the state base (and thus its parent chain) before opening the
         // DB — a fresh install has no directory yet (AC1 "fresh state").
         ensure_dir(paths.state_base(), "<state-dir>")?;
@@ -410,12 +387,13 @@ impl Registry {
     }
 
     /// The instance's open process-owning Run, read on the read-only
-    /// connection (story 21-9): `NoOpenRun` when it has none.
+    /// connection (story 21-9): `InstanceNotFound` when no instance has the
+    /// name, `NoOpenRun` when it has no open Run.
     pub(crate) fn instance_run(
         &self,
         instance: &str,
     ) -> Result<crate::domain::RunView, crate::domain::RunError> {
-        use crate::ports::RunRecords;
+        use crate::ports::{RunRecords, StateStore};
         let name = InstanceName::new(instance).map_err(|e| crate::domain::RunError::Invalid {
             field: "instance".to_string(),
             reason: e.to_string(),
@@ -423,10 +401,33 @@ impl Registry {
         self.store.snapshot(|store| {
             Ok(match store.open_process_run(&name)? {
                 Some(record) => crate::domain::runs::ops::view(store, &record.run_id),
+                None if store.get_instance(&name)?.is_none() => {
+                    Err(crate::domain::RunError::InstanceNotFound {
+                        instance: instance.to_string(),
+                    })
+                }
                 None => Err(crate::domain::RunError::NoOpenRun {
                     instance: instance.to_string(),
                 }),
             })
+        })?
+    }
+
+    /// Plan a label-verb change on the read-only connection (story 21-9):
+    /// the dry run, which writes nothing and so needs no store writer (a
+    /// read-only engine plans as well as the data-path owner).
+    pub(crate) fn plan_run_labels(
+        &self,
+        run_id: &crate::domain::RunId,
+        change: &crate::domain::LabelChange,
+        config: &[crate::domain::Label],
+    ) -> Result<crate::domain::LabelOutcome, crate::domain::RunError> {
+        let at = crate::time::now_rfc3339();
+        self.store.snapshot(|store| {
+            Ok(
+                crate::domain::runs::ops::label(store, run_id, change, config, true, &at)
+                    .map(|(outcome, _)| outcome),
+            )
         })?
     }
 
@@ -438,6 +439,71 @@ impl Registry {
     ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
         self.store
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
+    /// Open a READ-ONLY registry (story 21-4): no directory is created, no
+    /// migration runs, no legacy import happens, and the store writer is
+    /// CLOSED (every write answers a typed refusal). A missing state.db reads
+    /// as an empty fleet from an in-memory database — nothing is created on
+    /// disk; a state.db below the current schema answers
+    /// [`StoreError::NeedsMigration`].
+    pub fn open_read_only(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
+        let paths = Self::resolve_paths(base)?;
+        let db = paths.state_db();
+        let store = if db.exists() {
+            SqliteStore::open_existing_read_only(&db)?
+        } else {
+            SqliteStore::open_empty_read_only()?
+        };
+        Ok(Self {
+            paths,
+            store,
+            writer: StoreWriter::closed(),
+            open_notes: std::sync::Mutex::new(Vec::new()),
+            // A read-only registry serves no data path: its Run snapshot
+            // stays empty (only a store writer publishes, AD-25).
+            run_snapshot: std::sync::Arc::new(
+                crate::domain::runs::snapshot::SnapshotPublisher::default(),
+            ),
+        })
+    }
+
+    /// Resolve the state paths WITHOUT opening anything (story 21-4: the
+    /// `hekma` CLI locates the state root its Service Host owns), mapping a
+    /// resolution failure to the same typed `Io` error both opens raise.
+    pub fn resolve_state_paths(
+        base: Option<std::path::PathBuf>,
+    ) -> Result<EnginePaths, RegistryError> {
+        Self::resolve_paths(base)
+    }
+
+    /// Resolve the state paths, mapping a resolution failure to the typed
+    /// `Io` error naming the offending path (shared by both opens).
+    fn resolve_paths(base: Option<std::path::PathBuf>) -> Result<EnginePaths, RegistryError> {
+        EnginePaths::new(base).map_err(|e| {
+            // AI-4: name the ACTUAL path that failed. A rejected relative
+            // `KTESIO_STATE_DIR` carries the offending value itself — not the
+            // `<default via …>` placeholder, which describes a resolution mode,
+            // not the path the operator typed. Only the genuinely path-less
+            // failure (no env var and no platform data dir) keeps the
+            // placeholder, because there is no concrete path to name.
+            let path = match &e {
+                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
+                crate::paths::PathError::ConflictingStateDir { alias, .. } => {
+                    // Both env names set with different values: name the
+                    // alias value (the message itself quotes both).
+                    alias.to_string_lossy().into_owned()
+                }
+                crate::paths::PathError::NoStateDir => {
+                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
+                }
+            };
+            RegistryError::Io {
+                name: "<state-dir>".to_string(),
+                path,
+                source: std::io::Error::other(e.to_string()),
+            }
+        })
     }
 
     /// Run `work` on the store writer and wait for its commit (story 21-1).

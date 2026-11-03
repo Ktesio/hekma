@@ -571,12 +571,16 @@ pub enum RunError {
         run_id: String,
     },
     /// The instance has no open supervised Run to open a child under.
-    #[error(
-        "Agent Instance `{instance}` has no open Run — start it before opening a child Run \
-         under it"
-    )]
+    #[error("Agent Instance `{instance}` has no open Run — start it first")]
     NoOpenRun {
         /// The instance asked for.
+        instance: String,
+    },
+    /// No Agent Instance has this name (story 21-9: an agent named as a
+    /// label target).
+    #[error("no Agent Instance is named `{instance}`")]
+    InstanceNotFound {
+        /// The name asked for.
         instance: String,
     },
     /// The parent has ended.
@@ -692,6 +696,7 @@ impl RunError {
         match self {
             RunError::NotFound { .. } => "run-not-found",
             RunError::NoOpenRun { .. } => "no-open-run",
+            RunError::InstanceNotFound { .. } => "instance-not-found",
             RunError::ParentEnded { .. } => "parent-ended",
             RunError::NestingTooDeep { .. } => "nesting-too-deep",
             RunError::ActionUnavailable { .. } => "action-unavailable",

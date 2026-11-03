@@ -1254,6 +1254,19 @@ pub fn preserve_target_mode(
     Ok(())
 }
 
+/// Spawn `command` DETACHED (story 21-4): no console, a new process group,
+/// detached from the spawner's console — with the spawner's own stdio kept
+/// out of the child's handle inheritance for the spawn window
+/// ([`StdioInheritDisarm`], story 15-4), so a caller capturing the
+/// spawner's output never waits on the detached child.
+pub(crate) fn spawn_detached_command(command: &mut Command) -> std::io::Result<Child> {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let _disarm = StdioInheritDisarm::disarm_spawner_stdio();
+    command.spawn()
+}
+
 /// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
 /// Windows' `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` FAILS with a sharing
 /// violation while another process holds the target open WITHOUT

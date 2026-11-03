@@ -23,14 +23,23 @@ fn label_refusals_map_to_the_documented_exit_codes() {
     );
     assert_eq!(run.code, Some(3), "stderr: {}", run.stderr);
     assert!(run.stderr.contains(UNKNOWN_RUN), "{}", run.stderr);
-    // 4 — the agent has no open Run.
+    // 3 — no agent has the name (read-only: no Service Host is started).
     let run = run_hekma_agent(
         &["label", "remove", "ghost-agent", "team"],
         &ctx.project_dir,
         state_dir,
     );
-    assert_eq!(run.code, Some(4), "stderr: {}", run.stderr);
-    assert!(run.stderr.contains("no open Run"), "{}", run.stderr);
+    assert_eq!(run.code, Some(3), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("no Agent Instance is named `ghost-agent`"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        !state_dir.join("control.json").exists(),
+        "a refused read starts no Service Host"
+    );
     // 2 — malformed requests, refused before the state directory is touched.
     for args in [
         vec!["label", "set", "my-agent", "no-equals"],

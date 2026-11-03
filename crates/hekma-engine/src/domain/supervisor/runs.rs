@@ -164,10 +164,30 @@ impl Supervisor {
             .ok_or_else(|| RunError::NotFound {
                 run_id: run_id.as_str().to_string(),
             })?;
+        // Only a removal can restore a configured value, so only a removal
+        // needs the configuration — and must not plan without it: an
+        // unreadable configuration refuses the removal instead of dropping
+        // the key it would have restored.
         let config = match record.instance.as_deref().map(InstanceName::new) {
-            Some(Ok(name)) if record.process_owner => self.bound_labels(registry, &name),
+            Some(Ok(name)) if record.process_owner && !change.remove.is_empty() => {
+                let effective = registry
+                    .effective_config(&name, ConfigLayer::empty())
+                    .map_err(|err| RunError::Invalid {
+                        field: "config".to_string(),
+                        reason: format!(
+                            "the configuration of `{}` could not be read ({err}), so removing a \
+                             label cannot restore the value it binds — fix the configuration \
+                             and run the command again",
+                            name.as_str()
+                        ),
+                    })?;
+                runs::labels::bound_labels_from(&effective).0
+            }
             _ => Vec::new(),
         };
+        if dry_run {
+            return registry.plan_run_labels(run_id, &change, &config);
+        }
         let id = run_id.clone();
         let (outcome, events) = registry.run_job(move |store| {
             ops::label(
@@ -175,7 +195,7 @@ impl Supervisor {
                 &id,
                 &change,
                 &config,
-                dry_run,
+                false,
                 &crate::time::now_rfc3339(),
             )
         })?;

@@ -173,11 +173,10 @@ pub(crate) trait LegacySource {
     fn outbox(&self) -> Result<LegacyOutbox, String>;
 }
 
-/// The import-nothing source (in-memory and direct-open test stores).
-#[cfg(test)]
+/// The import-nothing source (in-memory and direct-open test stores, and the
+/// read-only engine's empty in-memory fleet — story 21-4).
 pub(crate) struct NoLegacy;
 
-#[cfg(test)]
 impl LegacySource for NoLegacy {
     fn transitions(&self, _instance: &str) -> LegacyLogs<TransitionEvent> {
         LegacyLogs::default()

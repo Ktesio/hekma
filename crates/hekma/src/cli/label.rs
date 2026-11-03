@@ -8,9 +8,13 @@
 //!
 //! Results go to stdout (one line per Run, or the `--json` document),
 //! diagnostics and refusals to stderr (AD-12). A Selector is resolved here,
-//! then the verb acts on exactly the listed Runs (FR-50). The write goes
-//! through [`apply`] alone, so routing it through a Service Host later is a
-//! local change.
+//! then the verb acts on exactly the listed Runs (FR-50).
+//!
+//! One data-path owner (AD-20): the target and the Selector are read from
+//! `state.db` read-only, and so is a `--dry-run` (it writes nothing, so it
+//! starts no Service Host); each write is one `PATCH /v0/runs/{id}/labels`
+//! routed to the state root's local Service Host, found or started as every
+//! `hekma agent` write is.
 
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -18,9 +22,12 @@ use hekma_engine::{
     Engine, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, Selector,
 };
 use serde::Serialize;
+use serde_json::json;
 
-use crate::cli::run::{looks_like_run_id, open_engine, run_error_class};
-use crate::error::RunInvalid;
+use super::agent::{open_read_only_engine, route, RoutedError};
+use super::host_client::{segment, CallError};
+use crate::cli::run::{looks_like_run_id, map_run_code, run_error_class};
+use crate::error::{AgentIo, RunInvalid};
 use crate::ui;
 
 /// The `--json` document's schema version (the label-results family).
@@ -74,8 +81,45 @@ struct RunResult {
 
 #[derive(Serialize)]
 struct ResultError {
-    code: &'static str,
+    code: String,
     message: String,
+}
+
+/// Why one Run's write failed: the engine's refusal (planned locally, or
+/// decoded from the host's `error.code`), or a host-level failure.
+struct Refusal {
+    code: String,
+    message: String,
+    diagnostic: Box<dyn std::error::Error>,
+}
+
+impl Refusal {
+    fn from_run_error(err: RunError) -> Self {
+        let message = err.to_string();
+        Self {
+            code: err.code().to_string(),
+            diagnostic: run_error_class(&err, message.clone()),
+            message,
+        }
+    }
+
+    fn from_routed(err: RoutedError) -> Self {
+        match err {
+            RoutedError::Call(CallError::Coded { code, message }) => Self {
+                diagnostic: map_run_code(&code, message.clone()),
+                code,
+                message,
+            },
+            other => {
+                let diagnostic = other.into_diagnostic();
+                Self {
+                    code: "service-host".to_string(),
+                    message: diagnostic.to_string(),
+                    diagnostic,
+                }
+            }
+        }
+    }
 }
 
 /// The `--json` document.
@@ -90,10 +134,16 @@ struct LabelDocument {
 /// `hekma label set|remove …`.
 pub fn run(args: LabelArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (target, change) = parse(&args)?;
-    let engine = open_engine()?;
+    let engine = open_read_only_engine()?;
     let facade = engine.blocking();
     let run_ids = match &target {
-        Target::Run(id) => vec![id.clone()],
+        // Read first, so an unknown id is refused without starting a host.
+        Target::Run(id) => vec![facade
+            .run(id)
+            .map_err(|err| run_error_class(&err, err.to_string()))?
+            .record
+            .run_id
+            .to_string()],
         Target::Instance(name) => vec![facade
             .instance_run(name)
             .map_err(|err| run_error_class(&err, err.to_string()))?
@@ -127,21 +177,21 @@ pub fn run(args: LabelArgs) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         if !confirmed {
             ui::note("Nothing was labeled.");
-            return Ok(());
+            return finish(&args, run_ids.len(), Vec::new(), None);
         }
     }
     let mut results = Vec::with_capacity(run_ids.len());
-    let mut first_failure: Option<RunError> = None;
+    let mut first_failure: Option<Refusal> = None;
     let mut failures = 0usize;
     for run_id in &run_ids {
-        match apply(&engine, run_id, change.clone(), args.dry_run) {
+        match apply(&engine, run_id, &change, args.dry_run) {
             Ok(outcome) => results.push(success(&outcome)),
-            Err(err) => {
+            Err(refusal) => {
                 failures += 1;
                 if selecting && !args.json {
                     eprintln!(
                         "{}",
-                        ui::error_text(format!("Run {run_id} not labeled: {err}"))
+                        ui::error_text(format!("Run {run_id} not labeled: {}", refusal.message))
                     );
                 }
                 results.push(RunResult {
@@ -150,34 +200,99 @@ pub fn run(args: LabelArgs) -> Result<(), Box<dyn std::error::Error>> {
                     labels: None,
                     prior_labels: None,
                     error: Some(ResultError {
-                        code: err.code(),
-                        message: err.to_string(),
+                        code: refusal.code.clone(),
+                        message: refusal.message.clone(),
                     }),
                 });
-                first_failure.get_or_insert(err);
+                first_failure.get_or_insert(refusal);
             }
         }
     }
     let matched = run_ids.len();
-    let failure = first_failure.map(|err| {
-        let message = if selecting {
-            format!("{failures} of {matched} Runs were not labeled; the first refusal: {err}")
+    let failure = first_failure.map(|refusal| {
+        if selecting {
+            // Keep the first refusal's exit class, with the count.
+            reclassed(
+                refusal.diagnostic,
+                format!(
+                    "{failures} of {matched} Runs were not labeled; the first refusal: {}",
+                    refusal.message
+                ),
+            )
         } else {
-            err.to_string()
-        };
-        run_error_class(&err, message)
+            refusal.diagnostic
+        }
     });
     finish(&args, matched, results, failure)
 }
 
-/// The one write: label one Run through the engine facade.
+/// Label one Run: a dry run plans on the read-only engine (nothing is
+/// written, so no Service Host is started); a write is one
+/// `PATCH /v0/runs/{id}/labels` routed to the local Service Host.
 fn apply(
     engine: &Engine,
     run_id: &str,
-    change: LabelChange,
+    change: &LabelChange,
     dry_run: bool,
-) -> Result<LabelOutcome, RunError> {
-    engine.blocking().label_run(run_id, change, dry_run)
+) -> Result<LabelOutcome, Refusal> {
+    if dry_run {
+        return engine
+            .blocking()
+            .label_run(run_id, change.clone(), true)
+            .map_err(Refusal::from_run_error);
+    }
+    let body = json!({ "set": change.set, "remove": change.remove });
+    let routed = route(
+        "PATCH",
+        &format!("/v0/runs/{}/labels", segment(run_id)),
+        Some(body),
+    )
+    .map_err(Refusal::from_routed)?;
+    let host_pid = routed.host_pid;
+    routed
+        .value
+        .and_then(|document| serde_json::from_value::<LabelOutcome>(document).ok())
+        .ok_or_else(|| {
+            let message = format!(
+                "the local Service Host (pid {host_pid}) applied the change but sent no labels \
+                 in its answer; check them with: hekma run show {run_id}"
+            );
+            Refusal {
+                code: "service-host".to_string(),
+                diagnostic: AgentIo {
+                    message: message.clone(),
+                }
+                .into(),
+                message,
+            }
+        })
+}
+
+/// `diagnostic`'s exit class carrying `message` instead (a partial
+/// failure's summary under its first refusal's class).
+fn reclassed(
+    diagnostic: Box<dyn std::error::Error>,
+    message: String,
+) -> Box<dyn std::error::Error> {
+    use crate::error::{
+        AgentNotFound, AgentStore, RunInvalidState, RunNotFound, ServiceHostRefused,
+        ServiceHostUnavailable,
+    };
+    if diagnostic.is::<RunNotFound>() {
+        RunNotFound { message }.into()
+    } else if diagnostic.is::<RunInvalid>() {
+        RunInvalid { message }.into()
+    } else if diagnostic.is::<AgentNotFound>() {
+        AgentNotFound { message }.into()
+    } else if diagnostic.is::<RunInvalidState>() {
+        RunInvalidState { message }.into()
+    } else if diagnostic.is::<ServiceHostRefused>() {
+        ServiceHostRefused { message }.into()
+    } else if diagnostic.is::<ServiceHostUnavailable>() {
+        ServiceHostUnavailable { message }.into()
+    } else {
+        AgentStore { message }.into()
+    }
 }
 
 /// Print the results (human lines or the `--json` document) and return the

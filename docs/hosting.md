@@ -312,8 +312,12 @@ ENTRYPOINT ["/hekma-host"]
 # Turn the Control API on: BOTH flags or neither. --bearer-secret names a
 # secret, not a value — it resolves from the environment at startup, which is
 # the natural container wiring (pass it with -e or a secret; never bake it
-# into the image). --stop-window 45 pairs with the 90s grace below.
-CMD ["--listen", "0.0.0.0:8477", "--bearer-secret", "CONTROL_BEARER", "--stop-window", "45"]
+# into the image). Binding beyond loopback REQUIRES TLS: the PEM certificate
+# and key come from a read-only mount (never baked into the image). --stop-window
+# 45 pairs with the 90s grace below.
+CMD ["--listen", "0.0.0.0:8477", "--bearer-secret", "CONTROL_BEARER", \
+     "--tls-cert", "/certs/cert.pem", "--tls-key", "/certs/key.pem", \
+     "--stop-window", "45"]
 ```
 
 Build and run it — note the stop timeout is sized **past** the stop window
@@ -325,17 +329,25 @@ docker build -t hekma-supervisor .
 docker run -d --name hekma \
   -v hekma-data:/data \
   -e CONTROL_BEARER="use-a-long-random-value" \
+  -v "$PWD/certs:/certs:ro" \
   -p 127.0.0.1:8477:8477 \
   --stop-timeout 90 \
   hekma-supervisor
 ```
 
-On the Control API in a container: a **non-loopback bind** works — container
-recipes legitimately bind `0.0.0.0` because the agent, the runtime's port
-publishing, or an in-network proxy needs to reach the host — but the surface
-stays **bearer-only with no TLS**; do not expose it on an untrusted network
-(the host warns loudly on any non-loopback bind). Publishing the port on the
-operator machine's loopback (`-p 127.0.0.1:8477:8477`) keeps it local. There
+On the Control API in a container: container recipes legitimately bind
+`0.0.0.0` because the agent, the runtime's port publishing, or an in-network
+proxy needs to reach the host — and **a non-loopback bind requires TLS**. The
+host refuses `--listen 0.0.0.0:…` without `--tls-cert` and `--tls-key` (exit
+code `2`, before anything binds or opens), and with them the listener answers
+HTTPS only. Use a certificate your clients trust (`curl --cacert
+certs/cert.pem https://127.0.0.1:8477/v0/version -H "Authorization: Bearer
+…"`); the TLS stack is the vendored rustls + ring pair, so the static image
+needs no system TLS library. Publishing the port on the operator machine's
+loopback (`-p 127.0.0.1:8477:8477`) keeps it local as well. Every serve also
+binds its own loopback local endpoint inside the container (recorded in
+`/data/control.json`) — that is how a `hekma agent` command run inside the
+container (`docker exec hekma /hekma agent list`) reaches the host. There
 is no built-in health-probe surface yet — and the Control API is not one:
 every route, `/v0/version` included, sits behind the bearer layer (an
 unauthenticated probe gets `401`, not a health answer). The honest liveness
