@@ -80,6 +80,45 @@ pub use unix::rename_over_target;
 #[cfg(windows)]
 pub use windows::rename_over_target;
 
+// ---- Story 21-4: the detached service spawn (the CLI's host auto-start) ----
+
+// The per-OS detached spawn of a prepared command (Unix: its own process
+// group; Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+// CREATE_NO_WINDOW`, with the spawner's stdio kept out of the inheritance).
+#[cfg(unix)]
+use unix::spawn_detached_command;
+#[cfg(windows)]
+use windows::spawn_detached_command;
+
+/// Spawn `exe args…` DETACHED from the calling process and its terminal,
+/// stdin null, stdout and stderr appended to `log` (created if absent);
+/// returns the child's pid. The child is never waited on — it outlives the
+/// caller by design (story 21-4: `hekma` auto-starting its Service Host).
+///
+/// On Windows the spawner's own stdin/stdout/stderr are kept out of the
+/// child's handle inheritance (the story 15-4 guard): without it a script
+/// capturing the `hekma` command's output would wait on the pipe until the
+/// detached child exits.
+pub fn spawn_detached_process(
+    exe: &std::path::Path,
+    args: &[std::ffi::OsString],
+    log: &std::path::Path,
+) -> std::io::Result<u32> {
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    let err = out.try_clone()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    let child = spawn_detached_command(&mut command)?;
+    Ok(child.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

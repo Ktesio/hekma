@@ -3099,7 +3099,7 @@ fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effe
         EngineError::DetachRefused { name, detail } => {
             assert_eq!(name, "obsdetach");
             assert!(
-                detail.contains("listener") && detail.contains("dies with the command"),
+                detail.contains("listener") && detail.contains("dies with the command or host"),
                 "the refusal must name the listener-lifetime why: {detail}"
             );
             assert!(

@@ -1078,6 +1078,14 @@ pub fn preserve_target_mode(target: &std::path::Path, temp: &std::path::Path) ->
     }
 }
 
+/// Spawn `command` DETACHED (story 21-4): its own process group, so the
+/// terminal's job-control signals (Ctrl+C, Ctrl+Z) target the spawner's
+/// foreground group, never the child.
+pub(crate) fn spawn_detached_command(command: &mut Command) -> io::Result<Child> {
+    command.process_group(0);
+    command.spawn()
+}
+
 /// Rename the temp over the atomic-write target (story 11-2 review-1, patch 4).
 /// POSIX `rename` replaces ANY existing non-directory target atomically and is
 /// never blocked by another process holding the target open (an open fd does

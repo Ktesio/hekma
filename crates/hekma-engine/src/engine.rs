@@ -113,6 +113,17 @@ pub struct DrainReport {
     pub outcome: crate::domain::DrainOutcome,
 }
 
+/// Story 21-4: the failed cause a READ-ONLY read shows for a `running` or
+/// `paused` row whose recorded process is gone — the fact adoption's
+/// reconciliation records, plus that nothing has recorded it yet.
+fn gone_cause(pid: u32, last_known: Option<&str>) -> String {
+    format!(
+        "process pid {pid} is gone (not recorded yet: the next hekma write reconciles the \
+         row to failed); last known: {}",
+        last_known.unwrap_or("no prior cause recorded")
+    )
+}
+
 /// Extract a human-readable failed-cause detail from a transition [`TransitionCause`]
 /// for the `instance_status` event-log fallback (AC9). Returns the carried detail
 /// for the failure-bearing causes (a launch error, a crash — the 18-3 charged
@@ -199,15 +210,18 @@ pub struct Engine {
     /// Shared engine state (registry + supervisor), guarded for `spawn_blocking`.
     inner: Arc<EngineInner>,
     /// The crash-detection reaper task's abort handle (story 1-6). Aborted on
-    /// [`Engine::drop`] so the background poll stops with the engine.
-    reaper: tokio::task::AbortHandle,
+    /// [`Engine::drop`] so the background poll stops with the engine. `None`
+    /// for a read-only engine (story 21-4), which runs no reaper.
+    reaper: Option<tokio::task::AbortHandle>,
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         // Stop the background reaper when the engine goes away (its supervised
         // handles drop with the supervisor, killing spawned processes).
-        self.reaper.abort();
+        if let Some(reaper) = &self.reaper {
+            reaper.abort();
+        }
         // Story 15-2 (Fibery 178): before the supervised handles drop with the
         // supervisor, release every DETACHED PAUSED one — SIGCONT the child
         // and record paused→running — so a detached child is never left
@@ -241,6 +255,12 @@ impl Drop for Engine {
 /// not a hot path and the engine is single-lifetime, so a coarse mutex is the
 /// correct, simplest altitude here.
 struct EngineInner {
+    /// Story 21-4: this engine was opened read-only ([`Engine::open_read_only`])
+    /// — no writer, no adoption, no reaper. Its Fleet reads take a live
+    /// instance's current Run id from the persisted spawn record (the id the
+    /// owning Service Host's supervisor holds), since its own supervisor is
+    /// empty.
+    read_only: bool,
     registry: Mutex<Registry>,
     supervisor: Mutex<Supervisor>,
     /// The supervisor's event bus clone (story 7-2): held OUTSIDE the mutex so
@@ -474,11 +494,7 @@ impl Engine {
             pause_command_cap_override,
         } = options;
         let registry = Registry::open(base)?;
-        let rt = Runtime::new().map_err(|e| RegistryError::Io {
-            name: "<engine-runtime>".to_string(),
-            path: "<tokio-runtime>".to_string(),
-            source: e,
-        })?;
+        let rt = Self::build_runtime()?;
         // Story 3-4: thread the engine runtime handle into the supervisor so an
         // `engine-observed` start can spawn its loopback forward listener's
         // accept loop on this runtime (the sync start path runs on the blocking
@@ -519,6 +535,7 @@ impl Engine {
         }
         let events = supervisor.event_bus();
         let inner = Arc::new(EngineInner {
+            read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
@@ -541,7 +558,66 @@ impl Engine {
         Ok(Self {
             rt: Arc::new(rt),
             inner,
-            reaper,
+            reaper: Some(reaper),
+        })
+    }
+
+    /// Open a READ-ONLY engine (story 21-4, AD-20's one data-path owner):
+    /// the same facade over a `query_only` connection with a CLOSED store
+    /// writer (every write answers a typed error, never a panic), an empty
+    /// supervisor, NO orphan adoption and NO crash-detection reaper — so it
+    /// never touches a process another engine supervises and never writes
+    /// state.db.
+    ///
+    /// * A missing state.db reads as an EMPTY fleet; nothing is created
+    ///   (not the state directory, not the database).
+    /// * A state.db below the current schema answers
+    ///   [`StoreError::NeedsMigration`](crate::ports::StoreError::NeedsMigration)
+    ///   (wrapped in [`RegistryError::Store`]); the migration is a write, so
+    ///   the caller lets a writer open first.
+    /// * A live instance's current-Run totals come from the spawn record's
+    ///   persisted Run id — the same id adoption resumes.
+    ///
+    /// This is the `hekma` CLI's read path (`list`, `show`, `usage`, `logs`,
+    /// `config get`); every CLI write goes to the Service Host instead.
+    pub fn open_read_only(base: Option<PathBuf>) -> Result<Self, RegistryError> {
+        let registry = Registry::open_read_only(base)?;
+        let rt = Self::build_runtime()?;
+        let supervisor = Supervisor::with_runtime(rt.handle().clone());
+        let events = supervisor.event_bus();
+        let inner = Arc::new(EngineInner {
+            read_only: true,
+            registry: Mutex::new(registry),
+            supervisor: Mutex::new(supervisor),
+            events,
+        });
+        Ok(Self {
+            rt: Arc::new(rt),
+            inner,
+            reaper: None,
+        })
+    }
+
+    /// Story 21-4: every mutating facade method on a READ-ONLY engine answers
+    /// this typed refusal before doing anything — not only the `state.db`
+    /// writes (which the closed writer refuses anyway) but the file writes
+    /// beside them (a config layer, a snapshot, a memory directory, a spawn).
+    fn refuse_if_read_only(&self) -> Result<(), crate::ports::StoreError> {
+        if self.inner.read_only {
+            Err(crate::store::read_only_refusal())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The ONE runtime construction site (the embed-clean audit pins it):
+    /// every engine — writing or read-only — owns its own multi-thread
+    /// runtime, built here and dropped with the engine.
+    fn build_runtime() -> Result<Runtime, RegistryError> {
+        Runtime::new().map_err(|e| RegistryError::Io {
+            name: "<engine-runtime>".to_string(),
+            path: "<tokio-runtime>".to_string(),
+            source: e,
         })
     }
 
@@ -686,6 +762,7 @@ impl Engine {
     /// Async wrapper over the blocking [`Registry::register`]; the FS+SQLite work
     /// runs on the blocking pool.
     pub async fn register(&self, name: &str, kind: &str) -> Result<AgentInstance, RegistryError> {
+        self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let kind = kind.to_string();
@@ -705,6 +782,7 @@ impl Engine {
         name: &str,
         reference: &AdapterRef,
     ) -> Result<AgentInstance, RegistryError> {
+        self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let reference = reference.clone();
@@ -758,6 +836,7 @@ impl Engine {
         disposition: RemoveDisposition,
         force: bool,
     ) -> Result<(), RegistryError> {
+        self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -868,7 +947,13 @@ impl Engine {
             let entries = instances
                 .into_iter()
                 .map(|instance| {
-                    Self::fleet_entry_for(&registry, &supervisor, records.as_ref(), instance)
+                    Self::fleet_entry_for(
+                        &registry,
+                        &supervisor,
+                        records.as_ref(),
+                        instance,
+                        inner.read_only,
+                    )
                 })
                 .collect();
             Ok(entries)
@@ -910,6 +995,7 @@ impl Engine {
                 &supervisor,
                 Some(&records),
                 instance,
+                inner.read_only,
             ))
         })
         .await
@@ -926,6 +1012,7 @@ impl Engine {
         supervisor: &Supervisor,
         records: Option<&HashMap<InstanceName, SpawnRecord>>,
         instance: AgentInstance,
+        read_only: bool,
     ) -> FleetEntry {
         // The write-ahead spawn record for the restart count/policy + cause.
         // `Some(map)` is the AI-16 batched read (no per-instance store query on
@@ -946,19 +1033,59 @@ impl Engine {
         // `None` (the honest absence a human cell renders as `—`), so a
         // stopped row can never imply supervised. Computed BEFORE the
         // `failed_cause` fold below consumes the record.
-        let supervision = record.as_ref().and_then(|record| {
+        // Story 21-4: a READ-ONLY engine reconciles nothing, so a
+        // `running`/`paused` row whose recorded process is provably gone is
+        // SHOWN as what the next write's reconciliation records (`failed`,
+        // no supervision, the cause naming the pid), with the stored state
+        // kept in `recorded_state` — written nowhere.
+        let gone = read_only
+            && matches!(
+                instance.state,
+                LifecycleState::Running | LifecycleState::Paused
+            )
+            && record
+                .as_ref()
+                .is_some_and(|record| supervisor.record_process_gone(record));
+        let recorded_state = gone.then_some(instance.state);
+        let mut instance = instance;
+        if gone {
+            instance.state = LifecycleState::Failed;
+        }
+        let supervision = record.as_ref().filter(|_| !gone).and_then(|record| {
             (record.fingerprint.pid != 0).then_some(if record.detach {
                 crate::domain::Supervision::Detached
             } else {
                 crate::domain::Supervision::Session
             })
         });
+        // Story 21-4: a READ-ONLY engine's supervisor is empty, so a live
+        // instance's current Run id comes from its persisted spawn record —
+        // the id the owning host's supervisor holds (and adoption resumes).
+        let persisted_run_id = if read_only
+            && matches!(
+                instance.state,
+                LifecycleState::Starting
+                    | LifecycleState::Running
+                    | LifecycleState::Paused
+                    | LifecycleState::Stopping
+            ) {
+            record.as_ref().and_then(|r| r.run_id.clone())
+        } else {
+            None
+        };
         let restart_policy = record
             .as_ref()
             .map(|r| r.restart_policy)
             .unwrap_or_default();
         let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
-        let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+        let gone_pid = record.as_ref().map(|r| r.fingerprint.pid);
+        let failed_cause = record.and_then(|r| r.last_known_cause);
+        let failed_cause = if gone {
+            Some(gone_cause(gone_pid.unwrap_or(0), failed_cause.as_deref()))
+        } else {
+            failed_cause
+        };
+        let failed_cause = failed_cause.or_else(|| {
             // No record cause. For a `failed` instance, fall back to the last
             // event-log cause (a launch-error / cleared-terminal crash) — the same
             // fallback `instance_status` uses (AC9).
@@ -984,7 +1111,9 @@ impl Engine {
         // truthful `zero()` (known-zero cached — there is nothing to be unknown
         // about a Run that does not exist).
         let cumulative = registry.usage_totals(&instance.name).unwrap_or_default();
-        let current_run_id = supervisor.current_run_id(&instance.name);
+        let current_run_id = supervisor
+            .current_run_id(&instance.name)
+            .or(persisted_run_id);
         let current_run = match current_run_id.as_ref() {
             Some(run_id) => registry
                 .run_usage_totals(&instance.name, run_id)
@@ -1135,6 +1264,7 @@ impl Engine {
             // Story 15-2: detached vs session-bound (from the spawn record;
             // `None` — omitted — for a stopped / never-started instance).
             supervision,
+            recorded_state,
             agent_home: instance.agent_home,
         }
     }
@@ -1165,6 +1295,7 @@ impl Engine {
     /// failed` on a launch error (diagnostic preserved, no zombie). Returns the
     /// instance in its new state.
     pub async fn start(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1184,6 +1315,7 @@ impl Engine {
     /// enforcement / event delivery between commands) — the `hekma` CLI states
     /// it on `--help` and its stderr notice.
     pub async fn start_detached(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1206,6 +1338,7 @@ impl Engine {
         name: &str,
         window: Option<Duration>,
     ) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1283,6 +1416,7 @@ impl Engine {
     /// fast ([`EngineError::CapabilityUnsupported`]) with no state change. Returns
     /// the instance in its new state.
     pub async fn pause(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1297,6 +1431,7 @@ impl Engine {
     /// counterpart of [`Engine::pause`]: guaranteed → SIGCONT + `paused→running`;
     /// best-effort → `paused→running` with a `resume-best-effort` qualifier.
     pub async fn resume(&self, name: &str) -> Result<AgentInstance, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1322,6 +1457,7 @@ impl Engine {
         name: &str,
         timeout_override: Option<Duration>,
     ) -> Result<DrainReport, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1349,6 +1485,7 @@ impl Engine {
     /// Interface (AD-2/AD-13): a Host embedding the engine gets `send_input`
     /// for free, no CLI required.
     pub async fn send_input(&self, name: &str, text: &str) -> Result<(), EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let text = text.to_string();
@@ -1381,18 +1518,43 @@ impl Engine {
                 name: name.clone(),
                 reason,
             })?;
-            let instance = registry
+            let mut instance = registry
                 .lookup(&iname)
                 .map_err(crate::domain::registry_error_to_engine)?;
             let record = registry
                 .spawn_record(&iname)
                 .map_err(crate::domain::registry_error_to_engine)?;
+            // Story 21-4: the read-only view of a provably-dead process (the
+            // Fleet read's rule, [`Engine::fleet_entry_for`]) — shown
+            // `failed`, nothing written.
+            let gone = inner.read_only
+                && matches!(
+                    instance.state,
+                    LifecycleState::Running | LifecycleState::Paused
+                )
+                && record.as_ref().is_some_and(|record| {
+                    inner
+                        .supervisor
+                        .lock()
+                        .expect("supervisor mutex poisoned")
+                        .record_process_gone(record)
+                });
+            if gone {
+                instance.state = LifecycleState::Failed;
+            }
             let restart_policy = record
                 .as_ref()
                 .map(|r| r.restart_policy)
                 .unwrap_or_default();
             let restart_count = record.as_ref().map(|r| r.restart_count).unwrap_or(0);
-            let failed_cause = record.and_then(|r| r.last_known_cause).or_else(|| {
+            let gone_pid = record.as_ref().map(|r| r.fingerprint.pid).unwrap_or(0);
+            let failed_cause = record.and_then(|r| r.last_known_cause);
+            let failed_cause = if gone {
+                Some(gone_cause(gone_pid, failed_cause.as_deref()))
+            } else {
+                failed_cause
+            };
+            let failed_cause = failed_cause.or_else(|| {
                 // No record cause. For a `failed` instance, fall back to the last
                 // event-log cause so a launch-error or a cleared-terminal crash
                 // still surfaces a reason (AC9).
@@ -1425,6 +1587,7 @@ impl Engine {
         name: &str,
         policy: RestartPolicy,
     ) -> Result<(), EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1524,6 +1687,11 @@ impl Engine {
         key: &str,
         value: &str,
     ) -> Result<Vec<String>, ConfigError> {
+        self.refuse_if_read_only()
+            .map_err(|err| ConfigError::Store {
+                name: name.to_string(),
+                detail: err.to_string(),
+            })?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let key = key.to_string();
@@ -1563,6 +1731,7 @@ impl Engine {
         name: &str,
         kind: crate::ports::MemoryBackingKind,
     ) -> Result<PathBuf, RegistryError> {
+        self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1582,6 +1751,7 @@ impl Engine {
     /// [`Engine::attach_memory`] (no hot-swap, no force), same registry-lock-only
     /// discipline. Detaching when nothing is attached is a successful no-op.
     pub async fn detach_memory(&self, name: &str) -> Result<(), RegistryError> {
+        self.refuse_if_read_only().map_err(RegistryError::Store)?;
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         self.run_blocking(move || {
@@ -1724,6 +1894,27 @@ impl Engine {
         .await
     }
 
+    /// Whether this engine holds a live attributed capture (a tailer) for
+    /// `name` (story 21-4): `true` for an instance it spawned and still
+    /// supervises; `false` for an adopted instance, one it does not hold, an
+    /// unknown or malformed name, and every instance of a read-only engine.
+    /// A reader that also polls the raw `agent.log` uses it to avoid
+    /// reporting the same bytes twice.
+    pub async fn has_live_capture(&self, name: &str) -> bool {
+        let Ok(name) = InstanceName::new(name) else {
+            return false;
+        };
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .supervisor
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .has_live_capture(&name)
+        })
+        .await
+    }
+
     /// The engine's configured log-capture posture (story 17-4, review
     /// finding 21): `full` | `metadata` | `off` — `/v0/version`'s
     /// self-description carries it, so a Host learns what `output.log`
@@ -1787,6 +1978,7 @@ impl Engine {
     /// Holds the SUPERVISOR lock: ack advances what compaction may drop, so
     /// it must not interleave an append's compaction decision.
     pub async fn ack_export(&self, seq: u64) -> Result<u64, EngineError> {
+        self.refuse_if_read_only().map_err(EngineError::Store)?;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
@@ -2022,6 +2214,11 @@ impl Blocking<'_> {
     /// have this twin — embedders on the sync facade read the same posture).
     pub fn log_capture_mode(&self) -> LogCaptureMode {
         self.engine.rt.block_on(self.engine.log_capture_mode())
+    }
+
+    /// Blocking [`Engine::has_live_capture`].
+    pub fn has_live_capture(&self, name: &str) -> bool {
+        self.engine.rt.block_on(self.engine.has_live_capture(name))
     }
 
     /// Blocking [`Engine::effective_capabilities`].
@@ -2496,5 +2693,176 @@ mod tests {
             }),
             RegistryError::Io { .. }
         ));
+    }
+
+    // ---- Story 21-4: the read-only open ----
+
+    #[test]
+    fn a_read_only_open_of_a_missing_state_dir_reads_an_empty_fleet_and_creates_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("never-created");
+        let engine = Engine::open_read_only(Some(base.clone())).unwrap();
+        let facade = engine.blocking();
+        assert!(facade.fleet().unwrap().is_empty());
+        assert!(facade.list().unwrap().is_empty());
+        assert!(matches!(
+            facade.fleet_entry("ghost").unwrap_err(),
+            RegistryError::NotFound { .. }
+        ));
+        // A write answers the typed read-only refusal — never a panic.
+        match facade.register("demo", "mock").unwrap_err() {
+            RegistryError::Store(StoreError::Backend(detail)) => {
+                assert!(detail.contains("read-only"), "{detail}")
+            }
+            other => panic!("expected the read-only refusal, got {other:?}"),
+        }
+        drop(engine);
+        assert!(!base.exists(), "a read-only open creates nothing");
+    }
+
+    #[test]
+    fn a_read_only_open_reads_what_a_writer_committed_and_never_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        {
+            let writer = Engine::open(Some(base.clone())).unwrap();
+            writer.blocking().register("demo", "mock").unwrap();
+        }
+        let db = base.join(crate::paths::STATE_DB_FILE);
+        let before = std::fs::read(&db).unwrap();
+        let engine = Engine::open_read_only(Some(base.clone())).unwrap();
+        let facade = engine.blocking();
+        let fleet = facade.fleet().unwrap();
+        assert_eq!(fleet.len(), 1);
+        assert_eq!(fleet[0].name.as_str(), "demo");
+        assert!(facade.effective_capabilities("demo").is_ok());
+        assert!(facade
+            .effective_config("demo", ConfigLayer::empty())
+            .is_ok());
+        // Writes refuse; nothing changed on disk.
+        assert!(facade.set_config("demo", "model", "x").is_err());
+        assert!(facade
+            .remove("demo", RemoveDisposition::Retain, false)
+            .is_err());
+        drop(engine);
+        assert_eq!(std::fs::read(&db).unwrap(), before, "state.db is untouched");
+    }
+
+    #[test]
+    fn a_read_only_open_of_an_older_schema_answers_needs_migration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let db = base.join(crate::paths::STATE_DB_FILE);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("PRAGMA user_version = 3").unwrap();
+        }
+        match Engine::open_read_only(Some(base.clone())) {
+            Err(RegistryError::Store(StoreError::NeedsMigration { found, current })) => {
+                assert_eq!(found, 3);
+                assert!(current > found);
+            }
+            Err(other) => panic!("expected NeedsMigration, got {other:?}"),
+            Ok(_) => panic!("an older schema must not open read-only"),
+        }
+        // A newer schema is still the typed too-new refusal.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("PRAGMA user_version = 9999").unwrap();
+        }
+        assert!(matches!(
+            Engine::open_read_only(Some(base)),
+            Err(RegistryError::Store(StoreError::SchemaTooNew { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_read_only_fleet_reads_the_current_run_from_the_persisted_spawn_record() {
+        // The live supervisor's only Fleet input — the current Run id — comes
+        // from the persisted spawn record for a live instance in a read-only
+        // engine, so its current-run totals match the owning host's. The
+        // "live" record carries THIS test process's own fingerprint (a
+        // process that is provably alive); the "ghost" record a pid whose
+        // start time can never match, so the read shows it `failed` with the
+        // stored state kept in `recorded_state` — and writes nothing.
+        use crate::ports::ProcessBackend;
+        let me = crate::backends::current()
+            .self_fingerprint()
+            .expect("this process's own fingerprint");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        {
+            let writer = Engine::open(Some(base.clone())).unwrap();
+            writer.blocking().register("live", "mock").unwrap();
+            writer.blocking().register("ghost", "mock").unwrap();
+        }
+        let db = base.join(crate::paths::STATE_DB_FILE);
+        let seed = |conn: &rusqlite::Connection, name: &str, pid: u32, start: u64, run: &str| {
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM agent_instances WHERE name = ?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE agent_instances SET state = 'running' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runtime \
+                 (instance_id, pid, start_time, restart_policy, restart_count, run_id) \
+                 VALUES (?1, ?2, ?3, 'on-failure', 0, ?4)",
+                rusqlite::params![id, pid, start as i64, run],
+            )
+            .unwrap();
+            // The per-Run rollup is what the Fleet's current-run totals read.
+            conn.execute(
+                "INSERT INTO usage_rollup_run \
+                 (instance_id, run_id, events, input_tokens, output_tokens) \
+                 VALUES (?1, ?2, 1, 7, 3)",
+                rusqlite::params![id, run],
+            )
+            .unwrap();
+        };
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            seed(&conn, "live", me.pid, me.start_time, "run-persisted");
+            seed(
+                &conn,
+                "ghost",
+                me.pid,
+                me.start_time.wrapping_add(1),
+                "run-ghost",
+            );
+        }
+        let before = std::fs::read(&db).unwrap();
+        let engine = Engine::open_read_only(Some(base)).unwrap();
+        let entry = engine.blocking().fleet_entry("live").unwrap();
+        assert_eq!(entry.state, LifecycleState::Running);
+        assert_eq!(entry.recorded_state, None, "{entry:?}");
+        assert_eq!(entry.usage.current_run_input_tokens, 7, "{entry:?}");
+        assert_eq!(entry.usage.current_run_output_tokens, 3, "{entry:?}");
+
+        let ghost = engine.blocking().fleet_entry("ghost").unwrap();
+        assert_eq!(ghost.state, LifecycleState::Failed, "{ghost:?}");
+        assert_eq!(ghost.recorded_state, Some(LifecycleState::Running));
+        assert_eq!(ghost.supervision, None, "a dead process is not supervised");
+        assert_eq!(ghost.usage.current_run_input_tokens, 0, "its Run ended");
+        let cause = ghost.failed_cause.clone().unwrap_or_default();
+        assert!(
+            cause.contains(&format!("pid {} is gone", me.pid)),
+            "{cause}"
+        );
+        let status = engine.blocking().instance_status("ghost").unwrap();
+        assert_eq!(status.instance.state, LifecycleState::Failed);
+        assert_eq!(status.failed_cause.as_deref(), Some(cause.as_str()));
+        drop(engine);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the reads wrote nothing"
+        );
     }
 }

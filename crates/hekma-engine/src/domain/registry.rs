@@ -276,30 +276,7 @@ impl Registry {
     ///
     /// Ensures the state dir exists and opens (creating + migrating) the DB.
     pub fn open(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
-        let paths = EnginePaths::new(base).map_err(|e| {
-            // AI-4: name the ACTUAL path that failed. A rejected relative
-            // `KTESIO_STATE_DIR` carries the offending value itself — not the
-            // `<default via …>` placeholder, which describes a resolution mode,
-            // not the path the operator typed. Only the genuinely path-less
-            // failure (no env var and no platform data dir) keeps the
-            // placeholder, because there is no concrete path to name.
-            let path = match &e {
-                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
-                crate::paths::PathError::ConflictingStateDir { alias, .. } => {
-                    // Both env names set with different values: name the
-                    // alias value (the message itself quotes both).
-                    alias.to_string_lossy().into_owned()
-                }
-                crate::paths::PathError::NoStateDir => {
-                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
-                }
-            };
-            RegistryError::Io {
-                name: "<state-dir>".to_string(),
-                path,
-                source: std::io::Error::other(e.to_string()),
-            }
-        })?;
+        let paths = Self::resolve_paths(base)?;
         // Create the state base (and thus its parent chain) before opening the
         // DB — a fresh install has no directory yet (AC1 "fresh state").
         ensure_dir(paths.state_base(), "<state-dir>")?;
@@ -322,6 +299,66 @@ impl Registry {
             store,
             writer,
             open_notes: std::sync::Mutex::new(notes),
+        })
+    }
+
+    /// Open a READ-ONLY registry (story 21-4): no directory is created, no
+    /// migration runs, no legacy import happens, and the store writer is
+    /// CLOSED (every write answers a typed refusal). A missing state.db reads
+    /// as an empty fleet from an in-memory database — nothing is created on
+    /// disk; a state.db below the current schema answers
+    /// [`StoreError::NeedsMigration`].
+    pub fn open_read_only(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
+        let paths = Self::resolve_paths(base)?;
+        let db = paths.state_db();
+        let store = if db.exists() {
+            SqliteStore::open_existing_read_only(&db)?
+        } else {
+            SqliteStore::open_empty_read_only()?
+        };
+        Ok(Self {
+            paths,
+            store,
+            writer: StoreWriter::closed(),
+            open_notes: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Resolve the state paths WITHOUT opening anything (story 21-4: the
+    /// `hekma` CLI locates the state root its Service Host owns), mapping a
+    /// resolution failure to the same typed `Io` error both opens raise.
+    pub fn resolve_state_paths(
+        base: Option<std::path::PathBuf>,
+    ) -> Result<EnginePaths, RegistryError> {
+        Self::resolve_paths(base)
+    }
+
+    /// Resolve the state paths, mapping a resolution failure to the typed
+    /// `Io` error naming the offending path (shared by both opens).
+    fn resolve_paths(base: Option<std::path::PathBuf>) -> Result<EnginePaths, RegistryError> {
+        EnginePaths::new(base).map_err(|e| {
+            // AI-4: name the ACTUAL path that failed. A rejected relative
+            // `KTESIO_STATE_DIR` carries the offending value itself — not the
+            // `<default via …>` placeholder, which describes a resolution mode,
+            // not the path the operator typed. Only the genuinely path-less
+            // failure (no env var and no platform data dir) keeps the
+            // placeholder, because there is no concrete path to name.
+            let path = match &e {
+                crate::paths::PathError::RelativeStateDir { value } => value.clone(),
+                crate::paths::PathError::ConflictingStateDir { alias, .. } => {
+                    // Both env names set with different values: name the
+                    // alias value (the message itself quotes both).
+                    alias.to_string_lossy().into_owned()
+                }
+                crate::paths::PathError::NoStateDir => {
+                    format!("<default via {}>", crate::paths::STATE_DIR_ENV)
+                }
+            };
+            RegistryError::Io {
+                name: "<state-dir>".to_string(),
+                path,
+                source: std::io::Error::other(e.to_string()),
+            }
         })
     }
 

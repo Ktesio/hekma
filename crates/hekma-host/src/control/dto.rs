@@ -119,6 +119,11 @@ pub(crate) struct StatusDocument {
     pub schema_version: u32,
     /// The status itself.
     pub status: StatusDetail,
+    /// Story 21-4 (additive): whether this host holds a live attributed
+    /// capture (a tailer) for the instance — `false` for an adopted one. A
+    /// raw-log reader falls back to `agent.log` only when it is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_capture: Option<bool>,
 }
 
 /// The status payload — [`hekma_engine::InstanceStatus`]'s fields rendered
@@ -369,10 +374,13 @@ mod tests {
                 restart_count: 0,
                 failed_cause: None,
             },
+            live_capture: None,
         };
         let json = serde_json::to_value(&document).unwrap();
         assert_eq!(json["schema_version"], CONTROL_API_SCHEMA_VERSION);
         assert_eq!(json["status"]["failed_cause"], serde_json::Value::Null);
+        // The additive live-capture fact is omitted when not read.
+        assert!(json.get("live_capture").is_none());
     }
 
     #[test]
@@ -476,4 +484,66 @@ mod tests {
         });
         serde_json::from_value(json).expect("sample instance")
     }
+}
+
+/// `POST /v0/instances/{name}/start` (story 21-4) — the optional start body.
+/// ABSENT (an empty request body) or `{"detach": false}` is a supervised
+/// start; `{"detach": true}` disarms the child's handle at spawn, so the
+/// agent survives this host's exit too (the engine's `start_detached`).
+#[derive(Deserialize, Default)]
+pub(crate) struct StartRequest {
+    /// Detach the agent from this host's lifetime.
+    #[serde(default)]
+    pub detach: bool,
+}
+
+/// `POST /v0/instances/{name}/send` (story 21-4) — text for the running
+/// agent's native input channel (the engine's `send_input`).
+#[derive(Deserialize)]
+pub(crate) struct SendRequest {
+    /// The text to deliver (sent as-is).
+    pub text: String,
+}
+
+/// `PUT /v0/instances/{name}/memory` (story 21-4) — attach a Memory Backing
+/// of this kind (`filesystem` or `native`).
+#[derive(Deserialize)]
+pub(crate) struct MemoryPutRequest {
+    /// The backing kind's wire form.
+    pub kind: String,
+}
+
+/// The `PUT /v0/instances/{name}/memory` response (story 21-4): the managed
+/// directory the attach returned plus the attachment read back — the same
+/// fields the CLI's `memory attach --json` document carries. A read-back
+/// that fails after the attach COMMITTED still answers `200` (the attach
+/// stands): the three read-back fields are then `null` and
+/// `readback_error` names the failure — never a fabricated status.
+#[derive(Serialize)]
+pub(crate) struct MemoryDocument {
+    /// The Control-API document family version.
+    pub schema_version: u32,
+    /// The instance the backing is attached to.
+    pub instance: String,
+    /// The engine-computed managed directory.
+    pub dir: String,
+    /// The attached kind's wire form (`None` when the read-back failed).
+    pub kind: Option<String>,
+    /// The NFR-7 guarantee level's wire form (`None` when the read-back
+    /// failed).
+    pub guarantee: Option<String>,
+    /// Whether the adapter's config mapping targets `memory.dir` (`None` when
+    /// the read-back failed).
+    pub declared: Option<bool>,
+    /// The read-back failure, when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readback_error: Option<String>,
+}
+
+/// `PUT /v0/instances/{name}/restart-policy` (story 21-4) — the Restart
+/// Policy's wire form (the engine setter the 17-3 projection excluded).
+#[derive(Deserialize)]
+pub(crate) struct RestartPolicyRequest {
+    /// The policy's wire form (e.g. `never`, `on-failure`).
+    pub policy: String,
 }
