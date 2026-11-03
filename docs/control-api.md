@@ -118,7 +118,7 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/fleet` | Every instance's Fleet row (the `list --json` document, verbatim) | 200 |
 | `POST` | `/v0/instances` | Register from exactly one adapter source: `{"name","kind"}` or `{"name","manifest"}` (an ABSOLUTE `adapter.toml` directory path) — both or neither is a 400 | 201 + `Location: /v0/instances/{name}` + read-back |
 | `GET` | `/v0/instances/{name}` | One instance's Fleet row (the `show --json` document) | 200 |
-| `DELETE` | `/v0/instances/{name}?disposition=&force=` | Remove an instance. `disposition` is `retain` (default — the Agent Home stays on disk) or `delete`; `force=true` removes a running instance (without it a running one is a 409 — stop it first). Any other value is a 400 | 204, empty |
+| `DELETE` | `/v0/instances/{name}?disposition=&force=` | Remove an instance. `disposition` is `retain` (default — the Agent Home stays on disk) or `delete`; `force=true` removes a running instance (without it a running one is a 409 — stop it first): the instance is first stopped through the bounded stop ladder with the default 30 s window, so the request can take that long. On Windows, where no graceful signal is sent yet, the whole window elapses before the forced kill. Any other value is a 400 | 204, empty |
 | `GET` | `/v0/instances/{name}/status` | Runtime status: the registry row, effective restart policy, restart count, failure cause | 200 |
 | `GET` | `/v0/instances/{name}/capabilities` | The effective Capability Declaration projected onto this OS | 200 |
 | `GET` | `/v0/instances/{name}/config` | The effective config (the `config get --json` document; values masked) | 200 |

@@ -3019,7 +3019,20 @@ fn call(
         ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
         (other, _) => panic!("unsupported test method {other}"),
     }
-    .unwrap()
+    .unwrap_or_else(|err| panic!("{method} {url}: {err}"))
+}
+
+/// A client that waits past the stop ladder's bound (the default 30 s
+/// window plus the forced kill's confirmation): a forced remove of a running
+/// instance stops it first, and on Windows — no graceful signal is sent yet —
+/// the whole window elapses before the kill.
+fn ladder_client() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_recv_response(Some(Duration::from_secs(90)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
+        .build();
+    ureq::Agent::new_with_config(config)
 }
 
 #[test]
@@ -3182,9 +3195,10 @@ fn the_story_21_4_routes_project_every_cli_write() {
         json_body(&mut response)["instance"]["supervision"],
         "detached"
     );
-    // force removes the running instance and deletes its home.
+    // force removes the running instance and deletes its home (it stops it
+    // through the ladder first — the full default window on Windows).
     let response = call(
-        &client,
+        &ladder_client(),
         "DELETE",
         &format!("{instances}/worker?disposition=delete&force=true"),
         None,
