@@ -47,7 +47,7 @@
 # - Generated headless-conservative inline in the parent orchestrator (flapping classifier; deviations logged in planning artifacts)
 
 generated: 2026-07-02
-last_updated: "2026-11-02"  # 21-2 in review. 21-4 built, in review. 21-1 done (PR #362). 2026-10-31: 19-2 done (PR #358). 2026-10-30: control-plane pivot (sprint-change-proposal-2026-10-30-control-plane-pivot.md): epic-18 + 19-1 drift fixed, 19-3 absorbed into 21-2, epics 21-25 added and renumbered into build order
+last_updated: "2026-11-03"  # 21-2 done (PR #376). 21-4 done (PR #378). 21-1 done (PR #362). 2026-10-31: 19-2 done (PR #358). 2026-10-30: control-plane pivot (sprint-change-proposal-2026-10-30-control-plane-pivot.md): epic-18 + 19-1 drift fixed, 19-3 absorbed into 21-2, epics 21-25 added and renumbered into build order
 project: ktesio
 project_key: NOKEY
 tracking_system: file-system
@@ -209,9 +209,9 @@ development_status:
   # Readiness gate 2026-10-30 (implementation-readiness-2026-10-30.md): CONCERNS resolved by Islam's D1-D3 rulings; 21-9 added.
   epic-21: in-progress  # One Control Plane (FR-49, FR-50, FR-57, FR-60; FR-21/FR-41 amendments; AD-20, AD-25, AD-27)
   21-1-the-store-writer-and-run-scale-storage: done  # 2026-11-02 MERGED as 026c074 (PR #362): one store writer per engine process, budget checks inside its transaction, transitions/breaches/outbox in state.db with a one-way upgrade, hekma-engine 0.11.0 (no public type change; semver baseline left at 7783aa4, as for 19-2). AD-27; money code (AI-55)
-  21-2-runs-as-first-class-entities: review  # 2026-11-02 PR open: Run registry (runs/run_labels/run_limits/run_identities, schema v13), relaunch keeps the Run, child Runs + ancestor ceilings, governance vectors 1.2.0, hekma-engine 0.12.0. AD-25; absorbs 19-3 as child Runs; money code (AI-55 two-pass done)
+  21-2-runs-as-first-class-entities: done  # 2026-11-03 MERGED as 7212e9d (PR #376). 2026-11-02 PR open: Run registry (runs/run_labels/run_limits/run_identities, schema v13), relaunch keeps the Run, child Runs + ancestor ceilings, governance vectors 1.2.0, hekma-engine 0.12.0. AD-25; absorbs 19-3 as child Runs; money code (AI-55 two-pass done)
   21-3-policies-the-default-policy-and-the-warn-default: backlog  # FR-60, FR-21 upgrade write; money code (AI-55)
-  21-4-one-data-path-owner-the-cli-routes-through-a-local-service-host: review  # 2026-11-02 built on ktesio/21-4-service-host-4b8753 (spec-21-4-one-data-path-owner.md): every CLI write routes through the local Service Host (auto-started, idle-exit), reads open read-only (Engine::open_read_only), credential resolver + authority matrix, TLS beyond loopback, send/memory/restart-policy routes, engine_error wire codec + engine notes header. AD-20. One independent review pass done; gates green (changed-line coverage 95.78%); one PR from ktesio/21-4-service-host-4b8753
+  21-4-one-data-path-owner-the-cli-routes-through-a-local-service-host: done  # 2026-11-03 MERGED as d30bbd6 (PR #378). 2026-11-02 built on ktesio/21-4-service-host-4b8753 (spec-21-4-one-data-path-owner.md): every CLI write routes through the local Service Host (auto-started, idle-exit), reads open read-only (Engine::open_read_only), credential resolver + authority matrix, TLS beyond loopback, send/memory/restart-policy routes, engine_error wire codec + engine notes header. AD-20. One independent review pass done; gates green (changed-line coverage 95.78%); one PR from ktesio/21-4-service-host-4b8753
   21-5-hekma-ps-and-run-listing: backlog
   21-6-selectors-on-every-verb-and-hekma-budget: backlog  # latch re-arm from 19-3 lands here
   21-7-hekma-top: backlog  # after 23-4
