@@ -2,7 +2,7 @@
 title: 'One data-path owner: the CLI routes through a local Service Host'
 type: 'feature'
 created: '2026-11-02'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 1
 baseline_commit: '8ead5ec81f7f6821eef0716a2759ae24f7291565'
 context:
