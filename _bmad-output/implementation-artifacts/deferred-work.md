@@ -403,6 +403,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-19-2-the-wire-fence-block-breach-action.md` (Design Notes: Restart Policy relaunch)
   summary: A Restart Policy relaunch begins a new Run in today's code (a fresh run id and per-run total), so a per-run `block` fence does not carry into it; a fenced agent that crashes and is relaunched gets a fresh per-run budget each relaunch, bounded only by the Restart Policy and any cumulative ceiling. Surfaced by a diagnostic at relaunch (`note_relaunch_lifts_per_run_fence`) and in docs/hosting.md.
   evidence: `crates/hekma-engine/src/domain/supervisor/spawn.rs` mints a fresh `RunId` on every (re)spawn; the spine's Run (AD-25) spans Restart Policy relaunches. Trigger: story 21.2 (the AD-25 Run that spans relaunches) — carry the per-run fence reasons across a relaunch in the same change.
+  resolved: story 21-2 (`spec-21-2-runs-as-first-class-entities.md`: a relaunch keeps the Run, so the per-run latch and fence carry; the relaunch diagnostic is removed) 2026-11-02
 - source_spec: `spec-19-2-the-wire-fence-block-breach-action.md` (AI-55 adversarial review, finding 8)
   summary: A fenced instance reads only `running` in the Fleet listing and `agent status`; the fence shows on the engine diagnostic line, in the breach event (`action: "block"`) and to the agent itself (every model call gets the 402), but not on the operator's state surface. A "fenced (`<code>`)" marker on the Fleet budget cell or status would close it.
   evidence: `FleetEntry`/`BudgetView` (crates/hekma-engine/src/domain/fleet.rs) carry the configured action, not the live fence; the fence lives on the listener (`WireFence`) with no read path to the Fleet. Trigger: the AD-26 disposition surface (stories 23.1/23.4 store the per-Run disposition on `runs` for `hekma ps`) — show `block` there; earlier if an operator reports a fenced agent read as healthy.
@@ -418,12 +419,33 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-1-the-store-writer-and-run-scale-storage.md` (Design Notes: launch generation)
   summary: An agent that re-emits a self-reported usage line it first emitted before an adoption is counted again, because the adoption bumped the launch generation in the dedup key. The engine itself never re-reads such a line (the drain anchors at end of file on adoption), and the error is an overcount, AD-8's safe direction.
   evidence: `store/run_store_sqlite.rs` (`idx_usage_events_dedup` on instance, run, generation, sequence); `supervisor/reaper.rs` bumps the generation at adoption. Trigger: story 21.2 (a Run that spans relaunches) — decide whether self-reported rows key on the agent process's launch and observed rows on the engine's attach.
+  re-deferred by story 21-2 (2026-11-02): the Run now spans relaunches but the dedup key is unchanged (instance, run, generation, sequence); the overcount stays the safe direction. New trigger: story 23.1, when proxied usage keys on call ids and self-reported usage is the only sequence-keyed source.
 - source_spec: `spec-21-1-the-store-writer-and-run-scale-storage.md` (AD-27 scope)
   summary: Ended-Run compaction (a compacted-Run rollup, then deleting `runs` detail rows), the calls store and the published snapshot are not in this story: they need the `runs` table (21.2), the shared proxy (23.1) and the snapshot publisher (21.2).
   evidence: readiness resolution 2026-10-30 names 21.2 for the snapshot publisher and 23.1 for the calls store; `usage_rollup_run` is keyed by (instance, run id) until `runs` exists. Trigger: story 21.2 (re-key the per-Run rollup by run and add the compaction window), 23.1 (calls store).
+  partly resolved by story 21-2 (2026-11-02): the snapshot publisher ships; `usage_rollup_run` stays keyed (instance, run) and becomes a subtree total (each ancestor under its own instance). Still open: ended-Run compaction and the retention window. New trigger: story 21.5 (`hekma ps --all` and the retention window it lists against).
 - source_spec: `spec-21-1-the-store-writer-and-run-scale-storage.md` (AI-55 adversarial review, finding 7)
   summary: `usage_events.instance_id` is nullable since schema 12, and SQLite treats NULLs as distinct in a UNIQUE index, so a self-reported row with no instance would never dedup against its replay. Nothing writes an instance-less row yet.
   evidence: `store/run_store_sqlite.rs` (`idx_usage_events_dedup` on instance, run, generation, sequence). Trigger: the first instance-less writer (story 21.2's Runs or 23.1's proxied usage) — key instance-less rows on (run, generation, sequence) or require a call id.
+  re-deferred by story 21-2 (2026-11-02): child Runs' rows carry the hosting instance, so 21.2 writes no instance-less usage. New trigger: story 23.1.
+
+## Deferred from: implementation of spec-21-2-runs-as-first-class-entities (2026-11-02)
+
+- source_spec: `spec-21-2-runs-as-first-class-entities.md` (Design Notes: child Runs)
+  summary: A child Run's own `pause`, `stop` and `block` Breach Actions are refused at open even when the hosting process has a wire path, because holding or rejecting one Run's calls does not exist yet; the verb × Control Depth cells for `announced` hold/reject and Breach Actions stay `pending`.
+  evidence: `domain/runs/ops.rs` (`action_refusal`), `domain/runs/verbs.rs` (`available: false` cells), `crates/hekma-conformance/fixtures/verb-depth.json`. Trigger: story 23.4 (wire hold / reject) — accept them, execute them over the child's calls, and flip the fixture cells.
+- source_spec: `spec-21-2-runs-as-first-class-entities.md` (Design Notes: child usage before 23.1)
+  summary: No public surface submits usage to a child Run; the pipeline evaluates any Run's ancestor chain, but only engine tests attribute usage to a child (`Supervisor::commit_run_usage`, cfg(test)). A Host's child Runs therefore carry ceilings and cascade, but meter nothing until attributed calls exist.
+  evidence: `domain/supervisor/runs.rs` (`commit_run_usage`); the readiness ruling scoped 21.2 to registry, rollup and cascade bookkeeping. Trigger: story 23.1 (the shared proxy attributes calls by run identity) — route attributed usage through the same pipeline job.
+- source_spec: `spec-21-2-runs-as-first-class-entities.md` (Design Notes: the snapshot)
+  summary: The Run snapshot is published copy-on-write, so a publish costs O(open Runs) pointer copies, and each engine process publishes its own (a child opened by a CLI engine reaches `hekma serve`'s snapshot only when that host next reloads it, which nothing does yet).
+  evidence: `domain/runs/snapshot.rs` (`RunSnapshot::with`), `Registry::open` (the one initial load). Trigger: story 21.4 (one data-path owner: the CLI routes writes through the host, so one writer publishes) and story 24.4 (O(changed entries) publish at scale).
+- source_spec: `spec-21-2-runs-as-first-class-entities.md` (Design Notes: depth changes)
+  summary: The `depth-fallback` Anomaly is raised only when a Run's depth changes; nothing raises it yet in production, since children are refused unexecutable actions at open and supervised Runs carry their actions in instance configuration.
+  evidence: `domain/runs/ops.rs` (`sync_depth`). Trigger: story 21.3 (Policy-inherited Breach Actions fall back to `warn` with an Anomaly) — raise the same Anomaly from Policy resolution.
+- source_spec: `spec-21-2-runs-as-first-class-entities.md` (AI-55 adversarial review, finding 2)
+  summary: Between a planned relaunch being dropped (its engine exited during the backoff) and the next engine open, the Run reads `active` with the `failed` Anomaly; the open's sweep then ends it (`relaunch-not-run`). A concurrently running host that does execute the relaunch reopens it, so the Run can read `ended` briefly before it runs again.
+  evidence: `domain/runs/ops.rs` (`end_runs_without_a_process`, the reopen in `ensure_supervised`), called from `adopt_orphans`. Trigger: story 21.4 (one data-path owner executes every plan) — the window closes.
 
 ## Deferred from: implementation of spec-21-4-one-data-path-owner (2026-11-02)
 

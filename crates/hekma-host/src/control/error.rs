@@ -26,7 +26,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use hekma_engine::{ConfigError, EngineError, RegistryError};
+use hekma_engine::{ConfigError, EngineError, RegistryError, RunError};
 use serde::Serialize;
 
 use super::dto;
@@ -106,6 +106,11 @@ pub(crate) struct ApiError {
     /// JSON-extractor rejections keep axum's 400/415/422 distinction; review
     /// item 9). Every other construction leaves it `None`.
     status_override: Option<StatusCode>,
+    /// A finer machine code for the Run routes (story 21-2: `run-not-found`,
+    /// `parent-ended`, `action-unavailable`, …), carried as `error.code`
+    /// beside the frozen `kind`. `None` everywhere else (the field is then
+    /// omitted — additive).
+    code: Option<&'static str>,
     /// Story 21-4: the engine's TYPED error, encoded by [`crate::wire`],
     /// whenever the failure is an engine error — the additive
     /// `error.engine_error` field a linking client decodes back into the
@@ -120,6 +125,7 @@ impl ApiError {
             kind,
             message: message.into(),
             status_override: None,
+            code: None,
             engine_error: None,
         }
     }
@@ -190,6 +196,7 @@ impl ApiError {
             error: ErrorDetail {
                 kind: self.kind.as_str(),
                 message: self.message.clone(),
+                code: self.code,
                 engine_error: self.engine_error.clone(),
             },
         }
@@ -295,6 +302,27 @@ impl ApiError {
     }
 }
 
+impl From<RunError> for ApiError {
+    fn from(err: RunError) -> Self {
+        let message = err.to_string();
+        let kind = match &err {
+            RunError::NotFound { .. } => ApiErrorKind::NotFound,
+            // The Run's (or its parent's) state forbids the request.
+            RunError::NoOpenRun { .. }
+            | RunError::ParentEnded { .. }
+            | RunError::OwnsProcess { .. } => ApiErrorKind::Conflict,
+            // The request itself cannot be honored.
+            RunError::NestingTooDeep { .. }
+            | RunError::ActionUnavailable { .. }
+            | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
+            RunError::Store(_) => ApiErrorKind::Internal,
+        };
+        let mut error = Self::new(kind, message);
+        error.code = Some(err.code());
+        error
+    }
+}
+
 impl From<ConfigError> for ApiError {
     fn from(err: ConfigError) -> Self {
         let encoded = crate::wire::encode_config(&err);
@@ -337,6 +365,8 @@ struct ErrorBody {
 struct ErrorDetail {
     kind: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
     /// Story 21-4: the encoded engine error (additive; absent when the
     /// failure is not an engine error — a routing or body rejection).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,6 +427,7 @@ where
                 message: rejection.body_text(),
                 // The rejection's status IS the more precise class.
                 status_override: Some(rejection.status()),
+                code: None,
                 engine_error: None,
             }),
         }

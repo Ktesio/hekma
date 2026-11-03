@@ -116,6 +116,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hekma agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
+| `open_child_run` / `close_run` / `run` | Open a child Run under a supervised Run for one unit of your own work (`ChildRunRequest`: parent, caller labels, per-run ceilings, an external id for idempotent retries), close it, and read any Run (`RunView`: depth, status, Anomalies, labels, limits, subtree usage). Refusals are a typed `RunError` with a stable `code()`. See [Runs](runs.md). |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
@@ -157,8 +158,10 @@ Four rules cover the whole contract:
    after it subscribed, in commit order, per-instance FIFO. Anything earlier is
    readable through the query APIs.
 2. **Payloads are versioned structs.** Every event carries a `schema_version`
-   and is one of: a lifecycle transition, a budget breach, or a committed
-   usage measurement — the exact wire shapes `hekma --json` documents.
+   and is one of: a lifecycle transition, a budget breach, a committed usage
+   measurement, or a Run event (`EngineEvent::Run`: a Run created, its depth,
+   status, Anomalies or bound labels changed, or ended — published right after
+   the event that caused it) — the exact wire shapes `hekma --json` documents.
 3. **A slow subscriber never stalls supervision.** The bus is bounded; if you
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the
@@ -241,7 +244,7 @@ The engine writes two kinds of operational diagnostics — a DC-10 notice when a
 attached filesystem memory backing cannot be delivered to the agent, and
 enforcement breadcrumbs: a budget-breach action (pause/stop) that could not be
 honored, a `block` wire fence raised (or not raised, so the breach acted as
-`warn`), and a Restart Policy relaunch that lifted a per-run fence. With no
+`warn`), and a Run's labels that could not be bound or updated. With no
 sink installed they go to **stderr**, byte-for-byte as they always have;
 nothing is written to stdout, ever. A host that owns its stderr (for a daemon,
 a GUI, a log pipeline) can route them into its own writer:

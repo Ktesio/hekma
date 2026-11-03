@@ -129,6 +129,14 @@ pub use domain::{
     OUTBOX_MAX_BYTES, OUTBOX_SCHEMA_VERSION, PASS_THROUGH_PREFIX, PAST_TAIL_SENTENCE, SECRET_MASK,
     USAGE_SCHEMA_VERSION,
 };
+// Story 21-2: Runs as first-class entities (AD-25) — the Run model, its
+// events and errors, and the verb × Control Depth table.
+pub use domain::{
+    parse_dollars_to_micros, validate_label_key, validate_label_value, verb_cell, Anomaly,
+    CellBehavior, ChildRunRequest, ControlDepth, Label, LabelSource, RunError, RunEvent,
+    RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage, RunVerb, RunView, VerbCell,
+    HOST_IDENTITY_BINDING, MAX_RUN_NESTING, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+};
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
@@ -140,13 +148,13 @@ pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // Story 19-2: the wire fence's pure consumer (`fence_refusal`) and the
 // `proxy-wire v1` refusal constants join it.
 pub use domain::{
-    canonical_json, checksum_file_content, decide, fence_code, fence_refusal, generate,
-    governance_vectors_checksum, run_derivation, Case, CoverTag, DecisionCase, DerivationCase,
-    DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision, GovernanceInput,
-    GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm, VectorsDocument, ALL_COVERS,
-    FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID,
-    GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
-    GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
+    canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
+    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
+    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
+    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
+    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
+    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 /// The governance conformance vectors artifact, embedded verbatim at build
 /// time (`governance/vectors-v1.json` — the canonical bytes the committed

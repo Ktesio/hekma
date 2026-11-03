@@ -687,10 +687,11 @@ dependencies = [
 
 [[package]]
 name = "hekma-engine"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "directories",
+ "getrandom 0.2.17",
  "hekma-adapter-api",
  "hekma-adapters-hermes",
  "hekma-conformance",

@@ -23,8 +23,9 @@ against its implementation and assert byte-exact agreement.
 - Artifact id: `hekma-governance-vectors`
 - Canonical location: `crates/hekma-engine/governance/vectors-v1.json`
 - Checksum sidecar: `crates/hekma-engine/governance/vectors-v1.json.sha256`
-- Current version: **1.1.0** (schema version 1). 1.1.0 appended the `block`
-  cases and the `fence` kind after the unchanged 1.0.0 set.
+- Current version: **1.2.0** (schema version 1). 1.1.0 appended the `block`
+  cases and the `fence` kind after the unchanged 1.0.0 set; 1.2.0 appended the
+  `chain` kind for ancestor ceilings after the unchanged 1.1.0 set.
 
 ## Getting the artifact
 
@@ -48,14 +49,14 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 34 cases; the shape is identical
+An excerpt (the full artifact carries 39 cases; the shape is identical
 throughout):
 
 ```json
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.1.0",
+  "vectors_version": "1.2.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
@@ -63,7 +64,8 @@ throughout):
       "cost_micros",
       "cost_micros_with_cached",
       "governance::decide",
-      "governance::fence_refusal"
+      "governance::fence_refusal",
+      "governance::decide_chain"
     ]
   },
   "cases": [
@@ -97,7 +99,7 @@ throughout):
 }
 ```
 
-Three case kinds exist:
+Four case kinds exist:
 
 - **`decision`** — a full governance evaluation: arms (the armed dimensions,
   with committed totals, ceilings, and the resolved breach action), the
@@ -115,7 +117,16 @@ Three case kinds exist:
   fields come from is described in
   [Hosting: the wire fence](hosting.md#the-refusal-proxy-wire-v1).
 
-A later minor version may add a case kind, as 1.1.0 added `fence`. See the
+- **`chain`** (from 1.2.0) — ancestor ceilings: one `decision`-shaped input
+  per level of a Run's ancestor chain (the Run a usage event is attributed to
+  first, the Run that owns the process last), each with that level's arms over
+  its own subtree totals and its own latches, and one outcome per level in the
+  same order. Every ancestor's ceilings apply: each level decides on its own,
+  so a child's breach never suppresses its parent's, and a parent's ceiling
+  binds its children's usage. A one-level chain is exactly a `decision`.
+
+A later minor version may add a case kind, as 1.1.0 added `fence` and 1.2.0
+added `chain`. See the
 versioning policy for how a consumer pinned to an older version handles it.
 
 Every case carries `covers` — the rule set it pins:
@@ -131,6 +142,7 @@ Every case carries `covers` — the rule set it pins:
 | `saturation` | A runaway product pins at the integer maximum — never wraps, so a cost can never silently un-breach. |
 | `no-retro-repricing` | Each ledger row prices at the rate persisted with it; repricing history at the latest rate produces a different (wrong) value. |
 | `block-fence` | A `block` decision fires under the same threshold, latch and order rules as any action. A fenced Run refuses with status 402 and the `hekma_budget_block` class, reporting the first raised reason: tokens before dollars, per-run before cumulative. |
+| `ancestor-ceilings` | Over a Run's ancestor chain every level decides on its own subtree totals and its own latches; outcomes come deepest level first, token before dollar within a level. |
 
 ## How a Host pins it
 
@@ -141,7 +153,8 @@ Every case carries `covers` — the rule set it pins:
    guard and compare the fired decisions (order included) and the resulting
    latch state to `expected`. For each `derivation` case, run the named
    derivation on the inputs and compare the micro-dollar result to
-   `expected_micros`.
+   `expected_micros`. For each `chain` case, run every level through your
+   guard and compare the outcomes level by level.
 3. **Fail on any difference.** A mismatch means your guard disagrees with the
    engine on a pinned rule — fix the guard (or file an issue if you believe
    the vector is wrong), never silently skip the case.
@@ -150,7 +163,7 @@ Every case carries `covers` — the rule set it pins:
    extend the proof. See the versioning policy below.
 
 A Rust Host can skip the re-implementation entirely: the engine exposes the
-same decision core (`governance::decide`, the derivations) through its public
+same decision core (`governance::decide`, `decide_chain`, the derivations) through its public
 API — see [Embedding the engine](embedding.md).
 
 ## Versioning policy
@@ -160,7 +173,8 @@ API — see [Embedding the engine](embedding.md).
 - **Additive cases** are a **minor** bump: new scenarios pinning the same
   rules, or cases for new rules. A new case may use a new case kind or a new
   value of an existing field (1.1.0 added the `fence` kind, the `block` action
-  and the `block-fence` tag). New cases are **appended**: every case an
+  and the `block-fence` tag; 1.2.0 the `chain` kind and the
+  `ancestor-ceilings` tag). New cases are **appended**: every case an
   earlier version shipped keeps its bytes and its position. A consumer pinned
   to an earlier version re-runs that version's cases, the leading prefix of
   the list, and parses the rest only when it adopts the new version. Its
@@ -171,9 +185,11 @@ API — see [Embedding the engine](embedding.md).
   | --- | --- | --- |
   | 1.0.0 | 1-26 | the first 26 `decision` and `derivation` cases |
   | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
+  | 1.2.0 | 35-39 | the `chain-*` cases |
 
   The provenance list grows with the generator functions the new cases come
-  from (1.1.0 added `governance::fence_refusal`).
+  from (1.1.0 added `governance::fence_refusal`, 1.2.0
+  `governance::decide_chain`).
 - **Any change to a shipped case** (its expected output or its input), or to
   the shape of the header or of an existing kind, is a **major** bump and is announced ahead of the release in the release
   notes. A major bump means a pinned verdict must be re-established — it does

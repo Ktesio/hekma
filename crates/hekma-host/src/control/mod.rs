@@ -207,6 +207,10 @@ fn router(state: ApiState) -> Router {
             "/v0/instances/{name}/restart-policy",
             put(routes::restart_policy_put),
         )
+        // Runs (story 21-2): open a child Run, read a Run, close a child.
+        .route("/v0/runs", post(routes::run_open))
+        .route("/v0/runs/{id}", get(routes::run_show))
+        .route("/v0/runs/{id}/close", post(routes::run_close))
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

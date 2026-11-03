@@ -1,6 +1,6 @@
 [package]
 name = "hekma-engine"
-version = "0.11.0"
+version = "0.12.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Hekma agent-runner engine; its public API is the Embedding Interface"
@@ -29,6 +29,9 @@ rusqlite = { workspace = true }
 directories = { workspace = true }
 # thiserror in the engine lib (no miette here — conventions).
 thiserror = { workspace = true }
+# Run ids (story 21-2, AD-25): `run_` + ULID, its random half from the OS
+# CSPRNG. Already in the tree through `ring`; no new crate (NFR-8).
+getrandom = { workspace = true }
 # serde derives on domain types (LifecycleState wire form, etc.).
 serde = { workspace = true }
 # Persist the effective per-OS Capability Declaration snapshot as a JSON file in

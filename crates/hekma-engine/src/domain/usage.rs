@@ -36,44 +36,53 @@ use serde::{Deserialize, Serialize};
 /// usage-update shape; adding a field is backward-additive and does NOT bump it.
 pub const USAGE_SCHEMA_VERSION: u32 = 1;
 
-/// A Run identifier (spine AD-7) — the span from a `starting` transition to the
-/// next terminal state (`stopped`/`failed`) of an Agent Instance.
+/// A Run identifier (spine AD-7, AD-25) — one Run's stable id.
 ///
-/// Minted FRESH at each `starting` transition (including a Restart-Policy restart,
-/// story 1-6 — a restarted instance opens a NEW Run), so per-run usage totals
-/// never bleed across a crash/restart boundary. The id must be unique per run and
-/// stable for that run's lifetime; [`RunId::mint`] derives it from the system
-/// clock (nanoseconds) plus a process-global monotonic counter, so two Runs that
-/// start in the SAME clock nanosecond still get DISTINCT ids (the counter breaks
-/// the tie). It is persisted verbatim on each `usage_events` row (`run_id`
-/// column) and is the `(instance_id, run_id, sequence)` dedup key's middle field.
+/// Since story 21-2 a Run is the PRD Glossary Run: for a supervised Agent
+/// Instance, the span from an operator `start` to the next operator `stop` or
+/// terminal failure, INCLUDING Restart Policy relaunches (a relaunch keeps the
+/// id), plus the child Runs a Host opens beneath it. [`RunId::mint`] renders
+/// `run_` + a ULID (AD-25): 48 bits of Unix milliseconds then 80 random bits,
+/// 26 uppercase Crockford base32 characters. Ids minted before 21-2
+/// (`run-<nanos>-<nonce>`) stay valid as-is — the store and every surface
+/// treat the id as an opaque string. Persisted verbatim on each
+/// `usage_events` row and as the `runs` primary key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RunId(String);
 
-/// Process-global monotonic counter that breaks ties between two Runs minted in
-/// the same clock nanosecond (or on a clock that does not advance between two
-/// rapid mints). Never reset; wraps only after 2^64 mints (unreachable).
+/// The Crockford base32 alphabet a ULID renders in (no I, L, O, U).
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Process-global counter mixed into a mint when the OS random source fails,
+/// so a degraded mint is still unique within the process (see [`RunId::mint`]).
 static RUN_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl RunId {
-    /// Mint a fresh, per-run-unique Run id.
+    /// Mint a fresh Run id: `run_` + ULID (story 21-2, AD-25).
     ///
-    /// Shape: `run-<unix_nanos>-<nonce>`. The `unix_nanos` orders runs by wall
-    /// time (useful for a human reading the ledger); the monotonic `nonce`
-    /// guarantees uniqueness even when the clock is coarse or two mints land in
-    /// the same nanosecond. A clock set before the epoch clamps `unix_nanos` to 0
-    /// (the nonce still keeps it unique) — this is an id, not a correctness value.
+    /// The time half is the wall clock in milliseconds (a clock before the
+    /// epoch clamps to 0); the random half is 80 bits from the OS CSPRNG. If
+    /// the OS source fails (it does not on supported platforms), the random
+    /// half falls back to the clock's nanoseconds plus a process-global
+    /// counter — still unique per process, never a panic: this is an id, not
+    /// a secret.
     pub fn mint() -> Self {
-        let nanos = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
-        Self(format!("run-{nanos}-{nonce}"))
+            .unwrap_or_default();
+        let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
+        let mut random = [0u8; 10];
+        if getrandom::getrandom(&mut random).is_err() {
+            let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
+            random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
+            random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
+        }
+        Self(format!("run_{}", encode_ulid(millis, &random)))
     }
 
     /// Reconstruct a [`RunId`] from its stored wire string (a DB read / a
-    /// deserialized event). No validation — the ledger stores whatever was minted.
+    /// deserialized event). No validation — the ledger stores whatever was
+    /// minted, legacy ids included.
     pub fn from_wire(raw: impl Into<String>) -> Self {
         Self(raw.into())
     }
@@ -82,6 +91,27 @@ impl RunId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether the id has the ULID shape [`RunId::mint`] produces
+    /// (`run_` + 26 Crockford characters). Legacy ids answer `false`.
+    pub fn is_ulid(&self) -> bool {
+        self.0
+            .strip_prefix("run_")
+            .is_some_and(|rest| rest.len() == 26 && rest.bytes().all(|b| CROCKFORD.contains(&b)))
+    }
+}
+
+/// Render a ULID: 48-bit time then 80 random bits, 130 bits padded to 26
+/// five-bit groups (the first character carries the top 3 bits, 0..=7).
+fn encode_ulid(millis: u64, random: &[u8; 10]) -> String {
+    let mut value: u128 = u128::from(millis) << 80;
+    for (i, byte) in random.iter().enumerate() {
+        value |= u128::from(*byte) << (8 * (9 - i));
+    }
+    (0..26)
+        .rev()
+        .map(|group| CROCKFORD[((value >> (5 * group)) & 0x1F) as usize] as char)
+        .collect()
 }
 
 impl std::fmt::Display for RunId {
@@ -280,8 +310,39 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "all minted run ids must be unique");
-        // Shape sanity: starts with the `run-` prefix.
-        assert!(ids[0].as_str().starts_with("run-"), "{}", ids[0]);
+        // Story 21-2: the ULID shape (AD-25).
+        for id in &ids {
+            assert!(id.is_ulid(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_minted_id_is_run_underscore_and_26_crockford_chars() {
+        let id = RunId::mint();
+        let rest = id.as_str().strip_prefix("run_").expect("run_ prefix");
+        assert_eq!(rest.len(), 26);
+        assert!(rest
+            .bytes()
+            .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)));
+        // The first character carries the time's top 3 bits (0..=7).
+        assert!((b'0'..=b'7').contains(&rest.as_bytes()[0]), "{rest}");
+        // Legacy ids stay valid, they are just not ULIDs.
+        assert!(!RunId::from_wire("run-42-7").is_ulid());
+        assert!(!RunId::from_wire("run_SHORT").is_ulid());
+        assert!(!RunId::from_wire("run_0123456789ABCDEFGHJKMNPQRU").is_ulid());
+    }
+
+    #[test]
+    fn the_ulid_encoding_is_the_reference_layout() {
+        // Time 0 + zero randomness renders all zeros; the max values render
+        // the documented maximum `7ZZZ…`.
+        assert_eq!(encode_ulid(0, &[0; 10]), "0".repeat(26));
+        assert_eq!(
+            encode_ulid((1 << 48) - 1, &[0xFF; 10]),
+            format!("7{}", "Z".repeat(25))
+        );
+        // Time sorts lexicographically ahead of the random half.
+        assert!(encode_ulid(2, &[0; 10]) > encode_ulid(1, &[0xFF; 10]));
     }
 
     #[test]
