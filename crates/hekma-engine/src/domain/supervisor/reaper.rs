@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::domain::liveness::{self, LivenessSignal, WindowDecision};
+use crate::domain::runs::ops::RunFate;
 use crate::ports::StoreError;
 
 /// The portable classification domain (story 18-3): only a code in
@@ -482,6 +483,7 @@ impl Supervisor {
                                  that has since cleared)",
                             ),
                             log_capture,
+                            RunFate::Terminal,
                         );
                     }
                     continue;
@@ -575,6 +577,7 @@ impl Supervisor {
                     LifecycleState::Stopped,
                     TransitionCause::clean_exit(code),
                     crash_log_capture,
+                    RunFate::Terminal,
                 );
                 continue;
             }
@@ -691,6 +694,11 @@ impl Supervisor {
                     LifecycleState::Failed,
                     transition_cause,
                     crash_log_capture,
+                    if plan.is_some() {
+                        RunFate::Relaunching
+                    } else {
+                        RunFate::Terminal
+                    },
                 )
                 .is_err()
             {
@@ -1095,6 +1103,11 @@ impl Supervisor {
                         LifecycleState::Failed,
                         cause,
                         liveness_log_capture,
+                        if decision.plan.is_some() {
+                            RunFate::Relaunching
+                        } else {
+                            RunFate::Terminal
+                        },
                     ) {
                         match err {
                             EngineError::Store(StoreError::StateConflict { .. }) => {
@@ -2053,6 +2066,15 @@ impl Supervisor {
                         },
                     );
                     adopted += 1;
+                    // Story 21-2: the adoption KEEPS the Run (created here if
+                    // the record predates Runs) and re-syncs its wire path
+                    // and bound labels from this engine's view.
+                    let adopted_source = self
+                        .running
+                        .get(&name)
+                        .map(|supervised| supervised.metering_source.clone())
+                        .unwrap_or_default();
+                    self.sync_adopted_run(registry, &name, &run_id, &adopted_source);
                     // NOTE (the live-owner boundary, deliberately NOT done
                     // here): the adopter does NOT re-stamp itself as the
                     // record's owner. A re-stamp would make every LONG-LIVED
@@ -2204,6 +2226,8 @@ impl Supervisor {
                 }
             }
         }
+        // Story 21-2: a Run left open by a relaunch that never ran ends now.
+        self.end_runs_without_a_process(registry);
         adopted
     }
 

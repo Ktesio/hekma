@@ -72,7 +72,11 @@ The `acp` kind supervises an Agent Client Protocol v1 agent over its stdio; thes
 
 ## `start --detach` Refused ("cannot be started with --detach")
 
-A detached start of an `engine-observed` instance is refused before anything changes: the engine-observed channel's loopback forward listener lives inside the starting command, so a detached start would leave the agent pointing at a listener that dies with the command — its model calls would then hit a dead port. Start the instance without `--detach` (the in-command supervision keeps the listener alive), or switch the adapter's metering source to `self-reported` if the instance must detach. This failure exits with code 5 and changes no state.
+A detached start of an `engine-observed` instance is refused before anything changes: the engine-observed channel's loopback forward listener lives inside the engine that starts it — for the CLI, the local Service Host — so a detached start would leave the agent pointing at a listener that dies with the host — its model calls would then hit a dead port. Start the instance without `--detach` (it still outlives the command: it runs under the host, which keeps the listener alive), or switch the adapter's metering source to `self-reported` if the instance must survive a host exit. This failure exits with code 5 and changes no state.
+
+## "No local Service Host answered" / "could not start a local Service Host"
+
+Every `hekma agent` write goes through the Service Host that owns the state directory; when none runs, the command starts one in the background and waits up to 10 seconds for `<state-dir>/control.json`. If that host could not start, the command exits with code 1 and names `<state-dir>/serve.log` — the background host's own output (a state directory another host already holds, an unreadable `secrets.toml`, a full disk). Read the log, fix the cause, and run the command again. A stale `control.json` left by a crashed host is harmless: the next write finds the host gone and starts a new one, which adopts the agents that survived.
 
 ## Invalid Lifecycle Transition
 

@@ -41,7 +41,6 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::run_store_sqlite::LegacySource;
-#[cfg(test)]
 use super::run_store_sqlite::NoLegacy;
 use crate::domain::{
     AgentInstance, InstanceName, LifecycleState, Micros, Rate, RecordOutcome, RestartPolicy, RunId,
@@ -88,7 +87,9 @@ use crate::ports::{
 /// column renamed/removed.
 /// v12 (story 21-1, AD-27): the store writer's tables — see
 /// [`super::run_store_sqlite::SCHEMA_V12`].
-const SCHEMA_VERSION: i64 = 12;
+/// v13 (story 21-2, AD-25): the Run registry's tables and their backfill —
+/// see [`super::runs_sqlite`].
+const SCHEMA_VERSION: i64 = 13;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -415,6 +416,51 @@ impl SqliteStore {
         Ok(Self { conn })
     }
 
+    /// Open a database for a READ-ONLY engine (story 21-4,
+    /// [`crate::Engine::open_read_only`]): `SQLITE_OPEN_READ_ONLY` (the file is
+    /// never created) plus `query_only`, and no pragma that writes (the WAL
+    /// switch is a writer's job). The schema is checked, never migrated: a
+    /// database below [`SCHEMA_VERSION`] answers [`StoreError::NeedsMigration`]
+    /// and one above it [`StoreError::SchemaTooNew`].
+    pub(crate) fn open_existing_read_only(path: &Path) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(backend)?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))
+            .map_err(backend)?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(backend)?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        if version < SCHEMA_VERSION {
+            return Err(StoreError::NeedsMigration {
+                found: version,
+                current: SCHEMA_VERSION,
+            });
+        }
+        Ok(Self { conn })
+    }
+
+    /// The empty fleet a READ-ONLY engine reads when no state database exists
+    /// yet (story 21-4): an in-memory database at the current schema, then
+    /// `query_only` — nothing is created on disk.
+    pub(crate) fn open_empty_read_only() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory().map_err(backend)?;
+        migrate(&conn, &NoLegacy)?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(backend)?;
+        Ok(Self { conn })
+    }
+
     /// The connection, for the sibling Run-scale implementation.
     pub(super) fn conn(&self) -> &Connection {
         &self.conn
@@ -646,11 +692,16 @@ fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, St
     }
     // Story 21-1: v12 imports the legacy event files inside its own step
     // transaction (DDL + import + stamp, crash-atomic like every step).
+    let mut notes = Vec::new();
     if version < 12 {
-        return super::run_store_sqlite::migrate_v12(conn, legacy);
+        notes = super::run_store_sqlite::migrate_v12(conn, legacy)?;
     }
-
-    Ok(Vec::new())
+    // Story 21-2: v13 adds the Run tables and backfills the run ids already
+    // recorded (one crash-atomic step).
+    if version < 13 {
+        super::runs_sqlite::migrate_v13(conn)?;
+    }
+    Ok(notes)
 }
 
 /// Apply ONE schema-version step atomically (story 11-3, B3): the step's DDL
@@ -2154,7 +2205,7 @@ mod tests {
         // stamp and the constant drifted together. (The v12 step, the store
         // writer's tables, is the current last step; bump this literal when
         // the next step lands.)
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -2737,7 +2788,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");
@@ -2783,7 +2834,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(!rec.detach, "the legacy attached flag survives");
@@ -3948,7 +3999,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -4092,7 +4143,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -4170,7 +4221,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()

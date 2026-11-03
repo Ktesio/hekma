@@ -1,7 +1,7 @@
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.1.0",
+  "vectors_version": "1.2.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
@@ -9,7 +9,8 @@
       "cost_micros",
       "cost_micros_with_cached",
       "governance::decide",
-      "governance::fence_refusal"
+      "governance::fence_refusal",
+      "governance::decide_chain"
     ]
   },
   "cases": [
@@ -1025,6 +1026,362 @@
         "dimension": "dollars",
         "scope": "per-run"
       }
+    },
+    {
+      "kind": "chain",
+      "id": "chain-child-and-parent-both-breach-deepest-first",
+      "covers": [
+        "ancestor-ceilings"
+      ],
+      "levels": [
+        {
+          "token": {
+            "run_total": 1200,
+            "cumulative_total": 1200,
+            "budget": {
+              "per_run": 1000,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "latched": []
+        },
+        {
+          "token": {
+            "run_total": 5200,
+            "cumulative_total": 5200,
+            "budget": {
+              "per_run": 5000,
+              "cumulative": null
+            },
+            "action": "pause"
+          },
+          "latched": []
+        }
+      ],
+      "expected": [
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run",
+              "action": "warn",
+              "limit": 1000,
+              "observed": 1200
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            }
+          ]
+        },
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run",
+              "action": "pause",
+              "limit": 5000,
+              "observed": 5200
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "chain",
+      "id": "chain-latch-is-per-level",
+      "covers": [
+        "ancestor-ceilings"
+      ],
+      "levels": [
+        {
+          "token": {
+            "run_total": 1500,
+            "cumulative_total": 1500,
+            "budget": {
+              "per_run": 1000,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "latched": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            }
+          ]
+        },
+        {
+          "token": {
+            "run_total": 5500,
+            "cumulative_total": 5500,
+            "budget": {
+              "per_run": 5000,
+              "cumulative": null
+            },
+            "action": "stop"
+          },
+          "latched": []
+        }
+      ],
+      "expected": [
+        {
+          "decisions": [],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            }
+          ]
+        },
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run",
+              "action": "stop",
+              "limit": 5000,
+              "observed": 5500
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "chain",
+      "id": "chain-parent-ceiling-binds-the-subtree",
+      "covers": [
+        "ancestor-ceilings"
+      ],
+      "levels": [
+        {
+          "token": {
+            "run_total": 400,
+            "cumulative_total": 400,
+            "budget": {
+              "per_run": 1000,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "latched": []
+        },
+        {
+          "token": {
+            "run_total": 5000,
+            "cumulative_total": 5000,
+            "budget": {
+              "per_run": 10000,
+              "cumulative": 5000
+            },
+            "action": "pause"
+          },
+          "latched": []
+        }
+      ],
+      "expected": [
+        {
+          "decisions": [],
+          "latched_after": []
+        },
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "cumulative",
+              "action": "pause",
+              "limit": 5000,
+              "observed": 5000
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "cumulative"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "chain",
+      "id": "chain-three-levels-token-before-dollar-per-level",
+      "covers": [
+        "ancestor-ceilings"
+      ],
+      "levels": [
+        {
+          "token": {
+            "run_total": 300,
+            "cumulative_total": 300,
+            "budget": {
+              "per_run": 300,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "dollar": {
+            "run_cost": 2000000,
+            "cumulative_cost": 2000000,
+            "cap": {
+              "per_run": 1000000,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "latched": []
+        },
+        {
+          "token": {
+            "run_total": 900,
+            "cumulative_total": 900,
+            "budget": {
+              "per_run": 2000,
+              "cumulative": null
+            },
+            "action": "warn"
+          },
+          "latched": []
+        },
+        {
+          "token": {
+            "run_total": 9000,
+            "cumulative_total": 9000,
+            "budget": {
+              "per_run": 8000,
+              "cumulative": null
+            },
+            "action": "pause"
+          },
+          "dollar": {
+            "run_cost": 9000000,
+            "cumulative_cost": 9000000,
+            "cap": {
+              "per_run": null,
+              "cumulative": 5000000
+            },
+            "action": "pause"
+          },
+          "latched": []
+        }
+      ],
+      "expected": [
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run",
+              "action": "warn",
+              "limit": 300,
+              "observed": 300
+            },
+            {
+              "dimension": "dollars",
+              "scope": "per-run",
+              "action": "warn",
+              "limit": 1000000,
+              "observed": 2000000
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            },
+            {
+              "dimension": "dollars",
+              "scope": "per-run"
+            }
+          ]
+        },
+        {
+          "decisions": [],
+          "latched_after": []
+        },
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run",
+              "action": "pause",
+              "limit": 8000,
+              "observed": 9000
+            },
+            {
+              "dimension": "dollars",
+              "scope": "cumulative",
+              "action": "pause",
+              "limit": 5000000,
+              "observed": 9000000
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "per-run"
+            },
+            {
+              "dimension": "dollars",
+              "scope": "cumulative"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "chain",
+      "id": "chain-one-level-is-decide",
+      "covers": [
+        "ancestor-ceilings"
+      ],
+      "levels": [
+        {
+          "token": {
+            "run_total": 100,
+            "cumulative_total": 100,
+            "budget": {
+              "per_run": null,
+              "cumulative": 100
+            },
+            "action": "warn"
+          },
+          "latched": []
+        }
+      ],
+      "expected": [
+        {
+          "decisions": [
+            {
+              "dimension": "tokens",
+              "scope": "cumulative",
+              "action": "warn",
+              "limit": 100,
+              "observed": 100
+            }
+          ],
+          "latched_after": [
+            {
+              "dimension": "tokens",
+              "scope": "cumulative"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

@@ -55,7 +55,7 @@ pub const GOVERNANCE_VECTORS_ARTIFACT_PATH: &str = "crates/hekma-engine/governan
 /// release notes (the pinning contract, docs/governance.md). Mirrored inside
 /// the artifact's `vectors_version` field by the generator — they cannot
 /// drift.
-pub const GOVERNANCE_VECTORS_VERSION: &str = "1.1.0";
+pub const GOVERNANCE_VECTORS_VERSION: &str = "1.2.0";
 
 /// The artifact's schema version — `1` until the DOCUMENT shape itself
 /// changes (a breaking schema change is a major `vectors_version` bump).
@@ -63,13 +63,14 @@ pub const GOVERNANCE_VECTORS_SCHEMA_VERSION: u32 = 1;
 
 /// The provenance list — the engine symbols every case is generated from and
 /// verified against (fixed order; the byte-compare pins it).
-const GENERATED_FROM: [&str; 6] = [
+const GENERATED_FROM: [&str; 7] = [
     "BudgetEvaluator",
     "CostEvaluator",
     "cost_micros",
     "cost_micros_with_cached",
     "governance::decide",
     "governance::fence_refusal",
+    "governance::decide_chain",
 ];
 
 // ---------------------------------------------------------------------------
@@ -279,6 +280,23 @@ pub fn decide(input: &GovernanceInput) -> GovernanceOutcome {
     }
 }
 
+/// Decide over an ANCESTOR CHAIN (story 21-2, vectors 1.2.0): `levels` runs
+/// from the Run a usage event is attributed to up to the Run that owns the
+/// process — each level's [`GovernanceInput`] carries ITS arms over ITS
+/// subtree totals and ITS latches. Every ancestor's ceilings apply (PRD
+/// FR-49): each level decides on its own with [`decide`], so a child's
+/// breach never suppresses its parent's (the latches are per Run), and the
+/// outcomes come back in the same order — deepest level first, token before
+/// dollar within a level. A one-level chain is exactly [`decide`].
+///
+/// The caller records each decision on its level's Run under its level's
+/// Breach Action; executing the action over the Runs beneath that level is
+/// the caller's (a process action on the process-owning level cascades to
+/// the in-process children).
+pub fn decide_chain(levels: &[GovernanceInput]) -> Vec<GovernanceOutcome> {
+    levels.iter().map(decide).collect()
+}
+
 /// The latch-input normalization (19-1 review round 1): deduplicate the
 /// `(dimension, scope)` pairs — first occurrence kept, input order preserved
 /// (a linear scan, not a set, so the output ORDER stays deterministic for the
@@ -447,6 +465,12 @@ pub enum CoverTag {
     /// `hekma_budget_block` class, reporting the first raised reason
     /// (tokens before dollars, per-run before cumulative).
     BlockFence,
+    /// Ancestor ceilings (story 21-2, vectors 1.2.0): over a Run's ancestor
+    /// chain every level decides on its own subtree totals and its own
+    /// latches — a child's breach never suppresses its parent's, a parent's
+    /// ceiling binds its children's usage, and outcomes come deepest level
+    /// first, token before dollar within a level.
+    AncestorCeilings,
 }
 
 impl CoverTag {
@@ -462,6 +486,7 @@ impl CoverTag {
             CoverTag::Saturation => "saturation",
             CoverTag::NoRetroRepricing => "no-retro-repricing",
             CoverTag::BlockFence => "block-fence",
+            CoverTag::AncestorCeilings => "ancestor-ceilings",
         }
     }
 }
@@ -479,6 +504,7 @@ pub const ALL_COVERS: &[CoverTag] = &[
     CoverTag::Saturation,
     CoverTag::NoRetroRepricing,
     CoverTag::BlockFence,
+    CoverTag::AncestorCeilings,
 ];
 
 /// A `decision` case (story 19-1): a [`GovernanceInput`] (ledger state,
@@ -611,6 +637,25 @@ pub enum Case {
     /// The wire fence's refusal: raised reasons → expected refusal (story
     /// 19-2, vectors 1.1.0).
     Fence(FenceCase),
+    /// An ancestor chain: per-level inputs → per-level outcomes (story 21-2,
+    /// vectors 1.2.0).
+    Chain(ChainCase),
+}
+
+/// A `chain` case (story 21-2, vectors 1.2.0): the decision inputs of each
+/// level of a Run's ancestor chain, deepest first, and the EXACT expected
+/// outcome per level — generated from [`decide_chain`] itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainCase {
+    /// The case's unique, stable id.
+    pub id: String,
+    /// Which rules this case pins.
+    pub covers: Vec<CoverTag>,
+    /// One input per level: the attributed Run first, the process-owning
+    /// Run last.
+    pub levels: Vec<GovernanceInput>,
+    /// One outcome per level, in the same order.
+    pub expected: Vec<GovernanceOutcome>,
 }
 
 /// Where the artifact's cases come from — the exact engine symbols the
@@ -658,6 +703,7 @@ impl VectorsDocument {
                 Case::Decision(decision) => &decision.covers,
                 Case::Derivation(derivation) => &derivation.covers,
                 Case::Fence(fence) => &fence.covers,
+                Case::Chain(chain) => &chain.covers,
             };
             for tag in covers {
                 if !seen.contains(tag) {
@@ -710,11 +756,13 @@ pub fn generate() -> VectorsDocument {
                 .collect(),
         },
         // Story 19-2 (1.1.0) APPENDS its cases after the 1.0.0 set, so every
-        // 1.0.0 case keeps its bytes and its position.
+        // 1.0.0 case keeps its bytes and its position; story 21-2 (1.2.0)
+        // appends the `chain` cases after both.
         cases: decision_cases()
             .into_iter()
             .chain(derivation_cases())
             .chain(block_fence_cases())
+            .chain(chain_cases())
             .collect(),
     }
 }
@@ -1168,6 +1216,137 @@ fn fence_case(id: &str, reasons: &[LatchKey]) -> Case {
         covers: vec![CoverTag::BlockFence],
         reasons: reasons.to_vec(),
         expected: fence_refusal(reasons),
+    })
+}
+
+/// The `chain` cases (story 21-2, vectors 1.2.0), in fixed canonical order.
+/// Each case's per-level `expected` is computed by [`decide_chain`].
+fn chain_cases() -> Vec<Case> {
+    let tokens = |run_total: u64, per_run: Option<u64>, cumulative: Option<u64>, action| {
+        Some(TokenArm {
+            run_total,
+            cumulative_total: run_total,
+            budget: TokenBudget {
+                per_run,
+                cumulative,
+            },
+            action,
+        })
+    };
+    let child_tokens =
+        |run_total: u64, per_run: u64| tokens(run_total, Some(per_run), None, BreachAction::Warn);
+    vec![
+        // A child's breach never suppresses its parent's: both levels trip
+        // on the same usage, each records under its own action, the deepest
+        // level first.
+        chain_case(
+            "chain-child-and-parent-both-breach-deepest-first",
+            vec![
+                GovernanceInput {
+                    token: child_tokens(1_200, 1_000),
+                    dollar: None,
+                    latched: vec![],
+                },
+                GovernanceInput {
+                    token: tokens(5_200, Some(5_000), None, BreachAction::Pause),
+                    dollar: None,
+                    latched: vec![],
+                },
+            ],
+        ),
+        // The latch is per level: the child already fired, the parent fires
+        // now — the child's latch says nothing about its parent.
+        chain_case(
+            "chain-latch-is-per-level",
+            vec![
+                GovernanceInput {
+                    token: child_tokens(1_500, 1_000),
+                    dollar: None,
+                    latched: vec![LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun)],
+                },
+                GovernanceInput {
+                    token: tokens(5_500, Some(5_000), None, BreachAction::Stop),
+                    dollar: None,
+                    latched: vec![],
+                },
+            ],
+        ),
+        // A parent's ceiling binds its children's usage: the child stays
+        // under its own ceiling while the parent's subtree crosses its own
+        // (and its cumulative scope).
+        chain_case(
+            "chain-parent-ceiling-binds-the-subtree",
+            vec![
+                GovernanceInput {
+                    token: child_tokens(400, 1_000),
+                    dollar: None,
+                    latched: vec![],
+                },
+                GovernanceInput {
+                    token: tokens(5_000, Some(10_000), Some(5_000), BreachAction::Pause),
+                    dollar: None,
+                    latched: vec![],
+                },
+            ],
+        ),
+        // Three levels, both dimensions: deepest first, token before dollar
+        // within each level.
+        chain_case(
+            "chain-three-levels-token-before-dollar-per-level",
+            vec![
+                GovernanceInput {
+                    token: child_tokens(300, 300),
+                    dollar: Some(DollarArm {
+                        run_cost: Micros(2_000_000),
+                        cumulative_cost: Micros(2_000_000),
+                        cap: CostCap {
+                            per_run: Some(Micros(1_000_000)),
+                            cumulative: None,
+                        },
+                        action: BreachAction::Warn,
+                    }),
+                    latched: vec![],
+                },
+                GovernanceInput {
+                    token: child_tokens(900, 2_000),
+                    dollar: None,
+                    latched: vec![],
+                },
+                GovernanceInput {
+                    token: tokens(9_000, Some(8_000), None, BreachAction::Pause),
+                    dollar: Some(DollarArm {
+                        run_cost: Micros(9_000_000),
+                        cumulative_cost: Micros(9_000_000),
+                        cap: CostCap {
+                            per_run: None,
+                            cumulative: Some(Micros(5_000_000)),
+                        },
+                        action: BreachAction::Pause,
+                    }),
+                    latched: vec![],
+                },
+            ],
+        ),
+        // A one-level chain is exactly `decide`.
+        chain_case(
+            "chain-one-level-is-decide",
+            vec![GovernanceInput {
+                token: tokens(100, None, Some(100), BreachAction::Warn),
+                dollar: None,
+                latched: vec![],
+            }],
+        ),
+    ]
+}
+
+/// Author ONE chain case: the per-level inputs as written, the expected
+/// outcomes computed by [`decide_chain`].
+fn chain_case(id: &str, levels: Vec<GovernanceInput>) -> Case {
+    Case::Chain(ChainCase {
+        id: id.to_string(),
+        covers: vec![CoverTag::AncestorCeilings],
+        expected: decide_chain(&levels),
+        levels,
     })
 }
 
@@ -1884,6 +2063,14 @@ mod tests {
                         case.id
                     );
                 }
+                Case::Chain(case) => {
+                    assert_eq!(
+                        decide_chain(&case.levels),
+                        case.expected,
+                        "case `{}`: the committed outcomes do not match decide_chain()",
+                        case.id
+                    );
+                }
             }
         }
     }
@@ -1899,6 +2086,7 @@ mod tests {
                 Case::Decision(case) => (&case.id, &case.covers),
                 Case::Derivation(case) => (&case.id, &case.covers),
                 Case::Fence(case) => (&case.id, &case.covers),
+                Case::Chain(case) => (&case.id, &case.covers),
             };
             assert!(!ids.contains(&id), "duplicate case id `{id}`");
             assert!(!covers.is_empty(), "case `{id}` carries no covers tags");
@@ -1934,6 +2122,7 @@ mod tests {
                 "cost_micros_with_cached",
                 "governance::decide",
                 "governance::fence_refusal",
+                "governance::decide_chain",
             ]
         );
     }
@@ -1949,7 +2138,7 @@ mod tests {
             .iter()
             .position(|case| match case {
                 Case::Decision(case) => case.id.starts_with("decision-block-"),
-                Case::Fence(_) => true,
+                Case::Fence(_) | Case::Chain(_) => true,
                 Case::Derivation(_) => false,
             })
             .expect("the 1.1.0 cases exist");
@@ -1959,9 +2148,54 @@ mod tests {
             .all(|case| match case {
                 Case::Decision(case) =>
                     case.input.token.map(|arm| arm.action) == Some(BreachAction::Block),
-                Case::Fence(_) => true,
+                Case::Fence(_) | Case::Chain(_) => true,
                 Case::Derivation(_) => false,
             }));
+    }
+
+    #[test]
+    fn the_1_2_0_chain_cases_follow_every_earlier_case() {
+        // Story 21-2: additive — the 1.1.0 cases keep their positions and
+        // the `chain` cases come last.
+        let document = generate();
+        let first_chain = document
+            .cases
+            .iter()
+            .position(|case| matches!(case, Case::Chain(_)))
+            .expect("the 1.2.0 cases exist");
+        assert!(document.cases[first_chain..]
+            .iter()
+            .all(|case| matches!(case, Case::Chain(_))));
+        assert!(document.cases[..first_chain]
+            .iter()
+            .all(|case| !matches!(case, Case::Chain(_))));
+    }
+
+    #[test]
+    fn decide_chain_decides_each_level_independently() {
+        let level = |total: u64, latched: Vec<LatchKey>| GovernanceInput {
+            token: Some(TokenArm {
+                run_total: total,
+                cumulative_total: total,
+                budget: TokenBudget {
+                    per_run: Some(10),
+                    cumulative: None,
+                },
+                action: BreachAction::Warn,
+            }),
+            dollar: None,
+            latched,
+        };
+        let latched = vec![LatchKey::new(BreachDimension::Tokens, BreachScope::PerRun)];
+        let outcomes = decide_chain(&[level(20, latched), level(20, vec![]), level(5, vec![])]);
+        assert_eq!(outcomes.len(), 3);
+        assert!(
+            outcomes[0].decisions.is_empty(),
+            "the latched child stays quiet"
+        );
+        assert_eq!(outcomes[1].decisions.len(), 1, "its parent still fires");
+        assert!(outcomes[2].decisions.is_empty(), "under its ceiling");
+        assert!(decide_chain(&[]).is_empty());
     }
 
     #[test]

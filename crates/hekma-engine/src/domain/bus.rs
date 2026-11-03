@@ -120,6 +120,10 @@ pub enum EngineEvent {
     /// A committed usage measurement (the AD-14 wire struct over the ledger
     /// row), published right after the row committed.
     UsageUpdate(UsageUpdateEvent),
+    /// A Run change (story 21-2, AD-14 amendment): created, depth changed,
+    /// status changed, Anomalies changed, labels changed or ended —
+    /// published after the writer job that caused it committed.
+    Run(super::runs::RunEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable [`broadcast::Sender`]

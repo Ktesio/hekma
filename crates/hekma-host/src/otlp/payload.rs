@@ -286,6 +286,10 @@ impl MetricState {
                 }
                 self.enforce_run_window(&event.instance);
             }
+            // Run events carry run ids and labels; `otlp-metrics v1` uses
+            // instance-level attributes only (no run id on a metric), so
+            // they export nothing until `otlp-metrics v2`.
+            EngineEvent::Run(_) => {}
         }
     }
 

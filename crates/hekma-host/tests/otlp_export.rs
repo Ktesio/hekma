@@ -354,6 +354,7 @@ fn options_with(
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(sink),
         otlp,
+        ..Default::default()
     }
 }
 
