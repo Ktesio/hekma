@@ -120,6 +120,30 @@ Examples:
   hekma run show run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
   hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json";
 
+const LABEL_AFTER_HELP: &str = "\
+Details:
+  A label set here is bound to the Run: it outranks the agent's labels
+  configuration and any label the Run set about itself, and it stays with
+  the Run across a crash relaunch (a new start opens a new Run without it).
+  remove takes back a label set here; if the agent's configuration binds the
+  same key, its value returns. A label that comes from the configuration is
+  changed with hekma agent config set, and a label the Run set about itself
+  cannot be removed here.
+  The target is a run id, an agent (its open Run), or --selector
+  key=value[,key=value...], which matches every open Run carrying all those
+  labels. When a Selector matches more than one Run, the set is listed and
+  you are asked to confirm (--yes skips the question; without a terminal the
+  command is refused unless --yes is given); --dry-run shows each Run's change
+  and writes nothing. Each Run reports its own result; the exit code is the
+  first failure's (3 not found, 4 refused by the Run's state or labels, 2 an
+  invalid request). A Selector may match at most 1000 Runs.
+
+Examples:
+  hekma label set my-agent team=core
+  hekma label set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T env=prod --json
+  hekma label set --selector team=core,env=prod tier=gold --dry-run
+  hekma label remove --selector team=core tier --yes";
+
 #[derive(Parser)]
 #[command(
     name = "hekma",
@@ -155,6 +179,12 @@ enum Commands {
     Run {
         #[command(subcommand)]
         command: RunCommands,
+    },
+    /// Bind and unbind labels on Runs
+    #[command(about = "Bind and unbind labels on Runs", after_help = LABEL_AFTER_HELP)]
+    Label {
+        #[command(subcommand)]
+        command: LabelCommands,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -267,6 +297,48 @@ enum RunCommands {
         /// The run id
         run_id: String,
         /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum LabelCommands {
+    /// Bind labels on a Run, an agent's open Run, or every Run a Selector matches
+    Set {
+        /// The target (a run id or an agent, unless --selector is given),
+        /// then the labels as key=value
+        #[arg(value_name = "TARGET|KEY=VALUE", required = true)]
+        args: Vec<String>,
+        /// Act on every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Show each Run's change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask before acting on several Runs
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unbind labels set with `hekma label set`
+    Remove {
+        /// The target (a run id or an agent, unless --selector is given),
+        /// then the label keys
+        #[arg(value_name = "TARGET|KEY", required = true)]
+        args: Vec<String>,
+        /// Act on every open Run carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// Show each Run's change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask before acting on several Runs
+        #[arg(long)]
+        yes: bool,
+        /// Print the results as JSON
         #[arg(long)]
         json: bool,
     },
@@ -596,6 +668,46 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             RunCommands::Close { run_id, json } => cli::run::close(&run_id, json),
             RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
         },
+        Some(Commands::Label { command }) => {
+            let (verb, args, selector, dry_run, yes, json) = match command {
+                LabelCommands::Set {
+                    args,
+                    selector,
+                    dry_run,
+                    yes,
+                    json,
+                } => (
+                    cli::label::LabelVerb::Set,
+                    args,
+                    selector,
+                    dry_run,
+                    yes,
+                    json,
+                ),
+                LabelCommands::Remove {
+                    args,
+                    selector,
+                    dry_run,
+                    yes,
+                    json,
+                } => (
+                    cli::label::LabelVerb::Remove,
+                    args,
+                    selector,
+                    dry_run,
+                    yes,
+                    json,
+                ),
+            };
+            cli::label::run(cli::label::LabelArgs {
+                verb,
+                selector,
+                args,
+                dry_run,
+                yes,
+                json,
+            })
+        }
         None => {
             Cli::command().print_help()?;
             println!();

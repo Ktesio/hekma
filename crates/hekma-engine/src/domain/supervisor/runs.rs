@@ -10,7 +10,9 @@ use super::Supervisor;
 use crate::domain::config::ConfigLayer;
 use crate::domain::name::InstanceName;
 use crate::domain::registry::Registry;
-use crate::domain::runs::{self, ops, ChildRunRequest, Label, RunError, RunView};
+use crate::domain::runs::{
+    self, ops, ChildRunRequest, Label, LabelChange, LabelOutcome, RunError, RunView,
+};
 use crate::domain::usage::RunId;
 
 impl Supervisor {
@@ -142,6 +144,43 @@ impl Supervisor {
         })?;
         self.publish_run_events(events);
         registry.run_view(run_id)
+    }
+
+    /// The label verb (story 21-9): bind and unbind labels on one Run as the
+    /// Operator, as one writer job, and publish its `labels-changed` event.
+    /// A process-owning Run's configuration labels are resolved first (here,
+    /// outside the job), so removing a verb label restores a configured value
+    /// it shadowed in the same change.
+    pub(crate) fn label_run(
+        &self,
+        registry: &Registry,
+        run_id: &RunId,
+        change: LabelChange,
+        dry_run: bool,
+    ) -> Result<LabelOutcome, RunError> {
+        change.validate()?;
+        let record = registry
+            .run_record(run_id)?
+            .ok_or_else(|| RunError::NotFound {
+                run_id: run_id.as_str().to_string(),
+            })?;
+        let config = match record.instance.as_deref().map(InstanceName::new) {
+            Some(Ok(name)) if record.process_owner => self.bound_labels(registry, &name),
+            _ => Vec::new(),
+        };
+        let id = run_id.clone();
+        let (outcome, events) = registry.run_job(move |store| {
+            ops::label(
+                store,
+                &id,
+                &change,
+                &config,
+                dry_run,
+                &crate::time::now_rfc3339(),
+            )
+        })?;
+        self.publish_run_events(events);
+        Ok(outcome)
     }
 
     /// Commit one usage event attributed to any Run of a supervised instance

@@ -400,6 +400,46 @@ impl Registry {
             .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
     }
 
+    /// One Run's row, read on the read-only connection (story 21-9).
+    pub(crate) fn run_record(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<Option<crate::domain::RunRecord>, crate::domain::RunError> {
+        use crate::ports::RunRecords;
+        Ok(self.store.snapshot(|store| store.run_record(run_id))?)
+    }
+
+    /// The instance's open process-owning Run, read on the read-only
+    /// connection (story 21-9): `NoOpenRun` when it has none.
+    pub(crate) fn instance_run(
+        &self,
+        instance: &str,
+    ) -> Result<crate::domain::RunView, crate::domain::RunError> {
+        use crate::ports::RunRecords;
+        let name = InstanceName::new(instance).map_err(|e| crate::domain::RunError::Invalid {
+            field: "instance".to_string(),
+            reason: e.to_string(),
+        })?;
+        self.store.snapshot(|store| {
+            Ok(match store.open_process_run(&name)? {
+                Some(record) => crate::domain::runs::ops::view(store, &record.run_id),
+                None => Err(crate::domain::RunError::NoOpenRun {
+                    instance: instance.to_string(),
+                }),
+            })
+        })?
+    }
+
+    /// Resolve a Selector over the non-ended Runs on the read-only
+    /// connection (story 21-9): one indexed read, capped.
+    pub(crate) fn select_runs(
+        &self,
+        selector: &crate::domain::Selector,
+    ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
+        self.store
+            .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
     /// Run `work` on the store writer and wait for its commit (story 21-1).
     fn write<R: Send + 'static>(
         &self,

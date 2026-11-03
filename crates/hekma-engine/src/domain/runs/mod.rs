@@ -32,10 +32,13 @@ use crate::ports::StoreError;
 
 pub(crate) mod labels;
 pub(crate) mod ops;
+pub(crate) mod policy;
+pub mod selector;
 pub(crate) mod snapshot;
 pub mod verbs;
 
-pub use labels::{validate_label_key, validate_label_value};
+pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
+pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
 pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
 
 /// The schema version stamped on every [`RunEvent`] (AD-14). Independent of
@@ -250,7 +253,41 @@ impl LabelSource {
     }
 }
 
-/// One `key=value` label with its source.
+/// Where a bound label came from (story 21-9). Per key, `label-verb` wins
+/// over `config`, and any bound label wins over a Caller's (FR-49): a
+/// configuration re-sync replaces only `config` rows, and the label verb never
+/// rewrites the configuration. Later sources join beside these (a Run Key, an
+/// endpoint binding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LabelOrigin {
+    /// The instance's `labels.<key>` configuration.
+    Config,
+    /// The Operator's label verb (`hekma label`, `PATCH /v0/runs/{id}/labels`).
+    LabelVerb,
+}
+
+impl LabelOrigin {
+    /// The stable wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LabelOrigin::Config => "config",
+            LabelOrigin::LabelVerb => "label-verb",
+        }
+    }
+
+    /// Parse the wire form.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "config" => Some(LabelOrigin::Config),
+            "label-verb" => Some(LabelOrigin::LabelVerb),
+            _ => None,
+        }
+    }
+}
+
+/// One `key=value` label with its source (and, for a bound label, its
+/// origin).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Label {
     /// The key (see [`validate_label_key`]).
@@ -259,15 +296,29 @@ pub struct Label {
     pub value: String,
     /// Who set it.
     pub source: LabelSource,
+    /// Where a bound label came from; `None` on a Caller label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<LabelOrigin>,
 }
 
 impl Label {
-    /// A bound label.
+    /// A bound label from the instance configuration (origin `config`).
     pub fn bound(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::bound_by(key, value, LabelOrigin::Config)
+    }
+
+    /// A bound label set by the label verb (origin `label-verb`).
+    pub fn verb(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self::bound_by(key, value, LabelOrigin::LabelVerb)
+    }
+
+    /// A bound label with an explicit origin.
+    pub fn bound_by(key: impl Into<String>, value: impl Into<String>, origin: LabelOrigin) -> Self {
         Self {
             key: key.into(),
             value: value.into(),
             source: LabelSource::Bound,
+            origin: Some(origin),
         }
     }
 
@@ -277,7 +328,21 @@ impl Label {
             key: key.into(),
             value: value.into(),
             source: LabelSource::Caller,
+            origin: None,
         }
+    }
+
+    /// Whether this label is bound.
+    pub fn is_bound(&self) -> bool {
+        self.source == LabelSource::Bound
+    }
+
+    /// A bound label's effective origin: a bound row with no recorded origin
+    /// can only have come from configuration (the one bound source before
+    /// origins were recorded). `None` on a Caller label.
+    pub fn bound_origin(&self) -> Option<LabelOrigin> {
+        self.is_bound()
+            .then(|| self.origin.unwrap_or(LabelOrigin::Config))
     }
 }
 
@@ -485,7 +550,11 @@ pub struct RunEvent {
     pub anomalies: Vec<Anomaly>,
     /// Its bound labels after the change.
     pub labels: Vec<Label>,
-    /// Why (a transition cause, `parent-paused`, `closed`, …).
+    /// Its bound labels before the change, on `labels-changed` (story 21-9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_labels: Option<Vec<Label>>,
+    /// Why (a transition cause, `parent-paused`, `closed`, `label-verb`,
+    /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
     /// RFC 3339 time of the change.
@@ -552,6 +621,58 @@ pub enum RunError {
         /// Its instance.
         instance: String,
     },
+    /// The Run has ended, so its labels cannot change (story 21-9).
+    #[error("Run `{run_id}` has ended, so its labels cannot change")]
+    RunEnded {
+        /// The Run.
+        run_id: String,
+    },
+    /// The label verb cannot remove a label the instance configuration binds
+    /// (story 21-9).
+    #[error(
+        "label `{key}` on Run `{run_id}` comes from the configuration key `labels.{key}` of \
+         agent `{instance}`, so it cannot be removed from the Run — change it with \
+         `hekma agent config set {instance} labels.{key} <value>`, or override it on the Run \
+         with `hekma label set {run_id} {key}=<value>`"
+    )]
+    LabelFromConfig {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+        /// The instance whose configuration binds it.
+        instance: String,
+    },
+    /// The label verb removes bound labels only; this key is a Caller's.
+    #[error(
+        "label `{key}` on Run `{run_id}` was set by the Run's Caller, not bound, so the label \
+         verb cannot remove it (it removes only labels it set)"
+    )]
+    LabelNotBound {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+    },
+    /// A Caller label write names a key already bound on the Run (FR-49).
+    #[error("label `{key}` is bound on Run `{run_id}`, so a Caller cannot set it")]
+    LabelBound {
+        /// The Run.
+        run_id: String,
+        /// The label key.
+        key: String,
+    },
+    /// A Selector matched more Runs than one request may act on.
+    #[error(
+        "Selector `{selector}` matches more than {max} Runs — narrow it with another \
+         `key=value` term"
+    )]
+    TooManyRuns {
+        /// The Selector.
+        selector: String,
+        /// [`MAX_SELECTED_RUNS`].
+        max: usize,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -575,6 +696,11 @@ impl RunError {
             RunError::NestingTooDeep { .. } => "nesting-too-deep",
             RunError::ActionUnavailable { .. } => "action-unavailable",
             RunError::OwnsProcess { .. } => "owns-process",
+            RunError::RunEnded { .. } => "run-ended",
+            RunError::LabelFromConfig { .. } => "label-from-config",
+            RunError::LabelNotBound { .. } => "label-not-bound",
+            RunError::LabelBound { .. } => "label-bound",
+            RunError::TooManyRuns { .. } => "too-many-runs",
             RunError::Invalid { .. } => "invalid-request",
             RunError::Store(_) => "store",
         }

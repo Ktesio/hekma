@@ -7,8 +7,7 @@
 //! stderr (AD-12). Listing every Run is `hekma ps`'s job.
 
 use hekma_engine::{
-    BreachAction, ChildRunRequest, Engine, Label, LabelSource, RunError, RunLimits, RunParent,
-    RunView,
+    BreachAction, ChildRunRequest, Engine, RunError, RunLimits, RunParent, RunView,
 };
 use serde::Serialize;
 
@@ -106,7 +105,7 @@ fn open_request(args: &OpenArgs) -> Result<ChildRunRequest, Box<dyn std::error::
 }
 
 /// Whether `raw` has a run id's shape (a ULID id, or a legacy id).
-fn looks_like_run_id(raw: &str) -> bool {
+pub(crate) fn looks_like_run_id(raw: &str) -> bool {
     if hekma_engine::RunId::from_wire(raw).is_ulid() {
         return true;
     }
@@ -123,7 +122,7 @@ fn invalid(message: String) -> Box<dyn std::error::Error> {
     RunInvalid { message }.into()
 }
 
-fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
+pub(crate) fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
     Engine::open(None).map_err(|err| {
         AgentIo {
             message: format!("Could not open the hekma state directory: {err}"),
@@ -137,6 +136,14 @@ fn open_engine() -> Result<Engine, Box<dyn std::error::Error>> {
 /// failure `1`.
 fn map_run_error(err: RunError) -> Box<dyn std::error::Error> {
     let message = err.to_string();
+    run_error_class(&err, message)
+}
+
+/// The diagnostic carrying `err`'s exit class with `message`: not found `3`,
+/// a request that cannot be honored `2`, a state that forbids it `4`, a
+/// store failure `1`. Shared by `hekma run` and `hekma label` (which reports
+/// a partial failure under its first failure's class).
+pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::error::Error> {
     match err {
         RunError::NotFound { .. } => RunNotFound {
             message: format!("{message}. Check the id with `hekma run show <run-id>`."),
@@ -144,10 +151,15 @@ fn map_run_error(err: RunError) -> Box<dyn std::error::Error> {
         .into(),
         RunError::NestingTooDeep { .. }
         | RunError::ActionUnavailable { .. }
+        | RunError::TooManyRuns { .. }
         | RunError::Invalid { .. } => RunInvalid { message }.into(),
         RunError::NoOpenRun { .. }
         | RunError::ParentEnded { .. }
-        | RunError::OwnsProcess { .. } => RunInvalidState { message }.into(),
+        | RunError::OwnsProcess { .. }
+        | RunError::RunEnded { .. }
+        | RunError::LabelFromConfig { .. }
+        | RunError::LabelNotBound { .. }
+        | RunError::LabelBound { .. } => RunInvalidState { message }.into(),
         RunError::Store(_) => AgentStore { message }.into(),
     }
 }
@@ -210,7 +222,7 @@ fn render_text(view: &RunView, verb: &str) -> String {
         "INSTANCE",
         record.instance.clone().unwrap_or_else(|| dash.clone()),
     );
-    row("LABELS", render_labels(&view.labels));
+    row("LABELS", crate::cli::label::render_labels(&view.labels));
     row("LIMITS", render_limits(&view.limits));
     row(
         "USAGE",
@@ -229,23 +241,6 @@ fn render_text(view: &RunView, verb: &str) -> String {
         row("ENDED", cause.clone());
     }
     out
-}
-
-fn render_labels(labels: &[Label]) -> String {
-    if labels.is_empty() {
-        return "—".to_string();
-    }
-    labels
-        .iter()
-        .map(|label| {
-            let source = match label.source {
-                LabelSource::Bound => "bound",
-                LabelSource::Caller => "caller",
-            };
-            format!("{}={} ({source})", label.key, label.value)
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn render_limits(limits: &RunLimits) -> String {

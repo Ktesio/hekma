@@ -71,7 +71,9 @@ use crate::domain::{
     RemoveDisposition, RestartPolicy, ResyncBatch, ResyncCursor, Supervisor, TransitionCause,
     TransitionEvent,
 };
-use crate::domain::{ChildRunRequest, RunError, RunId, RunView};
+use crate::domain::{
+    ChildRunRequest, LabelChange, LabelOutcome, RunError, RunId, RunRecord, RunView, Selector,
+};
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
 
@@ -1598,6 +1600,66 @@ impl Engine {
         .await
     }
 
+    /// The open Run that owns an instance's supervised process (story
+    /// 21-9): what an instance name means wherever a verb takes a Run.
+    /// [`RunError::NoOpenRun`] when the instance has none. Reads only.
+    pub async fn instance_run(&self, instance: &str) -> Result<RunView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let instance = instance.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .instance_run(&instance)
+        })
+        .await
+    }
+
+    /// Bind and unbind labels on one Run as the Operator (story 21-9, PRD
+    /// FR-49): the label verb behind `hekma label` and
+    /// `PATCH /v0/runs/{id}/labels`. A set label is bound with origin
+    /// `label-verb` and outranks the instance configuration and any Caller
+    /// label on its key; removing one restores the configured value it
+    /// shadowed. Removing a label the configuration binds
+    /// ([`RunError::LabelFromConfig`]) or a Caller label
+    /// ([`RunError::LabelNotBound`]) is refused, as is any change on an
+    /// ended Run ([`RunError::RunEnded`]). All-or-nothing; `dry_run` plans
+    /// and writes nothing. A change commits one `labels-changed` event and
+    /// re-resolves the Run's Policies in the same writer job.
+    pub async fn label_run(
+        &self,
+        run_id: &str,
+        change: LabelChange,
+        dry_run: bool,
+    ) -> Result<LabelOutcome, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.label_run(&registry, &run_id, change, dry_run)
+        })
+        .await
+    }
+
+    /// The non-ended Runs a Selector matches (story 21-9, PRD FR-50): every
+    /// Run carrying all its `key=value` terms, bound or Caller, ordered by run
+    /// id. More than [`crate::MAX_SELECTED_RUNS`] matches is refused
+    /// ([`RunError::TooManyRuns`]). Reads only.
+    pub async fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let selector = selector.clone();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .select_runs(&selector)
+        })
+        .await
+    }
+
     /// Attach a Memory Backing of `kind` to an Agent Instance (story 5-1,
     /// FR-15 / spine AD-11). The engine creates the managed directory inside the
     /// Agent Home (path authority — the returned path IS the engine's, `hekma`
@@ -2305,6 +2367,28 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.run(run_id))
     }
 
+    /// Blocking twin of [`Engine::instance_run`].
+    pub fn instance_run(&self, instance: &str) -> Result<RunView, RunError> {
+        self.engine.rt.block_on(self.engine.instance_run(instance))
+    }
+
+    /// Blocking twin of [`Engine::label_run`].
+    pub fn label_run(
+        &self,
+        run_id: &str,
+        change: LabelChange,
+        dry_run: bool,
+    ) -> Result<LabelOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.label_run(run_id, change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::select_runs`].
+    pub fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
+        self.engine.rt.block_on(self.engine.select_runs(selector))
+    }
+
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The
     /// `config get --reveal` un-mask uses this to fetch the resolved cleartext of
     /// the secret leaves.
@@ -2630,6 +2714,118 @@ mod tests {
         assert!(matches!(
             facade.run("run_none"),
             Err(RunError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn the_label_facade_binds_selects_and_publishes_one_committed_event() {
+        // Story 21-9: the async + blocking label verb end to end, over a
+        // supervised Run seeded through the registry (the builtin `mock`
+        // cannot start a process).
+        use crate::domain::{Label, LabelChange, Selector};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        facade
+            .set_config("demo", "labels.team", "payments")
+            .unwrap();
+        assert!(matches!(
+            facade.instance_run("demo"),
+            Err(RunError::NoOpenRun { .. })
+        ));
+        assert!(matches!(
+            facade.instance_run("Bad Name"),
+            Err(RunError::Invalid { .. })
+        ));
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: vec![Label::bound("team", "payments")],
+                    fresh: true,
+                })
+                .unwrap();
+        }
+        assert_eq!(facade.instance_run("demo").unwrap().record.run_id, owner);
+        let mut bus = engine.subscribe();
+        let outcome = facade
+            .label_run(owner.as_str(), LabelChange::set([("team", "core")]), false)
+            .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.labels, vec![Label::verb("team", "core")]);
+        // One labels-changed event on the bus …
+        let mut seen = Vec::new();
+        while let Ok(event) = bus.try_recv() {
+            seen.push(event);
+        }
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let EngineEvent::Run(event) = &seen[0] else {
+            panic!("expected a Run event, got {:?}", seen[0]);
+        };
+        assert_eq!(event.cause.as_deref(), Some("label-verb"));
+        assert_eq!(
+            event.prior_labels.as_deref(),
+            Some(&[Label::bound("team", "payments")][..])
+        );
+        // … the same one in the outbox, and the snapshot shows the label.
+        let batch = facade.export_events(None, 1_000).unwrap();
+        let committed: Vec<_> = batch
+            .events
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.event, EngineEvent::Run(run)
+                    if run.change == crate::domain::RunEventKind::LabelsChanged
+                        && run.cause.as_deref() == Some("label-verb"))
+            })
+            .collect();
+        assert_eq!(committed.len(), 1);
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            let snapshot = registry.run_snapshot();
+            assert!(snapshot
+                .run(&owner)
+                .unwrap()
+                .labels
+                .contains(&Label::verb("team", "core")));
+        }
+        // The same set again is unchanged and silent.
+        let again = facade
+            .label_run(owner.as_str(), LabelChange::set([("team", "core")]), false)
+            .unwrap();
+        assert!(!again.changed);
+        assert!(bus.try_recv().is_err());
+        // A config write keeps the verb's value; removal restores config.
+        facade.set_config("demo", "labels.team", "billing").unwrap();
+        assert_eq!(
+            facade.run(owner.as_str()).unwrap().labels,
+            vec![Label::verb("team", "core")]
+        );
+        let restored = facade
+            .label_run(owner.as_str(), LabelChange::remove(["team"]), false)
+            .unwrap();
+        assert_eq!(restored.labels, vec![Label::bound("team", "billing")]);
+        assert!(matches!(
+            facade.label_run(owner.as_str(), LabelChange::remove(["team"]), false),
+            Err(RunError::LabelFromConfig { .. })
+        ));
+        // Selection reads open Runs by label.
+        let matched = facade
+            .select_runs(&Selector::parse("team=billing").unwrap())
+            .unwrap();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].run_id, owner);
+        assert!(matches!(
+            facade.label_run("run_none", LabelChange::set([("a", "b")]), false),
+            Err(RunError::NotFound { .. })
+        ));
+        assert!(matches!(
+            facade.label_run(owner.as_str(), LabelChange::default(), false),
+            Err(RunError::Invalid { .. })
         ));
     }
 }

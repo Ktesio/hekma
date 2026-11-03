@@ -446,3 +446,18 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-2-runs-as-first-class-entities.md` (AI-55 adversarial review, finding 2)
   summary: Between a planned relaunch being dropped (its engine exited during the backoff) and the next engine open, the Run reads `active` with the `failed` Anomaly; the open's sweep then ends it (`relaunch-not-run`). A concurrently running host that does execute the relaunch reopens it, so the Run can read `ended` briefly before it runs again.
   evidence: `domain/runs/ops.rs` (`end_runs_without_a_process`, the reopen in `ensure_supervised`), called from `adopt_orphans`. Trigger: story 21.4 (one data-path owner executes every plan) — the window closes.
+
+## Deferred from: implementation of spec-21-9-bound-labels (2026-11-03)
+
+- source_spec: `spec-21-9-bound-labels.md` (Design Notes: the Policy hook)
+  summary: Every committed bound-label change (verb, config write, relaunch, adoption) calls `domain::runs::policy::labels_changed` inside the same writer job, but the hook returns no changes: Policies do not exist yet. A Run created with configuration labels does not call it (creation is not a label change), so Policy resolution at creation is 21.3's own step.
+  evidence: `domain/runs/policy.rs` (no-op body; under test it notes each call on the returned `RunChanges`, which pins every path), `domain/runs/ops.rs` (`write_labels`). Trigger: story 21.3 — fill the hook with the Run's Policy re-resolution and resolve Policies at Run creation.
+- source_spec: `spec-21-9-bound-labels.md` (Design Notes: Selectors; Routing)
+  summary: The CLI resolves a Selector locally (one indexed read of the CLI engine's state.db), confirms, then labels exactly the listed ids one `label_run` call at a time; the Control API has no Selector resolution or set token and labels one Run per `PATCH`. The CLI write runs in-process like `hekma run`, not through a Service Host.
+  evidence: `crates/hekma/src/cli/label.rs` (`run`, the single write in `apply`), `Engine::select_runs`. Trigger: story 21.4 (route `apply` through `PATCH /v0/runs/{id}/labels` on the local host, the Selector read through the read-only engine) and story 21.6 (Selector set tokens on the Control API and on every verb).
+- source_spec: `spec-21-9-bound-labels.md` (Design Notes: Caller guard)
+  summary: The Caller guard (`labels::check_caller_labels`) has one caller today, the child open, where it is vacuous for a fresh Run; the store's Caller upsert (`RunRecords::replace_labels` with `LabelSource::Caller`, which never replaces a bound row at the SQL level) has no production caller yet.
+  evidence: `domain/runs/ops.rs` (`open_child`), `store/runs_sqlite.rs` (`replace_labels`, `#[cfg_attr(not(test), allow(dead_code))]` on the port method). Trigger: stories 22.1/23.1 (announce and identity-header Caller labels) — route every Caller-label write through both.
+- source_spec: `spec-21-9-bound-labels.md` (Design Notes: the planners)
+  summary: A configured key replaces a Caller label on the same key, and if the configuration later drops the key, the Caller's value does not come back (the Caller row was replaced, not shadowed). The same holds for a verb label set over a Caller key and then removed. Bound wins by design; the Caller can set the label again where its surface allows.
+  evidence: `domain/runs/labels.rs` (`plan_config_sync`, `plan_label_change`). Trigger: an operator or Host report of a lost Caller label, or story 23.1 if identity-header labels need to survive an Operator override.
