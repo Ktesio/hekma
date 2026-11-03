@@ -1953,6 +1953,7 @@ mod tests {
             CoverTag::Saturation => "saturation",
             CoverTag::NoRetroRepricing => "no-retro-repricing",
             CoverTag::BlockFence => "block-fence",
+            CoverTag::AncestorCeilings => "ancestor-ceilings",
         }
     }
 
@@ -1970,7 +1971,7 @@ mod tests {
         // other lands here as a red count.
         assert_eq!(
             ALL_COVERS.len(),
-            9,
+            10,
             "the closed set grew: extend exhaustive_wire_form and ALL_COVERS together"
         );
         for tag in ALL_COVERS {
