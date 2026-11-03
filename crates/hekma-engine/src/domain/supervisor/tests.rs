@@ -8591,6 +8591,133 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
 }
 
 #[test]
+fn a_degraded_run_start_fence_read_still_decides_on_the_degraded_total() {
+    // The run-start fence's totals read degrades to zero on a store failure
+    // (story 19-1's surfaced_degradation contract) — and a DEGRADED read must
+    // never become a SKIPPED enforcement: the zero per-run ceiling still fires
+    // on the fabricated zero, so a store outage at Run start cannot silently
+    // un-fence an already-breaching instance. Driven through the cfg(test)
+    // `totals_read_fault_names` seam — no real store outage staged.
+    let (_state, _manifest, registry) = setup_fake("degradedfence", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("degradedfence").unwrap();
+    let path = registry.paths().instance_config(&name);
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 0\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.totals_read_fault_names.insert(name.clone());
+
+    let fence = crate::metering::WireFence::default();
+    assert!(
+        sup.run_start_fence(&registry, &name, &fence),
+        "a degraded cumulative read must not skip the fence decision"
+    );
+    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+
+    // SURFACED: the diagnostic names the instance + the degraded scope.
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("degradedfence: the cumulative token totals read failed"),
+        "the degraded fence read must be surfaced naming the instance + scope: {text}"
+    );
+    assert!(
+        text.contains("enforcement degrades it to zero"),
+        "the diagnostic must state the degradation, not just the error: {text}"
+    );
+}
+
+#[test]
+fn the_budget_evaluation_commit_failure_is_surfaced_and_records_no_breach() {
+    // The enforcement evaluation's writer job is the FR-21 commit point
+    // (story 21-1). A job that fails must be SURFACED (AI-18: never a silent
+    // no-op) and must NOT fabricate a breach record: the next usage event
+    // evaluates again on the then-committed totals. Driven through the
+    // cfg(test) `usage_eval_fault_names` seam (the `transition_fault_names`
+    // precedent) — no real store outage staged.
+    let (_state, _manifest, registry) = setup_fake("evalfault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("evalfault").unwrap();
+    let path = registry.paths().instance_config(&name);
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"warn\"\n[budget.tokens]\nper_run = 0\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.usage_eval_fault_names.insert(name.clone());
+
+    sup.enforce_budget(&registry, &name, &RunId::mint(), "engine-observed");
+
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("evalfault: the budget evaluation could not be committed"),
+        "the failed evaluation must be surfaced naming the instance: {text}"
+    );
+    assert!(
+        text.contains("no breach was recorded, and the next usage event evaluates again"),
+        "the diagnostic must state the retry contract: {text}"
+    );
+    assert!(
+        text.contains("injected usage-evaluation fault (test seam)"),
+        "the surfaced reason must name the underlying store error: {text}"
+    );
+    assert!(
+        Supervisor::read_breach_events(&registry, "evalfault")
+            .unwrap()
+            .is_empty(),
+        "a failed evaluation commit must not leave a breach record behind"
+    );
+}
+
+#[test]
+fn a_failed_breach_record_commit_is_surfaced_and_the_record_is_absent() {
+    // `persist_breach_event`'s Err arm: the breach record is the FR-21
+    // MANDATED durable artifact, so a commit that fails is never silent — and
+    // nothing half-committed survives in the ledger. Driven through the
+    // cfg(test) `breach_record_fault_names` seam (twin of
+    // `usage_eval_fault_names`; both the seam and the helper are test-only).
+    let (_state, _manifest, registry) = setup_fake("recordfault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("recordfault").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.breach_record_fault_names.insert(name.clone());
+
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &RunId::mint(),
+        BreachScope::Cumulative,
+        1000,
+        1200,
+        BreachAction::Warn,
+        "engine-observed",
+    );
+
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("recordfault: could not record the budget breach event in state.db"),
+        "the lost mandated record must be surfaced naming the instance: {text}"
+    );
+    assert!(
+        text.contains("the mandated breach record was NOT written"),
+        "the diagnostic must say the mandated record was NOT written: {text}"
+    );
+    assert!(
+        text.contains("injected breach-record fault (test seam)"),
+        "the surfaced reason must name the underlying store error: {text}"
+    );
+    assert!(
+        Supervisor::read_breach_events(&registry, "recordfault")
+            .unwrap()
+            .is_empty(),
+        "a failed breach-record commit must not leave a record behind"
+    );
+}
+
+#[test]
 fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
     // Story 21-1 (the adoption sequence-reset undercount): the adopting
     // engine's listener mints observed sequences from 0 again under the

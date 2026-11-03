@@ -1069,6 +1069,23 @@ pub struct Supervisor {
     /// `liveness_commit_fault_names`.
     #[cfg(test)]
     transition_fault_names: std::collections::HashSet<InstanceName>,
+    /// Story 21-1 follow-up — cfg(test) FAULT-INJECTION SEAM at the budget
+    /// EVALUATION writer job: an instance name listed here fails the
+    /// `pipeline::evaluate` commit itself (before any breach is built), so
+    /// the surfaced-not-silent Err arm — no breach recorded, the next usage
+    /// event evaluates again — runs deterministically without staging a real
+    /// store outage. Same placement rationale as `transition_fault_names`.
+    /// Never compiled outside the lib's own test builds.
+    #[cfg(test)]
+    usage_eval_fault_names: std::collections::HashSet<InstanceName>,
+    /// The record-side twin of `usage_eval_fault_names`: an armed name fails
+    /// the breach-record writer job (`pipeline::record_breach`), driving the
+    /// "mandated breach record was NOT written" diagnostic. The seam's only
+    /// consumer (`persist_breach_event`) is itself test-only, so this can
+    /// never fire in a production build. Never compiled outside the lib's own
+    /// test builds.
+    #[cfg(test)]
+    breach_record_fault_names: std::collections::HashSet<InstanceName>,
     /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
     /// the backend STOP boundary: a pid entry here makes the LIVENESS-EXPIRY
     /// teardown's force-kill (reaper.rs) and the READINESS-TIMEOUT teardown's
@@ -1183,6 +1200,10 @@ impl Supervisor {
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
             adoption_lease_faults: std::collections::HashMap::new(),
@@ -1236,6 +1257,10 @@ impl Supervisor {
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
             adoption_lease_faults: std::collections::HashMap::new(),
@@ -1288,6 +1313,10 @@ impl Supervisor {
             liveness_commit_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             transition_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            usage_eval_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            breach_record_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
