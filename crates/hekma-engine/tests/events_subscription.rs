@@ -137,6 +137,9 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::UsageUpdate(e) => {
             assert_eq!(e.schema_version, USAGE_SCHEMA_VERSION);
         }
+        EngineEvent::Run(e) => {
+            assert_eq!(e.schema_version, hekma_engine::RUN_EVENT_SCHEMA_VERSION);
+        }
     }
 }
 
@@ -292,6 +295,7 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             EngineEvent::Transition(e) => e.instance.as_str(),
             EngineEvent::BudgetBreach(e) => e.instance.as_str(),
             EngineEvent::UsageUpdate(e) => e.event.instance.as_str(),
+            EngineEvent::Run(e) => e.instance.as_deref().unwrap_or_default(),
         };
         assert_eq!(
             instance,
@@ -360,8 +364,9 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     // events are the start transitions; then usage flows; the crossing usage
     // event and BOTH breaches it fires commit in one transaction (the store
     // writer's pipeline job), so the durable order is usage -> token breach
-    // -> dollar breach -> pause. Any post-pause usage commits (events racing
-    // the suspension) come after all of those.
+    // -> dollar breach -> the Run's `breach` Anomaly -> pause (story 21-2:
+    // the Run events commit with the job that caused them). Any post-pause
+    // usage commits (events racing the suspension) come after all of those.
     let first_breach = phase1
         .iter()
         .position(|e| matches!(e, EngineEvent::BudgetBreach(_)))
@@ -371,10 +376,11 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
         "transitions + usage precede the breach (got breach at {first_breach})"
     );
     assert!(
-        phase1[..first_breach]
-            .iter()
-            .all(|e| matches!(e, EngineEvent::Transition(_) | EngineEvent::UsageUpdate(_))),
-        "only transitions and usage precede the breach"
+        phase1[..first_breach].iter().all(|e| matches!(
+            e,
+            EngineEvent::Transition(_) | EngineEvent::UsageUpdate(_) | EngineEvent::Run(_)
+        )),
+        "only transitions, Run events and usage precede the breach"
     );
     match &phase1[first_breach] {
         EngineEvent::BudgetBreach(b) => {
@@ -393,6 +399,13 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
         other => panic!("expected the dollar breach, got {other:?}"),
     }
     match &phase1[first_breach + 2] {
+        EngineEvent::Run(run) => {
+            assert_eq!(run.change, hekma_engine::RunEventKind::AnomaliesChanged);
+            assert!(run.anomalies.contains(&hekma_engine::Anomaly::Breach));
+        }
+        other => panic!("expected the Run's breach Anomaly, got {other:?}"),
+    }
+    match &phase1[first_breach + 3] {
         EngineEvent::Transition(t) => {
             assert_eq!(t.new_state, hekma_engine::LifecycleState::Paused);
             assert!(
@@ -565,9 +578,12 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
     // the durable log's tail (nothing committed is ever mis-delivered).
     let (events, lagged) = test_support::drain_subscription(&mut sub);
     let lagged = lagged.expect("a stalled receiver past the capacity observes Lagged");
+    // Story 21-2: each start, pause and resume also commits one Run event
+    // (created, held, active), published right after its transition.
+    let run_events = 1 + 2 * cycles as u64;
     assert_eq!(
         lagged,
-        total - EVENT_BUS_CAPACITY as u64,
+        total + run_events - EVENT_BUS_CAPACITY as u64,
         "exactly the events past the window were dropped"
     );
     assert_eq!(
@@ -575,18 +591,23 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
         EVENT_BUS_CAPACITY as u64,
         "the retained window is the full capacity"
     );
-    for (i, event) in events.iter().enumerate() {
-        match event {
-            EngineEvent::Transition(t) => {
-                assert_eq!(
-                    t,
-                    &committed[lagged as usize + i],
-                    "retained event {i} is durable-log entry {} in order",
-                    lagged as usize + i
-                );
-            }
-            other => panic!("only transitions publish here, got {other:?}"),
-        }
+    // The retained transitions are exactly the durable log's tail, in order.
+    let retained: Vec<&TransitionEvent> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Transition(t) => Some(t),
+            EngineEvent::Run(_) => None,
+            other => panic!("only transitions and Run events publish here, got {other:?}"),
+        })
+        .collect();
+    let first = committed.len() - retained.len();
+    for (i, t) in retained.iter().enumerate() {
+        assert_eq!(
+            *t,
+            &committed[first + i],
+            "retained transition {i} is durable-log entry {} in order",
+            first + i
+        );
     }
 
     // Resync: the receiver keeps working — a NEW publish after the lag is
@@ -783,7 +804,9 @@ fn interleaved_instances_keep_per_instance_fifo() {
             EngineEvent::Transition(t) => {
                 got.push((t.instance.as_str(), t.prior_state, t.new_state))
             }
-            other => panic!("only transitions publish here, got {other:?}"),
+            // Story 21-2: each transition's Run projection follows it.
+            EngineEvent::Run(_) => {}
+            other => panic!("only transitions and Run events publish here, got {other:?}"),
         }
     }
     assert_eq!(

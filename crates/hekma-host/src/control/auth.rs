@@ -1,63 +1,112 @@
-//! The Control API's bearer-auth layer (story 17-3): ONE tower-style
-//! middleware over every route, comparing the presented `Authorization:
-//! Bearer` token against the secret the host resolved at STARTUP through the
-//! engine's `SecretResolver` composite (env → the state-dir secrets file —
-//! AD-10; the host never builds a second resolution mechanism).
+//! The Control API's auth layer (story 17-3; story 21-4 made it AD-20's
+//! credential resolver): ONE middleware over every route, resolving the
+//! presented `Authorization: Bearer` credential against the host's
+//! [`CredentialResolver`] and checking the resolved class against the
+//! authority matrix ([`CredentialClass::allows`]).
 //!
-//! No-leak discipline (NFR-6 / the frozen acceptance criteria): the secret's
-//! VALUE lives only inside a [`BearerToken`] (a [`SecretString`] wrapper
-//! whose `Debug`/`Display` redact); the compare is CONSTANT-TIME over the
-//! token bytes (never an early content return); a 401 never echoes the
-//! presented value (the body is static — see [`super::error`]); no response,
-//! log line, or SSE frame ever carries the secret.
+//! The resolver holds NO credential value — only the SHA-256 of each one
+//! with its class (AD-22: every credential is looked up by hash). The local
+//! operator token (minted per serve, written to `control.json`) and the
+//! `--bearer-secret` value (resolved at startup through the engine's
+//! `SecretResolver` composite, AD-10) are both operator/Host bearer
+//! credentials — the only class issued today; the other AD-20 classes
+//! (announce-scoped, Run Key, refresh, proxy-access, Node) land with their
+//! stories (22-1, 22-3, 24-2, the Hub story).
+//!
+//! No-leak discipline (NFR-6): the presented value is hashed and compared in
+//! CONSTANT TIME against EVERY entry (no early exit — the number of entries
+//! and their order never shape the timing by content); a 401 never echoes
+//! it (the body is static — see [`super::error`]); no response, log line or
+//! SSE frame carries a credential.
 
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use hekma_engine::domain::SecretString;
 
 use super::error::ApiError;
 use super::ApiState;
 
-/// The startup-resolved bearer secret. `SecretString` is deliberately not
-/// `Clone`, so the token wraps it in an `Arc` — one allocation, shared by
-/// every request task. Construction is the ONLY way a value enters; the
-/// single greppable exposure site is inside [`BearerToken::matches`] (its
-/// `expose_secret()` call feeding the constant-time compare) — no other read
-/// exists.
-#[derive(Clone)]
-pub(crate) struct BearerToken {
-    secret: std::sync::Arc<SecretString>,
+/// The credential classes of AD-20's authority matrix. Only the
+/// operator/Host bearer is issued today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CredentialClass {
+    /// The operator/Host bearer: the local operator token and the
+    /// `--bearer-secret` value. Every Control API route; never accepted by
+    /// the Metering Proxy and never handed to an agent.
+    OperatorBearer,
 }
 
-impl BearerToken {
-    /// Wrap the startup-resolved secret.
-    pub(crate) fn new(secret: SecretString) -> Self {
-        BearerToken {
-            secret: std::sync::Arc::new(secret),
+/// The surfaces a credential may be presented on (the matrix's columns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// Every `/v0` Control API route.
+    ControlApi,
+}
+
+impl CredentialClass {
+    /// The authority matrix (`class × surface`). A class refused on a surface
+    /// answers the typed `403 forbidden`; with the one class issued today,
+    /// every presented-and-resolved credential is allowed.
+    pub(crate) fn allows(self, surface: Surface) -> bool {
+        match (self, surface) {
+            (CredentialClass::OperatorBearer, Surface::ControlApi) => true,
+        }
+    }
+}
+
+/// The host's credential resolver: `(sha256(credential), class)` entries,
+/// shared by every listener (the local endpoint and `--listen`).
+#[derive(Clone, Default)]
+pub(crate) struct CredentialResolver {
+    entries: std::sync::Arc<Vec<([u8; 32], CredentialClass)>>,
+}
+
+impl CredentialResolver {
+    /// A resolver over `(credential, class)` pairs — each credential is
+    /// hashed here and its value is never kept.
+    pub(crate) fn new<'a>(
+        credentials: impl IntoIterator<Item = (&'a str, CredentialClass)>,
+    ) -> Self {
+        let entries = credentials
+            .into_iter()
+            .map(|(value, class)| (sha256(value.as_bytes()), class))
+            .collect();
+        CredentialResolver {
+            entries: std::sync::Arc::new(entries),
         }
     }
 
-    /// Whether the presented `Authorization: Bearer` value (when one was
-    /// presented at all) matches the resolved secret. `None` (no bearer
-    /// value extracted) never matches. This method holds the ONE
-    /// `expose_secret()` read in the codebase — the grep anchor.
-    pub(crate) fn matches(&self, presented: Option<&str>) -> bool {
-        match presented {
-            Some(value) => {
-                constant_time_eq(value.as_bytes(), self.secret.expose_secret().as_bytes())
+    /// Resolve a presented credential to its class. `None` (nothing
+    /// presented) never resolves. The presented value is hashed once and
+    /// compared in constant time against EVERY entry — the loop never exits
+    /// early on a match.
+    pub(crate) fn resolve(&self, presented: Option<&str>) -> Option<CredentialClass> {
+        let presented = presented?;
+        let digest = sha256(presented.as_bytes());
+        let mut found = None;
+        for (hash, class) in self.entries.iter() {
+            if constant_time_eq(&digest, hash) && found.is_none() {
+                found = Some(*class);
             }
-            None => false,
         }
+        found
     }
 }
 
-impl std::fmt::Debug for BearerToken {
+impl std::fmt::Debug for CredentialResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never the value — not even a length hint (NFR-6).
-        f.write_str("BearerToken(<redacted>)")
+        // Never a hash, never a value — the count is a configuration fact.
+        write!(f, "CredentialResolver({} credentials)", self.entries.len())
     }
+}
+
+/// The SHA-256 of `bytes` (the vendored ring digest — no new package).
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
 }
 
 /// Byte-equal in time independent of WHERE the first difference is (fold-XOR
@@ -95,8 +144,7 @@ fn presented_bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
         return None;
     }
     // Extra SP between scheme and token is legal (1*SP); an EMPTY token is
-    // not a presentation (it would also never match — skipping the compare
-    // is free and explicit).
+    // not a presentation.
     let token = rest.trim_start_matches(' ');
     if token.is_empty() {
         None
@@ -106,17 +154,25 @@ fn presented_bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 }
 
 /// The ONE auth gate over every route (`middleware::from_fn_with_state`):
-/// a request that does not present the resolved bearer is answered 401
-/// (static body + `WWW-Authenticate: Bearer`) WITHOUT reaching any handler —
-/// the I/O matrix's "no handler runs".
+/// a request whose credential does not resolve is answered 401 (a static
+/// body and `WWW-Authenticate: Bearer`) WITHOUT reaching any handler; a
+/// resolved credential whose class the Control API does not allow is the
+/// typed 403 (reserved — see [`ApiError::forbidden`]). An authenticated
+/// request is counted as host activity (the auto-started host's idle clock,
+/// story 21-4).
 pub(crate) async fn require_bearer(
     State(state): State<ApiState>,
     request: Request,
     next: Next,
 ) -> Response {
-    if !state.bearer.matches(presented_bearer(request.headers())) {
-        return ApiError::unauthorized().into_response();
+    match state.resolver.resolve(presented_bearer(request.headers())) {
+        None => return ApiError::unauthorized().into_response(),
+        Some(class) if !class.allows(Surface::ControlApi) => {
+            return ApiError::forbidden().into_response();
+        }
+        Some(_) => {}
     }
+    let _active = state.activity.enter();
     next.run(request).await
 }
 
@@ -125,21 +181,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn equal_tokens_match_and_differing_tokens_do_not() {
-        let token = BearerToken::new(SecretString::new("correct-horse".to_string()));
-        assert!(token.matches(Some("correct-horse")));
-        assert!(!token.matches(Some("wrong-horse")));
-        assert!(!token.matches(Some("correct-horse ")));
-        assert!(!token.matches(Some("")));
-        // No presentation at all never matches.
-        assert!(!token.matches(None));
+    fn a_presented_credential_resolves_to_its_class_and_nothing_else_does() {
+        let resolver = CredentialResolver::new([
+            ("local-token", CredentialClass::OperatorBearer),
+            ("correct-horse", CredentialClass::OperatorBearer),
+        ]);
+        assert_eq!(
+            resolver.resolve(Some("local-token")),
+            Some(CredentialClass::OperatorBearer)
+        );
+        assert_eq!(
+            resolver.resolve(Some("correct-horse")),
+            Some(CredentialClass::OperatorBearer)
+        );
+        assert_eq!(resolver.resolve(Some("wrong-horse")), None);
+        assert_eq!(resolver.resolve(Some("correct-horse ")), None);
+        assert_eq!(resolver.resolve(Some("")), None);
+        // No presentation at all never resolves.
+        assert_eq!(resolver.resolve(None), None);
+        // An empty resolver resolves nothing.
+        assert_eq!(CredentialResolver::default().resolve(Some("x")), None);
+    }
+
+    #[test]
+    fn the_matrix_allows_the_operator_bearer_on_the_control_api() {
+        assert!(CredentialClass::OperatorBearer.allows(Surface::ControlApi));
     }
 
     #[test]
     fn length_differences_never_match_but_are_compared_in_constant_content_time() {
-        // The fold covers the longer extent: a long attacker token against a
-        // short secret is one full pass, not an early length bail with
-        // content influence.
         assert!(!constant_time_eq(b"short", b"a-much-longer-attacker-token"));
         assert!(!constant_time_eq(b"a-much-longer-attacker-token", b"short"));
         assert!(constant_time_eq(b"same", b"same"));
@@ -149,11 +219,23 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_form_never_carries_the_value() {
-        let token = BearerToken::new(SecretString::new("super-secret-value".to_string()));
-        let rendered = format!("{token:?}");
+    fn the_debug_form_never_carries_a_value_or_a_hash() {
+        let resolver =
+            CredentialResolver::new([("super-secret-value", CredentialClass::OperatorBearer)]);
+        let rendered = format!("{resolver:?}");
         assert!(!rendered.contains("super-secret-value"), "{rendered}");
-        assert!(rendered.contains("redacted"), "{rendered}");
+        assert_eq!(rendered, "CredentialResolver(1 credentials)");
+    }
+
+    #[test]
+    fn the_hash_is_sha256() {
+        // The FIPS 180-2 "abc" vector.
+        let digest = sha256(b"abc");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

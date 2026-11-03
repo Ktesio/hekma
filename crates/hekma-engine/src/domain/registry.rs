@@ -264,6 +264,9 @@ pub struct Registry {
     /// Import notes from a v12 upgrade on this open, drained once by the
     /// engine onto its diagnostic surface.
     open_notes: std::sync::Mutex<Vec<String>>,
+    /// The published Run snapshot (story 21-2, AD-25). Only store-writer
+    /// post-commit hooks publish into it.
+    run_snapshot: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
 }
 
 impl Registry {
@@ -276,7 +279,144 @@ impl Registry {
     ///
     /// Ensures the state dir exists and opens (creating + migrating) the DB.
     pub fn open(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
-        let paths = EnginePaths::new(base).map_err(|e| {
+        let paths = Self::resolve_paths(base)?;
+        // Create the state base (and thus its parent chain) before opening the
+        // DB — a fresh install has no directory yet (AC1 "fresh state").
+        ensure_dir(paths.state_base(), "<state-dir>")?;
+        // Story 21-1: the writer opens (and migrates) FIRST, importing the
+        // pre-v12 event files once; then the read-only connection opens on
+        // the migrated database.
+        let legacy = LegacyFiles { paths: &paths };
+        let (write_store, notes) = SqliteStore::open_with_legacy(&paths.state_db(), &legacy)
+            .map_err(|err| match err {
+                StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
+                    RegistryError::OutboxOpenRefused { detail }
+                }
+                other => RegistryError::Store(other),
+            })?;
+        legacy.retire_outbox_files();
+        let writer = StoreWriter::spawn(write_store)?;
+        let store = SqliteStore::open_read_only(&paths.state_db())?;
+        // Story 21-2: the writer publishes the initial Run snapshot (every
+        // non-ended Run) before any other job runs.
+        let run_snapshot =
+            std::sync::Arc::new(crate::domain::runs::snapshot::SnapshotPublisher::default());
+        // An unreadable Run row degrades the snapshot to empty with a note
+        // rather than refusing the open (graceful degradation).
+        let publisher = std::sync::Arc::clone(&run_snapshot);
+        let mut notes = notes;
+        if let Err(err) = writer.call(move |ctx| {
+            let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
+            ctx.after_commit(move || publisher.publish(entries));
+            Ok(())
+        }) {
+            notes.push(format!(
+                "the open Runs could not be read into the published Run snapshot ({err}); it \
+                 starts empty and fills as Runs change"
+            ));
+        }
+        Ok(Self {
+            paths,
+            store,
+            writer,
+            open_notes: std::sync::Mutex::new(notes),
+            run_snapshot,
+        })
+    }
+
+    /// The Run snapshot publisher (story 21-2): writer jobs that change a
+    /// Run hand it to [`crate::domain::runs::ops::commit`].
+    pub(crate) fn run_publisher(
+        &self,
+    ) -> &std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher> {
+        &self.run_snapshot
+    }
+
+    /// The current published Run snapshot (story 21-2): the data path's
+    /// lock-free view of every non-ended Run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn run_snapshot(
+        &self,
+    ) -> std::sync::Arc<crate::domain::runs::snapshot::RunSnapshot> {
+        self.run_snapshot.current()
+    }
+
+    /// Run a Run-registry operation as one writer job and commit its changes
+    /// (outbox rows + the snapshot publish). A refusal that is not a store
+    /// error comes back as `Ok(Err(..))` from the job, so the writer commits
+    /// nothing for it.
+    pub(crate) fn run_job<R: Send + 'static>(
+        &self,
+        op: impl FnOnce(
+                &SqliteStore,
+            )
+                -> Result<(R, crate::domain::runs::ops::RunChanges), crate::domain::RunError>
+            + Send
+            + 'static,
+    ) -> Result<(R, Vec<crate::domain::runs::ops::CommittedRunEvent>), crate::domain::RunError>
+    {
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        self.writer
+            .call(move |ctx| match op(ctx.store()) {
+                Ok((value, changes)) => {
+                    let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
+                    Ok(Ok((value, events)))
+                }
+                Err(crate::domain::RunError::Store(err)) => Err(err),
+                Err(refusal) => Ok(Err(refusal)),
+            })
+            .map_err(crate::domain::RunError::Store)?
+    }
+
+    /// One Run's facade view, read on the read-only connection.
+    pub(crate) fn run_view(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<crate::domain::RunView, crate::domain::RunError> {
+        self.store
+            .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
+    }
+
+    /// Open a READ-ONLY registry (story 21-4): no directory is created, no
+    /// migration runs, no legacy import happens, and the store writer is
+    /// CLOSED (every write answers a typed refusal). A missing state.db reads
+    /// as an empty fleet from an in-memory database — nothing is created on
+    /// disk; a state.db below the current schema answers
+    /// [`StoreError::NeedsMigration`].
+    pub fn open_read_only(base: Option<std::path::PathBuf>) -> Result<Self, RegistryError> {
+        let paths = Self::resolve_paths(base)?;
+        let db = paths.state_db();
+        let store = if db.exists() {
+            SqliteStore::open_existing_read_only(&db)?
+        } else {
+            SqliteStore::open_empty_read_only()?
+        };
+        Ok(Self {
+            paths,
+            store,
+            writer: StoreWriter::closed(),
+            open_notes: std::sync::Mutex::new(Vec::new()),
+            // A read-only registry serves no data path: its Run snapshot
+            // stays empty (only a store writer publishes, AD-25).
+            run_snapshot: std::sync::Arc::new(
+                crate::domain::runs::snapshot::SnapshotPublisher::default(),
+            ),
+        })
+    }
+
+    /// Resolve the state paths WITHOUT opening anything (story 21-4: the
+    /// `hekma` CLI locates the state root its Service Host owns), mapping a
+    /// resolution failure to the same typed `Io` error both opens raise.
+    pub fn resolve_state_paths(
+        base: Option<std::path::PathBuf>,
+    ) -> Result<EnginePaths, RegistryError> {
+        Self::resolve_paths(base)
+    }
+
+    /// Resolve the state paths, mapping a resolution failure to the typed
+    /// `Io` error naming the offending path (shared by both opens).
+    fn resolve_paths(base: Option<std::path::PathBuf>) -> Result<EnginePaths, RegistryError> {
+        EnginePaths::new(base).map_err(|e| {
             // AI-4: name the ACTUAL path that failed. A rejected relative
             // `KTESIO_STATE_DIR` carries the offending value itself — not the
             // `<default via …>` placeholder, which describes a resolution mode,
@@ -299,29 +439,6 @@ impl Registry {
                 path,
                 source: std::io::Error::other(e.to_string()),
             }
-        })?;
-        // Create the state base (and thus its parent chain) before opening the
-        // DB — a fresh install has no directory yet (AC1 "fresh state").
-        ensure_dir(paths.state_base(), "<state-dir>")?;
-        // Story 21-1: the writer opens (and migrates) FIRST, importing the
-        // pre-v12 event files once; then the read-only connection opens on
-        // the migrated database.
-        let legacy = LegacyFiles { paths: &paths };
-        let (write_store, notes) = SqliteStore::open_with_legacy(&paths.state_db(), &legacy)
-            .map_err(|err| match err {
-                StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
-                    RegistryError::OutboxOpenRefused { detail }
-                }
-                other => RegistryError::Store(other),
-            })?;
-        legacy.retire_outbox_files();
-        let writer = StoreWriter::spawn(write_store)?;
-        let store = SqliteStore::open_read_only(&paths.state_db())?;
-        Ok(Self {
-            paths,
-            store,
-            writer,
-            open_notes: std::sync::Mutex::new(notes),
         })
     }
 
@@ -1010,11 +1127,40 @@ impl Registry {
     pub(crate) fn write_spawn_record_new_launch(
         &self,
         record: &SpawnRecord,
-    ) -> Result<u64, RegistryError> {
+        run: crate::domain::runs::ops::SupervisedRun,
+    ) -> Result<(u64, Vec<crate::domain::runs::ops::CommittedRunEvent>), RegistryError> {
+        // Story 21-2: the Run is created (fresh start) or kept (relaunch) in
+        // the same job as the record, so the durable Run identity and the
+        // process record commit together.
         let record = record.clone();
-        Ok(self.write(move |store| {
-            store.upsert_spawn_record(&record)?;
-            store.bump_launch_generation(&record.name)
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        Ok(self.writer.call(move |ctx| {
+            ctx.store().upsert_spawn_record(&record)?;
+            let generation = ctx.store().bump_launch_generation(&record.name)?;
+            let changes = crate::domain::runs::ops::ensure_supervised(
+                ctx.store(),
+                &run,
+                &crate::time::now_rfc3339(),
+            )?;
+            let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
+            Ok((generation, events))
+        })?)
+    }
+
+    /// Create or keep an instance's supervised Run outside a spawn (story
+    /// 21-2): adoption keeps the Run and re-syncs its depth and labels.
+    pub(crate) fn ensure_supervised_run(
+        &self,
+        run: crate::domain::runs::ops::SupervisedRun,
+    ) -> Result<Vec<crate::domain::runs::ops::CommittedRunEvent>, RegistryError> {
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        Ok(self.writer.call(move |ctx| {
+            let changes = crate::domain::runs::ops::ensure_supervised(
+                ctx.store(),
+                &run,
+                &crate::time::now_rfc3339(),
+            )?;
+            crate::domain::runs::ops::commit(ctx, &publisher, changes)
         })?)
     }
 

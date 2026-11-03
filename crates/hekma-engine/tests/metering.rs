@@ -126,7 +126,8 @@ fn self_reported_usage_lands_in_the_ledger_under_the_run_id() {
     // Every row carries the SAME Run id (one Run so far).
     let runs = distinct_run_ids(state.path(), "meter");
     assert_eq!(runs.len(), 1, "all events share the one Run's id: {runs:?}");
-    assert!(runs[0].starts_with("run-"), "run id shape: {}", runs[0]);
+    // Story 21-2: run ids are `run_` + a ULID (AD-25).
+    assert!(runs[0].starts_with("run_"), "run id shape: {}", runs[0]);
 
     // The Fleet-detail usage totals EQUAL the ledger exactly (FR-22 discipline):
     // 3 events × (10 in, 20 out).
@@ -402,6 +403,11 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut writer_files = std::collections::BTreeSet::new();
     visit_rs(&src, &mut |path, text| {
+        // A test module file (`…/tests.rs`) seeds the ledger as a fixture; it
+        // is not a production writer.
+        if path.file_name().is_some_and(|name| name == "tests.rs") {
+            return;
+        }
         for line in text.lines() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//")

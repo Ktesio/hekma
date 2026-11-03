@@ -29,7 +29,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)', 'cfg(
 
 [workspace.dependencies]
 # Internal crates
-hekma-engine = { path = "crates/hekma-engine", version = "0.11.0" }
+hekma-engine = { path = "crates/hekma-engine", version = "0.12.0" }
 # The long-running Service Host (story 17-2, AD-2 amendment 2026-10-19): the
 # `hekma` CLI's `serve` subcommand drives it; its ONLY normal dep is the
 # engine's public API (`cargo tree -p hekma-host -e normal` = engine + tokio).
@@ -104,6 +104,9 @@ serde_json = "1"
 # consume the parsed form. New dep this story (approved: `toml = "1"`).
 toml = "1"
 thiserror = "2"
+# Run ids (story 21-2, AD-25): the ULID's 80 random bits. Already in the
+# tree through `ring` (rustls); a direct edge adds no crate (NFR-8).
+getrandom = "0.2"
 ureq = { version = "3", features = ["json"] }
 semver = "1"
 flate2 = "1"

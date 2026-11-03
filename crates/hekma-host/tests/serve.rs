@@ -231,6 +231,7 @@ fn the_options_debug_rendering_names_every_field_and_hides_the_sink() {
             log_capture: hekma_engine::LogCaptureMode::Metadata,
             diagnostics: Some(sink),
             otlp: Default::default(),
+            ..Default::default()
         }
     );
     assert!(

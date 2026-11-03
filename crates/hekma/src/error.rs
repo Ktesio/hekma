@@ -290,3 +290,55 @@ pub struct AgentPauseCommandFailed {
 pub struct AgentDrainBoundInvalid {
     pub message: String,
 }
+
+/// Story 21-2: no Run has the id (exit `3`, the not-found class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::not_found))]
+pub struct RunNotFound {
+    pub message: String,
+}
+
+/// Story 21-2: the Run request cannot be honored as given — nesting past the
+/// cap, a Breach Action the child's depth cannot execute, a malformed label
+/// or limit (exit `2`, the usage class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::invalid))]
+pub struct RunInvalid {
+    pub message: String,
+}
+
+/// Story 21-2: the Run's (or its parent's) state forbids the request — no
+/// open Run on the instance, an ended parent, a process-owning Run closed
+/// (exit `4`, the invalid-state class).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::run::invalid_state))]
+pub struct RunInvalidState {
+    pub message: String,
+}
+
+/// Story 21-4: the local Service Host (AD-20's one data-path owner) could not
+/// be found or started for the state root, or stopped answering after it was
+/// found. The message names the state root and `serve.log` where the host's
+/// own output lands. Classified as exit `1` (General) through the documented
+/// catch-all — an environment/system failure, like `ServeStartupFailed`; no
+/// new exit-code number was minted (DC-4).
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::host::unavailable))]
+pub struct ServiceHostUnavailable {
+    pub message: String,
+}
+
+/// Story 21-4: the local Service Host refused a CLI write with an error that
+/// is not an engine error this build can decode (a request rejection, or an
+/// engine error from a newer host). The message is the host's own. Exit `1`
+/// (General) through the catch-all, like `ServiceHostUnavailable`.
+#[derive(Error, Diagnostic, Debug)]
+#[error("{}", message)]
+#[diagnostic(code(hekma::host::refused))]
+pub struct ServiceHostRefused {
+    pub message: String,
+}

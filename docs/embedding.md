@@ -105,6 +105,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | Facade | Purpose |
 |--------|---------|
 | `Engine::open(base)` | Open (or create) an engine rooted at a state directory; `None` uses the OS default. |
+| `Engine::open_read_only(base)` | Open a READ-ONLY engine over the same facade: a `query_only` connection, a closed store writer (every write returns a typed error, never a panic), no orphan adoption and no crash-detection reaper — it never touches a process another engine supervises and never writes `state.db`. A missing `state.db` reads as an empty fleet and creates nothing; a `state.db` below the current schema answers `StoreError::NeedsMigration` (a writer must open it first). A live instance's current-Run totals come from its persisted Run id. This is how `hekma`'s read commands open the state while a Service Host owns the writes. |
 | `register` / `register_with_adapter` | Register an instance under a built-in adapter kind or a manifest (`adapter.toml`) directory. The built-in kinds include `hermes` and `acp` (any Agent Client Protocol v1 agent — set the `acp.command`/`acp.args` config keys; no contract negotiation). |
 | `set_config` / `effective_config` | Write and read the unified configuration (budgets, rates, model keys) with per-leaf provenance. |
 | `start` / `stop` / `pause` / `resume` | Drive the lifecycle; `stop` takes a graceful-shutdown window and kills the whole process group. |
@@ -115,10 +116,22 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `with_diagnostics` / `Blocking::with_diagnostics` | Route the engine's two stderr diagnostics into your own writer (below). |
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hekma agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
+| `open_child_run` / `close_run` / `run` | Open a child Run under a supervised Run for one unit of your own work (`ChildRunRequest`: parent, caller labels, per-run ceilings, an external id for idempotent retries), close it, and read any Run (`RunView`: depth, status, Anomalies, labels, limits, subtree usage). Refusals are a typed `RunError` with a stable `code()`. See [Runs](runs.md). |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
 with a reason and a remediation instead of panicking.
+
+**One writer per process — and the CLI's Service Host.** Each engine you open
+runs its own store writer. The `hekma` CLI never opens a
+writing engine: while a Service Host serves a state directory, every CLI
+write goes through it, and the CLI auto-starts one when none runs. If your
+program opens its own (writing) engine on a directory a `hekma serve` — or an
+auto-started host — also serves, the two serialize through SQLite's write
+lock (the 5 s busy timeout), and each supervises only the agents it started
+or adopted. Prefer one owner per state directory: drive the host's Control
+API (see [the Control API](control-api.md)), or give your engine its own
+state directory.
 
 ### The detached-start host duty
 
@@ -145,8 +158,10 @@ Four rules cover the whole contract:
    after it subscribed, in commit order, per-instance FIFO. Anything earlier is
    readable through the query APIs.
 2. **Payloads are versioned structs.** Every event carries a `schema_version`
-   and is one of: a lifecycle transition, a budget breach, or a committed
-   usage measurement — the exact wire shapes `hekma --json` documents.
+   and is one of: a lifecycle transition, a budget breach, a committed usage
+   measurement, or a Run event (`EngineEvent::Run`: a Run created, its depth,
+   status, Anomalies or bound labels changed, or ended — published right after
+   the event that caused it) — the exact wire shapes `hekma --json` documents.
 3. **A slow subscriber never stalls supervision.** The bus is bounded; if you
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the
@@ -229,7 +244,7 @@ The engine writes two kinds of operational diagnostics — a DC-10 notice when a
 attached filesystem memory backing cannot be delivered to the agent, and
 enforcement breadcrumbs: a budget-breach action (pause/stop) that could not be
 honored, a `block` wire fence raised (or not raised, so the breach acted as
-`warn`), and a Restart Policy relaunch that lifted a per-run fence. With no
+`warn`), and a Run's labels that could not be bound or updated. With no
 sink installed they go to **stderr**, byte-for-byte as they always have;
 nothing is written to stdout, ever. A host that owns its stderr (for a daemon,
 a GUI, a log pipeline) can route them into its own writer:

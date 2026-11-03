@@ -135,14 +135,22 @@ fn spawn_serve_with(
     // sentinel — peek via /proc-free approach: wait until the state DB's
     // lock file exists AND the process is alive, with the notice asserted
     // from the drained buffer at the end. Readiness = host.lock exists.
+    //
+    // Story 21-4: `host.lock` can predate THIS serve (an auto-started host
+    // the test killed left it behind), so readiness is now THIS process's
+    // `control.json` — written after the lock, the signal arming, the engine
+    // open and the local endpoint's bind.
     let lock = state_dir.join(hekma_engine::paths::HOST_LOCK_FILE);
     loop {
-        if lock.exists() {
+        let ours = hekma_host::read_discovery(state_dir)
+            .map(|discovery| discovery.pid == child.id())
+            .unwrap_or(false);
+        if lock.exists() && ours {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "serve never became ready (no host.lock)"
+            "serve never became ready (no host.lock / control.json of its own)"
         );
         if child.try_wait().expect("try_wait").is_some() {
             panic!("serve exited before becoming ready");
@@ -213,6 +221,10 @@ fn serve_stops_a_running_agent_on_sigterm_and_exits_zero() {
     assert!(started.success, "agent start failed: {}", started.stderr);
     let pid = wait_for_agent_pid(&agent_log_path(&state_dir, "hosted"));
 
+    // Story 21-4: the CLI writes above auto-started a background Service
+    // Host on this state root; end it abruptly (agents survive, the crashed-
+    // host shape) so the explicit serve below can take host.lock and adopt.
+    helpers::kill_host(&state_dir);
     let (mut serve, drainer) = spawn_serve(&state_dir);
     let status = signal_and_wait(&mut serve, "with a running agent");
     assert_eq!(status.code(), Some(0), "the drain path exits 0: {status}");
@@ -313,6 +325,10 @@ fn a_repeated_sigterm_is_idempotent_one_drain() {
         &state_dir,
     );
     assert!(started.success, "agent start failed: {}", started.stderr);
+    // Story 21-4: the CLI writes above auto-started a background Service
+    // Host on this state root; end it abruptly (agents survive, the crashed-
+    // host shape) so the explicit serve below can take host.lock and adopt.
+    helpers::kill_host(&state_dir);
     let (mut serve, drainer) = spawn_serve(&state_dir);
     // TWO signals, back to back: the drain must run exactly ONCE.
     for _ in 0..2 {
@@ -741,6 +757,10 @@ fn serve_log_capture_metadata_leaves_no_agent_content_at_rest_and_exports_events
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         probe.local_addr().unwrap().port()
     };
+    // Story 21-4: the CLI writes above auto-started a background Service
+    // Host on this state root; end it abruptly (agents survive, the crashed-
+    // host shape) so the explicit serve below can take host.lock and adopt.
+    helpers::kill_host(&state_dir);
     let (mut child, drainer) = spawn_serve_with(
         &state_dir,
         &[
@@ -1052,6 +1072,10 @@ fn served_exit_75_request_lands_failed_and_show_names_the_declared_class() {
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         probe.local_addr().unwrap().port()
     };
+    // Story 21-4: the CLI writes above auto-started a background Service
+    // Host on this state root; end it abruptly (agents survive, the crashed-
+    // host shape) so the explicit serve below can take host.lock and adopt.
+    helpers::kill_host(&state_dir);
     let (mut serve, drainer) = spawn_serve_with(
         &state_dir,
         &[
@@ -1163,6 +1187,10 @@ fn served_clean_exit_lands_stopped_and_show_reports_it() {
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         probe.local_addr().unwrap().port()
     };
+    // Story 21-4: the CLI writes above auto-started a background Service
+    // Host on this state root; end it abruptly (agents survive, the crashed-
+    // host shape) so the explicit serve below can take host.lock and adopt.
+    helpers::kill_host(&state_dir);
     let (mut serve, drainer) = spawn_serve_with(
         &state_dir,
         &[

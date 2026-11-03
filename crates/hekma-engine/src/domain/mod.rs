@@ -37,6 +37,7 @@ pub(crate) mod readiness;
 mod registry;
 mod restart;
 mod resync;
+pub(crate) mod runs;
 mod secret;
 mod supervisor;
 mod transition;
@@ -48,13 +49,13 @@ pub use budget::{
 pub(crate) use bus::EventBus;
 pub use bus::{broadcast, EngineEvent, EVENT_BUS_CAPACITY};
 pub use config::{
-    is_pass_through, is_secret_ref, pass_through_tail, resolve, resolve_cost, resolve_token_budget,
-    resolve_upstream_base_url, secret_name, ConfigError, ConfigLayer, EffectiveConfig,
-    ResolvedValue, SourceLayer, ACP_ARGS_KEY, ACP_COMMAND_KEY, BUDGET_BREACH_ACTION_KEY,
-    BUDGET_DOLLARS_CUMULATIVE_KEY, BUDGET_DOLLARS_PER_RUN_KEY, BUDGET_TOKENS_CUMULATIVE_KEY,
-    BUDGET_TOKENS_PER_RUN_KEY, COST_RATE_INPUT_KEY, COST_RATE_OUTPUT_KEY, MEMORY_DIR_KEY,
-    METERING_BASE_URL_KEY, METERING_UPSTREAM_BASE_URL_KEY, PASS_THROUGH_PREFIX, SECRET_MASK,
-    SECRET_PREFIX,
+    is_pass_through, is_secret_ref, parse_dollars_to_micros, pass_through_tail, resolve,
+    resolve_cost, resolve_token_budget, resolve_upstream_base_url, secret_name, ConfigError,
+    ConfigLayer, EffectiveConfig, ResolvedValue, SourceLayer, ACP_ARGS_KEY, ACP_COMMAND_KEY,
+    BUDGET_BREACH_ACTION_KEY, BUDGET_DOLLARS_CUMULATIVE_KEY, BUDGET_DOLLARS_PER_RUN_KEY,
+    BUDGET_TOKENS_CUMULATIVE_KEY, BUDGET_TOKENS_PER_RUN_KEY, COST_RATE_INPUT_KEY,
+    COST_RATE_OUTPUT_KEY, MEMORY_DIR_KEY, METERING_BASE_URL_KEY, METERING_UPSTREAM_BASE_URL_KEY,
+    PASS_THROUGH_PREFIX, SECRET_MASK, SECRET_PREFIX,
 };
 pub use cost::{
     cost_micros, cost_micros_with_cached, render_dollars, render_dollars_bare, CostCap,
@@ -70,13 +71,13 @@ pub use fleet::{
     Supervision, UsageGapNotice, UsageView,
 };
 pub use governance::{
-    canonical_json, checksum_file_content, decide, fence_code, fence_refusal, generate,
-    governance_vectors_checksum, run_derivation, Case, CoverTag, DecisionCase, DerivationCase,
-    DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision, GovernanceInput,
-    GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm, VectorsDocument, ALL_COVERS,
-    FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID,
-    GOVERNANCE_VECTORS_ARTIFACT_PATH, GOVERNANCE_VECTORS_SCHEMA_VERSION,
-    GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
+    canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
+    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
+    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
+    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
+    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
+    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 pub use instance::AgentInstance;
 pub use lifecycle::LifecycleState;
@@ -88,6 +89,12 @@ pub use outbox::{
 };
 pub use registry::{Registry, RemoveDisposition};
 pub use resync::{ResyncBatch, ResyncCursor};
+pub use runs::{
+    validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,
+    ControlDepth, Label, LabelSource, RunError, RunEvent, RunEventKind, RunLimits, RunParent,
+    RunRecord, RunStatus, RunUsage, RunVerb, RunView, VerbCell, HOST_IDENTITY_BINDING,
+    MAX_RUN_NESTING, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+};
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};
