@@ -3,12 +3,15 @@
 //! method and renders the mapped response, with error conversion delegated
 //! entirely to the [`ApiError`](super::error::ApiError) mapper (`?`).
 //!
-//! Projection discipline (AD-20 / the frozen route table): only the story's
-//! named facade methods appear here. NOT projected, by design: `send_input`,
-//! the restart-policy setter, the memory verbs (additive under 0.x later);
-//! the log/raw-output reads (FR-41 forbids raw agent output in v0); and
-//! `reveal_secrets` — NEVER, on any route, in any shape (the config read
-//! renders masked values only).
+//! Projection discipline (AD-20 / the frozen route table): only the named
+//! facade methods appear here. Story 21-4 projects the setters the 17-3 table
+//! had excluded "by design" because no CLI path needed them — every CLI write
+//! now routes through this API (AD-20's one data-path owner): `send_input`,
+//! the memory verbs, the restart-policy setter, `remove`'s disposition/force
+//! and `start`'s detach. Still NOT projected: the log/raw-output reads (FR-41
+//! forbids raw agent output unless explicitly enabled) and `reveal_secrets` —
+//! NEVER, on any route, in any shape (the config read renders masked values
+//! only).
 
 use std::time::Duration;
 
@@ -18,7 +21,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hekma_engine::{
-    AdapterRef, ConfigLayer, FleetListing, RegistryError, RemoveDisposition, ResyncCursor,
+    AdapterRef, BreachAction, ChildRunRequest, ConfigLayer, FleetListing, RegistryError,
+    RemoveDisposition, ResyncCursor, RunLimits, RunParent,
 };
 use serde::Deserialize;
 
@@ -31,8 +35,9 @@ use super::ApiState;
 pub(crate) async fn version(State(state): State<ApiState>) -> Json<dto::VersionDocument> {
     // Story 17-4 (review finding 21): the capture posture rides the version
     // self-description — an off engine says so HERE, on the surface a Host
-    // reads first, not only in a failed read round-trip.
-    let log_capture = state.engine.log_capture_mode().await;
+    // reads first, not only in a failed read round-trip. Story 21-4: read
+    // at bind, so this probe never waits on an engine lock.
+    let log_capture = state.log_capture;
     Json(dto::VersionDocument {
         api: dto::API_ID,
         version: dto::API_VERSION,
@@ -45,6 +50,7 @@ pub(crate) async fn version(State(state): State<ApiState>) -> Json<dto::VersionD
             usage: hekma_engine::USAGE_SCHEMA_VERSION,
             budget: hekma_engine::BUDGET_SCHEMA_VERSION,
             log: hekma_engine::LOG_SCHEMA_VERSION,
+            run: hekma_engine::RUN_EVENT_SCHEMA_VERSION,
         },
         log_capture: log_capture.as_str(),
     })
@@ -77,12 +83,14 @@ pub(crate) async fn status(
     Path(name): Path<String>,
 ) -> ApiResult<Json<dto::StatusDocument>> {
     let status = state.engine.instance_status(&name).await?;
+    let live_capture = state.engine.has_live_capture(&name).await;
     Ok(Json(dto::StatusDocument {
         // ONE schema-version discipline for the whole 0.x API (review item
         // 11) — the status family carries the API-level stamp, no separate
         // counter.
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         status: status.into(),
+        live_capture: Some(live_capture),
     }))
 }
 
@@ -234,30 +242,162 @@ pub(crate) async fn register(
     }
 }
 
-/// `DELETE /v0/instances/{name}` — remove the instance from the Fleet
-/// (retaining its Agent Home, the CLI `remove` default; DELETE of a RUNNING
-/// instance is a 409 naming the stop-first remediation — there is no force
-/// flag on v0's surface).
+/// The `DELETE /v0/instances/{name}` query (story 21-4): RAW strings parsed
+/// in [`remove`] so every malformed value stays inside the versioned
+/// envelope (the export `limit` discipline).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RemoveQuery {
+    /// `retain` (the default — the Agent Home stays on disk) or `delete`.
+    pub disposition: Option<String>,
+    /// `true` removes even a running instance (the CLI's `--force`).
+    pub force: Option<String>,
+}
+
+/// `DELETE /v0/instances/{name}?disposition=&force=` — remove the instance
+/// from the Fleet. The default retains its Agent Home (the CLI `remove`
+/// default); `disposition=delete` deletes it too. DELETE of a RUNNING
+/// instance without `force=true` is a 409 naming the stop-first remediation.
 pub(crate) async fn remove(
     State(state): State<ApiState>,
     Path(name): Path<String>,
+    Query(query): Query<RemoveQuery>,
 ) -> ApiResult<StatusCode> {
-    state
-        .engine
-        .remove(&name, RemoveDisposition::Retain, false)
-        .await?;
+    let disposition = match query.disposition.as_deref() {
+        None | Some("retain") => RemoveDisposition::Retain,
+        Some("delete") => RemoveDisposition::Delete,
+        Some(other) => {
+            return Err(ApiError::invalid_body(format!(
+                "the disposition query parameter must be \"retain\" or \"delete\": {other}"
+            )))
+        }
+    };
+    let force = match query.force.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(ApiError::invalid_body(format!(
+                "the force query parameter must be \"true\" or \"false\": {other}"
+            )))
+        }
+    };
+    state.engine.remove(&name, disposition, force).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /v0/instances/{name}/start` — the lifecycle verbs, each acknowledged
 /// with the post-transition Fleet-row read-back (the state the instance
-/// ACTUALLY reached, not the state the request hoped for).
+/// ACTUALLY reached, not the state the request hoped for). Story 21-4: the
+/// optional body `{"detach": true}` is the engine's detached start (the
+/// handle is disarmed at spawn, so the agent also survives this host's exit);
+/// an absent body is a supervised start. A PRESENT body must parse.
 pub(crate) async fn start(
     State(state): State<ApiState>,
     Path(name): Path<String>,
+    body: Bytes,
 ) -> ApiResult<Json<dto::ShowDocument>> {
-    state.engine.start(&name).await?;
+    let request = if body.is_empty() {
+        dto::StartRequest::default()
+    } else {
+        serde_json::from_slice::<dto::StartRequest>(&body).map_err(|err| {
+            ApiError::invalid_body(format!(
+                "the start body must be a JSON object like {{\"detach\":true}}, or no \
+                 body at all for a supervised start: {err}"
+            ))
+        })?
+    };
+    if request.detach {
+        state.engine.start_detached(&name).await?;
+    } else {
+        state.engine.start(&name).await?;
+    }
     read_back_show(&state, &name).await
+}
+
+/// `POST /v0/instances/{name}/send` (story 21-4) — deliver text to the
+/// running agent's native input channel (`send_input`). `204` on delivery;
+/// the host holds the pipe of every agent it started, so a send reaches an
+/// agent another CLI command started.
+pub(crate) async fn send(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    ApiJson(request): ApiJson<dto::SendRequest>,
+) -> ApiResult<StatusCode> {
+    state.engine.send_input(&name, &request.text).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /v0/instances/{name}/memory` (story 21-4) — attach a Memory Backing
+/// (`{"kind":"filesystem"|"native"}`), answered with the managed directory
+/// and the attachment read back. The attach is the committed truth: a
+/// read-back failure after it still answers `200`, naming the failure in
+/// `readback_error` (the backing REMAINS attached).
+pub(crate) async fn memory_put(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    ApiJson(request): ApiJson<dto::MemoryPutRequest>,
+) -> ApiResult<Json<dto::MemoryDocument>> {
+    let kind = hekma_engine::MemoryBackingKind::from_wire(&request.kind).ok_or_else(|| {
+        ApiError::invalid_body(format!(
+            "unknown Memory Backing kind {:?}: this release accepts \"filesystem\" or \
+             \"native\"",
+            request.kind
+        ))
+    })?;
+    let dir = state.engine.attach_memory(&name, kind).await?;
+    let dir = dir.to_string_lossy().into_owned();
+    // The attach committed; the read-back fills the attachment fields, or
+    // names why it could not (the backing stays attached either way).
+    let (status, readback_error) = match state.engine.memory_status(&name).await {
+        Ok(Some(status)) => (Some(status), None),
+        Ok(None) => (
+            None,
+            Some("the engine reports no attachment after the attach".to_string()),
+        ),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let document = dto::MemoryDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        instance: name,
+        dir,
+        kind: status.as_ref().map(|s| s.kind.as_str().to_string()),
+        guarantee: status.as_ref().map(|s| s.guarantee.as_str().to_string()),
+        declared: status.as_ref().map(|s| s.declared),
+        readback_error,
+    };
+    Ok(Json(document))
+}
+
+/// `DELETE /v0/instances/{name}/memory` (story 21-4) — detach the Memory
+/// Backing (metadata only: the managed directory stays on disk). `204`.
+pub(crate) async fn memory_delete(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    state.engine.detach_memory(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /v0/instances/{name}/restart-policy` (story 21-4) — set the Restart
+/// Policy (`{"policy":"never"|"on-failure"}`), acknowledged with the runtime
+/// status read back (the policy it now carries).
+pub(crate) async fn restart_policy_put(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    ApiJson(request): ApiJson<dto::RestartPolicyRequest>,
+) -> ApiResult<Json<dto::StatusDocument>> {
+    let policy = hekma_engine::RestartPolicy::from_wire(&request.policy).ok_or_else(|| {
+        ApiError::invalid_body(format!(
+            "unknown Restart Policy {:?}: this release accepts \"never\" or \"on-failure\"",
+            request.policy
+        ))
+    })?;
+    state.engine.set_restart_policy(&name, policy).await?;
+    let status = state.engine.instance_status(&name).await?;
+    Ok(Json(dto::StatusDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        status: status.into(),
+        live_capture: None,
+    }))
 }
 
 /// `POST /v0/instances/{name}/pause`.
@@ -497,5 +637,85 @@ pub(crate) async fn export_ack(
     Ok(Json(dto::ExportAckDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         seq: persisted,
+    }))
+}
+
+/// `POST /v0/runs` — open a child Run (story 21-2). `201` + `Location`
+/// with the new Run; a retried request carrying the same `external_id`
+/// answers `201` with the SAME Run (the open is idempotent by external id).
+pub(crate) async fn run_open(
+    State(state): State<ApiState>,
+    ApiJson(request): ApiJson<dto::RunOpenRequest>,
+) -> ApiResult<Response> {
+    let parent = match (request.parent_run_id, request.parent_instance) {
+        (Some(run_id), None) => RunParent::Run(hekma_engine::RunId::from_wire(run_id)),
+        (None, Some(instance)) => RunParent::Instance(instance),
+        _ => {
+            return Err(ApiError::invalid_body(
+                "exactly one parent is required: pass \"parent_run_id\" (a Run) or \
+                 \"parent_instance\" (an Agent Instance's open Run)",
+            ))
+        }
+    };
+    let breach_action = request
+        .breach_action
+        .as_deref()
+        .map(str::parse::<BreachAction>)
+        .transpose()
+        .map_err(|err| ApiError::invalid_body(format!("breach_action: {err}")))?;
+    let dollar_per_run_micros = request
+        .dollar_cap
+        .as_deref()
+        .map(hekma_engine::parse_dollars_to_micros)
+        .transpose()
+        .map_err(|reason| ApiError::invalid_body(format!("dollar_cap: {reason}")))?;
+    let view = state
+        .engine
+        .open_child_run(ChildRunRequest {
+            parent,
+            labels: request.labels.into_iter().collect(),
+            limits: RunLimits {
+                token_per_run: request.token_budget,
+                dollar_per_run_micros,
+                breach_action,
+            },
+            external_id: request.external_id,
+        })
+        .await?;
+    let location = format!("/v0/runs/{}", view.record.run_id);
+    Ok((
+        StatusCode::CREATED,
+        [(header::LOCATION, location)],
+        Json(dto::RunDocument {
+            schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+            run: view,
+        }),
+    )
+        .into_response())
+}
+
+/// `GET /v0/runs/{id}` — one Run: its row, labels, limits, subtree usage
+/// and open children.
+pub(crate) async fn run_show(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunDocument>> {
+    let view = state.engine.run(&run_id).await?;
+    Ok(Json(dto::RunDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run: view,
+    }))
+}
+
+/// `POST /v0/runs/{id}/close` — close a child Run (idempotent; a Run that
+/// owns a process is a `409` naming the stop remediation).
+pub(crate) async fn run_close(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunDocument>> {
+    let view = state.engine.close_run(&run_id).await?;
+    Ok(Json(dto::RunDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run: view,
     }))
 }

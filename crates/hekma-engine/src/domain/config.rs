@@ -741,6 +741,17 @@ pub fn validate_write(key: &str, value: &str) -> Result<(), ConfigError> {
             suggestion: None,
         });
     }
+    // Story 21-2 (D3): `labels.<key>` binds a label on the instance's
+    // supervised Runs; the key segment and the value are validated here.
+    if let Some(label_key) = key.strip_prefix(super::runs::labels::LABELS_PREFIX) {
+        return super::runs::labels::validate_label_write(label_key, value).map_err(|reason| {
+            ConfigError::InvalidValue {
+                key: key.to_string(),
+                value: value.to_string(),
+                reason,
+            }
+        });
+    }
     if is_known_key(key) {
         // The story-3-2 budget keys + the story-3-3 dollar keys additionally
         // TYPE-CHECK their value at write time (never silently defaulted). `model`

@@ -28,7 +28,10 @@ Example:
 const SERVE_AFTER_HELP: &str = "\
 Details:
   Runs the long-running Service Host over one state directory: adopts every
-  live agent at open, then waits. On SIGTERM (or Ctrl+C) every RUNNING agent
+  live agent at open, then waits. Every serve also binds a loopback local
+  endpoint for the hekma CLI (recorded in <state-dir>/control.json); while a
+  host serves the directory, every `hekma agent` write goes through it — and
+  when none does, the first write starts one in the background. On SIGTERM (or Ctrl+C) every RUNNING agent
   is stopped through the bounded graceful ladder (--stop-window <secs>,
   default 30, bounded 1..=86400), each outcome surfaced, and only then does
   the host exit. Hosted children inherit ONLY their manifest-declared
@@ -48,7 +51,8 @@ Examples:
 
 The Control API (--listen + --bearer-secret, both or neither) exposes the
 unstable v0 HTTP/JSON surface — fleet, per-instance lifecycle/config/status,
-and events (SSE + cursor pull) — guarded by the resolved bearer token; see
+and events (SSE + cursor pull) — guarded by the resolved bearer token. Beyond
+loopback it requires TLS (--tls-cert + --tls-key); see
 https://hekma.ktesio.dev/docs/control-api/.";
 
 const AGENT_AFTER_HELP: &str = "\
@@ -102,6 +106,24 @@ Examples:
   hekma agent config get demo --reveal
   hekma agent remove demo --delete";
 
+const RUN_AFTER_HELP: &str = "\
+Details:
+  A Run is one unit of agent work with a stable run id, a Control Depth,
+  labels, budgets and a Run Status. Starting an agent creates its supervised
+  Run; a Restart Policy relaunch keeps it. open starts a child Run under a
+  Run (--parent <run-id>) or under an agent's open Run (--parent <agent>):
+  a Host's unit of work inside that agent's process. The child's usage
+  counts on every ancestor and every ancestor's ceilings apply; its own
+  ceilings (--token-budget, --dollar-cap) take the warn Breach Action.
+  --label key=value adds caller labels; --external-id makes a retried open
+  return the same Run. close ends a child Run; show prints any Run. All
+  three accept --json.
+
+Examples:
+  hekma run open --parent my-agent --label task=review --token-budget 20000
+  hekma run show run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+  hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --json";
+
 #[derive(Parser)]
 #[command(
     name = "hekma",
@@ -131,6 +153,12 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
+    },
+    /// Open, close and show Runs
+    #[command(about = "Open, close and show Runs", after_help = RUN_AFTER_HELP)]
+    Run {
+        #[command(subcommand)]
+        command: RunCommands,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -201,6 +229,76 @@ enum Commands {
             requires = "otlp_endpoint"
         )]
         otlp_flush_interval: Option<u64>,
+        /// Serve --listen over HTTPS with this PEM certificate chain (with
+        /// --tls-key). Required for a non-loopback --listen.
+        #[arg(long, value_name = "PEM", requires_all = ["tls_key", "listen"])]
+        tls_cert: Option<String>,
+        /// The PEM private key for --tls-cert.
+        #[arg(long, value_name = "PEM", requires_all = ["tls_cert", "listen"])]
+        tls_key: Option<String>,
+        /// Internal: the background host a `hekma agent` command starts when
+        /// no host serves the state directory (loopback only; exits when
+        /// idle).
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["listen", "bearer_secret", "tls_cert", "tls_key"]
+        )]
+        autostart: bool,
+        /// Internal: the auto-started host's idle window in seconds (default
+        /// 30).
+        #[arg(
+            long,
+            hide = true,
+            value_name = "SECS",
+            requires = "autostart",
+            value_parser = clap::value_parser!(u64).range(1..=86_400)
+        )]
+        idle_window: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommands {
+    /// Open a child Run under a Run or an agent's open Run
+    Open {
+        /// The parent: a run id, or an agent name (its open Run)
+        #[arg(long, value_name = "RUN_ID|AGENT")]
+        parent: String,
+        /// A caller label, key=value (repeatable)
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+        /// A per-run token ceiling over the child and its own children
+        #[arg(long, value_name = "TOKENS")]
+        token_budget: Option<u64>,
+        /// A per-run dollar cap over the child and its own children ("3.00")
+        #[arg(long, value_name = "DOLLARS")]
+        dollar_cap: Option<String>,
+        /// The Breach Action for the child's ceilings (warn)
+        #[arg(long, value_name = "ACTION")]
+        breach_action: Option<String>,
+        /// An id under which a retried open returns the same Run
+        #[arg(long, value_name = "ID")]
+        external_id: Option<String>,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a child Run
+    Close {
+        /// The run id
+        run_id: String,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one Run
+    Show {
+        /// The run id
+        run_id: String,
+        /// Print the Run as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -240,12 +338,13 @@ enum AgentCommands {
     Start {
         /// Name of the Agent Instance to start
         name: String,
-        /// Detach: keep the agent running after this command exits; the next
-        /// `hekma` command re-adopts it. Between commands there is no
-        /// crash detection, no budget enforcement, and no event delivery:
-        /// supervision lasts only while a command runs. Refused for
-        /// engine-observed instances (their loopback listener stops with this
-        /// command).
+        /// Detach the agent from the local Service Host's lifetime: it keeps
+        /// running even if the host exits (every start already outlives this
+        /// command). Supervised while the host runs; after a host exit the
+        /// next host re-adopts it, and until then there is no crash
+        /// detection, no budget enforcement and no event delivery. Refused
+        /// for engine-observed instances (their metering listener lives in
+        /// the host).
         #[arg(long)]
         detach: bool,
     },
@@ -253,7 +352,8 @@ enum AgentCommands {
     Stop {
         /// Name of the Agent Instance to stop
         name: String,
-        /// Graceful-shutdown window in seconds before a forced kill (default 30)
+        /// Graceful-shutdown window in seconds before a forced kill (default
+        /// 30; served within 1 to 86400)
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -445,7 +545,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             otlp_endpoint,
             otlp_headers,
             otlp_flush_interval,
-        }) => cli::serve::run(
+            tls_cert,
+            tls_key,
+            autostart,
+            idle_window,
+        }) => cli::serve::run(cli::serve::ServeFlags {
             stop_window,
             metering_listen,
             state_dir,
@@ -456,9 +560,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // site (no clap `default_value` duplicates it).
             log_capture,
             otlp_endpoint,
-            otlp_headers.as_deref(),
+            otlp_headers,
             otlp_flush_interval,
-        ),
+            tls_cert,
+            tls_key,
+            autostart,
+            idle_window,
+        }),
         Some(Commands::Agent { command }) => match command {
             AgentCommands::Register {
                 name,
@@ -506,6 +614,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 MemoryCommands::Detach { name, json } => cli::agent::memory_detach(&name, json),
             },
             AgentCommands::GovernanceVectors { json } => cli::agent::governance_vectors(json),
+        },
+        Some(Commands::Run { command }) => match command {
+            RunCommands::Open {
+                parent,
+                labels,
+                token_budget,
+                dollar_cap,
+                breach_action,
+                external_id,
+                json,
+            } => cli::run::open(cli::run::OpenArgs {
+                parent,
+                labels,
+                token_budget,
+                dollar_cap,
+                breach_action,
+                external_id,
+                json,
+            }),
+            RunCommands::Close { run_id, json } => cli::run::close(&run_id, json),
+            RunCommands::Show { run_id, json } => cli::run::show(&run_id, json),
         },
         None => {
             Cli::command().print_help()?;

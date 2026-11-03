@@ -382,6 +382,8 @@ fn the_usage_and_breach_hooks_write_the_journal_too() {
                     paused_seq = Some(entry.seq);
                 }
             }
+            // Story 21-2: the Run events each transition and breach cause.
+            "run" => {}
             other => panic!("an unknown family in the journal: {other}"),
         }
     }

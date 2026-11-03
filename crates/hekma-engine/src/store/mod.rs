@@ -6,6 +6,7 @@
 //! the public surface, the store is an internal collaborator.
 
 mod run_store_sqlite;
+mod runs_sqlite;
 mod sqlite;
 pub(crate) mod writer;
 
@@ -14,4 +15,4 @@ pub(crate) use run_store_sqlite::{LegacyLogs, LegacyOutbox, LegacySource};
 pub(crate) use sqlite::create_v11_for_test;
 pub(crate) use sqlite::SqliteStore;
 pub(crate) use sqlite::BUSY_TIMEOUT_MS;
-pub(crate) use writer::{StoreWriter, WriterCtx};
+pub(crate) use writer::{read_only_refusal, StoreWriter, WriterCtx};
