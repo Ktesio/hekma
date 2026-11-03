@@ -67,6 +67,15 @@ pub(crate) enum CallError {
     /// error (a body rejection, an unknown route — or an engine error this
     /// build cannot decode): its message.
     Refused(String),
+    /// The host refused a Run route with a stable `error.code` (story 21-2:
+    /// `run-not-found`, `parent-ended`, …) — the code and the message, for
+    /// the caller to map onto its exit classes.
+    Coded {
+        /// The envelope's `error.code`.
+        code: String,
+        /// The envelope's `error.message`.
+        message: String,
+    },
     /// The host could not be reached, started, or stopped answering.
     Unavailable(String),
     /// The connection was refused before anything was sent (the host just
@@ -374,6 +383,12 @@ fn decode_failure(status: u16, json: Option<Value>) -> CallError {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("the local Service Host answered {status}"));
+    if let Some(code) = error.get("code").and_then(Value::as_str) {
+        return CallError::Coded {
+            code: code.to_string(),
+            message,
+        };
+    }
     CallError::Refused(message)
 }
 

@@ -220,7 +220,7 @@ Every start runs under the local Service Host (see [How the CLI reaches the Serv
 
 `--detach` keeps the meaning it has in the engine: the process handle is disarmed at spawn, so the agent survives even the **host's** exit, and the next host re-adopts the surviving process through the pid + start-time fingerprint path. A detached start still waits for the declared readiness probe (bounded by its `timeout_ms`) — it returns ready-or-failed, never wedged. While the host runs, a detached agent is supervised like any other; the notice on stderr names the honest **enforcement window** that remains: after a host exit, until the next host adopts it, there is no crash detection, no budget enforcement, and no usage/event delivery. Two further facts are pinned by design: a detached start refuses `engine-observed` instances (exit code 5) before anything changes — their loopback listener lives in the host, and a host exit would strand the agent's model traffic on a dead port — and a detached child is spawned with stdin closed regardless of its declared interaction level (`send` on it fails with the adopted-instance diagnostic, as for any adopted process).
 
-**One Run across the whole detached life.** The Run id is persisted with the spawn record, and every later adoption **resumes** it instead of minting a fresh one — so a detached instance is a single Run from its `start` until a genuine `stop`/`start` (or crash restart) opens a new one. Per-run token and dollar totals therefore keep accumulating across commands (`show`'s "this run" numbers no longer reset per command), and a budget breach that already fired for that Run is **spent**: the adoption-time re-evaluation still runs, but a breach already recorded in the instance's breach log for the resumed Run neither re-records a duplicate breach event nor re-fires the action — once per Run, not once per command. A genuine restart still resets both: a fresh Run mints and, if the cumulative total is still over a ceiling, the breach fires again under the new Run. A spawn record written before durable Run ids existed (pre-upgrade) is minted once, persisted back, and noted once on stderr — the next command resumes that minted id.
+**One Run across the whole detached life.** The Run id is persisted with the spawn record, and every later adoption **resumes** it instead of minting a fresh one — so a detached instance is a single Run from its `start` until a genuine `stop`/`start` opens a new one (a crash relaunch keeps it). Per-run token and dollar totals therefore keep accumulating across commands (`show`'s "this run" numbers no longer reset per command), and a budget breach that already fired for that Run is **spent**: the adoption-time re-evaluation still runs, but a breach already recorded in the instance's breach log for the resumed Run neither re-records a duplicate breach event nor re-fires the action — once per Run, not once per command. A genuine `stop`/`start` still resets both: a fresh Run mints and, if the cumulative total is still over a ceiling, the breach fires again under the new Run. A Restart Policy relaunch after a crash does not: it continues the same Run. A spawn record written before durable Run ids existed (pre-upgrade) is minted once, persisted back, and noted once on stderr — the next command resumes that minted id.
 
 ## `hekma agent stop <name> [--timeout <secs>]`
 
@@ -466,6 +466,40 @@ checksum exactly. The command reads the artifact embedded in the binary; it
 touches no state directory, needs no registered instance, and works offline.
 The same files ship as release assets with every release.
 
+## `hekma run open --parent <run-id|agent> [...]` / `close <run-id>` / `show <run-id>`
+
+Open, close and show Runs (see [Runs](runs.md)). Every started agent owns a
+Run; `open` starts a **child Run** under it for one unit of a Host's work.
+`open` and `close` are writes: like every `hekma agent` write they go through
+the state directory's local Service Host (started in the background when none
+runs). `show` only reads.
+
+```bash
+hekma run open --parent my-agent --label task=review --token-budget 20000 --json
+hekma run show run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+```
+
+| Flag (`open`) | Meaning |
+|---|---|
+| `--parent <run-id\|agent>` | The parent: a run id, or an agent name (its open Run) |
+| `--label key=value` | A caller label (repeatable) |
+| `--token-budget <tokens>` | A per-run token ceiling over the child and its own children |
+| `--dollar-cap <dollars>` | A per-run dollar cap over the child and its own children (needs the agent's Rate) |
+| `--breach-action warn` | The child's ceilings take `warn`; `pause`, `stop` and `block` are refused for a child Run |
+| `--external-id <id>` | A retried `open` with the same id returns the same Run |
+| `--json` | Print the Run as `{"schema_version": 1, "run": {…}}` |
+
+`show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
+skip the metering listener), status, Anomalies, parent, instance, labels with
+their source, limits, subtree usage and open children. A child's usage counts
+on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
+child Run (closing an ended one changes nothing); a Run that owns an agent's
+process is stopped with `hekma agent stop`, never closed. Exit codes: `3` when
+no Run has the id, `4` when the agent has no open Run, the parent has ended or
+the Run owns a process, `2` for a malformed flag, more than 8 levels of
+nesting, or a Breach Action the child cannot execute.
+
 ## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
@@ -548,6 +582,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `budget.dollars.cumulative` | dollar string | Cumulative dollar Cost Cap (needs a Rate to enforce) |
 | `metering.upstream_base_url` | URL | Real upstream endpoint for an `engine-observed` instance |
 | `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
+| `labels.<key>` | label value | A bound label on the agent's Runs (keys: a lowercase letter then up to 62 of `a-z 0-9 _ . -`; values: 1–128 of letters, digits, `_ . : / @ + -`, never `secret:`). Merged per key across layers; applied at start, and at once to a running agent's Run when set with `config set`. Never delivered to the agent |
 
 Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
 
@@ -559,7 +594,7 @@ When a token ceiling or dollar Cost Cap is crossed, the recorded breach names it
 
 ### The wire fence: `block`
 
-`block` is for engine-observed instances. On a breach, the metering listener refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends: raise the ceiling, then `stop` and `start` the instance. A new Run that starts at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance without the listener (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
+`block` is for engine-observed instances. On a breach, the metering listener refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends: raise the ceiling, then `stop` and `start` the instance. A Run that starts or relaunches at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance without the listener (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
 
 ## Global Behavior
 

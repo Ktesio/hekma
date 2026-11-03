@@ -108,7 +108,10 @@ impl ExitCode {
 /// documented catch-all that preserves the pre-4-3 behavior.
 pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
     // 3 — not found.
-    if err.is::<AgentNotFound>() || err.is::<AgentManifestNotFound>() {
+    if err.is::<AgentNotFound>()
+        || err.is::<AgentManifestNotFound>()
+        || err.is::<crate::error::RunNotFound>()
+    {
         ExitCode::NotFound
     // 2 — usage error (invalid invocation): a bad name, an unknown kind/config
     // key, or a duplicate name. (clap's parse/usage errors are already `2`.)
@@ -127,6 +130,8 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         // fault (the same class as ServeOptionsInvalid; the CLI's clap
         // range refuses it at parse time).
         || err.is::<crate::error::AgentDrainBoundInvalid>()
+        // Story 21-2: a Run request that cannot be honored as given.
+        || err.is::<crate::error::RunInvalid>()
     {
         ExitCode::Usage
     // 4 — invalid state: the instance is not in a state that permits the op.
@@ -141,6 +146,8 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ExitCode {
         // a terminal state; no force escape) and kinds never conflict-overwrite.
         || err.is::<AgentMemoryHotSwap>()
         || err.is::<AgentMemoryKindConflict>()
+        // Story 21-2: the Run's (or its parent's) state forbids the request.
+        || err.is::<crate::error::RunInvalidState>()
     {
         ExitCode::InvalidState
     // 5 — unsupported capability: the Capability Declaration forbids it.

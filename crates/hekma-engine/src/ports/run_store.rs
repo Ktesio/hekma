@@ -20,8 +20,9 @@
 
 use super::StoreError;
 use crate::domain::{
-    BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, LatchKey, Micros, OutboxEntry,
-    Rate, RecordOutcome, RunId, TransitionEvent, UsageEvent, UsageTotals,
+    BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, Label, LabelSource, LatchKey,
+    Micros, OutboxEntry, Rate, RecordOutcome, RunId, RunLimits, RunRecord, TransitionEvent,
+    UsageEvent, UsageTotals,
 };
 
 /// The largest page any keyset read returns, whatever the caller asks for.
@@ -173,4 +174,68 @@ pub(crate) trait RunStore {
 
     /// Persist the ack cursor (the caller has already validated it).
     fn set_outbox_ack(&self, seq: u64) -> Result<(), StoreError>;
+}
+
+/// A Run to insert (story 21-2): its row, its labels, the limits set on it
+/// and an optional `(binding, external id)` identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NewRun {
+    pub record: RunRecord,
+    pub labels: Vec<Label>,
+    pub limits: RunLimits,
+    pub identity: Option<(String, String)>,
+}
+
+/// The Run registry's storage (story 21-2, AD-25): the Run rows, their labels,
+/// limits and identities. Writes run inside the store writer's batch, like
+/// [`RunStore`]'s.
+pub(crate) trait RunRecords {
+    /// Insert a new Run with its labels, limits and identity.
+    fn insert_run(&self, run: &NewRun) -> Result<(), StoreError>;
+
+    /// One Run's row.
+    fn run_record(&self, run_id: &RunId) -> Result<Option<RunRecord>, StoreError>;
+
+    /// A Run's labels, sorted by key.
+    fn run_labels(&self, run_id: &RunId) -> Result<Vec<Label>, StoreError>;
+
+    /// The limits set directly on a Run.
+    fn run_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError>;
+
+    /// The Run and its ancestors, the Run first.
+    fn run_chain(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;
+
+    /// The instance's open process-owning Run.
+    fn open_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError>;
+
+    /// The non-ended descendants of a Run hosted in the same process (same
+    /// instance, not process owners), oldest first.
+    fn open_in_process_descendants(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;
+
+    /// Persist a Run's mutable fields (depth, wire path, status, Anomalies,
+    /// end fields, update time).
+    fn save_run(&self, record: &RunRecord) -> Result<(), StoreError>;
+
+    /// Replace every label of one source on a Run.
+    fn replace_labels(
+        &self,
+        run_id: &RunId,
+        source: LabelSource,
+        labels: &[Label],
+    ) -> Result<(), StoreError>;
+
+    /// The Run an external id maps to under a binding.
+    fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError>;
+
+    /// How many of a Run's children have not ended.
+    fn open_children(&self, run_id: &RunId) -> Result<u64, StoreError>;
+
+    /// Every non-ended Run (the snapshot's initial load).
+    fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError>;
+
+    /// Make sure a run id the pipeline is about to latch has a Run row: an id
+    /// with none (usage an older engine recorded under its own id after the
+    /// upgrade) gets an `ended` placeholder, end cause `unregistered`, so the
+    /// latch's reference holds and the usage commit never fails on it.
+    fn ensure_run_row(&self, run_id: &RunId, instance: &InstanceName) -> Result<(), StoreError>;
 }

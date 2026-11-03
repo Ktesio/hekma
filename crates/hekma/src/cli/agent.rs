@@ -2794,16 +2794,18 @@ fn governance_vectors_summary(
     };
     // Counted per kind with an exhaustive match, so a new case kind can never
     // be folded silently into another kind's count.
-    let (mut decision_cases, mut derivation_cases, mut fence_cases) = (0, 0, 0);
+    let (mut decision_cases, mut derivation_cases, mut fence_cases, mut chain_cases) = (0, 0, 0, 0);
     for case in &document.cases {
         match case {
             hekma_engine::Case::Decision(_) => decision_cases += 1,
             hekma_engine::Case::Derivation(_) => derivation_cases += 1,
             hekma_engine::Case::Fence(_) => fence_cases += 1,
+            hekma_engine::Case::Chain(_) => chain_cases += 1,
         }
     }
     Ok(format!(
-        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence)\n  \
+        "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence, \
+         {} chain)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
@@ -2814,6 +2816,7 @@ fn governance_vectors_summary(
         decision_cases,
         derivation_cases,
         fence_cases,
+        chain_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
     ))
 }
@@ -2827,7 +2830,7 @@ fn governance_vectors_summary(
 /// Nothing is created and no host is started — except when the state.db is
 /// at an OLDER schema: the migration is a write, so the command finds or
 /// starts the local Service Host (which migrates on open) and reads again.
-fn open_read_only_engine() -> Result<Engine, Box<dyn std::error::Error>> {
+pub(crate) fn open_read_only_engine() -> Result<Engine, Box<dyn std::error::Error>> {
     match Engine::open_read_only(None) {
         Err(RegistryError::Store(hekma_engine::ports::StoreError::NeedsMigration { .. })) => {
             let root = state_root()?;
@@ -2891,11 +2894,11 @@ fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// A routed write's answer (story 21-4): the response document and the pid
 /// of the Service Host that served it.
-struct Routed {
+pub(crate) struct Routed {
     /// The 2xx body, when there was one.
-    value: Option<Value>,
+    pub(crate) value: Option<Value>,
     /// The serving host's process id.
-    host_pid: u32,
+    pub(crate) host_pid: u32,
 }
 
 impl Routed {
@@ -2924,7 +2927,7 @@ impl Routed {
 
 /// Why a routed write failed: a state-root resolution failure (already a
 /// diagnostic), or a call failure still to be mapped.
-enum RoutedError {
+pub(crate) enum RoutedError {
     /// A ready diagnostic.
     Diagnostic(Box<dyn std::error::Error>),
     /// A Control API call failure.
@@ -2934,13 +2937,14 @@ enum RoutedError {
 impl RoutedError {
     /// Render through the command's usual mappers: the engine families keep
     /// their exact diagnostics and exit codes; host failures are exit 1.
-    fn into_diagnostic(self) -> Box<dyn std::error::Error> {
+    pub(crate) fn into_diagnostic(self) -> Box<dyn std::error::Error> {
         match self {
             RoutedError::Diagnostic(err) => err,
             RoutedError::Call(CallError::Engine(err)) => map_engine_error(err),
             RoutedError::Call(CallError::Registry(err)) => map_error(err),
             RoutedError::Call(CallError::Config(err)) => map_config_error(err),
-            RoutedError::Call(CallError::Refused(message)) => {
+            RoutedError::Call(CallError::Refused(message))
+            | RoutedError::Call(CallError::Coded { message, .. }) => {
                 CallError::host_diagnostic(message, true)
             }
             RoutedError::Call(CallError::Unavailable(message))
@@ -2955,7 +2959,7 @@ impl RoutedError {
 /// start the owner, make the call. A call refused BEFORE anything was sent
 /// (the host had just exited) finds or starts the owner again and retries
 /// once — a refused connection never applied anything.
-fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
+pub(crate) fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
     let root = state_root().map_err(RoutedError::Diagnostic)?;
     let mut retried = false;
     loop {

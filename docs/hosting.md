@@ -215,17 +215,16 @@ The rules:
   reaches such an instance some other way, for example through a hand-edited
   config file, a breach is recorded, acts as `warn`, and the engine log says
   the fence could not be raised.
-- **It lifts with the Run.** The fence lives as long as the Run's listener.
-  It lifts when the Run ends (`stop` then `start`, or a Restart Policy relaunch,
-  which starts a new Run). A new Run is checked before its process starts: if
+- **It lifts with the Run.** The fence lives as long as the Run. It lifts when
+  the Run ends (`stop` then `start`). A Run is checked before its process
+  starts: if
   it already sits at or over a `block` ceiling (usually the cumulative one), the
   fence is up before its first call. To un-fence, raise the ceiling, then start
   a new Run. Un-fencing a live Run when its ceiling is raised is planned for a
   later release.
-- **A relaunch does not carry a per-run fence.** A Restart Policy relaunch starts
-  a fresh per-run budget, and the engine log says so when the replaced Run was
-  fenced. Pair a per-run `block` ceiling with a cumulative one to bound an agent
-  that crashes and is relaunched.
+- **A relaunch keeps the fence.** A Restart Policy relaunch continues the same
+  Run, so its per-run totals keep counting and a per-run `block` fence is up
+  again on the relaunched listener before its first call.
 - **Restarts and adoption keep it.** A host that restarts and adopts the
   instance on the same `--metering-listen` port rebuilds the fence from the
   breach log before serving traffic.

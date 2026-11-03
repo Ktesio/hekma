@@ -4,6 +4,7 @@
 
 use super::drain::{render_command, run_bounded_command, BoundedCommandOutcome};
 use super::*;
+use crate::domain::runs::ops::RunFate;
 
 impl Supervisor {
     /// Perform ONE Restart Policy restart of a crashed instance (story 1-6, AC4).
@@ -224,6 +225,7 @@ impl Supervisor {
                          OS-level I/O wait that has since cleared)",
                     ),
                     log_capture,
+                    RunFate::Terminal,
                 )?;
                 return registry.lookup(&name).map_err(registry_to_engine);
             }
@@ -636,6 +638,7 @@ impl Supervisor {
             LifecycleState::Stopped,
             cause,
             log_capture,
+            RunFate::Terminal,
         )?;
 
         registry.lookup(&name).map_err(registry_to_engine)

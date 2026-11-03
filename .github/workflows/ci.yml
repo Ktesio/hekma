@@ -1562,7 +1562,9 @@ jobs:
         # What a non-Rust Host does with the artifact: parse JSON, pin the
         # header, assert unique ids, every case kind, and full rule coverage.
         # Story 19-2 (vectors 1.1.0) adds the `block-fence` rule and the
-        # `fence` kind, whose refusals a Host re-derives below.
+        # `fence` kind, whose refusals a Host re-derives below. Story 21-2
+        # (vectors 1.2.0) adds the `ancestor-ceilings` rule and the `chain`
+        # kind (one outcome per level, never a latched pair re-firing).
         run: |
           python3 - <<'PY'
           import json
@@ -1592,12 +1594,23 @@ jobs:
               "saturation",
               "no-retro-repricing",
               "block-fence",
+              "ancestor-ceilings",
           }
           missing = expected - tags
           assert not missing, f"uncovered rules: {sorted(missing)}"
           assert kinds.get("decision"), f"no decision cases: {kinds}"
           assert kinds.get("derivation"), f"no derivation cases: {kinds}"
           assert kinds.get("fence"), f"no fence cases: {kinds}"
+          assert kinds.get("chain"), f"no chain cases: {kinds}"
+          for case in document["cases"]:
+              if case["kind"] != "chain":
+                  continue
+              assert len(case["expected"]) == len(case["levels"]), case["id"]
+              for level, outcome in zip(case["levels"], case["expected"]):
+                  latched = {(k["dimension"], k["scope"]) for k in level["latched"]}
+                  for decision in outcome["decisions"]:
+                      key = (decision["dimension"], decision["scope"])
+                      assert key not in latched, case["id"]
           # The fence consumer, re-implemented as a Host would: the first
           # raised reason in canonical order, status 402, the stable class.
           order = [

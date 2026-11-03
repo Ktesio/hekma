@@ -136,6 +136,9 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
+| `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action` and `external_id` | 201 + `Location: /v0/runs/{id}` + the Run |
+| `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
+| `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
 
 The identity-bearing reads return the engine's own documents — the same wire
 shapes (and schema versions) the CLI already renders. A `POST` lifecycle verb
@@ -148,6 +151,47 @@ where the instance is removed again before the read-back runs, the `201` +
 the `Location`. A `PUT .../config` is serialized per host (write + read-back
 under one lock), so a response's read-back always reflects the value ITS
 request wrote; `GET`s stay unsynchronized snapshots.
+
+## Runs
+
+A Run is one unit of agent work with a stable run id (see
+[Runs](runs.md)). Every started instance owns one; a Host opens **child
+Runs** under it for its own units of work:
+
+```text
+POST /v0/runs
+{
+  "parent_instance": "my-agent",
+  "labels": {"task": "review"},
+  "token_budget": 20000,
+  "dollar_cap": "1.50",
+  "external_id": "job-42"
+}
+```
+
+`parent_run_id` names any open Run instead of an instance. `labels` are caller
+labels. `token_budget` and `dollar_cap` (a dollar string) are per-run ceilings
+over the child and its own children; they take `breach_action` `warn` (the
+default) — `pause`, `stop` and `block` are refused for a child Run today.
+A retried request with the same `external_id` answers `201` with the same
+Run. The response (and `GET /v0/runs/{id}`) is
+`{"schema_version": 1, "run": {…}}`: the run id, `control_depth`,
+`wire_path`, `status`, `anomalies`, `parent_run_id`, `instance`,
+`process_owner`, `end_cause`, timestamps, `labels` (each with its `source`),
+`limits`, `usage` (input, output and cached tokens plus `cost_micros`, over the
+Run's subtree, labelled `estimated`) and `open_children`.
+
+Run refusals carry a stable `error.code` beside the `kind`:
+
+| `code` | Status | When |
+|--------|--------|------|
+| `run-not-found` | 404 | No Run has the id |
+| `no-open-run` | 409 | `parent_instance` has no open Run (start it first) |
+| `parent-ended` | 409 | The parent Run has ended |
+| `owns-process` | 409 | `close` on a Run that owns an agent's process |
+| `nesting-too-deep` | 400 | The child would nest more than 8 levels deep |
+| `action-unavailable` | 400 | The Breach Action cannot execute at the child's depth; the message names the depth and the Metering Source |
+| `invalid-request` | 400 | A malformed label or field |
 
 ## Documents and versions
 
@@ -171,7 +215,8 @@ changelog, to know what it is talking to:
     "fleet": 2,
     "usage": 1,
     "budget": 1,
-    "log": 1
+    "log": 1,
+    "run": 1
   },
   "log_capture": "full"
 }
@@ -192,6 +237,9 @@ class:
 ```json
 { "schema_version": 1, "error": { "kind": "not_found", "message": "…" } }
 ```
+
+The Run routes add a finer `"code"` inside `error` (see [Runs](#runs)); every
+other route omits it.
 
 When the failure is an engine error, the `error` object also carries the
 engine's **typed** error — the additive `engine_error` field — so a client
@@ -248,7 +296,8 @@ first** (the SSE stream), then act, then pull the durable record.
 **Live — `GET /v0/events` (SSE).** One engine event bus subscription per
 connected client; each event rides one `data:` frame whose payload is the
 engine's own kind-tagged JSON (`{"kind":"transition",…}`,
-`{"kind":"budget_breach",…}`, `{"kind":"usage_update",…}`) — never re-shaped.
+`{"kind":"budget_breach",…}`, `{"kind":"usage_update",…}`, and
+`{"kind":"run",…}` for a Run created, ended or changed) — never re-shaped.
 A client that falls behind the bus gets an in-stream
 `{"kind":"lagged","skipped":N}` frame naming the gap and the stream continues
 at the current tail (the skipped events stay readable in the durable logs —

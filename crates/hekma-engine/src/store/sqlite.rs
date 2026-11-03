@@ -87,7 +87,9 @@ use crate::ports::{
 /// column renamed/removed.
 /// v12 (story 21-1, AD-27): the store writer's tables — see
 /// [`super::run_store_sqlite::SCHEMA_V12`].
-const SCHEMA_VERSION: i64 = 12;
+/// v13 (story 21-2, AD-25): the Run registry's tables and their backfill —
+/// see [`super::runs_sqlite`].
+const SCHEMA_VERSION: i64 = 13;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -690,11 +692,16 @@ fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, St
     }
     // Story 21-1: v12 imports the legacy event files inside its own step
     // transaction (DDL + import + stamp, crash-atomic like every step).
+    let mut notes = Vec::new();
     if version < 12 {
-        return super::run_store_sqlite::migrate_v12(conn, legacy);
+        notes = super::run_store_sqlite::migrate_v12(conn, legacy)?;
     }
-
-    Ok(Vec::new())
+    // Story 21-2: v13 adds the Run tables and backfills the run ids already
+    // recorded (one crash-atomic step).
+    if version < 13 {
+        super::runs_sqlite::migrate_v13(conn)?;
+    }
+    Ok(notes)
 }
 
 /// Apply ONE schema-version step atomically (story 11-3, B3): the step's DDL
@@ -2198,7 +2205,7 @@ mod tests {
         // stamp and the constant drifted together. (The v12 step, the store
         // writer's tables, is the current last step; bump this literal when
         // the next step lands.)
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(reopened.get_instance(&name("demo")).unwrap().is_some());
     }
 
@@ -2781,7 +2788,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(rec.detach, "the legacy detached flag survives");
@@ -2827,7 +2834,7 @@ mod tests {
         // PINNED LITERAL (AI-66 #5, review round 1): the migrated version is
         // 11 (the v11 step, the adoption-lease columns, is the current last
         // step).
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let rec = store.get_spawn_record(&name("legacy")).unwrap().unwrap();
         assert_eq!(rec.fingerprint.pid, 4242, "the legacy row survives");
         assert!(!rec.detach, "the legacy attached flag survives");
@@ -3992,7 +3999,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(store.get_instance(&name("legacy")).unwrap().is_some());
         assert_eq!(
             store.usage_totals(&name("legacy")).unwrap(),
@@ -4136,7 +4143,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         // The row survived, tokens intact.
         assert_eq!(store.count_usage_events(&name("legacy")).unwrap(), 1);
         // THE HONEST READ: the pre-v7 row's cached subset is UNKNOWN — None on
@@ -4214,7 +4221,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         let record = store
             .get_spawn_record(&name("legacy"))
             .unwrap()
