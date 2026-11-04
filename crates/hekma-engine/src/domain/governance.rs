@@ -2046,11 +2046,12 @@ mod tests {
             .map(|tag| exhaustive_wire_form(tag).0)
             .collect();
         covers_indices.sort_unstable();
-        covers_indices.dedup();
         assert_eq!(
             covers_indices,
             (0..variant_count).collect::<Vec<_>>(),
-            "ALL_COVERS must carry every enum variant, no duplicates"
+            "ALL_COVERS must carry every enum variant exactly once: sorted \
+             indices must equal 0..N with no duplicate and no gap, which also \
+             pins ALL_COVERS.len() to the variant count"
         );
     }
 
