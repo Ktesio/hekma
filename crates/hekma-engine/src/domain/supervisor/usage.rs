@@ -5,7 +5,6 @@
 use super::*;
 use crate::domain::pipeline;
 use crate::domain::{CostCap, Rate, TokenBudget};
-use crate::ports::RunStore;
 
 /// WHICH captured-output channel a self-reported usage drain reads (story
 /// 14-3, T3). The two channels are byte-identical in SEMANTICS (the same
@@ -988,6 +987,7 @@ impl Supervisor {
             fence: supervised
                 .and_then(|supervised| supervised.observed_listener.as_ref())
                 .map(ObservedListener::fence),
+            runs: Some(Arc::clone(registry.run_publisher())),
             #[cfg(test)]
             totals_fault: self.totals_read_fault_names.contains(name),
         }
@@ -1079,7 +1079,17 @@ impl Supervisor {
             self.note_outbox_append(&committed.outbox);
             self.publish(EngineEvent::BudgetBreach(committed.event.clone()));
         }
-        for committed in &evaluation.breaches {
+        // Story 21-2: the `breach` Anomalies those breaches raised, committed
+        // after them.
+        self.publish_run_events(evaluation.run_events);
+        // Only the process-owning Run's breaches act on the process; a child
+        // Run's breach is recorded under `warn` (its own action cannot act on
+        // the shared process before wire hold exists).
+        for committed in evaluation
+            .breaches
+            .iter()
+            .filter(|committed| committed.process_level)
+        {
             let decision = committed.decision;
             if decision.action == BreachAction::Block {
                 self.note_block(registry, name, decision.dimension, decision.scope);
@@ -1177,10 +1187,12 @@ impl Supervisor {
             .unwrap_or(false)
     }
 
-    /// The RUN-START fence evaluation (story 19-2): before a new Run's process
-    /// spawns, evaluate the pure [`governance::decide`] against that FRESH Run
-    /// (per-run totals zero, cumulative totals from the ledger, an empty
-    /// latch) and RAISE `fence` for every `block` decision — so a Run that
+    /// The RUN-START fence evaluation (story 19-2): before a Run's process
+    /// spawns, evaluate the pure [`governance::decide`] against that Run —
+    /// a fresh Run's per-run totals are zero; a Restart Policy relaunch keeps
+    /// its Run (story 21-2), so `kept_run`'s per-run totals count — with
+    /// cumulative totals from the ledger and an empty latch, and RAISE
+    /// `fence` for every `block` decision — so a Run that
     /// begins at or over a `block` ceiling refuses its very first model call
     /// instead of letting one through before the first usage event fires the
     /// breach. Only `block` decisions act here; `pause`/`stop`/`warn` keep
@@ -1196,6 +1208,7 @@ impl Supervisor {
         registry: &Registry,
         name: &InstanceName,
         fence: &crate::metering::WireFence,
+        kept_run: Option<&RunId>,
     ) -> bool {
         let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
             return false;
@@ -1208,7 +1221,7 @@ impl Supervisor {
         let (token, dollar) = self.governance_arms(
             registry,
             name,
-            None,
+            kept_run,
             (budget, token_action),
             (rate, cost_cap, cost_action),
         );
@@ -1230,54 +1243,6 @@ impl Supervisor {
             raised = true;
         }
         raised
-    }
-
-    /// Surface that a Restart Policy relaunch LIFTS a per-run `block` fence
-    /// (story 19-2): the relaunch begins a NEW Run in today's code (a fresh run
-    /// id, a fresh per-run total, a fresh listener), so a per-run fence of the
-    /// Run it replaces does not carry — exactly as the per-run latch does not.
-    /// A cumulative fence re-raises at Run start on its own. When the replaced
-    /// Run (`replaced`, read off the spawn record before the relaunch
-    /// overwrote it) recorded a per-run `block` breach, say so, and point at
-    /// the cumulative ceiling that bounds a crash loop. Silent otherwise; an
-    /// unreadable breach log stays silent here (the adoption path already
-    /// surfaces that read). The carry itself arrives with story 21.2's Run,
-    /// which spans relaunches (deferred-work).
-    pub(super) fn note_relaunch_lifts_per_run_fence(
-        &self,
-        registry: &Registry,
-        name: &InstanceName,
-        replaced: Option<&RunId>,
-    ) {
-        let Some(replaced) = replaced else {
-            return;
-        };
-        let Ok(events) = registry.reader().run_breaches(name, replaced) else {
-            return;
-        };
-        let lifted: Vec<&'static str> = events
-            .iter()
-            .filter(|event| {
-                event.run_id == replaced.as_str()
-                    && event.action == BreachAction::Block
-                    && event.scope == BreachScope::PerRun
-            })
-            .map(|event| event.dimension.as_str())
-            .collect();
-        if lifted.is_empty() {
-            return;
-        }
-        self.log_enforcement_diagnostic(
-            registry,
-            name,
-            &format!(
-                "the Restart Policy relaunched this instance into a NEW Run, so the per-run \
-                 `block` fence of the previous Run ({}) does not carry into it — this Run starts \
-                 with a fresh per-run budget. Set a cumulative ceiling to bound spend across \
-                 relaunches",
-                lifted.join(", "),
-            ),
-        );
     }
 
     /// Surface a committed `block` breach (story 19-2; the fence itself was
@@ -1365,6 +1330,79 @@ impl Supervisor {
                     &format!("budget breach pause could not be honored: {e}"),
                 );
             }
+        }
+    }
+
+    /// Re-apply a kept Run's latched process Breach Action after a Restart
+    /// Policy relaunch (story 21-2). A relaunch keeps the Run and with it the
+    /// latch, so a `pause` or `stop` that already fired would never fire again
+    /// on the relaunched process: a crash while breach-paused would come back
+    /// unpaused with its spend unbounded. A latch recorded under the
+    /// CURRENTLY configured action is re-executed with its breach's cause; a
+    /// latch under another action re-fires on its own at the next evaluation.
+    pub(super) fn reapply_latched_actions(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        run_id: &RunId,
+    ) {
+        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
+            return;
+        };
+        let (_budget, token_action) = config::resolve_token_budget(&effective);
+        let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+        let breaches = match registry.reader().run_breaches(name, run_id) {
+            Ok(breaches) => breaches,
+            Err(err) => {
+                self.log_enforcement_diagnostic(
+                    registry,
+                    name,
+                    &format!(
+                        "the relaunched Run's breach records could not be read ({err}); a \
+                         `pause` or `stop` it had already fired is not re-applied"
+                    ),
+                );
+                return;
+            }
+        };
+        let latched = breaches.into_iter().rev().find(|event| {
+            let configured = match event.dimension {
+                BreachDimension::Tokens => token_action,
+                BreachDimension::Dollars => cost_action,
+            };
+            event.action == configured
+                && matches!(event.action, BreachAction::Pause | BreachAction::Stop)
+        });
+        let Some(event) = latched else {
+            return;
+        };
+        self.log_enforcement_diagnostic(
+            registry,
+            name,
+            &format!(
+                "the Restart Policy relaunched this instance into the same Run, whose {} {} \
+                 ceiling had already fired `{}` — re-applying it",
+                event.dimension.as_str(),
+                event.scope.as_str(),
+                event.action.as_str(),
+            ),
+        );
+        let cause = match event.dimension {
+            BreachDimension::Tokens => {
+                TransitionCause::budget_exceeded(event.scope, event.limit, event.observed)
+            }
+            BreachDimension::Dollars => TransitionCause::cost_cap_exceeded(
+                event.scope,
+                event.dollar_limit.unwrap_or(Micros(event.limit as i64)),
+                event
+                    .dollar_observed
+                    .unwrap_or(Micros(event.observed as i64)),
+                EstimateLabel::Estimated,
+            ),
+        };
+        match event.action {
+            BreachAction::Pause => self.enforce_pause(registry, name, cause),
+            _ => self.enforce_stop(registry, name, cause),
         }
     }
 

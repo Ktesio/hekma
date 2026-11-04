@@ -3099,7 +3099,7 @@ fn detached_start_of_an_engine_observed_instance_is_refused_before_any_side_effe
         EngineError::DetachRefused { name, detail } => {
             assert_eq!(name, "obsdetach");
             assert!(
-                detail.contains("listener") && detail.contains("dies with the command"),
+                detail.contains("listener") && detail.contains("dies with the command or host"),
                 "the refusal must name the listener-lifetime why: {detail}"
             );
             assert!(
@@ -6437,9 +6437,13 @@ fn transitions_land_in_the_outbox_with_monotonic_seqs() {
     assert_eq!(seqs.first(), Some(&1), "the first seq is 1 (START is 0)");
     for entry in &entries {
         assert_eq!(entry.schema_version, crate::domain::OUTBOX_SCHEMA_VERSION);
+        // Story 21-2: the Run projection commits with its transition.
         assert!(
-            matches!(entry.event, EngineEvent::Transition(_)),
-            "start/stop commit transitions: {entry:?}"
+            matches!(
+                entry.event,
+                EngineEvent::Transition(_) | EngineEvent::Run(_)
+            ),
+            "start/stop commit transitions and their Run events: {entry:?}"
         );
     }
     // At least the starting→(running/failed)→stopping→stopped sequence.
@@ -8352,42 +8356,40 @@ fn the_config_write_refuses_block_on_an_instance_without_a_listener() {
 }
 
 #[test]
-fn a_relaunch_says_a_per_run_block_fence_does_not_carry() {
+fn a_relaunch_keeps_its_run_so_a_per_run_block_fence_carries() {
+    // Story 21-2: a Restart Policy relaunch keeps its Run, so the Run-start
+    // fence evaluates the KEPT Run's per-run totals — a per-run `block`
+    // ceiling it already crossed fences the relaunched listener before its
+    // first call; a fresh Run (no kept id) starts at zero.
     let (_state, _manifest, registry) = setup_fake("fencerelaunch", &["--linger-ms", "600000"]);
     let name = InstanceName::new("fencerelaunch").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 10\n",
+    )
+    .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    let buffer = install_capture_sink(&mut sup);
-    let fenced = RunId::mint();
-    let unfenced = RunId::mint();
-    sup.record_token_breach(
+    let kept = RunId::mint();
+    let usage = ParsedUsage {
+        sequence: 1,
+        input_tokens: 8,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
         &registry,
         &name,
-        &fenced,
-        BreachScope::PerRun,
-        10,
-        10,
-        BreachAction::Block,
+        &kept,
         "engine-observed",
-    );
-    sup.record_token_breach(
-        &registry,
-        &name,
-        &unfenced,
-        BreachScope::Cumulative,
-        10,
-        10,
-        BreachAction::Block,
-        "engine-observed",
-    );
-    // No replaced Run, or one with only a cumulative fence: silent.
-    sup.note_relaunch_lifts_per_run_fence(&registry, &name, None);
-    sup.note_relaunch_lifts_per_run_fence(&registry, &name, Some(&unfenced));
-    assert!(!sink_text(&buffer).contains("does not carry"));
-    sup.note_relaunch_lifts_per_run_fence(&registry, &name, Some(&fenced));
-    let notes = sink_text(&buffer);
-    assert!(notes.contains("does not carry"), "{notes}");
-    assert!(notes.contains("(tokens)"), "{notes}");
-    assert!(notes.contains("cumulative ceiling"), "{notes}");
+        &usage,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    let fresh = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &fresh, None));
+    let relaunched = crate::metering::WireFence::default();
+    assert!(sup.run_start_fence(&registry, &name, &relaunched, Some(&kept)));
+    assert_eq!(relaunched.refusal().unwrap().code, "tokens_per_run");
 }
 
 #[test]
@@ -8568,7 +8570,7 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
     )
     .unwrap();
     let fence = crate::metering::WireFence::default();
-    assert!(sup.run_start_fence(&registry, &name, &fence));
+    assert!(sup.run_start_fence(&registry, &name, &fence, None));
     assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
 
     std::fs::write(
@@ -8577,7 +8579,7 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
     )
     .unwrap();
     let fence = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fence));
+    assert!(!sup.run_start_fence(&registry, &name, &fence, None));
     assert!(fence.refusal().is_none());
 
     std::fs::write(
@@ -8586,7 +8588,7 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
     )
     .unwrap();
     let fence = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fence));
+    assert!(!sup.run_start_fence(&registry, &name, &fence, None));
     assert!(fence.refusal().is_none());
 }
 
@@ -8612,7 +8614,9 @@ fn a_degraded_run_start_fence_read_still_decides_on_the_degraded_total() {
 
     let fence = crate::metering::WireFence::default();
     assert!(
-        sup.run_start_fence(&registry, &name, &fence),
+        // `None` = a fresh Run (story 21-2): per-run totals are zero by
+        // construction, so only the fault-armed CUMULATIVE read decides.
+        sup.run_start_fence(&registry, &name, &fence, None),
         "a degraded cumulative read must not skip the fence decision"
     );
     assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
@@ -8837,4 +8841,344 @@ fn a_busy_store_parks_usage_without_spending_attempts_and_never_skips_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let _ = sup.stop(&registry, "busypark", Some(Duration::from_secs(5)));
+}
+
+// ---- Story 21-2: Runs as first-class entities (AD-25) ----
+
+/// The instance's open process-owning Run, from the published snapshot.
+fn open_run(registry: &Registry, name: &str) -> crate::domain::RunView {
+    let snapshot = registry.run_snapshot();
+    let id = snapshot
+        .owner_of(name)
+        .unwrap_or_else(|| panic!("{name} has an open Run in the snapshot"))
+        .record
+        .run_id
+        .clone();
+    registry.run_view(&id).unwrap()
+}
+
+#[test]
+fn a_start_creates_a_supervised_run_with_its_bound_labels_before_running() {
+    let (_state, _manifest, registry) = setup_fake("runstart", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runstart").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[labels]\nteam = \"payments\"\nBad = \"x\"\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "runstart").unwrap();
+    let run = open_run(&registry, "runstart");
+    assert!(run.record.run_id.is_ulid(), "{}", run.record.run_id);
+    assert_eq!(
+        run.record.control_depth,
+        crate::domain::ControlDepth::Supervised
+    );
+    assert!(
+        !run.record.wire_path,
+        "self-reported is supervised (no wire)"
+    );
+    assert_eq!(run.record.status, crate::domain::RunStatus::Active);
+    assert_eq!(
+        run.labels,
+        vec![crate::domain::Label::bound("team", "payments")]
+    );
+    assert!(
+        sink_text(&buffer).contains("binds no label"),
+        "a malformed label leaf is named"
+    );
+    // The Run's `created` precedes the `running` transition in commit order.
+    let entries = outbox_entries(&registry);
+    let created = entries
+        .iter()
+        .position(|e| matches!(&e.event, EngineEvent::Run(r) if r.change == crate::domain::RunEventKind::Created))
+        .expect("a created event");
+    let running = entries
+        .iter()
+        .position(|e| matches!(&e.event, EngineEvent::Transition(t) if t.new_state == LifecycleState::Running))
+        .expect("a running transition");
+    assert!(
+        created < running,
+        "created at {created}, running at {running}"
+    );
+    // A `labels.*` write re-binds the open Run's labels.
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    sup.sync_run_labels(&registry, &name);
+    assert_eq!(
+        open_run(&registry, "runstart").labels,
+        vec![crate::domain::Label::bound("team", "core")]
+    );
+    // A stop ends the Run with its cause and leaves the snapshot.
+    let id = run.record.run_id.clone();
+    sup.stop(&registry, "runstart", Some(Duration::from_secs(5)))
+        .unwrap();
+    let ended = registry.run_view(&id).unwrap();
+    assert_eq!(ended.record.status, crate::domain::RunStatus::Ended);
+    assert!(ended.record.anomalies.is_empty());
+    assert!(ended.record.end_cause.is_some());
+    assert!(registry.run_snapshot().owner_of("runstart").is_none());
+    // A new start opens a NEW Run.
+    sup.start(&registry, "runstart").unwrap();
+    assert_ne!(open_run(&registry, "runstart").record.run_id, id);
+    let _ = sup.stop(&registry, "runstart", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_restart_policy_relaunch_keeps_the_run_and_its_per_run_totals() {
+    let (_state, _manifest, registry) = setup_fake("runkeep", &["--crash-after-ms", "450"]);
+    let name = InstanceName::new("runkeep").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "runkeep").unwrap();
+    let run = open_run(&registry, "runkeep").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 30,
+            output_tokens: 12,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let plans = wait_for_crash(&mut sup, &registry);
+    assert_eq!(plans.len(), 1);
+    let crashed = registry.run_view(&run).unwrap();
+    assert_eq!(crashed.record.status, crate::domain::RunStatus::Active);
+    assert_eq!(
+        crashed.record.anomalies,
+        vec![crate::domain::Anomaly::Failed]
+    );
+    std::thread::sleep(plans[0].delay);
+    sup.restart(&registry, "runkeep", plans[0].attempt, plans[0].delay)
+        .unwrap();
+    let relaunched = open_run(&registry, "runkeep");
+    assert_eq!(relaunched.record.run_id, run, "the relaunch keeps the Run");
+    assert!(
+        relaunched.record.anomalies.is_empty(),
+        "running again clears `failed`"
+    );
+    assert_eq!(
+        registry.spawn_record(&name).unwrap().unwrap().run_id,
+        Some(run.clone())
+    );
+    assert_eq!(relaunched.usage.input_tokens, 30, "per-run totals carry");
+    let _ = sup.stop(&registry, "runkeep", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_crash_that_is_not_relaunched_ends_the_run_with_the_failed_anomaly() {
+    let (_state, _manifest, registry) = setup_fake("runend", &["--crash-after-ms", "450"]);
+    let name = InstanceName::new("runend").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::Never)
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "runend").unwrap();
+    let run = open_run(&registry, "runend").record.run_id;
+    assert!(wait_for_crash(&mut sup, &registry).is_empty());
+    let ended = registry.run_view(&run).unwrap();
+    assert_eq!(ended.record.status, crate::domain::RunStatus::Ended);
+    assert_eq!(ended.record.anomalies, vec![crate::domain::Anomaly::Failed]);
+    assert!(ended.record.end_cause.unwrap().starts_with("crashed"));
+}
+
+#[test]
+fn child_usage_rolls_up_and_every_ancestor_ceiling_applies() {
+    let (_state, _manifest, registry) = setup_fake("runtree", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runtree").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"stop\"\n[budget.tokens]\nper_run = 100\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "runtree").unwrap();
+    let owner = open_run(&registry, "runtree").record.run_id;
+    let mut request = crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+        "runtree".to_string(),
+    ));
+    request.limits.token_per_run = Some(40);
+    let child = sup.open_child_run(&registry, request).unwrap();
+    assert_eq!(child.record.parent_run_id, Some(owner.clone()));
+    assert!(registry.run_snapshot().run(&child.record.run_id).is_some());
+    let grandchild = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(
+                child.record.run_id.clone(),
+            )),
+        )
+        .unwrap();
+    let closed = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(owner.clone())),
+        )
+        .unwrap();
+    sup.close_run(&registry, &closed.record.run_id).unwrap();
+    assert!(registry.run_snapshot().run(&closed.record.run_id).is_none());
+    let usage = |sequence, tokens| ParsedUsage {
+        sequence,
+        input_tokens: tokens,
+        output_tokens: 0,
+        cached_tokens: 0,
+    };
+    // 50 tokens on the grandchild: the child's 40-token ceiling breaches
+    // (warn), the owner's 100 does not.
+    sup.commit_run_usage(&registry, &name, &grandchild.record.run_id, &usage(1, 50))
+        .unwrap();
+    let view = |id: &RunId| registry.run_view(id).unwrap();
+    assert_eq!(view(&grandchild.record.run_id).usage.input_tokens, 50);
+    assert_eq!(view(&child.record.run_id).usage.input_tokens, 50);
+    assert_eq!(view(&owner).usage.input_tokens, 50);
+    assert_eq!(registry.usage_totals(&name).unwrap().input_tokens, 50);
+    let breaches = Supervisor::read_breach_events(&registry, "runtree").unwrap();
+    assert_eq!(breaches.len(), 1);
+    assert_eq!(breaches[0].run_id, child.record.run_id.as_str());
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert_eq!(
+        view(&child.record.run_id).record.anomalies,
+        vec![crate::domain::Anomaly::Breach]
+    );
+    assert_eq!(state_of(&registry, "runtree"), LifecycleState::Running);
+    // 60 more: the owner's ceiling breaches and its `stop` stops the
+    // process; the open in-process children end with the cascade's cause.
+    sup.commit_run_usage(&registry, &name, &grandchild.record.run_id, &usage(2, 60))
+        .unwrap();
+    assert_eq!(state_of(&registry, "runtree"), LifecycleState::Stopped);
+    let breaches = Supervisor::read_breach_events(&registry, "runtree").unwrap();
+    assert_eq!(
+        breaches.len(),
+        2,
+        "the child's latch holds; the owner fires"
+    );
+    assert_eq!(breaches[1].run_id, owner.as_str());
+    assert_eq!(breaches[1].action, BreachAction::Stop);
+    for id in [&child.record.run_id, &grandchild.record.run_id] {
+        assert_eq!(view(id).record.end_cause.as_deref(), Some("parent-stopped"));
+    }
+    assert_eq!(
+        view(&closed.record.run_id).record.end_cause.as_deref(),
+        Some("closed")
+    );
+    assert_eq!(view(&owner).record.status, crate::domain::RunStatus::Ended);
+}
+
+#[test]
+fn a_relaunch_re_applies_a_latched_process_breach_action() {
+    // Review round 1 (finding 1): a relaunch keeps the Run and its spent
+    // latch, so a `stop` (or `pause`) the Run already fired must be applied
+    // again to the relaunched process — never a silently unbounded spend.
+    let (_state, _manifest, registry) = setup_fake("runlatch", &["--crash-after-ms", "450"]);
+    let name = InstanceName::new("runlatch").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"stop\"\n[budget.tokens]\nper_run = 10\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "runlatch").unwrap();
+    let run = open_run(&registry, "runlatch").record.run_id;
+    // The breach fired under `stop` (recorded and latched) just before the
+    // process died.
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &run,
+        BreachScope::PerRun,
+        10,
+        12,
+        BreachAction::Stop,
+        "self-reported",
+    );
+    let plans = wait_for_crash(&mut sup, &registry);
+    assert_eq!(plans.len(), 1);
+    std::thread::sleep(plans[0].delay);
+    sup.restart(&registry, "runlatch", plans[0].attempt, plans[0].delay)
+        .unwrap();
+    assert_eq!(state_of(&registry, "runlatch"), LifecycleState::Stopped);
+    assert!(sink_text(&buffer).contains("re-applying it"));
+    let ended = registry.run_view(&run).unwrap();
+    assert_eq!(ended.record.status, crate::domain::RunStatus::Ended);
+}
+
+#[test]
+fn a_breach_on_a_replaced_run_never_acts_on_the_new_process() {
+    // Review round 1 (finding 8): usage attributed to a child of an ENDED
+    // process-owning Run records that Run's breach but acts on nothing.
+    let (_state, _manifest, registry) = setup_fake("runstale", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("runstale").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"stop\"\n[budget.tokens]\nper_run = 10\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "runstale").unwrap();
+    let first = open_run(&registry, "runstale").record.run_id;
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(first.clone())),
+        )
+        .unwrap();
+    sup.stop(&registry, "runstale", Some(Duration::from_secs(5)))
+        .unwrap();
+    sup.start(&registry, "runstale").unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &child.record.run_id,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 20,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "runstale").unwrap();
+    assert_eq!(breaches.len(), 1);
+    assert_eq!(breaches[0].run_id, first.as_str());
+    assert_eq!(state_of(&registry, "runstale"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "runstale", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn engine_open_ends_a_run_whose_relaunch_never_ran() {
+    // Review round 1 (finding 2): a relaunch planned by an engine that
+    // exited during the backoff leaves the Run `active`; the next adoption
+    // pass ends it.
+    let (_state, _manifest, registry) = setup_fake("runorph", &["--crash-after-ms", "450"]);
+    let name = InstanceName::new("runorph").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "runorph").unwrap();
+    let run = open_run(&registry, "runorph").record.run_id;
+    assert_eq!(wait_for_crash(&mut sup, &registry).len(), 1);
+    assert_eq!(
+        registry.run_view(&run).unwrap().record.status,
+        crate::domain::RunStatus::Active
+    );
+    // A later engine opens and never executes the dropped plan.
+    let mut later = Supervisor::with_backoff(fast_backoff());
+    later.adopt_orphans(&registry);
+    let ended = registry.run_view(&run).unwrap();
+    assert_eq!(ended.record.status, crate::domain::RunStatus::Ended);
+    assert_eq!(ended.record.end_cause.as_deref(), Some("relaunch-not-run"));
+    assert_eq!(ended.record.anomalies, vec![crate::domain::Anomaly::Failed]);
+    // The relaunch running after all reopens the same Run.
+    let _ = name;
 }

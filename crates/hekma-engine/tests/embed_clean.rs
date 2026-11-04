@@ -419,13 +419,14 @@ fn assert_subscriber_isolation(result: &FlowResult) {
     );
 }
 
-/// The instance name an [`EngineEvent`] payload carries (all three payload
-/// families are instance-scoped).
+/// The instance name an [`EngineEvent`] payload carries (a Run event names
+/// its hosting instance; every Run these tests create has one).
 fn event_instance(event: &EngineEvent) -> &str {
     match event {
         EngineEvent::Transition(t) => &t.instance,
         EngineEvent::BudgetBreach(b) => &b.instance,
         EngineEvent::UsageUpdate(u) => &u.event.instance,
+        EngineEvent::Run(r) => r.instance.as_deref().unwrap_or_default(),
     }
 }
 

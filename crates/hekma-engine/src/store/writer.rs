@@ -111,6 +111,9 @@ pub(crate) struct StoreWriter {
     tx: Option<Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     stats: Arc<WriterStats>,
+    /// Story 21-4: a CLOSED writer (the read-only engine's) — no thread, and
+    /// every write answers the typed read-only refusal, never a panic.
+    read_only: bool,
 }
 
 impl StoreWriter {
@@ -127,7 +130,19 @@ impl StoreWriter {
             tx: Some(tx),
             thread: Some(thread),
             stats,
+            read_only: false,
         })
+    }
+
+    /// A closed writer for a read-only engine (story 21-4): no thread, no
+    /// connection; every write answers [`read_only_refusal`].
+    pub(crate) fn closed() -> Self {
+        Self {
+            tx: None,
+            thread: None,
+            stats: Arc::new(WriterStats::default()),
+            read_only: true,
+        }
     }
 
     /// Run `work` on the writer and wait for its commit (the acked write).
@@ -224,6 +239,9 @@ impl StoreWriter {
     }
 
     fn send(&self, job: Job) -> Result<(), StoreError> {
+        if self.read_only {
+            return Err(read_only_refusal());
+        }
         self.tx
             .as_ref()
             .ok_or_else(writer_gone)?
@@ -240,6 +258,13 @@ impl Drop for StoreWriter {
             let _ = thread.join();
         }
     }
+}
+
+/// The typed refusal every write on a read-only engine answers (story 21-4).
+pub(crate) fn read_only_refusal() -> StoreError {
+    StoreError::Backend(
+        "this engine was opened read-only (no store writer); the write was not applied".to_string(),
+    )
 }
 
 fn writer_gone() -> StoreError {

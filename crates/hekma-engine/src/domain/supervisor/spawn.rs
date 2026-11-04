@@ -3,6 +3,7 @@
 //! additional `impl Supervisor` block, no signature or behavior change.
 
 use super::*;
+use crate::domain::runs::ops::RunFate;
 
 impl Supervisor {
     /// Start a registered / previously stopped / FAILED Agent Instance
@@ -183,11 +184,11 @@ impl Supervisor {
             return Err(EngineError::DetachRefused {
                 name: name.as_str().to_string(),
                 detail: "the instance meters via the engine-observed channel, whose loopback \
-                         forward listener lives inside the starting command — detaching would \
-                         leave the agent pointed at a listener that dies with the command. \
-                         Start it without --detach (the in-command supervision keeps the \
-                         listener alive), or switch the adapter's metering source to \
-                         self-reported."
+                         forward listener lives inside the engine that starts it (for the hekma \
+                         CLI, the local Service Host) — detaching would leave the agent pointed \
+                         at a listener that dies with the command or host that started it. \
+                         Start it without --detach (the supervising engine keeps the listener \
+                         alive), or switch the adapter's metering source to self-reported."
                     .to_string(),
             });
         }
@@ -358,9 +359,16 @@ impl Supervisor {
         // it already starts at or over (a cumulative ceiling, or a zero per-run
         // one). The listener is born with this fence. Recorded + latched after
         // the `Supervised` insert below.
+        //
+        // Story 21-2: a Restart Policy relaunch KEEPS its Run (read off the
+        // spawn record the relaunch replaces), so the fence evaluates that
+        // Run's per-run totals — a per-run `block` carries across the crash.
+        let kept_run_id = restart
+            .and_then(|_| registry.spawn_record(&name).ok().flatten())
+            .and_then(|record| record.run_id);
         let run_fence = crate::metering::WireFence::default();
         let run_start_fenced = metering_source == "engine-observed"
-            && self.run_start_fence(registry, &name, &run_fence);
+            && self.run_start_fence(registry, &name, &run_fence, kept_run_id.as_ref());
         let observed_listener =
             self.start_observed_listener(&name, &metering_source, &effective, run_fence)?;
         // The effective config the MAPPING applies: for an observed instance it
@@ -696,14 +704,11 @@ impl Supervisor {
         // (re)spawn — operator start, stop→start, or a Restart Policy restart —
         // flows through here, so each rewrites the record with a FRESH id: the
         // Run resets exactly when a new process is spawned, never on adoption.
-        // Story 19-2: a Restart Policy relaunch begins a NEW Run, so a per-run
-        // `block` fence of the Run it replaces does not carry. Read that Run's
-        // id off the record BEFORE the commit below overwrites it, so the
-        // relaunch can say so (see `note_relaunch_lifts_per_run_fence`).
-        let replaced_run_id = restart
-            .and_then(|_| registry.spawn_record(&name).ok().flatten())
-            .and_then(|record| record.run_id);
-        let run_id = RunId::mint();
+        // Story 21-2: only an operator start mints; a Restart Policy relaunch
+        // keeps the Run it relaunches (per-run budgets, latches and the
+        // `block` fence carry — PRD FR-49). A relaunch whose record carries
+        // no id (a pre-v9 record) mints.
+        let run_id = kept_run_id.clone().unwrap_or_else(RunId::mint);
         let restart_count = restart.map(|(attempt, _)| attempt).unwrap_or(0);
         let record = SpawnRecord {
             name: name.clone(),
@@ -750,41 +755,54 @@ impl Supervisor {
         // commit in one writer job — every usage row of this launch carries
         // it, so a sequence a relaunch restarts never collides with the
         // previous launch's rows.
-        let launch_generation = match registry.write_spawn_record_new_launch(&record) {
-            Ok(generation) => generation,
-            Err(e) => {
-                // Persisting the record failed: kill the just-spawned process and
-                // land the instance in `failed` so we never leave an unrecorded
-                // process behind (AD-5 safety).
-                //
-                // Review round 2: `drop(handle)` alone only tears the process down
-                // when the handle is ATTACHED (drop = group/job kill). A DETACHED
-                // handle is DISARMED — its Drop deliberately kills nothing — so a
-                // detached start whose record commit fails would LEAK a live,
-                // unrecorded process. The teardown is therefore explicit on the
-                // detach path: a short graceful window through the backend stop
-                // (which still works on a detached handle — the pgid/job is
-                // unchanged), then the drop releases whatever remains.
-                //
-                // AUDIT of the other post-spawn error paths in this function (why
-                // this is the ONLY fix site): between `spawn` and this commit the
-                // sole fallible step is `watch_startup`, whose failure branch runs
-                // only when the process ALREADY exited (reaped by the poll —
-                // nothing survives, detached or not); every `?` after the commit
-                // happens once the record is DURABLE, so a dropped detached
-                // handle there leaves a recorded (adoptable) process, not an
-                // unrecorded one.
-                if detach {
-                    let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
-                }
-                drop(handle);
-                return Err(self.fail_launch_detail(
-                    registry,
-                    &name,
-                    format!("could not commit the write-ahead spawn record: {e}"),
-                ));
-            }
+        let supervised_run = crate::domain::runs::ops::SupervisedRun {
+            instance: name.clone(),
+            run_id: run_id.clone(),
+            wire_path: metering_source == "engine-observed",
+            labels: self.bound_labels(registry, &name),
+            fresh: kept_run_id.is_none(),
         };
+        let launch_generation =
+            match registry.write_spawn_record_new_launch(&record, supervised_run) {
+                Ok((generation, run_events)) => {
+                    // The Run's `created` (or a kept Run's re-sync) precedes the
+                    // `running` transition on the bus.
+                    self.publish_run_events(run_events);
+                    generation
+                }
+                Err(e) => {
+                    // Persisting the record failed: kill the just-spawned process and
+                    // land the instance in `failed` so we never leave an unrecorded
+                    // process behind (AD-5 safety).
+                    //
+                    // Review round 2: `drop(handle)` alone only tears the process down
+                    // when the handle is ATTACHED (drop = group/job kill). A DETACHED
+                    // handle is DISARMED — its Drop deliberately kills nothing — so a
+                    // detached start whose record commit fails would LEAK a live,
+                    // unrecorded process. The teardown is therefore explicit on the
+                    // detach path: a short graceful window through the backend stop
+                    // (which still works on a detached handle — the pgid/job is
+                    // unchanged), then the drop releases whatever remains.
+                    //
+                    // AUDIT of the other post-spawn error paths in this function (why
+                    // this is the ONLY fix site): between `spawn` and this commit the
+                    // sole fallible step is `watch_startup`, whose failure branch runs
+                    // only when the process ALREADY exited (reaped by the poll —
+                    // nothing survives, detached or not); every `?` after the commit
+                    // happens once the record is DURABLE, so a dropped detached
+                    // handle there leaves a recorded (adoptable) process, not an
+                    // unrecorded one.
+                    if detach {
+                        let _ = self.backend.stop(&mut handle, Duration::from_millis(500));
+                    }
+                    drop(handle);
+                    return Err(self.fail_launch_detail(
+                        registry,
+                        &name,
+                        format!("could not commit the write-ahead spawn record: {e}"),
+                    ));
+                }
+            };
 
         // (6b) ACP HANDSHAKE (story 14-1, spine AD-19) — for an `acp` instance,
         // take ownership of the child's pipe halves, start the connection
@@ -1118,6 +1136,11 @@ impl Supervisor {
                             LifecycleState::Failed,
                             TransitionCause::crashed(decision.crash_cause.clone()),
                             crash_log_capture,
+                            if decision.plan.is_some() {
+                                RunFate::Relaunching
+                            } else {
+                                RunFate::Terminal
+                            },
                         )
                         .is_err()
                     {
@@ -1176,6 +1199,7 @@ impl Supervisor {
             LifecycleState::Running,
             ready_cause,
             self.backend.log_capture(&handle),
+            RunFate::Terminal,
         )?;
         // The Run id was minted BEFORE the record commit (story 15-2 — the
         // durable Run identity; see step (6)): each `starting` — operator start
@@ -1292,8 +1316,10 @@ impl Supervisor {
         if run_start_fenced || self.block_configured(registry, &name) {
             self.enforce_budget(registry, &name, &fence_run_id, &fence_metering_source);
         }
-        if restart.is_some() {
-            self.note_relaunch_lifts_per_run_fence(registry, &name, replaced_run_id.as_ref());
+        // Story 21-2: a relaunch keeps the Run and its spent latch, so a
+        // `pause` or `stop` the Run had already fired is re-applied here.
+        if restart.is_some() && kept_run_id.is_some() {
+            self.reapply_latched_actions(registry, &name, &fence_run_id);
         }
 
         registry.lookup(&name).map_err(registry_to_engine)
