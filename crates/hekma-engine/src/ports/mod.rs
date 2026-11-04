@@ -35,7 +35,7 @@ pub use process_backend::{
     StdinState, StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub(crate) use run_store::{
-    clamp_page, OutboxAppend, OutboxBounds, Page, Rollup, RunStore, PAGE_MAX,
+    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunRecords, RunStore, PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,
@@ -92,6 +92,23 @@ pub enum StoreError {
         found: i64,
         /// The highest schema version this build applies.
         supported: i64,
+    },
+
+    /// Story 21-4: a READ-ONLY open ([`crate::Engine::open_read_only`]) found
+    /// a state database below this build's schema version. A read-only
+    /// connection never migrates (the migration is a write), so the caller
+    /// must let a writer open the database first — the `hekma` CLI starts or
+    /// finds the local Service Host, which migrates, then reads again.
+    #[error(
+        "the state database is at schema v{found} and this build reads v{current}; it needs \
+         a migration, which only a writer applies (run any hekma write command, or start \
+         `hekma serve`)"
+    )]
+    NeedsMigration {
+        /// The `user_version` found on disk.
+        found: i64,
+        /// The schema version this build reads.
+        current: i64,
     },
 
     /// A memory-backing re-attach tried to CHANGE the kind on a row that

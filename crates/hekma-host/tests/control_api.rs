@@ -112,6 +112,7 @@ fn spawn_serve_with_api(base: PathBuf, sink: SharedSink) -> ServeHandle {
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink)),
         otlp: Default::default(),
+        ..Default::default()
     };
     let mut server = spawn_serve(options);
     // Wait for the listening notice, then parse the OS-chosen address —
@@ -242,6 +243,10 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // auth layer — no anonymous route.
         ("GET", format!("http://{addr}/v0/export")),
         ("POST", format!("http://{addr}/v0/export/ack")),
+        // Story 21-2: the Run routes.
+        ("POST", format!("http://{addr}/v0/runs")),
+        ("GET", format!("http://{addr}/v0/runs/run_ghost")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/close")),
     ]
 }
 
@@ -357,7 +362,10 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // body carries no `seq` — the Json extractor's 422 is the
         // handler-reached answer (auth passed, the request shape was wrong).
         let ack_wrong_body = method == "POST" && url.ends_with("/v0/export/ack");
-        let expected = match (register, identity) {
+        // The Run open POST reached its handler: the register-shaped body
+        // names no parent, so the exactly-one-parent rule answers 400.
+        let run_open = method == "POST" && url.ends_with("/v0/runs");
+        let expected = match (register || run_open, identity) {
             // The SSE stream answers 200 and STAYS OPEN — never drained
             // here (read_to_string would block until shutdown); dropping
             // the response closes the socket.
@@ -1716,6 +1724,7 @@ fn a_state_dir_on_an_explicit_volume_holds_everything_and_refuses_a_second_host(
         log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: None,
         otlp: Default::default(),
+        ..Default::default()
     };
     let err = hekma_host::serve(options).expect_err("the second host must be refused");
     assert!(
@@ -1856,8 +1865,9 @@ fn the_sse_stream_delivers_live_events_and_ends_on_shutdown() {
 
 #[test]
 fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
-    // Off by default: NO control notice, NO socket — serve is byte-identical
-    // to 17-2 (same steps, same notices).
+    // Story 21-4: with no `--listen` there is no OPERATOR listener — only the
+    // loopback LOCAL endpoint every serve binds for the hekma CLI (recorded
+    // in control.json, removed at shutdown).
     let state = tempfile::tempdir().unwrap();
     let (sink_handle, _diagnostics) = SharedSink::new();
     let options = hekma_host::ServeOptions {
@@ -1867,39 +1877,65 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         ..hekma_host::ServeOptions::default()
     };
     let server = spawn_serve(options);
+    // The discovery file appears once the local endpoint is bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let discovery = loop {
+        if let Ok(discovery) = hekma_host::read_discovery(state.path()) {
+            break discovery;
+        }
+        assert!(std::time::Instant::now() < deadline, "no control.json");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(discovery.addr.ip().is_loopback());
+    assert!(!discovery.autostarted);
+    assert_eq!(discovery.token.len(), 64);
     server.stop().expect("serve completes");
+    assert!(
+        !hekma_host::control_file(state.path()).exists(),
+        "control.json is removed at shutdown"
+    );
     let text = sink_handle.text();
     assert!(
-        !text.contains("control api"),
-        "no API exists by default:\n{text}"
+        !text.contains("control api listening on"),
+        "no operator listener exists by default:\n{text}"
     );
-    // Byte-identity, strengthened (review item 27): the notice SEQUENCE is
-    // exactly 17-2's — started, signal, the drain's zero-agent outcome,
-    // complete, in order, and NOTHING else (an interleaved API notice breaks
-    // the exact-count pin, which is the point: the default serve must not
-    // change shape).
+    // The notice SEQUENCE, pinned exactly (review item 27's discipline):
+    // started, the local endpoint, signal, the API stop, the drain's
+    // zero-agent outcome, complete — in order, and NOTHING else.
     let notices: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         notices.len(),
-        4,
-        "an API-off serve emits exactly 17-2's four notices:\n{text}"
+        6,
+        "a listener-less serve emits exactly six notices:\n{text}"
     );
     assert!(
         notices[0].starts_with("[hekma] host started; state root "),
         "the first notice is the started notice:\n{text}"
     );
+    assert!(
+        notices[1].starts_with(&format!(
+            "[hekma] local control endpoint on {} (loopback, for the hekma CLI;",
+            discovery.addr
+        )),
+        "the second notice names the local endpoint:\n{text}"
+    );
     assert_eq!(
-        notices[1],
+        notices[2],
         "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
-        "the second notice is the signal notice, verbatim:\n{text}"
+        "the third notice is the signal notice, verbatim:\n{text}"
     );
     assert_eq!(
-        notices[2], "[hekma] no running or paused agents; nothing to stop",
-        "the third notice is the drain's zero-agent outcome:\n{text}"
+        notices[3],
+        "[hekma] control api stopped; no requests are accepted for the rest of the shutdown",
+        "the fourth notice is the API stop:\n{text}"
     );
     assert_eq!(
-        notices[3], "[hekma] shutdown complete (SIGTEST)",
-        "the fourth notice is the completion notice, verbatim:\n{text}"
+        notices[4], "[hekma] no running or paused agents; nothing to stop",
+        "the fifth notice is the drain's zero-agent outcome:\n{text}"
+    );
+    assert_eq!(
+        notices[5], "[hekma] shutdown complete (SIGTEST)",
+        "the sixth notice is the completion notice, verbatim:\n{text}"
     );
 
     // --listen without --bearer-secret: a typed InvalidOptions (usage class).
@@ -2460,19 +2496,115 @@ fn the_config_put_surfaces_the_steering_warnings_over_the_wire() {
 }
 
 #[test]
-fn a_non_loopback_bind_warns_loudly() {
+fn a_non_loopback_bind_without_tls_is_refused_before_anything_binds_or_opens() {
+    // Story 21-4 (AD-20 amended 2026-10-30): beyond loopback the Control API
+    // REQUIRES TLS — a plain non-loopback --listen is a usage refusal before
+    // the lock, the bind or the engine open (no state.db appears).
     let state = tempfile::tempdir().unwrap();
+    let base = state.path().join("never-created");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let err = hekma_host::serve_with_signal(
+        hekma_host::ServeOptions {
+            state_base: Some(base.clone()),
+            control_listen: Some("0.0.0.0:0".parse().unwrap()),
+            bearer_secret: Some(BEARER_NAME.to_string()),
+            diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+            ..Default::default()
+        },
+        |_sink| async { Ok("SIGTEST") },
+    )
+    .expect_err("a plain non-loopback listener refuses");
+    assert!(
+        matches!(err, hekma_host::ServeError::InvalidOptions { .. }),
+        "the usage class: {err}"
+    );
+    assert!(err.to_string().contains("--tls-cert"), "{err}");
+    assert!(!base.exists(), "nothing was created or opened");
+    // One TLS flag alone is refused too, and so is TLS without --listen.
+    for (cert, key, listen) in [
+        (Some("c.pem"), None, Some("127.0.0.1:0")),
+        (None, Some("k.pem"), Some("127.0.0.1:0")),
+        (Some("c.pem"), Some("k.pem"), None),
+    ] {
+        let err = hekma_host::serve_with_signal(
+            hekma_host::ServeOptions {
+                state_base: Some(base.clone()),
+                control_listen: listen.map(|addr| addr.parse().unwrap()),
+                bearer_secret: listen.map(|_| BEARER_NAME.to_string()),
+                tls_cert: cert.map(PathBuf::from),
+                tls_key: key.map(PathBuf::from),
+                ..Default::default()
+            },
+            |_sink| async { Ok("SIGTEST") },
+        )
+        .expect_err("a half TLS configuration refuses");
+        assert!(
+            matches!(err, hekma_host::ServeError::InvalidOptions { .. }),
+            "{err}"
+        );
+    }
+    // An unreadable PEM is refused naming the path — before the lock.
+    let err = hekma_host::serve_with_signal(
+        hekma_host::ServeOptions {
+            state_base: Some(base.clone()),
+            control_listen: Some("0.0.0.0:0".parse().unwrap()),
+            bearer_secret: Some(BEARER_NAME.to_string()),
+            tls_cert: Some(state.path().join("missing-cert.pem")),
+            tls_key: Some(state.path().join("missing-key.pem")),
+            ..Default::default()
+        },
+        |_sink| async { Ok("SIGTEST") },
+    )
+    .expect_err("a missing certificate refuses");
+    assert!(err.to_string().contains("missing-cert.pem"), "{err}");
+    assert!(!base.exists(), "nothing was created or opened");
+    // The autostart mode refuses the explicit-listener flags.
+    let err = hekma_host::serve_with_signal(
+        hekma_host::ServeOptions {
+            state_base: Some(base.clone()),
+            control_listen: Some("127.0.0.1:0".parse().unwrap()),
+            bearer_secret: Some(BEARER_NAME.to_string()),
+            autostart: true,
+            ..Default::default()
+        },
+        |_sink| async { Ok("SIGTEST") },
+    )
+    .expect_err("autostart with --listen refuses");
+    assert!(err.to_string().contains("--autostart"), "{err}");
+    assert!(!base.exists(), "nothing was created or opened");
+}
+
+/// A self-signed certificate for `127.0.0.1`, written as PEM files.
+fn self_signed(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+    (cert, key, certified.cert.der().to_vec())
+}
+
+#[test]
+fn a_tls_listener_answers_https_and_refuses_plain_http() {
+    // Story 21-4: with --tls-cert/--tls-key the operator's listener serves
+    // HTTPS (any address — here 0.0.0.0, the container recipe); a plain-HTTP
+    // request fails the handshake and is never served. The local endpoint
+    // stays loopback plain HTTP.
+    let state = tempfile::tempdir().unwrap();
+    let pems = tempfile::tempdir().unwrap();
+    let (cert, key, der) = self_signed(pems.path());
     let (sink_handle, _diagnostics) = SharedSink::new();
     write_secrets_file(state.path());
     let options = hekma_host::ServeOptions {
         state_base: Some(state.path().to_path_buf()),
         control_listen: Some("0.0.0.0:0".parse().unwrap()),
         bearer_secret: Some(BEARER_NAME.to_string()),
-        metering_listen_port: 0,
         stop_window: Some(1),
-        log_capture: hekma_engine::LogCaptureMode::Full,
         diagnostics: Some(diagnostic_sink_of(&sink_handle)),
-        otlp: Default::default(),
+        tls_cert: Some(cert),
+        tls_key: Some(key),
+        ..Default::default()
     };
     let server = spawn_serve(options);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2492,28 +2624,70 @@ fn a_non_loopback_bind_warns_loudly() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    // The warning is LOUD and names the posture (review item 15) — the bind
-    // itself is legitimate (17-5's container recipe), never refused.
-    let text = sink_handle.text();
     assert!(
-        text.contains("NON-LOOPBACK"),
-        "a non-loopback bind warns loudly:\n{text}"
+        sink_handle.text().contains("bearer required; https)"),
+        "the notice names the scheme:\n{}",
+        sink_handle.text()
     );
-    assert!(
-        text.contains("no TLS and bearer-only auth"),
-        "the warning names the exposure:\n{text}"
-    );
-    // And the API still answers — on the loopback side of 0.0.0.0.
     let port = addr.rsplit(':').next().unwrap().to_string();
-    let client = client();
-    let mut response = client
-        .get(format!("http://127.0.0.1:{port}/v0/version"))
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::new_with_certs(&[
+            ureq::tls::Certificate::from_der(&der).to_owned(),
+        ]))
+        .build();
+    let https: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .tls_config(tls)
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    let mut response = https
+        .get(format!("https://127.0.0.1:{port}/v0/version"))
         .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .call()
+        .expect("the HTTPS call is answered");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.body_mut().read_to_string().unwrap();
+    assert!(body.contains("hekma-control-api"), "{body}");
+    // The local operator token is the same credential class: served too.
+    let discovery = hekma_host::read_discovery(state.path()).unwrap();
+    let response = https
+        .get(format!("https://127.0.0.1:{port}/v0/version"))
+        .header("Authorization", format!("Bearer {}", discovery.token))
         .call()
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let _ = response.body_mut().read_to_string();
-
+    // A wrong bearer over TLS is still the static 401.
+    let response = https
+        .get(format!("https://127.0.0.1:{port}/v0/version"))
+        .header("Authorization", "Bearer wrong")
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Plain HTTP on the TLS port is never served.
+    let plain: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    assert!(
+        plain
+            .get(format!("http://127.0.0.1:{port}/v0/version"))
+            .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+            .call()
+            .is_err(),
+        "plain HTTP must not be answered on the TLS listener"
+    );
+    // The local endpoint answers plain HTTP with the local token, and the
+    // --bearer-secret value works there too (one resolver, two listeners).
+    for token in [discovery.token.as_str(), BEARER_VALUE] {
+        let response = plain
+            .get(format!("http://{}/v0/version", discovery.addr))
+            .header("Authorization", format!("Bearer {token}"))
+            .call()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     server.stop().expect("serve must shut down cleanly");
 }
 
@@ -2823,4 +2997,496 @@ fn export_limit_parse_failures_are_versioned_400s_never_extractor_text() {
     }
 
     server.stop().unwrap();
+}
+
+#[test]
+fn the_run_routes_open_show_and_close_a_child_run_with_typed_refusals() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let runs = format!("http://{}/v0/runs", server.addr);
+    let post = |url: &str, body: serde_json::Value| {
+        client
+            .post(url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .unwrap()
+    };
+
+    // No open Run yet: 409 with the stable code.
+    let mut response = post(&runs, serde_json::json!({"parent_instance": "host"}));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["kind"], "conflict");
+    assert_eq!(json["error"]["code"], "no-open-run");
+
+    let mut response = client
+        .post(format!("http://{}/v0/instances/host/start", server.addr))
+        .header("Authorization", &auth)
+        .send("")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+
+    // Exactly one parent.
+    let mut response = post(&runs, serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "breach_action": "explode"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "dollar_cap": "-1"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    // A `pause` on a child in a process with no wire path is refused.
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "breach_action": "pause"}),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "action-unavailable"
+    );
+
+    // Open: 201 + Location + the Run.
+    let mut response = post(
+        &runs,
+        serde_json::json!({
+            "parent_instance": "host",
+            "labels": {"task": "review"},
+            "token_budget": 500,
+            "dollar_cap": "1.50",
+            "breach_action": "warn",
+            "external_id": "job-1"
+        }),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let json = json_body(&mut response);
+    let run_id = json["run"]["run_id"].as_str().unwrap().to_string();
+    assert_eq!(location, format!("/v0/runs/{run_id}"));
+    assert_eq!(json["run"]["control_depth"], "announced");
+    assert_eq!(json["run"]["wire_path"], false);
+    assert_eq!(json["run"]["labels"][0]["source"], "caller");
+    assert_eq!(json["run"]["limits"]["token_per_run"], 500);
+    // A retried open with the same external id is the same Run.
+    let mut response = post(
+        &runs,
+        serde_json::json!({"parent_instance": "host", "external_id": "job-1"}),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(json_body(&mut response)["run"]["run_id"], run_id.as_str());
+
+    // Show it, and its parent through the parent id.
+    let mut response = get_ok(&client, &server.addr, &location);
+    let json = json_body(&mut response);
+    let parent = json["run"]["parent_run_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{parent}"));
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["control_depth"], "supervised");
+    assert_eq!(json["run"]["open_children"], 1);
+
+    // Close the child; closing the process-owning Run is a 409.
+    let mut response = post(&format!("{runs}/{run_id}/close"), serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["status"], "ended");
+    assert_eq!(json["run"]["end_cause"], "closed");
+    let mut response = post(&format!("{runs}/{parent}/close"), serde_json::json!({}));
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "owns-process");
+    let mut response = get_ok(&client, &server.addr, "/v0/runs/run_ghost");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(&mut response)["error"]["code"], "run-not-found");
+
+    let _ = client
+        .post(format!("http://{}/v0/instances/host/stop", server.addr))
+        .header("Authorization", &auth)
+        .send("");
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-4: the routes every CLI write needs (send, memory, restart policy,
+// remove's disposition/force, start's detach), the engine error on the wire,
+// and the auto-started host's lifetime.
+// ---------------------------------------------------------------------------
+
+/// A JSON request with the valid bearer; `body: None` sends no body.
+fn call(
+    client: &ureq::Agent,
+    method: &str,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> ureq::http::Response<ureq::Body> {
+    let auth = format!("Bearer {BEARER_VALUE}");
+    match (method, body) {
+        ("POST", Some(json)) => client
+            .post(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("POST", None) => client.post(url).header("Authorization", &auth).send_empty(),
+        ("PUT", Some(json)) => client
+            .put(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
+        (other, _) => panic!("unsupported test method {other}"),
+    }
+    .unwrap_or_else(|err| panic!("{method} {url}: {err}"))
+}
+
+/// A client that waits past the stop ladder's bound (the default 30 s
+/// window plus the forced kill's confirmation): a forced remove of a running
+/// instance stops it first, and on Windows — no graceful signal is sent yet —
+/// the whole window elapses before the kill.
+fn ladder_client() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_recv_response(Some(Duration::from_secs(90)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+#[test]
+fn the_story_21_4_routes_project_every_cli_write() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // A compiled fake_agent that echoes stdin (cross-OS: no `sh`).
+    let manifest_dir = tempfile::tempdir().unwrap();
+    ManifestFixture::fake_agent("worker", &["--echo-stdin", "--linger-ms", "600000"])
+        .write(manifest_dir.path());
+    let engine = Engine::open(Some(base.clone())).expect("engine open");
+    engine
+        .blocking()
+        .register_with_adapter(
+            "worker",
+            &AdapterRef::Manifest(manifest_dir.path().to_path_buf()),
+        )
+        .expect("register");
+    engine.blocking().register("mem", "mock").expect("register");
+    drop(engine);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+    let instances = format!("http://{}/v0/instances", server.addr);
+
+    // A present start body must parse.
+    let mut response = client
+        .post(format!("{instances}/worker/start"))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .header("Content-Type", "application/json")
+        .send("not json")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+
+    // start (an explicit non-detached body) → running, session-supervised.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{instances}/worker/start"),
+        Some(serde_json::json!({"detach": false})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["instance"]["state"], "running");
+    assert_eq!(json["instance"]["supervision"], "session");
+    // The status read names the host's live capture of an agent it spawned
+    // (a raw-log reader's dedupe question).
+    let mut response = get_ok(&client, &server.addr, "/v0/instances/worker/status");
+    assert_eq!(json_body(&mut response)["live_capture"], true);
+    let mut response = get_ok(&client, &server.addr, "/v0/instances/mem/status");
+    assert_eq!(json_body(&mut response)["live_capture"], false);
+
+    // send → 204, and the line reaches the agent's stdin (it echoes it).
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{instances}/worker/send"),
+        Some(serde_json::json!({"text": "hello-21-4"})),
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.body_mut().read_to_string().unwrap(), "");
+    let agent_log = base
+        .join("agents")
+        .join("worker")
+        .join("logs")
+        .join("agent.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&agent_log)
+        .unwrap_or_default()
+        .contains("stdin: hello-21-4")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sent line never reached the agent"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // send to an unknown instance: the 404 envelope carries the engine's
+    // typed error, decodable back into the engine's own value.
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{instances}/ghost/send"),
+        Some(serde_json::json!({"text": "x"})),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["engine_error"]["family"], "engine");
+    match hekma_host::wire::decode(&json["error"]["engine_error"]) {
+        Some(hekma_host::wire::WireError::Engine(hekma_engine::EngineError::NotFound { name })) => {
+            assert_eq!(name, "ghost")
+        }
+        other => panic!("{other:?}"),
+    }
+    // A send body without `text` is the extractor's typed rejection.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{instances}/worker/send"),
+        Some(serde_json::json!({"txt": "x"})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // restart-policy: set, read back, and refuse an unknown policy.
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{instances}/worker/restart-policy"),
+        Some(serde_json::json!({"policy": "never"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["status"]["restart_policy"], "never", "{json}");
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{instances}/worker/restart-policy"),
+        Some(serde_json::json!({"policy": "sometimes"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+
+    // remove: a running instance needs force; malformed query values are
+    // envelope 400s.
+    let mut response = call(&client, "DELETE", &format!("{instances}/worker"), None);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["engine_error"]["variant"],
+        "RunningRequiresForce"
+    );
+    for query in ["disposition=bogus", "force=maybe"] {
+        let mut response = call(
+            &client,
+            "DELETE",
+            &format!("{instances}/worker?{query}"),
+            None,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        assert_eq!(json_body(&mut response)["error"]["kind"], "invalid_body");
+    }
+
+    // stop, then a DETACHED start: the handle is disarmed at spawn.
+    let response = call(
+        &client,
+        "POST",
+        &format!("{instances}/worker/stop"),
+        Some(serde_json::json!({"window_secs": 2})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("{instances}/worker/start"),
+        Some(serde_json::json!({"detach": true})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&mut response)["instance"]["supervision"],
+        "detached"
+    );
+    // force removes the running instance and deletes its home (it stops it
+    // through the ladder first — the full default window on Windows).
+    let response = call(
+        &ladder_client(),
+        "DELETE",
+        &format!("{instances}/worker?disposition=delete&force=true"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!base.join("agents").join("worker").exists());
+
+    // memory: attach answers the directory and the read-back; a kind change
+    // is the typed conflict; an unknown kind is a 400; detach is a 204.
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{instances}/mem/memory"),
+        Some(serde_json::json!({"kind": "filesystem"})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["kind"], "filesystem");
+    assert_eq!(json["instance"], "mem");
+    assert!(json.get("readback_error").is_none(), "{json}");
+    assert!(
+        Path::new(json["dir"].as_str().unwrap()).is_dir(),
+        "the managed dir exists: {json}"
+    );
+    let mut response = call(
+        &client,
+        "PUT",
+        &format!("{instances}/mem/memory"),
+        Some(serde_json::json!({"kind": "native"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = json_body(&mut response);
+    assert_eq!(json["error"]["engine_error"]["family"], "registry");
+    assert_eq!(
+        json["error"]["engine_error"]["variant"],
+        "MemoryBackingKindConflict"
+    );
+    let response = call(
+        &client,
+        "PUT",
+        &format!("{instances}/mem/memory"),
+        Some(serde_json::json!({"kind": "cloud"})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = call(&client, "DELETE", &format!("{instances}/mem/memory"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // The default remove retains the Agent Home.
+    let response = call(&client, "DELETE", &format!("{instances}/mem"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(base.join("agents").join("mem").exists());
+
+    server.stop().unwrap();
+}
+
+#[test]
+fn an_auto_started_host_exits_when_idle_and_removes_its_discovery_file() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    // The signal never arrives: only the idle exit can end this host.
+    let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let options = hekma_host::ServeOptions {
+        state_base: Some(base.clone()),
+        stop_window: Some(1),
+        diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+        autostart: true,
+        autostart_idle_override: Some(Duration::from_secs(2)),
+        ..Default::default()
+    };
+    let thread = std::thread::spawn(move || {
+        hekma_host::serve_with_signal(options, move |_sink| async move {
+            signal_rx
+                .await
+                .map_err(|_| "the test signal source was dropped".to_string())
+        })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let discovery = loop {
+        if let Ok(discovery) = hekma_host::read_discovery(&base) {
+            break discovery;
+        }
+        assert!(std::time::Instant::now() < deadline, "no control.json");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(discovery.autostarted);
+    // A request resets the idle clock (and is served with the local token).
+    let response = client()
+        .get(format!("http://{}/v0/version", discovery.addr))
+        .header("Authorization", format!("Bearer {}", discovery.token))
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let started = std::time::Instant::now();
+    thread
+        .join()
+        .expect("serve thread")
+        .expect("the idle exit is a clean shutdown");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the host waited out its idle window"
+    );
+    assert!(!hekma_host::control_file(&base).exists());
+    let text = sink_handle.text();
+    assert!(
+        text.contains("auto-started host exiting (idle: no live agent and no request)"),
+        "{text}"
+    );
+    assert!(text.contains("shutdown complete (idle"), "{text}");
+}
+
+#[test]
+fn an_auto_started_host_leaves_when_its_state_root_disappears() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // Windows refuses to delete a directory with open files: the idle
+        // exit (above) is the auto host's way out there.
+        return;
+    }
+    let parent = tempfile::tempdir().unwrap();
+    let base = parent.path().join("root");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let options = hekma_host::ServeOptions {
+        state_base: Some(base.clone()),
+        stop_window: Some(1),
+        diagnostics: Some(diagnostic_sink_of(&sink_handle)),
+        autostart: true,
+        // A long idle window: only the vanished root ends this host.
+        autostart_idle_override: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    let thread = std::thread::spawn(move || {
+        hekma_host::serve_with_signal(options, move |_sink| async move {
+            signal_rx
+                .await
+                .map_err(|_| "the test signal source was dropped".to_string())
+        })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while hekma_host::read_discovery(&base).is_err() {
+        assert!(std::time::Instant::now() < deadline, "no control.json");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+    thread
+        .join()
+        .expect("serve thread")
+        .expect("the vanished root ends the host cleanly");
+    assert!(
+        sink_handle
+            .text()
+            .contains("auto-started host exiting (its state root was removed)"),
+        "{}",
+        sink_handle.text()
+    );
 }

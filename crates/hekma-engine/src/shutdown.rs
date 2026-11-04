@@ -385,6 +385,7 @@ mod tests {
             acp_context_usage: None,
             usage_gap: None,
             supervision: None,
+            recorded_state: None,
             agent_home: "/tmp/test-home".to_string(),
         }
     }
