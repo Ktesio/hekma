@@ -1984,7 +1984,11 @@ mod tests {
     /// deserializer names every variant in its unknown-variant error, so
     /// the listing cannot go stale when the enum grows — unlike a
     /// hand-written one. This is the honest variant count the `ALL_COVERS`
-    /// membership check needs.
+    /// membership check needs. The parse below depends on serde_json's
+    /// exact error wording — the ` at line ` suffix cut, the `expected`
+    /// separator, and the backtick-quoted variant segments — so a
+    /// serde_json message rewording surfaces here as a red listing
+    /// assert, not as a silent gap.
     fn every_wire_form_from_serde() -> Vec<String> {
         let err = serde_json::from_str::<CoverTag>("\"__not_a_variant__\"")
             .expect_err("the sentinel tag must fail to deserialize");
