@@ -7259,7 +7259,10 @@ source = "self-reported"
         facade.start("tck-slowbeat").expect("start slowbeat");
         let reason = prove_heartbeat_freeze(&facade, "tck-slowbeat", Duration::from_millis(400))
             .expect("a never-beating probe must be reported");
-        assert!(reason.contains("heartbeat never started"), "{reason}");
+        assert!(
+            reason.contains("heartbeat never started") && reason.contains("tck-slowbeat"),
+            "{reason}"
+        );
         let _ = facade.stop("tck-slowbeat", Some(Duration::from_secs(5)));
     }
 
@@ -9760,61 +9763,9 @@ env = "TCK_SUBJECT_MEMORY"
     // runs the freeze proof on its OWN signal-path probe (guaranteed, no
     // command pair); these pin the DETECTION directly — a misbehaving
     // probe of each documented lie shape must trip the named arm, never
-    // pass vacuously. All three drive the private pipeline fn through a
+    // pass vacuously. Both drive the private pipeline fn through a
     // real engine, mirroring how the section runner would call it.
     // ------------------------------------------------------------------
-
-    /// A probe whose heartbeat NEVER STARTS: the startup wait must exhaust
-    /// its budget and fail naming the probe — a vacuous pass here would
-    /// mean the proof runs against a dead probe undetected.
-    #[test]
-    fn heartbeat_freeze_detects_a_probe_that_never_beats() {
-        let state = tempfile::Builder::new()
-            .prefix("ktesio-tck-hb-quiet-")
-            .tempdir()
-            .expect("tempdir");
-        let manifest = tempfile::Builder::new()
-            .prefix("ktesio-tck-hb-quiet-m-")
-            .tempdir()
-            .expect("tempdir");
-        write_probe_manifest(
-            manifest.path(),
-            "tck-quiet-probe",
-            &["--linger-ms", "600000"],
-            Some("best-effort"),
-            "guaranteed",
-            "self-reported",
-            "1.0.0",
-            None,
-        )
-        .expect("write quiet probe manifest");
-        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
-        let facade = engine.blocking();
-        facade
-            .register_with_adapter(
-                "tck-quiet-probe",
-                &AdapterRef::Manifest(manifest.path().to_path_buf()),
-            )
-            .expect("register quiet probe");
-        facade.start("tck-quiet-probe").expect("start quiet probe");
-        wait_for_state(
-            &facade,
-            "tck-quiet-probe",
-            LifecycleState::Running,
-            Duration::from_secs(10),
-        )
-        .expect("quiet probe reaches running");
-        // A deliberately small budget: the quiet loop must time it out.
-        let verdict =
-            heartbeat_freeze_inner(&facade, "tck-quiet-probe", Duration::from_millis(400));
-        let _ = facade.stop("tck-quiet-probe", Some(Duration::from_secs(5)));
-        let err =
-            verdict.expect_err("a never-beating probe must fail the freeze proof's startup wait");
-        assert!(
-            err.contains("heartbeat never started") && err.contains("tck-quiet-probe"),
-            "the failure must name the never-started arm and the probe"
-        );
-    }
 
     /// The lying cooperative-pause subject: a declared
     /// `[lifecycle.pause]`/`[lifecycle.resume]` command pair makes the
@@ -9861,7 +9812,7 @@ env = "TCK_SUBJECT_MEMORY"
             .expect_err("a subject that keeps beating while Paused must fail the freeze watch");
         assert!(
             err.contains("heartbeat must NOT grow while paused"),
-            "the failure must name the grows-while-paused arm"
+            "the failure must name the grows-while-paused arm: {err}"
         );
     }
 
@@ -9921,7 +9872,7 @@ env = "TCK_SUBJECT_MEMORY"
             .expect_err("a subject that never resumes beating must fail the post-resume wait");
         assert!(
             err.contains("heartbeat must resume growing after SIGCONT"),
-            "the failure must name the stuck-after-resume arm"
+            "the failure must name the stuck-after-resume arm: {err}"
         );
     }
 }
