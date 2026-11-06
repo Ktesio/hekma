@@ -627,6 +627,90 @@ mod tests {
         }
     }
 
+    /// A loopback "host" that breaks every connection MID-FLIGHT: it accepts,
+    /// reads the request line, then DROPS the connection without ever
+    /// answering — the request was sent, the answer never came (distinct
+    /// from a refused port's pre-send failure and from a stalling host's
+    /// timeout). Runs until the test process exits.
+    fn breaking_host() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    // Drop the connection: accepted, read, then broken.
+                });
+            }
+        });
+        addr
+    }
+
+    /// A loopback "host" that answers the FIRST connection as the Control
+    /// API (the discovery probe) and breaks every later one mid-flight —
+    /// a host that is found alive and then dies on the first real call.
+    fn probe_then_breaking_host() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let mut connections = 0usize;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                connections += 1;
+                let answer_version = connections == 1;
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    if answer_version {
+                        let body = r#"{"api":"hekma-control-api"}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    }
+                    // Later connections: read the request, then drop it.
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_discovery_connection_that_breaks_after_accept_reads_as_absent() {
+        // The probe's connection was ACCEPTED and then broken without an
+        // answer: not never-sent (the connect completed), not a timeout
+        // (nothing is stalling — a stalling host is alive, not absent). The
+        // catch-all reads a garbled/broken probe as an absent host, so the
+        // command moves on to starting one instead of trusting a dead file.
+        let broken = breaking_host();
+        assert!(HostClient::find(discovery_at(broken, env!("CARGO_PKG_VERSION")).path()).is_none());
+    }
+
+    #[test]
+    fn a_call_that_breaks_after_the_request_was_sent_is_unavailable_not_unsent() {
+        // The host answered the probe, then broke the connection AFTER the
+        // real call's request left this process: it may have acted on it,
+        // so the failure is Unavailable ("stopped answering") — NEVER
+        // NotSent, whose retry-once contract would risk a duplicated write.
+        let host = probe_then_breaking_host();
+        let client = HostClient::find(discovery_at(host, env!("CARGO_PKG_VERSION")).path())
+            .expect("a live host");
+        match client.call("POST", "/v0/instances/w/start", None) {
+            Err(CallError::Unavailable(message)) => {
+                assert!(message.contains("stopped answering"), "{message}");
+                assert!(message.contains("serve.log"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn only_a_connect_phase_failure_counts_as_never_sent() {
         // Refused, failed or timed out while connecting: never sent (the
