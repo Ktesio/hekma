@@ -5475,6 +5475,58 @@ mod tests {
         }
     }
 
+    // ---- story 18-4 arms: the declared lifecycle command + the drain bound ----
+
+    #[test]
+    fn pause_command_failed_maps_to_the_lifecycle_not_applied_error() {
+        // The adapter's declared pause/resume command failing (nonzero exit,
+        // spawn failure, or bound overrun) surfaces the typed remediation:
+        // the instance, the direction, the rendered command line (exec +
+        // args only — never the environment, NFR-6) and the manifest fix.
+        let err = map_engine_error(EngineError::PauseCommandFailed {
+            name: "greeter".to_string(),
+            direction: "pause".to_string(),
+            command: "bin/pause.sh --confirm".to_string(),
+            detail: "exited 2".to_string(),
+        });
+        assert!(
+            err.downcast_ref::<crate::error::AgentPauseCommandFailed>()
+                .is_some(),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("the pause command for Agent Instance 'greeter' failed"));
+        assert!(msg.contains("lifecycle change was NOT applied"));
+        assert!(msg.contains("exited 2"));
+        assert!(msg.contains("(command: bin/pause.sh --confirm)"));
+        assert!(msg.contains(
+            "Fix the command in the adapter's manifest and retry: hekma agent show greeter"
+        ));
+    }
+
+    #[test]
+    fn drain_bound_invalid_maps_to_the_usage_class_error() {
+        // A programmatically invalid drain bound (the CLI's clap range
+        // refuses it at parse time, so this arm fires for engine/API
+        // callers) maps to the usage-class message naming the rejected
+        // value and the adapter-contract range.
+        use crate::exit_code::{classify, ExitCode};
+        let err = map_engine_error(EngineError::DrainBoundInvalid { bound_ms: 0 });
+        assert!(
+            err.downcast_ref::<crate::error::AgentDrainBoundInvalid>()
+                .is_some(),
+            "{err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("invalid drain bound 0ms"));
+        assert!(msg.contains("between 1 and 600000"));
+        assert_eq!(
+            classify(err.as_ref()),
+            ExitCode::Usage,
+            "the value, not the environment, is at fault — usage class per the arm's contract"
+        );
+    }
+
     // ---- governance-vectors (story 19-1) ----
 
     #[test]
