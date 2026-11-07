@@ -824,3 +824,94 @@ fn a_refused_collector_surfaces_diagnostics_grows_the_counter_and_never_blocks()
         "the dropped counter's honesty rides the stop notes:\n{text}"
     );
 }
+
+#[test]
+fn a_terminal_status_is_surfaced_and_never_retried_within_the_flush() {
+    // 400 is TERMINAL for the batch (only 429/503/504 and the bounded
+    // timeout are retryable): the batch is dropped THIS flush with the
+    // status named, and NO retry fires — a later POST, if any, belongs to
+    // the NEXT flush's cumulative re-export, never to a retry storm.
+    let state = tempfile::tempdir().unwrap();
+    let collector = Collector::start_scripted(vec![400]);
+    let (sink_handle, sink) = SharedSink::new();
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(collector.endpoint()), None, Some(1))
+        .expect("the flags parse");
+    let options = options_with(state.path().to_path_buf(), sink, otlp);
+    let server = spawn_serve(options, &sink_handle, true);
+
+    // One recorded POST = the flush fired exactly once.
+    collector.wait_for(|requests| !requests.is_empty(), Duration::from_secs(30));
+    // Past the whole retry schedule (2 × 200ms backoff between attempts)
+    // and still inside the 1s flush interval: a retry would have landed
+    // in this window, and the next flush cannot have started yet.
+    std::thread::sleep(Duration::from_millis(600));
+    let recorded = collector.requests.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a terminal status is never retried: {recorded:?}"
+    );
+    assert_eq!(recorded[0].answered, 400);
+
+    // The drop is surfaced with the terminal wording naming the status.
+    let text = sink_handle.text();
+    assert!(
+        text.contains("the collector answered 400 (terminal for this batch)"),
+        "the terminal status is named in the surfaced drop:\n{text}"
+    );
+
+    // The host still exits clean — the stream, not the exit code, carries
+    // the export failure.
+    let result = server.stop().expect("the serve thread joins");
+    assert!(
+        result.is_ok(),
+        "a terminal status never fails the host: {result:?}"
+    );
+}
+
+#[test]
+fn an_always_503_collector_exhausts_the_bounded_budget_and_surfaces_the_last_outcome() {
+    // The bounded budget: the first attempt plus at most two retries. A
+    // collector answering 503 FOREVER consumes the whole budget within the
+    // flush, and the surfaced drop names the LAST retryable outcome — the
+    // budget-exhaustion fallthrough, not a silent swallow or a storm.
+    let state = tempfile::tempdir().unwrap();
+    let collector = Collector::start_scripted(vec![503, 503, 503]);
+    let (sink_handle, sink) = SharedSink::new();
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(collector.endpoint()), None, Some(1))
+        .expect("the flags parse");
+    let options = options_with(state.path().to_path_buf(), sink, otlp);
+    let server = spawn_serve(options, &sink_handle, true);
+
+    // The budget's full three attempts within the first flush.
+    collector.wait_for(|requests| requests.len() >= 3, Duration::from_secs(30));
+    let recorded = collector.requests.lock().unwrap().clone();
+    assert!(recorded.len() >= 3, "the budget was consumed: {recorded:?}");
+    assert!(
+        recorded
+            .iter()
+            .take(3)
+            .all(|request| request.answered == 503),
+        "every scripted answer was a 503: {recorded:?}"
+    );
+
+    // The surfaced drop names the LAST outcome with its retryable class
+    // (the Retryable arm interpolates the FULL status line, reason and
+    // all, while the terminal arm renders the bare code).
+    let text = sink_handle.text();
+    assert!(
+        text.contains("the metrics batch was NOT delivered"),
+        "the exhausted batch's drop is surfaced:\n{text}"
+    );
+    assert!(
+        text.contains("the collector answered 503 Service Unavailable (retryable)"),
+        "the last retryable outcome is named in the drop:\n{text}"
+    );
+
+    // The host still exits clean.
+    let result = server.stop().expect("the serve thread joins");
+    assert!(
+        result.is_ok(),
+        "retry exhaustion never fails the host: {result:?}"
+    );
+}

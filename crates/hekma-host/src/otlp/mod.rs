@@ -532,4 +532,60 @@ mod tests {
             "85944171f73967e8"
         );
     }
+
+    #[test]
+    fn empty_pairs_in_the_header_spec_are_skipped() {
+        // `,`-separated specs tolerate EMPTY segments — a trailing comma is
+        // the practical operator shape — by skipping them, never by parsing
+        // one as a malformed pair refusal.
+        let options =
+            OtlpOptions::from_flags(Some("http://h".to_string()), Some("a=1,,b=2,"), None).unwrap();
+        let names: Vec<&str> = options
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(options.headers[1].1.expose(), "2");
+    }
+
+    #[test]
+    fn resolve_headers_resolves_secret_refs_and_passes_literals_through() {
+        // The SUCCESS arm: a `secret:NAME` reference resolves through the
+        // composite resolver (the AD-10 env→file order) to its cleartext —
+        // consumed only by the HTTP client — while literal values pass
+        // through untouched, in spec order.
+        struct FixedMap(&'static [(&'static str, &'static str)]);
+        impl hekma_engine::ports::SecretResolver for FixedMap {
+            fn resolve(
+                &self,
+                name: &str,
+            ) -> Result<Option<hekma_engine::domain::SecretString>, hekma_engine::ports::SecretError>
+            {
+                Ok(self
+                    .0
+                    .iter()
+                    .find(|(known, _)| *known == name)
+                    .map(|(_, value)| hekma_engine::domain::SecretString::new(*value)))
+            }
+        }
+        let resolver = hekma_engine::ports::CompositeSecretResolver::new(vec![(
+            "test",
+            Box::new(FixedMap(&[("OTLP_AUTH", "env-cleartext")])),
+        )]);
+        let options = OtlpOptions::from_flags(
+            Some("http://h".to_string()),
+            Some("authorization=secret:OTLP_AUTH,x-tenant=acme"),
+            None,
+        )
+        .unwrap();
+        let resolved = options.resolve_headers(&resolver).unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                ("authorization".to_string(), "env-cleartext".to_string()),
+                ("x-tenant".to_string(), "acme".to_string()),
+            ]
+        );
+    }
 }
