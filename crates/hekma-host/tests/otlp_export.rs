@@ -931,8 +931,11 @@ fn a_terminal_collector_and_a_started_agent_name_the_undelivered_count_at_stop()
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    // One recorded POST at the 400 collector proves observations were folded
-    // into a batch and offered — the exporter's bus really carried them.
+    // The exporter offers a serialized snapshot on every tick, so a recorded
+    // POST here proves the flush loop is live and reaching the collector —
+    // not that the agent's observations rode this batch. The decisive
+    // delivery proof is the stop note below: its in-flight count is >= 1
+    // only if the agent's observations were folded into the state.
     collector.wait_for(|requests| !requests.is_empty(), Duration::from_secs(30));
 
     // Stop: the final flush fails terminal too (fast), the handshake
