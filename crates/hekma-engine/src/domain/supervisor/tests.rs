@@ -8596,16 +8596,25 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
 fn a_degraded_run_start_fence_read_still_decides_on_the_degraded_total() {
     // The run-start fence's totals read degrades to zero on a store failure
     // (story 19-1's surfaced_degradation contract) — and a DEGRADED read must
-    // never become a SKIPPED enforcement: the zero per-run ceiling still fires
-    // on the fabricated zero, so a store outage at Run start cannot silently
-    // un-fence an already-breaching instance. Driven through the cfg(test)
+    // never become a SKIPPED enforcement: the decision still RUNS, on the
+    // fabricated zero, and a zero CUMULATIVE ceiling still fires on it. The
+    // arm is deliberately `cumulative = 0` with NO per-run ceiling: a fresh
+    // Run (`None`) hardcodes its per-run total to zero (usage.rs
+    // `governance_arms`), so arming per_run would fire on that constant and
+    // the faulted cumulative read would never decide anything — only the
+    // cumulative arm makes the FAULTED read the deciding input (a change that
+    // skips the cumulative ceiling on a degraded read turns this test red).
+    // Contract as shipped: the decision runs on the fabricated zero, so only
+    // a ZERO ceiling fires — a non-zero ceiling fails OPEN (pinned by the
+    // twin test below; failing closed is the spec-19-1 review round-1
+    // deferred-work entry). Driven through the cfg(test)
     // `totals_read_fault_names` seam — no real store outage staged.
     let (_state, _manifest, registry) = setup_fake("degradedfence", &["--linger-ms", "600000"]);
     let name = InstanceName::new("degradedfence").unwrap();
     let path = registry.paths().instance_config(&name);
     std::fs::write(
         &path,
-        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 0\n",
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\ncumulative = 0\n",
     )
     .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
@@ -8614,17 +8623,61 @@ fn a_degraded_run_start_fence_read_still_decides_on_the_degraded_total() {
 
     let fence = crate::metering::WireFence::default();
     assert!(
-        // `None` = a fresh Run (story 21-2): per-run totals are zero by
-        // construction, so only the fault-armed CUMULATIVE read decides.
+        // `None` = a fresh Run (story 21-2): the per-run total is zero by
+        // construction and NO per-run ceiling is armed, so only the
+        // fault-armed CUMULATIVE read decides.
         sup.run_start_fence(&registry, &name, &fence, None),
         "a degraded cumulative read must not skip the fence decision"
     );
-    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+    assert_eq!(fence.refusal().unwrap().code, "tokens_cumulative");
 
     // SURFACED: the diagnostic names the instance + the degraded scope.
     let text = sink_text(&sink);
     assert!(
         text.contains("degradedfence: the cumulative token totals read failed"),
+        "the degraded fence read must be surfaced naming the instance + scope: {text}"
+    );
+    assert!(
+        text.contains("enforcement degrades it to zero"),
+        "the diagnostic must state the degradation, not just the error: {text}"
+    );
+}
+
+#[test]
+fn a_degraded_run_start_fence_read_fails_open_for_a_nonzero_cumulative_ceiling() {
+    // The deferred fail-closed contract, pinned AS IT SHIPS TODAY: the
+    // spec-19-1 review round-1 deferred-work entry records that deciding
+    // DIFFERENTLY on a degraded read (skipping the arm / failing closed) is a
+    // money-path behavior change deferred to its own story. So against a
+    // NON-ZERO cumulative ceiling the degraded read's zero substitute decides
+    // "under the ceiling": the fence stays DOWN and only the diagnostic
+    // records the outage — fail-open, surfaced, never silent. The story that
+    // retires the deferred-work entry must FLIP this pin with it (the fence
+    // rises and the refusal names the degraded read).
+    let (_state, _manifest, registry) = setup_fake("degradedopen", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("degradedopen").unwrap();
+    let path = registry.paths().instance_config(&name);
+    std::fs::write(
+        &path,
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\ncumulative = 100\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.totals_read_fault_names.insert(name.clone());
+
+    let fence = crate::metering::WireFence::default();
+    assert!(
+        !sup.run_start_fence(&registry, &name, &fence, None),
+        "a non-zero ceiling must not fire on the fabricated zero (failing closed is deferred work)"
+    );
+    assert!(fence.refusal().is_none());
+
+    // Fail-open never means silent: the degraded read is still surfaced,
+    // naming the instance + the degraded scope.
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("degradedopen: the cumulative token totals read failed"),
         "the degraded fence read must be surfaced naming the instance + scope: {text}"
     );
     assert!(
@@ -8640,7 +8693,11 @@ fn the_budget_evaluation_commit_failure_is_surfaced_and_records_no_breach() {
     // no-op) and must NOT fabricate a breach record: the next usage event
     // evaluates again on the then-committed totals. Driven through the
     // cfg(test) `usage_eval_fault_names` seam (the `transition_fault_names`
-    // precedent) — no real store outage staged.
+    // precedent) — no real store outage staged. The seam fails the writer job
+    // BEFORE any write, so the empty-ledger assert below holds by
+    // construction; the disarm-and-retry leg after it proves "evaluates
+    // again" by OUTCOME (the seam does not latch, and exactly one breach
+    // lands from the retry alone).
     let (_state, _manifest, registry) = setup_fake("evalfault", &["--linger-ms", "600000"]);
     let name = InstanceName::new("evalfault").unwrap();
     let path = registry.paths().instance_config(&name);
@@ -8653,7 +8710,13 @@ fn the_budget_evaluation_commit_failure_is_surfaced_and_records_no_breach() {
     let sink = install_capture_sink(&mut sup);
     sup.usage_eval_fault_names.insert(name.clone());
 
-    sup.enforce_budget(&registry, &name, &RunId::mint(), "engine-observed");
+    // A REAL supervised Run — the writer pipeline no-ops on an unsupervised
+    // input (`pipeline::evaluate`'s first guard), so both evaluations below
+    // must run against the started Run's chain to mean anything.
+    sup.start(&registry, "evalfault").unwrap();
+    let run_id = sup.running.get(&name).unwrap().run_id.clone();
+
+    sup.enforce_budget(&registry, &name, &run_id, "engine-observed");
 
     let text = sink_text(&sink);
     assert!(
@@ -8674,6 +8737,23 @@ fn the_budget_evaluation_commit_failure_is_surfaced_and_records_no_breach() {
             .is_empty(),
         "a failed evaluation commit must not leave a breach record behind"
     );
+
+    // The retry contract, proven by outcome: disarm the fault and evaluate
+    // the SAME Run again — the retry commits and records the per-run breach
+    // EXACTLY ONCE, which also proves the faulted call spent no LATCH (a
+    // latched (tokens, per-run) pair would keep the retry at zero records)
+    // and left no record behind.
+    sup.usage_eval_fault_names.remove(&name);
+    sup.enforce_budget(&registry, &name, &run_id, "engine-observed");
+    let events = Supervisor::read_breach_events(&registry, "evalfault").unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one breach after the retry — the faulted evaluation recorded none: {events:?}"
+    );
+    assert_eq!(events[0].scope, BreachScope::PerRun);
+    assert_eq!(events[0].limit, 0);
+    assert_eq!(events[0].observed, 0);
 }
 
 #[test]
@@ -8683,6 +8763,10 @@ fn a_failed_breach_record_commit_is_surfaced_and_the_record_is_absent() {
     // nothing half-committed survives in the ledger. Driven through the
     // cfg(test) `breach_record_fault_names` seam (twin of
     // `usage_eval_fault_names`; both the seam and the helper are test-only).
+    // The seam fails the writer job BEFORE any write, so the empty-ledger
+    // assert below holds by construction; the disarm-and-retry leg after it
+    // proves the ledger was left clean AND the seam does not latch (exactly
+    // one record lands from the retry alone).
     let (_state, _manifest, registry) = setup_fake("recordfault", &["--linger-ms", "600000"]);
     let name = InstanceName::new("recordfault").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
@@ -8719,6 +8803,30 @@ fn a_failed_breach_record_commit_is_surfaced_and_the_record_is_absent() {
             .is_empty(),
         "a failed breach-record commit must not leave a record behind"
     );
+
+    // The retry, proven by outcome: disarm the fault and commit the same
+    // breach — the mandated record lands EXACTLY ONCE (nothing from the
+    // faulted call), with the scope/limit this test's faulted call carried.
+    sup.breach_record_fault_names.remove(&name);
+    sup.record_token_breach(
+        &registry,
+        &name,
+        &RunId::mint(),
+        BreachScope::Cumulative,
+        1000,
+        1200,
+        BreachAction::Warn,
+        "engine-observed",
+    );
+    let events = Supervisor::read_breach_events(&registry, "recordfault").unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one breach after the retry — the faulted commit wrote none: {events:?}"
+    );
+    assert_eq!(events[0].scope, BreachScope::Cumulative);
+    assert_eq!(events[0].limit, 1000);
+    assert_eq!(events[0].observed, 1200);
 }
 
 #[test]
