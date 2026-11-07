@@ -4,8 +4,10 @@
 //! payload conformance (a real fake agent commits usage + a dollar breach;
 //! the POSTed body decodes against `otlp-metrics v1` verbatim), the refused
 //! collector (surfaced diagnostics + the dropped counter, supervision
-//! unaffected), and the unresolvable `secret:NAME` header (typed startup
-//! refusal naming the secret).
+//! unaffected), the unresolvable `secret:NAME` header (typed startup
+//! refusal naming the secret), and the serve-level stop honesty notes (a
+//! started agent's never-delivered observations named with their count; a
+//! stalled final flush abandoned at the stop bound with an unknown count).
 //!
 //! OS-neutral by construction: no OS-conditional compilation anywhere — the
 //! agent fixture is the cross-OS `fake_agent` binary, the bearer
@@ -204,6 +206,37 @@ fn answer_with(mut stream: TcpStream, status: u16, record: impl FnOnce(RecordedR
         format!("HTTP/1.1 {status} ANSWER\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// A collector that ACCEPTS connections (counting each accept) and then
+/// never answers: the flush POST is held mid-flight for the exporter's full
+/// POST timeout. The accept counter lets a test WAIT until a flush is
+/// already stalled before it stops serve — exactly the shape the stop bound
+/// exists for. Serving threads park in a blocking read until the process
+/// ends (the unit suite's `stalled_collector` shape, plus the counter).
+fn stalling_collector() -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the stalling collector");
+    let addr = listener.local_addr().unwrap();
+    let accepted: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let accepted_thread = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            *accepted_thread.lock().unwrap() += 1;
+            std::thread::spawn(move || {
+                // Hold the socket open in a blocking read — no response is
+                // ever written.
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => continue,
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), accepted)
 }
 
 /// A running host + its parsed Control-API address (the control suite's
@@ -822,5 +855,154 @@ fn a_refused_collector_surfaces_diagnostics_grows_the_counter_and_never_blocks()
     assert!(
         text.contains("dropped"),
         "the dropped counter's honesty rides the stop notes:\n{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Leg 6 — the serve-level stop honesty notes (the shutdown handshake's
+// Some(n) and None arms at the host, not the task): a STARTED agent whose
+// observations no flush ever delivered, and a final flush stalled past the
+// host's stop bound.
+// ---------------------------------------------------------------------------
+
+/// Parse the serve-level stop note's in-flight count
+/// ("... export: {n} in-flight observation(s) were NOT delivered at stop").
+fn in_flight_count_of_stop_note(text: &str) -> Option<u64> {
+    text.lines()
+        .find(|line| line.contains("in-flight observation(s) were NOT delivered at stop"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .find_map(|pair| (pair[1] == "in-flight").then_some(pair[0]))
+        })
+        .and_then(|token| token.parse().ok())
+}
+
+#[test]
+fn a_terminal_collector_and_a_started_agent_name_the_undelivered_count_at_stop() {
+    // A 400-answering collector classifies every batch TERMINAL — fast and
+    // identically on every OS (a real answered request, no connect-timeout
+    // variance), so the final flush also fails within the stop bound: the
+    // started agent's observations fold into the cumulative state, no flush
+    // ever lands, and serve's stop note must carry the honest count.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_budgeted_agent(&base, "lossy");
+
+    let collector = Collector::start(400);
+    let (sink_handle, sink) = SharedSink::new();
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(collector.endpoint()), None, Some(1))
+        .expect("the flags parse");
+    let options = options_with(base, sink, otlp);
+    let server = spawn_serve(options, &sink_handle, true);
+
+    // Start the agent through the Control API (the end-to-end leg's drive
+    // shape): the usage commit + the priced breach land on the bus the
+    // exporter subscribes to.
+    let http = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let start_url = format!("http://{}/v0/instances/lossy/start", server.addr);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(mut response) = http
+            .post(&start_url)
+            .header("Authorization", &auth)
+            .send("")
+        {
+            let status = response.status();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            if status == StatusCode::OK {
+                let started: Value = serde_json::from_str(&body).expect("the start body is JSON");
+                let start_state = started["instance"]["state"].as_str().unwrap();
+                assert!(
+                    start_state == "running" || start_state == "paused",
+                    "the agent started (then may have breach-paused): {started}"
+                );
+                break;
+            }
+            // Transitional refusals settle on retry within the bound.
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent never started:\n{}",
+            sink_handle.text()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // One recorded POST at the 400 collector proves observations were folded
+    // into a batch and offered — the exporter's bus really carried them.
+    collector.wait_for(|requests| !requests.is_empty(), Duration::from_secs(30));
+
+    // Stop: the final flush fails terminal too (fast), the handshake
+    // reports the undelivered count, and serve names it.
+    let result = server.stop().expect("the serve thread joins");
+    assert!(
+        result.is_ok(),
+        "a lost collector never fails the host: {result:?}"
+    );
+    let text = sink_handle.text();
+    let count = in_flight_count_of_stop_note(&text)
+        .unwrap_or_else(|| panic!("the serve-level in-flight loss note is missing:\n{text}"));
+    assert!(
+        count >= 1,
+        "a started agent's observations were never delivered — the count is honest:\n{text}"
+    );
+    assert!(
+        text.contains("the documented restart-reset"),
+        "the note names the reset semantics:\n{text}"
+    );
+}
+
+#[test]
+fn a_stalled_flush_at_stop_is_abandoned_at_the_bound_and_reports_the_unknown_count() {
+    // The exporter's periodic flush is ACCEPTED and then held by the
+    // collector (a POST in flight when the host stops): the shutdown
+    // handshake cannot await the task within the stop bound, abandons it,
+    // and serve surfaces the None arm — the count is UNKNOWN, the shutdown
+    // was never blocked past the bound, supervision continues.
+    let state = tempfile::tempdir().unwrap();
+    let (endpoint, accepted) = stalling_collector();
+    let (sink_handle, sink) = SharedSink::new();
+    let otlp = hekma_host::OtlpOptions::from_flags(Some(endpoint), None, Some(1))
+        .expect("the flags parse");
+    let options = options_with(state.path().to_path_buf(), sink, otlp);
+    let server = spawn_serve(options, &sink_handle, true);
+
+    // Wait until the first flush POST is accepted and stalled mid-flight
+    // (the first 1s tick): from here the task cannot settle for the
+    // remainder of its 5s POST timeout — well past the host's 2s stop
+    // bound in both directions.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if *accepted.lock().unwrap() >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stalled collector never saw the flush POST:\n{}",
+            sink_handle.text()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let result = server.stop().expect("the serve thread joins");
+    assert!(
+        result.is_ok(),
+        "a stalled flush never fails the host: {result:?}"
+    );
+    let text = sink_handle.text();
+    assert!(
+        text.contains("the exporter task did not settle within its stop bound"),
+        "the unknown-count note is surfaced:\n{text}"
+    );
+    assert!(
+        text.contains("it no longer blocks the shutdown; supervision continues"),
+        "the note names the liveness rule:\n{text}"
+    );
+    assert!(
+        !text.contains("were NOT delivered at stop"),
+        "an UNKNOWN count is never reported as a known one:\n{text}"
     );
 }

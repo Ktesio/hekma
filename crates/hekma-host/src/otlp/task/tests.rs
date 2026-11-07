@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hekma_engine::EngineEvent;
 
-use super::{push, ExporterConfig, OtlpExporter, FINAL_FLUSH_BOUND, QUEUE_CAPACITY};
+use super::{drain_bus, push, ExporterConfig, OtlpExporter, FINAL_FLUSH_BOUND, QUEUE_CAPACITY};
 use crate::otlp::payload::MetricState;
 use crate::Notifier;
 
@@ -180,6 +180,64 @@ fn the_overflow_note_is_rate_limited_to_once_per_flush_cycle() {
         2,
         "a NEW cycle notes again (still once per cycle):\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The tail-drain arms, driven directly: `drain_bus` is the non-blocking
+// drain the flush tick and the final flush both run, and its try_recv arms
+// (the Lagged marker, the retained-tail fold, the quiet end) are unreachable
+// through the loop legs below — `recv()` consumes the buffered bus (and
+// reports its own Lagged) before any drain ever runs.
+// ---------------------------------------------------------------------------
+
+/// A capacity-4 bus fed 10 events with the receiver parked: the first
+/// `try_recv` reports `Lagged(6)` — the surfaced drop count reaches the
+/// self-metric — then the four RETAINED (newest) events fold through the
+/// bounded push, and further drains on a quiet or closed bus end
+/// immediately with nothing folded and nothing noted.
+#[test]
+fn drain_bus_surfaces_the_lag_marker_folds_the_retained_tail_and_ends_quiet() {
+    let (sink, notifier) = SharedSink::notifier();
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<EngineEvent>(4);
+    for seq in 0..10u64 {
+        let _ = tx.send(transition(seq));
+    }
+    let mut queue = VecDeque::new();
+    let mut state = MetricState::new(0, "test".to_string());
+    let mut noted = false;
+    drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut noted);
+    assert_eq!(
+        state.dropped(),
+        6,
+        "the lag marker's missed count reaches the dropped counter"
+    );
+    assert_eq!(queue.len(), 4, "the retained tail folded whole");
+    let front = match queue.front().unwrap() {
+        EngineEvent::Transition(t) => t.instance.clone(),
+        other => panic!("unexpected event {other:?}"),
+    };
+    assert_eq!(front, "probe-6", "the retained tail is the NEWEST four");
+    let text = sink.text();
+    assert!(
+        text.contains("the event bus lagged — 6 committed event(s)"),
+        "the lag marker is surfaced, not silent:\n{text}"
+    );
+    assert!(
+        !text.contains("OLDEST"),
+        "four events never overflow the queue — no drop-oldest note:\n{text}"
+    );
+
+    // A quiet bus (sender alive, nothing buffered) ends the drain on Empty
+    // immediately: no note, no counter growth, queue untouched.
+    drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut noted);
+    assert_eq!(state.dropped(), 6, "an empty drain drops nothing");
+    assert_eq!(queue.len(), 4, "an empty drain folds nothing");
+
+    // The closed bus (sender gone) ends the drain the same quiet way.
+    drop(tx);
+    drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut noted);
+    assert_eq!(state.dropped(), 6);
+    assert_eq!(queue.len(), 4);
 }
 
 // ---------------------------------------------------------------------------
