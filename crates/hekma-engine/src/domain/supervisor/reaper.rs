@@ -1641,7 +1641,21 @@ impl Supervisor {
                             (token_action, cost_action)
                         })
                         .unwrap_or((BreachAction::Pause, BreachAction::Pause));
-                    let resumed_breaches = match registry.reader().run_breaches(&name, &run_id) {
+                    // cfg(test) FAULT-INJECTION SEAM (the `adoption_lease_faults`
+                    // precedent): an armed instance's resumed-Run breach read
+                    // fails with an injected store error so the surfaced AI-18
+                    // fallback arm below is reachable deterministically.
+                    #[cfg(test)]
+                    let run_breaches_result = if self.run_breaches_fault_names.contains(&name) {
+                        Err(crate::ports::StoreError::Backend(
+                            "injected run-breaches read fault (test seam)".to_string(),
+                        ))
+                    } else {
+                        registry.reader().run_breaches(&name, &run_id)
+                    };
+                    #[cfg(not(test))]
+                    let run_breaches_result = registry.reader().run_breaches(&name, &run_id);
+                    let resumed_breaches = match run_breaches_result {
                         Ok(events) => events,
                         Err(detail) => {
                             self.emit_diagnostic(&format!(
@@ -1668,7 +1682,23 @@ impl Supervisor {
                     // collides with the previous attach's rows (the adoption
                     // sequence-reset undercount). A failed bump is surfaced and
                     // falls back to the stored generation.
-                    let launch_generation = match registry.bump_launch_generation(&name) {
+                    // cfg(test) FAULT-INJECTION SEAM (the `run_breaches_fault_names`
+                    // twin): an armed instance's launch-generation bump fails
+                    // with an injected error so the dedupe-honesty fallback
+                    // arm below is reachable deterministically.
+                    #[cfg(test)]
+                    let launch_bump_result = if self.launch_bump_fault_names.contains(&name) {
+                        Err(crate::domain::RegistryError::Io {
+                            name: name.as_str().to_string(),
+                            path: "<launch-generation bump (adoption test seam)>".to_string(),
+                            source: std::io::Error::other("injected launch-bump fault (test seam)"),
+                        })
+                    } else {
+                        registry.bump_launch_generation(&name)
+                    };
+                    #[cfg(not(test))]
+                    let launch_bump_result = registry.bump_launch_generation(&name);
+                    let launch_generation = match launch_bump_result {
                         Ok(generation) => generation,
                         Err(err) => {
                             self.emit_diagnostic(&format!(

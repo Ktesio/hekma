@@ -1091,6 +1091,24 @@ pub struct Supervisor {
     /// rationale as `liveness_commit_fault_names`.
     #[cfg(test)]
     adoption_lease_faults: std::collections::HashMap<InstanceName, AdoptionLeaseFault>,
+    /// Coverage slice (reaper adoption arms) — cfg(test) FAULT-INJECTION SEAM
+    /// at the adoption Run-fence read: an instance name listed here makes the
+    /// resumed Run's `run_breaches` read fail with an injected store error,
+    /// driving the surfaced AI-18 diagnostic + empty-fence fallback arm of
+    /// the adoption path deterministically (a real store outage mid-adoption
+    /// cannot be staged in-process). Same placement rationale as
+    /// `adoption_lease_faults`. Never compiled outside the lib's own test
+    /// builds.
+    #[cfg(test)]
+    run_breaches_fault_names: std::collections::HashSet<InstanceName>,
+    /// Coverage slice (reaper adoption arms) — cfg(test) FAULT-INJECTION SEAM
+    /// at the adoption launch-generation bump: an instance name listed here
+    /// makes `bump_launch_generation` fail with an injected error, driving
+    /// the dedupe-honesty diagnostic + stored-generation fallback arm
+    /// deterministically. Same placement rationale as
+    /// `run_breaches_fault_names`.
+    #[cfg(test)]
+    launch_bump_fault_names: std::collections::HashSet<InstanceName>,
     /// Coverage second pass (epic 20-1) — cfg(test) FAULT-INJECTION SEAM at
     /// the spawn path's PRE-TIMEOUT death re-check (spawn.rs): an instance
     /// named here makes that ONE re-check poll fail with an injected error,
@@ -1188,6 +1206,10 @@ impl Supervisor {
             #[cfg(test)]
             adoption_lease_faults: std::collections::HashMap::new(),
             #[cfg(test)]
+            run_breaches_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            launch_bump_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
             spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
@@ -1241,6 +1263,10 @@ impl Supervisor {
             #[cfg(test)]
             adoption_lease_faults: std::collections::HashMap::new(),
             #[cfg(test)]
+            run_breaches_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            launch_bump_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
             spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
         }
@@ -1293,6 +1319,10 @@ impl Supervisor {
             stop_fault_pids: std::collections::HashMap::new(),
             #[cfg(test)]
             adoption_lease_faults: std::collections::HashMap::new(),
+            #[cfg(test)]
+            run_breaches_fault_names: std::collections::HashSet::new(),
+            #[cfg(test)]
+            launch_bump_fault_names: std::collections::HashSet::new(),
             #[cfg(test)]
             spawn_recheck_fault_names: std::collections::HashSet::new(),
             pending_restarts: std::sync::Mutex::new(Vec::new()),
