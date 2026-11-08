@@ -227,17 +227,33 @@ fn drain_bus_surfaces_the_lag_marker_folds_the_retained_tail_and_ends_quiet() {
         "four events never overflow the queue — no drop-oldest note:\n{text}"
     );
 
+    // Both later legs (quiet, then closed) emit NOTHING: the sink's text
+    // stays byte-identical after each drain, pinning "nothing noted"
+    // against a future arm that adds a note without touching the counter
+    // or the queue.
+    let before = sink.text();
+
     // A quiet bus (sender alive, nothing buffered) ends the drain on Empty
     // immediately: no note, no counter growth, queue untouched.
     drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut noted);
     assert_eq!(state.dropped(), 6, "an empty drain drops nothing");
     assert_eq!(queue.len(), 4, "an empty drain folds nothing");
+    assert_eq!(sink.text(), before, "a quiet drain notes nothing");
+    assert!(
+        !noted,
+        "the overflow flag stays unset through a quiet drain"
+    );
 
     // The closed bus (sender gone) ends the drain the same quiet way.
     drop(tx);
     drain_bus(&mut rx, &mut queue, &mut state, &notifier, &mut noted);
     assert_eq!(state.dropped(), 6);
     assert_eq!(queue.len(), 4);
+    assert_eq!(sink.text(), before, "a closed drain notes nothing");
+    assert!(
+        !noted,
+        "the overflow flag stays unset through a closed drain"
+    );
 }
 
 // ---------------------------------------------------------------------------

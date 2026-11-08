@@ -990,10 +990,22 @@ fn a_stalled_flush_at_stop_is_abandoned_at_the_bound_and_reports_the_unknown_cou
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // The stop itself must be BOUNDED, not just honest about the note: the
+    // handshake abandons the stalled exporter at the stop bound (2s —
+    // `FINAL_FLUSH_BOUND`, private to the crate and pinned in the in-crate
+    // task tests) rather than awaiting its 5s POST timeout, so a future
+    // exit path that blocks on the abandoned task or the runtime cannot
+    // pass this test on the note text alone.
+    let stop_started = Instant::now();
     let result = server.stop().expect("the serve thread joins");
     assert!(
         result.is_ok(),
         "a stalled flush never fails the host: {result:?}"
+    );
+    assert!(
+        stop_started.elapsed() < Duration::from_secs(4),
+        "stop() must return near its 2s stop bound — well under the 5s POST timeout — but took {}s",
+        stop_started.elapsed().as_secs_f32()
     );
     let text = sink_handle.text();
     assert!(
