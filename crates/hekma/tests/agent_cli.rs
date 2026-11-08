@@ -1014,6 +1014,11 @@ fn a_write_surfaces_the_state_dir_when_it_cannot_be_created() {
         "a state root under a file can never be served: stdout={}\nstderr={}",
         run.stdout, run.stderr
     );
+    // docs/testing.md pins this as the typed `<state-dir>` creation
+    // refusal, exit 1 (the IO/system class of the frozen exit table): a
+    // silent remap to a usage (2) or lock-refusal code would ship red
+    // here, not just drift the docs (exit_code.rs's own warning).
+    assert_eq!(run.code, Some(1), "stderr={}", run.stderr);
     assert!(
         run.stderr
             .contains("Filesystem error for Agent Instance '<state-dir>'"),
@@ -1025,10 +1030,17 @@ fn a_write_surfaces_the_state_dir_when_it_cannot_be_created() {
         "the refusal names the unusable path: {}",
         run.stderr
     );
-    // Nothing was started and nothing binds the root.
-    assert!(!under_file
-        .join(hekma_engine::paths::HOST_LOCK_FILE)
-        .exists());
+    // The refusal took the TYPED `<state-dir>` registry-Io path, not
+    // host_client.rs's spawn-failure catch-all ("could not start a local
+    // Service Host", a different untyped surface) — the catch-all must NOT
+    // appear. (Replaces the former `under_file/host.lock` existence
+    // assert, which could never fail: `under_file` is `<regular
+    // file>/state`, so any path under it fails ENOTDIR — review nit.)
+    assert!(
+        !run.stderr.contains("could not start a local Service Host"),
+        "the typed `<state-dir>` refusal must not be the spawn-failure catch-all: {}",
+        run.stderr
+    );
 }
 
 #[test]
@@ -1062,6 +1074,27 @@ fn a_write_waits_out_the_startup_bound_then_names_the_log_when_no_host_comes_up(
         run.stderr.contains("serve.log"),
         "the diagnostic points at the refused serve's log: {}",
         run.stderr
+    );
+    // The deadline message names serve.log unconditionally, so that assert
+    // alone cannot show the timeout was caused by the held lock — any early
+    // serve exit (broken flag parse, bad state-dir hand-off) also leaves
+    // control.json absent. The refused serve's own log carries the
+    // StateDirLocked refusal (both holder variants name the wording below
+    // and the held host.lock path) — THAT ties this timeout to the lock.
+    let serve_log = std::fs::read_to_string(hekma_host::serve_log_file(&state_dir))
+        .expect("the refused serve's serve.log");
+    assert!(
+        serve_log.contains("the state directory is already served by another host"),
+        "the serve exited by the StateDirLocked refusal, not any other failure: {serve_log}"
+    );
+    assert!(
+        serve_log.contains(
+            &state_dir
+                .join(hekma_engine::paths::HOST_LOCK_FILE)
+                .display()
+                .to_string()
+        ),
+        "the refusal names the held host.lock path: {serve_log}"
     );
     assert!(
         started.elapsed() >= std::time::Duration::from_secs(9),
