@@ -6109,6 +6109,106 @@ fn the_release_pass_reconciles_an_already_dead_paused_child() {
 }
 
 #[test]
+fn the_release_pass_reconciles_a_self_exited_cooperatively_paused_child_with_its_code() {
+    // The Some(code) twin of the already-dead reconcile (review round 1): a
+    // COOPERATIVELY paused detached child is alive and unsuspended, so it
+    // can SELF-EXIT with a real code while the row reads `paused` — the
+    // release probe then reaps a waitable exit code and the crashed edge
+    // NAMES it (never the unavailable-code wording a signal-killed or
+    // adopted corpse carries, never a fake paused→running resume). The
+    // 6s self-exit budget gives the preceding cooperative pause a wide
+    // margin on a cold runner.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coopex",
+        &["--exit-with", "7:6000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "coopex",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("coopex").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let sink = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coopex").unwrap();
+    // The cooperative pause commits well inside the 6s self-exit budget.
+    sup.pause(&registry, "coopex").unwrap();
+    assert_eq!(state_of(&registry, "coopex"), LifecycleState::Paused);
+
+    // The child self-exits with code 7 while the row reads paused (the
+    // release-time discovery premise, the waitable-code variant).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let exited = {
+            let supervised = sup.running.get_mut(&name).unwrap();
+            sup.backend
+                .poll(&mut supervised.handle)
+                .map(|status| status.is_exited())
+                .unwrap_or(true)
+        };
+        if exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the self-exiting child never registered as exited"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    sup.release_detached_paused(&registry);
+
+    assert_eq!(
+        state_of(&registry, "coopex"),
+        LifecycleState::Failed,
+        "the self-exited paused child reconciles to failed, never to running"
+    );
+    let events = Supervisor::read_events(&registry, "coopex").unwrap();
+    let reconcile = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Failed)
+        .expect("the crashed reconcile edge must be recorded");
+    let cause = serde_json::to_string(&reconcile.cause).unwrap();
+    assert!(
+        cause.contains("crashed")
+            && cause.contains("exited before engine release")
+            && cause.contains("exited with code 7"),
+        "the reconcile edge names the reaped exit code: {cause}"
+    );
+    assert!(
+        !cause.contains("exit code unavailable"),
+        "a waitable child must never read as the adopted-corpse variant: {cause}"
+    );
+    let text = sink_text(&sink);
+    assert!(
+        text.contains("coopex: the paused detached child had already exited"),
+        "the reconcile must be surfaced: {text}"
+    );
+    assert!(
+        text.contains("exited with code 7"),
+        "the surfaced note carries the code too: {text}"
+    );
+    // The stale record was settled: no live spawn record survives the dead
+    // child (a later open never adopt-attempts the pid).
+    assert!(
+        registry.spawn_record(&name).unwrap().is_none()
+            || registry
+                .spawn_record(&name)
+                .unwrap()
+                .is_some_and(|record| record.fingerprint.pid == 0),
+        "the settled record is gone or a pid-0 seed"
+    );
+}
+
+#[test]
 fn the_release_pass_leaves_a_cooperatively_paused_detached_child_paused() {
     // The COOPERATIVE arm (18-4, review round 1 B2): a detached child paused
     // via its DECLARED pause command has no OS suspension to undo, and no
@@ -7626,6 +7726,85 @@ fn cooperative_pause_divergence_after_the_command_ran_is_surfaced() {
     // Repair the log so the teardown's own transitions land.
     repair_instance_event_log(&mut sup, &name);
     sup.stop(&registry, "coopdiv", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
+fn cooperative_resume_divergence_after_the_command_ran_is_surfaced() {
+    // AI-18's post-commit divergence arm (18-4), the RESUME direction: the
+    // declared RESUME command already RAN, then the ledger REFUSES the
+    // paused→running transition — the note names BOTH sides (command ran /
+    // record failed) plus the RESUME recovery verb (a failed RESUME commit
+    // realigns by re-running `resume`: the gate accepts paused→running and
+    // a well-formed command re-runs harmlessly), the error is returned, and
+    // the durable row keeps reading `paused` until that recovery runs —
+    // which the disarm-and-retry leg then proves end to end.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_coop_pair_manifest(
+        manifest.path(),
+        "coopres",
+        &["--linger-ms", "600000"],
+        &["--touch", "pause.sentinel"],
+        &["--touch", "resume.sentinel"],
+        None,
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "coopres",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("coopres").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    sup.start_detached(&registry, "coopres").unwrap();
+    // The cooperative pause commits cleanly first — the row must read paused.
+    sup.pause(&registry, "coopres").unwrap();
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Paused);
+
+    break_instance_event_log(&mut sup, &name);
+    let _err = sup.resume(&registry, "coopres").unwrap_err();
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("the resume command already ran"),
+        "the note names the side that already happened:\n{text}"
+    );
+    assert!(
+        text.contains("recording the paused→running transition failed"),
+        "the note names the failed record: {text}"
+    );
+    assert!(
+        text.contains("diverge") && text.contains("recovery:"),
+        "the note names the divergence and the recovery: {text}"
+    );
+    assert!(
+        text.contains("hekma agent resume coopres"),
+        "a failed RESUME commit realigns by re-running resume: {text}"
+    );
+    // The ledger refused: the durable row keeps reading paused — exactly the
+    // state the recovery note assumes.
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Paused);
+
+    // The documented recovery, end to end: disarm the fault and re-run the
+    // verb — the gate still accepts paused→running, the well-formed command
+    // re-runs harmlessly, and the edge lands with the cooperative cause.
+    repair_instance_event_log(&mut sup, &name);
+    sup.resume(&registry, "coopres").unwrap();
+    assert_eq!(state_of(&registry, "coopres"), LifecycleState::Running);
+    let events = Supervisor::read_events(&registry, "coopres").unwrap();
+    let resumed = events
+        .iter()
+        .find(|e| e.prior_state == LifecycleState::Paused && e.new_state == LifecycleState::Running)
+        .expect("the retry's paused→running edge must be recorded");
+    let cause = serde_json::to_string(&resumed.cause).unwrap();
+    assert!(
+        cause.contains("resume-cooperative"),
+        "the recovery edge carries the cooperative cause: {cause}"
+    );
+
+    sup.stop(&registry, "coopres", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
