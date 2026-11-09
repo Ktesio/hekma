@@ -213,11 +213,8 @@ impl Supervisor {
             })?;
         if dry_run {
             if existing.is_default() {
-                return Err(RunError::Invalid {
-                    field: "name".to_string(),
-                    reason: "the default Policy cannot be deleted — change it instead (it is the \
-                             fallback every Run resolves through)"
-                        .to_string(),
+                return Err(RunError::PolicyDefault {
+                    what: "cannot be deleted — change it instead",
                 });
             }
             let plan = registry.plan_policy_change(

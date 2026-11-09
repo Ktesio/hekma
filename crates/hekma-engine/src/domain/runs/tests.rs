@@ -725,8 +725,14 @@ fn the_label_verb_binds_once_with_one_event_and_a_repeat_changes_nothing() {
         event.prior_labels.as_deref(),
         Some(&[Label::bound("team", "payments")][..])
     );
-    assert_eq!(changes.entries.len(), 1);
+    // Story 21-3: the Policy re-resolution republishes the Run's entry
+    // (carrying its stored resolution) beside the label change's entry.
+    assert_eq!(changes.entries.len(), 2);
     assert_eq!(changes.entries[0].labels, outcome.labels);
+    assert!(
+        changes.entries[1].policy.is_some(),
+        "the resolution rides the entry"
+    );
     let json = serde_json::to_value(event).unwrap();
     assert_eq!(json["labels"][0]["origin"], "label-verb");
     assert_eq!(json["prior_labels"][0]["origin"], "config");

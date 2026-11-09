@@ -475,6 +475,20 @@ impl Registry {
         })?
     }
 
+    /// The instance's open process-owning Run id, read on the read-only
+    /// connection (story 21-3: the enforcement arms resolve for the process
+    /// level, so a child Run's own limits never leak into them).
+    pub(crate) fn open_process_run(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Option<crate::domain::usage::RunId>, StoreError> {
+        use crate::ports::RunRecords;
+        Ok(self
+            .store
+            .snapshot(|store| store.open_process_run(name))?
+            .map(|record| record.run_id))
+    }
+
     /// Resolve a Selector over the non-ended Runs on the read-only
     /// connection (story 21-9): one indexed read, capped.
     pub(crate) fn select_runs(
@@ -4790,11 +4804,18 @@ source = "self-reported"
         // The outbox: seqs and the ack carry over; the next seq continues.
         let batch = crate::domain::export_core(&reg, None, 0).unwrap();
         let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        // Story 21-3: the open's FR-21 upgrade finish emits its ONE event
+        // after the imported tail — the fixture's instance carries no
+        // explicit Breach Action, so it was kept on `pause` (seq 8).
         assert_eq!(
             seqs,
-            vec![7],
-            "the default pull resumes after the imported ack"
+            vec![7, 8],
+            "the default pull resumes after the imported ack, then the upgrade event"
         );
+        assert!(matches!(
+            batch.events[1].event,
+            EngineEvent::BreachDefaultUpgraded(_)
+        ));
         assert_eq!(batch.retained_from, 5);
         let event = batch.events[0].event.clone();
         let next = reg
@@ -4804,7 +4825,7 @@ source = "self-reported"
                     .append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES)
             })
             .unwrap();
-        assert_eq!(next.seq, 8);
+        assert_eq!(next.seq, 9);
         assert!(matches!(batch.events[0].event, EngineEvent::Transition(_)));
 
         // The journal pair is retired; the log files stay as mirrors.

@@ -232,9 +232,6 @@ pub(crate) trait PolicyRecords {
     /// The instances whose upgrade has not finished (the resume list).
     fn breach_default_pending(&self) -> Result<Vec<String>, StoreError>;
 
-    /// Every marker row (name, whether its `config.toml` was written).
-    fn breach_default_rows(&self) -> Result<Vec<(String, bool)>, StoreError>;
-
     /// Mark the named instances' upgrade finished (the closing
     /// transaction's write).
     fn finish_breach_default(&self, written: &[(String, bool)], at: &str)

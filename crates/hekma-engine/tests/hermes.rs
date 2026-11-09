@@ -922,6 +922,9 @@ fn hermes_lifecycle_end_to_end_under_a_path_shimmed_gateway() {
     facade
         .set_config("gw", "budget.tokens.cumulative", "90")
         .unwrap();
+    facade
+        .set_config("gw", "budget.breach_action", "pause")
+        .unwrap();
     script("--emit-usage 5 --linger-ms 600000");
     facade.start("gw").unwrap();
     wait_until_state(

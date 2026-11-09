@@ -40,8 +40,8 @@ pub mod verbs;
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
-    PolicyLimits, PolicyRecord, PolicyResolution, ResolutionInput, ResolveInputs, RunPolicy,
-    ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+    PolicyLimits, PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy, ScentCheckMode,
+    UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
 pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
@@ -720,6 +720,25 @@ pub enum RunError {
         /// The existing Policy's name.
         name: String,
     },
+    /// The `default` Policy's reserved shape forbids the change (story
+    /// 21-3): it cannot be deleted or carry a Selector — it is the
+    /// fallback every Run resolves through.
+    #[error("the default Policy {what} — it is the fallback every Run resolves through, and every limit it carries applies to every Run")]
+    PolicyDefault {
+        /// What it cannot do (`"cannot be deleted"`, `"cannot carry a Selector"`).
+        what: &'static str,
+    },
+    /// A Scent-Check Mode other than `off` before Scent-Check ships
+    /// (story 21-3, PRD §13 Q9's interim): an accepted-but-inert mode
+    /// would be a silent no-op.
+    #[error(
+        "Scent-Check Modes land with their own story — only `off` is accepted for now; `{mode}` \
+         does nothing until then"
+    )]
+    ScentUnavailable {
+        /// The refused mode.
+        mode: String,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -751,6 +770,8 @@ impl RunError {
             RunError::TooManyRuns { .. } => "too-many-runs",
             RunError::PolicyNotFound { .. } => "policy-not-found",
             RunError::PolicyExists { .. } => "policy-exists",
+            RunError::PolicyDefault { .. } => "policy-default",
+            RunError::ScentUnavailable { .. } => "scent-unavailable",
             RunError::Invalid { .. } => "invalid-request",
             RunError::Store(_) => "store",
         }

@@ -1317,7 +1317,7 @@ impl Supervisor {
     /// publishes are serialized in durable-append order: the per-instance FIFO
     /// guarantee. Publishing cannot fail supervision: a send with no receivers
     /// (or any send error) is swallowed by the bus.
-    fn publish(&self, event: EngineEvent) {
+    pub(crate) fn publish(&self, event: EngineEvent) {
         self.events.publish(event);
     }
 

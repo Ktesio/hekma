@@ -5990,6 +5990,9 @@ fn the_release_pass_freezes_a_breach_paused_detached_child() {
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
         .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
+        .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let sink = install_capture_sink(&mut sup);
     sup.start_detached(&registry, "brz").unwrap();
@@ -6207,6 +6210,9 @@ fn a_breach_pause_resumes_through_the_signal_even_under_a_declared_pair() {
     let name = InstanceName::new("brpair").unwrap();
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
         .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     sup.start(&registry, "brpair").unwrap();
@@ -7539,6 +7545,9 @@ fn adopted_breach_paused_child_notes_the_between_commands_freeze() {
     let name = InstanceName::new("adopbrz").unwrap();
     registry
         .set_config(&name, "budget.tokens.cumulative", "15")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.breach_action", "pause")
         .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     sup.start_detached(&registry, "adopbrz").unwrap();

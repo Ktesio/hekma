@@ -47,7 +47,7 @@ use crate::domain::cost::Rate;
 use crate::domain::runs::ops::RunChanges;
 use crate::domain::runs::selector::Selector;
 use crate::domain::usage::RunId;
-use crate::ports::{PolicyRecords, RunRecords, StoreError};
+use crate::ports::{RunRecords, StoreError};
 
 /// The event families' schema versions (AD-14).
 pub const POLICY_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -435,7 +435,18 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
                 .is_some_and(|selector| selector.matches_pairs(&input.bound_labels))
         })
         .collect();
-    let maximal: Vec<&PolicyRecord> = maximal_candidates(&named);
+    // FR-60's per-limit rule: "each limit is resolved on its own" — the
+    // most-specific comparison runs among the matching Policies that SET
+    // the limit, so a more-specific Policy that leaves it unset does not
+    // suppress a less-specific one that sets it.
+    let maximal_setting = |sets: &dyn Fn(&PolicyLimits) -> bool| -> Vec<&PolicyRecord> {
+        let setting: Vec<&PolicyRecord> = named
+            .iter()
+            .copied()
+            .filter(|policy| sets(&policy.limits))
+            .collect();
+        maximal_candidates(&setting)
+    };
 
     let mut sources = LimitSources {
         tokens_per_run: LimitSource::Unset,
@@ -455,15 +466,12 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     // ---- Ceilings, per limit kind: Run > instance > the most specific
     // matching Policy > the default Policy. Ties among the maximal
     // candidates take the tightest value (the minimum).
-    for (index, kind) in [
+    for kind in [
         LimitKind::TokensPerRun,
         LimitKind::TokensCumulative,
         LimitKind::DollarsPerRun,
         LimitKind::DollarsCumulative,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    ] {
         let slot = match kind {
             LimitKind::TokensPerRun => &mut tokens.per_run,
             LimitKind::TokensCumulative => &mut tokens.cumulative,
@@ -486,11 +494,8 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             *source = LimitSource::Instance;
             continue;
         }
-        let candidates: Vec<&PolicyRecord> = maximal
-            .iter()
-            .copied()
-            .filter(|policy| policy.limits.ceiling(kind).is_some())
-            .collect();
+        let candidates: Vec<&PolicyRecord> =
+            maximal_setting(&|limits| limits.ceiling(kind).is_some());
         if let Some((value, name)) = policy_ceiling(&candidates, kind) {
             *slot = Some(value);
             *source = LimitSource::Policy(name);
@@ -522,7 +527,9 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     } else if input.kept_on_pause {
         sources.breach_action = LimitSource::Instance;
         BreachAction::Pause
-    } else if let Some((action, name)) = policy_action(&maximal) {
+    } else if let Some((action, name)) =
+        policy_action(&maximal_setting(&|limits| limits.breach_action.is_some()))
+    {
         sources.breach_action = LimitSource::Policy(name);
         action
     } else {
@@ -538,7 +545,9 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     let scent_check = if let Some(mode) = input.inputs.explicit.scent_check {
         sources.scent_check = LimitSource::Instance;
         mode
-    } else if let Some((mode, name)) = policy_scent(&maximal) {
+    } else if let Some((mode, name)) =
+        policy_scent(&maximal_setting(&|limits| limits.scent_check.is_some()))
+    {
         sources.scent_check = LimitSource::Policy(name);
         mode
     } else {
@@ -558,7 +567,7 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     let rate = if input.inputs.explicit.rate.is_some() {
         sources.rate = LimitSource::Instance;
         input.inputs.explicit.rate
-    } else if let Some(policy) = policy_rate(&maximal) {
+    } else if let Some(policy) = policy_rate(&maximal_setting(&|limits| limits.rate.is_some())) {
         sources.rate = LimitSource::Policy(policy.name.clone());
         policy.limits.rate
     } else {
@@ -573,19 +582,24 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
         entry
     };
 
-    // ---- The depth fallback: a resolved action the Run's (depth, wire
-    // path) cannot execute acts as `warn` with the `depth-fallback`
-    // Anomaly (FR-60); it takes effect when the depth allows it again.
+    // ---- The depth fallback: a POLICY-sourced action the Run's (depth,
+    // wire path) cannot execute acts as `warn` with the `depth-fallback`
+    // Anomaly (FR-60); it takes effect when the depth allows it again. An
+    // action set DIRECTLY (Run limits or instance config) keeps the story
+    // 19-2 contract: the decision carries the configured action and the
+    // executor degrades loudly (a `block` with no listener records `block`,
+    // fences nothing, and says so).
     let action_source = match &sources.breach_action {
         LimitSource::Policy(name) => Some(name.clone()),
         LimitSource::Default => Some(DEFAULT_POLICY_NAME.to_string()),
         LimitSource::Run | LimitSource::Instance | LimitSource::Unset => None,
     };
     let fallback = if action != BreachAction::Warn
+        && action_source.is_some()
         && !action_executable(input.depth, input.wire_path, action)
     {
         Some(DepthFallback {
-            policy: action_source.unwrap_or_else(|| "run limits".to_string()),
+            policy: action_source.clone().unwrap_or_default(),
             action,
         })
     } else {
@@ -664,35 +678,37 @@ fn policy_ceiling(candidates: &[&PolicyRecord], kind: LimitKind) -> Option<(u64,
 }
 
 /// The winning action among the maximal candidates that set one: the
-/// tightest action, an equal value naming the alphabetically-first Policy.
+/// TIGHTEST action (`warn` < `pause` < `stop` < `block`, FR-60's tie
+/// order), an equal value naming the alphabetically-first Policy.
 fn policy_action(candidates: &[&PolicyRecord]) -> Option<(BreachAction, String)> {
     let winner = candidates
         .iter()
         .copied()
         .filter(|policy| policy.limits.breach_action.is_some())
-        .min_by(|a, b| {
+        .max_by(|a, b| {
             action_tightness(a.limits.breach_action.unwrap_or(BreachAction::Warn))
                 .cmp(&action_tightness(
                     b.limits.breach_action.unwrap_or(BreachAction::Warn),
                 ))
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| b.name.cmp(&a.name))
         })?;
     Some((winner.limits.breach_action?, winner.name.clone()))
 }
 
 /// The winning Scent-Check Mode among the maximal candidates that set one:
-/// the tightest mode, an equal value naming the alphabetically-first Policy.
+/// the TIGHTEST mode (`off` < `shadow` < `enforce`, FR-60's tie order), an
+/// equal value naming the alphabetically-first Policy.
 fn policy_scent(candidates: &[&PolicyRecord]) -> Option<(ScentCheckMode, String)> {
     let winner = candidates
         .iter()
         .copied()
         .filter(|policy| policy.limits.scent_check.is_some())
-        .min_by(|a, b| {
+        .max_by(|a, b| {
             scent_tightness(a.limits.scent_check.unwrap_or(ScentCheckMode::Off))
                 .cmp(&scent_tightness(
                     b.limits.scent_check.unwrap_or(ScentCheckMode::Off),
                 ))
-                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| b.name.cmp(&a.name))
         })?;
     Some((winner.limits.scent_check?, winner.name.clone()))
 }
@@ -862,6 +878,8 @@ fn store_changes<S: RunRecords + ?Sized>(
     if let Some(note) = &resolution.fail_closed {
         changes.notes.push(note.clone());
     }
+    #[cfg(test)]
+    changes.policy_resolved.push(record.run_id.clone());
     store.set_run_policy(&record.run_id, resolution, inputs, at)?;
     let labels = store.run_labels(&record.run_id)?;
     let run_limits = store.run_limits(&record.run_id)?;
@@ -1371,8 +1389,9 @@ mod tests {
         input.policies[1].limits.dollars_per_run_micros = Some(5_000_000);
         input.inputs.explicit.rate = Some(Rate::new(1, 1));
         assert!(resolve(&input).unpriced.is_none());
-        // No model configured names it.
+        // No model configured names it (the explicit cap stays cleared).
         input.inputs.explicit.rate = None;
+        input.inputs.explicit.dollars_per_run_micros = None;
         input.inputs.model = None;
         assert_eq!(
             resolve(&input).unpriced.expect("unpriced").model,

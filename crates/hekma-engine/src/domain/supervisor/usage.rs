@@ -967,7 +967,15 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
     ) -> pipeline::EvalInput {
-        let resolution = registry.resolved_limits(name, Some(run_id));
+        // The ARMS resolve for the instance's process-owning Run — the
+        // pipeline's process level (`pipeline::levels_for`) — so a child
+        // Run's own `run_limits` never leak into the instance arms (each
+        // level's own ceilings ride its own level) and the instance's
+        // explicit ceilings still apply however usage is attributed. The
+        // attributed `run_id` stays the evaluation's target.
+        let _ = run_id;
+        let owner = registry.open_process_run(name).ok().flatten();
+        let resolution = registry.resolved_limits(name, owner.as_ref());
         let supervised = self.running.get(name);
         pipeline::EvalInput {
             name: name.clone(),

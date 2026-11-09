@@ -238,6 +238,12 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         }
         .into(),
         RunError::PolicyExists { .. } => RunInvalid { message }.into(),
+        // Story 21-3: the default Policy's reserved shape is a refusal the
+        // Operator fixes on the command line (2), and a Scent-Check Mode
+        // before Scent-Check ships likewise (2).
+        RunError::PolicyDefault { .. } | RunError::ScentUnavailable { .. } => {
+            RunInvalid { message }.into()
+        }
         RunError::NestingTooDeep { .. }
         | RunError::ActionUnavailable { .. }
         | RunError::TooManyRuns { .. }

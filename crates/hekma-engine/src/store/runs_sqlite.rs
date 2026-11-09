@@ -11,8 +11,6 @@
 //! every bound row — the only bound source before it. One crash-atomic step,
 //! like v13.
 
-use std::str::FromStr;
-
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
@@ -297,7 +295,6 @@ pub(super) fn migrate_v15(
         let now = crate::time::now_rfc3339();
         // The seeded `default` Policy (warn, `off`, no ceilings, an empty
         // Rate table). `#[default]`'s `Pause` is only the fail-closed seed.
-        let default = PolicyRecord::default_policy();
         conn.execute(
             "INSERT INTO policies (name, selector, breach_action, scent_check, created_at, \
              updated_at) VALUES ('default', NULL, ?1, ?2, ?3, ?3)",
@@ -1072,24 +1069,6 @@ impl PolicyRecords for SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(backend)?;
         Ok(names)
-    }
-
-    fn breach_default_rows(&self) -> Result<Vec<(String, bool)>, StoreError> {
-        let mut stmt = self
-            .conn()
-            .prepare(
-                "SELECT i.name, b.config_written FROM breach_default_upgrade b \
-                 JOIN agent_instances i ON i.id = b.instance_id ORDER BY i.name",
-            )
-            .map_err(backend)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
-            })
-            .map_err(backend)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(backend)?;
-        Ok(rows)
     }
 
     fn finish_breach_default(

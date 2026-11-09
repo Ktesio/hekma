@@ -29,9 +29,8 @@ use crate::domain::outbox::OUTBOX_MAX_BYTES;
 use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
-    self, BreachDefaultUpgradedEvent, PolicyCache, PolicyEvent, PolicyEventKind, PolicyLimits,
-    PolicyRecord, ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME,
-    POLICY_EVENT_SCHEMA_VERSION,
+    self, BreachDefaultUpgradedEvent, PolicyEvent, PolicyEventKind, PolicyLimits, PolicyRecord,
+    ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
@@ -94,11 +93,6 @@ pub(crate) struct InstanceContext {
 }
 
 impl Registry {
-    /// The cached policy set (amendment 3): one `Arc` clone, no SQL.
-    pub(crate) fn policy_cache(&self) -> &Arc<PolicyCache> {
-        &self.policies
-    }
-
     /// Drain the events the open produced (the initial sweep's Run events,
     /// the upgrade event), for the engine to publish on the bus once it
     /// exists. They are already durable in the outbox.
@@ -260,10 +254,9 @@ impl Registry {
         });
         if is_default {
             if change.selector.is_some() {
-                return Err(invalid(
-                    "selector",
-                    "the default Policy matches every Run — it cannot carry a Selector".to_string(),
-                ));
+                return Err(RunError::PolicyDefault {
+                    what: "cannot carry a Selector",
+                });
             }
         } else if selector.is_none() {
             return Err(invalid(
@@ -274,12 +267,9 @@ impl Registry {
         }
         if let Some(mode) = change.set.scent_check {
             if mode != policy::ScentCheckMode::Off {
-                return Err(invalid(
-                    "scent-check",
-                    "Scent-Check Modes land with their own story — only `off` is accepted for \
-                     now; `shadow` and `enforce` do nothing until then"
-                        .to_string(),
-                ));
+                return Err(RunError::ScentUnavailable {
+                    mode: mode.as_str().to_string(),
+                });
             }
         }
         if !change.rates.is_empty() && !is_default {
@@ -406,7 +396,7 @@ impl Registry {
 
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
-            let mut body = || -> Result<_, RunError> {
+            let body = || -> Result<_, RunError> {
                 store.put_policy(&record).map_err(RunError::Store)?;
                 let (outcome, run_events, breaches) = re_resolve_matched(
                     store,
@@ -486,11 +476,8 @@ impl Registry {
         contexts: HashMap<String, InstanceContext>,
     ) -> Result<PolicyApplied, RunError> {
         if existing.is_default() {
-            return Err(RunError::Invalid {
-                field: "name".to_string(),
-                reason: "the default Policy cannot be deleted — change it instead (it is the \
-                         fallback every Run resolves through)"
-                    .to_string(),
+            return Err(RunError::PolicyDefault {
+                what: "cannot be deleted — change it instead",
             });
         }
         let matched_selector = existing.selector.clone();

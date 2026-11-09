@@ -549,9 +549,16 @@ impl Engine {
         // reaper starts so an adopted process is already held when the first poll
         // runs (and a phantom row is already `failed`).
         {
-            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut registry = inner.registry.lock().expect("registry mutex poisoned");
             let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
             supervisor.adopt_orphans(&registry);
+            // Story 21-3: publish what the open produced (the policy sweep's
+            // Run events, the FR-21 upgrade's one event) on the bus — they
+            // are already durable in the outbox; this makes them live too
+            // for any subscriber seated before the engine was handed out.
+            for event in registry.take_open_events() {
+                supervisor.publish(event);
+            }
         }
 
         // (2) Spawn the crash-detection reaper on the engine's runtime. It is
