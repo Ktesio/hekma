@@ -552,8 +552,7 @@ mod tests {
     #[test]
     fn resolve_headers_resolves_secret_refs_and_passes_literals_through() {
         // The SUCCESS arm: a `secret:NAME` reference resolves through the
-        // composite resolver (the AD-10 env→file order) to its cleartext —
-        // consumed only by the HTTP client — while literal values pass
+        // composite resolver to its cleartext, while literal values pass
         // through untouched, in spec order.
         struct FixedMap(&'static [(&'static str, &'static str)]);
         impl hekma_engine::ports::SecretResolver for FixedMap {

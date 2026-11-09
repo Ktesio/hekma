@@ -428,14 +428,13 @@ mod tests {
     async fn an_invalid_header_value_surfaces_terminal_named_at_the_builder() {
         // A header VALUE the HTTP builder rejects (a CR/LF is
         // response-splitting material): the flag-time P4b parse refuses
-        // such values on the CLI path, but `OtlpClient::new` is a PUBlic
+        // such values on the CLI path, but `OtlpClient::new` is a public
         // lib surface taking arbitrary pairs — for a library caller the
         // builder's own error state is the defense, and the failure is
         // TERMINAL for the batch, named at the builder, BEFORE anything is
         // dialed (port 1 is never contacted: the request build fails
-        // first; a non-ASCII letter like é, by contrast, is legal obs-text
-        // and sails through the builder — verified by this very suite's
-        // first red draft).
+        // first; a non-ASCII letter such as é is legal obs-text and
+        // passes the builder).
         let client = OtlpClient::new(
             "http://127.0.0.1:1",
             vec![("x-tenant".to_string(), "bad\r\nvalue".to_string())],

@@ -839,12 +839,31 @@ fn a_terminal_status_is_surfaced_and_never_retried_within_the_flush() {
     let options = options_with(state.path().to_path_buf(), sink, otlp);
     let server = spawn_serve(options, &sink_handle, true);
 
-    // One recorded POST = the flush fired exactly once.
+    // The first POST is recorded; the terminal drop note lands once
+    // deliver has fully returned. Poll for the NOTE, not a clock window:
+    // a fixed sleep inside the 1s interval can lose the race against a
+    // slow first connection, or let the NEXT flush's legitimate POST
+    // land inside the window and fail a healthy run.
     collector.wait_for(|requests| !requests.is_empty(), Duration::from_secs(30));
-    // Past the whole retry schedule (2 × 200ms backoff between attempts)
-    // and still inside the 1s flush interval: a retry would have landed
-    // in this window, and the next flush cannot have started yet.
-    std::thread::sleep(Duration::from_millis(600));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = sink_handle.text();
+        if text.contains("the collector answered 400 (terminal for this batch)") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the terminal drop was never surfaced:\n{}",
+            sink_handle.text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // By note-time deliver has returned — a retry regression would
+    // already be recorded, whatever its timing — and the next flush's
+    // cumulative re-export is still around a full interval away:
+    // exactly one POST pins "terminal is never retried within the
+    // flush".
     let recorded = collector.requests.lock().unwrap().clone();
     assert_eq!(
         recorded.len(),
@@ -852,13 +871,6 @@ fn a_terminal_status_is_surfaced_and_never_retried_within_the_flush() {
         "a terminal status is never retried: {recorded:?}"
     );
     assert_eq!(recorded[0].answered, 400);
-
-    // The drop is surfaced with the terminal wording naming the status.
-    let text = sink_handle.text();
-    assert!(
-        text.contains("the collector answered 400 (terminal for this batch)"),
-        "the terminal status is named in the surfaced drop:\n{text}"
-    );
 
     // The host still exits clean — the stream, not the exit code, carries
     // the export failure.
@@ -883,26 +895,48 @@ fn an_always_503_collector_exhausts_the_bounded_budget_and_surfaces_the_last_out
     let options = options_with(state.path().to_path_buf(), sink, otlp);
     let server = spawn_serve(options, &sink_handle, true);
 
-    // The budget's full three attempts within the first flush.
-    collector.wait_for(|requests| requests.len() >= 3, Duration::from_secs(30));
+    // The drop note lands only once deliver has FULLY returned — the
+    // third response read, the budget exhausted, the flush calling the
+    // notifier — so poll for it with a deadline instead of racing the
+    // third response's read: the stub records each request BEFORE it
+    // writes the response, so a `wait_for(len >= 3)` can return while
+    // deliver is still waiting for that response and the note does not
+    // exist yet.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = sink_handle.text();
+        if text.contains("the metrics batch was NOT delivered") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exhausted batch's drop was never surfaced:\n{}",
+            sink_handle.text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // By note-time the flush's WHOLE budget is recorded — deliver has
+    // returned — and the next flush (the cumulative re-export) is still
+    // the better part of an interval away, so the count pins the
+    // budget's exact shape: the first attempt plus at most two retries,
+    // never more.
     let recorded = collector.requests.lock().unwrap().clone();
-    assert!(recorded.len() >= 3, "the budget was consumed: {recorded:?}");
+    assert_eq!(
+        recorded.len(),
+        3,
+        "the bounded budget is exactly three attempts: {recorded:?}"
+    );
     assert!(
-        recorded
-            .iter()
-            .take(3)
-            .all(|request| request.answered == 503),
+        recorded.iter().all(|request| request.answered == 503),
         "every scripted answer was a 503: {recorded:?}"
     );
 
     // The surfaced drop names the LAST outcome with its retryable class
-    // (the Retryable arm interpolates the FULL status line, reason and
-    // all, while the terminal arm renders the bare code).
+    // (the Retryable arm renders the StatusCode with its canonical
+    // reason, not the wire reason phrase, while the terminal arm renders
+    // the bare u16).
     let text = sink_handle.text();
-    assert!(
-        text.contains("the metrics batch was NOT delivered"),
-        "the exhausted batch's drop is surfaced:\n{text}"
-    );
     assert!(
         text.contains("the collector answered 503 Service Unavailable (retryable)"),
         "the last retryable outcome is named in the drop:\n{text}"
