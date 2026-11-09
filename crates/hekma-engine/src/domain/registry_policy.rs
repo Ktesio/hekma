@@ -29,8 +29,9 @@ use crate::domain::outbox::OUTBOX_MAX_BYTES;
 use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
-    self, PolicyCache, PolicyEvent, PolicyEventKind, PolicyLimits, PolicyRecord, ResolveInputs,
-    BreachDefaultUpgradedEvent, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+    self, BreachDefaultUpgradedEvent, PolicyCache, PolicyEvent, PolicyEventKind, PolicyLimits,
+    PolicyRecord, ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME,
+    POLICY_EVENT_SCHEMA_VERSION,
 };
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
@@ -43,7 +44,7 @@ use crate::time::now_rfc3339;
 /// A create/change request: limits to set, fields to clear, and Rate-table
 /// edits. Merged over the existing row on a change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PolicyChange {
+pub struct PolicyChange {
     /// The Policy's name.
     pub name: String,
     /// Its Selector (required and non-empty unless `default`).
@@ -61,7 +62,7 @@ pub(crate) struct PolicyChange {
 
 /// What a committed Policy change reports (FR-60: the fallback count).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PolicyOutcome {
+pub struct PolicyOutcome {
     /// The Policy after the change (`None` on a delete).
     pub record: Option<PolicyRecord>,
     /// How many non-ended Runs the (old, on a delete) Selector matches.
@@ -177,11 +178,9 @@ impl Registry {
                 ..ResolveInputs::default()
             });
         let (depth, wire_path, run_limits) = match &facts {
-            Some((record, _, limits, _)) => (
-                record.control_depth,
-                record.wire_path,
-                limits.clone(),
-            ),
+            Some((record, _, limits, _)) => {
+                (record.control_depth, record.wire_path, limits.clone())
+            }
             None => (ControlDepth::Supervised, true, Default::default()),
         };
         policy::resolve(&policy::ResolutionInput {
@@ -209,13 +208,18 @@ impl Registry {
     /// the name grammar, `default`'s reserved shape, the required
     /// non-empty Selector on named Policies, `off`-only Scent-Check values
     /// until 22.3, and the Rate table's ownership.
-    fn validate_change(existing: Option<&PolicyRecord>, change: &PolicyChange) -> Result<(), RunError> {
+    fn validate_change(
+        existing: Option<&PolicyRecord>,
+        change: &PolicyChange,
+    ) -> Result<(), RunError> {
         let invalid = |field: &str, reason: String| RunError::Invalid {
             field: field.to_string(),
             reason,
         };
         let mut chars = change.name.chars();
-        let shape_ok = chars.next().is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        let shape_ok = chars
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
             && change.name.len() <= 63
             && change
                 .name
@@ -239,8 +243,7 @@ impl Registry {
             if change.selector.is_some() {
                 return Err(invalid(
                     "selector",
-                    "the default Policy matches every Run — it cannot carry a Selector"
-                        .to_string(),
+                    "the default Policy matches every Run — it cannot carry a Selector".to_string(),
                 ));
             }
         } else if selector.is_none() {
@@ -307,7 +310,10 @@ impl Registry {
     /// Selector bound.
     fn matched_runs(&self, record: &PolicyRecord) -> Result<Vec<RunRecord>, RunError> {
         if record.is_default() {
-            return self.store.snapshot(|store| store.open_runs()).map_err(RunError::Store);
+            return self
+                .store
+                .snapshot(|store| store.open_runs())
+                .map_err(RunError::Store);
         }
         let selector = record.selector.clone().expect("validated");
         self.store
@@ -319,11 +325,7 @@ impl Registry {
 
     /// Resolve one Run record against a policy set (the shared pure call,
     /// read-side).
-    fn resolve_record(
-        &self,
-        record: &RunRecord,
-        policies: &[PolicyRecord],
-    ) -> PolicyResolution {
+    fn resolve_record(&self, record: &RunRecord, policies: &[PolicyRecord]) -> PolicyResolution {
         let facts = self.store.snapshot(|store| {
             Ok((
                 store.run_labels(&record.run_id)?,
@@ -614,8 +616,7 @@ impl Registry {
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
             store.finish_breach_default(&rows, &at)?;
-            store
-                .append_outbox(&EngineEvent::BreachDefaultUpgraded(event), OUTBOX_MAX_BYTES)
+            store.append_outbox(&EngineEvent::BreachDefaultUpgraded(event), OUTBOX_MAX_BYTES)
         });
         match result {
             Ok(_) => {
@@ -670,8 +671,7 @@ impl Registry {
             toml::Value::String(BreachAction::Pause.as_str().to_string()),
         )
         .map_err(|err| err.to_string())?;
-        let serialized =
-            toml::to_string_pretty(&table).map_err(|err| err.to_string())?;
+        let serialized = toml::to_string_pretty(&table).map_err(|err| err.to_string())?;
         crate::paths::write_atomically(&path, serialized.as_bytes())
             .map_err(|err| err.to_string())?;
         Ok(true)
@@ -719,8 +719,7 @@ impl Registry {
                     .as_deref()
                     .and_then(|instance| inputs_by_instance.get(instance))
                     .cloned();
-                let resolved =
-                    policy::resolve_run(store, &run.run_id, inputs, &at)?;
+                let resolved = policy::resolve_run(store, &run.run_id, inputs, &at)?;
                 changes.extend(resolved);
             }
             let events = ops::commit(ctx, &publisher, changes)?;
@@ -827,7 +826,16 @@ fn re_resolve_matched(
             if let Some(instance) = &run.instance {
                 if let Ok(name) = InstanceName::new(instance) {
                     let context = contexts.get(instance).cloned().unwrap_or_default();
-                    re_arm(store, &name, run, &resolution, &context, ctx, publisher, &mut breaches)?;
+                    re_arm(
+                        store,
+                        &name,
+                        run,
+                        &resolution,
+                        &context,
+                        ctx,
+                        publisher,
+                        &mut breaches,
+                    )?;
                 }
             }
         }
@@ -942,8 +950,8 @@ fn re_arm(
 
     // ---- the breach-at-once half (lowered to at-or-below the usage):
     // the same pipeline evaluation a usage commit runs, over the NEW arms.
-    let armed = resolution.tokens.is_set()
-        || (resolution.rate.is_some() && resolution.dollars.is_set());
+    let armed =
+        resolution.tokens.is_set() || (resolution.rate.is_some() && resolution.dollars.is_set());
     if armed {
         let input = EvalInput {
             name: instance.clone(),
@@ -1035,8 +1043,8 @@ pub(crate) struct RegistryBreachDefault;
 
 impl BreachDefaultSource for RegistryBreachDefault {
     fn resolve(&self, kind: &str, home: &std::path::Path) -> ResolveInputs {
-        let engine =
-            crate::domain::registry::engine_defaults_layer().unwrap_or_else(|_| ConfigLayer::empty());
+        let engine = crate::domain::registry::engine_defaults_layer()
+            .unwrap_or_else(|_| ConfigLayer::empty());
         let kind_layer = crate::domain::registry::kind_defaults_layer(kind);
         let config_path = home.join(crate::paths::INSTANCE_CONFIG_FILE);
         let instance = std::fs::read_to_string(&config_path)
@@ -1050,12 +1058,7 @@ impl BreachDefaultSource for RegistryBreachDefault {
                 .ok()
             })
             .unwrap_or_else(ConfigLayer::empty);
-        let effective = config::resolve([
-            engine,
-            kind_layer,
-            instance,
-            ConfigLayer::empty(),
-        ]);
+        let effective = config::resolve([engine, kind_layer, instance, ConfigLayer::empty()]);
         config::explicit_limits(&effective)
     }
 }

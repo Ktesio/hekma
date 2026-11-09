@@ -1294,8 +1294,12 @@ mod tests {
         // An ack file survived an empty journal: the ack is the seq floor, so
         // the first new entry is 42, never a reused range below it.
         let dir = tempfile::TempDir::new().unwrap();
-        let (store, notes) =
-            SqliteStore::open_with_legacy(&dir.path().join("state.db"), &AckOnly).unwrap();
+        let (store, notes) = SqliteStore::open_with_legacy(
+            &dir.path().join("state.db"),
+            &AckOnly,
+            &crate::store::runs_sqlite::NoBreachDefault,
+        )
+        .unwrap();
         assert!(notes.is_empty());
         let event = EngineEvent::Transition(TransitionEvent::new(
             "x",

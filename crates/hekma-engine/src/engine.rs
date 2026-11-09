@@ -72,7 +72,8 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, RunError, RunId, RunRecord, RunView, Selector,
+    ChildRunRequest, LabelChange, LabelOutcome, PolicyChange, PolicyOutcome, PolicyRecord,
+    RunError, RunId, RunRecord, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -1844,6 +1845,122 @@ impl Engine {
         .await
     }
 
+    /// Every stored Policy (story 21-3, PRD FR-60), the `default` Policy
+    /// included, ordered by name. Reads only.
+    pub async fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .policies()
+                .map_err(RunError::Store)
+        })
+        .await
+    }
+
+    /// One stored Policy by name (story 21-3); [`RunError::PolicyNotFound`]
+    /// when none has it. Reads only.
+    pub async fn policy(&self, name: &str) -> Result<PolicyRecord, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .policy(&name)
+                .map_err(RunError::Store)?
+                .ok_or(RunError::PolicyNotFound { name })
+        })
+        .await
+    }
+
+    /// Create a Policy (story 21-3, PRD FR-60): Operator- or Host-set limits
+    /// for the Runs its Selector matches by bound label. Refused with
+    /// [`RunError::PolicyExists`] when the name is taken. The change applies
+    /// to every matched open Run at once — a ceiling at or below a Run's
+    /// usage breaches in the same writer job — and commits one `policy`
+    /// event. The outcome reports how many Runs matched and how many fall
+    /// back to `warn` at their Control Depth. `dry_run` plans and writes
+    /// nothing.
+    pub async fn create_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            if registry
+                .policy(&change.name)
+                .map_err(RunError::Store)?
+                .is_some()
+            {
+                return Err(RunError::PolicyExists { name: change.name });
+            }
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.change_policy(&registry, change, dry_run)
+        })
+        .await
+    }
+
+    /// Change a Policy, the `default` Policy included (story 21-3): set
+    /// limits, clear them, and (on `default`) edit the model-keyed Rate
+    /// table. [`RunError::PolicyNotFound`] when no Policy has the name.
+    /// Follows the latest: every matched open Run re-resolves at once; a
+    /// lowered ceiling at or below usage breaches, a raised one above usage
+    /// re-arms the latch and clears the matching `block` fence reasons.
+    /// `dry_run` plans and writes nothing.
+    pub async fn change_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            if registry
+                .policy(&change.name)
+                .map_err(RunError::Store)?
+                .is_none()
+            {
+                return Err(RunError::PolicyNotFound { name: change.name });
+            }
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.change_policy(&registry, change, dry_run)
+        })
+        .await
+    }
+
+    /// Delete a Policy (story 21-3); its matched Runs re-resolve under the
+    /// remaining Policies. The `default` Policy cannot be deleted.
+    /// `dry_run` reports the Runs it would re-resolve and writes nothing.
+    pub async fn delete_policy(
+        &self,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        let name = name.to_string();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            supervisor.delete_policy(&registry, &name, dry_run)
+        })
+        .await
+    }
+
     /// Attach a Memory Backing of `kind` to an Agent Instance (story 5-1,
     /// FR-15 / spine AD-11). The engine creates the managed directory inside the
     /// Agent Home (path authority — the returned path IS the engine's, `hekma`
@@ -2600,6 +2717,45 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::select_runs`].
     pub fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
+    }
+
+    /// Blocking twin of [`Engine::policies`].
+    pub fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
+        self.engine.rt.block_on(self.engine.policies())
+    }
+
+    /// Blocking twin of [`Engine::policy`].
+    pub fn policy(&self, name: &str) -> Result<PolicyRecord, RunError> {
+        self.engine.rt.block_on(self.engine.policy(name))
+    }
+
+    /// Blocking twin of [`Engine::create_policy`].
+    pub fn create_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.create_policy(change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::change_policy`].
+    pub fn change_policy(
+        &self,
+        change: PolicyChange,
+        dry_run: bool,
+    ) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.change_policy(change, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::delete_policy`].
+    pub fn delete_policy(&self, name: &str, dry_run: bool) -> Result<PolicyOutcome, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.delete_policy(name, dry_run))
     }
 
     /// Blocking [`Engine::reveal_secrets`] (story 2-4, AC-C/AC11). The

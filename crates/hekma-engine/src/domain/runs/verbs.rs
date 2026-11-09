@@ -29,7 +29,11 @@ use crate::domain::budget::BreachAction;
 /// A resolved action that cannot execute falls back to `warn` with the
 /// `depth-fallback` Anomaly (FR-60); it takes effect when the Run's depth
 /// allows it again.
-pub(crate) fn action_executable(depth: ControlDepth, wire_path: bool, action: BreachAction) -> bool {
+pub(crate) fn action_executable(
+    depth: ControlDepth,
+    wire_path: bool,
+    action: BreachAction,
+) -> bool {
     match action {
         BreachAction::Warn => true,
         BreachAction::Pause | BreachAction::Stop => depth == ControlDepth::Supervised,

@@ -16,9 +16,7 @@ use std::str::FromStr;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
-use crate::domain::runs::policy::{
-    PolicyRecord, RunPolicy, ScentCheckMode, DEFAULT_POLICY_NAME,
-};
+use crate::domain::runs::policy::{PolicyRecord, RunPolicy, ScentCheckMode, DEFAULT_POLICY_NAME};
 use crate::domain::{
     Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelOrigin, LabelSource, Micros,
     Rate, RunId, RunLimits, RunRecord, RunStatus, Selector,
@@ -378,7 +376,6 @@ impl BreachDefaultSource for NoBreachDefault {
         crate::domain::runs::ResolveInputs::default()
     }
 }
-
 
 /// The columns a [`RunRecord`] reads, joined to the instance name.
 const RUN_COLUMNS: &str = "r.run_id, r.control_depth, r.wire_path, r.status, r.anomalies, \
@@ -911,11 +908,9 @@ impl PolicyRecords for SqliteStore {
     fn policy(&self, name: &str) -> Result<Option<PolicyRecord>, StoreError> {
         let exists: Option<i64> = self
             .conn()
-            .query_row(
-                "SELECT 1 FROM policies WHERE name = ?1",
-                [name],
-                |row| row.get(0),
-            )
+            .query_row("SELECT 1 FROM policies WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
             .optional()
             .map_err(backend)?;
         Ok(match exists {
@@ -948,7 +943,10 @@ impl PolicyRecords for SqliteStore {
                 rusqlite::params![
                     record.name,
                     selector,
-                    record.limits.tokens_per_run.map(|v| v.min(i64::MAX as u64) as i64),
+                    record
+                        .limits
+                        .tokens_per_run
+                        .map(|v| v.min(i64::MAX as u64) as i64),
                     record
                         .limits
                         .tokens_cumulative
@@ -965,16 +963,15 @@ impl PolicyRecords for SqliteStore {
                     record.limits.scent_check.map(|m| m.as_str()),
                     rate.map(|r| r.input_micros_per_1m.min(i64::MAX as u64) as i64),
                     rate.map(|r| r.output_micros_per_1m.min(i64::MAX as u64) as i64),
-                    rate.and_then(|r| r.cached_micros_per_1m.map(|c| c.min(i64::MAX as u64) as i64)),
+                    rate.and_then(|r| r
+                        .cached_micros_per_1m
+                        .map(|c| c.min(i64::MAX as u64) as i64)),
                     now,
                 ],
             )
             .map_err(backend)?;
         self.conn()
-            .execute(
-                "DELETE FROM policy_rates WHERE policy = ?1",
-                [&record.name],
-            )
+            .execute("DELETE FROM policy_rates WHERE policy = ?1", [&record.name])
             .map_err(backend)?;
         for (model, rate) in &record.rates {
             self.conn()
@@ -986,7 +983,8 @@ impl PolicyRecords for SqliteStore {
                         model,
                         rate.input_micros_per_1m.min(i64::MAX as u64) as i64,
                         rate.output_micros_per_1m.min(i64::MAX as u64) as i64,
-                        rate.cached_micros_per_1m.map(|c| c.min(i64::MAX as u64) as i64),
+                        rate.cached_micros_per_1m
+                            .map(|c| c.min(i64::MAX as u64) as i64),
                     ],
                 )
                 .map_err(backend)?;
@@ -1024,10 +1022,11 @@ impl PolicyRecords for SqliteStore {
         inputs: &crate::domain::runs::ResolveInputs,
         at: &str,
     ) -> Result<(), StoreError> {
-        let resolution = serde_json::to_string(resolution).map_err(|err| StoreError::CorruptRow {
-            name: "run_policy".to_string(),
-            detail: format!("the resolution could not be serialized: {err}"),
-        })?;
+        let resolution =
+            serde_json::to_string(resolution).map_err(|err| StoreError::CorruptRow {
+                name: "run_policy".to_string(),
+                detail: format!("the resolution could not be serialized: {err}"),
+            })?;
         let inputs = serde_json::to_string(inputs).map_err(|err| StoreError::CorruptRow {
             name: "run_policy".to_string(),
             detail: format!("the resolution inputs could not be serialized: {err}"),
@@ -1124,15 +1123,7 @@ impl PolicyRecords for SqliteStore {
     fn run_resolution_facts(
         &self,
         run_id: &RunId,
-    ) -> Result<
-        Option<(
-            RunRecord,
-            Vec<Label>,
-            RunLimits,
-            bool,
-        )>,
-        StoreError,
-    > {
+    ) -> Result<Option<(RunRecord, Vec<Label>, RunLimits, bool)>, StoreError> {
         use crate::ports::RunRecords;
         let Some(record) = self.run_record(run_id)? else {
             return Ok(None);
@@ -1289,8 +1280,8 @@ fn decode_run_policy(
     inputs: &str,
     updated_at: &str,
 ) -> Result<RunPolicy, StoreError> {
-    let resolution: crate::domain::runs::PolicyResolution =
-        serde_json::from_str(resolution).map_err(|err| StoreError::CorruptRow {
+    let resolution: crate::domain::runs::PolicyResolution = serde_json::from_str(resolution)
+        .map_err(|err| StoreError::CorruptRow {
             name: "run_policy".to_string(),
             detail: format!("a stored resolution could not be decoded: {err}"),
         })?;
@@ -1305,5 +1296,3 @@ fn decode_run_policy(
         updated_at: updated_at.to_string(),
     })
 }
-
-

@@ -121,9 +121,12 @@ fn note<S: RunRecords + ?Sized>(
             .unwrap_or_default(),
         at: record.updated_at.clone(),
     });
-    changes
-        .entries
-        .push(super::snapshot::entry_of(record, &labels, limits, resolution.as_ref()));
+    changes.entries.push(super::snapshot::entry_of(
+        record,
+        &labels,
+        limits,
+        resolution.as_ref(),
+    ));
     Ok(())
 }
 

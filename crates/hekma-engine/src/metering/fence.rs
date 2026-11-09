@@ -71,8 +71,7 @@ impl WireFence {
     /// stays up (amendment 2, orchestrator review 2026-11-09). Called from
     /// a store-writer post-commit hook.
     pub(crate) fn clear(&self, reason: LatchKey) {
-        self.0
-            .fetch_and(!reason_bit(reason), Ordering::Release);
+        self.0.fetch_and(!reason_bit(reason), Ordering::Release);
     }
 
     /// The raised reasons, in [`FENCE_REASON_ORDER`] (the tests' view; the

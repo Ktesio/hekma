@@ -498,8 +498,7 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
         }
     }
     dollars.per_run = dollar_scope[0].map(|micros| crate::domain::cost::Micros(micros as i64));
-    dollars.cumulative =
-        dollar_scope[1].map(|micros| crate::domain::cost::Micros(micros as i64));
+    dollars.cumulative = dollar_scope[1].map(|micros| crate::domain::cost::Micros(micros as i64));
 
     // ---- The Breach Action: Run > instance (present-but-malformed fails
     // CLOSED to `pause` with a note, AD-7) > the upgrade marker's `pause` >
@@ -1324,13 +1323,10 @@ mod tests {
         let resolution = resolve(&input);
         assert_eq!(resolution.action, BreachAction::Pause);
         assert_eq!(resolution.effective_action, BreachAction::Warn);
-        let fallback = resolution.fallback.expect("fallback");
+        let fallback = resolution.fallback.clone().expect("fallback");
         assert_eq!(fallback.policy, "p");
         assert_eq!(fallback.action, BreachAction::Pause);
-        assert_eq!(
-            resolution.raised_anomalies(),
-            vec![Anomaly::DepthFallback]
-        );
+        assert_eq!(resolution.raised_anomalies(), vec![Anomaly::DepthFallback]);
 
         // The same action executes at the supervised depth, and `block`
         // needs a wire path even there.
@@ -1360,13 +1356,10 @@ mod tests {
         ];
         input.inputs.model = Some("gpt-demo".to_string());
         let resolution = resolve(&input);
-        let unpriced = resolution.unpriced.expect("unpriced");
+        let unpriced = resolution.unpriced.clone().expect("unpriced");
         assert_eq!(unpriced.model, "gpt-demo");
         assert_eq!(unpriced.policy, "p");
-        assert_eq!(
-            resolution.raised_anomalies(),
-            vec![Anomaly::UnpricedModel]
-        );
+        assert_eq!(resolution.raised_anomalies(), vec![Anomaly::UnpricedModel]);
         // An explicit-instance cap with no Rate keeps the documented
         // inert-with-notice (no Anomaly — FR-20).
         input.policies[1].limits.dollars_per_run_micros = None;

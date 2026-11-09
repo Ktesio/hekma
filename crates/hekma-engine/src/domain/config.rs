@@ -1053,10 +1053,12 @@ pub(crate) fn read_breach_action(effective: &EffectiveConfig) -> ActionRead {
 pub(crate) fn explicit_limits(effective: &EffectiveConfig) -> crate::domain::runs::ResolveInputs {
     let action = match read_breach_action(effective) {
         ActionRead::Present(action) => Some(action),
-        ActionRead::Malformed(raw) => return crate::domain::runs::ResolveInputs {
-            malformed_action: Some(raw),
-            ..crate::domain::runs::ResolveInputs::default()
-        },
+        ActionRead::Malformed(raw) => {
+            return crate::domain::runs::ResolveInputs {
+                malformed_action: Some(raw),
+                ..crate::domain::runs::ResolveInputs::default()
+            }
+        }
         ActionRead::Absent => None,
     };
     let (rate, cap, _) = resolve_cost(effective);

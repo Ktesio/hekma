@@ -39,9 +39,9 @@ pub mod verbs;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use policy::{
-    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent,
-    PolicyEventKind, PolicyLimits, PolicyRecord, PolicyResolution, ResolutionInput, ResolveInputs,
-    RunPolicy, ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
+    PolicyLimits, PolicyRecord, PolicyResolution, ResolutionInput, ResolveInputs, RunPolicy,
+    ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
 pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
@@ -64,7 +64,9 @@ pub const HOST_IDENTITY_BINDING: &str = "host";
 /// with `wire_path: false` on every surface (AD-25). `Default` is the
 /// ladder's lowest rung (a resolution input with no depth named resolves
 /// the least control).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum ControlDepth {
     /// Known from its telemetry or announcement only.
@@ -703,6 +705,21 @@ pub enum RunError {
         /// [`MAX_SELECTED_RUNS`].
         max: usize,
     },
+    /// No Policy has this name (story 21-3).
+    #[error("no Policy is named `{name}`")]
+    PolicyNotFound {
+        /// The name asked for.
+        name: String,
+    },
+    /// A Policy with this name already exists (story 21-3): change it
+    /// instead of creating it again.
+    #[error(
+        "a Policy named `{name}` already exists — change it with `hekma policy change {name}`"
+    )]
+    PolicyExists {
+        /// The existing Policy's name.
+        name: String,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -732,6 +749,8 @@ impl RunError {
             RunError::LabelNotBound { .. } => "label-not-bound",
             RunError::LabelBound { .. } => "label-bound",
             RunError::TooManyRuns { .. } => "too-many-runs",
+            RunError::PolicyNotFound { .. } => "policy-not-found",
+            RunError::PolicyExists { .. } => "policy-exists",
             RunError::Invalid { .. } => "invalid-request",
             RunError::Store(_) => "store",
         }

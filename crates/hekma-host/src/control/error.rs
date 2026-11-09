@@ -306,9 +306,11 @@ impl From<RunError> for ApiError {
     fn from(err: RunError) -> Self {
         let message = err.to_string();
         let kind = match &err {
-            RunError::NotFound { .. } | RunError::InstanceNotFound { .. } => {
-                ApiErrorKind::NotFound
-            }
+            RunError::NotFound { .. }
+            | RunError::InstanceNotFound { .. }
+            | RunError::PolicyNotFound { .. } => ApiErrorKind::NotFound,
+            // Story 21-3: the name is already taken.
+            RunError::PolicyExists { .. } => ApiErrorKind::Conflict,
             // The Run's (or its parent's) state forbids the request.
             RunError::NoOpenRun { .. }
             | RunError::ParentEnded { .. }

@@ -225,6 +225,13 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         }
         .into(),
         RunError::InstanceNotFound { .. } => instance_not_found(message),
+        // Story 21-3: an unknown Policy is not found (3); a taken name is a
+        // request that cannot be honored (2).
+        RunError::PolicyNotFound { .. } => RunNotFound {
+            message: format!("{message}. List them with `hekma policy list`."),
+        }
+        .into(),
+        RunError::PolicyExists { .. } => RunInvalid { message }.into(),
         RunError::NestingTooDeep { .. }
         | RunError::ActionUnavailable { .. }
         | RunError::TooManyRuns { .. }

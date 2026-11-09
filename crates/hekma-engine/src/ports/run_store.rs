@@ -162,8 +162,12 @@ pub(crate) trait RunStore {
 
     /// Unlatch one `(dimension, scope)` under `action` (the raise re-arm,
     /// story 21-3): the pair may fire again under the same action.
-    fn unlatch(&self, run_id: &RunId, key: LatchKey, action: BreachAction)
-        -> Result<(), StoreError>;
+    fn unlatch(
+        &self,
+        run_id: &RunId,
+        key: LatchKey,
+        action: BreachAction,
+    ) -> Result<(), StoreError>;
 
     /// Every latch recorded for a Run.
     fn latches(&self, run_id: &RunId) -> Result<Vec<(LatchKey, BreachAction)>, StoreError>;

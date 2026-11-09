@@ -1042,7 +1042,7 @@ impl Supervisor {
     /// executes its action in commit order, as before: when a token breach
     /// already paused the instance, the dollar breach's pause meets the
     /// transition gate and says so on the diagnostic surface.
-    fn apply_evaluation(
+    pub(super) fn apply_evaluation(
         &mut self,
         registry: &Registry,
         name: &InstanceName,

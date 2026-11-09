@@ -149,6 +149,133 @@ impl Supervisor {
         }
     }
 
+    /// The live per-instance context a Policy change's money half needs
+    /// (story 21-3): each supervised instance's wire fence (when it has a
+    /// metering listener) and its metering source.
+    fn policy_contexts(
+        &self,
+    ) -> std::collections::HashMap<String, crate::domain::registry_policy::InstanceContext> {
+        self.running
+            .iter()
+            .map(|(name, supervised)| {
+                (
+                    name.as_str().to_string(),
+                    crate::domain::registry_policy::InstanceContext {
+                        fence: supervised
+                            .observed_listener
+                            .as_ref()
+                            .map(crate::metering::ObservedListener::fence),
+                        metering_source: supervised.metering_source.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Create or change a Policy (story 21-3, PRD FR-60): one writer job
+    /// re-resolves every matched open Run, fires a breach at once where a
+    /// lowered ceiling is at or below usage and re-arms where a raised one
+    /// is above it. The committed events are published here and the
+    /// breaches' process actions executed (D2: the caller applies them).
+    /// `dry_run` plans the change, reporting the matched and fallback
+    /// counts, and writes nothing.
+    pub(crate) fn change_policy(
+        &mut self,
+        registry: &Registry,
+        change: crate::domain::PolicyChange,
+        dry_run: bool,
+    ) -> Result<crate::domain::PolicyOutcome, RunError> {
+        let existing = registry.policy(&change.name).map_err(RunError::Store)?;
+        if dry_run {
+            return registry.plan_policy_change(existing.as_ref(), &change);
+        }
+        let applied = registry.apply_policy_change(existing, change, self.policy_contexts())?;
+        Ok(self.finish_policy_applied(registry, applied))
+    }
+
+    /// Delete a Policy (story 21-3): its matched Runs re-resolve under the
+    /// remaining set. The `default` Policy is refused. `dry_run` reports the
+    /// Runs the delete would re-resolve and writes nothing.
+    pub(crate) fn delete_policy(
+        &mut self,
+        registry: &Registry,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<crate::domain::PolicyOutcome, RunError> {
+        let existing = registry
+            .policy(name)
+            .map_err(RunError::Store)?
+            .ok_or_else(|| RunError::PolicyNotFound {
+                name: name.to_string(),
+            })?;
+        if dry_run {
+            if existing.is_default() {
+                return Err(RunError::Invalid {
+                    field: "name".to_string(),
+                    reason: "the default Policy cannot be deleted — change it instead (it is the \
+                             fallback every Run resolves through)"
+                        .to_string(),
+                });
+            }
+            let plan = registry.plan_policy_change(
+                Some(&existing),
+                &crate::domain::PolicyChange {
+                    name: existing.name.clone(),
+                    ..Default::default()
+                },
+            )?;
+            return Ok(crate::domain::PolicyOutcome {
+                record: None,
+                ..plan
+            });
+        }
+        let applied = registry.apply_policy_delete(existing, self.policy_contexts())?;
+        Ok(self.finish_policy_applied(registry, applied))
+    }
+
+    /// Publish what a committed Policy write produced, in commit order (the
+    /// Policy event, the Runs it re-resolved, then the breaches it fired),
+    /// and execute each breach's process action through the lifecycle.
+    fn finish_policy_applied(
+        &mut self,
+        registry: &Registry,
+        applied: crate::domain::registry_policy::PolicyApplied,
+    ) -> crate::domain::PolicyOutcome {
+        for (event, outbox) in applied.events {
+            self.note_outbox_append(&outbox);
+            self.publish(crate::domain::EngineEvent::Policy(event));
+        }
+        self.publish_run_events(applied.run_events);
+        let mut by_instance: std::collections::BTreeMap<
+            String,
+            Vec<crate::domain::pipeline::CommittedBreach>,
+        > = std::collections::BTreeMap::new();
+        for breach in applied.breaches {
+            by_instance
+                .entry(breach.event.instance.clone())
+                .or_default()
+                .push(breach);
+        }
+        for (instance, breaches) in by_instance {
+            match InstanceName::new(&instance) {
+                Ok(name) => self.apply_evaluation(
+                    registry,
+                    &name,
+                    crate::domain::pipeline::Evaluation {
+                        breaches,
+                        ..Default::default()
+                    },
+                ),
+                Err(err) => self.emit_diagnostic(&format!(
+                    "a Policy change fired a breach on `{instance}`, which is not a valid \
+                     instance name ({err}); the breach is recorded but its action was not \
+                     executed"
+                )),
+            }
+        }
+        applied.outcome
+    }
+
     /// Open a child Run (FR-43, FR-49) and publish its `created` event.
     pub(crate) fn open_child_run(
         &self,

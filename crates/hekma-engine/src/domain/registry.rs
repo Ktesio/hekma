@@ -21,9 +21,9 @@ use hekma_adapter_api::{
 use crate::adapter::{self, AdapterRef, ResolvedAdapter, StartLaunch};
 use crate::paths::EnginePaths;
 use crate::ports::RunStore;
-use crate::ports::{PolicyRecords, 
+use crate::ports::{
     CompositeSecretResolver, GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus,
-    SecretError, SpawnRecord, StateStore, StoreError,
+    PolicyRecords, SecretError, SpawnRecord, StateStore, StoreError,
 };
 use crate::store::{LegacyLogs, LegacyOutbox, LegacySource, SqliteStore, StoreWriter};
 use crate::time::now_rfc3339;
@@ -297,14 +297,17 @@ impl Registry {
         // Story 21-3: the v15 step reads the persisted config layers
         // through the REAL resolution (engine defaults, kind defaults,
         // instance config.toml) to build the FR-21 upgrade's pending list.
-        let (write_store, notes) =
-            SqliteStore::open_with_legacy(&paths.state_db(), &legacy, &super::registry_policy::RegistryBreachDefault)
-                .map_err(|err| match err {
-                    StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
-                        RegistryError::OutboxOpenRefused { detail }
-                    }
-                    other => RegistryError::Store(other),
-                })?;
+        let (write_store, notes) = SqliteStore::open_with_legacy(
+            &paths.state_db(),
+            &legacy,
+            &super::registry_policy::RegistryBreachDefault,
+        )
+        .map_err(|err| match err {
+            StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
+                RegistryError::OutboxOpenRefused { detail }
+            }
+            other => RegistryError::Store(other),
+        })?;
         legacy.retire_outbox_files();
         let writer = StoreWriter::spawn(write_store)?;
         let store = SqliteStore::open_read_only(&paths.state_db())?;
@@ -332,9 +335,7 @@ impl Registry {
             writer,
             open_notes: std::sync::Mutex::new(notes),
             run_snapshot,
-            policies: std::sync::Arc::new(
-                crate::domain::runs::policy::PolicyCache::default(),
-            ),
+            policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
         };
         // Story 21-3: the cached policy set loads, the FR-21 upgrade
@@ -355,7 +356,10 @@ impl Registry {
     /// the write just set, and the note clears on the next write).
     pub(crate) fn clear_breach_default_marker(&self, name: &InstanceName) -> Option<String> {
         let instance = name.as_str().to_string();
-        match self.writer.call(move |ctx| ctx.store().clear_breach_default(&instance)) {
+        match self
+            .writer
+            .call(move |ctx| ctx.store().clear_breach_default(&instance))
+        {
             Ok(()) => None,
             Err(err) => Some(format!(
                 "the upgrade note could not be cleared ({err}); the action already resolves \
@@ -1617,7 +1621,9 @@ impl Registry {
     /// Holding the returned [`std::fs::File`] IS holding the lock — drop ends
     /// it. The residue file itself is intentionally left behind (the
     /// `host.lock` precedent: the LOCK decides, never the content).
-    pub(crate) fn acquire_config_write_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    pub(crate) fn acquire_config_write_lock(
+        path: &std::path::Path,
+    ) -> Result<std::fs::File, String> {
         use std::io::Write;
         let file = std::fs::OpenOptions::new()
             .read(true)
