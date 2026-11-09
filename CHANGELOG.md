@@ -4,6 +4,19 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — Policies and the `warn` default (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **The default Breach Action is now `warn`.** A breach with no Breach Action configured is recorded, raises the Run's `breach` Anomaly and is published, and acts on nothing. `pause`, `stop` and `block` stay opt-in.
+> - **Upgrades keep your pause.** The first open of an upgraded state directory writes `budget.breach_action = "pause"` into the configuration of every agent that relied on the old implicit default, records one `breach-default-upgraded` event, and shows a "kept on pause by upgrade" note until a Breach Action is set explicitly. An agent whose configuration cannot be written still pauses. A malformed `breach_action` fails closed to `pause` with a diagnostic.
+> - **Policies.** `hekma policy list|show|create|change|delete` (and `/v0/policies` on the Control API, Operator bearer) set Token Budgets, Cost Caps, a flat Rate and a Breach Action for every Run a `--selector` matches by **bound** label. Each limit resolves on its own: explicit limits on the Run or the agent first, then the most specific matching Selector (a tie goes to the tightest value), then the stored `default` Policy. `--dry-run` reports the matched Runs and how many fall back to `warn` at their Control Depth.
+> - **The `default` Policy** is stored and editable: no ceiling, `warn`, Scent-Check Mode `off`, and a model-keyed Rate table that starts empty (`hekma policy change default --rate-for <model> --rate-input … --rate-output …`). A Policy Cost Cap on a model with no Rate raises the `unpriced-model` Anomaly instead of staying silently inert.
+> - **Changes apply at once.** A Policy change re-resolves every matched open Run: a ceiling lowered to or below usage breaches now, a raised one re-arms the latch and lifts the matching `block` fence reason on a live Run.
+> - **Fallback.** A Policy Breach Action a Run's Control Depth cannot execute acts as `warn` and raises the `depth-fallback` Anomaly.
+> - **Events.** The bus, SSE and export carry two new event kinds, `policy` (created, changed, deleted, with the matched and fallback counts) and `breach-default-upgraded`. The OTLP v1 export ignores them.
+> - **One-way upgrade.** The first open migrates `state.db` to schema 15. An older engine refuses the migrated state dir.
+> - **Breaking engine surface within the unreleased `hekma-engine` 0.12.0:** `EngineEvent` gains `Policy` and `BreachDefaultUpgraded`, `Anomaly` gains `UnpricedModel` and `RunError` gains `PolicyNotFound` and `PolicyExists` (exhaustive public enums). Additive: `Engine::policies`, `policy`, `create_policy`, `change_policy`, `delete_policy` (async and blocking), `PolicyChange`, `PolicyOutcome`, `PolicyRecord`, `PolicyLimits`, `PolicyEvent`, `ScentCheckMode` and the resolution types.
+
 > **Unreleased — bound labels: `hekma label` (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
