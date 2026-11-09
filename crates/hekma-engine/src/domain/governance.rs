@@ -1913,6 +1913,153 @@ mod tests {
     }
 
     #[test]
+    fn checksum_file_content_renders_the_sha256sum_c_line_for_any_bytes() {
+        // The bless lever's sidecar writer, pinned OUTSIDE the lever (the
+        // lever never fires in CI): for arbitrary canonical bytes the line
+        // is `<64-char lowercase hex digest>  <repo-relative artifact
+        // path>` + one newline — exactly the `sha256sum -c` contract the
+        // repo-root gate verifies in place.
+        let line = checksum_file_content("stable canonical bytes");
+        let (hex, rest) = line
+            .split_once("  ")
+            .expect("the digest and the path are separated by two spaces");
+        assert_eq!(hex.len(), 64);
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "the digest must be 64 lowercase hex characters"
+        );
+        assert_eq!(rest, format!("{GOVERNANCE_VECTORS_ARTIFACT_PATH}\n"));
+        // The digest itself must be the artifact digest of THOSE bytes (not
+        // of the committed artifact): independently recomputed.
+        assert_eq!(
+            hex,
+            crate::sha256::to_hex(&crate::sha256::digest("stable canonical bytes".as_bytes()))
+        );
+    }
+
+    /// The wire form every `CoverTag` variant must render on BOTH surfaces,
+    /// with a distinct index per arm. The exhaustive `match` ties this table
+    /// to the enum itself: a variant added later fails THIS compilation
+    /// until it is mapped — and takes the next index — so the sweep below
+    /// can never silently skip a member of the closed set.
+    fn exhaustive_wire_form(tag: &CoverTag) -> (usize, &'static str) {
+        match tag {
+            CoverTag::ThresholdGe => (0, "threshold-ge"),
+            CoverTag::LatchPerScope => (1, "latch-per-scope"),
+            CoverTag::LatchReArm => (2, "latch-re-arm"),
+            CoverTag::TokenBeforeDollar => (3, "token-before-dollar"),
+            CoverTag::IntegerMicros => (4, "integer-micros"),
+            CoverTag::RoundHalfUp => (5, "round-half-up"),
+            CoverTag::Saturation => (6, "saturation"),
+            CoverTag::NoRetroRepricing => (7, "no-retro-repricing"),
+            CoverTag::BlockFence => (8, "block-fence"),
+            CoverTag::AncestorCeilings => (9, "ancestor-ceilings"),
+        }
+    }
+
+    #[test]
+    fn cover_tag_as_str_matches_the_serde_wire_form_for_every_variant() {
+        // The closed rule set's tags travel on TWO surfaces — the `as_str`
+        // accessor and serde's kebab-case rename — and the verifier's
+        // `ALL_COVERS` match relies on them never drifting apart. The
+        // enumeration is the exhaustive map above (compiler-tied to the
+        // enum), swept through the canonical `ALL_COVERS` set: every member
+        // round-trips wire form → tag → wire form on BOTH surfaces. The
+        // membership direction — every ENUM variant present in
+        // `ALL_COVERS` — is pinned separately in
+        // `all_covers_carries_every_enum_variant_exactly_once`.
+        for tag in ALL_COVERS {
+            let expected = exhaustive_wire_form(tag).1;
+            assert_eq!(tag.as_str(), expected);
+            let json = serde_json::to_string(tag).unwrap();
+            assert_eq!(json, format!("\"{expected}\""));
+            let back: CoverTag = serde_json::from_str(&json)
+                .unwrap_or_else(|err| panic!("wire form must deserialize: {err}"));
+            assert_eq!(back, *tag);
+        }
+    }
+
+    /// The full variant listing as serde itself reports it: the derived
+    /// deserializer names every variant in its unknown-variant error, so
+    /// the listing cannot go stale when the enum grows — unlike a
+    /// hand-written one. This is the honest variant count the `ALL_COVERS`
+    /// membership check needs. The parse below depends on serde_json's
+    /// exact error wording — the ` at line ` suffix cut, the `expected`
+    /// separator, and the backtick-quoted variant segments — so a
+    /// serde_json message rewording surfaces here as a red listing
+    /// assert, not as a silent gap.
+    fn every_wire_form_from_serde() -> Vec<String> {
+        let err = serde_json::from_str::<CoverTag>("\"__not_a_variant__\"")
+            .expect_err("the sentinel tag must fail to deserialize");
+        let message = err.to_string();
+        let message = &message[..message.find(" at line ").unwrap_or(message.len())];
+        let (_, listed) = message
+            .rsplit_once("expected")
+            .expect("the unknown-variant error names the expected variants");
+        // The tail reads " one of `a`, `b`, …" — the backtick-quoted
+        // segments are the variant wire forms.
+        listed
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn all_covers_carries_every_enum_variant_exactly_once() {
+        // The wire-form sweep visits only what `ALL_COVERS` already
+        // carries, so a variant added to the enum — compile-forcing its
+        // map arm — but left OUT of `ALL_COVERS` would silently escape
+        // both the sweep and the verifier's closed set (its rule would
+        // need no committed case). Enumerate the enum through serde's own
+        // error listing and require the two surfaces to agree exactly:
+        // every arm index 0..N appears once per surface, no gaps, no
+        // strays.
+        let wire_forms = every_wire_form_from_serde();
+        assert!(
+            wire_forms.len() > 1,
+            "serde must list the variants, got {wire_forms:?}"
+        );
+
+        let mut enum_indices: Vec<usize> = wire_forms
+            .iter()
+            .map(|wire| {
+                let tag: CoverTag = serde_json::from_str(&format!("\"{wire}\""))
+                    .expect("serde's own listing must deserialize");
+                let (index, mapped) = exhaustive_wire_form(&tag);
+                assert_eq!(
+                    mapped,
+                    wire.as_str(),
+                    "the exhaustive map disagrees with serde's listing"
+                );
+                index
+            })
+            .collect();
+        enum_indices.sort_unstable();
+        let variant_count = wire_forms.len();
+        assert_eq!(
+            enum_indices,
+            (0..variant_count).collect::<Vec<_>>(),
+            "every arm index 0..N exactly once: a new variant takes the next index"
+        );
+
+        let mut covers_indices: Vec<usize> = ALL_COVERS
+            .iter()
+            .map(|tag| exhaustive_wire_form(tag).0)
+            .collect();
+        covers_indices.sort_unstable();
+        assert_eq!(
+            covers_indices,
+            (0..variant_count).collect::<Vec<_>>(),
+            "ALL_COVERS must carry every enum variant exactly once: sorted \
+             indices must equal 0..N with no duplicate and no gap, which also \
+             pins ALL_COVERS.len() to the variant count"
+        );
+    }
+
+    #[test]
     fn every_committed_case_reruns_exactly_against_the_real_functions() {
         // VERIFIER (c) — the HOST'S PIN, executed by the engine itself:
         // parse the COMMITTED bytes and re-run every case against the real

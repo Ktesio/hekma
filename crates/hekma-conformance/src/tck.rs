@@ -7259,7 +7259,10 @@ source = "self-reported"
         facade.start("tck-slowbeat").expect("start slowbeat");
         let reason = prove_heartbeat_freeze(&facade, "tck-slowbeat", Duration::from_millis(400))
             .expect("a never-beating probe must be reported");
-        assert!(reason.contains("heartbeat never started"), "{reason}");
+        assert!(
+            reason.contains("heartbeat never started") && reason.contains("tck-slowbeat"),
+            "{reason}"
+        );
         let _ = facade.stop("tck-slowbeat", Some(Duration::from_secs(5)));
     }
 
@@ -9753,5 +9756,123 @@ env = "TCK_SUBJECT_MEMORY"
         assert_eq!(back.schema_version, REPORT_SCHEMA_VERSION);
         assert_eq!(back.adapter_kind, "old");
         assert_eq!(back.contract_version, "", "empty = produced pre-field");
+    }
+
+    // ------------------------------------------------------------------
+    // heartbeat_freeze_inner's lie-detection arms. The harness only ever
+    // runs the freeze proof on its OWN signal-path probe (guaranteed, no
+    // command pair); these pin the DETECTION directly — a misbehaving
+    // probe of each documented lie shape must trip the named arm, never
+    // pass vacuously. Both drive the private pipeline fn through a
+    // real engine, mirroring how the section runner would call it.
+    // ------------------------------------------------------------------
+
+    /// The lying cooperative-pause subject: a declared
+    /// `[lifecycle.pause]`/`[lifecycle.resume]` command pair makes the
+    /// engine's cooperative-first dispatch run the SUBJECT'S commands (the
+    /// state reaches Paused without any signal) — a subject that keeps
+    /// beating while "paused" is exactly the lie the 1s watch exists to
+    /// catch.
+    #[test]
+    fn heartbeat_freeze_detects_a_subject_that_keeps_beating_while_paused() {
+        let state = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-lying-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-lying-m-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-lying-pause",
+            &["--heartbeat-ms", "50", "--linger-ms", "600000"],
+        )
+        .guaranteed_on_all_oses("pause")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "tck-lying-pause",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .expect("register lying probe");
+        facade.start("tck-lying-pause").expect("start lying probe");
+        wait_for_state(
+            &facade,
+            "tck-lying-pause",
+            LifecycleState::Running,
+            Duration::from_secs(10),
+        )
+        .expect("lying probe reaches running");
+        let verdict = heartbeat_freeze_inner(&facade, "tck-lying-pause", Duration::from_secs(5));
+        let _ = facade.stop("tck-lying-pause", Some(Duration::from_secs(5)));
+        let err = verdict
+            .expect_err("a subject that keeps beating while Paused must fail the freeze watch");
+        assert!(
+            err.contains("heartbeat must NOT grow while paused"),
+            "the failure must name the grows-while-paused arm: {err}"
+        );
+    }
+
+    /// The resume-lying subject (`--heartbeat-stop-on-pause`): it OBEYS the
+    /// pause — the heartbeat freezes when the pause command's sentinel
+    /// lands, so the whole paused window reads flat — then never resumes
+    /// beating after the resume command runs. Resume still reaches Running;
+    /// the post-resume growth wait must be the arm that names the lie.
+    #[test]
+    fn heartbeat_freeze_detects_a_subject_that_never_resumes_beating() {
+        let state = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-dead-")
+            .tempdir()
+            .expect("tempdir");
+        let manifest = tempfile::Builder::new()
+            .prefix("ktesio-tck-hb-dead-m-")
+            .tempdir()
+            .expect("tempdir");
+        crate::test_support::ManifestFixture::new(
+            "tck-dead-resume",
+            &[
+                "--heartbeat-ms",
+                "50",
+                "--linger-ms",
+                "600000",
+                "--heartbeat-stop-on-pause",
+                "pause.sentinel",
+            ],
+        )
+        .guaranteed_on_all_oses("pause")
+        .touch_pair("pause.sentinel", "resume.sentinel")
+        .write(manifest.path());
+        let engine = Engine::open(Some(state.path().to_path_buf())).expect("open engine");
+        let facade = engine.blocking();
+        facade
+            .register_with_adapter(
+                "tck-dead-resume",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .expect("register dead-resume probe");
+        facade
+            .start("tck-dead-resume")
+            .expect("start dead-resume probe");
+        wait_for_state(
+            &facade,
+            "tck-dead-resume",
+            LifecycleState::Running,
+            Duration::from_secs(10),
+        )
+        .expect("dead-resume probe reaches running");
+        // The budget bounds BOTH bounded waits; 700ms is generous for the
+        // 50ms startup beats and still short for the stuck-growth wait.
+        let verdict =
+            heartbeat_freeze_inner(&facade, "tck-dead-resume", Duration::from_millis(700));
+        let _ = facade.stop("tck-dead-resume", Some(Duration::from_secs(5)));
+        let err = verdict
+            .expect_err("a subject that never resumes beating must fail the post-resume wait");
+        assert!(
+            err.contains("heartbeat must resume growing after SIGCONT"),
+            "the failure must name the stuck-after-resume arm: {err}"
+        );
     }
 }
