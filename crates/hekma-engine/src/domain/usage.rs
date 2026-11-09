@@ -72,7 +72,7 @@ impl RunId {
             .unwrap_or_default();
         let millis = (now.as_millis() as u64) & ((1 << 48) - 1);
         let mut random = [0u8; 10];
-        if getrandom::getrandom(&mut random).is_err() {
+        if getrandom::fill(&mut random).is_err() {
             let nonce = RUN_NONCE.fetch_add(1, Ordering::Relaxed);
             random[..4].copy_from_slice(&now.subsec_nanos().to_be_bytes());
             random[4..].copy_from_slice(&nonce.to_be_bytes()[2..]);
