@@ -772,6 +772,7 @@ fn policy_change_document(
         policy: outcome.record,
         matched: outcome.matched,
         fallbacks: outcome.fallbacks,
+        notes: outcome.notes,
         dry_run,
     }
 }

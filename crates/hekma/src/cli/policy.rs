@@ -294,6 +294,7 @@ fn print_outcome(
                 "policy": outcome.record,
                 "matched": outcome.matched,
                 "fallbacks": outcome.fallbacks,
+                "notes": outcome.notes,
                 "dry_run": dry_run,
             }))?
         );
@@ -308,6 +309,9 @@ fn print_outcome(
         "{lead}: {} open Run(s) matched, {} fall back to `warn` at their Control Depth",
         outcome.matched, outcome.fallbacks
     );
+    for note in &outcome.notes {
+        eprintln!("note: {note}");
+    }
     Ok(())
 }
 
@@ -326,6 +330,11 @@ fn outcome_from(document: Option<Value>) -> PolicyOutcome {
             .get("fallbacks")
             .and_then(Value::as_u64)
             .unwrap_or_default() as usize,
+        notes: document
+            .get("notes")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
     }
 }
 

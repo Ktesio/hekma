@@ -69,6 +69,11 @@ pub struct PolicyOutcome {
     pub matched: usize,
     /// How many matched Runs fall back to `warn` at their depth.
     pub fallbacks: usize,
+    /// Runs the change could not re-resolve (their instance's configuration
+    /// could not be read), each named with the reason. Those Runs keep
+    /// their previous resolution; enforcement still resolves live at every
+    /// usage event.
+    pub notes: Vec<String>,
 }
 
 /// The live per-instance context the policy-change job's money half needs
@@ -82,6 +87,10 @@ pub(crate) struct InstanceContext {
     pub fence: Option<WireFence>,
     /// The instance's metering source (the breach records name it).
     pub metering_source: String,
+    /// The instance's explicit limits and model, read fresh from its
+    /// configuration by the caller; `Err` names why they could not be read
+    /// (the Run is then skipped, never resolved as if nothing were set).
+    pub inputs: Option<Result<ResolveInputs, String>>,
 }
 
 impl Registry {
@@ -128,6 +137,16 @@ impl Registry {
     /// The caller-resolved instance facts (explicit config limits + the
     /// model key), reading the instance's effective config. An unreadable
     /// or unknown instance resolves empty (no explicit limits).
+    pub(crate) fn try_resolve_inputs_for(&self, instance: &str) -> Result<ResolveInputs, String> {
+        let name = InstanceName::new(instance).map_err(|err| err.to_string())?;
+        self.effective_config(&name, ConfigLayer::empty())
+            .map(|effective| config::explicit_limits(&effective))
+            .map_err(|err| err.to_string())
+    }
+
+    /// The infallible read: an unreadable or unknown instance resolves
+    /// empty. Never use it where a missing explicit limit could let a
+    /// Policy act (use [`Self::try_resolve_inputs_for`]).
     pub(crate) fn resolve_inputs_for(&self, instance: &str) -> ResolveInputs {
         InstanceName::new(instance)
             .ok()
@@ -288,6 +307,7 @@ impl Registry {
             record: Some(record),
             matched,
             fallbacks,
+            notes: Vec::new(),
         })
     }
 
@@ -317,9 +337,7 @@ impl Registry {
         }
         let selector = record.selector.clone().expect("validated");
         self.store
-            .snapshot(move |store| {
-                store.select_runs(&selector, crate::domain::runs::MAX_SELECTED_RUNS)
-            })
+            .snapshot(move |store| policy_matched_runs(store, &selector))
             .map_err(RunError::Store)
     }
 
@@ -420,6 +438,7 @@ impl Registry {
                             record: Some(record.clone()),
                             matched: outcome.matched,
                             fallbacks: outcome.fallbacks,
+                            notes: outcome.notes.clone(),
                         },
                         events: vec![(event, append)],
                         breaches,
@@ -513,6 +532,7 @@ impl Registry {
                             record: None,
                             matched: outcome.matched,
                             fallbacks: outcome.fallbacks,
+                            notes: outcome.notes.clone(),
                         },
                         events: vec![(event, append)],
                         breaches,
@@ -767,31 +787,45 @@ fn re_resolve_matched(
 ) -> Result<(PolicyOutcome, RunChanges, Vec<CommittedBreach>), RunError> {
     let matched: Vec<RunRecord> = match selector {
         None => store.open_runs().map_err(RunError::Store)?,
-        Some(selector) => store
-            .select_runs(selector, crate::domain::runs::MAX_SELECTED_RUNS)
-            .map_err(RunError::Store)?,
+        Some(selector) => policy_matched_runs(store, selector).map_err(RunError::Store)?,
     };
+    let mut notes = Vec::new();
     let policies: Vec<PolicyRecord> = store.policies().map_err(RunError::Store)?;
     let mut fallbacks = 0;
     let mut changes = RunChanges::default();
     let mut breaches = Vec::new();
     let at = now_rfc3339();
     for run in &matched {
-        let inputs = run
-            .instance
-            .as_deref()
-            .map(|instance| {
-                // The Run's stored inputs: a Policy change cannot change
-                // the instance's explicit limits, and the config-write path
-                // re-resolves with fresh ones.
-                store
-                    .run_policy(&run.run_id)
-                    .ok()
-                    .flatten()
-                    .map(|row| row.inputs)
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
+        // The instance's explicit limits (money code, AD-7: fail closed).
+        // Fresh from the configuration when the caller read them; else the
+        // Run's stored inputs. A Run whose inputs cannot be known is
+        // SKIPPED with a note — resolving it as "nothing set" would let a
+        // Policy fill (and breach on) a limit the instance set explicitly.
+        let inputs = match run.instance.as_deref() {
+            None => ResolveInputs::default(),
+            Some(instance) => match contexts.get(instance).and_then(|c| c.inputs.clone()) {
+                Some(Ok(inputs)) => inputs,
+                Some(Err(reason)) => {
+                    notes.push(format!(
+                        "Run `{}` (agent `{instance}`) was not re-resolved: its configuration \
+                         could not be read ({reason})",
+                        run.run_id.as_str()
+                    ));
+                    continue;
+                }
+                None => match store.run_policy(&run.run_id).map_err(RunError::Store)? {
+                    Some(row) => row.inputs,
+                    None => {
+                        notes.push(format!(
+                            "Run `{}` (agent `{instance}`) was not re-resolved: it has no \
+                             stored resolution and its agent is not supervised here",
+                            run.run_id.as_str()
+                        ));
+                        continue;
+                    }
+                },
+            },
+        };
         let kept = run
             .instance
             .as_deref()
@@ -845,6 +879,7 @@ fn re_resolve_matched(
             record: None,
             matched: matched.len(),
             fallbacks,
+            notes,
         },
         changes,
         breaches,
@@ -1061,4 +1096,23 @@ impl BreachDefaultSource for RegistryBreachDefault {
         let effective = config::resolve([engine, kind_layer, instance, ConfigLayer::empty()]);
         config::explicit_limits(&effective)
     }
+}
+
+/// The non-ended Runs a Policy Selector matches: every term against BOUND
+/// labels only (PRD FR-60 — a Caller label never selects a Policy), with no
+/// cap, so a Policy change reaches every Run it governs.
+fn policy_matched_runs(
+    store: &crate::store::SqliteStore,
+    selector: &Selector,
+) -> Result<Vec<RunRecord>, crate::ports::StoreError> {
+    use crate::ports::RunRecords;
+    let candidates = store.select_runs(selector, usize::MAX)?;
+    let mut matched = Vec::with_capacity(candidates.len());
+    for run in candidates {
+        let labels = store.run_labels(&run.run_id)?;
+        if selector.matches(&labels, crate::domain::runs::SelectorScope::BoundOnly) {
+            matched.push(run);
+        }
+    }
+    Ok(matched)
 }

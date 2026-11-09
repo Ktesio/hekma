@@ -154,6 +154,7 @@ impl Supervisor {
     /// metering listener) and its metering source.
     fn policy_contexts(
         &self,
+        registry: &Registry,
     ) -> std::collections::HashMap<String, crate::domain::registry_policy::InstanceContext> {
         self.running
             .iter()
@@ -166,6 +167,7 @@ impl Supervisor {
                             .as_ref()
                             .map(crate::metering::ObservedListener::fence),
                         metering_source: supervised.metering_source.clone(),
+                        inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
                     },
                 )
             })
@@ -189,7 +191,8 @@ impl Supervisor {
         if dry_run {
             return registry.plan_policy_change(existing.as_ref(), &change);
         }
-        let applied = registry.apply_policy_change(existing, change, self.policy_contexts())?;
+        let applied =
+            registry.apply_policy_change(existing, change, self.policy_contexts(registry))?;
         Ok(self.finish_policy_applied(registry, applied))
     }
 
@@ -229,7 +232,7 @@ impl Supervisor {
                 ..plan
             });
         }
-        let applied = registry.apply_policy_delete(existing, self.policy_contexts())?;
+        let applied = registry.apply_policy_delete(existing, self.policy_contexts(registry))?;
         Ok(self.finish_policy_applied(registry, applied))
     }
 
@@ -272,6 +275,9 @@ impl Supervisor {
                      executed"
                 )),
             }
+        }
+        for note in &applied.outcome.notes {
+            self.emit_diagnostic(note);
         }
         applied.outcome
     }

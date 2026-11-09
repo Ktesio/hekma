@@ -741,5 +741,8 @@ pub(crate) struct PolicyChangeDocument {
     pub policy: Option<hekma_engine::PolicyRecord>,
     pub matched: usize,
     pub fallbacks: usize,
+    /// Runs the change could not re-resolve, each with the reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     pub dry_run: bool,
 }
