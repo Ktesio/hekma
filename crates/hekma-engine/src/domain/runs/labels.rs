@@ -167,10 +167,12 @@ impl LabelChange {
                 .and_then(|()| validate_label_value(value))
                 .map_err(invalid)?;
         }
-        let mut seen = Vec::with_capacity(self.remove.len());
+        // A set, not a pre-sized Vec: nothing is allocated from the
+        // request's own length, and a duplicate is found in O(log n).
+        let mut seen = std::collections::BTreeSet::new();
         for key in &self.remove {
             validate_label_key(key).map_err(invalid)?;
-            if seen.contains(&key) {
+            if !seen.insert(key) {
                 return Err(invalid(format!("label key `{key}` is removed twice")));
             }
             if self.set.contains_key(key) {
@@ -178,7 +180,6 @@ impl LabelChange {
                     "label key `{key}` is both set and removed"
                 )));
             }
-            seen.push(key);
         }
         Ok(())
     }
