@@ -2802,6 +2802,111 @@ channel = "stdio"
     }
 
     #[test]
+    fn readiness_kind_wire_names_are_pinned_across_as_str_and_display() {
+        // The serde wire form is the contract: `as_str` and `Display` must
+        // both spell the exact kebab-case names a manifest may carry (a
+        // drifted name would strand every manifest of that kind at parse).
+        for (kind, wire) in [
+            (ReadinessKind::HttpGet, "http-get"),
+            (ReadinessKind::FileFresh, "file-fresh"),
+            (ReadinessKind::LogContains, "log-contains"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(kind.to_string(), wire);
+        }
+    }
+
+    #[test]
+    fn readiness_foreign_kind_field_hints_list_the_owning_kinds_fields() {
+        // The refusal's DETAIL must point the author at the fields the
+        // offending kind ACTUALLY carries (the sibling pin only checks the
+        // stray `field` name; all three kinds' hint texts are pinned here).
+        let toml = with_readiness(
+            "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \"http://127.0.0.1:8080/health\"\n\
+             expected_status = 200\nline = \"ready\"",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`line`")),
+            "got {err}"
+        );
+        assert!(
+            err.to_string().contains(
+                "the `http-get` kind carries only its own fields (`url`, `expected_status`)"
+            ),
+            "got {err}"
+        );
+
+        let toml = with_readiness(
+            "kind = \"log-contains\"\ntimeout_ms = 5000\nline = \"ready\"\n\
+             url = \"http://127.0.0.1:8080/health\"",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`url`")),
+            "got {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("the `log-contains` kind carries only its own fields (`line`)"),
+            "got {err}"
+        );
+
+        let toml = with_readiness(
+            "kind = \"file-fresh\"\ntimeout_ms = 5000\npath = \"ready.marker\"\nmax_age_ms = 250\n\
+             url = \"http://127.0.0.1:8080/health\"",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. } if field.contains("`url`")),
+            "got {err}"
+        );
+        assert!(
+            err.to_string().contains(
+                "the `file-fresh` kind carries only its own fields (`path`, `max_age_ms`)"
+            ),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn readiness_bracketed_host_malformed_forms_are_refused() {
+        // The two bracket arms of the shared loopback parser: an unclosed
+        // `[` and trailing characters after a closed bracket must both be
+        // refused naming the malformation (a parser that "recovered" could
+        // probe a host the manifest never named).
+        for (url, needle) in [
+            (
+                "http://[::1]junk/x",
+                "trailing characters after the bracketed host",
+            ),
+            ("http://[::1", "opens a `[` bracket it never closes"),
+        ] {
+            let toml = with_readiness(&format!(
+                "kind = \"http-get\"\ntimeout_ms = 5000\nurl = \
+                 \"{url}\"\nexpected_status = 200"
+            ));
+            let err = Manifest::from_toml_str(&toml)
+                .expect("parse")
+                .validate()
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(needle),
+                "{url} must be refused naming the malformation: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn readiness_missing_kind_fields_are_rejected_naming_the_field() {
         // http-get without expected_status.
         let toml = with_readiness(
@@ -3123,6 +3228,27 @@ channel = "stdio"
                 .contains("the liveness check URL must target a literal loopback address"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn liveness_url_control_characters_are_rejected_like_readiness() {
+        // The liveness twin of the readiness C0/C1 sweep: a control byte in
+        // the liveness URL is refused BEFORE any scheme or host reasoning —
+        // a newline in a URL is request-smuggling material whichever poll
+        // carries it.
+        let toml = with_liveness(
+            "[liveness.http_get]\nurl = \"http://127.0.0.1:8080/health\\u0001\"\nexpected_status = 200\nmax_age_ms = 5000",
+        );
+        let err = Manifest::from_toml_str(&toml)
+            .expect("parse")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ManifestError::InvalidField { field, .. }
+                if field == "`url` field in the `[liveness.http_get]` sub-table"),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("control character"), "got {err}");
     }
 
     #[test]
