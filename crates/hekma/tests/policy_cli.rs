@@ -33,7 +33,15 @@ fn policy_refusals_map_to_the_documented_exit_codes() {
         vec!["policy", "create", "Bad-Name", "--selector", "team=core"],
         vec!["policy", "create", "ok-name"],
         vec!["policy", "create", "ok-name", "--selector", "team"],
-        vec!["policy", "create", "ok-name", "--selector", "team=core", "--breach-action", "zap"],
+        vec![
+            "policy",
+            "create",
+            "ok-name",
+            "--selector",
+            "team=core",
+            "--breach-action",
+            "zap",
+        ],
     ] {
         let run = hekma(&args);
         assert_eq!(run.code, Some(2), "{args:?} stderr: {}", run.stderr);
@@ -129,16 +137,13 @@ fn a_policy_round_trip_through_the_service_host() {
         .iter()
         .filter_map(|entry| entry["name"].as_str())
         .collect();
-    assert!(names.contains(&"default") && names.contains(&"nightly"), "{names:?}");
+    assert!(
+        names.contains(&"default") && names.contains(&"nightly"),
+        "{names:?}"
+    );
 
     // Duplicate create: 2 with the policy-exists code.
-    let run = hekma(&[
-        "policy",
-        "create",
-        "nightly",
-        "--selector",
-        "team=research",
-    ]);
+    let run = hekma(&["policy", "create", "nightly", "--selector", "team=research"]);
     assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
     assert!(run.stderr.contains("already exists"), "{}", run.stderr);
 
@@ -156,21 +161,22 @@ fn a_policy_round_trip_through_the_service_host() {
     let run = hekma(&["policy", "show", "nightly", "--json"]);
     let document = json(&run.stdout);
     assert_eq!(document["policy"]["limits"]["tokens_per_run"], 5_000_000);
-    assert_eq!(document["policy"]["limits"]["dollars_per_run_micros"], serde_json::Value::Null);
+    assert_eq!(
+        document["policy"]["limits"]["dollars_per_run_micros"],
+        serde_json::Value::Null
+    );
 
     // The default Policy's reserved shape.
     let run = hekma(&["policy", "delete", "default"]);
     assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
     assert!(run.stderr.contains("cannot be deleted"), "{}", run.stderr);
-    let run = hekma(&[
-        "policy",
-        "change",
-        "default",
-        "--selector",
-        "team=core",
-    ]);
+    let run = hekma(&["policy", "change", "default", "--selector", "team=core"]);
     assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
-    assert!(run.stderr.contains("cannot carry a Selector"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("cannot carry a Selector"),
+        "{}",
+        run.stderr
+    );
 
     // The default's Rate table: add, read, clear.
     let run = hekma(&[

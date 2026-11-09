@@ -2794,18 +2794,25 @@ fn governance_vectors_summary(
     };
     // Counted per kind with an exhaustive match, so a new case kind can never
     // be folded silently into another kind's count.
-    let (mut decision_cases, mut derivation_cases, mut fence_cases, mut chain_cases) = (0, 0, 0, 0);
+    let (
+        mut decision_cases,
+        mut derivation_cases,
+        mut fence_cases,
+        mut chain_cases,
+        mut policy_cases,
+    ) = (0, 0, 0, 0, 0);
     for case in &document.cases {
         match case {
             hekma_engine::Case::Decision(_) => decision_cases += 1,
             hekma_engine::Case::Derivation(_) => derivation_cases += 1,
             hekma_engine::Case::Fence(_) => fence_cases += 1,
             hekma_engine::Case::Chain(_) => chain_cases += 1,
+            hekma_engine::Case::Policy(_) => policy_cases += 1,
         }
     }
     Ok(format!(
         "{}\n  checksum  sha256:{checksum}\n  cases     {} ({} decision, {} derivation, {} fence, \
-         {} chain)\n  \
+         {} chain, {} policy)\n  \
          artifact  {}\n  pin       vectors_version + sha256 — re-run every case against your \
          guard on any upgrade\n",
         ui::success_text(format!(
@@ -2817,6 +2824,7 @@ fn governance_vectors_summary(
         derivation_cases,
         fence_cases,
         chain_cases,
+        policy_cases,
         hekma_engine::GOVERNANCE_VECTORS_ARTIFACT_PATH,
     ))
 }

@@ -1,7 +1,7 @@
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.2.0",
+  "vectors_version": "1.3.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
@@ -10,7 +10,8 @@
       "cost_micros_with_cached",
       "governance::decide",
       "governance::fence_refusal",
-      "governance::decide_chain"
+      "governance::decide_chain",
+      "runs::policy::resolve"
     ]
   },
   "cases": [
@@ -1382,6 +1383,619 @@
           ]
         }
       ]
+    },
+    {
+      "kind": "policy",
+      "id": "policy-explicit-run-instance-policy",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {
+          "token_per_run": 100
+        },
+        "inputs": {
+          "explicit": {
+            "tokens_per_run": 5000,
+            "breach_action": "pause"
+          }
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "breach_action": "stop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 100,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "pause",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "run",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "instance",
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-most-specific-per-limit",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ],
+          [
+            "env",
+            "prod"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "loose",
+            "selector": "team=core",
+            "limits": {
+              "tokens_per_run": 1000,
+              "tokens_cumulative": 50000,
+              "breach_action": "pause"
+            }
+          },
+          {
+            "name": "tight",
+            "selector": "team=core,env=prod",
+            "limits": {
+              "tokens_per_run": 2000,
+              "breach_action": "warn"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 2000,
+          "cumulative": 50000
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "tight"
+          },
+          "tokens_cumulative": {
+            "policy": "loose"
+          },
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "tight"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-tie-takes-the-tightest",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "a",
+            "1"
+          ],
+          [
+            "b",
+            "2"
+          ],
+          [
+            "c",
+            "3"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "left",
+            "selector": "a=1,b=2",
+            "limits": {
+              "tokens_per_run": 5000,
+              "breach_action": "warn"
+            }
+          },
+          {
+            "name": "right",
+            "selector": "a=1,c=3",
+            "limits": {
+              "tokens_per_run": 3000,
+              "breach_action": "pause"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": 3000,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": {
+            "policy": "right"
+          },
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "right"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "right",
+          "action": "pause"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-default-fills-the-action",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": []
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-fail-closed-malformed-and-marker",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {},
+          "malformed_action": "throttle"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "breach_action": "stop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "pause",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "instance",
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fail_closed": "the configured breach action `throttle` is not one of pause, stop, warn or block, so it fails closed to pause until it is fixed"
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-upgrade-marker-holds-pause",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": true,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "breach_action": "stop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "pause",
+        "effective_action": "pause",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "instance",
+          "scent_check": "default",
+          "rate": "unset"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-depth-fallback-and-wire-path",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "supervised",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {}
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "breach_action": "block"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "block",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": {
+            "policy": "p"
+          },
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "fallback": {
+          "policy": "p",
+          "action": "block"
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-rate-chain",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {},
+          "model": "gpt-demo"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            },
+            "rates": {
+              "gpt-demo": {
+                "input_micros_per_1m": 1000000,
+                "output_micros_per_1m": 2000000
+              }
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "rate": {
+                "input_micros_per_1m": 3000000,
+                "output_micros_per_1m": 4000000
+              }
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": {
+          "input_micros_per_1m": 3000000,
+          "output_micros_per_1m": 4000000
+        },
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": "unset",
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": {
+            "policy": "p"
+          }
+        }
+      }
+    },
+    {
+      "kind": "policy",
+      "id": "policy-unpriced-cap-is-loud",
+      "covers": [
+        "policy-resolution"
+      ],
+      "input": {
+        "depth": "observed",
+        "wire_path": false,
+        "bound_labels": [
+          [
+            "team",
+            "core"
+          ]
+        ],
+        "run_limits": {},
+        "inputs": {
+          "explicit": {},
+          "model": "gpt-demo"
+        },
+        "kept_on_pause": false,
+        "policies": [
+          {
+            "name": "default",
+            "selector": null,
+            "limits": {
+              "breach_action": "warn",
+              "scent_check": "off"
+            }
+          },
+          {
+            "name": "p",
+            "selector": "team=core",
+            "limits": {
+              "dollars_per_run_micros": 5000000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "tokens": {
+          "per_run": null,
+          "cumulative": null
+        },
+        "dollars": {
+          "per_run": 5000000,
+          "cumulative": null
+        },
+        "action": "warn",
+        "effective_action": "warn",
+        "scent_check": "off",
+        "rate": null,
+        "sources": {
+          "tokens_per_run": "unset",
+          "tokens_cumulative": "unset",
+          "dollars_per_run": {
+            "policy": "p"
+          },
+          "dollars_cumulative": "unset",
+          "breach_action": "default",
+          "scent_check": "default",
+          "rate": "unset"
+        },
+        "unpriced": {
+          "model": "gpt-demo",
+          "policy": "p"
+        }
+      }
     }
   ]
 }
