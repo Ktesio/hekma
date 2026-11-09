@@ -31,15 +31,19 @@ use crate::store::WriterCtx;
 pub(crate) struct RunChanges {
     pub events: Vec<RunEvent>,
     pub entries: Vec<RunEntry>,
+    /// Diagnostics the operation surfaced (a fail-closed resolution note):
+    /// the caller emits them on the engine's diagnostic surface.
+    pub notes: Vec<String>,
     /// Test-only: the Runs whose Policy hook ran in this operation.
     #[cfg(test)]
     pub policy_resolved: Vec<RunId>,
 }
 
 impl RunChanges {
-    fn extend(&mut self, other: RunChanges) {
+    pub(crate) fn extend(&mut self, other: RunChanges) {
         self.events.extend(other.events);
         self.entries.extend(other.entries);
+        self.notes.extend(other.notes);
         #[cfg(test)]
         self.policy_resolved.extend(other.policy_resolved);
     }
@@ -82,7 +86,8 @@ pub(crate) fn commit(
 }
 
 /// Record one change of `record` (already saved) as an event plus its
-/// snapshot entry.
+/// snapshot entry. The event names the Policies that supplied the Run's
+/// limits and the entry carries its stored resolution (AD-14, story 21-3).
 fn note<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -93,6 +98,7 @@ fn note<S: RunRecords + ?Sized>(
 ) -> Result<(), StoreError> {
     let labels = store.run_labels(&record.run_id)?;
     let limits = store.run_limits(&record.run_id)?;
+    let resolution = store.run_policy(&record.run_id)?.map(|row| row.resolution);
     changes.events.push(RunEvent {
         schema_version: RUN_EVENT_SCHEMA_VERSION,
         change: kind,
@@ -109,13 +115,15 @@ fn note<S: RunRecords + ?Sized>(
         labels: bound_only(&labels),
         prior_labels: prior.labels,
         cause,
+        policies: resolution
+            .as_ref()
+            .map(|resolution| resolution.sources.policy_names())
+            .unwrap_or_default(),
         at: record.updated_at.clone(),
     });
-    changes.entries.push(RunEntry {
-        record: record.clone(),
-        labels,
-        limits,
-    });
+    changes
+        .entries
+        .push(super::snapshot::entry_of(record, &labels, limits, resolution.as_ref()));
     Ok(())
 }
 
@@ -516,6 +524,25 @@ fn write_labels<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note an `anomalies-changed` event for `record` (already saved with its
+/// new Anomalies) plus its snapshot entry. Story 21-3's public entry point
+/// for the resolution-owned Anomalies (`depth-fallback`, `unpriced-model`).
+pub(crate) fn note_anomalies_changed<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    _at: &str,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::AnomaliesChanged,
+        Prior::default(),
+        None,
+    )
+}
+
 /// The label verb (story 21-9, FR-49): bind and unbind labels on one
 /// non-ended Run as the Operator. `config` is what the instance
 /// configuration binds the Run today — the caller resolves it for a
@@ -617,6 +644,35 @@ pub(crate) fn mark_breach<S: RunRecords + ?Sized>(
     let status = record.status;
     move_to(store, &mut changes, record, status, anomalies, None, at)?;
     Ok(changes)
+}
+
+/// Clear the `breach` Anomaly from a Run whose every latch re-armed
+/// (story 21-3's raise path; the Anomaly stays while any latch holds).
+/// Nothing when it is not raised or the Run has no row.
+pub(crate) fn clear_breach_anomaly<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    at: &str,
+) -> Result<(), StoreError> {
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(());
+    };
+    if !record.anomalies.contains(&Anomaly::Breach) {
+        return Ok(());
+    }
+    let mut anomalies: Vec<Anomaly> = record
+        .anomalies
+        .iter()
+        .copied()
+        .filter(|anomaly| *anomaly != Anomaly::Breach)
+        .collect();
+    anomalies.sort();
+    anomalies.dedup();
+    let mut updated = record;
+    updated.anomalies = anomalies;
+    updated.updated_at = at.to_string();
+    store.save_run(&updated)?;
+    Ok(())
 }
 
 /// Why a directly set Breach Action cannot execute on a child Run at this
@@ -838,6 +894,7 @@ pub(crate) fn view<S: RunRecords + RunStore + ?Sized>(
     Ok(RunView {
         labels: store.run_labels(run_id)?,
         limits: store.run_limits(run_id)?,
+        policy: store.run_policy(run_id)?.map(|row| row.resolution),
         open_children: store.open_children(run_id)?,
         usage,
         record,
@@ -850,11 +907,15 @@ pub(crate) fn open_entries<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<RunE
         .open_runs()?
         .into_iter()
         .map(|record| {
-            Ok(RunEntry {
-                labels: store.run_labels(&record.run_id)?,
-                limits: store.run_limits(&record.run_id)?,
-                record,
-            })
+            let labels = store.run_labels(&record.run_id)?;
+            let limits = store.run_limits(&record.run_id)?;
+            let resolution = store.run_policy(&record.run_id)?.map(|row| row.resolution);
+            Ok(super::snapshot::entry_of(
+                &record,
+                &labels,
+                limits,
+                resolution.as_ref(),
+            ))
         })
         .collect()
 }

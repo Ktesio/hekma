@@ -12,10 +12,11 @@
 //! pin. No lock and no allocation on the pass path (AD-18: nothing in the
 //! request path waits on the engine).
 //!
-//! Bits are only ever SET: a fence lives exactly as long as its listener,
-//! which lives for one Run, so every reason clears with the Run (a raised
-//! ceiling takes effect at the next Run; the live un-fence on a raise lands
-//! with story 21.6's within-Run re-arm).
+//! Bits are set when a `block` breach records; a RAISED ceiling above a
+//! Run's totals clears its reason's bit PER REASON (story 21-3's re-arm —
+//! the fence stays up while any other latched `block` reason holds), and
+//! every remaining reason clears with the Run (a new Run re-checks the
+//! cumulative ceiling at start).
 //!
 //! ## The refusal — `proxy-wire v1`, first slice
 //!
@@ -62,6 +63,16 @@ impl WireFence {
     /// Run-start evaluation, and the adoption rebuild from the breach log.
     pub(crate) fn raise(&self, reason: LatchKey) {
         self.0.fetch_or(reason_bit(reason), Ordering::Release);
+    }
+
+    /// CLEAR the fence for `reason` (story 21-3's raise re-arm): a raised
+    /// ceiling above a Run's totals unlatches the reason and clears its bit
+    /// — PER REASON, so a fence holding any other latched `block` reason
+    /// stays up (amendment 2, orchestrator review 2026-11-09). Called from
+    /// a store-writer post-commit hook.
+    pub(crate) fn clear(&self, reason: LatchKey) {
+        self.0
+            .fetch_and(!reason_bit(reason), Ordering::Release);
     }
 
     /// The raised reasons, in [`FENCE_REASON_ORDER`] (the tests' view; the

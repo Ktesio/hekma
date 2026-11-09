@@ -1016,6 +1016,70 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
     (rate, cap, action)
 }
 
+/// How the `budget.breach_action` key reads from a resolved config
+/// (story 21-3): present and valid, PRESENT BUT MALFORMED (fails closed to
+/// `pause` with a surfaced note — AD-7, never the new default), or absent
+/// (the Policy resolution fills it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActionRead {
+    Present(BreachAction),
+    Malformed(String),
+    Absent,
+}
+
+/// Read the `budget.breach_action` key with absent/malformed distinguished
+/// (the resolution's action precedence needs all three).
+pub(crate) fn read_breach_action(effective: &EffectiveConfig) -> ActionRead {
+    match effective
+        .value(BUDGET_BREACH_ACTION_KEY)
+        .and_then(|value| value.as_str())
+    {
+        Some(raw) => match raw.trim().parse::<BreachAction>() {
+            Ok(action) => ActionRead::Present(action),
+            Err(_) => ActionRead::Malformed(raw.trim().to_string()),
+        },
+        None => ActionRead::Absent,
+    }
+}
+
+/// The explicit instance limits and model key the Policy resolution needs
+/// (story 21-3): the layer-merged `budget.*` ceilings, the
+/// present/malformed/absent action, the `cost.rate.*` Rate (both
+/// directions or absent — a half-configured Rate falls through, FR-20's
+/// documented "no Rate yet"), and the resolved `model` (the default
+/// Policy's Rate-table lookup key). A malformed ceiling degrades to absent
+/// (the defensive read); a malformed ACTION is carried as malformed (fail
+/// closed).
+pub(crate) fn explicit_limits(effective: &EffectiveConfig) -> crate::domain::runs::ResolveInputs {
+    let action = match read_breach_action(effective) {
+        ActionRead::Present(action) => Some(action),
+        ActionRead::Malformed(raw) => return crate::domain::runs::ResolveInputs {
+            malformed_action: Some(raw),
+            ..crate::domain::runs::ResolveInputs::default()
+        },
+        ActionRead::Absent => None,
+    };
+    let (rate, cap, _) = resolve_cost(effective);
+    let model = effective
+        .value("model")
+        .and_then(|value| value.as_str())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty() && !is_secret_ref(raw));
+    crate::domain::runs::ResolveInputs {
+        explicit: crate::domain::runs::PolicyLimits {
+            tokens_per_run: budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY),
+            tokens_cumulative: budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY),
+            dollars_per_run_micros: cap.per_run.map(|micros| micros.get() as u64),
+            dollars_cumulative_micros: cap.cumulative.map(|micros| micros.get() as u64),
+            breach_action: action,
+            scent_check: None,
+            rate,
+        },
+        malformed_action: None,
+        model,
+    }
+}
+
 /// Resolve the ENGINE-OBSERVED upstream provider base URL from an already-resolved
 /// [`EffectiveConfig`] (story 3-4, AC6) — the operator's real OpenAI-compatible
 /// endpoint the loopback listener forwards to. Returns the trimmed string value of

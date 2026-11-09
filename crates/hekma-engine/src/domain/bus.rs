@@ -124,6 +124,14 @@ pub enum EngineEvent {
     /// status changed, Anomalies changed, labels changed or ended —
     /// published after the writer job that caused it committed.
     Run(super::runs::RunEvent),
+    /// A Policy change (story 21-3, AD-14 amendment): created, changed or
+    /// deleted — committed with the outbox row in the change's own writer
+    /// job, published after commit.
+    Policy(super::runs::policy::PolicyEvent),
+    /// The one event the FR-21 breach-default upgrade emits (story 21-3):
+    /// which instances were kept on `pause`, and whether each one's config
+    /// was written.
+    BreachDefaultUpgraded(super::runs::policy::BreachDefaultUpgradedEvent),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable [`broadcast::Sender`]

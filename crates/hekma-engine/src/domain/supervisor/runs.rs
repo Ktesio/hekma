@@ -115,6 +115,40 @@ impl Supervisor {
         }
     }
 
+    /// Re-resolve the open process-owning Run's Policies after a
+    /// `budget.*` or `cost.rate.*` config write (story 21-3): one writer
+    /// job with FRESH caller-side inputs (the write just changed them), so
+    /// the stored resolution, its Anomalies and the published snapshot
+    /// match the config the operator sees. An instance with no open Run
+    /// resolves nothing (the next start resolves at creation).
+    pub(crate) fn sync_run_policy(&self, registry: &Registry, name: &InstanceName) {
+        let inputs = registry.resolve_inputs_for(name.as_str());
+        let instance = name.clone();
+        let result = registry.run_job(move |store| {
+            use crate::ports::RunRecords;
+            let Some(open) = store.open_process_run(&instance)? else {
+                return Ok(((), crate::domain::runs::ops::RunChanges::default()));
+            };
+            let changes = crate::domain::runs::policy::resolve_run(
+                store,
+                &open.run_id,
+                Some(inputs),
+                &crate::time::now_rfc3339(),
+            )?;
+            Ok(((), changes))
+        });
+        match result {
+            Ok(((), events)) => {
+                self.publish_run_events(events);
+            }
+            Err(err) => self.emit_diagnostic(&format!(
+                "{}: the configuration was written, but the open Run's Policies could not be \
+                 re-resolved ({err}); they re-resolve at the next change or start",
+                name.as_str(),
+            )),
+        }
+    }
+
     /// Open a child Run (FR-43, FR-49) and publish its `created` event.
     pub(crate) fn open_child_run(
         &self,

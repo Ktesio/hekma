@@ -939,6 +939,27 @@ impl RunStore for SqliteStore {
         Ok(())
     }
 
+    fn unlatch(
+        &self,
+        run_id: &RunId,
+        key: LatchKey,
+        action: BreachAction,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM run_latches WHERE run_id = ?1 AND dimension = ?2 AND scope = ?3 \
+                 AND action = ?4",
+                rusqlite::params![
+                    run_id.as_str(),
+                    key.dimension.as_str(),
+                    key.scope.as_str(),
+                    action.as_str(),
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     fn latches(&self, run_id: &RunId) -> Result<Vec<(LatchKey, BreachAction)>, StoreError> {
         let mut stmt = self
             .conn()

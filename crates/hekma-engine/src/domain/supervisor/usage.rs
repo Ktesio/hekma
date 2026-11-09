@@ -951,12 +951,15 @@ impl Supervisor {
         }
     }
 
-    /// The pipeline's evaluator inputs for one instance and Run (story 21-1):
-    /// the LIVE resolved budget, Rate, cap and actions (AC-B — a change while
-    /// `running` applies on the very next event), whether the instance is
-    /// supervised, and its wire fence. A malformed on-disk layer degrades to
-    /// "no budget / no Rate" (best-effort — never a crash mid-ingestion), the
-    /// same degrade the in-supervisor evaluator took.
+    /// The pipeline's evaluator inputs for one instance and Run (story
+    /// 21-1): the LIVE resolved limits (AC-B — a change while `running`
+    /// applies on the very next event), whether the instance is
+    /// supervised, and its wire fence. Since story 21-3 the limits resolve
+    /// through the ONE Policy resolver (`Registry::resolved_limits`):
+    /// explicit Run limits, explicit instance config, the kept-on-pause
+    /// marker, matching Policies and the default Policy — the same pure
+    /// function every surface calls. A failed config or store read fails
+    /// CLOSED to `pause` arms (AD-7: never the new default by accident).
     pub(super) fn eval_input(
         &self,
         registry: &Registry,
@@ -964,25 +967,17 @@ impl Supervisor {
         run_id: &RunId,
         metering_source: &str,
     ) -> pipeline::EvalInput {
-        let effective = registry.effective_config(name, ConfigLayer::empty()).ok();
-        let (token_budget, token_action) = effective
-            .as_ref()
-            .map(config::resolve_token_budget)
-            .unwrap_or((TokenBudget::default(), BreachAction::Pause));
-        let (rate, cost_cap, cost_action) = effective
-            .as_ref()
-            .map(config::resolve_cost)
-            .unwrap_or((None, CostCap::default(), BreachAction::Pause));
+        let resolution = registry.resolved_limits(name, Some(run_id));
         let supervised = self.running.get(name);
         pipeline::EvalInput {
             name: name.clone(),
             run_id: run_id.clone(),
             metering_source: metering_source.to_string(),
-            token_budget,
-            token_action,
-            rate,
-            cost_cap,
-            cost_action,
+            token_budget: resolution.tokens,
+            token_action: resolution.effective_action,
+            rate: resolution.rate,
+            cost_cap: resolution.dollars,
+            cost_action: resolution.effective_action,
             supervised: supervised.is_some(),
             fence: supervised
                 .and_then(|supervised| supervised.observed_listener.as_ref())
@@ -1155,18 +1150,12 @@ impl Supervisor {
         (token, dollar)
     }
 
-    /// Whether the instance's CURRENT resolved Breach Action is `block` for
-    /// either dimension (story 19-2). A failed config read is `false` — the
-    /// same degrade `enforce_budget` takes (it returns early on that read).
+    /// Whether the instance's CURRENT resolved Breach Action is `block`
+    /// (story 19-2; story 21-3: the resolution, not the config alone — a
+    /// Policy can supply `block`). A failed read is `false` — the same
+    /// degrade `enforce_budget` takes (it returns early on that read).
     pub(super) fn block_configured(&self, registry: &Registry, name: &InstanceName) -> bool {
-        registry
-            .effective_config(name, ConfigLayer::empty())
-            .map(|effective| {
-                let (_budget, token_action) = config::resolve_token_budget(&effective);
-                let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
-                token_action == BreachAction::Block || cost_action == BreachAction::Block
-            })
-            .unwrap_or(false)
+        registry.resolved_limits(name, None).effective_action == BreachAction::Block
     }
 
     /// The RUN-START fence evaluation (story 19-2): before a Run's process
@@ -1192,11 +1181,15 @@ impl Supervisor {
         fence: &crate::metering::WireFence,
         kept_run: Option<&RunId>,
     ) -> bool {
-        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
-            return false;
-        };
-        let (budget, token_action) = config::resolve_token_budget(&effective);
-        let (rate, cost_cap, cost_action) = config::resolve_cost(&effective);
+        // Story 21-3: the Run-start fence resolves through the ONE Policy
+        // resolver — a Policy can supply the ceilings and the `block`
+        // action, not only the instance config.
+        let resolution = registry.resolved_limits(name, kept_run);
+        let budget = resolution.tokens;
+        let token_action = resolution.effective_action;
+        let rate = resolution.rate;
+        let cost_cap = resolution.dollars;
+        let cost_action = resolution.effective_action;
         if token_action != BreachAction::Block && cost_action != BreachAction::Block {
             return false;
         }
@@ -1328,11 +1321,11 @@ impl Supervisor {
         name: &InstanceName,
         run_id: &RunId,
     ) {
-        let Ok(effective) = registry.effective_config(name, ConfigLayer::empty()) else {
-            return;
-        };
-        let (_budget, token_action) = config::resolve_token_budget(&effective);
-        let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
+        // Story 21-3: the latched actions re-apply under the RESOLVED
+        // action (a Policy can supply it), not the config alone.
+        let resolution = registry.resolved_limits(name, Some(run_id));
+        let token_action = resolution.effective_action;
+        let cost_action = resolution.effective_action;
         let breaches = match registry.reader().run_breaches(name, run_id) {
             Ok(breaches) => breaches,
             Err(err) => {

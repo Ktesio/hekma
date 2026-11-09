@@ -1630,17 +1630,15 @@ impl Supervisor {
                     // are the reasons its wire fence was up. Re-raised on the
                     // re-bound listener below, so an engine restart or
                     // adoption never drops a fence the latch would stop from
-                    // re-firing. A failed config read degrades to no fence
-                    // reasons (the enforcement call returns early on that read
-                    // too); a failed breach read is SURFACED (AI-18).
-                    let (token_action, cost_action) = registry
-                        .effective_config(&name, ConfigLayer::empty())
-                        .map(|effective| {
-                            let (_budget, token_action) = config::resolve_token_budget(&effective);
-                            let (_rate, _cap, cost_action) = config::resolve_cost(&effective);
-                            (token_action, cost_action)
-                        })
-                        .unwrap_or((BreachAction::Pause, BreachAction::Pause));
+                    // re-firing. A failed resolution degrades to no fence
+                    // reasons (the enforcement call returns early on that
+                    // read too); a failed breach read is SURFACED (AI-18).
+                    // Story 21-3: the action resolves through the ONE Policy
+                    // resolver (a Policy can supply `block`).
+                    let action = registry
+                        .resolved_limits(&name, Some(&run_id))
+                        .effective_action;
+                    let (token_action, cost_action) = (action, action);
                     let resumed_breaches = match registry.reader().run_breaches(&name, &run_id) {
                         Ok(events) => events,
                         Err(detail) => {

@@ -8,6 +8,7 @@
 //! FR-60). The store resolves a Selector over the non-ended Runs with one
 //! indexed read, capped at [`MAX_SELECTED_RUNS`].
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
@@ -27,7 +28,10 @@ pub enum SelectorScope {
 }
 
 /// A parsed Selector: its `key=value` terms, in the order given.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Serialized as its wire form (`"team=core,env=prod"`) so a stored
+/// Policy row and the vectors artifact carry the same string everywhere.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct Selector {
     terms: Vec<(String, String)>,
 }
@@ -70,6 +74,15 @@ impl Selector {
             })
         })
     }
+
+    /// Whether a Run's BOUND label pairs (`(key, value)`, already filtered
+    /// to bound) match every term — the Policy-selection read (FR-60: only
+    /// bound labels select Policies).
+    pub fn matches_pairs(&self, pairs: &[(String, String)]) -> bool {
+        self.terms
+            .iter()
+            .all(|(key, value)| pairs.iter().any(|(k, v)| k == key && v == value))
+    }
 }
 
 impl FromStr for Selector {
@@ -77,6 +90,22 @@ impl FromStr for Selector {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         Self::parse(raw)
+    }
+}
+
+/// The serde bridge (stored Policy rows and the vectors artifact carry the
+/// wire form): parse on deserialize, render on serialize.
+impl TryFrom<String> for Selector {
+    type Error = String;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<Selector> for String {
+    fn from(selector: Selector) -> Self {
+        selector.to_string()
     }
 }
 

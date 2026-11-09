@@ -11,7 +11,7 @@
 
 mod budget;
 mod bus;
-mod config;
+pub(crate) mod config;
 mod cost;
 mod error;
 mod event;
@@ -35,6 +35,7 @@ pub(crate) mod probe_kinds;
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
 mod registry;
+mod registry_policy;
 mod restart;
 mod resync;
 pub(crate) mod runs;

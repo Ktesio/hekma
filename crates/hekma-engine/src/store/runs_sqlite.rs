@@ -11,14 +11,19 @@
 //! every bound row — the only bound source before it. One crash-atomic step,
 //! like v13.
 
+use std::str::FromStr;
+
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
+use crate::domain::runs::policy::{
+    PolicyRecord, RunPolicy, ScentCheckMode, DEFAULT_POLICY_NAME,
+};
 use crate::domain::{
     Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelOrigin, LabelSource, Micros,
-    RunId, RunLimits, RunRecord, RunStatus, Selector,
+    Rate, RunId, RunLimits, RunRecord, RunStatus, Selector,
 };
-use crate::ports::{NewRun, RunRecords, StoreError};
+use crate::ports::{NewRun, PolicyRecords, RunRecords, StoreError};
 
 /// Schema v13 DDL (story 21-2): the Run registry's tables.
 ///
@@ -213,6 +218,167 @@ pub(super) fn migrate_v14(conn: &Connection) -> Result<(), StoreError> {
         }
     }
 }
+
+/// Schema v15 (story 21-3): Policies and their resolution.
+///
+/// * `policies` — one row per Policy. `selector` is NULL only on the
+///   seeded `default` Policy (the fallback layer, not a match-all
+///   Selector). `scent_check` is NULL when unset, `'off'` when explicit
+///   (the seeded default carries `'off'`, PRD §13 Q9's interim).
+/// * `policy_rates` — the `default` Policy's model-keyed Rate table
+///   (exact, case-sensitive model match; ships empty).
+/// * `run_policy` — each Run's stored resolution plus the caller-resolved
+///   inputs that produced it (so a re-resolution inside a writer job
+///   reuses the last config read).
+/// * `breach_default_upgrade` — the FR-21 upgrade's pending list AND
+///   marker in one table: rows exist from the migration transaction on, so
+///   resolution fail-closes to `pause` for every row across the whole
+///   upgrade window (a crash can never leave an upgraded instance on the
+///   new `warn` default); `done_at` marks the finish.
+const SCHEMA_V15: &str = "\
+CREATE TABLE policies (
+    name                     TEXT PRIMARY KEY,
+    selector                 TEXT,
+    tokens_per_run           INTEGER,
+    tokens_cumulative        INTEGER,
+    dollars_per_run_micros   INTEGER,
+    dollars_cumulative_micros INTEGER,
+    breach_action            TEXT,
+    scent_check              TEXT,
+    rate_input_micros        INTEGER,
+    rate_output_micros       INTEGER,
+    rate_cached_micros       INTEGER,
+    created_at               TEXT NOT NULL,
+    updated_at               TEXT NOT NULL
+);
+CREATE TABLE policy_rates (
+    policy               TEXT NOT NULL REFERENCES policies(name) ON DELETE CASCADE,
+    model                TEXT NOT NULL,
+    input_micros_per_1m  INTEGER NOT NULL,
+    output_micros_per_1m INTEGER NOT NULL,
+    cached_micros_per_1m INTEGER,
+    PRIMARY KEY (policy, model)
+);
+CREATE TABLE run_policy (
+    run_id     TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+    resolution TEXT NOT NULL,
+    inputs     TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE breach_default_upgrade (
+    instance_id    INTEGER PRIMARY KEY REFERENCES agent_instances(id) ON DELETE CASCADE,
+    config_written INTEGER NOT NULL DEFAULT 0,
+    listed_at      TEXT NOT NULL,
+    done_at        TEXT
+);
+";
+
+/// Run the v15 step (DDL + the seeded `default` Policy + the pending list +
+/// the stamp) in one `BEGIN IMMEDIATE`, stepping aside when another process
+/// finished it while this one waited.
+///
+/// The pending list is built through [`BreachDefaultSource`] — the REAL
+/// persisted layers (the embedded engine-default const, the kind-default
+/// layer, the instance `config.toml`), resolved exactly as runtime resolves
+/// them, so the test is "no `budget.breach_action` in any persisted layer
+/// the instance resolves through". The invocation-override layer is
+/// ephemeral and ignored (an override still outranks at start, as today).
+pub(super) fn migrate_v15(
+    conn: &Connection,
+    breach: &dyn BreachDefaultSource,
+) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 15 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V15).map_err(backend)?;
+        let now = crate::time::now_rfc3339();
+        // The seeded `default` Policy (warn, `off`, no ceilings, an empty
+        // Rate table). `#[default]`'s `Pause` is only the fail-closed seed.
+        let default = PolicyRecord::default_policy();
+        conn.execute(
+            "INSERT INTO policies (name, selector, breach_action, scent_check, created_at, \
+             updated_at) VALUES ('default', NULL, ?1, ?2, ?3, ?3)",
+            rusqlite::params![
+                BreachAction::Warn.as_str(),
+                ScentCheckMode::Off.as_str(),
+                now,
+            ],
+        )
+        .map_err(backend)?;
+        // The pending list: every registered instance whose persisted
+        // layers carry no explicit `budget.breach_action` (a MALFORMED
+        // value is present — not pending; the fail-closed read keeps it
+        // `pause`).
+        let mut stmt = conn
+            .prepare("SELECT id, kind, agent_home FROM agent_instances")
+            .map_err(backend)?;
+        let instances = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        drop(stmt);
+        for (id, kind, home) in instances {
+            let inputs = breach.resolve(&kind, std::path::Path::new(&home));
+            if inputs.explicit.breach_action.is_none() && inputs.malformed_action.is_none() {
+                conn.execute(
+                    "INSERT INTO breach_default_upgrade (instance_id, listed_at) \
+                     VALUES (?1, ?2)",
+                    rusqlite::params![id, now],
+                )
+                .map_err(backend)?;
+            }
+        }
+        conn.execute_batch("PRAGMA user_version = 15")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+/// Reads an instance's persisted config layers for the FR-21 upgrade
+/// (story 21-3): the merged explicit limits and model key the real
+/// resolution would produce from the engine-default const, the kind-default
+/// layer and the instance `config.toml`. A layer that cannot be read counts
+/// as carrying the key (fail closed — the runtime read degrades to `pause`
+/// the same way).
+pub(crate) trait BreachDefaultSource {
+    fn resolve(&self, kind: &str, home: &std::path::Path) -> crate::domain::runs::ResolveInputs;
+}
+
+/// The empty source: no instances to read (an in-memory or fresh database).
+pub(crate) struct NoBreachDefault;
+
+impl BreachDefaultSource for NoBreachDefault {
+    fn resolve(&self, _kind: &str, _home: &std::path::Path) -> crate::domain::runs::ResolveInputs {
+        crate::domain::runs::ResolveInputs::default()
+    }
+}
+
 
 /// The columns a [`RunRecord`] reads, joined to the instance name.
 const RUN_COLUMNS: &str = "r.run_id, r.control_depth, r.wire_path, r.status, r.anomalies, \
@@ -723,5 +889,421 @@ pub(super) fn ancestors_for_fold(
     rows.collect::<Result<_, _>>().map_err(backend)
 }
 
-#[cfg(test)]
-mod tests;
+// ---------------------------------------------------------------------------
+// Policies and their resolution (story 21-3, schema v15).
+// ---------------------------------------------------------------------------
+
+impl PolicyRecords for SqliteStore {
+    fn policies(&self) -> Result<Vec<PolicyRecord>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT name FROM policies ORDER BY name")
+            .map_err(backend)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        drop(stmt);
+        names.iter().map(|name| self.read_policy(name)).collect()
+    }
+
+    fn policy(&self, name: &str) -> Result<Option<PolicyRecord>, StoreError> {
+        let exists: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM policies WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(match exists {
+            Some(_) => Some(self.read_policy(name)?),
+            None => None,
+        })
+    }
+
+    fn put_policy(&self, record: &PolicyRecord) -> Result<(), StoreError> {
+        let now = crate::time::now_rfc3339();
+        let selector = record.selector.as_ref().map(Selector::to_string);
+        let rate = record.limits.rate;
+        self.conn()
+            .execute(
+                "INSERT INTO policies (name, selector, tokens_per_run, tokens_cumulative, \
+                 dollars_per_run_micros, dollars_cumulative_micros, breach_action, scent_check, \
+                 rate_input_micros, rate_output_micros, rate_cached_micros, created_at, \
+                 updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12) \
+                 ON CONFLICT(name) DO UPDATE SET selector = excluded.selector, \
+                 tokens_per_run = excluded.tokens_per_run, \
+                 tokens_cumulative = excluded.tokens_cumulative, \
+                 dollars_per_run_micros = excluded.dollars_per_run_micros, \
+                 dollars_cumulative_micros = excluded.dollars_cumulative_micros, \
+                 breach_action = excluded.breach_action, scent_check = excluded.scent_check, \
+                 rate_input_micros = excluded.rate_input_micros, \
+                 rate_output_micros = excluded.rate_output_micros, \
+                 rate_cached_micros = excluded.rate_cached_micros, \
+                 updated_at = excluded.updated_at",
+                rusqlite::params![
+                    record.name,
+                    selector,
+                    record.limits.tokens_per_run.map(|v| v.min(i64::MAX as u64) as i64),
+                    record
+                        .limits
+                        .tokens_cumulative
+                        .map(|v| v.min(i64::MAX as u64) as i64),
+                    record
+                        .limits
+                        .dollars_per_run_micros
+                        .map(|v| v.min(i64::MAX as u64) as i64),
+                    record
+                        .limits
+                        .dollars_cumulative_micros
+                        .map(|v| v.min(i64::MAX as u64) as i64),
+                    record.limits.breach_action.map(|a| a.as_str()),
+                    record.limits.scent_check.map(|m| m.as_str()),
+                    rate.map(|r| r.input_micros_per_1m.min(i64::MAX as u64) as i64),
+                    rate.map(|r| r.output_micros_per_1m.min(i64::MAX as u64) as i64),
+                    rate.and_then(|r| r.cached_micros_per_1m.map(|c| c.min(i64::MAX as u64) as i64)),
+                    now,
+                ],
+            )
+            .map_err(backend)?;
+        self.conn()
+            .execute(
+                "DELETE FROM policy_rates WHERE policy = ?1",
+                [&record.name],
+            )
+            .map_err(backend)?;
+        for (model, rate) in &record.rates {
+            self.conn()
+                .execute(
+                    "INSERT INTO policy_rates (policy, model, input_micros_per_1m, \
+                     output_micros_per_1m, cached_micros_per_1m) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        record.name,
+                        model,
+                        rate.input_micros_per_1m.min(i64::MAX as u64) as i64,
+                        rate.output_micros_per_1m.min(i64::MAX as u64) as i64,
+                        rate.cached_micros_per_1m.map(|c| c.min(i64::MAX as u64) as i64),
+                    ],
+                )
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn delete_policy(&self, name: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute("DELETE FROM policies WHERE name = ?1", [name])
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn run_policy(&self, run_id: &RunId) -> Result<Option<RunPolicy>, StoreError> {
+        let row: Option<(String, String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT resolution, inputs, updated_at FROM run_policy WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        row.map(|(resolution, inputs, updated_at)| {
+            decode_run_policy(&resolution, &inputs, &updated_at)
+        })
+        .transpose()
+    }
+
+    fn set_run_policy(
+        &self,
+        run_id: &RunId,
+        resolution: &crate::domain::runs::PolicyResolution,
+        inputs: &crate::domain::runs::ResolveInputs,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        let resolution = serde_json::to_string(resolution).map_err(|err| StoreError::CorruptRow {
+            name: "run_policy".to_string(),
+            detail: format!("the resolution could not be serialized: {err}"),
+        })?;
+        let inputs = serde_json::to_string(inputs).map_err(|err| StoreError::CorruptRow {
+            name: "run_policy".to_string(),
+            detail: format!("the resolution inputs could not be serialized: {err}"),
+        })?;
+        self.conn()
+            .execute(
+                "INSERT INTO run_policy (run_id, resolution, inputs, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(run_id) DO UPDATE SET resolution = excluded.resolution, \
+                 inputs = excluded.inputs, updated_at = excluded.updated_at",
+                rusqlite::params![run_id.as_str(), resolution, inputs, at],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn breach_default_kept(&self, instance: &str) -> Result<bool, StoreError> {
+        let kept: Option<i64> = self
+            .conn()
+            .query_row(
+                "SELECT 1 FROM breach_default_upgrade b \
+                 JOIN agent_instances i ON i.id = b.instance_id WHERE i.name = ?1",
+                [instance],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(kept.is_some())
+    }
+
+    fn breach_default_pending(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT i.name FROM breach_default_upgrade b \
+                 JOIN agent_instances i ON i.id = b.instance_id \
+                 WHERE b.done_at IS NULL ORDER BY i.name",
+            )
+            .map_err(backend)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(names)
+    }
+
+    fn breach_default_rows(&self) -> Result<Vec<(String, bool)>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT i.name, b.config_written FROM breach_default_upgrade b \
+                 JOIN agent_instances i ON i.id = b.instance_id ORDER BY i.name",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+            })
+            .map_err(backend)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(backend)?;
+        Ok(rows)
+    }
+
+    fn finish_breach_default(
+        &self,
+        written: &[(String, bool)],
+        at: &str,
+    ) -> Result<(), StoreError> {
+        for (name, config_written) in written {
+            self.conn()
+                .execute(
+                    "UPDATE breach_default_upgrade SET config_written = ?1, done_at = ?2 \
+                     WHERE instance_id = (SELECT id FROM agent_instances WHERE name = ?3)",
+                    rusqlite::params![*config_written as i64, at, name],
+                )
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn clear_breach_default(&self, instance: &str) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM breach_default_upgrade \
+                 WHERE instance_id = (SELECT id FROM agent_instances WHERE name = ?1)",
+                [instance],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
+    fn run_resolution_facts(
+        &self,
+        run_id: &RunId,
+    ) -> Result<
+        Option<(
+            RunRecord,
+            Vec<Label>,
+            RunLimits,
+            bool,
+        )>,
+        StoreError,
+    > {
+        use crate::ports::RunRecords;
+        let Some(record) = self.run_record(run_id)? else {
+            return Ok(None);
+        };
+        let labels = self.run_labels(run_id)?;
+        let limits = self.run_limits(run_id)?;
+        let kept = match &record.instance {
+            Some(instance) => self.breach_default_kept(instance)?,
+            None => false,
+        };
+        Ok(Some((record, labels, limits, kept)))
+    }
+}
+
+impl SqliteStore {
+    /// Read one Policy row with its Rate table. A row whose Selector no
+    /// longer parses is a typed corrupt-row error — the policies read fails
+    /// closed upstream (money code never silently drops a standing limit).
+    fn read_policy(&self, name: &str) -> Result<PolicyRecord, StoreError> {
+        let row: (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = self
+            .conn()
+            .query_row(
+                "SELECT selector, tokens_per_run, tokens_cumulative, dollars_per_run_micros, \
+                 dollars_cumulative_micros, breach_action, scent_check, rate_input_micros, \
+                 rate_output_micros, rate_cached_micros FROM policies WHERE name = ?1",
+                [name],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .map_err(backend)?;
+        let (
+            selector,
+            tokens_per_run,
+            tokens_cumulative,
+            dollars_per_run,
+            dollars_cumulative,
+            breach_action,
+            scent_check,
+            rate_input,
+            rate_output,
+            rate_cached,
+        ) = row;
+        let corrupt = |detail: String| StoreError::CorruptRow {
+            name: "policies".to_string(),
+            detail,
+        };
+        let selector = match selector {
+            None => {
+                if name != DEFAULT_POLICY_NAME {
+                    return Err(corrupt(format!(
+                        "policy `{name}` has no Selector (only the default Policy may)"
+                    )));
+                }
+                None
+            }
+            Some(raw) => Some(
+                Selector::parse(&raw)
+                    .map_err(|err| corrupt(format!("policy `{name}` Selector `{raw}`: {err}")))?,
+            ),
+        };
+        let breach_action = breach_action
+            .map(|raw| raw.parse::<BreachAction>())
+            .transpose()
+            .map_err(|err| corrupt(format!("policy `{name}`: {err}")))?;
+        let scent_check = scent_check
+            .map(|raw| {
+                ScentCheckMode::from_wire(&raw)
+                    .ok_or_else(|| corrupt(format!("policy `{name}` has an unknown mode `{raw}`")))
+            })
+            .transpose()?;
+        let rate = match (rate_input, rate_output) {
+            (Some(input), Some(output)) => {
+                let mut rate = Rate::new(input.max(0) as u64, output.max(0) as u64);
+                if let Some(cached) = rate_cached {
+                    rate = rate.with_cached(cached.max(0) as u64);
+                }
+                Some(rate)
+            }
+            _ => None,
+        };
+        let mut rates = std::collections::BTreeMap::new();
+        if name == DEFAULT_POLICY_NAME {
+            let mut stmt = self
+                .conn()
+                .prepare(
+                    "SELECT model, input_micros_per_1m, output_micros_per_1m, \
+                     cached_micros_per_1m FROM policy_rates WHERE policy = ?1 ORDER BY model",
+                )
+                .map_err(backend)?;
+            let entries = stmt
+                .query_map([name], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(backend)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend)?;
+            for (model, input, output, cached) in entries {
+                let mut rate = Rate::new(input.max(0) as u64, output.max(0) as u64);
+                if let Some(cached) = cached {
+                    rate = rate.with_cached(cached.max(0) as u64);
+                }
+                rates.insert(model, rate);
+            }
+        }
+        Ok(PolicyRecord {
+            name: name.to_string(),
+            selector,
+            limits: crate::domain::runs::PolicyLimits {
+                tokens_per_run: tokens_per_run.map(|v| v.max(0) as u64),
+                tokens_cumulative: tokens_cumulative.map(|v| v.max(0) as u64),
+                dollars_per_run_micros: dollars_per_run.map(|v| v.max(0) as u64),
+                dollars_cumulative_micros: dollars_cumulative.map(|v| v.max(0) as u64),
+                breach_action,
+                scent_check,
+                rate,
+            },
+            rates,
+        })
+    }
+}
+
+/// Decode one `run_policy` row (typed corruption — the stored resolution is
+/// money config; a row that cannot be read must fail the read).
+fn decode_run_policy(
+    resolution: &str,
+    inputs: &str,
+    updated_at: &str,
+) -> Result<RunPolicy, StoreError> {
+    let resolution: crate::domain::runs::PolicyResolution =
+        serde_json::from_str(resolution).map_err(|err| StoreError::CorruptRow {
+            name: "run_policy".to_string(),
+            detail: format!("a stored resolution could not be decoded: {err}"),
+        })?;
+    let inputs: crate::domain::runs::ResolveInputs =
+        serde_json::from_str(inputs).map_err(|err| StoreError::CorruptRow {
+            name: "run_policy".to_string(),
+            detail: format!("stored resolution inputs could not be decoded: {err}"),
+        })?;
+    Ok(RunPolicy {
+        resolution,
+        inputs,
+        updated_at: updated_at.to_string(),
+    })
+}
+
+

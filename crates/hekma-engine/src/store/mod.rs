@@ -7,6 +7,7 @@
 
 mod run_store_sqlite;
 mod runs_sqlite;
+pub(crate) use runs_sqlite::BreachDefaultSource;
 mod sqlite;
 pub(crate) mod writer;
 

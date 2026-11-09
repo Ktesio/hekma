@@ -1123,25 +1123,25 @@ impl Engine {
                 .unwrap_or_default(),
             None => crate::domain::UsageTotals::zero(),
         };
-        // Story 3-3 dollar surface: resolve the CURRENT Rate/cap + action ONCE
-        // through the SAME live config resolve enforcement uses (so the Fleet view
-        // matches what enforcement sees). A degraded read → no Rate / no budget
-        // (honest absence), never failing the Fleet. Story 14-3 (T2): the SAME
-        // resolved effective config decides the acp kind's ACTIVE metering source
-        // (the `metering.upstream_base_url` opt-in), so the surfaced source matches
+        // Story 3-3 dollar surface + story 21-3 (the resolved limits): the
+        // CURRENT Rate/cap/action resolve ONCE through the ONE Policy
+        // resolver (`Registry::resolved_limits` — explicit config, the
+        // kept-on-pause marker, matching Policies, the default Policy), so
+        // the Fleet view matches what enforcement sees, names the source of
+        // every limit, and reads `warn` for a fresh ungoverned instance. A
+        // degraded read fails closed (honest absence), never failing the
+        // Fleet. Story 14-3 (T2): the SAME resolved effective config decides
+        // the acp kind's ACTIVE metering source (the
+        // `metering.upstream_base_url` opt-in), so the surfaced source matches
         // what the start seam did — the snapshot alone would always read
         // self-reported for the acp builtin.
         let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok();
-        let (rate, cost_cap, action) = effective_opt
-            .as_ref()
-            .map(|effective| {
-                let (_token_budget, action) = crate::domain::resolve_token_budget(effective);
-                let (rate, cost_cap, _cost_action) = crate::domain::resolve_cost(effective);
-                (rate, cost_cap, action)
-            })
-            .unwrap_or_else(|| (None, crate::domain::CostCap::none(), Default::default()));
+        let resolution = registry.resolved_limits(&instance.name, current_run_id.as_ref());
+        let rate = resolution.rate;
+        let cost_cap = resolution.dollars;
+        let action = resolution.effective_action;
         let is_acp = crate::acp::is_acp_kind(&instance.kind);
         let metering_source = if is_acp {
             // The active source for the acp kind resolves from the effective
@@ -1180,18 +1180,17 @@ impl Engine {
                 base
             }
         };
-        // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10): the
-        // CURRENT resolved Token Budget + Cost Cap + Breach Action + remaining per
-        // scope, from the SAME effective config the Rate/action above resolved
-        // (one read — the AI-63 "double effective_config fold" debt shrinks by
-        // one here). TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are
-        // present ONLY when a Rate exists (a cap with no Rate is inert — AC-B).
-        // An instance with NEITHER a budget nor an enforceable cap surfaces an
-        // honest absent budget (never a fabricated ceiling).
-        let budget = effective_opt.as_ref().and_then(|effective| {
-            let (token_budget, _action) = crate::domain::resolve_token_budget(effective);
+        // Story 3-2 budget surface + story 3-3 dollar cap surface (AC9/AC10),
+        // resolved through the ONE Policy resolver since story 21-3 (the
+        // same `resolution` the Rate/action above used): the CURRENT
+        // resolved Token Budget + Cost Cap + Breach Action + remaining per
+        // scope. TOKEN remaining is `usage` tokens; DOLLAR cap/remaining are
+        // present ONLY when a Rate exists (a cap with no Rate is inert —
+        // AC-B). An instance with NEITHER a budget nor an enforceable cap
+        // surfaces an honest absent budget (never a fabricated ceiling).
+        let budget = effective_opt.as_ref().and_then(|_effective| {
             crate::domain::BudgetView::from_budget_and_cost(
-                &token_budget,
+                &resolution.tokens,
                 &cost_cap,
                 action,
                 current_run.total_tokens(),
@@ -1714,6 +1713,23 @@ impl Engine {
                     .lock()
                     .expect("supervisor mutex poisoned")
                     .sync_run_labels(&registry, &iname);
+            }
+            // Story 21-3: an explicit `budget.breach_action` write clears
+            // the FR-21 upgrade marker (the "kept on pause" note ends), and
+            // a budget or Rate write re-resolves the instance's open
+            // process-owning Run's Policies in the same change.
+            let mut warnings = warnings;
+            if key == crate::domain::config::BUDGET_BREACH_ACTION_KEY {
+                if let Some(note) = registry.clear_breach_default_marker(&iname) {
+                    warnings.push(note);
+                }
+            }
+            if key.starts_with("budget.") || key.starts_with("cost.rate.") {
+                inner
+                    .supervisor
+                    .lock()
+                    .expect("supervisor mutex poisoned")
+                    .sync_run_policy(&registry, &iname);
             }
             Ok(warnings)
         })

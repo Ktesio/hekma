@@ -91,7 +91,7 @@ use crate::ports::{
 /// see [`super::runs_sqlite`].
 /// v14 (story 21-9): `run_labels.origin`, each bound label's origin —
 /// see [`super::runs_sqlite`].
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -388,18 +388,22 @@ impl SqliteStore {
     /// the state dir before opening. Idempotent across reopens.
     #[cfg(test)]
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_with_legacy(path, &NoLegacy).map(|(store, _notes)| store)
+        Self::open_with_legacy(path, &NoLegacy, &super::runs_sqlite::NoBreachDefault)
+            .map(|(store, _notes)| store)
     }
 
     /// Open read-write and migrate, importing the pre-v12 event files from
-    /// `legacy` if the v12 step runs (story 21-1). The store writer's open.
+    /// `legacy` if the v12 step runs (story 21-1) and reading the persisted
+    /// config layers through `breach` if the v15 step runs (story 21-3).
+    /// The store writer's open.
     pub(crate) fn open_with_legacy(
         path: &Path,
         legacy: &dyn LegacySource,
+        breach: &dyn super::runs_sqlite::BreachDefaultSource,
     ) -> Result<(Self, OpenNotes), StoreError> {
         let conn = Connection::open(path).map_err(backend)?;
         Self::configure(&conn)?;
-        let notes = migrate(&conn, legacy)?;
+        let notes = migrate(&conn, legacy, breach)?;
         // Fold any usage row another writer left unfolded (an older engine
         // still running against this database after the upgrade).
         in_immediate_txn(&conn, || super::run_store_sqlite::fold_unfolded_rows(&conn))?;
@@ -457,7 +461,7 @@ impl SqliteStore {
     /// `query_only` — nothing is created on disk.
     pub(crate) fn open_empty_read_only() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
-        migrate(&conn, &NoLegacy)?;
+        migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
         conn.pragma_update(None, "query_only", "ON")
             .map_err(backend)?;
         Ok(Self { conn })
@@ -473,7 +477,7 @@ impl SqliteStore {
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory().map_err(backend)?;
         Self::configure(&conn)?;
-        migrate(&conn, &NoLegacy)?;
+        migrate(&conn, &NoLegacy, &super::runs_sqlite::NoBreachDefault)?;
         Ok(Self { conn })
     }
 
@@ -628,7 +632,11 @@ impl SqliteStore {
 /// [`SCHEMA_VERSION`] was written by a newer ktesio. We refuse it with
 /// [`StoreError::SchemaTooNew`] rather than skip the DDL and stamp the version
 /// back down — the old behavior silently downgraded a forward schema.
-fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, StoreError> {
+fn migrate(
+    conn: &Connection,
+    legacy: &dyn LegacySource,
+    breach: &dyn super::runs_sqlite::BreachDefaultSource,
+) -> Result<OpenNotes, StoreError> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(backend)?;
@@ -707,6 +715,13 @@ fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, St
     // `config` (one crash-atomic step).
     if version < 14 {
         super::runs_sqlite::migrate_v14(conn)?;
+    }
+    // Story 21-3: v15 adds Policies, the per-Run resolutions, and the FR-21
+    // breach-default upgrade's pending list (one crash-atomic step; the
+    // config.toml writes and the closing transaction run after the writer
+    // opens — see the registry's finish pass).
+    if version < 15 {
+        super::runs_sqlite::migrate_v15(conn, breach)?;
     }
     Ok(notes)
 }
