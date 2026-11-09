@@ -635,3 +635,111 @@ pub(crate) struct RestartPolicyRequest {
     /// The policy's wire form (e.g. `never`, `on-failure`).
     pub policy: String,
 }
+
+/// The `POST /v0/policies` body (story 21-3): a named Policy, its Selector
+/// over bound labels, and the limits it sets. Unknown fields are refused
+/// (a misspelled limit would otherwise be silently dropped).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyCreate {
+    /// The Policy's name.
+    pub name: String,
+    /// Its Selector (`key=value[,key=value…]`, bound labels only).
+    pub selector: hekma_engine::Selector,
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling.
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run Cost Cap, micro-dollars.
+    #[serde(default)]
+    pub dollars_per_run_micros: Option<u64>,
+    /// A cumulative Cost Cap, micro-dollars.
+    #[serde(default)]
+    pub dollars_cumulative_micros: Option<u64>,
+    /// The Breach Action for these ceilings.
+    #[serde(default)]
+    pub breach_action: Option<hekma_engine::BreachAction>,
+    /// The Scent-Check Mode (`off` only for now).
+    #[serde(default)]
+    pub scent_check: Option<hekma_engine::ScentCheckMode>,
+    /// A flat Rate for the matched Runs.
+    #[serde(default)]
+    pub rate: Option<hekma_engine::Rate>,
+    /// Plan only: report the matched and fallback counts, write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The `rates` part of a `PATCH /v0/policies/{name}` body: model-keyed
+/// Rate-table edits on the `default` Policy.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyRatesPatch {
+    /// Models to price (exact model names).
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, hekma_engine::Rate>,
+    /// Models whose entry to remove.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// The `PATCH /v0/policies/{name}` body (story 21-3).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyPatch {
+    /// A new Selector (never on `default`).
+    #[serde(default)]
+    pub selector: Option<hekma_engine::Selector>,
+    /// Limits to set.
+    #[serde(default)]
+    pub set: hekma_engine::PolicyLimits,
+    /// Limits to clear (`tokens-per-run`, `tokens-cumulative`,
+    /// `dollars-per-run`, `dollars-cumulative`, `breach-action`,
+    /// `scent-check`, `rate`).
+    #[serde(default)]
+    pub clear: Vec<String>,
+    /// Rate-table edits (`default` only).
+    #[serde(default)]
+    pub rates: PolicyRatesPatch,
+    /// Plan only.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `DELETE /v0/policies/{name}` query: `?dry_run=true` previews.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyDeleteQuery {
+    /// Plan only.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `GET /v0/policies`: every stored Policy, `default` included.
+#[derive(Serialize)]
+pub(crate) struct PolicyListDocument {
+    pub schema_version: u32,
+    pub policies: Vec<hekma_engine::PolicyRecord>,
+}
+
+/// `GET /v0/policies/{name}`: one stored Policy.
+#[derive(Serialize)]
+pub(crate) struct PolicyShowDocument {
+    pub schema_version: u32,
+    pub policy: hekma_engine::PolicyRecord,
+}
+
+/// A create, change or delete answer (story 21-3, PRD FR-60): the Policy
+/// after the change (absent on a delete), how many open Runs it matches,
+/// and how many of those fall back to `warn` at their Control Depth.
+#[derive(Serialize)]
+pub(crate) struct PolicyChangeDocument {
+    pub schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<hekma_engine::PolicyRecord>,
+    pub matched: usize,
+    pub fallbacks: usize,
+    pub dry_run: bool,
+}

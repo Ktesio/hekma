@@ -127,6 +127,12 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         }
         .into(),
         "instance-not-found" => instance_not_found(message),
+        // Story 21-3.
+        "policy-not-found" => RunNotFound {
+            message: format!("{message}. List them with `hekma policy list`."),
+        }
+        .into(),
+        "policy-exists" => RunInvalid { message }.into(),
         "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs" => {
             RunInvalid { message }.into()
         }
