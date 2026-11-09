@@ -106,7 +106,7 @@ toml = "1"
 thiserror = "2"
 # Run ids (story 21-2, AD-25): the ULID's 80 random bits. Already in the
 # tree through `ring` (rustls); a direct edge adds no crate (NFR-8).
-getrandom = "0.2"
+getrandom = "0.4"
 ureq = { version = "3", features = ["json"] }
 semver = "1"
 flate2 = "1"
