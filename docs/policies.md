@@ -1,70 +1,86 @@
 ---
 title: "Policies and the warn default"
-description: "Standing limits that apply to every Run a Selector matches, and warn as the default Breach Action. In development."
+description: "Standing limits that apply to every Run a Selector matches, and warn as the default Breach Action."
 ---
 
 # Policies and the warn default
 
-> **In development.** Apart from the `block` Breach Action, nothing on this page is in Hekma 0.11.0 or on main yet. It describes the design being built in the open, and names, commands and defaults may change before it ships. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **On main, unreleased.** Policies and the `warn` default are on main and ship in the next release. Scent-Check Modes other than `off` arrive with Run Keys (planned). See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/policies/](https://hekma.ktesio.dev/docs/policies/), where it is kept current.
 
-Budgets in Hekma today belong to one agent at a time. A developer running a dozen coding and personal agents wants one ceiling for all of them, and a looping session to be loud, not frozen mid-task. A team running CrewAI or LangGraph flows in production wants one rule for "every nightly research flow", including tomorrow's runs, that never stops production unless someone chose that.
+A developer running a dozen coding and personal agents wants one ceiling for all of them, and a looping session to be loud, not frozen mid-task. A team running CrewAI or LangGraph flows in production wants one rule for "every nightly research flow", including tomorrow's runs, that never stops production unless someone chose that.
 
-A **Policy** is that rule: standing limits that apply to every [Run](runs.md) its Selector matches, now and later. A Run is one unit of agent work, whether or not Hekma started it. The default **Breach Action**, what happens when a ceiling is reached, also changes from `pause` to `warn`.
+A **Policy** is that rule: standing limits that apply to every [Run](runs.md) its Selector matches, now and later. The default **Breach Action**, what happens when a ceiling is reached, is `warn`.
 
-## What works today
+## A Policy
 
-In Hekma 0.11.0, limits are per-agent [config keys](https://hekma.ktesio.dev/docs/budgets/#set-a-budget): `budget.tokens.*`, `budget.dollars.*`, `cost.rate.*`, and one `budget.breach_action` for all of an agent's caps. The Breach Action defaults to `pause`, and `warn` only writes a line to `logs/breaches.log`. A cap fires once per run, and [raising it does not re-arm it](https://hekma.ktesio.dev/docs/budgets/#resume).
+A Policy holds any mix of Token Budgets (per run and cumulative), Cost Caps (per run and cumulative, estimated from Rates), a flat Rate and a Breach Action. It names its Runs with a **Selector**, a label expression such as `team=research,env=prod`, and every term must match.
 
-On main, the [Control API](https://hekma.ktesio.dev/docs/control-api/) can set the same keys over HTTP. `budget.breach_action` also accepts `block`, the wire fence, on agents whose usage is read off the wire (see [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/)). There are no Policies yet; bound labels for them to select are on main (an agent's `labels` key and [`hekma label`](runs.md#bound-labels)).
-
-## What is coming
-
-**Policies.** A Policy holds any mix of Token Budgets, Cost Caps, Rates, a Breach Action and, once Run Keys land (planned), a **Scent-Check Mode**: how Hekma treats a call without a valid Run Key, `off`, `shadow` (served and recorded as unscented) or `enforce` (refused). It names its Runs with a **Selector**, a label expression such as `team=research,env=prod`. Selectors match only *bound* labels, set by the Operator or a Host through an agent's configuration, a [Run Key](run-keys.md), a Metering Proxy endpoint or `hekma label`. Labels a Run sets about itself never pick its Policy, so an agent cannot choose a looser one.
-
-**One limit at a time.** Hekma resolves each limit on its own, in this order:
-
-| Source | Rule |
-|---|---|
-| Explicit limits on an agent or a Run | Set by the Operator or Host. They outrank every Policy. |
-| Matching Policies | The most specific Selector wins; a tie goes to the tightest value. |
-| The default Policy | Fills whatever is still unset. |
-
-Selector A is more specific than B when A's terms are a strict superset of B's; Selectors that cannot be compared tie. From loosest to tightest, Breach Actions run `warn` < `pause` < `stop` < `block`, and Scent-Check Modes run `off` < `shadow` < `enforce`.
-
-Once Run Keys land (planned), a **Caller**, an agent or helper acting on its own Run through its Run Key, can also set a limit; it applies only while tighter than the effective one. Callers can tighten, never loosen.
-
-**The default Policy** is a stored Policy named `default` that you can edit like any other: no ceiling, Breach Action `warn`, Scent-Check Mode `off`, and a model-keyed Rate table, so Runs that Hekma only sees on the wire still have a price.
-
-**The warn default.** `warn` acts on nothing and signals loudly: an **Anomaly** on the Run in `hekma ps`, an event, an OTLP metric when export is configured, and a response header on calls that pass through the **Metering Proxy**, Hekma's interception point for model traffic. `pause`, `stop` and `block` stay opt-in. Nothing Hekma does on its own stops a production Run unless an Operator configured it, and a Run is never treated differently for running long.
-
-**Upgrades keep your pause.** An agent registered before the change that relied on the implicit `pause` default keeps `pause`, written into its config, with a "kept on pause by upgrade" note in listings until you set a Breach Action yourself. A malformed `breach_action` fails closed to `pause` with a diagnostic, never to `warn`.
-
-**`block`, the wire fence.** `block` is never a default. On main it already works per agent: on a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error, and the fence lifts when the Run ends (raise the ceiling, then start a new Run). With Policies it will apply to every Run on the Metering Proxy, and raising a ceiling will lift the fence on a live Run. An agent that bypasses the listener or the proxy bypasses the fence too.
-
-## How it will work
-
-You will manage Policies with `hekma policy` or `/v0/policies` on the Control API; every change is an event. A change applies at once to every matched open Run: lowering a ceiling below a Run's usage breaches it now, and raising one re-arms its breach latch. Policies will have no versions at first; versioned policy-as-data comes later.
-
-Each Run has a **Control Depth**, how far Hekma controls it: `observed` < `wire` < `announced` < `supervised`. Where a Policy's Breach Action is beyond a Run's depth, such as `pause` on a Run known only from its telemetry, the Run acts as `warn` for that ceiling and carries an Anomaly naming the depth and Policy. Policy changes report how many Runs fall back.
-
-A sketch of the planned command; the final flags may differ.
+Selectors match only *bound* labels: labels the Operator set through an agent's `labels` configuration or with [`hekma label`](runs.md#bound-labels). Labels a Run sets about itself never pick its Policy, so an agent cannot choose a looser one.
 
 ```text
 hekma policy create nightly-research \
   --selector team=research,env=prod \
   --tokens-per-run 2000000 \
+  --dollars-per-run 25 \
   --breach-action pause
 ```
 
-## Open questions
+`hekma policy list`, `show`, `change` and `delete` manage them; each takes `--json`, and every write takes `--dry-run`, which reports what it would match and writes nothing. `/v0/policies` on the [Control API](control-api.md) does the same over HTTP. Every change is a `policy` event.
 
-- **Scent-Check defaults per environment.** The default Policy starts at `off`. Whether a laptop and a server should start differently is still open; deciding it will not overwrite a default Policy you have edited.
-- **Pinning a Policy for long Runs.** For now a Run follows the latest Policy. Whether it should keep the one in force when it started will be decided with versioned policy-as-data.
+## One limit at a time
+
+Hekma resolves each limit on its own, in this order:
+
+| Source | Rule |
+|---|---|
+| Explicit limits on a Run, then on an agent | Set by the Operator, in any configuration layer. They outrank every Policy. |
+| Matching Policies | The most specific Selector wins; a tie goes to the tightest value. |
+| The default Policy | Fills whatever is still unset. |
+
+Selector A is more specific than B when A's terms are a strict superset of B's; Selectors that cannot be compared tie. From loosest to tightest, Breach Actions run `warn` < `pause` < `stop` < `block`. A tie between two ceilings goes to the lower one.
+
+`hekma agent show` names where each limit came from: the Run, the agent's configuration, a Policy by name, or the default Policy.
+
+## The default Policy
+
+`default` is a stored Policy you change like any other, with `hekma policy change default`. It starts with no ceiling, Breach Action `warn` and Scent-Check Mode `off`. It cannot be deleted or given a Selector.
+
+It also carries a Rate table keyed by model, used for Runs with no Rate of their own. The table starts empty: Hekma never invents prices. Add an entry for the exact model name an agent's `model` key sets:
+
+```text
+hekma policy change default --rate-for gpt-4.1 --rate-input 2.00 --rate-output 8.00
+hekma policy change default --clear rate:gpt-4.1
+```
+
+A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Policy's flat Rate, then this table. A Cost Cap set by a Policy on a Run whose model has no Rate cannot be enforced; the Run carries the `unpriced-model` Anomaly until a Rate resolves, so the gap is never silent.
+
+## The warn default
+
+`warn` acts on nothing and signals loudly: the breach is recorded, raises the `breach` Anomaly on the Run, and is published as an event (and an OTLP metric when export is configured). `pause`, `stop` and `block` stay opt-in. Nothing Hekma does on its own stops a Run unless an Operator configured it.
+
+**Upgrades keep your pause.** An agent registered before this change that relied on the implicit `pause` default keeps `pause`: the first open of the upgraded state directory writes `budget.breach_action = "pause"` into the agent's configuration, records one `breach-default-upgraded` event, and shows a "kept on pause by upgrade" note until you set a Breach Action yourself. An agent whose configuration cannot be written still pauses. A malformed `breach_action` fails closed to `pause` with a diagnostic, never to `warn`.
+
+## Changes apply at once
+
+A Policy change applies to every matched open Run immediately. Lowering a ceiling to or below a Run's usage breaches it now; raising one above the usage re-arms its breach latch, so the next crossing fires again, and lifts the `block` fence for that ceiling on a live Run. Deleting a Policy re-resolves the Runs it governed under what remains.
+
+## Control Depth and fallback
+
+Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Breach Action is beyond a Run's depth, such as `block` on an agent with no metering listener, or `pause` on a child Run inside an agent's process, the Run acts as `warn` for that ceiling and carries the `depth-fallback` Anomaly. The action takes effect if the Run's depth later allows it. Creating or changing a Policy reports how many matched Runs fall back.
+
+## `block`, the wire fence
+
+`block` is never a default. On a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error. The fence lifts when the Run ends, or when a Policy raises the ceiling above the Run's usage. An agent that bypasses the listener bypasses the fence too.
+
+## Not yet
+
+- **Scent-Check Modes.** Every Policy carries a Scent-Check Mode, and only `off` is accepted until Run Keys land; `shadow` and `enforce` are refused rather than stored and ignored.
+- **Pinning a Policy for long Runs.** A Run follows the latest Policy. Versioned policy-as-data comes later.
 
 ## Read next
 
 - [Runs](runs.md): Control Depth, Run Status and labels.
-- [Run Keys](run-keys.md): how a Run gets bound labels and an identity.
-- [Budgets and cost](https://hekma.ktesio.dev/docs/budgets/): per-agent budgets as they work in 0.11.0.
+- [Run Keys](run-keys.md): how a Run will get bound labels and an identity.
+- [Budgets and cost](https://hekma.ktesio.dev/docs/budgets/): per-agent budgets and Rates.
