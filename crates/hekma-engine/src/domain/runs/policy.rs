@@ -400,8 +400,10 @@ pub fn dominates(a: &Selector, b: &Selector) -> bool {
 
 /// The tightest ceiling among tied maximal candidates: the MINIMUM (a
 /// higher ceiling would loosen; FR-60's tie rule).
-fn tightest_ceiling(values: &[u64]) -> u64 {
-    *values.iter().min().expect("a tie has candidates")
+fn tightest_ceiling(values: &[u64]) -> Option<u64> {
+    // No candidate sets the limit: nothing to pick (never a panic on the
+    // enforcement path).
+    values.iter().min().copied()
 }
 
 /// The flat-Rate tie rule's tightness: the `input+output` micros sum — a
@@ -652,7 +654,7 @@ fn policy_ceiling(candidates: &[&PolicyRecord], kind: LimitKind) -> Option<(u64,
         .iter()
         .map(|policy| policy.limits.ceiling(kind))
         .collect::<Option<_>>()?;
-    let value = tightest_ceiling(&values);
+    let value = tightest_ceiling(&values)?;
     let name = candidates
         .iter()
         .filter(|policy| policy.limits.ceiling(kind) == Some(value))
