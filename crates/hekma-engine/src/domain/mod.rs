@@ -36,6 +36,8 @@ pub(crate) mod probe_kinds;
 pub(crate) mod readiness;
 mod registry;
 pub(crate) mod registry_policy;
+#[cfg(test)]
+mod registry_policy_tests;
 mod restart;
 mod resync;
 pub(crate) mod runs;
