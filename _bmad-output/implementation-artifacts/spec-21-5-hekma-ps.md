@@ -2,7 +2,7 @@
 title: 'hekma ps and Run listing'
 type: 'feature'
 created: '2026-11-09'
-status: 'draft'
+status: 'ready-for-dev'
 review_loop_iteration: 0
 baseline_commit: '4d1b85e7ae6cf142ac1b5cbf50785545279cb070'
 context:
@@ -35,7 +35,7 @@ context:
 - [ ] `hekma-host` — `GET /v0/runs?selector=&limit=&cursor=&view=exceptions|all` (operator bearer; `RunError`/listing errors mapped); `/v0/events` gains `id:` frames (the outbox seq), `?selector=` (per-event: the subject Run's CURRENT labels, snapshot first, one read-only store read when the Run is not in the snapshot; events naming no Run are dropped under a selector), and `Last-Event-ID` resume (subscribe first, replay outbox rows with seq > the id through the same filter, then live with seq-dedup; a seq below the outbox floor or past the tail is a typed `409` at connect — never clamped).
 - [ ] `hekma` CLI — `hekma ps [--selector SEL] [--all] [--limit N] [--cursor C] [--json]` (`cli/ps.rs`, new): read-only open, human table per the width rule (COLUMNS else terminal else 80, clamped 40–132; a column never narrower than its header; `…` truncation), counts + next-cursor hint on stderr, `--json` one document; exit classes per the frozen table (2 invalid selector/cursor/limit, 1 store/host, 0 on an empty result with a note).
 - [ ] Bench — `perf-budgets.rs` gains `--ps-seed <N>` (the `--serve-shape` pattern: runs after the default phases, adds a `ps_listing` report block, gates bind only on the flag): seeds N Runs directly into a temp state.db (labels, `run_policy`, subtree rollups; 2% anomalous, 2% held, 2% ended-with-Anomaly inside the window, 20% ended clean inside, 10% ended older than the window), then measures `open_read_only` + the first exceptions page + the counts, p50/p95/p99.
-- [ ] Docs + release — `docs/runs.md` (ps moves from "in development" to shipped: the view, the window, the ordering, the cursor), `docs/commands.md`, `docs/control-api.md` (`GET /v0/runs`, the SSE id/selector/Last-Event-ID contract), `docs/architecture.md` (the listing indexes), `docs/testing.md` (the seeded mode), `README.md`; CHANGELOG + RELEASE_NOTES Unreleased banners; hekma-engine 0.13.0 → 0.14.0 (post-21-3; take the next minor if 21-3 lands differently); deferred-work entries (Design Notes: the four trigger decisions), sprint status.
+- [ ] Docs + release — `docs/runs.md` (ps moves from "in development" to shipped: the view, the window, the ordering, the cursor), `docs/commands.md`, `docs/control-api.md` (`GET /v0/runs`, the SSE id/selector/Last-Event-ID contract), `docs/architecture.md` (the listing indexes), `docs/testing.md` (the seeded mode), `README.md`; CHANGELOG + RELEASE_NOTES Unreleased banners (the feature, not a version bump — the engine stays 0.12.0); deferred-work entries (Design Notes: the four trigger decisions), sprint status.
 
 **Acceptance Criteria:**
 - Given Runs in every shape — an active healthy Run, an active Run with the `breach` Anomaly (a latched `block`), a `held` Run, an ended Run with the `failed` Anomaly ended 2 days ago, an ended clean Run ended 2 days ago, and an ended Run with an Anomaly ended 20 days ago — when `hekma ps` runs with no flags, then the first three exception Runs and the recent failed one are listed (newest run id first), the 20-day-old one is not (outside the 7-day window), the healthy Run is not listed but is counted, and the footer names the listed and healthy counts; `--all` additionally lists the recent clean ended Run, still not the 20-day-old one.
@@ -68,7 +68,7 @@ context:
 - **Exit codes.** The frozen table: `2` an invalid Selector/cursor/limit (`RunInvalid`), `1` store/host failure, `0` otherwise — including an empty result (a note, not an error; the 21-9 no-match precedent). No confirmation, `--yes` or `--dry-run`: a listing acts on nothing.
 - **SSE ids, filter and resume.** The bus envelope becomes `(outbox seq, EngineEvent)` internally — the writer's ack already returns each committed event's seq (21-1), so the publisher sends them together; `subscribe()` still yields `EngineEvent` (hosts unchanged) and `subscribe_sequenced()` feeds the SSE path. Every event frame carries `id: <seq>`; `lagged` frames carry none (a gap marker, not an event). Resume: the handler validates `Last-Event-ID` BEFORE streaming (below the outbox floor → `409 cursor-below-retention`; past the tail → `409 cursor-past-tail`, matching the export contract's never-clamp rule), then subscribes first, replays outbox rows with seq > the id through the active selector, then streams live, dropping live seqs ≤ the replayed tail. The selector filter evaluates each event's subject Run (`RunEvent.run_id`; `UsageUpdate`/`BudgetBreach` via their run id; `Transition` via the snapshot's `owners` map) against its CURRENT labels — snapshot first (no SQL), one read-only store read when the Run is absent from the snapshot (ended Runs keep matching until compaction). Events naming no Run (`policy`, `breach-default-upgraded`) are delivered only without a selector. Honest limitation, documented: the filter sees current labels, not labels-at-event-time.
 - **The bench mode (NFR-4 from here on).** `--ps-seed <N>` mirrors `--serve-shape`: additive scenario + `ps_listing` report block + gates that bind only on the flag; the default report stays byte-equivalent. Seeding writes rows directly through the store (no processes — Windows-safe): N Runs with 2 labels each, `run_policy` rows, subtree rollups on 10%, and the status mix named in the task. Gate: `ps_first_page_p99_ms < 1000` strict at the CI seed (10k), with the existing CI once-retry policy; a local 100k number goes in the build report. 24.4 owns the 10k/100k/1M ladder and the proxy p99.
-- **Version.** New public types (`ListRunsQuery`, `RunListing`, `RunSummary`, the counts), new facade methods (`list_runs`, `subscribe_sequenced`), schema v16 (one-way): hekma-engine 0.13.0 → 0.14.0 (21-3's bump assumed merged; otherwise the next minor), announced in CHANGELOG/RELEASE_NOTES with the semver baseline SHA bump per the armed-gate procedure. No new `EngineEvent` or `Anomaly` variants; the bus envelope change is crate-internal.
+- **Version.** New public types (`ListRunsQuery`, `RunListing`, `RunSummary`, the counts), new facade methods (`list_runs`, `subscribe_sequenced`), schema v16 (one-way): hekma-engine **stays 0.12.0** — nothing has been released since 21-2's 0.11.0 → 0.12.0 bump, every story in this unreleased cycle stays on 0.12.0, and the semver gate's baseline (7783aa4) already permits breaking changes at 0.12, so the additions land within it with no bump and no baseline move. No new `EngineEvent` or `Anomaly` variants; the bus envelope change is crate-internal.
 - **Deferred-work decisions (the four triggers naming this story).**
   1. *Row-id cursor on per-instance event reads (from 21-1, trigger "21.5")* — **keep deferred.** `hekma ps` never reads per-instance event history (runs, labels, `run_policy`, rollups, latches only); the SSE replay reads the outbox, already seq-keyset. Re-point the trigger to 24.4's scale pass or the first paging consumer of per-instance events.
   2. *Ended-Run compaction and the retention window (trigger "21.5: `--all` and the retention window it lists against")* — **partially absorb.** The window's default and its read-side meaning land here; the configurable knob and compaction stay with 24.4 (one mechanism, one owner). Update the entry: resolved-in-part, new trigger 24.4.
@@ -89,7 +89,7 @@ context:
 | A fenced (`block`) Run | reads healthy on listings | `breach[block]` on `ps`, `latched` in `--json` |
 | Ended Runs in listings | none listed | exception-first inside 7 days; `--all` inside the window |
 | perf-budgets | default + `--serve-shape` | + `--ps-seed <N>` (`ps_listing` block, gated) |
-| hekma-engine | 0.13.0 | 0.14.0 |
+| hekma-engine | 0.12.0 | 0.12.0 (unchanged; additive within the unreleased cycle) |
 
 ## Code Map
 
@@ -100,7 +100,7 @@ context:
 - `crates/hekma-host/src/control/{routes,sse,dto,error}.rs` — `GET /v0/runs`; SSE ids, selector filter, Last-Event-ID.
 - `crates/hekma/src/cli/ps.rs` (new), `crates/hekma/src/{lib.rs,cli/mod.rs,error.rs,exit_code.rs}`, `crates/hekma/tests/ps_cli.rs` (new).
 - `crates/hekma-engine/tests/` (listing + v16 plan pins), `crates/hekma-host/tests/control_api.rs` (route + SSE resume/filter).
-- `docs/{runs,commands,control-api,architecture,testing}.md`, `README.md`, `CHANGELOG.md`, `docs/RELEASE_NOTES.md`, `Cargo.toml` + `crates/hekma-engine/Cargo.toml` (0.14.0).
+- `docs/{runs,commands,control-api,architecture,testing}.md`, `README.md`, `CHANGELOG.md`, `docs/RELEASE_NOTES.md` (no `Cargo.toml` version change — the engine stays 0.12.0).
 - `_bmad-output/implementation-artifacts/{deferred-work.md,sprint-status.yaml}`.
 
 ## Verification
@@ -132,8 +132,9 @@ Each is a public-contract choice taken under the delegated brief; the recommenda
 7. **SSE selector evaluates the subject Run's CURRENT labels (snapshot first, one store read when absent); no-Run events drop under a selector** (vs event-time labels, which nothing stores). Recommended: as written, documented as a limitation.
 8. **`Last-Event-ID` below-floor and past-tail are typed `409`s at connect, never clamped** (matching the export contract). Recommended: as written.
 9. **`hekma ps` sits beside `hekma agent list`** (no alias, no replacement, `agent list` JSON frozen). Recommended: as written (different grains: Runs vs supervised instances).
-10. **hekma-engine 0.14.0** for the new public facade/types and schema v16 (0.13.0 assumed from 21-3). Recommended: yes.
+10. **hekma-engine stays 0.12.0** — no bump for the new public facade/types and schema v16: the cycle is unreleased since 21-2's 0.11.0 → 0.12.0 bump, and the semver gate's baseline (7783aa4) already permits breaking changes at 0.12. Recommended: stay (orchestrator amendment).
 
 ## Spec Change Log
 
 - 2026-11-09 — spec written from the story text and its readiness context, FR-50/FR-49/NFR-4 (amended), AD-20/AD-25/AD-27, the 21-1/21-2/21-3/21-4/21-9 specs and the deferred-work triggers naming this story. Status draft; awaiting the orchestrator's review.
+- 2026-11-09 — orchestrator review: approved; Ask First 1-9 as recommended, #10 amended to stay on 0.12.0 (nothing released since 21-2's 0.11.0 → 0.12.0 bump; the semver baseline 7783aa4 already permits breaking changes at 0.12 — the bump, its `Cargo.toml` change and the baseline move are struck from the Tasks, the Version note, the I/O matrix and the Code Map). Status ready-for-dev.
