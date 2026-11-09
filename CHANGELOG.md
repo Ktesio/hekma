@@ -4,6 +4,11 @@ All notable changes to Hekma (Ktesio through v0.7.0) are generated from git hist
 
 Release automation updates this file with a pull request after each `vMAJOR.MINOR.PATCH` tag.
 
+> **Unreleased — honest release diagnostics for a signal-killed paused agent (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **A signal-killed paused detached agent is no longer recorded as an adopted process when the engine releases it.** At shutdown the engine reconciles a paused detached agent that had already exited to `failed`; when that agent was spawned by this engine and died by a signal, the recorded cause now says "terminated by signal". Only an agent adopted from a previous engine — whose exit code this engine structurally cannot read — keeps the "exit code unavailable — adopted process is not this engine's child" wording. The `paused → failed` transition, the record settlement, and the coded-exit wording are unchanged.
+
 > **Unreleased — Runs as first-class entities (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >

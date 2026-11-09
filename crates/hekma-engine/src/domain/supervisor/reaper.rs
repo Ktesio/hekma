@@ -622,12 +622,14 @@ impl Supervisor {
                 // reads the real exit code via GetExitCodeProcess, so a
                 // Windows adopted exit normally lands in the `Exited(Some)`
                 // arm above carrying its true code (the story-11-5 closure of
-                // the 11-1 Windows-half defer).
-                CrashInput::Exited(None) if adopted => "process exited unexpectedly (exit \
-                 code unavailable — adopted process is not this engine's child)"
-                    .to_string(),
+                // the 11-1 Windows-half defer). The parentheticals are the
+                // shared fragments (issue #387) so the release pass's
+                // released-exit reconcile words the same two shapes identically.
+                CrashInput::Exited(None) if adopted => {
+                    format!("process exited unexpectedly ({CODE_LESS_ADOPTED_FRAGMENT})")
+                }
                 CrashInput::Exited(None) => {
-                    "process exited unexpectedly (terminated by signal)".to_string()
+                    format!("process exited unexpectedly ({CODE_LESS_SIGNAL_FRAGMENT})")
                 }
             };
             // Story 18-3: the classified branches pick the cause + the policy
