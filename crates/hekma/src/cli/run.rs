@@ -133,6 +133,9 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         }
         .into(),
         "policy-exists" => RunInvalid { message }.into(),
+        // Story 21-3: the default Policy's reserved shape is an Operator
+        // refusal (2); a Scent-Check Mode before Scent-Check ships (2).
+        "policy-default" | "scent-unavailable" => RunInvalid { message }.into(),
         "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs" => {
             RunInvalid { message }.into()
         }

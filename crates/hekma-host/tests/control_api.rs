@@ -3290,6 +3290,11 @@ fn call(
             .put(url)
             .header("Authorization", &auth)
             .send_json(json),
+        ("PATCH", Some(json)) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_json(json),
+        ("PATCH", None) => client.patch(url).header("Authorization", &auth).send_empty(),
         ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
         (other, _) => panic!("unsupported test method {other}"),
     }
@@ -3628,4 +3633,161 @@ fn an_auto_started_host_leaves_when_its_state_root_disappears() {
         "{}",
         sink_handle.text()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-3: the /v0/policies routes — CRUD, the reserved default, the
+// matched/fallback counts, and the typed refusals.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
+    let state = tempfile::tempdir().unwrap();
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    let base = format!("http://{}/v0/policies", server.addr);
+
+    // The seeded default Policy reads before any write: warn, `off`, no
+    // ceilings, an empty Rate table (absent when empty).
+    let mut response =
+        get_ok(&client, &server.addr, "/v0/policies/default");
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(&mut response);
+    assert_eq!(document["policy"]["limits"]["breach_action"], "warn");
+    assert_eq!(document["policy"]["limits"]["scent_check"], "off");
+
+    // Create: 201 + the Location header, answering the matched counts.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "nightly",
+            "selector": "team=research",
+            "tokens_per_run": 2_000_000,
+            "breach_action": "pause",
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers()["location"].to_str().unwrap(),
+        "/v0/policies/nightly"
+    );
+    let document = json_body(&mut response);
+    assert_eq!(document["matched"], 0);
+    assert_eq!(document["fallbacks"], 0);
+
+    // A duplicate name is 409 policy-exists.
+    let mut response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({"name": "nightly", "selector": "team=x"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-exists");
+
+    // The default Policy's reserved shape: delete and a Selector are 409
+    // policy-default.
+    let mut response = call(&client, "DELETE", &format!("{base}/default"), None);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "policy-default"
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"selector": "team=core"})),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "policy-default"
+    );
+
+    // A Scent-Check Mode before Scent-Check ships is 400
+    // scent-unavailable (never stored-and-ignored).
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"set": {"scent_check": "enforce"}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "scent-unavailable"
+    );
+
+    // The Rate table edits through PATCH's `rates`: set, read back, remove.
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-demo": {
+                "input_micros_per_1m": 2_000_000,
+                "output_micros_per_1m": 8_000_000,
+            }}},
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    let document = json_body(&mut response);
+    assert_eq!(
+        document["policy"]["rates"]["gpt-demo"]["input_micros_per_1m"],
+        2_000_000
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({"rates": {"remove": ["gpt-demo"]}})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
+    assert!(
+        json_body(&mut response)["policy"]["rates"].is_null(),
+        "the removed entry leaves an absent table"
+    );
+
+    // A dry run plans and writes nothing; unknown fields are 422.
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_run": 9_000_000}, "dry_run": true})),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(&mut response)["dry_run"], true);
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(
+        json_body(&mut response)["policy"]["limits"]["tokens_per_run"],
+        2_000_000,
+        "the dry run wrote nothing"
+    );
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"tokens_per_run": 9})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // An unknown name is 404 policy-not-found; delete answers 204.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/ghost");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "policy-not-found"
+    );
+    let response = call(&client, "DELETE", &format!("{base}/nightly"), None);
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = get_ok(&client, &server.addr, "/v0/policies/nightly");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    server.stop().unwrap();
 }
