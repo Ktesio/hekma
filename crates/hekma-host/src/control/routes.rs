@@ -292,13 +292,18 @@ pub(crate) async fn remove(
 /// non-object shapes BEFORE the typed read — the same shape the refusal
 /// message has always named.
 fn object_body<T: serde::de::DeserializeOwned>(body: &[u8], expected: &str) -> Result<T, ApiError> {
+    // Shape-check through `Value` (refuses the sequence forms serde's derive
+    // would otherwise accept), then deserialize the typed struct from the
+    // ORIGINAL bytes: the derived field visitor still rejects duplicate keys
+    // ("duplicate field `timeout_ms`"), which a `Value` re-read would
+    // silently collapse — last one wins. The body is tiny, so the second
+    // parse of the same bytes costs almost nothing.
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|err| ApiError::invalid_body(format!("{expected}: {err}")))?;
     if !value.is_object() {
         return Err(ApiError::invalid_body(expected.to_string()));
     }
-    serde_json::from_value(value)
-        .map_err(|err| ApiError::invalid_body(format!("{expected}: {err}")))
+    serde_json::from_slice(body).map_err(|err| ApiError::invalid_body(format!("{expected}: {err}")))
 }
 
 /// `POST /v0/instances/{name}/start` — the lifecycle verbs, each acknowledged

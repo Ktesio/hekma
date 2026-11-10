@@ -1025,6 +1025,32 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
         );
     }
 
+    // A duplicate key is a rejected REQUEST too — the shape check reads the
+    // body as `Value`, which would collapse the pair (last one winning),
+    // but the typed read runs on the ORIGINAL bytes, where the derived
+    // visitor still refuses it. A `Value` re-read would silently drain on
+    // the manifest tier here.
+    for body in [
+        "{\"timeout_ms\":1,\"timeout_ms\":null}",
+        "{\"timeout_ms\":null,\"timeout_ms\":1500}",
+    ] {
+        let mut response = client
+            .post(format!("{obj}/drain"))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "body={body}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "body={body}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "body={body}: the refusal names the duplicate key"
+        );
+    }
+
     // `{}` — an object with NO timeout — is the manifest tier's equal: the
     // drain runs on the declared 10s bound, the idle signal lands mid-wait,
     // and the outcome is the completed shape with an honestly counted wait.
@@ -1102,6 +1128,34 @@ fn start_stop_and_drain_refuse_the_sequence_forms_as_shape() {
                 .unwrap()
                 .contains("must be a JSON object"),
             "{verb}: the refusal names the expected shape"
+        );
+    }
+
+    // The duplicate-key refusal is the SAME route-family contract, one step
+    // later: the body IS an object, so the shape check passes, but the
+    // typed read runs on the ORIGINAL bytes and the derived visitor refuses
+    // the repeated field — the sequence-form loop above cannot see this
+    // (a `Value` re-read would collapse the pair and act on the last
+    // value: a detached start, an out-of-bounds window, a 1500ms drain).
+    for (verb, body) in [
+        ("start", "{\"detach\":false,\"detach\":true}"),
+        ("stop", "{\"window_secs\":5,\"window_secs\":86400}"),
+        ("drain", "{\"timeout_ms\":1,\"timeout_ms\":null}"),
+    ] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("duplicate field"),
+            "{verb}: the refusal names the repeated field"
         );
     }
 
