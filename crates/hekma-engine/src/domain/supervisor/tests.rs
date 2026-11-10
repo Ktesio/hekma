@@ -8951,6 +8951,214 @@ fn child_usage_rolls_up_and_every_ancestor_ceiling_applies() {
 }
 
 #[test]
+fn the_policy_delete_dry_run_reports_and_default_is_refused_at_the_supervisor() {
+    // The delete dry run plans (the matched count) and writes nothing; the
+    // `default` Policy is refused on the dry path too.
+    let (_state, _manifest, registry) = setup_fake("poldel", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "poldel").unwrap();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "gone".to_string(),
+            selector: Some("team=absent".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let dry = sup
+        .delete_policy(&registry, "gone", true)
+        .expect("the dry run plans");
+    assert_eq!(dry.matched, 0);
+    assert!(
+        registry.policy("gone").unwrap().is_some(),
+        "nothing written"
+    );
+    let refusal = sup.delete_policy(&registry, "default", true).unwrap_err();
+    assert!(
+        matches!(refusal, crate::domain::RunError::PolicyDefault { .. }),
+        "{refusal}"
+    );
+    let applied = sup.delete_policy(&registry, "gone", false).unwrap();
+    assert_eq!(applied.matched, 0);
+    assert!(registry.policy("gone").unwrap().is_none());
+    let _ = sup.stop(&registry, "poldel", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_change_fired_breach_on_an_unsupervised_instance_is_recorded_not_acted_on() {
+    // A matched open Run whose instance this engine does NOT supervise
+    // (registered, seeded through the registry, never started): the Policy
+    // change's breach records and latches, the event is published and
+    // mirrored, and ONE diagnostic says the process action will apply at
+    // the agent's next start or adoption — nothing is handed to the
+    // lifecycle (the process is not ours to act on).
+    let (_state, _manifest, registry) = setup_fake("polghost", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // An open process-owning Run for an instance that is NOT running here.
+    let ghost = RunId::mint();
+    let run = crate::domain::runs::ops::SupervisedRun {
+        instance: InstanceName::new("polghost").unwrap(),
+        run_id: ghost.clone(),
+        wire_path: false,
+        labels: vec![crate::domain::Label::bound("team", "ghost")],
+        fresh: true,
+        inputs: None,
+    };
+    registry.ensure_supervised_run(run).unwrap();
+    let buffer = install_capture_sink(&mut sup);
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostcap".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(10),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // The breach recorded (the seeded usage? none — so lower below zero
+    // usage: any ceiling at/below 0 fires; use 0).
+    // (The ceiling of 10 with no usage does NOT breach; re-arm with 0.)
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostcap2".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(0),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "polghost").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].run_id, ghost.as_str());
+    let text = sink_text(&buffer);
+    assert!(
+        text.contains("does not supervise"),
+        "the diagnostic says the action was not executed: {text}"
+    );
+    assert_eq!(
+        state_of(&registry, "polghost"),
+        LifecycleState::Registered,
+        "nothing was handed to the lifecycle"
+    );
+}
+
+#[test]
+fn a_child_run_bound_into_a_policy_breaches_from_its_own_usage() {
+    // Story 21-3 (review round 1, finding 2): a child Run bound into a
+    // Policy BY LABEL (the verb — the announce path's labels are Caller
+    // labels) enforces the Policy's ceiling on its OWN level: usage
+    // attributed to the child breaches on the child's Run (under `warn` at
+    // its depth — a child breach never acts on the shared process), while
+    // the process-owning Run, whose labels do not match, stays unbreached
+    // and the process keeps running.
+    let (_state, _manifest, registry) = setup_fake("polkid", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polkid").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "polkid").unwrap();
+    let owner = open_run(&registry, "polkid");
+    assert!(
+        owner.labels.is_empty(),
+        "no configuration label: the owner must not match"
+    );
+    // The child, opened under the owner, binds the label through the verb.
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "polkid".to_string(),
+            )),
+        )
+        .unwrap();
+    let child_id = child.record.run_id.clone();
+    registry
+        .run_job(move |store| {
+            crate::domain::runs::ops::label(
+                store,
+                &child_id,
+                &crate::domain::LabelChange::set([("team", "core")]),
+                &[],
+                false,
+                &crate::time::now_rfc3339(),
+            )
+        })
+        .unwrap();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "kidcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(60),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // The child's stored resolution carries the Policy ceiling (its own
+    // level is armed); the owner's does not.
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    let resolution = child_view.policy.as_ref().expect("the child resolved");
+    assert_eq!(resolution.tokens.per_run, Some(60));
+    assert!(matches!(
+        resolution.sources.tokens_per_run,
+        crate::domain::LimitSource::Policy(ref policy) if policy == "kidcap"
+    ));
+    let owner_view = registry.run_view(&owner.record.run_id).unwrap();
+    assert!(owner_view.policy.as_ref().unwrap().tokens.per_run.is_none());
+
+    // Usage THROUGH the child's id: 3 events × 30 = 90 > 60 → the child's
+    // own level breaches.
+    let usage = |sequence, tokens| ParsedUsage {
+        sequence,
+        input_tokens: tokens,
+        output_tokens: 0,
+        cached_tokens: 0,
+    };
+    for sequence in 1..=3 {
+        sup.commit_run_usage(&registry, &name, &child.record.run_id, &usage(sequence, 30))
+            .unwrap();
+    }
+    let breaches = Supervisor::read_breach_events(&registry, "polkid").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].run_id, child.record.run_id.as_str());
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert_eq!(breaches[0].limit, 60);
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    assert!(child_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    let owner_view = registry.run_view(&owner.record.run_id).unwrap();
+    assert!(!owner_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    // A child breach never acts on the shared process.
+    assert_eq!(state_of(&registry, "polkid"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "polkid", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_relaunch_re_applies_a_latched_process_breach_action() {
     // Review round 1 (finding 1): a relaunch keeps the Run and its spent
     // latch, so a `stop` (or `pause`) the Run already fired must be applied

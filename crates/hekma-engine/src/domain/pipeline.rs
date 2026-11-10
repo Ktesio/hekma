@@ -84,6 +84,20 @@ pub(crate) struct Evaluation {
     /// The Run events the breaches caused (the `breach` Anomaly), committed
     /// after the breach rows (story 21-2).
     pub run_events: Vec<CommittedRunEvent>,
+    /// The Run CHANGES the breaches caused (events + snapshot entries),
+    /// returned whether or not they were committed here: a caller that
+    /// folds them into its own job (the policy-change job, which passes
+    /// `runs: None`) takes them through [`Evaluation::take_run_changes`]
+    /// so ONE commit publishes the freshest entries in order.
+    pub run_changes: RunChanges,
+}
+
+impl Evaluation {
+    /// Take the run changes (clearing them here) — for the caller that
+    /// commits them in its own job.
+    pub(crate) fn take_run_changes(&mut self) -> RunChanges {
+        std::mem::take(&mut self.run_changes)
+    }
 }
 
 /// One usage event for [`commit_usage`].
@@ -141,10 +155,23 @@ pub(crate) fn commit_usage(
 /// level's Run under its level's action and raises that Run's `breach`
 /// Anomaly; only a process-level breach executes a process action.
 ///
+/// Story 21-3 (review round 1): a child level's own arms come from its own
+/// stored Policy resolution (`run_policy`) when one exists — a Policy whose
+/// Selector matches the child Run arms ITS level, not only the process
+/// level — falling back to its `run_limits` when no resolution is stored
+/// yet. The resolution's per-run ceilings, Rate and (for a Policy-sourced
+/// action) effective action after the depth fallback ride the level.
+///
 /// The latch is keyed by action (story 21-1): a `(dimension, scope)` is
 /// spent for the Run only under the action that recorded it, so a breach
 /// re-fires once when the configured action changes — live and after an
 /// adoption alike.
+///
+/// The Run changes the breaches cause are returned in
+/// [`Evaluation::run_changes`] AND committed here (outbox + snapshot) when
+/// `input.runs` is set; a caller that folds them into its OWN job's changes
+/// passes `runs: None` and commits them itself — one commit, one publish
+/// order (the policy-change job's pattern).
 pub(crate) fn evaluate(
     ctx: &mut WriterCtx<'_>,
     input: &EvalInput,
@@ -201,8 +228,9 @@ pub(crate) fn evaluate(
             run_changes.entries.extend(changes.entries);
         }
     }
+    evaluation.run_changes = run_changes;
     if let Some(publisher) = &input.runs {
-        evaluation.run_events = runs::ops::commit(ctx, publisher, run_changes)?;
+        evaluation.run_events = runs::ops::commit(ctx, publisher, evaluation.take_run_changes())?;
     }
     Ok(evaluation)
 }
@@ -219,13 +247,34 @@ struct Level {
     acts: bool,
     /// A child level's own ceilings.
     limits: RunLimits,
+    /// A child level's own resolution-derived per-run ceilings (story
+    /// 21-3): the Policy resolution's per-run arms when a `run_policy` row
+    /// exists, `None` per field otherwise.
+    resolved: Option<ResolvedArms>,
     /// A child level's action (`warn` when its own cannot execute).
     child_action: BreachAction,
 }
 
+/// A child level's resolution-derived arms (story 21-3).
+struct ResolvedArms {
+    token_per_run: Option<u64>,
+    dollar_per_run_micros: Option<u64>,
+    /// The child's own Rate (a Policy flat Rate), when its resolution
+    /// carries one.
+    rate: Option<Rate>,
+    /// The effective action for a POLICY-sourced action (the depth
+    /// fallback already applied); `None` when the action is set directly
+    /// (the 21-2 loud-degrade contract keeps the configured action).
+    policy_action: Option<BreachAction>,
+}
+
 impl Level {
     fn is_armed(&self) -> bool {
-        self.process || self.limits.is_armed()
+        self.process
+            || self.limits.is_armed()
+            || self.resolved.as_ref().is_some_and(|arms| {
+                arms.token_per_run.is_some() || arms.dollar_per_run_micros.is_some()
+            })
     }
 }
 
@@ -245,6 +294,7 @@ fn levels_for<S: RunRecords + ?Sized>(
             process: true,
             acts: true,
             limits: RunLimits::default(),
+            resolved: None,
             child_action: BreachAction::Warn,
         }]);
     }
@@ -256,6 +306,7 @@ fn levels_for<S: RunRecords + ?Sized>(
                 run_id: record.run_id,
                 process: true,
                 limits: RunLimits::default(),
+                resolved: None,
                 child_action: BreachAction::Warn,
             });
             // The process-owning Run is the top of what this process
@@ -263,13 +314,57 @@ fn levels_for<S: RunRecords + ?Sized>(
             break;
         }
         let limits = store.run_limits(&record.run_id)?;
-        let action = limits.action();
-        let child_action = if runs::ops::action_refusal(
-            action,
-            record.control_depth,
-            record.wire_path,
-        )
-        .is_some()
+        // Story 21-3: the child's own stored resolution arms its level —
+        // a Policy matching the child Run supplies ITS ceilings, Rate and
+        // (policy-sourced) effective action. Only RUN- and POLICY-sourced
+        // arms ride the child level: the INSTANCE's explicit ceilings arm
+        // the process level alone (the owner's resolution, in the
+        // EvalInput) — a child level enforcing them too would fire the
+        // instance ceiling once per level.
+        let policy_sourced = |source: &crate::domain::runs::LimitSource| {
+            matches!(
+                source,
+                crate::domain::runs::LimitSource::Policy(_)
+                    | crate::domain::runs::LimitSource::Default
+            )
+        };
+        let resolution = store.run_policy(&record.run_id)?.map(|row| {
+            let token_per_run = policy_sourced(&row.resolution.sources.tokens_per_run)
+                .then_some(row.resolution.tokens.per_run)
+                .flatten();
+            let dollar_per_run_micros = policy_sourced(&row.resolution.sources.dollars_per_run)
+                .then(|| {
+                    row.resolution
+                        .dollars
+                        .per_run
+                        .map(|micros| micros.get() as u64)
+                })
+                .flatten();
+            let rate = policy_sourced(&row.resolution.sources.rate)
+                .then_some(row.resolution.rate)
+                .flatten();
+            let policy_action = policy_sourced(&row.resolution.sources.breach_action)
+                .then_some(row.resolution.effective_action);
+            ResolvedArms {
+                token_per_run,
+                dollar_per_run_micros,
+                rate,
+                policy_action,
+            }
+        });
+        let action = resolution
+            .as_ref()
+            .and_then(|arms| arms.policy_action)
+            .unwrap_or_else(|| limits.action());
+        let child_action = if resolution
+            .as_ref()
+            .and_then(|arms| arms.policy_action)
+            .is_some()
+        {
+            // A policy-sourced action already fell back at resolution.
+            action
+        } else if runs::ops::action_refusal(action, record.control_depth, record.wire_path)
+            .is_some()
         {
             BreachAction::Warn
         } else {
@@ -280,6 +375,7 @@ fn levels_for<S: RunRecords + ?Sized>(
             process: false,
             acts: false,
             limits,
+            resolved: resolution,
             child_action,
         });
     }
@@ -302,21 +398,35 @@ fn level_input(
             input.cost_action,
         )
     } else {
+        let arms = level.resolved.as_ref();
         (
             TokenBudget {
-                per_run: level.limits.token_per_run,
+                per_run: arms
+                    .and_then(|arms| arms.token_per_run)
+                    .or(level.limits.token_per_run),
                 cumulative: None,
             },
             level.child_action,
             CostCap {
-                per_run: level.limits.dollar_per_run_micros,
+                per_run: arms
+                    .and_then(|arms| arms.dollar_per_run_micros)
+                    .map(|micros| Micros(micros as i64))
+                    .or(level.limits.dollar_per_run_micros),
                 cumulative: None,
             },
             level.child_action,
         )
     };
+    // A child level's dollar arm prices through its OWN Rate when its
+    // resolution carries one (a Policy flat Rate), else the instance-level
+    // Rate that prices its rows.
+    let rate = level
+        .resolved
+        .as_ref()
+        .and_then(|arms| arms.rate)
+        .or(input.rate);
     let token_armed = token_budget.is_set();
-    let dollar_armed = input.rate.is_some() && cost_cap.is_set();
+    let dollar_armed = rate.is_some() && cost_cap.is_set();
     let mut read = |scope: &str, result: Result<Rollup, StoreError>| match result {
         Ok(rollup) => rollup,
         Err(err) => {

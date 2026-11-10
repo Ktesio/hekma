@@ -100,6 +100,10 @@ impl Supervisor {
     /// per-channel drains are independent cursors over independent files, so
     /// a line can never be ingested twice.
     pub(super) fn drain_usage_all(&mut self, registry: &Registry) {
+        // Story 21-3: the cross-process policy-cache staleness check rides
+        // the tick (one pragma read — never per event): a second engine's
+        // Policy change is picked up within a tick.
+        registry.refresh_policy_cache();
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         for name in names {
             self.drain_self_reported_for(registry, &name, DrainMode::MidRun);
@@ -1476,7 +1480,14 @@ impl Supervisor {
     /// Append a committed breach to the instance's `breaches.log` mirror
     /// (story 21-1: best-effort, after commit — state.db holds the record, so
     /// a failed mirror is a diagnostic, never a lost breach).
-    fn mirror_breach(&self, registry: &Registry, name: &InstanceName, event: &BudgetBreachEvent) {
+    /// `pub(super)`: the policy-change job's unsupervised-instance breach
+    /// surface (supervisor/runs.rs) mirrors the same way.
+    pub(super) fn mirror_breach(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+        event: &BudgetBreachEvent,
+    ) {
         let path = registry.instance_breach_log_path(name);
         let mirrored = path
             .parent()

@@ -666,10 +666,83 @@ pub(crate) struct PolicyCreate {
     pub scent_check: Option<hekma_engine::ScentCheckMode>,
     /// A flat Rate for the matched Runs.
     #[serde(default)]
-    pub rate: Option<hekma_engine::Rate>,
+    pub rate: Option<RatePatch>,
     /// Plan only: report the matched and fallback counts, write nothing.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// The `set` part of a `PATCH /v0/policies/{name}` body: the same limit
+/// fields a create carries, with UNKNOWN FIELDS REFUSED (a misspelled
+/// limit would otherwise be silently dropped — the create body's rule,
+/// applied to the nested object too).
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PolicyLimitsPatch {
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling.
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run Cost Cap, micro-dollars.
+    #[serde(default)]
+    pub dollars_per_run_micros: Option<u64>,
+    /// A cumulative Cost Cap, micro-dollars.
+    #[serde(default)]
+    pub dollars_cumulative_micros: Option<u64>,
+    /// The Breach Action for these ceilings.
+    #[serde(default)]
+    pub breach_action: Option<hekma_engine::BreachAction>,
+    /// The Scent-Check Mode (`off` only for now).
+    #[serde(default)]
+    pub scent_check: Option<hekma_engine::ScentCheckMode>,
+    /// A flat Rate for the matched Runs (a named Policy only).
+    #[serde(default)]
+    pub rate: Option<RatePatch>,
+}
+
+impl PolicyLimitsPatch {
+    /// The engine limits this patch sets.
+    pub(crate) fn into_limits(self) -> hekma_engine::PolicyLimits {
+        hekma_engine::PolicyLimits {
+            tokens_per_run: self.tokens_per_run,
+            tokens_cumulative: self.tokens_cumulative,
+            dollars_per_run_micros: self.dollars_per_run_micros,
+            dollars_cumulative_micros: self.dollars_cumulative_micros,
+            breach_action: self.breach_action,
+            scent_check: self.scent_check,
+            rate: self.rate.map(RatePatch::into_rate),
+        }
+    }
+}
+
+/// A Rate in a Policy body: the engine [`Rate`] fields, with UNKNOWN
+/// FIELDS REFUSED (money code: a misspelled micros field would silently
+/// price at 0).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RatePatch {
+    /// Input micro-dollars per 1M tokens.
+    #[serde(default)]
+    pub input_micros_per_1m: u64,
+    /// Output micro-dollars per 1M tokens.
+    #[serde(default)]
+    pub output_micros_per_1m: u64,
+    /// Cached-token micro-dollars per 1M tokens (optional; defaults to
+    /// the input rate).
+    #[serde(default)]
+    pub cached_micros_per_1m: Option<u64>,
+}
+
+impl RatePatch {
+    pub(crate) fn into_rate(self) -> hekma_engine::Rate {
+        let rate = hekma_engine::Rate::new(self.input_micros_per_1m, self.output_micros_per_1m);
+        match self.cached_micros_per_1m {
+            Some(cached) => rate.with_cached(cached),
+            None => rate,
+        }
+    }
 }
 
 /// The `rates` part of a `PATCH /v0/policies/{name}` body: model-keyed
@@ -679,13 +752,14 @@ pub(crate) struct PolicyCreate {
 pub(crate) struct PolicyRatesPatch {
     /// Models to price (exact model names).
     #[serde(default)]
-    pub set: std::collections::BTreeMap<String, hekma_engine::Rate>,
+    pub set: std::collections::BTreeMap<String, RatePatch>,
     /// Models whose entry to remove.
     #[serde(default)]
     pub remove: Vec<String>,
 }
 
-/// The `PATCH /v0/policies/{name}` body (story 21-3).
+/// The `PATCH /v0/policies/{name}` body (story 21-3). Unknown fields are
+/// refused at every level (`set`, the Rates, the body itself).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PolicyPatch {
@@ -694,10 +768,10 @@ pub(crate) struct PolicyPatch {
     pub selector: Option<hekma_engine::Selector>,
     /// Limits to set.
     #[serde(default)]
-    pub set: hekma_engine::PolicyLimits,
+    pub set: PolicyLimitsPatch,
     /// Limits to clear (`tokens-per-run`, `tokens-cumulative`,
     /// `dollars-per-run`, `dollars-cumulative`, `breach-action`,
-    /// `scent-check`, `rate`).
+    /// `scent-check`, `rate`); an unknown name is a `400 invalid_body`.
     #[serde(default)]
     pub clear: Vec<String>,
     /// Rate-table edits (`default` only).

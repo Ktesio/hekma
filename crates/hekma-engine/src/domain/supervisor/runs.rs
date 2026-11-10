@@ -59,6 +59,10 @@ impl Supervisor {
             wire_path: metering_source == "engine-observed",
             labels: self.bound_labels(registry, name),
             fresh: false,
+            // Story 21-3: the adoption resolves with fresh caller-side
+            // inputs; an unreadable configuration fail-closes the action to
+            // `pause` in the resolution (never resolved as if unset).
+            inputs: Some(registry.resolve_inputs_fail_closed(name)),
         };
         match registry.ensure_supervised_run(run) {
             Ok(events) => self.publish_run_events(events),
@@ -151,7 +155,8 @@ impl Supervisor {
 
     /// The live per-instance context a Policy change's money half needs
     /// (story 21-3): each supervised instance's wire fence (when it has a
-    /// metering listener) and its metering source.
+    /// metering listener), its metering source and its fresh explicit
+    /// inputs.
     fn policy_contexts(
         &self,
         registry: &Registry,
@@ -258,14 +263,26 @@ impl Supervisor {
         }
         for (instance, breaches) in by_instance {
             match InstanceName::new(&instance) {
-                Ok(name) => self.apply_evaluation(
-                    registry,
-                    &name,
-                    crate::domain::pipeline::Evaluation {
-                        breaches,
-                        ..Default::default()
-                    },
-                ),
+                Ok(name) => {
+                    // Only a supervised instance's process actions execute
+                    // (D2: the caller applies them): a matched Run whose
+                    // instance this engine does not supervise keeps its
+                    // breaches RECORDED (they latched; the next start or
+                    // adoption re-applies them), with one honest diagnostic
+                    // instead of a failed pause per breach.
+                    if !self.running.contains_key(&name) {
+                        self.publish_and_note_unsupervised_breaches(registry, &name, breaches);
+                        continue;
+                    }
+                    self.apply_evaluation(
+                        registry,
+                        &name,
+                        crate::domain::pipeline::Evaluation {
+                            breaches,
+                            ..Default::default()
+                        },
+                    )
+                }
                 Err(err) => self.emit_diagnostic(&format!(
                     "a Policy change fired a breach on `{instance}`, which is not a valid \
                      instance name ({err}); the breach is recorded but its action was not \
@@ -279,16 +296,59 @@ impl Supervisor {
         applied.outcome
     }
 
+    /// Publish and mirror the breaches a Policy change fired on an
+    /// instance this engine does NOT supervise, and say so once: the
+    /// breaches are recorded and latched (they re-apply at the next start
+    /// or adoption), but no process action executes here — surfaced, not
+    /// silent (AI-18; the 21-3 review round 1 finding).
+    fn publish_and_note_unsupervised_breaches(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        breaches: Vec<crate::domain::pipeline::CommittedBreach>,
+    ) {
+        let count = breaches.len();
+        for committed in &breaches {
+            self.mirror_breach(registry, name, &committed.event);
+            self.note_outbox_append(&committed.outbox);
+            self.publish(crate::domain::EngineEvent::BudgetBreach(
+                committed.event.clone(),
+            ));
+        }
+        self.emit_diagnostic(&format!(
+            "{}: a Policy change fired {count} breach(es) on a Run of an agent this engine \
+             does not supervise — each is recorded and latched, and its process action will \
+             apply at the agent's next start or adoption",
+            name.as_str(),
+        ));
+    }
+
     /// Open a child Run (FR-43, FR-49) and publish its `created` event.
+    /// The child resolves against the Policies in the same job (story
+    /// 21-3): its parent instance's facts are read fresh here, outside the
+    /// job (D2), failing closed to `pause` when the configuration cannot
+    /// be read.
     pub(crate) fn open_child_run(
         &self,
         registry: &Registry,
         request: ChildRunRequest,
     ) -> Result<RunView, RunError> {
         let run_id = RunId::mint();
+        // The parent instance's facts, read outside the job (D2): the
+        // child resolves at creation (story 21-3).
+        let parent_instance = match &request.parent {
+            crate::domain::RunParent::Instance(instance) => Some(instance.clone()),
+            crate::domain::RunParent::Run(id) => {
+                registry.run_record(id)?.and_then(|record| record.instance)
+            }
+        };
+        let inputs = parent_instance
+            .as_deref()
+            .and_then(|instance| InstanceName::new(instance).ok())
+            .map(|name| registry.resolve_inputs_fail_closed(&name));
         let ((opened, _), events) = registry.run_job(move |store| {
             let (id, changes) =
-                ops::open_child(store, &request, run_id, &crate::time::now_rfc3339())?;
+                ops::open_child(store, &request, run_id, inputs, &crate::time::now_rfc3339())?;
             Ok(((id, ()), changes))
         })?;
         self.publish_run_events(events);

@@ -684,6 +684,19 @@ impl SqliteStore {
         result
     }
 
+    /// The connection's `PRAGMA data_version` (the cross-process change
+    /// detector, story 21-3): the value changes when ANOTHER connection or
+    /// process commits to the database — our own commits do not move it —
+    /// so a caller that stamps it after a load can cheaply tell (one
+    /// pragma read, no table scan) whether anything changed underneath it
+    /// since.
+    pub(crate) fn data_version(&self) -> Result<u64, StoreError> {
+        self.conn()
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .map(|version| version.max(0) as u64)
+            .map_err(backend)
+    }
+
     /// The instance's current launch generation (`NotFound` when absent).
     pub(crate) fn launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError> {
         self.conn()

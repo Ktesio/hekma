@@ -27,7 +27,7 @@ use crate::ports::{NewRun, OutboxAppend, RunRecords, RunStore, StoreError};
 use crate::store::WriterCtx;
 
 /// What one operation changed.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RunChanges {
     pub events: Vec<RunEvent>,
     pub entries: Vec<RunEntry>,
@@ -317,6 +317,12 @@ pub(crate) struct SupervisedRun {
     /// instance ends as `replaced`); `false` for a relaunch or adoption,
     /// which keep the Run.
     pub fresh: bool,
+    /// The caller-resolved instance facts (story 21-3): the created or
+    /// kept Run resolves against the Policies in the SAME job (the 21-9
+    /// deferral, filled). `None` reuses the Run's stored inputs (a kept
+    /// Run); a fresh Run with `None` resolves with no explicit instance
+    /// limits.
+    pub inputs: Option<super::policy::ResolveInputs>,
 }
 
 /// Create the supervised Run (fresh start), or keep it (relaunch, adoption):
@@ -387,7 +393,22 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 run.wire_path,
                 at,
             )?);
-            changes.extend(sync_bound_labels(store, &run.run_id, &run.labels, at)?);
+            let label_changes = sync_bound_labels(store, &run.run_id, &run.labels, at)?;
+            let labels_changed = !label_changes.entries.is_empty();
+            changes.extend(label_changes);
+            // Story 21-3: the kept Run re-resolves with the caller's fresh
+            // inputs when it has them (an adoption's depth/wire facts may
+            // have shifted the resolution), else its stored inputs. A label
+            // change already resolved inside its own hook (with the same
+            // fresh inputs) — never resolve twice for one job.
+            if !labels_changed {
+                changes.extend(policy::resolve_run(
+                    store,
+                    &run.run_id,
+                    run.inputs.clone(),
+                    at,
+                )?);
+            }
         }
         _ => {
             let record = RunRecord {
@@ -418,6 +439,16 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 Prior::default(),
                 None,
             )?;
+            // Story 21-3: the Run resolves at creation — the 21-9 deferral
+            // (a Policy created while this engine was off, a hand-edited
+            // config) cannot leave a fresh Run unpriced/unresolved until
+            // its first label change.
+            changes.extend(policy::resolve_run(
+                store,
+                &run.run_id,
+                run.inputs.clone(),
+                at,
+            )?);
         }
     }
     Ok(changes)
@@ -425,8 +456,12 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
 
 /// Re-derive a Run's depth and wire path; a change keeps the id and emits
 /// `depth-changed` (FR-49). Latches are keyed by run id, so they survive.
-/// A directly set non-`warn` Breach Action the new depth cannot execute
-/// raises `depth-fallback`; one it can execute clears it.
+/// The Run's Policies re-resolve in the same job (a depth change moves the
+/// fallback rule, so a Policy-sourced `depth-fallback` Anomaly sets or
+/// clears here); a directly set non-`warn` Breach Action the new depth
+/// cannot execute raises `depth-fallback` after it (the 21-2 loud signal
+/// for directly set actions, which the resolution deliberately leaves to
+/// the executor).
 pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     store: &S,
     mut record: RunRecord,
@@ -446,15 +481,6 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     record.control_depth = depth;
     record.wire_path = wire_path;
     record.updated_at = at.to_string();
-    let limits = store.run_limits(&record.run_id)?;
-    if limits.is_armed() && limits.action() != BreachAction::Warn && !record.process_owner {
-        let unexecutable = action_refusal(limits.action(), depth, wire_path).is_some();
-        record.anomalies.retain(|a| *a != Anomaly::DepthFallback);
-        if unexecutable {
-            record.anomalies.push(Anomaly::DepthFallback);
-            record.anomalies.sort();
-        }
-    }
     store.save_run(&record)?;
     note(
         store,
@@ -464,6 +490,27 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
         prior,
         None,
     )?;
+    changes.extend(policy::resolve_run(store, &record.run_id, None, at)?);
+    // The 21-2 directly-set arm: re-read the record the resolution just
+    // rewrote (it owns the Policy-sourced Anomalies) and raise the
+    // `depth-fallback` Anomaly for a directly set action the new depth
+    // cannot execute.
+    if let Some(record) = store.run_record(&record.run_id)? {
+        let limits = store.run_limits(&record.run_id)?;
+        if limits.is_armed()
+            && limits.action() != BreachAction::Warn
+            && !record.process_owner
+            && action_refusal(limits.action(), depth, wire_path).is_some()
+            && !record.anomalies.contains(&Anomaly::DepthFallback)
+        {
+            let mut updated = record;
+            updated.anomalies.push(Anomaly::DepthFallback);
+            updated.anomalies.sort();
+            updated.updated_at = at.to_string();
+            store.save_run(&updated)?;
+            note_anomalies_changed(store, &mut changes, &updated, at)?;
+        }
+    }
     Ok(changes)
 }
 
@@ -651,17 +698,21 @@ pub(crate) fn mark_breach<S: RunRecords + ?Sized>(
 
 /// Clear the `breach` Anomaly from a Run whose every latch re-armed
 /// (story 21-3's raise path; the Anomaly stays while any latch holds).
-/// Nothing when it is not raised or the Run has no row.
+/// Nothing when it is not raised or the Run has no row. Returns the
+/// `anomalies-changed` event and snapshot entry (committed by the caller's
+/// own `commit`, so the clearing publishes — the pre-fix silent save left
+/// surfaces stale, 21-3 review round 1).
 pub(crate) fn clear_breach_anomaly<S: RunRecords + ?Sized>(
     store: &S,
     run_id: &RunId,
     at: &str,
-) -> Result<(), StoreError> {
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
     let Some(record) = store.run_record(run_id)? else {
-        return Ok(());
+        return Ok(changes);
     };
     if !record.anomalies.contains(&Anomaly::Breach) {
-        return Ok(());
+        return Ok(changes);
     }
     let mut anomalies: Vec<Anomaly> = record
         .anomalies
@@ -671,11 +722,9 @@ pub(crate) fn clear_breach_anomaly<S: RunRecords + ?Sized>(
         .collect();
     anomalies.sort();
     anomalies.dedup();
-    let mut updated = record;
-    updated.anomalies = anomalies;
-    updated.updated_at = at.to_string();
-    store.save_run(&updated)?;
-    Ok(())
+    let status = record.status;
+    move_to(store, &mut changes, record, status, anomalies, None, at)?;
+    Ok(changes)
 }
 
 /// Why a directly set Breach Action cannot execute on a child Run at this
@@ -708,11 +757,14 @@ pub(crate) fn action_refusal(
 
 /// Open a child Run (FR-43, FR-49) under an existing, non-ended parent.
 /// A request whose external id already maps to a Run returns that Run with
-/// no change.
+/// no change. The child resolves against the Policies in the same job
+/// (story 21-3: creation resolves — `inputs` is the caller-resolved
+/// instance facts; `None` resolves with no explicit instance limits).
 pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
     store: &S,
     request: &ChildRunRequest,
     run_id: RunId,
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(RunId, RunChanges), RunError> {
     let mut changes = RunChanges::default();
@@ -825,6 +877,9 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
         Prior::default(),
         held.then(|| "parent-paused".to_string()),
     )?;
+    // Story 21-3: the child resolves at creation (a bound label it carries
+    // can select a Policy whose ceilings arm its own level from the start).
+    changes.extend(policy::resolve_run(store, &run_id, inputs, at)?);
     Ok((run_id, changes))
 }
 

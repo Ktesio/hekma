@@ -1208,6 +1208,47 @@ fn block_fence_cases() -> Vec<Case> {
                 latched: vec![key(BreachDimension::Tokens, BreachScope::PerRun)],
             },
         ),
+        // ---- policy-resolution: a ceiling LOWERED below usage breaches at
+        // once even while ANOTHER scope's latch holds — the latch is per
+        // (dimension, scope), so the lowered scope fires now (the
+        // policy-change breach-at-once rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-lowered-per-run-fires-while-cumulative-latched",
+            &[CoverTag::PolicyResolution, CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 2_000,
+                    cumulative_total: 9_000,
+                    budget: TokenBudget {
+                        per_run: Some(1_000),
+                        cumulative: Some(5_000),
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![key(BreachDimension::Tokens, BreachScope::Cumulative)],
+            },
+        ),
+        // ---- policy-resolution: a ceiling RAISED above usage re-arms —
+        // the cleared latch means the NEXT crossing fires again (the
+        // policy-change re-arm rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-raised-then-recrossed-refires",
+            &[CoverTag::PolicyResolution, CoverTag::LatchReArm],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 4_000,
+                    cumulative_total: 0,
+                    budget: TokenBudget {
+                        per_run: Some(5_000),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![],
+            },
+        ),
         // ---- block-fence: no raised reason → the call passes ----
         fence_case("fence-no-reason-passes", &[]),
         // ---- block-fence: a single reason is reported as itself ----
@@ -1604,6 +1645,71 @@ fn policy_cases() -> Vec<Case> {
                         },
                     ),
                 ],
+                ..Default::default()
+            },
+        ),
+        // Bound labels only: a Run whose labels lack the Selector's term
+        // never selects the Policy — the limit stays unset (the
+        // caller-vs-bound distinction itself is the Selector scope's own
+        // pin; this case pins the resolution-side negative).
+        policy_case(
+            "policy-no-bound-term-no-match",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "other")]),
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        limits(Some(1_000), Some(BreachAction::Stop)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // A malformed explicit `breach_action` fails closed to `pause`
+        // WITHOUT dropping the other explicit inputs: the ceilings, the
+        // Rate and the model survive (only the action fails closed — the
+        // review round 1 finding that once dropped them all).
+        policy_case(
+            "policy-malformed-keeps-explicit-ceilings",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                inputs: crate::domain::runs::ResolveInputs {
+                    explicit: crate::domain::runs::PolicyLimits {
+                        tokens_per_run: Some(7_000),
+                        rate: Some(crate::domain::cost::Rate::new(1_000_000, 2_000_000)),
+                        ..Default::default()
+                    },
+                    malformed_action: Some("throttle".to_string()),
+                    model: Some("gpt-demo".to_string()),
+                },
+                policies: vec![
+                    crate::domain::runs::PolicyRecord::default_policy(),
+                    policy(
+                        "p",
+                        "team=core",
+                        limits(Some(1_000), Some(BreachAction::Warn)),
+                    ),
+                ],
+                ..Default::default()
+            },
+        ),
+        // The malformed rule outranks EVERY other source, the Run's own
+        // action included (the precedence chain's rule 1).
+        policy_case(
+            "policy-malformed-outranks-the-run-action",
+            crate::domain::runs::policy::ResolutionInput {
+                bound_labels: labels(&[("team", "core")]),
+                run_limits: crate::domain::runs::RunLimits {
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                inputs: crate::domain::runs::ResolveInputs {
+                    malformed_action: Some("1".to_string()),
+                    ..Default::default()
+                },
+                policies: vec![crate::domain::runs::PolicyRecord::default_policy()],
                 ..Default::default()
             },
         ),
@@ -2482,6 +2588,10 @@ mod tests {
         // Story 19-2: the minor bump is ADDITIVE — the 26 cases 1.0.0
         // shipped keep their position, and every story-19-2 case follows
         // them. A consumer pinned to 1.0.0 sees its cases unchanged.
+        // 1.3.0 adds two decision cases tagged `policy-resolution` (the
+        // policy-change lower/raise consequences); they are exempt from
+        // the block-only rule, which stays true for the 1.1.0 fence-era
+        // decision cases.
         let document = generate();
         let first_fence_era = document
             .cases
@@ -2496,8 +2606,11 @@ mod tests {
         assert!(document.cases[first_fence_era..]
             .iter()
             .all(|case| match case {
-                Case::Decision(case) =>
-                    case.input.token.map(|arm| arm.action) == Some(BreachAction::Block),
+                Case::Decision(case) => {
+                    let policy_tagged = case.covers.contains(&CoverTag::PolicyResolution);
+                    policy_tagged
+                        || case.input.token.map(|arm| arm.action) == Some(BreachAction::Block)
+                }
                 Case::Fence(_) | Case::Chain(_) | Case::Policy(_) => true,
                 Case::Derivation(_) => false,
             }));

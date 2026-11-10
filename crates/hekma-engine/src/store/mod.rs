@@ -16,4 +16,6 @@ pub(crate) use run_store_sqlite::{LegacyLogs, LegacyOutbox, LegacySource};
 pub(crate) use sqlite::create_v11_for_test;
 pub(crate) use sqlite::SqliteStore;
 pub(crate) use sqlite::BUSY_TIMEOUT_MS;
+#[cfg(test)]
+pub(crate) use sqlite::SCHEMA_VERSION;
 pub(crate) use writer::{read_only_refusal, StoreWriter, WriterCtx};

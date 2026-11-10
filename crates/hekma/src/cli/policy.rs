@@ -134,7 +134,27 @@ fn change_from(args: &WriteArgs, create: bool) -> Result<PolicyChange, Box<dyn s
             Some(model) if !model.is_empty() => {
                 rates.insert(model.to_string(), None);
             }
-            _ => clear.push(entry.to_string()),
+            _ => {
+                // A known limit name or a refusal (exit 2): a typo would
+                // otherwise report success while clearing nothing.
+                if !matches!(
+                    entry,
+                    "tokens-per-run"
+                        | "tokens-cumulative"
+                        | "dollars-per-run"
+                        | "dollars-cumulative"
+                        | "breach-action"
+                        | "scent-check"
+                        | "rate"
+                ) {
+                    return Err(invalid(format!(
+                        "--clear: `{entry}` is not a limit field (tokens-per-run, \
+                         tokens-cumulative, dollars-per-run, dollars-cumulative, \
+                         breach-action, scent-check, rate, rate:<model>)"
+                    )));
+                }
+                clear.push(entry.to_string());
+            }
         }
     }
     Ok(PolicyChange {
@@ -436,4 +456,165 @@ pub fn delete(name: &str, dry_run: bool, json: bool) -> Result<(), Box<dyn std::
         return Ok(());
     }
     print_outcome("delete", name, &outcome, dry_run, json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(limits: LimitFlags, clear: Vec<String>, rate_for: Option<String>) -> WriteArgs {
+        WriteArgs {
+            name: "cap".to_string(),
+            selector: Some("team=core".to_string()),
+            limits,
+            clear,
+            rate_for,
+            dry_run: true,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn a_half_configured_rate_is_refused_before_anything_is_opened() {
+        let err = change_from(
+            &args(
+                LimitFlags {
+                    rate_input: Some("1.00".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("both --rate-input"), "{err}");
+    }
+
+    #[test]
+    fn a_model_without_its_rate_flags_is_refused() {
+        let err = change_from(
+            &args(LimitFlags::default(), Vec::new(), Some("model".to_string())),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--rate-for needs"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_clear_field_is_refused() {
+        let err = change_from(
+            &args(
+                LimitFlags::default(),
+                vec!["tokens-per-rn".to_string()],
+                None,
+            ),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--clear"), "{err}");
+        // A rate-entry removal is parsed, not cleared.
+        let change = change_from(
+            &args(
+                LimitFlags::default(),
+                vec!["rate:gpt-demo".to_string()],
+                None,
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(change.clear, Vec::<String>::new());
+        assert!(change.rates.contains_key("gpt-demo"));
+    }
+
+    #[test]
+    fn the_flags_build_the_engine_request() {
+        let change = change_from(
+            &args(
+                LimitFlags {
+                    tokens_per_run: Some(100),
+                    dollars_per_run: Some("3.00".to_string()),
+                    breach_action: Some("stop".to_string()),
+                    rate_input: Some("1.00".to_string()),
+                    rate_output: Some("2.00".to_string()),
+                    ..LimitFlags::default()
+                },
+                Vec::new(),
+                None,
+            ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(change.set.tokens_per_run, Some(100));
+        assert_eq!(change.set.dollars_per_run_micros, Some(3_000_000));
+        assert_eq!(change.set.breach_action, Some(BreachAction::Stop));
+        assert_eq!(
+            change.set.rate,
+            Some(Rate {
+                input_micros_per_1m: 1_000_000,
+                output_micros_per_1m: 2_000_000,
+                cached_micros_per_1m: None,
+            })
+        );
+    }
+
+    #[test]
+    fn the_human_line_renders_every_limit_and_the_absence() {
+        let limits = PolicyLimits {
+            tokens_per_run: Some(100),
+            tokens_cumulative: Some(1_000),
+            dollars_per_run_micros: Some(3_000_000),
+            dollars_cumulative_micros: Some(30_000_000),
+            breach_action: Some(BreachAction::Pause),
+            rate: Some(Rate::new(1_000_000, 2_000_000)),
+            ..PolicyLimits::default()
+        };
+        let line = limits_summary(&limits);
+        for needle in [
+            "tokens/run 100",
+            "tokens cumulative 1000",
+            "est. $3.00/run",
+            "est. $30.00 cumulative",
+            "on breach pause",
+            "rate $1.00/$2.00 per 1M in/out",
+        ] {
+            assert!(line.contains(needle), "{needle}: {line}");
+        }
+        assert_eq!(limits_summary(&PolicyLimits::default()), "no limits");
+        let record = PolicyRecord {
+            name: "cap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            limits,
+            rates: Default::default(),
+        };
+        let line = policy_line(&record);
+        assert!(line.starts_with("cap  team=core"), "{line}");
+        let bare = PolicyRecord {
+            name: "default".to_string(),
+            selector: None,
+            limits: PolicyLimits::default(),
+            rates: Default::default(),
+        };
+        let line = policy_line(&bare);
+        assert!(line.contains("(every Run)"), "{line}");
+    }
+
+    #[test]
+    fn an_outcome_is_read_from_a_routed_document_or_its_absence() {
+        let document = serde_json::json!({
+            "policy": {"name": "cap", "limits": {}, "rates": {}},
+            "matched": 3,
+            "fallbacks": 1,
+            "notes": ["a note"],
+        });
+        let outcome = outcome_from(Some(document));
+        assert_eq!(outcome.matched, 3);
+        assert_eq!(outcome.fallbacks, 1);
+        assert_eq!(outcome.notes, vec!["a note".to_string()]);
+        assert_eq!(outcome.record.as_ref().unwrap().name, "cap");
+        // A body-less answer (a delete) or a torn one degrades honestly.
+        let empty = outcome_from(None);
+        assert_eq!(empty.matched, 0);
+        assert!(empty.record.is_none());
+    }
 }

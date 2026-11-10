@@ -6,17 +6,18 @@
 //! enforcement read, the stored per-Run resolution, the CLI and the Control
 //! API — none re-implements it:
 //!
-//! 1. explicit limits on the Run (`run_limits`, operator/Host);
-//! 2. explicit limits on the Agent Instance (any FR-11 layer, merged —
+//! 1. a `breach_action` value that is present but malformed anywhere fails
+//!    CLOSED to `pause` with a surfaced note (AD-7, the chain's rule 1 —
+//!    before the Run's own action), never to the new default;
+//! 2. explicit limits on the Run (`run_limits`, operator/Host);
+//! 3. explicit limits on the Agent Instance (any FR-11 layer, merged —
 //!    including the FR-21 upgrade write);
-//!    * a `breach_action` value that is present but malformed fails CLOSED
-//!      to `pause` with a surfaced note (AD-7), never to the new default;
 //!    * an instance kept on `pause` by the FR-21 upgrade (its marker row)
 //!      resolves `pause` at this level until an explicit action is set;
-//! 3. per limit, the matching Policy with the MOST SPECIFIC Selector
+//! 4. per limit, the matching Policy with the MOST SPECIFIC Selector
 //!    (a strict term-set superset); Selectors that cannot be compared tie,
 //!    and a tie resolves to the tightest value;
-//! 4. the stored, editable `default` Policy fills whatever is still unset.
+//! 5. the stored, editable `default` Policy fills whatever is still unset.
 //!
 //! Policy Selectors match BOUND labels only ([`SelectorScope::BoundOnly`]),
 //! so a Caller can never choose its way into a looser Policy. Caller limits
@@ -234,6 +235,12 @@ pub struct ResolutionInput {
     pub run_limits: RunLimits,
     /// The caller-resolved instance facts.
     pub inputs: ResolveInputs,
+    /// Caller-supplied limits (FR-53/FR-60: a Caller may only TIGHTEN —
+    /// they apply per limit only where tighter than the resolved value).
+    /// No surface supplies them yet; the field is threaded so 22.x wires
+    /// in without touching the function's shape.
+    #[serde(default, skip_serializing_if = "PolicyLimits::is_set")]
+    pub caller_limits: PolicyLimits,
     /// The instance is kept on `pause` by the FR-21 upgrade (its marker
     /// row): the action resolves `pause` at the explicit level until a
     /// Breach Action is set explicitly.
@@ -284,6 +291,31 @@ impl LimitSources {
             &self.dollars_cumulative,
             &self.breach_action,
             &self.scent_check,
+            &self.rate,
+        ]
+        .into_iter()
+        .filter_map(|source| match source {
+            LimitSource::Policy(name) => Some(name.clone()),
+            LimitSource::Default => Some(DEFAULT_POLICY_NAME.to_string()),
+            LimitSource::Run | LimitSource::Instance | LimitSource::Unset => None,
+        })
+        .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The same, over the limits a BUDGET view shows (the ceilings, the
+    /// action, the Rate — everything but Scent-Check, which the budget
+    /// surfaces do not carry): naming `default` there for a Scent-Check the
+    /// view never shows would be noise, not provenance.
+    pub fn budget_policy_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = [
+            &self.tokens_per_run,
+            &self.tokens_cumulative,
+            &self.dollars_per_run,
+            &self.dollars_cumulative,
+            &self.breach_action,
             &self.rate,
         ]
         .into_iter()
@@ -507,20 +539,22 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     dollars.per_run = dollar_scope[0].map(|micros| crate::domain::cost::Micros(micros as i64));
     dollars.cumulative = dollar_scope[1].map(|micros| crate::domain::cost::Micros(micros as i64));
 
-    // ---- The Breach Action: Run > instance (present-but-malformed fails
-    // CLOSED to `pause` with a note, AD-7) > the upgrade marker's `pause` >
-    // the most specific matching Policy > the default Policy (`warn`, so
-    // the action always resolves).
-    let action = if let Some(action) = input.run_limits.breach_action {
-        sources.breach_action = LimitSource::Run;
-        action
-    } else if let Some(value) = input.inputs.malformed_action.clone() {
+    // ---- The Breach Action: a malformed explicit value anywhere fails
+    // CLOSED to `pause` with a note (AD-7) BEFORE every other source,
+    // the Run's own action included (the precedence chain's rule 1) >
+    // explicit Run > instance > the upgrade marker's `pause` > the most
+    // specific matching Policy > the default Policy (`warn`, so the
+    // action always resolves).
+    let action = if let Some(value) = input.inputs.malformed_action.clone() {
         fail_closed = Some(format!(
             "the configured breach action `{value}` is not one of pause, stop, warn or block, so \
              it fails closed to pause until it is fixed"
         ));
         sources.breach_action = LimitSource::Instance;
         BreachAction::Pause
+    } else if let Some(action) = input.run_limits.breach_action {
+        sources.breach_action = LimitSource::Run;
+        action
     } else if let Some(action) = input.inputs.explicit.breach_action {
         sources.breach_action = LimitSource::Instance;
         action
@@ -760,28 +794,100 @@ fn maximal_candidates<'a>(candidates: &[&'a PolicyRecord]) -> Vec<&'a PolicyReco
 /// between commit and swap dies with the process; the next open loads the
 /// committed set). [`PolicyCache::current`] is one `Arc` clone — the
 /// per-usage-event resolution reads no SQL.
+///
+/// **Degraded reads fail closed (21-3 review round 1):** a load that
+/// failed leaves the DEGRADED marker set — every resolution through the
+/// cache then fails closed to `pause` with a note until a later load
+/// succeeds (AD-7: a read failure must never resolve the `warn` default
+/// by accident). The marker also covers a cached set whose `default` row
+/// is missing (a corrupt row drops it): [`PolicyCache::current`] answers
+/// `Err` and the caller fails closed the same way.
 #[derive(Debug, Default)]
 pub(crate) struct PolicyCache {
     current: std::sync::RwLock<std::sync::Arc<Vec<PolicyRecord>>>,
+    degraded: std::sync::RwLock<Option<String>>,
+    loaded_data_version: std::sync::RwLock<Option<u64>>,
 }
 
 impl PolicyCache {
-    /// The current policy set (a cheap `Arc` clone).
-    pub(crate) fn current(&self) -> std::sync::Arc<Vec<PolicyRecord>> {
+    /// The current policy set (a cheap `Arc` clone). `Err` carries the
+    /// reason the set cannot be trusted (fail closed to `pause`).
+    pub(crate) fn current(
+        &self,
+    ) -> Result<std::sync::Arc<Vec<PolicyRecord>>, PolicyCacheUnavailable> {
+        if let Ok(guard) = self.degraded.read() {
+            if let Some(reason) = guard.as_ref() {
+                return Err(PolicyCacheUnavailable {
+                    reason: reason.clone(),
+                });
+            }
+        }
         match self.current.read() {
-            Ok(guard) => std::sync::Arc::clone(&guard),
-            Err(poisoned) => std::sync::Arc::clone(&poisoned.into_inner()),
+            Ok(guard) => Ok(std::sync::Arc::clone(&guard)),
+            Err(poisoned) => Ok(std::sync::Arc::clone(&poisoned.into_inner())),
         }
     }
 
-    /// Publish the next policy set. Called only from a store-writer
-    /// post-commit hook, so swaps follow commit order.
+    /// Publish the next policy set, clear the degraded marker and stamp
+    /// the `data_version` it was read at (the cross-process staleness
+    /// check's baseline). Called only from a store-writer post-commit hook
+    /// or the open/tick load, so swaps follow commit order.
     pub(crate) fn publish(&self, policies: Vec<PolicyRecord>) {
         let mut guard = match self.current.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         *guard = std::sync::Arc::new(policies);
+        drop(guard);
+        if let Ok(mut degraded) = self.degraded.write() {
+            *degraded = None;
+        }
+    }
+
+    /// Mark the cache untrustworthy (a failed load): every resolution
+    /// through it fails closed to `pause` with this reason until a
+    /// successful publish clears it.
+    pub(crate) fn degrade(&self, reason: String) {
+        let mut degraded = match self.degraded.write() {
+            Ok(degraded) => degraded,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *degraded = Some(reason);
+    }
+
+    /// The `data_version` the cache was last (re)loaded at, and whether a
+    /// reload is therefore needed (the caller just read `now`). Our own
+    /// policy-change jobs call [`Self::publish`] in their post-commit hook
+    /// WITHOUT stamping a version — the next tick's check then reloads
+    /// once (harmless: the set is already current) and stamps its baseline
+    /// — while a DIFFERENT process's change moves `data_version` and is
+    /// picked up within a tick.
+    pub(crate) fn stale_at(&self, now: u64) -> bool {
+        match self.loaded_data_version.read() {
+            Ok(guard) => *guard != Some(now),
+            Err(poisoned) => *poisoned.into_inner() != Some(now),
+        }
+    }
+
+    /// Stamp the `data_version` the current set was read at.
+    pub(crate) fn stamp(&self, version: u64) {
+        let mut guard = match self.loaded_data_version.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(version);
+    }
+}
+
+/// Why the cached policy set cannot be trusted (the fail-closed reason).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PolicyCacheUnavailable {
+    pub reason: String,
+}
+
+impl std::fmt::Display for PolicyCacheUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
     }
 }
 
@@ -860,6 +966,7 @@ fn resolve_for<S: RunRecords + ?Sized>(
             .collect(),
         run_limits,
         inputs: inputs.clone(),
+        caller_limits: PolicyLimits::default(),
         kept_on_pause: kept,
         policies: store.policies()?,
     }))
@@ -927,12 +1034,16 @@ pub(crate) fn labels_changed<S: RunRecords + ?Sized>(
 // ---------------------------------------------------------------------------
 
 /// A Policy change event: created, changed or deleted. Committed with the
-/// outbox row in the change's own writer job.
+/// outbox row in the change's own writer job. The payload's own change
+/// field serializes as `change` (the [`super::RunEvent`] precedent): the
+/// bus envelope's tag is `kind`, and a payload field of the same name
+/// would serialize twice and make the stored row unreadable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEvent {
     /// The event family's schema version.
     pub schema_version: u32,
     /// Which change this is.
+    #[serde(rename = "change")]
     pub kind: PolicyEventKind,
     /// The Policy's name.
     pub name: String,
@@ -1103,6 +1214,23 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_instance_action_outranks_the_run_level_action() {
+        // The precedence chain's rule 1: a malformed explicit value fails
+        // closed BEFORE every other source — the Run's own action included
+        // (the pre-fix chain let the Run's `warn` win and never paused).
+        let mut input = input(&[]);
+        input.policies = vec![PolicyRecord::default_policy()];
+        input.inputs.malformed_action = Some("1".to_string());
+        input.run_limits = RunLimits {
+            breach_action: Some(BreachAction::Warn),
+            ..RunLimits::default()
+        };
+        let resolution = resolve(&input);
+        assert_eq!(resolution.action, BreachAction::Pause);
+        assert!(resolution.fail_closed.is_some());
+    }
+
+    #[test]
     fn the_upgrade_marker_holds_pause_above_the_policies() {
         let mut input = input(&[("team", "core")]);
         input.policies = vec![
@@ -1207,6 +1335,111 @@ mod tests {
             resolution.sources.tokens_per_run,
             LimitSource::Policy(ref name) if name == "left"
         ));
+    }
+
+    #[test]
+    fn the_default_policy_fills_ceilings_too_and_every_wire_form_renders() {
+        let mut input = input(&[]);
+        let mut default = PolicyRecord::default_policy();
+        default.limits.tokens_per_run = Some(9_000);
+        input.policies = vec![default];
+        let resolution = resolve(&input);
+        assert_eq!(limits_of(&resolution), Some(9_000));
+        assert!(matches!(
+            resolution.sources.tokens_per_run,
+            LimitSource::Default
+        ));
+        // The Scent-Check modes' wire forms and Display (created before
+        // Scent-Check ships; the resolve-side tie order below covers the
+        // arms the create/change refusal leaves cold).
+        for (mode, wire) in [
+            (ScentCheckMode::Off, "off"),
+            (ScentCheckMode::Shadow, "shadow"),
+            (ScentCheckMode::Enforce, "enforce"),
+        ] {
+            assert_eq!(mode.as_str(), wire);
+            assert_eq!(ScentCheckMode::from_wire(wire), Some(mode));
+            assert_eq!(mode.to_string(), wire);
+        }
+        assert!(ScentCheckMode::from_wire("nope").is_none());
+        for (kind, wire) in [
+            (PolicyEventKind::Created, "created"),
+            (PolicyEventKind::Changed, "changed"),
+            (PolicyEventKind::Deleted, "deleted"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+        }
+        for (action, tightness) in [
+            (BreachAction::Warn, 0),
+            (BreachAction::Pause, 1),
+            (BreachAction::Stop, 2),
+            (BreachAction::Block, 3),
+        ] {
+            assert_eq!(action_tightness(action), tightness);
+        }
+    }
+
+    #[test]
+    fn the_scent_tie_order_runs_off_shadow_enforce() {
+        // The resolve-side rule is total even though create/change refuse
+        // `shadow`/`enforce` until their own story: the TIGHTEST mode wins
+        // a tie, an equal value names the alphabetically-first Policy.
+        let mut input = input(&[("a", "1")]);
+        input.policies = vec![
+            PolicyRecord::default_policy(),
+            policy(
+                "aaa",
+                "a=1",
+                PolicyLimits {
+                    scent_check: Some(ScentCheckMode::Shadow),
+                    ..PolicyLimits::default()
+                },
+            ),
+            policy(
+                "zzz",
+                "a=1",
+                PolicyLimits {
+                    scent_check: Some(ScentCheckMode::Enforce),
+                    ..PolicyLimits::default()
+                },
+            ),
+        ];
+        let resolution = resolve(&input);
+        assert_eq!(resolution.scent_check, ScentCheckMode::Enforce);
+        assert!(matches!(
+            resolution.sources.scent_check,
+            LimitSource::Policy(ref name) if name == "zzz"
+        ));
+        // An instance-set mode outranks every Policy.
+        let mut with_instance = input.clone();
+        with_instance.inputs.explicit.scent_check = Some(ScentCheckMode::Off);
+        assert_eq!(resolve(&with_instance).scent_check, ScentCheckMode::Off);
+    }
+
+    #[test]
+    fn a_poisoned_cache_still_answers_and_stays_stamped() {
+        // The poisoned-lock arms: a poisoned RwLock never wedges the cache
+        // (the guard is recovered) — fail-closed resolution must never
+        // depend on lock hygiene.
+        let cache = PolicyCache::default();
+        cache.publish(vec![PolicyRecord::default_policy()]);
+        {
+            // Poison the lock: a panic while the write guard is LIVE (the
+            // unwind drops the guard, which poisons the RwLock).
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = cache.current.write().unwrap();
+                panic!("poison the cache lock");
+            });
+            std::panic::set_hook(previous);
+        }
+        assert!(cache.current().is_ok(), "a poisoned lock still answers");
+        cache.stamp(7);
+        assert!(!cache.stale_at(7), "the stamped version is current");
+        assert!(cache.stale_at(8), "a moved version is stale");
+        cache.publish(Vec::new());
+        assert!(cache.current().is_ok());
     }
 
     #[test]

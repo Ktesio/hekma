@@ -1207,6 +1207,7 @@ impl Engine {
                 current_run_cost,
                 cumulative_cost,
                 label,
+                &resolution.sources.budget_policy_names(),
             )
         });
         // The active Metering Source is visible in Fleet detail (AC-C), resolved
@@ -3069,6 +3070,7 @@ mod tests {
                     wire_path: false,
                     labels: Vec::new(),
                     fresh: true,
+                    inputs: None,
                 })
                 .unwrap();
         }
@@ -3136,6 +3138,7 @@ mod tests {
                     wire_path: false,
                     labels: vec![Label::bound("team", "payments")],
                     fresh: true,
+                    inputs: None,
                 })
                 .unwrap();
         }
@@ -3284,6 +3287,91 @@ mod tests {
         }
         drop(engine);
         assert!(!base.exists(), "a read-only open creates nothing");
+    }
+
+    #[test]
+    fn the_blocking_policy_facades_round_trip_and_a_budget_write_re_resolves() {
+        // The blocking twins of the async Policy facade, end to end over one
+        // engine: create (dry then real), show, list, change, delete — and
+        // the `budget.*` config write's same-job re-resolution of the open
+        // Run (the review round's creation-time resolution made the Run
+        // resolvable from the start).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        facade.set_config("demo", "labels.team", "core").unwrap();
+        let change = PolicyChange {
+            name: "cap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        };
+        // The dry run plans and writes nothing.
+        let dry = facade.create_policy(change.clone(), true).unwrap();
+        assert_eq!(dry.matched, 0);
+        assert!(facade.policy("cap").is_err());
+        // The real create answers, the list carries it, the change edits it.
+        let created = facade.create_policy(change, false).unwrap();
+        assert_eq!(created.matched, 0);
+        assert_eq!(facade.policy("cap").unwrap().name, "cap");
+        assert!(facade
+            .policies()
+            .unwrap()
+            .iter()
+            .any(|record| record.name == "cap"));
+        facade
+            .change_policy(
+                PolicyChange {
+                    name: "cap".to_string(),
+                    selector: None,
+                    set: crate::domain::PolicyLimits {
+                        tokens_per_run: Some(3_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                    rates: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            facade.policy("cap").unwrap().limits.tokens_per_run,
+            Some(3_000)
+        );
+        // A `budget.*` write on an instance with an open Run re-resolves it
+        // in the same job: the run's stored resolution carries the explicit
+        // ceiling (the Run is created by the registry; the mock cannot
+        // start).
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: vec![crate::domain::Label::bound("team", "core")],
+                    fresh: true,
+                    inputs: None,
+                })
+                .unwrap();
+        }
+        facade
+            .set_config("demo", "budget.tokens.per_run", "1234")
+            .unwrap();
+        let run = facade.run(owner.as_str()).unwrap();
+        assert_eq!(run.policy.as_ref().unwrap().tokens.per_run, Some(1_234));
+        // The delete dry run plans; the real delete removes it.
+        let dry = facade.delete_policy("cap", true).unwrap();
+        assert!(dry.record.is_none());
+        assert!(facade.policy("cap").is_ok());
+        facade.delete_policy("cap", false).unwrap();
+        assert!(facade.policy("cap").is_err());
     }
 
     #[test]

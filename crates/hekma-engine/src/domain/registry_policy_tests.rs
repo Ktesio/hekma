@@ -99,6 +99,66 @@ fn contexts() -> HashMap<String, InstanceContext> {
     )])
 }
 
+/// Seed a fleet whose open Run has used `open_tokens` and whose INSTANCE
+/// lifetime total is `instance_tokens`: an ENDED sibling Run carries the
+/// difference (the multi-Run fixture — the instance's lifetime totals are
+/// NOT the open Run's totals).
+fn seed_multi_run(open_tokens: u64, instance_tokens: u64) -> Seeded {
+    let seeded = seed(open_tokens.max(1));
+    let sibling = RunId::mint();
+    let earlier = instance_tokens.saturating_sub(open_tokens).max(1) / 2;
+    let run_for_job = sibling.clone();
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            let store = ctx.store();
+            use crate::ports::{NewRun, RunRecords as _, RunStore as _};
+            let mut record = RunRecord {
+                run_id: run_for_job.clone(),
+                control_depth: ControlDepth::Supervised,
+                wire_path: true,
+                status: crate::domain::runs::RunStatus::Ended,
+                anomalies: Vec::new(),
+                parent_run_id: None,
+                instance: Some("money".to_string()),
+                process_owner: true,
+                end_cause: Some("stopped".to_string()),
+                created_at: "t".to_string(),
+                updated_at: "t".to_string(),
+                ended_at: Some("t".to_string()),
+            };
+            record.run_id = run_for_job.clone();
+            store.insert_run(&NewRun {
+                record,
+                labels: Vec::new(),
+                limits: Default::default(),
+                identity: None,
+            })?;
+            store.insert_usage(
+                &crate::domain::usage::UsageEvent {
+                    instance: "money".to_string(),
+                    run_id: run_for_job,
+                    input_tokens: earlier,
+                    output_tokens: earlier,
+                    cached_tokens: Some(0),
+                    metering_source: "self-reported".to_string(),
+                    sequence: 1,
+                    occurred_at: "t".to_string(),
+                },
+                None,
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    Seeded {
+        state: seeded.state,
+        registry: seeded.registry,
+        run: seeded.run,
+    }
+}
+
 fn change(registry: &Registry, name: &str, selector: &str, set: PolicyLimits) -> PolicyOutcome {
     let existing = registry.policy(name).unwrap();
     registry
@@ -754,6 +814,639 @@ enum LimitField {
     TokensCumulative,
     DollarsPerRun,
     DollarsCumulative,
+}
+
+// ---------------------------------------------------------------------------
+// The adversarial review round 1 fixes: multi-Run cumulative re-arm, the
+// clear/delete re-arm, the planned-set dry run, the selector-change union,
+// the default's flat-rate refusal, unknown clear fields, the fail-closed
+// cache and the cross-process refresh.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_multi_run_instance_never_re_arms_a_cumulative_ceiling_on_the_run_totals() {
+    // The instance's LIFETIME total (10M) sits far above the open Run's
+    // (1M). A cumulative cap of 5M breaches (against the lifetime total).
+    // An UNRELATED later Policy change — one that matches the Run but does
+    // not touch the cumulative ceiling — must NOT unlatch the breach,
+    // clear the Anomaly or drop the fence: the cumulative ceiling still
+    // sits below the INSTANCE totals, wherever the open Run's own totals
+    // sit (the pre-fix re-arm compared every scope against the Run's own
+    // totals and cleared all of them).
+    let seeded = seed_multi_run(1_000_000, 10_000_000);
+    let fence = WireFence::default();
+    let mut contexts = contexts();
+    contexts.insert(
+        "money".to_string(),
+        InstanceContext {
+            fence: Some(fence.clone()),
+            metering_source: "engine-observed".to_string(),
+            inputs: Some(Ok(ResolveInputs::default())),
+        },
+    );
+    let both = PolicyLimits {
+        tokens_cumulative: Some(5_000_000),
+        breach_action: Some(BreachAction::Block),
+        // A per-run ceiling the unrelated change edits (still above the
+        // open Run's usage, so only the cumulative latch exists).
+        tokens_per_run: Some(8_000_000),
+        ..PolicyLimits::default()
+    };
+    let existing = seeded.registry.policy("cap").unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            existing,
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: both.clone(),
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            contexts.clone(),
+        )
+        .unwrap();
+    let events = breaches(&seeded.registry, &seeded.run);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].scope, crate::domain::BreachScope::Cumulative);
+    assert!(fence.refusal().is_some(), "the cumulative block fences");
+    // The PUBLISHED snapshot entry carries the breach Anomaly: the money
+    // half's entries commit AFTER the pre-breach resolution entry, so the
+    // freshest entry wins (the pre-fix order let the pre-breach entry
+    // overwrite it).
+    let snapshot = seeded.registry.run_snapshot();
+    let published = snapshot.run(&seeded.run).unwrap();
+    assert!(
+        published
+            .record
+            .anomalies
+            .contains(&crate::domain::runs::Anomaly::Breach),
+        "the published entry carries the breach: {:?}",
+        published.record.anomalies
+    );
+    // The unrelated change: raise the per-run ceiling only.
+    let raised = PolicyLimits {
+        tokens_per_run: Some(9_000_000),
+        ..both
+    };
+    let existing = seeded.registry.policy("cap").unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            existing,
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: raised,
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            contexts,
+        )
+        .unwrap();
+    // Still one breach (no duplicate fire), the latch holds, the Anomaly
+    // holds and the fence stays UP.
+    assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 1);
+    use crate::ports::RunStore as _;
+    let latched = seeded.registry.reader().latches(&seeded.run).unwrap();
+    assert!(
+        latched
+            .iter()
+            .any(|(key, _)| key.scope == crate::domain::BreachScope::Cumulative),
+        "the cumulative latch holds: {latched:?}"
+    );
+    assert!(
+        fence.refusal().is_some(),
+        "still fenced: still over the cap"
+    );
+    let view = seeded.registry.run_view(&seeded.run).unwrap();
+    assert!(
+        view.record
+            .anomalies
+            .contains(&crate::domain::runs::Anomaly::Breach),
+        "the breach Anomaly holds: {:?}",
+        view.record.anomalies
+    );
+}
+
+#[test]
+fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
+    // A ceiling that became UNSET re-arms: `--clear` and a delete loosen,
+    // and a latch under a ceiling that no longer exists must not hold the
+    // Run (or a `block` fence) for the rest of its life.
+    let seeded = seed(1_000);
+    let fence = WireFence::default();
+    let mut contexts = contexts();
+    contexts.insert(
+        "money".to_string(),
+        InstanceContext {
+            fence: Some(fence.clone()),
+            metering_source: "engine-observed".to_string(),
+            inputs: Some(Ok(ResolveInputs::default())),
+        },
+    );
+    let apply = |name: &str, set, clear: Vec<String>, contexts| {
+        let existing = seeded.registry.policy(name).unwrap();
+        seeded
+            .registry
+            .apply_policy_change(
+                existing,
+                PolicyChange {
+                    name: name.to_string(),
+                    selector: Some("team=core".parse().unwrap()),
+                    set,
+                    clear,
+                    rates: BTreeMap::new(),
+                },
+                contexts,
+            )
+            .unwrap()
+    };
+    apply(
+        "cap",
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            breach_action: Some(BreachAction::Block),
+            ..PolicyLimits::default()
+        },
+        Vec::new(),
+        contexts.clone(),
+    );
+    assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 1);
+    assert!(fence.refusal().is_some(), "latched under block: fenced");
+
+    // --clear tokens-per-run: the latch, the Anomaly and the fence reason
+    // all clear.
+    apply(
+        "cap",
+        PolicyLimits::default(),
+        vec!["tokens-per-run".to_string()],
+        contexts.clone(),
+    );
+    use crate::ports::RunStore as _;
+    assert!(
+        seeded
+            .registry
+            .reader()
+            .latches(&seeded.run)
+            .unwrap()
+            .is_empty(),
+        "the cleared ceiling re-arms its latch"
+    );
+    assert!(fence.refusal().is_none(), "the fence reason cleared");
+    let view = seeded.registry.run_view(&seeded.run).unwrap();
+    assert!(
+        !view
+            .record
+            .anomalies
+            .contains(&crate::domain::runs::Anomaly::Breach),
+        "the Anomaly cleared with the cleared ceiling: {:?}",
+        view.record.anomalies
+    );
+    // The clearing PUBLISHES: an `anomalies-changed` event is in the outbox
+    // (the pre-fix silent save left the bus and SSE blind to it).
+    let batch = crate::domain::export_core(&seeded.registry, None, 0).unwrap();
+    let cleared = batch
+        .events
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.event,
+                crate::domain::EngineEvent::Run(run_event)
+                    if run_event.change == crate::domain::runs::RunEventKind::AnomaliesChanged
+                        && run_event.run_id == seeded.run
+                        && !run_event.anomalies.contains(&crate::domain::runs::Anomaly::Breach)
+            )
+        })
+        .count();
+    assert!(
+        cleared >= 1,
+        "the Anomaly's CLEARING is an event (not only its raising): {batch:?}"
+    );
+    let raisings = batch
+        .events
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.event,
+                crate::domain::EngineEvent::Run(run_event)
+                    if run_event.change == crate::domain::runs::RunEventKind::AnomaliesChanged
+                        && run_event.run_id == seeded.run
+            )
+        })
+        .count();
+    assert_eq!(raisings, 2, "raised once, cleared once: {batch:?}");
+
+    // Re-arm the breach, then DELETE the Policy: the same loosening.
+    apply(
+        "cap",
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            breach_action: Some(BreachAction::Block),
+            ..PolicyLimits::default()
+        },
+        Vec::new(),
+        contexts.clone(),
+    );
+    assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 2);
+    assert!(fence.refusal().is_some());
+    let existing = seeded.registry.policy("cap").unwrap().unwrap();
+    seeded
+        .registry
+        .apply_policy_delete(existing, contexts)
+        .unwrap();
+    assert!(
+        seeded
+            .registry
+            .reader()
+            .latches(&seeded.run)
+            .unwrap()
+            .is_empty(),
+        "the delete re-arms every latch the Policy held"
+    );
+    assert!(fence.refusal().is_none(), "unfenced after the delete");
+}
+
+#[test]
+fn the_dry_run_reports_the_planned_sets_fallback_count() {
+    // The dry run must count the fallbacks the REAL change would produce:
+    // a `pause` Policy matching an announced-depth child falls back to
+    // `warn` only once the Policy EXISTS in the set the count resolves
+    // against. The pre-fix dry run resolved against the pre-change set and
+    // answered 0 while the real create answered 1.
+    let seeded = seed(1_000);
+    let child = RunId::mint();
+    let child_record = RunRecord {
+        run_id: child.clone(),
+        control_depth: ControlDepth::Announced,
+        wire_path: true,
+        status: crate::domain::runs::RunStatus::Active,
+        anomalies: Vec::new(),
+        parent_run_id: Some(seeded.run.clone()),
+        instance: Some("money".to_string()),
+        process_owner: false,
+        end_cause: None,
+        created_at: "t".to_string(),
+        updated_at: "t".to_string(),
+        ended_at: None,
+    };
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _};
+            ctx.store().insert_run(&NewRun {
+                record: child_record,
+                labels: vec![crate::domain::runs::Label::bound("team", "core")],
+                limits: Default::default(),
+                identity: None,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let set = PolicyLimits {
+        breach_action: Some(BreachAction::Pause),
+        ..PolicyLimits::default()
+    };
+    let request = PolicyChange {
+        name: "kid".to_string(),
+        selector: Some("team=core".parse().unwrap()),
+        set: set.clone(),
+        clear: Vec::new(),
+        rates: BTreeMap::new(),
+    };
+    let dry = seeded.registry.plan_policy_change(None, &request).unwrap();
+    assert_eq!(dry.matched, 2, "{dry:?}");
+    assert_eq!(dry.fallbacks, 1, "the dry run sees the planned set");
+    let real = change(&seeded.registry, "kid", "team=core", set);
+    assert_eq!(real.matched, 2);
+    assert_eq!(real.fallbacks, 1, "the real create agrees");
+}
+
+#[test]
+fn a_selector_change_re_resolves_the_runs_only_the_old_selector_matched() {
+    // Runs ONLY the OLD Selector matched must re-resolve on a Selector
+    // change (they loosen): the pre-fix change re-resolved the new
+    // Selector's matches alone, stranding the old ones' latches, breach
+    // Anomalies and stored ceilings.
+    let seeded = seed(1_000);
+    change(
+        &seeded.registry,
+        "cap",
+        "team=core",
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            ..PolicyLimits::default()
+        },
+    );
+    assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 1);
+    // Move the Selector elsewhere: the still-bound Run loosens.
+    change(
+        &seeded.registry,
+        "cap",
+        "team=other",
+        PolicyLimits {
+            tokens_per_run: Some(500),
+            ..PolicyLimits::default()
+        },
+    );
+    use crate::ports::RunStore as _;
+    assert!(
+        seeded
+            .registry
+            .reader()
+            .latches(&seeded.run)
+            .unwrap()
+            .is_empty(),
+        "the old match's latch re-armed"
+    );
+    let view = seeded.registry.run_view(&seeded.run).unwrap();
+    let resolution = view.policy.as_ref().unwrap();
+    assert!(
+        resolution.tokens.per_run.is_none(),
+        "the stranded ceiling cleared: {resolution:?}"
+    );
+}
+
+#[test]
+fn a_named_policy_without_a_selector_and_rates_on_a_named_policy_are_refused() {
+    let seeded = seed(1_000);
+    // No Selector (and no existing row to inherit one from).
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "loose".to_string(),
+                selector: None,
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            contexts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, RunError::Invalid { field, .. } if field == "selector"),
+        "{refusal}"
+    );
+    // A model-keyed Rate table belongs to `default` alone.
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "tabled".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: BTreeMap::from([("gpt-demo".to_string(), Some(Rate::new(1, 1)))]),
+            },
+            contexts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, RunError::Invalid { field, .. } if field == "rates"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_store_set_without_its_default_row_degrades_the_cache_at_load() {
+    // A `default`-less store (the row deleted out from under the engine)
+    // degrades the cache AT LOAD with an open note — the resolution then
+    // fails closed until a healthy set loads again.
+    let seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("DELETE FROM policies WHERE name = 'default'");
+            Ok(())
+        })
+        .unwrap();
+    seeded.registry.load_policy_cache();
+    assert!(
+        !seeded.registry.take_open_notes().is_empty(),
+        "the defaultless load is an open note"
+    );
+    let name = InstanceName::new("money").unwrap();
+    assert_eq!(
+        seeded
+            .registry
+            .resolved_limits(&name, Some(&seeded.run))
+            .effective_action,
+        BreachAction::Pause,
+        "fail closed while degraded"
+    );
+    // A healthy reload (a restore) recovers.
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            use crate::ports::PolicyRecords as _;
+            ctx.store()
+                .put_policy(&crate::domain::runs::PolicyRecord::default_policy())?;
+            Ok(())
+        })
+        .unwrap();
+    seeded.registry.load_policy_cache();
+    assert_eq!(
+        seeded
+            .registry
+            .resolved_limits(&name, Some(&seeded.run))
+            .effective_action,
+        BreachAction::Warn
+    );
+}
+
+#[test]
+fn a_flat_rate_on_the_default_policy_is_refused() {
+    // The default Policy prices through its model-keyed table; a flat rate
+    // on it would be stored and shown but never apply — refuse it.
+    let seeded = seed(1_000);
+    let existing = seeded.registry.policy("default").unwrap().unwrap();
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            Some(existing),
+            PolicyChange {
+                name: "default".to_string(),
+                selector: None,
+                set: PolicyLimits {
+                    rate: Some(Rate::new(1_000_000, 1_000_000)),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            contexts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, RunError::Invalid { field, .. } if field == "rate"),
+        "{refusal}"
+    );
+    // The refusal names the table.
+    assert!(refusal.to_string().contains("model-keyed"), "{refusal}");
+}
+
+#[test]
+fn an_unknown_clear_field_is_refused() {
+    let seeded = seed(1_000);
+    change(
+        &seeded.registry,
+        "cap",
+        "team=core",
+        PolicyLimits {
+            tokens_per_run: Some(2_000),
+            ..PolicyLimits::default()
+        },
+    );
+    let existing = seeded.registry.policy("cap").unwrap().unwrap();
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            Some(existing),
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits::default(),
+                clear: vec!["tokens-per-rn".to_string()],
+                rates: BTreeMap::new(),
+            },
+            contexts(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&refusal, RunError::Invalid { field, .. } if field == "clear"),
+        "{refusal}"
+    );
+}
+
+#[test]
+fn a_degraded_or_defaultless_policy_cache_fails_closed_to_pause() {
+    // A cache whose load failed — or whose set lost the `default` row —
+    // must never resolve the seeded `warn` by accident: every resolution
+    // through it fails closed to `pause` with a note naming why.
+    let seeded = seed(1_000);
+    let name = InstanceName::new("money").unwrap();
+    seeded
+        .registry
+        .policies
+        .degrade("the Policies could not be read (test)".to_string());
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    let note = resolution.fail_closed.expect("the fail-closed note");
+    assert!(note.contains("fail closed to pause"), "{note}");
+
+    // A published set WITHOUT the default row fails closed the same way.
+    seeded.registry.policies.publish(Vec::new());
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    assert!(resolution.fail_closed.is_some());
+
+    // A healthy publish clears it.
+    let policies = seeded.registry.policies().unwrap();
+    seeded.registry.policies.publish(policies);
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert!(resolution.fail_closed.is_none());
+    assert_eq!(resolution.effective_action, BreachAction::Warn);
+}
+
+#[test]
+fn a_second_engines_policy_change_is_visible_after_one_refresh() {
+    // The cross-process staleness check: engine B (its own writer and
+    // cache) creates a Policy with a ceiling; engine A's cached set is
+    // stale until ONE `refresh_policy_cache` (the reaper tick's one pragma
+    // read) picks it up — the pre-fix engine A resolved against its stale
+    // set until restart.
+    let seeded = seed(1_000);
+    let name = InstanceName::new("money").unwrap();
+    let second = Registry::open(Some(seeded.state.path().to_path_buf())).unwrap();
+    let limits = PolicyLimits {
+        tokens_per_run: Some(123_456),
+        ..PolicyLimits::default()
+    };
+    second
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "remote".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: limits,
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    // Engine A still resolves its stale cached set.
+    assert_eq!(
+        seeded
+            .registry
+            .resolved_limits(&name, Some(&seeded.run))
+            .tokens
+            .per_run,
+        None,
+        "the cached set is stale before the refresh"
+    );
+    // One tick's refresh picks the change up.
+    seeded.registry.refresh_policy_cache();
+    assert_eq!(
+        seeded
+            .registry
+            .resolved_limits(&name, Some(&seeded.run))
+            .tokens
+            .per_run,
+        Some(123_456),
+        "the refresh reloaded the set the second engine changed"
+    );
+}
+
+#[test]
+fn a_breach_on_an_unsupervised_instance_names_the_unknown_source() {
+    // A matched Run whose instance this engine does not supervise (no
+    // context) still breaches at once (its stored inputs arm the money
+    // half) — and its breach record names the honest `unknown` metering
+    // source, never a fabricated empty one.
+    let seeded = seed(1_000);
+    // Above the usage first, WITH a context: the Run's resolution is
+    // stored (the money half can later reuse it).
+    change(
+        &seeded.registry,
+        "cap",
+        "team=core",
+        PolicyLimits {
+            tokens_per_run: Some(2_000),
+            ..PolicyLimits::default()
+        },
+    );
+    // Then LOWER it with an EMPTY context map (the instance is not
+    // supervised here): the breach still fires from the stored inputs.
+    let existing = seeded.registry.policy("cap").unwrap().unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            Some(existing),
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(500),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    let events = breaches(&seeded.registry, &seeded.run);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].metering_source, "unknown");
 }
 
 impl LimitField {

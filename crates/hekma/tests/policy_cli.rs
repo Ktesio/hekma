@@ -42,6 +42,19 @@ fn policy_refusals_map_to_the_documented_exit_codes() {
             "--breach-action",
             "zap",
         ],
+        // An unknown --clear field is a typo, not a silent no-op.
+        vec!["policy", "change", "default", "--clear", "tokens-per-rn"],
+        // A flat Rate belongs to a named Policy; the default's table is
+        // edited through --rate-for (a flat rate on it would never apply).
+        vec![
+            "policy",
+            "change",
+            "default",
+            "--rate-input",
+            "1",
+            "--rate-output",
+            "2",
+        ],
     ] {
         let run = hekma(&args);
         assert_eq!(run.code, Some(2), "{args:?} stderr: {}", run.stderr);

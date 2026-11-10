@@ -65,7 +65,7 @@ use super::usage::UsageTotals;
 /// The remaining values are computed from the SAME ledger totals `usage` reports,
 /// so they equal the Usage Ledger exactly (the FR-22 discipline). snake_case on
 /// the wire (AD-14); `Deserialize` so `--json` round-trips.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetView {
     /// The configured per-run token ceiling (`null` when the per-run scope is
     /// unset).
@@ -110,6 +110,13 @@ pub struct BudgetView {
     /// The configured Breach Action (`pause` / `stop` / `warn` / `block`). Governs BOTH the
     /// token and the dollar breach (story 3-3: one action).
     pub breach_action: BreachAction,
+    /// The names of every Policy that supplied a limit in this view, sorted
+    /// (`default` counts; absent when no Policy did — an instance-shaped
+    /// budget). AD-14/AD-25: the surface names the Policies behind a Run's
+    /// limits, so the Fleet row shows WHERE the ceiling came from, not just
+    /// its value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<String>,
 }
 
 impl BudgetView {
@@ -142,6 +149,7 @@ impl BudgetView {
             cumulative_dollars_remaining: None,
             estimate_label: None,
             breach_action: action,
+            policies: Vec::new(),
         })
     }
 
@@ -153,7 +161,8 @@ impl BudgetView {
     /// Remaining is `cap.saturating_remaining(cost)` per scope (a breached scope →
     /// `$0`, never negative). Returns `None` when NEITHER a token budget nor an
     /// enforceable dollar cap exists (an honest absent budget — never a fabricated
-    /// ceiling).
+    /// ceiling). `policies` names every Policy that supplied a limit in this
+    /// view (story 21-3: the surface shows the source, not just the value).
     #[allow(clippy::too_many_arguments)]
     pub fn from_budget_and_cost(
         budget: &TokenBudget,
@@ -165,6 +174,7 @@ impl BudgetView {
         current_run_cost: Micros,
         cumulative_cost: Micros,
         label: EstimateLabel,
+        policies: &[String],
     ) -> Option<Self> {
         // The dollar dimension is surfaced ONLY when a Rate exists AND a cap scope is
         // set (AC-B inert otherwise: no Rate ⇒ no dollar figure at all).
@@ -199,6 +209,7 @@ impl BudgetView {
             // The label rides only when the dollar dimension is active.
             estimate_label: dollar_active.then_some(label),
             breach_action: action,
+            policies: policies.to_vec(),
         })
     }
 }
@@ -1003,7 +1014,7 @@ mod tests {
         assert_eq!(v.cumulative_remaining, Some(600)); // 1000 − 400
         assert_eq!(v.breach_action, BreachAction::Stop);
 
-        let value: serde_json::Value = serde_json::to_value(v).unwrap();
+        let value: serde_json::Value = serde_json::to_value(&v).unwrap();
         assert_eq!(value["per_run_limit"], serde_json::json!(100));
         assert_eq!(value["per_run_remaining"], serde_json::json!(70));
         assert_eq!(value["cumulative_remaining"], serde_json::json!(600));
@@ -1613,12 +1624,13 @@ mod tests {
             Micros(0),
             Micros(300_000),
             EstimateLabel::Estimated,
+            &[],
         )
         .expect("a dollar cap makes the view present even with no token budget");
         assert_eq!(v.cumulative_cost_cap, Some(Micros(500_000)));
         assert_eq!(v.cumulative_dollars_remaining, Some(Micros(200_000)));
         assert_eq!(v.estimate_label, Some(EstimateLabel::Estimated));
-        let value: serde_json::Value = serde_json::to_value(v).unwrap();
+        let value: serde_json::Value = serde_json::to_value(&v).unwrap();
         assert_eq!(value["cumulative_cost_cap"], serde_json::json!(500_000));
         assert_eq!(
             value["cumulative_dollars_remaining"],
@@ -1644,6 +1656,7 @@ mod tests {
             Micros(0),
             Micros(800_000), // spent past the cap
             EstimateLabel::Estimated,
+            &[],
         )
         .unwrap();
         assert_eq!(v.cumulative_dollars_remaining, Some(Micros(0)));
@@ -1667,6 +1680,7 @@ mod tests {
             Micros(0),
             Micros(0),
             EstimateLabel::Estimated,
+            &[],
         );
         assert!(
             v.is_none(),
@@ -1691,6 +1705,7 @@ mod tests {
             Micros(0),
             Micros(0),
             EstimateLabel::Estimated,
+            &[],
         )
         .unwrap();
         assert_eq!(v.cumulative_limit, Some(100));

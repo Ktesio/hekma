@@ -3773,6 +3773,72 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     );
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
+    // Unknown fields are refused at EVERY level: a misspelled limit inside
+    // `set` (or inside a Rate) would otherwise be silently dropped, and an
+    // unknown `clear` name silently clear nothing.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"tokens_per_rn": 5}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 1, "output_micros_per_1m": 1, "input_micros": 2,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"clear": ["tokens-per-rn"]})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "invalid-request",
+        "an unknown clear name is an engine refusal"
+    );
+
+    // The list carries every Policy, `default` included.
+    let mut response = get_ok(&client, &server.addr, "/v0/policies");
+    let document = json_body(&mut response);
+    let names: Vec<&str> = document["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|policy| policy["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"default"), "{names:?}");
+    assert!(names.contains(&"nightly"), "{names:?}");
+
+    // A create dry run plans and writes nothing (200, no Location).
+    let response = call(
+        &client,
+        "POST",
+        &base,
+        Some(serde_json::json!({
+            "name": "previewed", "selector": "team=x", "tokens_per_run": 5, "dry_run": true,
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = get_ok(&client, &server.addr, "/v0/policies/previewed");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND, "nothing written");
+
+    // A delete dry run reports what would loosen instead of deleting.
+    let response = call(
+        &client,
+        "DELETE",
+        &format!("{base}/nightly?dry_run=true"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+
     // An unknown name is 404 policy-not-found; delete answers 204.
     let mut response = get_ok(&client, &server.addr, "/v0/policies/ghost");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

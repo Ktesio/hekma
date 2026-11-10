@@ -35,6 +35,7 @@ Hekma resolves each limit on its own, in this order:
 
 | Source | Rule |
 |---|---|
+| A malformed `breach_action` anywhere | Fails closed to `pause` with a diagnostic — before every other source, a Run's own action included. Only the action fails closed: the ceilings, the Rate and the model an agent set explicitly still apply. |
 | Explicit limits on a Run, then on an agent | Set by the Operator, in any configuration layer. They outrank every Policy. |
 | Matching Policies | The most specific Selector wins; a tie goes to the tightest value. |
 | The default Policy | Fills whatever is still unset. |
@@ -56,7 +57,7 @@ hekma policy change default --rate-for gpt-4.1 --rate-input 2.00 --rate-output 8
 hekma policy change default --clear rate:gpt-4.1
 ```
 
-A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Policy's flat Rate, then this table. A Cost Cap set by a Policy on a Run whose model has no Rate cannot be enforced; the Run carries the `unpriced-model` Anomaly until a Rate resolves, so the gap is never silent.
+A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Policy's flat Rate, then this table. A flat Rate belongs to a named Policy — setting one on `default` is refused, because only the table prices `default`'s Runs. A Cost Cap set by a Policy on a Run whose model has no Rate cannot be enforced; the Run carries the `unpriced-model` Anomaly until a Rate resolves, so the gap is never silent.
 
 ## The warn default
 
@@ -66,7 +67,9 @@ A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Poli
 
 ## Changes apply at once
 
-A Policy change applies to every matched open Run immediately. Lowering a ceiling to or below a Run's usage breaches it now; raising one above the usage re-arms its breach latch, so the next crossing fires again, and lifts the `block` fence for that ceiling on a live Run. Deleting a Policy re-resolves the Runs it governed under what remains.
+A Policy change applies to every matched open Run immediately. Lowering a ceiling to or below a Run's usage breaches it now; raising one above the usage re-arms its breach latch, so the next crossing fires again, and lifts the `block` fence for that ceiling on a live Run. Clearing a ceiling or deleting the Policy re-arms too — a latch never outlives the ceiling that fired it. Changing a Policy's Selector re-resolves the Runs both the old and the new Selector match, so the Runs only the old one governed loosen as well. Deleting a Policy re-resolves the Runs it governed under what remains.
+
+An unknown `--clear` field is refused (exit 2 on the CLI, `400` on the API): a typo would otherwise report success while clearing nothing.
 
 ## Control Depth and fallback
 

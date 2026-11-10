@@ -5106,6 +5106,7 @@ mod tests {
         breach_action: hekma_engine::BreachAction,
     ) -> BudgetView {
         BudgetView {
+            policies: Vec::new(),
             per_run_limit: per_run.map(|(limit, _)| limit),
             per_run_remaining: per_run.map(|(_, remaining)| remaining),
             cumulative_limit: cumulative.map(|(limit, _)| limit),
@@ -5581,7 +5582,7 @@ mod tests {
             "the summary names the artifact path: {summary}"
         );
         assert!(
-            summary.contains("18 decision")
+            summary.contains("20 decision")
                 && summary.contains("11 derivation")
                 && summary.contains("5 fence"),
             "the summary gives the case mix: {summary}"

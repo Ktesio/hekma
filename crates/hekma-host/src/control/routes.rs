@@ -821,7 +821,7 @@ pub(crate) async fn policy_create(
             dollars_cumulative_micros: request.dollars_cumulative_micros,
             breach_action: request.breach_action,
             scent_check: request.scent_check,
-            rate: request.rate,
+            rate: request.rate.map(dto::RatePatch::into_rate),
         },
         clear: Vec::new(),
         rates: std::collections::BTreeMap::new(),
@@ -854,7 +854,7 @@ pub(crate) async fn policy_change(
         .rates
         .set
         .into_iter()
-        .map(|(model, rate)| (model, Some(rate)))
+        .map(|(model, rate)| (model, Some(rate.into_rate())))
         .collect();
     for model in request.rates.remove {
         rates.insert(model, None);
@@ -862,7 +862,7 @@ pub(crate) async fn policy_change(
     let change = hekma_engine::PolicyChange {
         name,
         selector: request.selector,
-        set: request.set,
+        set: request.set.into_limits(),
         clear: request.clear,
         rates,
     };

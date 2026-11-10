@@ -6645,6 +6645,9 @@ const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
     "per_run_dollars_remaining",
     "per_run_limit",
     "per_run_remaining",
+    // The Policies that supplied a limit in this view (Policies shipped;
+    // `default` supplies the action when nothing tighter does).
+    "policies",
 ];
 
 // ---------------------------------------------------------------------------
@@ -6967,8 +6970,20 @@ fn budget_view_key_set_is_frozen_on_the_json_wire() {
     );
     assert_frozen_keys(
         budget,
-        &["breach_action", "cumulative_limit", "cumulative_remaining"],
+        &[
+            "breach_action",
+            "cumulative_limit",
+            "cumulative_remaining",
+            // The default Policy supplied the action (no explicit action
+            // anywhere): the view names its source.
+            "policies",
+        ],
         "BudgetView",
+    );
+    assert_eq!(
+        budget["policies"],
+        serde_json::json!(["default"]),
+        "the default Policy names itself as the action's source: {budget}"
     );
     // Dollars are integer micros + a label on the wire, NEVER a `$` string
     // (AD-8/AD-14) — with no Rate the dollar dimension is absent entirely.

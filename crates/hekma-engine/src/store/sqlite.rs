@@ -91,7 +91,7 @@ use crate::ports::{
 /// see [`super::runs_sqlite`].
 /// v14 (story 21-9): `run_labels.origin`, each bound label's origin —
 /// see [`super::runs_sqlite`].
-const SCHEMA_VERSION: i64 = 15;
+pub(crate) const SCHEMA_VERSION: i64 = 15;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///

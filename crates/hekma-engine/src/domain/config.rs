@@ -1019,7 +1019,9 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
 /// How the `budget.breach_action` key reads from a resolved config
 /// (story 21-3): present and valid, PRESENT BUT MALFORMED (fails closed to
 /// `pause` with a surfaced note — AD-7, never the new default), or absent
-/// (the Policy resolution fills it).
+/// (the Policy resolution fills it). A value of the WRONG TYPE (an integer,
+/// a boolean, an array) is malformed, not absent — a hand-edited
+/// `breach_action = 1` must never fall through to the default.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionRead {
     Present(BreachAction),
@@ -1027,17 +1029,30 @@ pub(crate) enum ActionRead {
     Absent,
 }
 
+/// Render a non-string TOML value for the malformed note (never a Debug
+/// dump — a short, human-readable rendering).
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Datetime(d) => d.to_string(),
+        Value::Array(_) => "[…]".to_string(),
+        Value::Table(_) => "{…}".to_string(),
+    }
+}
+
 /// Read the `budget.breach_action` key with absent/malformed distinguished
 /// (the resolution's action precedence needs all three).
 pub(crate) fn read_breach_action(effective: &EffectiveConfig) -> ActionRead {
-    match effective
-        .value(BUDGET_BREACH_ACTION_KEY)
-        .and_then(|value| value.as_str())
-    {
-        Some(raw) => match raw.trim().parse::<BreachAction>() {
+    match effective.value(BUDGET_BREACH_ACTION_KEY) {
+        Some(Value::String(raw)) => match raw.trim().parse::<BreachAction>() {
             Ok(action) => ActionRead::Present(action),
             Err(_) => ActionRead::Malformed(raw.trim().to_string()),
         },
+        // Present but not a string: malformed (fail closed to pause).
+        Some(other) => ActionRead::Malformed(render_value(other)),
         None => ActionRead::Absent,
     }
 }
@@ -1049,17 +1064,15 @@ pub(crate) fn read_breach_action(effective: &EffectiveConfig) -> ActionRead {
 /// documented "no Rate yet"), and the resolved `model` (the default
 /// Policy's Rate-table lookup key). A malformed ceiling degrades to absent
 /// (the defensive read); a malformed ACTION is carried as malformed (fail
-/// closed).
+/// closed) while every OTHER explicit input survives — only the action
+/// fails closed, never the ceilings, the Rate or the model (a malformed
+/// action once dropped them all, recording usage unpriced and unceilinged:
+/// the 21-3 review round 1 finding).
 pub(crate) fn explicit_limits(effective: &EffectiveConfig) -> crate::domain::runs::ResolveInputs {
-    let action = match read_breach_action(effective) {
-        ActionRead::Present(action) => Some(action),
-        ActionRead::Malformed(raw) => {
-            return crate::domain::runs::ResolveInputs {
-                malformed_action: Some(raw),
-                ..crate::domain::runs::ResolveInputs::default()
-            }
-        }
-        ActionRead::Absent => None,
+    let (action, malformed) = match read_breach_action(effective) {
+        ActionRead::Present(action) => (Some(action), None),
+        ActionRead::Malformed(raw) => (None, Some(raw)),
+        ActionRead::Absent => (None, None),
     };
     let (rate, cap, _) = resolve_cost(effective);
     let model = effective
@@ -1077,7 +1090,7 @@ pub(crate) fn explicit_limits(effective: &EffectiveConfig) -> crate::domain::run
             scent_check: None,
             rate,
         },
-        malformed_action: None,
+        malformed_action: malformed,
         model,
     }
 }
@@ -1351,6 +1364,67 @@ mod tests {
     }
 
     // ---- resolve(): key present in exactly one layer (×4) ----
+
+    #[test]
+    fn a_malformed_action_keeps_the_explicit_ceilings_rate_and_model() {
+        // The 21-3 review round 1 finding: only the ACTION fails closed —
+        // the explicit ceilings, the Rate and the model key survive a
+        // malformed `breach_action` (dropping them once left the usage
+        // unpriced and unceilinged beside the pause).
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "model = \"gpt-demo\"\n[budget]\nbreach_action = \"throttle\"\n[budget.tokens]\nper_run = 250\ncumulative = 2500\n[budget.dollars]\nper_run = \"3\"\n[cost.rate]\ninput = \"1\"\noutput = \"2\"",
+        ));
+        let inputs = explicit_limits(&eff);
+        assert_eq!(inputs.malformed_action.as_deref(), Some("throttle"));
+        assert_eq!(inputs.explicit.tokens_per_run, Some(250));
+        assert_eq!(inputs.explicit.tokens_cumulative, Some(2_500));
+        assert_eq!(inputs.explicit.dollars_per_run_micros, Some(3_000_000));
+        assert_eq!(
+            inputs.explicit.rate,
+            Some(crate::domain::cost::Rate::new(1_000_000, 2_000_000))
+        );
+        assert_eq!(inputs.model.as_deref(), Some("gpt-demo"));
+        // And the resolution pauses (fail closed) WITH the ceilings armed.
+        let resolution =
+            crate::domain::runs::policy::resolve(&crate::domain::runs::policy::ResolutionInput {
+                inputs,
+                ..Default::default()
+            });
+        assert_eq!(resolution.action, BreachAction::Pause);
+        assert_eq!(resolution.tokens.per_run, Some(250));
+        assert!(resolution.fail_closed.is_some());
+    }
+
+    #[test]
+    fn a_non_string_breach_action_reads_as_malformed_not_absent() {
+        // A hand-edited `breach_action = 1` (or `true`, or a list) is
+        // PRESENT but malformed: it fails closed to `pause`, never falls
+        // through to the default as if nothing were set.
+        for text in [
+            "[budget]\nbreach_action = 1\n",
+            "[budget]\nbreach_action = true\n",
+            "[budget]\nbreach_action = [\"stop\"]\n",
+            "[budget]\nbreach_action = 1.5\n",
+            "[budget]\nbreach_action = 1979-05-27T07:32:00Z\n",
+        ] {
+            let eff = resolve(one_layer(SourceLayer::Instance, text));
+            assert!(
+                matches!(read_breach_action(&eff), ActionRead::Malformed(_)),
+                "{text}: a non-string value is malformed, not absent"
+            );
+            let inputs = explicit_limits(&eff);
+            assert!(inputs.malformed_action.is_some(), "{text}");
+            assert!(inputs.explicit.breach_action.is_none(), "{text}");
+            let resolution = crate::domain::runs::policy::resolve(
+                &crate::domain::runs::policy::ResolutionInput {
+                    inputs,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(resolution.action, BreachAction::Pause, "{text}");
+        }
+    }
 
     #[test]
     fn key_in_only_engine_default_resolves_to_it() {
