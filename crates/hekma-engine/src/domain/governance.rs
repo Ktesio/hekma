@@ -636,9 +636,12 @@ pub struct FenceCase {
 
 /// ONE case of the vectors artifact. The `kind` tag discriminates the case
 /// kinds; the variant's fields are inlined beside it. A consumer pinned to
-/// an older minor skips a kind it does not know (docs/governance.md).
+/// an older minor skips a kind it does not know (docs/governance.md). The
+/// cases are built once per generation and read once per verification —
+/// never in a hot path — so the variant size difference is accepted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum Case {
     /// A full decision: [`GovernanceInput`] → [`GovernanceOutcome`].
     Decision(DecisionCase),

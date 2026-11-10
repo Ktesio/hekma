@@ -479,3 +479,25 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-21-9-bound-labels.md` (Design Notes: the planners)
   summary: A configured key replaces a Caller label on the same key, and if the configuration later drops the key, the Caller's value does not come back (the Caller row was replaced, not shadowed). The same holds for a verb label set over a Caller key and then removed. Bound wins by design; the Caller can set the label again where its surface allows.
   evidence: `domain/runs/labels.rs` (`plan_config_sync`, `plan_label_change`). Trigger: an operator or Host report of a lost Caller label, or story 23.1 if identity-header labels need to survive an Operator override.
+
+## Deferred from: implementation of spec-21-3-policies (2026-11-10)
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: Scent-Check in 21-3)
+  summary: Scent-Check behavior (`off`/`shadow`/`enforce`) does not exist; 21-3 stores the field on every Policy row, resolves it through the tie order and refuses `shadow`/`enforce` at create/change with `scent-unavailable`. The modes take effect — and Q9's per-environment default is decided — with story 22.3, which never overwrites an Operator-edited default Policy.
+  evidence: `domain/runs/policy.rs` (`ScentCheckMode`, the resolver's scent arm), `registry_policy.rs` (`ScentUnavailable` refusal); PRD §13 Q9 interim. Trigger: story 22.3.
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: the policy change job)
+  summary: A Policy change's re-arm covers the POLICY trigger only; `hekma budget` and plain config-write raises re-arm with story 21.6 (which generalizes the same rule and clears matching fence reasons), and Selector set tokens on the Control API are 21.6's too — the CLI resolves a Selector locally today.
+  evidence: `registry_policy.rs::re_arm` (the policy-change job); FR-60's budget-trigger sibling lands with 21.6. Trigger: story 21.6.
+
+- source_spec: `spec-21-3-policies.md` (Design Notes: What 21-3 does NOT do)
+  summary: Wire Runs' enforcement through the shared proxy — the snapshot entry carries the resolution but nothing reads it on a call path until 23.1; until then depths below `supervised` execute no action (the depth fallback covers them honestly). `hekma ps` (21.5) carries the "kept on pause by upgrade" note to the Run-first surface; today the note lives on `fleet`/`show`/`run show`.
+  evidence: `runs/policy.rs` (the snapshot entry), `cli/agent.rs::breach_default_note`; FR-49's verb×depth table. Trigger: stories 23.1, 21.5.
+
+- source_spec: `spec-21-3-policies.md` (I/O Impact Matrix)
+  summary: The hekma-engine semver baseline does NOT move for 21-3 — the orchestrator ruled (2026-11-09) that every story in this unreleased cycle stays on 0.12.0, whose 0.11→0.12 bump already permits breaking changes; the new `EngineEvent`/`Anomaly`/`RunError` variants and `FleetEntry` field are breaking additions within the unreleased 0.12.0, announced in the Unreleased banners. No follow-up baseline bump is owed for this story.
+  evidence: CHANGELOG.md + docs/RELEASE_NOTES.md Unreleased banners; 21-2's 0.11→0.12 bump (PR #376). Trigger: none.
+
+- source_spec: `spec-21-3-policies.md` (Verification — the bench)
+  summary: The 21-1 writer bench was not re-run before/after in this story's build session (the resolver rides the per-event `eval_input` read plus one `Arc` clone of the cached policy set, by design no new SQL on the per-event path; the store-level money tests pin the change-job behavior instead). The bench number comparison is owed if the independent review flags the per-event cost.
+  evidence: `registry_policy.rs` (`PolicyCache`, `resolved_limits`); spec Verification. Trigger: the independent adversarial pass, or story 24.4's scale benchmark.

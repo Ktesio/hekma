@@ -41,7 +41,9 @@ Hekma resolves each limit on its own, in this order:
 
 Selector A is more specific than B when A's terms are a strict superset of B's; Selectors that cannot be compared tie. From loosest to tightest, Breach Actions run `warn` < `pause` < `stop` < `block`. A tie between two ceilings goes to the lower one.
 
-`hekma agent show` names where each limit came from: the Run, the agent's configuration, a Policy by name, or the default Policy.
+`hekma run show <run-id> --json` names where each of its Run's limits came
+from: the Run itself, the agent's configuration, a Policy by name, or the
+default Policy.
 
 ## The default Policy
 
@@ -60,7 +62,7 @@ A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Poli
 
 `warn` acts on nothing and signals loudly: the breach is recorded, raises the `breach` Anomaly on the Run, and is published as an event (and an OTLP metric when export is configured). `pause`, `stop` and `block` stay opt-in. Nothing Hekma does on its own stops a Run unless an Operator configured it.
 
-**Upgrades keep your pause.** An agent registered before this change that relied on the implicit `pause` default keeps `pause`: the first open of the upgraded state directory writes `budget.breach_action = "pause"` into the agent's configuration, records one `breach-default-upgraded` event, and shows a "kept on pause by upgrade" note until you set a Breach Action yourself. An agent whose configuration cannot be written still pauses. A malformed `breach_action` fails closed to `pause` with a diagnostic, never to `warn`.
+**Upgrades keep your pause.** An agent registered before this change that relied on the implicit `pause` default keeps `pause`: the first open of the upgraded state directory writes `budget.breach_action = "pause"` into the agent's configuration, records one `breach_default_upgraded` event, and shows a "kept on pause by upgrade" note until you set a Breach Action yourself. An agent whose configuration cannot be written still pauses. A malformed `breach_action` fails closed to `pause` with a diagnostic, never to `warn`.
 
 ## Changes apply at once
 

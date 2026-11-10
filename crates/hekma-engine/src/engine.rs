@@ -1250,6 +1250,11 @@ impl Engine {
         } else {
             None
         };
+        // Story 21-3: the FR-21 "kept on pause by upgrade" marker rides the
+        // row (rendered as the note; the explicit-key write clears it).
+        let breach_default_upgraded = registry
+            .breach_default_upgraded(&instance.name)
+            .unwrap_or(false);
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -1275,6 +1280,7 @@ impl Engine {
             // `None` — omitted — for a stopped / never-started instance).
             supervision,
             recorded_state,
+            breach_default_upgraded,
             agent_home: instance.agent_home,
         }
     }

@@ -524,6 +524,14 @@ pub struct FleetEntry {
     /// `acp_context_usage` pattern.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision: Option<Supervision>,
+    /// The instance is kept on `pause` by the breach-default upgrade (the
+    /// FR-21 write): its effective Breach Action stays `pause`, set by the
+    /// upgrade rather than by you, until a Breach Action is set explicitly.
+    /// Rendered as the "kept on pause by upgrade" note; ABSENT-when-false
+    /// (the `acp_context_usage` pattern), so only upgraded instances carry
+    /// it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub breach_default_upgraded: bool,
     /// Story 21-4: the Lifecycle State the record still holds when it differs
     /// from [`FleetEntry::state`]. A READ-ONLY engine
     /// ([`crate::Engine::open_read_only`]) writes nothing, so when it finds a
@@ -825,6 +833,7 @@ mod tests {
             // (a registered instance is not supervised).
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: format!("/x/agents/{name}"),
         }
     }

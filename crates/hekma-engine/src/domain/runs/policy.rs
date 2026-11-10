@@ -786,7 +786,6 @@ impl PolicyCache {
 }
 
 /// The stored per-Run resolution (schema v15) and the re-resolution paths.
-
 /// The stored-resolution row (the resolution plus the inputs that produced
 /// it, so a re-resolution inside a writer job reuses the caller's last
 /// config read).

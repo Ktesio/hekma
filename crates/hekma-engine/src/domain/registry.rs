@@ -349,6 +349,14 @@ impl Registry {
         Ok(registry)
     }
 
+    /// Whether the instance carries the FR-21 "kept on pause by upgrade"
+    /// marker (story 21-3): the Fleet and Run surfaces render the note from
+    /// this read.
+    pub(crate) fn breach_default_upgraded(&self, name: &InstanceName) -> Result<bool, StoreError> {
+        self.store
+            .snapshot(|store| store.breach_default_kept(name.as_str()))
+    }
+
     /// Clear an instance's FR-21 upgrade marker (story 21-3): an explicit
     /// `budget.breach_action` write ends the "kept on pause by upgrade"
     /// note. Best-effort — a failure returns a warning note (the marker

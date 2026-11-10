@@ -3294,7 +3294,10 @@ fn call(
             .patch(url)
             .header("Authorization", &auth)
             .send_json(json),
-        ("PATCH", None) => client.patch(url).header("Authorization", &auth).send_empty(),
+        ("PATCH", None) => client
+            .patch(url)
+            .header("Authorization", &auth)
+            .send_empty(),
         ("DELETE", _) => client.delete(url).header("Authorization", &auth).call(),
         (other, _) => panic!("unsupported test method {other}"),
     }
@@ -3646,13 +3649,11 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     let (sink_handle, _diagnostics) = SharedSink::new();
     let server = spawn_serve_with_api(state.path().to_path_buf(), sink_handle);
     let client = client();
-    let auth = format!("Bearer {BEARER_VALUE}");
     let base = format!("http://{}/v0/policies", server.addr);
 
     // The seeded default Policy reads before any write: warn, `off`, no
     // ceilings, an empty Rate table (absent when empty).
-    let mut response =
-        get_ok(&client, &server.addr, "/v0/policies/default");
+    let mut response = get_ok(&client, &server.addr, "/v0/policies/default");
     assert_eq!(response.status(), StatusCode::OK);
     let document = json_body(&mut response);
     assert_eq!(document["policy"]["limits"]["breach_action"], "warn");
@@ -3693,10 +3694,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     // policy-default.
     let mut response = call(&client, "DELETE", &format!("{base}/default"), None);
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(&mut response)["error"]["code"],
-        "policy-default"
-    );
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
     let mut response = call(
         &client,
         "PATCH",
@@ -3704,10 +3702,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
         Some(serde_json::json!({"selector": "team=core"})),
     );
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(&mut response)["error"]["code"],
-        "policy-default"
-    );
+    assert_eq!(json_body(&mut response)["error"]["code"], "policy-default");
 
     // A Scent-Check Mode before Scent-Check ships is 400
     // scent-unavailable (never stored-and-ignored).
@@ -3724,7 +3719,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     );
 
     // The Rate table edits through PATCH's `rates`: set, read back, remove.
-    let mut response = call(
+    let response = call(
         &client,
         "PATCH",
         &format!("{base}/default"),
@@ -3742,7 +3737,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
         document["policy"]["rates"]["gpt-demo"]["input_micros_per_1m"],
         2_000_000
     );
-    let mut response = call(
+    let response = call(
         &client,
         "PATCH",
         &format!("{base}/default"),
@@ -3770,7 +3765,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
         2_000_000,
         "the dry run wrote nothing"
     );
-    let mut response = call(
+    let response = call(
         &client,
         "PATCH",
         &format!("{base}/nightly"),

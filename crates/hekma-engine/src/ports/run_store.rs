@@ -243,10 +243,23 @@ pub(crate) trait PolicyRecords {
     /// One Run's resolution facts in one read: its row, labels, Run limits
     /// and whether its instance is kept on `pause` by the upgrade (the
     /// pipeline's live per-event resolution).
-    fn run_resolution_facts(
-        &self,
-        run_id: &RunId,
-    ) -> Result<Option<(RunRecord, Vec<Label>, RunLimits, bool)>, StoreError>;
+    fn run_resolution_facts(&self, run_id: &RunId) -> Result<Option<ResolutionFacts>, StoreError>;
+}
+
+/// One Run's resolution facts (story 21-3): everything the live per-event
+/// resolution reads in one store pass. The `labels` and `kept_on_pause`
+/// arms are read by the stored-resolution path (`resolve_run`), which
+/// re-reads them through its own store handle today.
+#[allow(dead_code)]
+pub(crate) struct ResolutionFacts {
+    /// The Run's row.
+    pub record: RunRecord,
+    /// Its labels, sorted by key.
+    pub labels: Vec<Label>,
+    /// The limits set directly on it.
+    pub limits: RunLimits,
+    /// Its instance is kept on `pause` by the FR-21 upgrade.
+    pub kept_on_pause: bool,
 }
 
 /// The Run registry's storage (story 21-2, AD-25): the Run rows, their labels,

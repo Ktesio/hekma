@@ -94,6 +94,16 @@ fn recorded_state_note(entry: &FleetEntry) -> Option<String> {
     })
 }
 
+/// The FR-21 "kept on pause by upgrade" note (story 21-3): the instance's
+/// effective Breach Action is `pause` because the upgrade wrote it, and it
+/// stays until a Breach Action is set explicitly. `None` for every other
+/// row.
+fn breach_default_note(entry: &FleetEntry) -> Option<&'static str> {
+    entry
+        .breach_default_upgraded
+        .then_some("kept on pause by upgrade (set a Breach Action to change it)")
+}
+
 /// The stderr gap NOTE for one gapped entry (story 14-3, AI-18 — the narrow
 /// `list` cell truncates to the bare `—`, so the full tier breakdown rides
 /// the stderr note channel, AD-12). Composed from the engine's structured
@@ -617,8 +627,14 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
         // synthesized.
         let entry = facade.fleet_entry(name).map_err(map_error)?;
         let gone_note = recorded_state_note(&entry);
+        let upgraded_note = breach_default_note(&entry);
         let json = show_json(entry)?;
         println!("{json}");
+        if let Some(note) = upgraded_note {
+            // stderr beside the pure-JSON stdout (AD-12): the row's
+            // `breach_default_upgraded` field carries it for machines.
+            ui::note(note);
+        }
         if let Some(note) = gone_note {
             ui::note(note);
         }
@@ -641,6 +657,9 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|f| f.into_iter().find(|e| e.name.as_str() == name));
             render_runtime_status(&status, entry.as_ref());
+            if let Some(note) = entry.as_ref().and_then(breach_default_note) {
+                ui::note(note);
+            }
             if let Some(note) = entry.as_ref().and_then(recorded_state_note) {
                 ui::note(note);
             }
@@ -1159,6 +1178,9 @@ pub fn list(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         let empty = listing.instances.is_empty();
         let document = fleet_json(&listing)?;
         println!("{document}");
+        for note in listing.instances.iter().filter_map(breach_default_note) {
+            ui::note(note);
+        }
         for note in listing.instances.iter().filter_map(recorded_state_note) {
             ui::note(note);
         }
@@ -4284,6 +4306,7 @@ mod tests {
             // live spawn record, so it is not supervised.
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: format!("/x/agents/{name}"),
         }
     }
@@ -5829,6 +5852,7 @@ mod tests {
             usage_gap: None,
             supervision: None,
             recorded_state: None,
+            breach_default_upgraded: false,
             agent_home: "/h".into(),
         };
         let routed = Routed {

@@ -1102,18 +1102,23 @@ impl PolicyRecords for SqliteStore {
     fn run_resolution_facts(
         &self,
         run_id: &RunId,
-    ) -> Result<Option<(RunRecord, Vec<Label>, RunLimits, bool)>, StoreError> {
+    ) -> Result<Option<crate::ports::ResolutionFacts>, StoreError> {
         use crate::ports::RunRecords;
         let Some(record) = self.run_record(run_id)? else {
             return Ok(None);
         };
         let labels = self.run_labels(run_id)?;
         let limits = self.run_limits(run_id)?;
-        let kept = match &record.instance {
+        let kept_on_pause = match &record.instance {
             Some(instance) => self.breach_default_kept(instance)?,
             None => false,
         };
-        Ok(Some((record, labels, limits, kept)))
+        Ok(Some(crate::ports::ResolutionFacts {
+            record,
+            labels,
+            limits,
+            kept_on_pause,
+        }))
     }
 }
 
@@ -1122,6 +1127,7 @@ impl SqliteStore {
     /// longer parses is a typed corrupt-row error — the policies read fails
     /// closed upstream (money code never silently drops a standing limit).
     fn read_policy(&self, name: &str) -> Result<PolicyRecord, StoreError> {
+        #[allow(clippy::type_complexity)]
         let row: (
             Option<String>,
             Option<i64>,
@@ -1275,3 +1281,6 @@ fn decode_run_policy(
         updated_at: updated_at.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests;

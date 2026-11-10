@@ -4271,12 +4271,14 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
         human.stdout
     );
     // (3) The Budget cell renders BARE dollar figures whose only trailing
-    // parenthetical is the Breach Action `(pause)` — NEVER an inline `(estimated)`
+    // parenthetical is the Breach Action — NEVER an inline `(estimated)`
     // (which truncation could mangle into `(esti…` glued to a dollar). The exact
-    // `cum $5.00/$5.00 (pause)` cell is proof: the `$` cap + remaining are bare, the
+    // `cum $5.00/$5.00 (warn)` cell is proof: the `$` cap + remaining are bare, the
     // estimate label is not in the cell at all, so no mangled label can appear here.
+    // (`warn` is the resolved default since Policies landed; this instance sets no
+    // Breach Action.)
     assert!(
-        human.stdout.contains("cum $5.00/$5.00 (pause)"),
+        human.stdout.contains("cum $5.00/$5.00 (warn)"),
         "the Budget cell must render bare dollars + only the breach action (no inline \
          estimate label to truncate); stdout=\n{}",
         human.stdout

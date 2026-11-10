@@ -173,7 +173,7 @@ impl Registry {
         });
         let kept_instance = facts
             .as_ref()
-            .map(|(record, _, _, _)| record.instance.clone())
+            .map(|facts| facts.record.instance.clone())
             .unwrap_or_else(|| Some(name.as_str().to_string()));
         let kept = kept_instance
             .as_deref()
@@ -191,9 +191,11 @@ impl Registry {
                 ..ResolveInputs::default()
             });
         let (depth, wire_path, run_limits) = match &facts {
-            Some((record, _, limits, _)) => {
-                (record.control_depth, record.wire_path, limits.clone())
-            }
+            Some(facts) => (
+                facts.record.control_depth,
+                facts.record.wire_path,
+                facts.limits,
+            ),
             None => (ControlDepth::Supervised, true, Default::default()),
         };
         policy::resolve(&policy::ResolutionInput {
@@ -883,6 +885,7 @@ fn re_resolve_matched(
 /// * THEN lowered-to-at-or-below: `pipeline::evaluate` commits the breach
 ///   NOW (breach row, latch, outbox, `breach` Anomaly; the decision's
 ///   process action returns to the caller to apply).
+#[allow(clippy::too_many_arguments)]
 fn re_arm(
     store: &crate::store::SqliteStore,
     instance: &InstanceName,
