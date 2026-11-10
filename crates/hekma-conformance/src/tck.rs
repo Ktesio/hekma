@@ -3585,10 +3585,11 @@ fn observe_readiness_hold(
             };
             let watch_start = std::time::Instant::now();
             // PHASE 1 — anchor: the subject's `starting` commitment is the
-            // agent's clock zero (the engine spawns, then commits the
-            // transition onto the bus). Any OTHER event is evidence at
-            // most: a start that dies before the anchor (a launch failure)
-            // is carried honestly by the joined starter's own verdict.
+            // agent's clock zero (the engine commits the transition onto
+            // the bus, THEN spawns). Any OTHER event is evidence at most:
+            // a launch failure either finishes the starter before the poll
+            // sees the commitment (early return) or anchors first and is
+            // then carried honestly by the joined starter's own verdict.
             let anchored = loop {
                 if starter.is_finished() {
                     let started = starter
@@ -5919,13 +5920,16 @@ mod tests {
 
     /// A subject that dies at 150ms against a 250ms declared hold: the
     /// child's death lands INSIDE the startup survival window (300ms), so
-    /// the engine's own watch — not the readiness probe — fails the start,
-    /// and the threshold is crossed DURING that survival watch (the child
-    /// cannot die before its own `--exit-with` bound, and the anchored
-    /// elapsed only grows), leaving `hold_proven` honestly `Some(true)`.
-    /// The engine's own death text then propagates AS ITSELF through the
-    /// post-proof `started?` — pinned by substring, so a generic error can
-    /// never stand in for the engine's verdict.
+    /// an engine start stage — not the readiness gate — fails the launch.
+    /// WHICH stage catches the death (the survival watch on a fast launch,
+    /// the readiness probe on a slow one) is runner timing, not contract:
+    /// both surface the engine's own death text as the start's verdict,
+    /// and either way the threshold is crossed first (the child cannot die
+    /// before its own `--exit-with` bound, and the anchored elapsed only
+    /// grows), leaving `hold_proven` honestly `Some(true)`. The engine's
+    /// own death text then propagates AS ITSELF through the post-proof
+    /// `started?` — pinned by substring, so a generic error can never
+    /// stand in for the engine's verdict.
     #[test]
     fn readiness_healthy_leg_propagates_a_post_threshold_start_failure_as_itself() {
         let (_engine_root, facade) = helper_engine();
@@ -5975,9 +5979,10 @@ mod tests {
             "a post-threshold failure is NOT a failed hold: {err}"
         );
         assert!(
-            err.contains("exited immediately during startup"),
-            "the engine's own startup-death text rides the surfaced error (never a \
-             generic verdict): {err}"
+            err.contains("exited immediately during startup")
+                || err.contains("process exited during the readiness probe"),
+            "the engine's own death text rides the surfaced error, whichever \
+             stage catches the death (never a generic verdict): {err}"
         );
         assert_eq!(
             evidence.hold_proven,
