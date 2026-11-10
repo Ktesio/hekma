@@ -4439,9 +4439,10 @@ fn show_and_config_get_render_whole_headers_and_grow_value_cells_with_the_termin
         "the Capabilities header must render whole; stdout=\n{}",
         show.stdout
     );
+    // (`warn` is the resolved default since Policies landed.)
     assert!(
         show.stdout
-            .contains("cum 150000/150000 tok, cum $5.00/$5.00 (estimated) (pause)"),
+            .contains("cum 150000/150000 tok, cum $5.00/$5.00 (estimated) (warn)"),
         "the Budget cell must render whole, its inline estimate label intact; \
          stdout=\n{}",
         show.stdout
