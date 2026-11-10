@@ -5847,11 +5847,16 @@ mod tests {
     }
 
     /// An unlaunchable subject (the exec path names no real binary): the
-    /// start fails AT SPAWN, so the hold observation never anchors and the
-    /// joined starter's own verdict rides the surfaced reason — a launch
-    /// failure must say so, never masquerade as a failed hold. Pins the
-    /// early-return arm (the starter finishing before any `starting`
-    /// commitment) AND the `; the start itself failed:` splice.
+    /// engine publishes the `starting` commitment BEFORE the spawn attempt
+    /// (an exec-path failure is not a registration failure), so the
+    /// observation takes whichever arm the 5ms poll lands on — the starter
+    /// finishing first (the early return) or that commitment anchoring
+    /// first — and the pinned contract is the one BOTH arms keep: the
+    /// exec failure returns within moments of the commitment (fork/exec
+    /// ENOENT, no timeout involved), so the hold is honestly unproven and
+    /// the joined starter's own verdict rides the surfaced reason through
+    /// the `; the start itself failed:` splice — a launch failure must
+    /// say so, never masquerade as a failed hold.
     #[test]
     fn readiness_healthy_leg_carries_a_launch_failure_verdict_instead_of_a_failed_hold() {
         let (_engine_root, facade) = helper_engine();
@@ -5912,12 +5917,15 @@ mod tests {
         );
     }
 
-    /// A subject that dies at 150ms against a 250ms declared hold: the gate
-    /// HELD past the anchored threshold (the child cannot die before its own
-    /// `--exit-with` bound, and the anchored elapsed only grows), so the
-    /// start's own failure — whichever way the engine surfaces it, fast
-    /// death detection or the probe budget — propagates AS ITSELF through
-    /// the post-proof `started?`, with `hold_proven` honestly `Some(true)`.
+    /// A subject that dies at 150ms against a 250ms declared hold: the
+    /// child's death lands INSIDE the startup survival window (300ms), so
+    /// the engine's own watch — not the readiness probe — fails the start,
+    /// and the threshold is crossed DURING that survival watch (the child
+    /// cannot die before its own `--exit-with` bound, and the anchored
+    /// elapsed only grows), leaving `hold_proven` honestly `Some(true)`.
+    /// The engine's own death text then propagates AS ITSELF through the
+    /// post-proof `started?` — pinned by substring, so a generic error can
+    /// never stand in for the engine's verdict.
     #[test]
     fn readiness_healthy_leg_propagates_a_post_threshold_start_failure_as_itself() {
         let (_engine_root, facade) = helper_engine();
@@ -5965,6 +5973,11 @@ mod tests {
         assert!(
             !err.contains("the gate did not hold the transition"),
             "a post-threshold failure is NOT a failed hold: {err}"
+        );
+        assert!(
+            err.contains("exited immediately during startup"),
+            "the engine's own startup-death text rides the surfaced error (never a \
+             generic verdict): {err}"
         );
         assert_eq!(
             evidence.hold_proven,
@@ -6029,11 +6042,39 @@ mod tests {
             )
             .expect("register the queued subject");
         std::thread::scope(|scope| {
+            // Subscribe FIRST, then spawn the blocker, then wait — bounded —
+            // for the blocker's `starting` commitment ON THE BUS: the
+            // commitment is published inside the supervisor-serialized
+            // start, so seeing it proves the blocker HOLDS the
+            // serialization before the queued start is issued — no
+            // scheduling assumption between the two threads (the
+            // subscribe-first anchoring `observe_readiness_hold` uses).
+            let mut events = facade.subscribe();
             let blocker =
                 scope.spawn(|| facade.start("tck-hold-blocker").map_err(|e| e.to_string()));
-            // Let the blocker's gated start enter the supervisor before the
-            // queued start is issued (the serialization this test pins).
-            std::thread::sleep(Duration::from_millis(200));
+            let ordering_deadline = std::time::Instant::now() + Duration::from_secs(8);
+            loop {
+                match events.try_recv() {
+                    Ok(EngineEvent::Transition(t))
+                        if t.instance == "tck-hold-blocker"
+                            && t.new_state == LifecycleState::Starting =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(::hekma_engine::domain::broadcast::error::TryRecvError::Lagged(n)) => {
+                        panic!("the event bus dropped {n} events arming the queue-ordering proof");
+                    }
+                    Err(_) => {}
+                }
+                if std::time::Instant::now() > ordering_deadline {
+                    panic!(
+                        "the blocker never committed its `starting` transition — the \
+                         queue-ordering proof never armed"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
             let mut evidence = ReadinessEvidence::default();
             let err = readiness_healthy_leg(
                 &facade,
