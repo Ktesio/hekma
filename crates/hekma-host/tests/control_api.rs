@@ -994,11 +994,20 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
         assert_eq!(json_body(&mut response)["instance"]["state"], "running");
     }
 
-    // A body that is not the object shape is a rejected REQUEST — the parse
-    // arm's three shapes: non-JSON bytes, a JSON array, and a mistyped
-    // field. None of them stop the instance (the route refuses before the
-    // engine gate, the out-of-range pin's own order).
-    for body in ["not json at all", "[1,2,3]", "{\"timeout_ms\":\"soon\"}"] {
+    // A body that is not the object shape is a rejected REQUEST — five
+    // forms: non-JSON bytes, three arrays (a bare `[1500]` and `[null]` are
+    // the sequence forms serde's derive would otherwise read as
+    // `timeout_ms`, draining with 200/defaults — the route refuses them AS
+    // SHAPE, before the typed read), and a mistyped field. None of them
+    // stop the instance (the route refuses before the engine gate, the
+    // out-of-range pin's own order).
+    for body in [
+        "not json at all",
+        "[1,2,3]",
+        "[1500]",
+        "[null]",
+        "{\"timeout_ms\":\"soon\"}",
+    ] {
         let mut response = client
             .post(format!("{obj}/drain"))
             .header("Authorization", &auth)
@@ -1058,6 +1067,43 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
         waited < 9000,
         "the explicit null's drain finished inside its manifest bound (waited {waited}ms)"
     );
+
+    server.stop().unwrap();
+}
+
+// The non-object refusal is a ROUTE-FAMILY contract: the same typed-body
+// read backs `start`, `stop`, and `drain`, and serde's derive would accept
+// each DTO's bare sequence form — `[true]` would start detached, `[30]`
+// would stop on a 30s window, `[1500]` would drain on 1500ms — so every
+// one of them is refused AS SHAPE, before the engine gate (the instance
+// below is never started; the refusals never reach it), naming the object
+// each route wants.
+#[test]
+fn start_stop_and_drain_refuse_the_sequence_forms_as_shape() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "host");
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+    for (verb, body) in [("start", "[true]"), ("stop", "[30]"), ("drain", "[1500]")] {
+        let mut response = client
+            .post(format!("http://{}/v0/instances/host/{verb}", server.addr))
+            .header("Authorization", &auth)
+            .send(body)
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{verb}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["kind"], "invalid_body", "{verb}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a JSON object"),
+            "{verb}: the refusal names the expected shape"
+        );
+    }
 
     server.stop().unwrap();
 }
@@ -3321,14 +3367,25 @@ fn the_run_routes_open_a_grandchild_run_from_a_parent_run_id() {
     assert_eq!(json["run"]["limits"]["token_per_run"], 250);
 
     // The parent link, read from both sides: the grandchild's document
-    // names its parent Run, and the parent's subtree count moved to one.
+    // names its parent Run, and the parent's open-children count moved to
+    // one — a DIRECT-children count, so the ROOT Run (the child's own
+    // parent, read back the same way) also counts exactly one open child;
+    // a subtree count would read two at the root.
     let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{grandchild}"));
     assert_eq!(
         json_body(&mut response)["run"]["parent_run_id"],
         child.as_str()
     );
     let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{child}"));
-    assert_eq!(json_body(&mut response)["run"]["open_children"], 1);
+    let json = json_body(&mut response);
+    assert_eq!(json["run"]["open_children"], 1);
+    let root = json["run"]["parent_run_id"].as_str().unwrap().to_string();
+    let mut response = get_ok(&client, &server.addr, &format!("/v0/runs/{root}"));
+    assert_eq!(
+        json_body(&mut response)["run"]["open_children"],
+        1,
+        "open_children counts DIRECT children only — the open grandchild is not counted at the root"
+    );
 
     let _ = client
         .post(format!("http://{}/v0/instances/host/stop", server.addr))
