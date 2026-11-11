@@ -238,10 +238,14 @@ pub(crate) trait PolicyRecords {
     /// The instances whose upgrade has not finished (the resume list).
     fn breach_default_pending(&self) -> Result<Vec<String>, StoreError>;
 
-    /// Mark the named instances' upgrade finished (the closing
-    /// transaction's write).
-    fn finish_breach_default(&self, written: &[(String, bool)], at: &str)
-        -> Result<(), StoreError>;
+    /// Mark the named instances' upgrade finished, claiming only rows
+    /// still pending, and return the names THIS call finished (stage 3's
+    /// cross-open idempotence: the event fires for exactly these).
+    fn finish_breach_default(
+        &self,
+        written: &[(String, bool)],
+        at: &str,
+    ) -> Result<Vec<String>, StoreError>;
 
     /// Clear an instance's marker (an explicit `budget.breach_action` write).
     fn clear_breach_default(&self, instance: &str) -> Result<(), StoreError>;

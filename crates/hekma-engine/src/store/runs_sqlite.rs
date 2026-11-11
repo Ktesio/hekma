@@ -1093,17 +1093,28 @@ impl PolicyRecords for SqliteStore {
         &self,
         written: &[(String, bool)],
         at: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<String>, StoreError> {
+        // Stage 3 is idempotent ACROSS CONCURRENT OPENS: the UPDATE claims
+        // only rows still pending (`done_at IS NULL`), and the names
+        // returned are the ones THIS job finished — the event fires for
+        // exactly those, so two engines that both read the same pending
+        // list emit exactly one event between them.
+        let mut finished = Vec::new();
         for (name, config_written) in written {
-            self.conn()
+            let changed = self
+                .conn()
                 .execute(
                     "UPDATE breach_default_upgrade SET config_written = ?1, done_at = ?2 \
-                     WHERE instance_id = (SELECT id FROM agent_instances WHERE name = ?3)",
+                     WHERE done_at IS NULL \
+                       AND instance_id = (SELECT id FROM agent_instances WHERE name = ?3)",
                     rusqlite::params![*config_written as i64, at, name],
                 )
                 .map_err(backend)?;
+            if changed > 0 {
+                finished.push(name.clone());
+            }
         }
-        Ok(())
+        Ok(finished)
     }
 
     fn clear_breach_default(&self, instance: &str) -> Result<(), StoreError> {

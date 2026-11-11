@@ -736,6 +736,118 @@ fn a_pending_upgrade_row_holds_pause_across_the_window_and_finishes_once() {
 }
 
 #[test]
+fn the_upgrade_finish_claims_its_rows_and_a_concurrent_open_emits_one_event() {
+    // Round 2, N6: stage 3 claims only rows still pending. Two engines
+    // that both read the same pending list (the concurrent-open race)
+    // emit exactly ONE event between them — the first job's UPDATE claims
+    // the rows, the second claims nothing and emits nothing.
+    let (state, _home) = mid_upgrade_state();
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    // The open above finished the upgrade (one event). Re-pend the rows —
+    // simulating a second engine whose pending READ happened BEFORE the
+    // first engine's job — then run the stage-3 claim directly with the
+    // same rows the second engine read.
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("UPDATE breach_default_upgrade SET done_at = NULL");
+            Ok(())
+        })
+        .unwrap();
+    let rows = vec![("kept".to_string(), true)];
+    let finished = registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::PolicyRecords as _;
+            ctx.store().finish_breach_default(&rows, "t2")
+        })
+        .unwrap();
+    assert_eq!(finished, vec!["kept".to_string()], "the first claim wins");
+    // The second engine's job, with the rows IT read: claims nothing.
+    let rows = vec![("kept".to_string(), true)];
+    let finished = registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::PolicyRecords as _;
+            ctx.store().finish_breach_default(&rows, "t3")
+        })
+        .unwrap();
+    assert!(
+        finished.is_empty(),
+        "the concurrent claim finishes nothing: {finished:?}"
+    );
+    // The store-level twin: same rows, same connection, second call is a
+    // no-op (the WHERE done_at IS NULL guard).
+    let rows = vec![("kept".to_string(), true)];
+    let finished = registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::PolicyRecords as _;
+            ctx.store().finish_breach_default(&rows, "t4")
+        })
+        .unwrap();
+    assert!(finished.is_empty());
+    // Exactly one upgrade event across all of it.
+    let events = registry.take_open_events();
+    let upgraded = events
+        .iter()
+        .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+        .count();
+    assert_eq!(upgraded, 1, "{events:?}");
+}
+
+#[test]
+fn an_undecodable_pending_name_closes_unwritten_instead_of_wedging_every_open() {
+    // Round 2, N6's second arm: a pending name that fails the name grammar
+    // is closed UNWRITTEN with a note — the row does not sit pending
+    // forever, emitting an empty upgrade event on every later open.
+    let state = tempfile::TempDir::new().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'Bad Name', 'mock', 'registered', '/h', 't', 't'); \
+                 INSERT INTO breach_default_upgrade (instance_id, listed_at) VALUES (1, 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    drop(registry);
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let notes = registry.take_open_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("not a valid agent name")),
+        "{notes:?}"
+    );
+    let events = registry.take_open_events();
+    let upgraded = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::BreachDefaultUpgraded(event) => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(upgraded.len(), 1, "the close emits one event: {events:?}");
+    assert_eq!(upgraded[0].instances.len(), 1);
+    assert!(!upgraded[0].instances[0].config_written);
+    // A reopen emits nothing more (the row is done).
+    drop(registry);
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    assert!(
+        !registry
+            .take_open_events()
+            .iter()
+            .any(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_))),
+        "the closed row never re-fires"
+    );
+}
+
+#[test]
 fn the_pending_row_alone_fail_closes_resolution_to_pause() {
     // The crash window itself: a pending row and NO finished upgrade (the
     // open's finish is what writes; simulate by inserting the row into an

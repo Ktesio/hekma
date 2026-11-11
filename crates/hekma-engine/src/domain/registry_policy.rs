@@ -935,6 +935,16 @@ impl Registry {
         let mut written: Vec<(String, bool)> = Vec::new();
         for name in &pending {
             let Ok(instance) = InstanceName::new(name) else {
+                // An undecodable name can never be written or resolved:
+                // mark it DONE with `config_written = false` (the open
+                // note names it) so it does not wedge the pending list —
+                // every later open once emitted an empty event for it.
+                written.push((name.clone(), false));
+                self.push_open_note(format!(
+                    "the kept-on-pause upgrade list carries `{name}`, which is not a valid \
+                     agent name; its row is closed unwritten and its instance resolves fail \
+                     closed (no config write was possible)"
+                ));
                 continue;
             };
             let config_written = match self.upgrade_write_pause(&instance) {
@@ -953,35 +963,45 @@ impl Registry {
             };
             written.push((name.clone(), config_written));
         }
+        // Stage 3, cross-open idempotent: the job claims only rows still
+        // pending and the EVENT fires for exactly the rows THIS job
+        // finished — two engines that both read the same pending list
+        // emit exactly one event between them, and a job that finished
+        // nothing emits none.
         let at = now_rfc3339();
-        let at_for_event = at.clone();
-        let instances: Vec<UpgradedInstance> = written
-            .iter()
-            .map(|(name, config_written)| UpgradedInstance {
-                name: name.clone(),
-                config_written: *config_written,
-            })
-            .collect();
-        let event = BreachDefaultUpgradedEvent {
-            schema_version: POLICY_EVENT_SCHEMA_VERSION,
-            instances: instances.clone(),
-            at: at.clone(),
-        };
         let rows = written.clone();
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
-            store.finish_breach_default(&rows, &at)?;
-            store.append_outbox(&EngineEvent::BreachDefaultUpgraded(event), OUTBOX_MAX_BYTES)
+            let finished = store.finish_breach_default(&rows, &at)?;
+            if finished.is_empty() {
+                return Ok(None);
+            }
+            let event = BreachDefaultUpgradedEvent {
+                schema_version: POLICY_EVENT_SCHEMA_VERSION,
+                instances: rows
+                    .iter()
+                    .filter(|(name, _)| finished.contains(name))
+                    .map(|(name, config_written)| UpgradedInstance {
+                        name: name.clone(),
+                        config_written: *config_written,
+                    })
+                    .collect(),
+                at: at.clone(),
+            };
+            let append = store.append_outbox(
+                &EngineEvent::BreachDefaultUpgraded(event.clone()),
+                OUTBOX_MAX_BYTES,
+            )?;
+            Ok(Some((event, append)))
         });
         match result {
-            Ok(_) => {
-                self.note_open_event(EngineEvent::BreachDefaultUpgraded(
-                    BreachDefaultUpgradedEvent {
-                        schema_version: POLICY_EVENT_SCHEMA_VERSION,
-                        instances,
-                        at: at_for_event,
-                    },
-                ));
+            Ok(Some((event, _append))) => {
+                self.note_open_event(EngineEvent::BreachDefaultUpgraded(event));
+            }
+            Ok(None) => {
+                // Another open finished the list first (the concurrent
+                // case): nothing to emit, and the pending read on the
+                // next open is empty.
             }
             Err(err) => self.push_open_note(format!(
                 "the kept-on-pause upgrade could not finish ({err}); the pending list stays \
