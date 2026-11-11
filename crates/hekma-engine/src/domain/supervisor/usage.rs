@@ -104,8 +104,13 @@ impl Supervisor {
         // rides the tick (one tiny aggregate read — never per event). A
         // degraded reload is SURFACED here, once per continuous degraded
         // state (the open notes are drained only at open and would grow
-        // unbounded); a healthy tick re-arms the notice.
-        match registry.refresh_policy_cache() {
+        // unbounded); a healthy tick re-arms the notice (and a failed load
+        // retries next tick). A successful RELOAD re-checks this engine's
+        // supervised Runs: another engine's raise unlatched rows (its own
+        // fence reasons must lift), and its lowering or new ceiling fires
+        // here under this engine's fence and lifecycle (round 3, M1).
+        let refresh = registry.refresh_policy_cache();
+        match refresh.degraded {
             Some(note) => {
                 if !self.policies_degraded_noted {
                     self.policies_degraded_noted = true;
@@ -122,8 +127,50 @@ impl Supervisor {
             }
         }
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
+        if refresh.reloaded {
+            self.recheck_after_policy_reload(registry, &names);
+        }
         for name in names {
             self.drain_self_reported_for(registry, &name, DrainMode::MidRun);
+        }
+    }
+
+    /// Re-check the supervised Runs after the policy set reloaded (story
+    /// 21-3, review round 3 M1): another engine's change may have
+    /// unlatched a Run (lift this engine's fence reasons whose latch rows
+    /// are gone) or lowered a ceiling / added one this engine supervises
+    /// (evaluate now, under this engine's own fence and lifecycle — the
+    /// foreign engine cannot latch what it cannot execute).
+    fn recheck_after_policy_reload(&mut self, registry: &Registry, names: &[InstanceName]) {
+        for name in names {
+            let Some(supervised) = self.running.get(name) else {
+                continue;
+            };
+            let Some(run_id) = registry.open_process_run(name).ok().flatten() else {
+                continue;
+            };
+            // Lift fence reasons whose latch rows are gone (a foreign
+            // raise unlatched them in the shared store).
+            if let Some(fence) = supervised
+                .observed_listener
+                .as_ref()
+                .map(ObservedListener::fence)
+            {
+                let latched = match registry.latches(&run_id) {
+                    Ok(latches) => latches.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                    Err(_) => continue,
+                };
+                for reason in fence.reasons() {
+                    if !latched.contains(&reason) {
+                        fence.clear(reason);
+                    }
+                }
+            }
+            // Evaluate: a lowered or newly-added ceiling this engine
+            // supervises fires here (enforce_budget is idempotent under
+            // the latch rows).
+            let metering_source = supervised.metering_source.clone();
+            self.enforce_budget(registry, name, &run_id, &metering_source);
         }
     }
 

@@ -166,30 +166,52 @@ impl Registry {
     /// connection's counters too; harmless, one redundant reload) or
     /// another engine's — so one tiny aggregate read per tick (never per
     /// event) picks a second engine's change up within a tick. A failed
-    /// reload degrades the cache exactly like a failed open load; the
-    /// returned note is the caller's to surface (the supervisor emits it
-    /// ONCE per continuous degraded state, re-armed on recovery).
-    pub(crate) fn refresh_policy_cache(&self) -> Option<String> {
+    /// reload degrades the cache exactly like a failed open load BUT is
+    /// retried on the next tick (the fingerprint is stamped only after a
+    /// SUCCESSFUL load — a transient read error once stuck the whole
+    /// fleet at forced `pause` until a restart, the 21-3 review round 3
+    /// finding M2); the returned note is the caller's to surface (the
+    /// supervisor emits it ONCE per continuous degraded state, re-armed
+    /// on recovery).
+    pub(crate) fn refresh_policy_cache(&self) -> PolicyRefresh {
         let fingerprint = match self.store.policies_fingerprint() {
             Ok(fingerprint) => fingerprint,
             Err(err) => {
                 // The check itself failed: treat it as a reload failure
                 // (degrade, keep the last good set) rather than silently
-                // standing still.
+                // standing still. The unstamped fingerprint makes the next
+                // tick retry.
                 self.policies
                     .degrade(format!("the policy table could not be read ({err})"));
-                return Some(format!(
-                    "the policy table could not be read ({err}); limits resolve fail closed to \
-                     pause (the last good set still arms its ceilings) until the read succeeds"
-                ));
+                return PolicyRefresh {
+                    reloaded: false,
+                    degraded: Some(format!(
+                        "the policy table could not be read ({err}); limits resolve fail closed \
+                         to pause (the last good set still arms its ceilings) until the read \
+                         succeeds"
+                    )),
+                };
             }
         };
         if !self.policies.stale_at(&fingerprint) {
-            return None;
+            return PolicyRefresh::default();
         }
-        let note = self.load_policy_cache();
-        self.policies.stamp(fingerprint);
-        note
+        match self.load_policy_cache() {
+            None => {
+                // A successful load: stamp the baseline so an unchanged
+                // table costs nothing, and tell the caller the set moved
+                // (its latched breaches and fences need a re-check).
+                self.policies.stamp(fingerprint);
+                PolicyRefresh {
+                    reloaded: true,
+                    degraded: None,
+                }
+            }
+            Some(note) => PolicyRefresh {
+                reloaded: false,
+                degraded: Some(note),
+            },
+        }
     }
 
     /// Whether the policy cache is currently degraded (the supervisor's
@@ -1175,6 +1197,18 @@ impl Registry {
     }
 }
 
+/// What one reaper-tick policy refresh found (story 21-3): whether the
+/// set RELOADED (the caller re-checks its latched breaches and fences —
+/// another engine's change may have unlatched a Run or lowered a ceiling
+/// this engine supervises) and the degradation note when the cache is
+/// degraded (the last good set stays armed with the action forced to
+/// `pause`; a failed load retries on the next tick).
+#[derive(Debug, Default)]
+pub(crate) struct PolicyRefresh {
+    pub reloaded: bool,
+    pub degraded: Option<String>,
+}
+
 /// Which Runs a Policy change re-resolves: every non-ended Run (the
 /// `default` Policy) or the union of the named Selectors (a change passes
 /// old AND new so only-old matches loosen too; a delete passes the
@@ -1293,44 +1327,45 @@ fn re_resolve_matched(
         let resolved = policy::resolve_and_store(store, run, &resolution, &inputs, &at)?;
         changes.extend(resolved);
 
-        // The money half, ONLY on Runs whose instance this engine
-        // supervises (a context exists): the breach-at-once latch must be
-        // executable by the engine that records it — its own fence and
-        // lifecycle. A change by an engine that does NOT supervise the
-        // instance leaves the breach UNLATCHED: the supervising engine
-        // picks the new set up at its next tick and its own live
-        // evaluation fires the breach under its own fence and lifecycle
-        // (a foreign latch once wedged the supervising engine's decide
-        // into silence for the rest of the Run — the 21-3 review round 2
-        // finding). A context-free instance still gets the re-resolve
-        // above (its row and snapshot stay true) with a note.
+        // The money half. The RE-ARM half (a raise, clear or delete above
+        // the totals: unlatch, clear the `breach` Anomaly) runs for EVERY
+        // matched instance — it is a shared-DB write any engine may make,
+        // and skipping it once left a raised ceiling latched forever, so
+        // the next crossing never fired and spend ran unbounded (the 21-3
+        // review round 3 finding M1). Only the BREACH-AT-ONCE half (and
+        // the in-memory fence clear) needs this engine to supervise the
+        // instance: the latch must be executable by the engine that
+        // records it. A change by an engine that does NOT supervise the
+        // agent leaves the lowering to the supervising engine's next
+        // evaluation (its tick reload re-checks), with a note.
         if !run.is_ended() {
             if let Some(instance) = &run.instance {
-                match contexts.get(instance) {
-                    Some(context) if context.supervised => {
-                        if let Ok(name) = InstanceName::new(instance) {
-                            re_arm(
-                                store,
-                                &name,
-                                run,
-                                &resolution,
-                                context,
-                                ctx,
-                                &mut breaches,
-                                &mut changes,
-                                &mut notes,
-                            )?;
-                        }
-                    }
-                    _ => {
-                        notes.push(format!(
-                            "Run `{}` (agent `{instance}`) was not breach-checked here: this \
-                             engine does not supervise the agent, so its supervising engine's \
-                             next evaluation fires any crossing under its own fence and \
-                             lifecycle",
-                            run.run_id.as_str(),
-                        ));
-                    }
+                let supervised = contexts
+                    .get(instance)
+                    .is_some_and(|context| context.supervised);
+                if !supervised {
+                    notes.push(format!(
+                        "Run `{}` (agent `{instance}`) was not breach-checked here: this engine \
+                         does not supervise the agent. A raise or clear still re-arms its latch \
+                         (done here); a lowering waits for the supervising engine's next \
+                         evaluation",
+                        run.run_id.as_str(),
+                    ));
+                }
+                let context = contexts.get(instance).cloned().unwrap_or_default();
+                if let Ok(name) = InstanceName::new(instance) {
+                    re_arm(
+                        store,
+                        &name,
+                        run,
+                        &resolution,
+                        &context,
+                        supervised,
+                        ctx,
+                        &mut breaches,
+                        &mut changes,
+                        &mut notes,
+                    )?;
                 }
             }
         }
@@ -1373,6 +1408,7 @@ fn re_arm(
     run: &RunRecord,
     resolution: &PolicyResolution,
     context: &InstanceContext,
+    supervised: bool,
     ctx: &mut crate::store::WriterCtx<'_>,
     breaches: &mut Vec<CommittedBreach>,
     changes: &mut RunChanges,
@@ -1499,12 +1535,17 @@ fn re_arm(
         }
     }
 
-    // ---- the breach-at-once half (lowered to at-or-below the usage):
+    // ---- the breach-at-once half (lowered to at-or-below the usage),
+    // ONLY on an instance this engine supervises (the latch must be
+    // executable by the engine that records it):
     // the same pipeline evaluation a usage commit runs, over the NEW arms.
     // The process level's arms are the instance's (the process-owning
     // Run's resolution — the matched Run's own when it IS the owner; the
     // owner's STORED resolution when the match is a child, whose own arms
     // ride its own level inside the evaluation).
+    if !supervised {
+        return Ok(());
+    }
     let owner_arms = if run.process_owner {
         resolution.clone()
     } else {
@@ -1536,10 +1577,11 @@ fn re_arm(
             }
         }
     };
-    let armed = owner_arms.tokens.is_set()
-        || (owner_arms.rate.is_some() && owner_arms.dollars.is_set())
-        || resolution.tokens.per_run.is_some()
-        || (resolution.rate.is_some() && resolution.dollars.per_run.is_some());
+    let armed = supervised
+        && (owner_arms.tokens.is_set()
+            || (owner_arms.rate.is_some() && owner_arms.dollars.is_set())
+            || resolution.tokens.per_run.is_some()
+            || (resolution.rate.is_some() && resolution.dollars.per_run.is_some()));
     if armed {
         let input = EvalInput {
             name: instance.clone(),

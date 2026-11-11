@@ -485,6 +485,28 @@ impl Registry {
         })?
     }
 
+    /// The instance's open process-owning Run id, read on the read-only
+    /// connection (the supervision surfaces' post-reload re-check).
+    pub(crate) fn open_process_run(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Option<crate::domain::usage::RunId>, StoreError> {
+        use crate::ports::RunRecords;
+        Ok(self
+            .store
+            .snapshot(|store| store.open_process_run(name))?
+            .map(|record| record.run_id))
+    }
+
+    /// One Run's latch rows, read on the read-only connection.
+    pub(crate) fn latches(
+        &self,
+        run: &crate::domain::usage::RunId,
+    ) -> Result<Vec<(crate::domain::LatchKey, crate::domain::BreachAction)>, StoreError> {
+        use crate::ports::RunStore as _;
+        self.store.snapshot(|store| store.latches(run))
+    }
+
     /// Every non-ended Run (the change facade's context sweep: an
     /// unsupervised instance's stored resolution still gets fresh inputs).
     pub(crate) fn open_runs(&self) -> Result<Vec<crate::domain::runs::RunRecord>, StoreError> {

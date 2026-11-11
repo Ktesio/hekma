@@ -9577,6 +9577,290 @@ fn the_tick_degradation_notice_latches_and_re_arms() {
 }
 
 #[test]
+fn a_foreign_raise_re_arms_the_supervising_engines_latched_run() {
+    // Round 3, M1: engine A supervises `x` and latches a per-run breach at
+    // 500 tokens. The Operator RAISES the Policy to 2M through engine B
+    // (no supervision of `x`): the unlatch still happens (a shared-DB
+    // write), and engine A's tick reload re-arms its own view — the next
+    // crossing of the raised ceiling FIRES AGAIN. The round-2 gate once
+    // skipped the whole re-arm for unsupervised instances, leaving the
+    // latch forever and spend unbounded.
+    let (_state, _manifest, registry) = setup_fake("forenraise", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("forenraise").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "forenraise").unwrap();
+    let run = open_run(&registry, "forenraise").record.run_id;
+    // The Policy at 500: the first usage breaches and pauses.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "raiser".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "forenraise")
+            .unwrap()
+            .len(),
+        1
+    );
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // ENGINE B raises to 2M (a foreign change; no context for `x`).
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("raiser").unwrap(),
+            crate::domain::PolicyChange {
+                name: "raiser".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(2_000_000),
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    // The unlatch happened (any engine may write it).
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign raise unlatched the shared latch"
+    );
+    // ENGINE A's tick picks the raise up; the next crossing fires AGAIN.
+    registry.refresh_policy_cache();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 2_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "forenraise").unwrap();
+    assert_eq!(
+        breaches.len(),
+        2,
+        "the raised ceiling re-armed: the second crossing fires: {breaches:?}"
+    );
+    assert_eq!(breaches[1].limit, 2_000_000);
+    let _ = sup.stop(&registry, "forenraise", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_foreign_lowering_fires_on_the_supervising_engines_tick() {
+    // Round 3, M1's other half: engine B lowers the Policy below the
+    // usage of an agent engine A supervises (B cannot latch what it
+    // cannot execute). Engine A's tick reloads the set and its re-check
+    // evaluates — the breach fires WITHOUT any new usage event, under
+    // A's own fence and lifecycle.
+    let (_state, _manifest, registry) = setup_fake("forenlower", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("forenlower").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "forenlower").unwrap();
+    let run = open_run(&registry, "forenlower").record.run_id;
+    // High ceiling, some usage: nothing fires.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "lowerer".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000_000),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "forenlower")
+        .unwrap()
+        .is_empty());
+    // ENGINE B lowers below the usage.
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("lowerer").unwrap(),
+            crate::domain::PolicyChange {
+                name: "lowerer".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(500),
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    // No breach yet (B latched nothing).
+    assert!(Supervisor::read_breach_events(&registry, "forenlower")
+        .unwrap()
+        .is_empty());
+    // ENGINE A's TICK (the reaper cadence): the reload re-check fires it.
+    sup.drain_usage_all(&registry);
+    let breaches = Supervisor::read_breach_events(&registry, "forenlower").unwrap();
+    assert_eq!(
+        breaches.len(),
+        1,
+        "the tick re-check fired the foreign lowering: {breaches:?}"
+    );
+    assert_eq!(breaches[0].limit, 500);
+    let _ = sup.stop(&registry, "forenlower", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_raise_during_a_restart_backoff_re_arms_the_kept_run() {
+    // Round 3, M1's second topology, one engine: the crash path removes
+    // the instance from `running` while its Run stays open (the Restart
+    // Policy backoff window). A raise in that window has no supervised
+    // context — the unlatch must still happen, so the relaunched Run's
+    // raised ceiling is live (and its old latch does not silence the
+    // next crossing).
+    let (_state, _manifest, registry) = setup_fake(
+        "backoffraise",
+        &["--crash-after-ms", "450", "--linger-ms", "600000"],
+    );
+    let name = InstanceName::new("backoffraise").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "backoffraise").unwrap();
+    let run = open_run(&registry, "backoffraise").record.run_id;
+    // Latch at 500 (warn: the process keeps running until the crash).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "backoffcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // The crash lands the instance in the backoff window (not running,
+    // Run still open).
+    let plans = wait_for_crash(&mut sup, &registry);
+    assert_eq!(plans.len(), 1);
+    assert!(registry.reader().latches(&run).unwrap().len() == 1);
+    // The Operator RAISES during the backoff: no supervised context, but
+    // the unlatch happens anyway.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "backoffcap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(2_000_000),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the raise during the backoff re-armed the kept Run"
+    );
+    // The relaunch keeps the Run; the raised ceiling is live.
+    std::thread::sleep(plans[0].delay);
+    sup.restart(&registry, "backoffraise", plans[0].attempt, plans[0].delay)
+        .unwrap();
+    assert_eq!(open_run(&registry, "backoffraise").record.run_id, run);
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 2_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "backoffraise").unwrap();
+    assert_eq!(
+        breaches.len(),
+        2,
+        "the raised ceiling fired on the relaunched Run: {breaches:?}"
+    );
+    let _ = sup.stop(&registry, "backoffraise", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_child_run_bound_into_a_policy_breaches_from_its_own_usage() {
     // Story 21-3 (review round 1, finding 2): a child Run bound into a
     // Policy BY LABEL (the verb — the announce path's labels are Caller

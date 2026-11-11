@@ -74,9 +74,9 @@ impl WireFence {
         self.0.fetch_and(!reason_bit(reason), Ordering::Release);
     }
 
-    /// The raised reasons, in [`FENCE_REASON_ORDER`] (the tests' view; the
-    /// request path goes through [`Self::refusal`]).
-    #[cfg(test)]
+    /// The raised reasons, in [`FENCE_REASON_ORDER`] (the tests' view;
+    /// the post-reload re-check reads them to lift reasons whose latch
+    /// rows are gone; the request path goes through [`Self::refusal`]).
     pub(crate) fn reasons(&self) -> Vec<LatchKey> {
         reasons_from_bits(self.0.load(Ordering::Acquire))
     }
