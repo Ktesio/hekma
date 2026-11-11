@@ -409,4 +409,72 @@ mod tests {
             Some((0, "quota".to_string()))
         );
     }
+
+    #[test]
+    fn unclosed_bracketed_authorities_carry_no_port_constraint() {
+        // The bracketed-IPv6 parser: an UNCLOSED bracket yields no port
+        // segment at all, so the numeric-port rule cannot apply (`true` —
+        // malformed-shape refusals belong to the URL shape checks, and a
+        // missing port is the "use the default port" case like a bare host).
+        assert!(port_is_numeric("[2001:db8::1"));
+        // The sane bracketed forms around it: a numeric port passes and a
+        // non-numeric (or empty) one is refused.
+        assert!(port_is_numeric("[::1]:4318"));
+        assert!(!port_is_numeric("[::1]:x"));
+        assert!(!port_is_numeric("[::1]:"));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_header_value_surfaces_terminal_named_at_the_builder() {
+        // A header VALUE the HTTP builder rejects (a CR/LF is
+        // response-splitting material): the flag-time P4b parse refuses
+        // such values on the CLI path, but `OtlpClient::new` is a public
+        // lib surface taking arbitrary pairs — for a library caller the
+        // builder's own error state is the defense, and the failure is
+        // TERMINAL for the batch, named at the builder, BEFORE anything is
+        // dialed (port 1 is never contacted: the request build fails
+        // first; a non-ASCII letter such as é is legal obs-text and
+        // passes the builder).
+        let client = OtlpClient::new(
+            "http://127.0.0.1:1",
+            vec![("x-tenant".to_string(), "bad\r\nvalue".to_string())],
+        )
+        .expect("the endpoint itself is valid");
+        match client.post_once("{}".to_string()).await {
+            PostOutcome::Terminal(msg) => assert!(
+                msg.starts_with("could not build the POST:"),
+                "the builder fault is named: {msg}"
+            ),
+            other => panic!("an invalid header value is terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalling_collector_trips_the_bounded_post_timeout_as_retryable() {
+        // A collector that ACCEPTS and then never answers: the attempt is
+        // classified RETRYABLE when the explicit POST_TIMEOUT bound trips —
+        // never an unbounded hang (the AD-21 liveness rule). The listener
+        // holds every accepted connection open for its whole life.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let client = OtlpClient::new(&format!("http://{addr}"), Vec::new()).unwrap();
+        let start = std::time::Instant::now();
+        let outcome = client.post_once("{}".to_string()).await;
+        assert_eq!(
+            outcome,
+            PostOutcome::Retryable(
+                "the POST timed out (retryable within the bounded budget)".to_string()
+            )
+        );
+        assert!(
+            start.elapsed() >= POST_TIMEOUT,
+            "the explicit bound decided the outcome"
+        );
+    }
 }
