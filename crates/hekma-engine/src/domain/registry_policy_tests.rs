@@ -2408,3 +2408,63 @@ impl LimitField {
         }
     }
 }
+
+#[test]
+fn a_change_planned_on_a_stale_read_merges_over_the_fresh_row() {
+    // Two Operators change the same Policy at once: B's read predates A's
+    // commit. B's change must merge over the row A wrote (inside the
+    // writer job), not over B's stale copy — a stale merge silently
+    // undid A's lowering (round 4, the concurrent-change case).
+    let seeded = seed(1_000);
+    change(
+        &seeded.registry,
+        "cap",
+        "team=core",
+        PolicyLimits {
+            tokens_per_run: Some(9_000_000),
+            ..PolicyLimits::default()
+        },
+    );
+    let stale = seeded.registry.policy("cap").unwrap();
+    // A lowers the cumulative ceiling (planned and committed on a fresh read).
+    change(
+        &seeded.registry,
+        "cap",
+        "team=core",
+        PolicyLimits {
+            tokens_cumulative: Some(7_000_000),
+            ..PolicyLimits::default()
+        },
+    );
+    // B changes another field, planned on its stale read.
+    let outcome = seeded
+        .registry
+        .apply_policy_change(
+            stale,
+            PolicyChange {
+                name: "cap".to_string(),
+                selector: None,
+                set: PolicyLimits {
+                    dollars_per_run_micros: Some(25_000_000),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            contexts(),
+        )
+        .unwrap();
+    let stored = seeded.registry.policy("cap").unwrap().unwrap();
+    assert_eq!(
+        stored.limits.tokens_cumulative,
+        Some(7_000_000),
+        "A's lowering survives B's stale-read change: {stored:?}"
+    );
+    assert_eq!(stored.limits.dollars_per_run_micros, Some(25_000_000));
+    assert_eq!(stored.limits.tokens_per_run, Some(9_000_000));
+    assert_eq!(
+        outcome.outcome.record.as_ref(),
+        Some(&stored),
+        "the outcome names the row written"
+    );
+}

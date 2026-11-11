@@ -343,15 +343,19 @@ impl Registry {
         // and every open Run resolves once so the stored resolutions and
         // the snapshot start true. All fail soft (open notes), and the
         // events ride `open_events` to the bus.
-        if let Some(note) = registry.load_policy_cache() {
-            registry.push_open_note(note);
-        }
         // The open's own load is the BASELINE: stamp the fingerprint so
         // the first reaper tick does not read as a foreign change and
         // re-check every supervised Run for nothing (a reload means "the
         // policy table moved since we loaded" — the round-3 M1 lesson,
-        // found by the adoption suite's mid-configuration window).
-        if let Ok(fingerprint) = registry.store.policies_fingerprint() {
+        // found by the adoption suite's mid-configuration window). The
+        // fingerprint is read BEFORE the load: a change another engine
+        // commits between the two then reads as stale at the first tick
+        // and reloads, instead of being stamped as already seen.
+        let baseline = registry.store.policies_fingerprint();
+        if let Some(note) = registry.load_policy_cache() {
+            registry.push_open_note(note);
+        }
+        if let Ok(fingerprint) = baseline {
             registry.policies.stamp(fingerprint);
         }
         registry.finish_breach_default_upgrade();
@@ -587,10 +591,12 @@ impl Registry {
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
         };
+        // Fingerprint first, then load (see the writer open above).
+        let baseline = registry.store.policies_fingerprint();
         if let Some(note) = registry.load_policy_cache() {
             registry.push_open_note(note);
         }
-        if let Ok(fingerprint) = registry.store.policies_fingerprint() {
+        if let Ok(fingerprint) = baseline {
             registry.policies.stamp(fingerprint);
         }
         Ok(registry)

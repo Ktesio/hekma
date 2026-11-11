@@ -791,15 +791,12 @@ impl Registry {
         } else {
             PolicyEventKind::Created
         };
-        let prior_limits = existing.as_ref().map(|prior| prior.limits.clone());
-        let prior_selector = existing.as_ref().and_then(|prior| prior.selector.clone());
-        let matched_selector = record.selector.clone();
         let publisher = Arc::clone(&self.run_snapshot);
         let cache = Arc::clone(&self.policies);
 
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
-            let body = || -> Result<_, RunError> {
+            let mut body = || -> Result<_, RunError> {
                 // The existence check runs INSIDE the job (round 3, L9):
                 // the caller's read is only a plan. A CREATE over a name
                 // another engine created meanwhile is a typed
@@ -820,7 +817,11 @@ impl Registry {
                     }
                     Err(other) => return Err(RunError::Store(other)),
                 };
-                let record = match (&existing, fresh) {
+                // The prior limits and Selector come from the FRESH row
+                // too, so the event and the old ∪ new re-resolve set name
+                // what the write actually replaced (round 4: the stale
+                // caller read was merged over, undoing a concurrent edit).
+                let (record, prior_limits, prior_selector) = match (&existing, fresh) {
                     (None, Some(_)) => {
                         return Err(RunError::PolicyExists {
                             name: change.name.clone(),
@@ -831,9 +832,14 @@ impl Registry {
                             name: change.name.clone(),
                         })
                     }
-                    (Some(fresh), Some(_)) => merge(Some(fresh), &change),
-                    (None, None) => record.clone(),
+                    (Some(_), Some(fresh)) => (
+                        merge(Some(&fresh), &change),
+                        Some(fresh.limits.clone()),
+                        fresh.selector.clone(),
+                    ),
+                    (None, None) => (record.clone(), None, None),
                 };
+                let matched_selector = record.selector.clone();
                 store.put_policy(&record).map_err(RunError::Store)?;
                 // The re-resolve set is the UNION of the old and new
                 // Selectors: Runs only the OLD Selector matched loosen too.
