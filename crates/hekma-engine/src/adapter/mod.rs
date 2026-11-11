@@ -2617,4 +2617,101 @@ max_age_ms = 5000
             other => panic!("expected InvalidLifecyclePair, got {other}"),
         }
     }
+
+    #[test]
+    fn launch_resolvers_refuse_a_manifest_path_that_cannot_be_read() {
+        // Every launch-time resolver re-reads the manifest file from disk;
+        // a path that cannot be read (the file vanished between
+        // registration and the verb, or the path never existed) refuses
+        // with ManifestUnreadable echoing the path and the io detail —
+        // never a panic, never a silently-defaulted plan. The errno text
+        // itself is platform-worded (Windows says "cannot find the file"),
+        // so the pin is the stable raw code, not the prose.
+        let tmp = TempDir::new().unwrap();
+        let absent = tmp.path().join("absent").join(MANIFEST_FILE);
+        let err = resolve_readiness_probe("demo", Some(&absent)).unwrap_err();
+        match &err {
+            LaunchResolveError::ManifestUnreadable { path, detail } => {
+                assert_eq!(path, &absent.to_string_lossy());
+                assert!(detail.contains("os error 2"), "detail: {detail}");
+            }
+            other => panic!("expected ManifestUnreadable, got {other}"),
+        }
+        let err = resolve_liveness_check("demo", Some(&absent)).unwrap_err();
+        match &err {
+            LaunchResolveError::ManifestUnreadable { path, detail } => {
+                assert_eq!(path, &absent.to_string_lossy());
+                assert!(detail.contains("os error 2"), "detail: {detail}");
+            }
+            other => panic!("expected ManifestUnreadable, got {other}"),
+        }
+        let err = resolve_exit_codes("demo", Some(&absent)).unwrap_err();
+        match &err {
+            LaunchResolveError::ManifestUnreadable { path, detail } => {
+                assert_eq!(path, &absent.to_string_lossy());
+                assert!(detail.contains("os error 2"), "detail: {detail}");
+            }
+            other => panic!("expected ManifestUnreadable, got {other}"),
+        }
+        let err = resolve_drain_plan("demo", Some(&absent)).unwrap_err();
+        match &err {
+            LaunchResolveError::ManifestUnreadable { path, detail } => {
+                assert_eq!(path, &absent.to_string_lossy());
+                assert!(detail.contains("os error 2"), "detail: {detail}");
+            }
+            other => panic!("expected ManifestUnreadable, got {other}"),
+        }
+    }
+
+    #[test]
+    fn launch_resolvers_refuse_a_manifest_that_is_not_valid_toml() {
+        // The parse arm of the same re-read: a file that IS present but is
+        // not parseable TOML (truncated write, hand-edit gone wrong)
+        // surfaces the manifest error verbatim through ManifestUnreadable —
+        // the resolver never guesses a default gate, check, or plan from a
+        // document it could not parse.
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(tmp.path(), "not a manifest at all [");
+        for label in ["readiness", "liveness", "exit-codes", "drain"] {
+            let err = match label {
+                "readiness" => resolve_readiness_probe("demo", Some(&path)).unwrap_err(),
+                "liveness" => resolve_liveness_check("demo", Some(&path)).unwrap_err(),
+                "exit-codes" => resolve_exit_codes("demo", Some(&path)).unwrap_err(),
+                _ => resolve_drain_plan("demo", Some(&path)).unwrap_err(),
+            };
+            match &err {
+                LaunchResolveError::ManifestUnreadable {
+                    path: echoed,
+                    detail,
+                } => {
+                    assert_eq!(echoed, &path.to_string_lossy(), "{label}");
+                    assert!(detail.contains("not valid TOML"), "{label}: {detail}");
+                }
+                other => panic!("{label}: expected ManifestUnreadable, got {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_drain_plan_refuses_a_drifted_drain_bound() {
+        // The drift gate for the bound itself: the heartbeat-collision and
+        // half-pair refusals re-check the drain plan's STRUCTURE, but a
+        // `[drain]` section whose timeout drifted out of range after
+        // registration is caught by the spec re-validation — InvalidDrain
+        // naming the field, the section, and the legal range, so the verb
+        // never waits on a bound that cannot bound anything.
+        let tmp = TempDir::new().unwrap();
+        let body = DRAIN_PLAN_MANIFEST.replace("timeout_ms = 5_000", "timeout_ms = 0");
+        let path = write_manifest(tmp.path(), &body);
+        let err = resolve_drain_plan("demo", Some(&path)).unwrap_err();
+        match err {
+            LaunchResolveError::InvalidDrain { adapter, detail } => {
+                assert_eq!(adapter, "demo");
+                assert!(detail.contains("timeout_ms"), "{detail}");
+                assert!(detail.contains("[drain]"), "{detail}");
+                assert!(detail.contains("out of range"), "{detail}");
+            }
+            other => panic!("expected InvalidDrain, got {other}"),
+        }
+    }
 }
