@@ -295,32 +295,45 @@ impl Registry {
         name: &InstanceName,
         run: Option<&RunId>,
     ) -> PolicyResolution {
-        let mut fail_closed = None;
-        // The Run facts: the named Run's, else the instance's open
-        // process-owning Run's, else none (a fresh start before its Run
-        // row exists).
-        let mut facts = None;
-        if let Some(run_id) = run {
-            match self
-                .store
-                .snapshot(|store| store.run_resolution_facts(run_id))
-            {
-                Ok(Some(read)) => facts = Some(read),
-                Ok(None) => {}
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "this Run's resolution facts could not be read ({err}), so its limits \
-                         fail closed to pause until the read succeeds"
-                    ))
-                }
-            }
-        }
-        if facts.is_none() && fail_closed.is_none() {
-            match self.store.snapshot(|store| store.open_process_run(name)) {
-                Ok(Some(owner)) => match self
-                    .store
-                    .snapshot(|store| store.run_resolution_facts(&owner.run_id))
-                {
+        let effective = self.effective_config(name, ConfigLayer::empty()).ok();
+        self.resolved_limits_with(name, run, effective.as_ref())
+    }
+
+    /// [`Self::resolved_limits`] over an effective configuration the caller
+    /// already read (`None` when that read failed — the same fail-closed
+    /// `pause` as an unreadable configuration). The Fleet read resolves
+    /// every instance this way so its configuration is read once, not
+    /// twice (the perf-budgets ratchet caught the double read).
+    pub(crate) fn resolved_limits_with(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+    ) -> PolicyResolution {
+        self.resolved_limits_and_kept(name, run, effective).0
+    }
+
+    /// [`Self::resolved_limits_with`] plus the instance's kept-on-pause
+    /// marker as read in the same snapshot (`false` when that read failed;
+    /// the resolution then fails closed). The Fleet row renders the marker
+    /// as its note, so it reads it here rather than in another snapshot.
+    pub(crate) fn resolved_limits_and_kept(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+    ) -> (PolicyResolution, bool) {
+        // The store facts — the Run's resolution facts (the named Run's,
+        // else the instance's open process-owning Run's, else none: a fresh
+        // start before its Run row exists) and the kept-on-pause marker —
+        // read in ONE snapshot (one read transaction per resolution, not
+        // one per fact: this runs per usage event and per Fleet row). A
+        // failed fact read keeps its own fail-closed note.
+        let reads = self.store.snapshot(|store| {
+            let mut fail_closed = None;
+            let mut facts = None;
+            if let Some(run_id) = run {
+                match store.run_resolution_facts(run_id) {
                     Ok(Some(read)) => facts = Some(read),
                     Ok(None) => {}
                     Err(err) => {
@@ -329,43 +342,66 @@ impl Registry {
                              limits fail closed to pause until the read succeeds"
                         ))
                     }
-                },
-                Ok(None) => {}
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "the open Run could not be read ({err}), so the limits fail closed to \
-                         pause until the read succeeds"
-                    ))
                 }
             }
-        }
-        let kept_instance = facts
-            .as_ref()
-            .map(|facts| facts.record.instance.clone())
-            .unwrap_or_else(|| Some(name.as_str().to_string()));
-        let mut kept = false;
-        if let Some(instance) = kept_instance.as_deref() {
-            match self
-                .store
-                .snapshot(|store| store.breach_default_kept(instance))
-            {
-                Ok(read) => kept = read,
-                // A failed kept-marker read keeps `pause` (fail closed):
-                // the marker is the FR-21 promise's carrier.
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "the kept-on-pause marker could not be read ({err}), so the breach \
-                         action fails closed to pause until the read succeeds"
-                    ))
+            if facts.is_none() && fail_closed.is_none() {
+                match store.open_process_run(name) {
+                    Ok(Some(owner)) => match store.run_resolution_facts(&owner.run_id) {
+                        Ok(Some(read)) => facts = Some(read),
+                        Ok(None) => {}
+                        Err(err) => {
+                            fail_closed = Some(format!(
+                                "this Run's resolution facts could not be read ({err}), so \
+                                 its limits fail closed to pause until the read succeeds"
+                            ))
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(err) => {
+                        fail_closed = Some(format!(
+                            "the open Run could not be read ({err}), so the limits fail \
+                             closed to pause until the read succeeds"
+                        ))
+                    }
                 }
             }
-        }
-        let (inputs, config_labels) = match self.effective_config(name, ConfigLayer::empty()) {
-            Ok(effective) => {
-                let labels = crate::domain::runs::labels::bound_labels_from(&effective).0;
-                (config::explicit_limits(&effective), labels)
+            let kept_instance = facts
+                .as_ref()
+                .map(|facts: &crate::ports::ResolutionFacts| facts.record.instance.clone())
+                .unwrap_or_else(|| Some(name.as_str().to_string()));
+            let mut kept = false;
+            if let Some(instance) = kept_instance.as_deref() {
+                match store.breach_default_kept(instance) {
+                    Ok(read) => kept = read,
+                    // A failed kept-marker read keeps `pause` (fail
+                    // closed): the marker is the FR-21 promise's carrier.
+                    Err(err) => {
+                        fail_closed = Some(format!(
+                            "the kept-on-pause marker could not be read ({err}), so the \
+                             breach action fails closed to pause until the read succeeds"
+                        ))
+                    }
+                }
             }
-            Err(_) => (
+            Ok((facts, kept, fail_closed))
+        });
+        let (facts, kept, mut fail_closed) = match reads {
+            Ok(reads) => reads,
+            Err(err) => (
+                None,
+                false,
+                Some(format!(
+                    "the Run's resolution facts could not be read ({err}), so its limits \
+                     fail closed to pause until the read succeeds"
+                )),
+            ),
+        };
+        let (inputs, config_labels) = match effective {
+            Some(effective) => {
+                let labels = crate::domain::runs::labels::bound_labels_from(effective).0;
+                (config::explicit_limits(effective), labels)
+            }
+            None => (
                 ResolveInputs {
                     malformed_action: Some("the configuration could not be read".to_string()),
                     ..ResolveInputs::default()
@@ -443,7 +479,7 @@ impl Registry {
             resolution.effective_action = tighten(resolution.effective_action);
             resolution.fail_closed = Some(note);
         }
-        resolution
+        (resolution, kept)
     }
 
     /// Every Policy, ordered by name (the read-only connection).
