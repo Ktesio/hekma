@@ -3860,6 +3860,32 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     );
     assert_eq!(response.status(), StatusCode::OK);
 
+    // A model in both rates.set and rates.remove is a contradiction
+    // (400), not a silent remove.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {"input_micros_per_1m": 1, "output_micros_per_1m": 1}},
+                      "remove": ["gpt-x"]}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A $0 CACHED direction prices cached tokens at nothing — the engine
+    // refuses it like a $0 direction.
+    let response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/default"),
+        Some(serde_json::json!({
+            "rates": {"set": {"gpt-x": {
+                "input_micros_per_1m": 1, "output_micros_per_1m": 1, "cached_micros_per_1m": 0,
+            }}}
+        })),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
     // An unknown name is 404 policy-not-found; delete answers 204.
     let mut response = get_ok(&client, &server.addr, "/v0/policies/ghost");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

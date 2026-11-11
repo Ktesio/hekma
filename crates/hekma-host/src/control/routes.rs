@@ -850,6 +850,16 @@ pub(crate) async fn policy_change(
     ApiJson(request): ApiJson<dto::PolicyPatch>,
 ) -> ApiResult<Json<dto::PolicyChangeDocument>> {
     let dry_run = request.dry_run;
+    // A model named in BOTH `set` and `remove` is a contradiction, not a
+    // silent remove (the remove once won the map insert and the priced
+    // entry quietly disappeared).
+    for model in &request.rates.remove {
+        if request.rates.set.contains_key(model) {
+            return Err(ApiError::invalid_body(format!(
+                "the model `{model}` is named in both rates.set and rates.remove — pick one"
+            )));
+        }
+    }
     let mut rates: std::collections::BTreeMap<String, Option<hekma_engine::Rate>> = request
         .rates
         .set
@@ -872,7 +882,7 @@ pub(crate) async fn policy_change(
 
 /// `DELETE /v0/policies/{name}` — delete a Policy (story 21-3). `204`
 /// (`200` with the counts on `?dry_run=true`); `404 policy-not-found`;
-/// deleting `default` is `400 invalid_body`.
+/// deleting `default` is `409 policy-default`.
 pub(crate) async fn policy_delete(
     State(state): State<ApiState>,
     Path(name): Path<String>,

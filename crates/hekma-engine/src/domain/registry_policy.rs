@@ -534,14 +534,21 @@ impl Registry {
         // Cost Cap (the instance rule — both directions or no Rate —
         // applied to the Policy writes; the API body makes a missing
         // direction a 422, the engine makes a zero one a refusal).
-        let rate_shape =
-            |rate: &Rate| rate.input_micros_per_1m != 0 && rate.output_micros_per_1m != 0;
+        let rate_shape = |rate: &Rate| {
+            rate.input_micros_per_1m != 0
+                && rate.output_micros_per_1m != 0
+                // A $0 CACHED direction prices cached tokens at nothing
+                // (understating cost the same way a $0 direction does);
+                // unset keeps the conservative input-rate default.
+                && rate.cached_micros_per_1m != Some(0)
+        };
         if let Some(rate) = change.set.rate {
             if !rate_shape(&rate) {
                 return Err(invalid(
                     "rate",
-                    "a Rate needs both directions priced above zero — a $0 direction \
-                     understates cost and passes every Cost Cap"
+                    "a Rate needs both directions priced above zero (and a cached \
+                     direction, when set, above zero too) — a $0 direction understates cost \
+                     and passes every Cost Cap"
                         .to_string(),
                 ));
             }
@@ -553,7 +560,8 @@ impl Registry {
                         "rates",
                         format!(
                             "the Rate for model `{model}` needs both directions priced above \
-                             zero — a $0 direction understates cost and passes every Cost Cap"
+                             zero (and a cached direction, when set, above zero too) — a $0 \
+                             direction understates cost and passes every Cost Cap"
                         ),
                     ));
                 }
@@ -792,6 +800,28 @@ impl Registry {
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
             let body = || -> Result<_, RunError> {
+                // The existence check runs INSIDE the job (round 3, L9):
+                // the caller's read is only a plan. A CREATE over a name
+                // another engine created meanwhile is a typed
+                // `policy-exists` (not a silent last-write-wins), and a
+                // CHANGE over a row deleted meanwhile is `not-found`. A
+                // change re-merges over the FRESH row, so a concurrent
+                // edit to another field is kept rather than overwritten.
+                let fresh = store.policy(&change.name).map_err(RunError::Store)?;
+                let record = match (&existing, fresh) {
+                    (None, Some(_)) => {
+                        return Err(RunError::PolicyExists {
+                            name: change.name.clone(),
+                        })
+                    }
+                    (Some(_), None) => {
+                        return Err(RunError::PolicyNotFound {
+                            name: change.name.clone(),
+                        })
+                    }
+                    (Some(fresh), Some(_)) => merge(Some(fresh), &change),
+                    (None, None) => record.clone(),
+                };
                 store.put_policy(&record).map_err(RunError::Store)?;
                 // The re-resolve set is the UNION of the old and new
                 // Selectors: Runs only the OLD Selector matched loosen too.

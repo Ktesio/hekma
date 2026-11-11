@@ -1956,6 +1956,162 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
 }
 
 #[test]
+fn a_same_second_change_to_one_policy_still_moves_the_fingerprint() {
+    // Round 3, L1: `updated_at` has whole-second resolution, so the old
+    // name+timestamp fingerprint missed a second change to the same
+    // Policy within the same second. The fingerprint covers every policy
+    // column plus the Rate table, so a CONTENT change moves it however
+    // fast it happens — the second engine reloads.
+    let seeded = seed(1_000);
+    let read = |registry: &Registry| {
+        registry
+            .writer
+            .call(|ctx| {
+                use crate::ports::PolicyRecords as _;
+                Ok::<_, crate::ports::StoreError>(ctx.store().policies_fingerprint())
+            })
+            .unwrap()
+            .expect("the fingerprint reads")
+    };
+    let second = Registry::open(Some(seeded.state.path().to_path_buf())).unwrap();
+    let limits = |value: u64| PolicyLimits {
+        tokens_per_run: Some(value),
+        ..PolicyLimits::default()
+    };
+    // Both writes land within the same second (they are back to back).
+    second
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "fast".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: limits(1),
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    let after_create = read(&seeded.registry);
+    second
+        .apply_policy_change(
+            second.policy("fast").unwrap(),
+            PolicyChange {
+                name: "fast".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: limits(2),
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    let after_change = read(&seeded.registry);
+    assert_ne!(
+        after_create, after_change,
+        "the same-second content change moves the fingerprint"
+    );
+    // A same-second Rate-table edit moves it too.
+    second
+        .apply_policy_change(
+            second.policy("default").unwrap(),
+            PolicyChange {
+                name: "default".to_string(),
+                selector: None,
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: BTreeMap::from([(
+                    "gpt-demo".to_string(),
+                    Some(Rate::new(1_000_000, 2_000_000)),
+                )]),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    assert_ne!(after_change, read(&seeded.registry));
+}
+
+#[test]
+fn a_cross_engine_create_is_refused_and_a_change_over_a_delete_is_not_found() {
+    // Round 3, L9: the existence check runs INSIDE the writer job. A
+    // CREATE over a name another engine created meanwhile is a typed
+    // `policy-exists` (not a silent last-write-wins overwrite), and a
+    // CHANGE over a row deleted meanwhile is `not-found`.
+    let seeded = seed(1_000);
+    // The caller's read says the name is free…
+    assert!(seeded.registry.policy("race").unwrap().is_none());
+    // …but another engine creates it before the job runs.
+    let second = Registry::open(Some(seeded.state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "race".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .unwrap();
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "race".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(9_999),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refusal, RunError::PolicyExists { .. }),
+        "{refusal}"
+    );
+    // The winner's row is intact (9999 never wrote).
+    assert_eq!(
+        second
+            .policy("race")
+            .unwrap()
+            .unwrap()
+            .limits
+            .tokens_per_run,
+        None
+    );
+    // A CHANGE over a row deleted meanwhile is not-found.
+    let existing = seeded.registry.policy("race").unwrap().unwrap();
+    second
+        .apply_policy_delete("race", second.policy("race").unwrap(), None, HashMap::new())
+        .unwrap();
+    let refusal = seeded
+        .registry
+        .apply_policy_change(
+            Some(existing),
+            PolicyChange {
+                name: "race".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(refusal, RunError::PolicyNotFound { .. }),
+        "{refusal}"
+    );
+}
+
+#[test]
 fn a_degraded_cache_keeps_an_explicit_block_and_its_fence_action() {
     // Round 3, L2: the fail-closed action only TIGHTENS — an explicit
     // `block` stays `block` (and keeps its Run-start fence) through a
@@ -2038,6 +2194,7 @@ fn a_second_engines_policy_change_is_visible_after_one_refresh() {
         None,
         "the cached set is stale before the refresh"
     );
+
     // One tick's refresh picks the change up.
     seeded.registry.refresh_policy_cache();
     assert_eq!(

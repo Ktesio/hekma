@@ -517,6 +517,11 @@ impl Registry {
     /// The Rate one Run's own resolution carries (story 21-3, review
     /// round 2): the per-Run pricing read for usage attributed to a child
     /// Run — its Policy's flat Rate, priced onto its own ledger rows.
+    /// Only a POLICY-sourced Rate rides the row (round 3, L5): an
+    /// instance- or table-sourced one goes stale after a `cost.rate.*` or
+    /// `model` write (only the process-owning Run re-resolves on the
+    /// config write), so those price at the evaluator's fresh Rate
+    /// instead.
     pub(crate) fn run_rate(
         &self,
         run: &crate::domain::usage::RunId,
@@ -525,7 +530,14 @@ impl Registry {
         Ok(self
             .store
             .snapshot(|store| store.run_policy(run))?
-            .and_then(|row| row.resolution.rate))
+            .and_then(|row| {
+                let sourced = matches!(
+                    row.resolution.sources.rate,
+                    crate::domain::runs::LimitSource::Policy(_)
+                        | crate::domain::runs::LimitSource::Default
+                );
+                sourced.then(|| row.resolution.rate).flatten()
+            }))
     }
 
     /// Resolve a Selector over the non-ended Runs on the read-only
