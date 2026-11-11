@@ -893,7 +893,16 @@ impl Registry {
                         Ok(next) => next,
                         Err(err) => return Err(err),
                     };
-                    ctx.after_commit(move || cache.publish(next));
+                    // Stamp this engine's OWN commit as seen: without the
+                    // stamp the next tick reads the moved fingerprint as a
+                    // FOREIGN change and re-checks every supervised Run
+                    // (breach-at-once already ran here — the round-3 M1
+                    // lesson, found by the adoption suite).
+                    let fingerprint = store.policies_fingerprint()?;
+                    ctx.after_commit(move || {
+                        cache.publish(next);
+                        cache.stamp(fingerprint);
+                    });
                     Ok(Ok((value, events)))
                 }
                 Err(RunError::Store(err)) => Err(err),
@@ -1024,7 +1033,16 @@ impl Registry {
                         Ok(next) => next,
                         Err(err) => return Err(err),
                     };
-                    ctx.after_commit(move || cache.publish(next));
+                    // Stamp this engine's OWN commit as seen: without the
+                    // stamp the next tick reads the moved fingerprint as a
+                    // FOREIGN change and re-checks every supervised Run
+                    // (breach-at-once already ran here — the round-3 M1
+                    // lesson, found by the adoption suite).
+                    let fingerprint = store.policies_fingerprint()?;
+                    ctx.after_commit(move || {
+                        cache.publish(next);
+                        cache.stamp(fingerprint);
+                    });
                     Ok(Ok((value, events)))
                 }
                 Err(RunError::Store(err)) => Err(err),

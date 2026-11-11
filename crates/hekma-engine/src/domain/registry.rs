@@ -346,6 +346,14 @@ impl Registry {
         if let Some(note) = registry.load_policy_cache() {
             registry.push_open_note(note);
         }
+        // The open's own load is the BASELINE: stamp the fingerprint so
+        // the first reaper tick does not read as a foreign change and
+        // re-check every supervised Run for nothing (a reload means "the
+        // policy table moved since we loaded" — the round-3 M1 lesson,
+        // found by the adoption suite's mid-configuration window).
+        if let Ok(fingerprint) = registry.store.policies_fingerprint() {
+            registry.policies.stamp(fingerprint);
+        }
         registry.finish_breach_default_upgrade();
         registry.initial_policy_sweep();
         Ok(registry)
@@ -581,6 +589,9 @@ impl Registry {
         };
         if let Some(note) = registry.load_policy_cache() {
             registry.push_open_note(note);
+        }
+        if let Ok(fingerprint) = registry.store.policies_fingerprint() {
+            registry.policies.stamp(fingerprint);
         }
         Ok(registry)
     }
