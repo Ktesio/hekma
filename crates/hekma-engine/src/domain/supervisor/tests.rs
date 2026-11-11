@@ -8402,6 +8402,107 @@ fn a_relaunch_keeps_its_run_so_a_per_run_block_fence_carries() {
 }
 
 #[test]
+fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
+    // Round 2, N3: a FRESH Run's start fence must resolve the Policies its
+    // configuration-bound labels select (the Run row does not exist yet at
+    // fence time). A named Policy's `block` CUMULATIVE ceiling over an
+    // already-spent lifetime refuses the agent's very first model call —
+    // 19-2's guarantee, extended to Policy-sourced ceilings. Before the
+    // fix the fresh-start resolve carried no labels, resolved the default
+    // `warn`, and let the first call through.
+    let (_state, _manifest, registry) = setup_fake("fencepolicy", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("fencepolicy").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[labels]\nteam = \"core\"\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // The Policy: 1M cumulative tokens, `block`, matching the label the
+    // configuration binds.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "wirecap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_cumulative: Some(1_000_000),
+                breach_action: Some(BreachAction::Block),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // A prior Run spent 1.5M lifetime tokens. Seeded directly through the
+    // writer (the ingest path evaluates live and would fire the block
+    // itself — the fence test needs the ledger spent and NOTHING fired).
+    let earlier = RunId::mint();
+    let seed_usage = earlier.clone();
+    registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _, RunStore as _};
+            let store = ctx.store();
+            store.insert_run(&NewRun {
+                record: crate::domain::RunRecord {
+                    run_id: seed_usage.clone(),
+                    control_depth: crate::domain::ControlDepth::Supervised,
+                    wire_path: true,
+                    status: crate::domain::runs::RunStatus::Ended,
+                    anomalies: Vec::new(),
+                    parent_run_id: None,
+                    instance: Some("fencepolicy".to_string()),
+                    process_owner: true,
+                    end_cause: Some("stopped".to_string()),
+                    created_at: "t".to_string(),
+                    updated_at: "t".to_string(),
+                    ended_at: Some("t".to_string()),
+                },
+                labels: Vec::new(),
+                limits: Default::default(),
+                identity: None,
+            })?;
+            store.insert_usage(
+                &crate::domain::usage::UsageEvent {
+                    instance: "fencepolicy".to_string(),
+                    run_id: seed_usage,
+                    input_tokens: 1_500_000,
+                    output_tokens: 0,
+                    cached_tokens: Some(0),
+                    metering_source: "engine-observed".to_string(),
+                    sequence: 1,
+                    occurred_at: "t".to_string(),
+                },
+                None,
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "fencepolicy")
+        .unwrap()
+        .is_empty());
+    // The FRESH start fences: the Policy's cumulative `block` ceiling
+    // refuses the first call.
+    let fresh = crate::metering::WireFence::default();
+    assert!(
+        sup.run_start_fence(&registry, &name, &fresh, None),
+        "the Policy's cumulative block ceiling fences the fresh Run"
+    );
+    assert_eq!(fresh.refusal().unwrap().code, "tokens_cumulative");
+    // `block_configured` agrees (the spawn path's belt-and-braces check).
+    assert!(sup.block_configured(&registry, &name));
+    // Without the label the Policy does not select: no fence.
+    registry.set_config(&name, "labels.team", "other").unwrap();
+    sup.sync_run_labels(&registry, &name);
+    let unfenced = crate::metering::WireFence::default();
+    assert!(!sup.run_start_fence(&registry, &name, &unfenced, None));
+}
+
+#[test]
 fn block_is_never_the_resolved_default() {
     let (_state, _manifest, registry) = setup_fake("fencedefault", &["--linger-ms", "600000"]);
     let name = InstanceName::new("fencedefault").unwrap();
