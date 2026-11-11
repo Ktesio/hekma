@@ -5911,6 +5911,14 @@ mod tests {
             err.contains("the start itself failed"),
             "the launch-failure verdict rides the reason (never a bare failed hold): {err}"
         );
+        assert!(
+            err.contains("could not launch"),
+            "the engine's own spawn diagnostic rides the reason — the starter's verdict is not dropped: {err}"
+        );
+        assert!(
+            err.contains("no-such-agent-binary"),
+            "the diagnostic names the unlaunchable binary it tried: {err}"
+        );
         assert_eq!(
             evidence.hold_proven,
             Some(false),
@@ -5920,9 +5928,10 @@ mod tests {
 
     /// A subject that dies at 150ms against a 250ms declared hold: the
     /// child's death lands INSIDE the startup survival window (300ms), so
-    /// an engine start stage — not the readiness gate — fails the launch.
-    /// WHICH stage catches the death (the survival watch on a fast launch,
-    /// the readiness probe on a slow one) is runner timing, not contract:
+    /// the engine's own death detection — not a readiness pass or timeout —
+    /// fails the launch. WHICH stage catches the death (the survival watch
+    /// on a fast launch, the readiness probe on a slow one) is runner
+    /// timing, not contract:
     /// both surface the engine's own death text as the start's verdict,
     /// and either way the threshold is crossed first (the child cannot die
     /// before its own `--exit-with` bound, and the anchored elapsed only
@@ -5987,7 +5996,7 @@ mod tests {
         assert_eq!(
             evidence.hold_proven,
             Some(true),
-            "the gate demonstrably held past the anchored threshold before the subject died"
+            "the anchored threshold elapsed before the start's own failure returned"
         );
     }
 
@@ -6084,7 +6093,11 @@ mod tests {
             let err = readiness_healthy_leg(
                 &facade,
                 "tck-hold-queued",
-                Some(500),
+                // Only `Some` matters here: the anchorless refusal in PHASE 1
+                // fires before the hold size is ever read (the queued subject
+                // declares no readiness endpoint), so the value is nominal —
+                // 200 stays under the section's clamp regardless.
+                Some(200),
                 Duration::from_millis(900),
                 &mut evidence,
             )
