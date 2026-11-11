@@ -134,44 +134,67 @@ pub enum EngineEvent {
     BreachDefaultUpgraded(super::runs::policy::BreachDefaultUpgradedEvent),
 }
 
-/// The in-supervisor handle to the event bus: a cloneable [`broadcast::Sender`]
-/// plus the subscribe seam (story 7-2).
+/// The in-supervisor handle to the event bus: a cloneable pair of
+/// [`broadcast::Sender`]s — the plain channel and the SEQUENCED channel —
+/// over one ring each (story 21-5).
 ///
 /// The [`Supervisor`](super::supervisor::Supervisor) owns one clone and
-/// publishes at the three commit points; the
-/// [`Engine`](crate::Engine) holds another so `subscribe()` never has to take
-/// the supervisor lock. `broadcast::Sender::clone` shares the same channel, so
-/// receivers handed out from either side see the same stream.
+/// publishes at the commit points; the [`Engine`](crate::Engine) holds
+/// another so `subscribe()` never has to take the supervisor lock.
+/// `broadcast::Sender::clone` shares the same channel, so receivers handed
+/// out from either side see the same stream.
+///
+/// **The sequenced envelope (story 21-5).** Every committed event already
+/// carries its outbox seq (the store writer's ack returns it beside the
+/// event), so a publish sends `(seq, event)` on the sequenced ring while
+/// the plain ring keeps carrying the bare [`EngineEvent`] — `subscribe()`
+/// is unchanged for every existing consumer, and
+/// [`subscribe_sequenced`](Self::subscribe_sequenced) feeds the SSE path
+/// (whose frames carry `id: <seq>` and resume from `Last-Event-ID`). Both
+/// rings are bounded at [`EVENT_BUS_CAPACITY`] and publishes stay
+/// non-blocking; a receiver of either ring sees the same order (publishes
+/// are serialized under the supervisor lock, and each ring preserves it).
 #[derive(Clone, Debug)]
 pub(crate) struct EventBus {
     tx: broadcast::Sender<EngineEvent>,
+    sequenced: broadcast::Sender<(u64, EngineEvent)>,
 }
 
 impl EventBus {
-    /// Build a bus bounded at [`EVENT_BUS_CAPACITY`].
+    /// Build a bus bounded at [`EVENT_BUS_CAPACITY`] (both rings).
     pub(crate) fn new() -> Self {
         Self {
             tx: broadcast::channel(EVENT_BUS_CAPACITY).0,
+            sequenced: broadcast::channel(EVENT_BUS_CAPACITY).0,
         }
     }
 
-    /// Publish one event to every current subscriber — never blocks, never
-    /// fails supervision.
+    /// Publish one committed event — with its outbox `seq` — to every
+    /// current subscriber, never blocking, never failing supervision.
     ///
     /// `send` errors ONLY when no receiver exists (an unsubscribed engine);
-    /// that is the expected common case and is swallowed by design. A publish
-    /// is called exclusively from the supervisor's commit points, AFTER the
-    /// durable append succeeded.
-    pub(crate) fn publish(&self, event: EngineEvent) {
-        // A send with no receivers is an Err that MUST be ignored — a publish
-        // failure can never fail supervision (story 7-2 design).
+    /// that is the expected common case and is swallowed by design. A
+    /// publish is called exclusively from the supervisor's commit points,
+    /// AFTER the durable append succeeded, with the seq that append minted.
+    pub(crate) fn publish(&self, seq: u64, event: EngineEvent) {
+        // A send with no receivers is an Err that MUST be ignored — a
+        // publish failure can never fail supervision (story 7-2 design).
+        let _ = self.sequenced.send((seq, event.clone()));
         let _ = self.tx.send(event);
     }
 
-    /// Hand out a fresh receiver positioned at the CURRENT tail (it sees only
-    /// events published after this call — the standard broadcast semantics).
+    /// Hand out a fresh receiver positioned at the CURRENT tail (it sees
+    /// only events published after this call — the standard broadcast
+    /// semantics).
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.tx.subscribe()
+    }
+
+    /// The sequenced receiver (story 21-5): `(outbox seq, EngineEvent)`
+    /// pairs in publish order — the SSE path's stream, whose frames carry
+    /// the seq as their `id:` so a reconnect can resume from it.
+    pub(crate) fn subscribe_sequenced(&self) -> broadcast::Receiver<(u64, EngineEvent)> {
+        self.sequenced.subscribe()
     }
 }
 
@@ -196,8 +219,8 @@ mod tests {
         // cheap no-op (send's no-receiver Err swallowed), never a panic or an
         // error surfaced into supervision.
         let bus = EventBus::new();
-        bus.publish(sample_transition(0));
-        bus.publish(sample_transition(1));
+        bus.publish(1, sample_transition(0));
+        bus.publish(2, sample_transition(1));
     }
 
     #[test]
@@ -208,7 +231,7 @@ mod tests {
         let mut rx1 = bus.subscribe();
         let mut rx2 = bus.subscribe();
         for seq in 0..3u64 {
-            bus.publish(sample_transition(seq));
+            bus.publish(seq, sample_transition(seq));
         }
         for rx in [&mut rx1, &mut rx2] {
             for seq in 0..3u64 {
@@ -229,7 +252,7 @@ mod tests {
         let mut rx = bus.subscribe();
         let extra = 8usize;
         for seq in 0..(EVENT_BUS_CAPACITY + extra) as u64 {
-            bus.publish(sample_transition(seq));
+            bus.publish(seq, sample_transition(seq));
         }
         // First recv: the Lagged marker naming the dropped count (tokio
         // reports the loss BEFORE replaying the retained window).
@@ -256,7 +279,7 @@ mod tests {
             assert_eq!(got, sample_transition(seq), "tail order preserved");
         }
         assert!(rx.try_recv().is_err(), "drained to the tail");
-        bus.publish(sample_transition(u64::MAX));
+        bus.publish(u64::MAX, sample_transition(u64::MAX));
         let after = rx
             .try_recv()
             .expect("the resynced receiver receives new events");
@@ -299,7 +322,7 @@ mod tests {
 
         // Round 1: exceed the capacity; the receiver (never drained) drops 10.
         for seq in 0..round {
-            bus.publish(sample_transition(seq));
+            bus.publish(seq, sample_transition(seq));
         }
         let next = round;
         let (events, dropped) = drain_with_lag(&mut rx);
@@ -317,7 +340,7 @@ mod tests {
 
         // Round 2: the resynced receiver stalls past the capacity AGAIN.
         for seq in next..(next + round) {
-            bus.publish(sample_transition(seq));
+            bus.publish(seq, sample_transition(seq));
         }
         let (events, dropped) = drain_with_lag(&mut rx);
         assert_eq!(dropped, 10, "round 2 drops exactly its own overflow again");
@@ -340,10 +363,28 @@ mod tests {
         }
 
         // And the twice-resynced receiver still keeps working.
-        bus.publish(sample_transition(u64::MAX));
+        bus.publish(u64::MAX, sample_transition(u64::MAX));
         let (events, dropped) = drain_with_lag(&mut rx);
         assert_eq!(dropped, 0, "no third lag");
         assert_eq!(events, vec![sample_transition(u64::MAX)]);
+    }
+
+    #[tokio::test]
+    async fn the_sequenced_ring_carries_the_pairs_and_the_plain_ring_stays_bare() {
+        // Story 21-5: one publish lands on BOTH rings — the sequenced
+        // receiver sees (seq, event) in publish order, the plain receiver
+        // sees the bare EngineEvent, and neither ring's semantics change.
+        let bus = EventBus::new();
+        let mut plain = bus.subscribe();
+        let mut sequenced = bus.subscribe_sequenced();
+        bus.publish(7, sample_transition(0));
+        bus.publish(9, sample_transition(1));
+        assert_eq!(sequenced.try_recv().unwrap(), (7, sample_transition(0)));
+        assert_eq!(sequenced.try_recv().unwrap(), (9, sample_transition(1)));
+        assert_eq!(plain.try_recv().unwrap(), sample_transition(0));
+        assert_eq!(plain.try_recv().unwrap(), sample_transition(1));
+        assert!(sequenced.try_recv().is_err());
+        assert!(plain.try_recv().is_err());
     }
 
     #[test]

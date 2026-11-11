@@ -1345,17 +1345,20 @@ impl Supervisor {
         self.events.clone()
     }
 
-    /// Publish one committed event onto the bus (story 7-2).
+    /// Publish one committed event — with its outbox `seq` — onto the bus
+    /// (story 7-2; the seq rides since story 21-5).
     ///
-    /// Called EXCLUSIVELY from the three commit points, immediately AFTER the
-    /// durable append/commit succeeded. Every caller runs while the supervisor
-    /// lock is held — a CALLER-ENFORCED obligation (the bus itself does not
-    /// serialize; see the `domain::bus` module's ordering invariant) — so
-    /// publishes are serialized in durable-append order: the per-instance FIFO
-    /// guarantee. Publishing cannot fail supervision: a send with no receivers
-    /// (or any send error) is swallowed by the bus.
-    pub(crate) fn publish(&self, event: EngineEvent) {
-        self.events.publish(event);
+    /// Called EXCLUSIVELY from the commit points, immediately AFTER the
+    /// durable append/commit succeeded, with the seq that append minted
+    /// (the SSE path frames it as the event's `id:`). Every caller runs
+    /// while the supervisor lock is held — a CALLER-ENFORCED obligation
+    /// (the bus itself does not serialize; see the `domain::bus` module's
+    /// ordering invariant) — so publishes are serialized in durable-append
+    /// order: the per-instance FIFO guarantee. Publishing cannot fail
+    /// supervision: a send with no receivers (or any send error) is
+    /// swallowed by the bus.
+    pub(crate) fn publish(&self, seq: u64, event: EngineEvent) {
+        self.events.publish(seq, event);
     }
 
     /// Install (or replace) the host-provided diagnostic sink (story 10-2).
@@ -1802,7 +1805,7 @@ impl Supervisor {
     ) {
         for (event, append) in events {
             self.note_outbox_append(&append);
-            self.publish(EngineEvent::Run(event));
+            self.publish(append.seq, EngineEvent::Run(event));
         }
     }
 
@@ -1951,7 +1954,7 @@ impl Supervisor {
             ));
         }
         self.note_outbox_append(append);
-        self.publish(EngineEvent::Transition(event.clone()));
+        self.publish(append.seq, EngineEvent::Transition(event.clone()));
         if let Some(capture) = log_capture {
             let text = engine_transition_line_text(event);
             capture.send_engine_line(LogLine::new(

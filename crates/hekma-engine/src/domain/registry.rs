@@ -273,7 +273,7 @@ pub struct Registry {
     /// Events an open produced (the policy sweep's Run events, the FR-21
     /// upgrade event) for `Engine::open` to publish on the bus; they are
     /// already durable in the outbox.
-    pub(crate) open_events: std::sync::Mutex<Vec<crate::domain::bus::EngineEvent>>,
+    pub(crate) open_events: std::sync::Mutex<Vec<(u64, crate::domain::bus::EngineEvent)>>,
 }
 
 impl Registry {
@@ -560,6 +560,40 @@ impl Registry {
     ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
         self.store
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
+    /// The Run listing (story 21-5): one exception-first (or all-inside-the-
+    /// window) keyset page plus its counts, with each row's labels, stored
+    /// resolution, usage, latches and headroom assembled as bounded point
+    /// reads. Read on the read-only connection; a bad cursor is the typed
+    /// `invalid-cursor` refusal.
+    pub(crate) fn list_runs(
+        &self,
+        query: &crate::domain::runs::ListRunsQuery,
+    ) -> Result<crate::domain::runs::RunListing, crate::domain::RunError> {
+        use crate::domain::runs::listing;
+        let cutoff = listing::ended_run_cutoff(crate::time::now_unix_secs());
+        let after = query.after_key()?;
+        self.store
+            .snapshot(|store| {
+                use crate::ports::RunRecords as _;
+                let limit = query.clamped_limit();
+                let (records, next_key) = store.list_runs(
+                    query.view,
+                    query.selector.as_ref(),
+                    after.as_deref(),
+                    limit,
+                    &cutoff,
+                )?;
+                let items = listing::assemble(store, records)?;
+                let counts = store.listing_counts(query.view, query.selector.as_ref(), &cutoff)?;
+                Ok(crate::domain::runs::RunListing {
+                    items,
+                    next_cursor: next_key.as_deref().map(crate::domain::runs::encode_cursor),
+                    counts,
+                })
+            })
+            .map_err(crate::domain::RunError::Store)
     }
 
     /// Open a READ-ONLY registry (story 21-4): no directory is created, no

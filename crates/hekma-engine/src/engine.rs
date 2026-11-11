@@ -72,8 +72,8 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, PolicyChange, PolicyOutcome, PolicyRecord,
-    RunError, RunId, RunRecord, RunView, Selector,
+    ChildRunRequest, LabelChange, LabelOutcome, ListRunsQuery, PolicyChange, PolicyOutcome,
+    PolicyRecord, RunError, RunId, RunListing, RunRecord, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -556,8 +556,8 @@ impl Engine {
             // Run events, the FR-21 upgrade's one event) on the bus — they
             // are already durable in the outbox; this makes them live too
             // for any subscriber seated before the engine was handed out.
-            for event in registry.take_open_events() {
-                supervisor.publish(event);
+            for (seq, event) in registry.take_open_events() {
+                supervisor.publish(seq, event);
             }
         }
 
@@ -755,6 +755,18 @@ impl Engine {
     /// blocking `recv` bridged through the engine runtime).
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// The SEQUENCED subscription (story 21-5): `(outbox seq, EngineEvent)`
+    /// pairs in commit order — the SSE path's stream, whose frames carry
+    /// the seq as their `id:` so a reconnect can replay the outbox from
+    /// `Last-Event-ID` and hand over to live delivery with seq-dedup at
+    /// the seam. Same contract as [`Engine::subscribe`] (bounded at
+    /// [`EVENT_BUS_CAPACITY`], `Lagged` on overrun); the seq comes from the
+    /// store writer's ack, so it is the durable outbox position of the
+    /// event — what `export_events` serves.
+    pub fn subscribe_sequenced(&self) -> broadcast::Receiver<(u64, EngineEvent)> {
+        self.inner.events.subscribe_sequenced()
     }
 
     /// The engine-computed Agent Home path for `name` (display helper).
@@ -1859,6 +1871,28 @@ impl Engine {
         .await
     }
 
+    /// The Run listing (story 21-5, PRD FR-50): one exception-first (or
+    /// `--all`, inside-the-ended-Run-window) keyset page, newest run id
+    /// first, with each row's CONTROL depth, Run Status, Anomalies with
+    /// their latched breach actions, labels with source and origin, usage
+    /// (subtree always; the instance cumulative on process-owning rows),
+    /// and headroom against the Run's RESOLVED limits with each limit's
+    /// source. A Listing Selectors PAGES past [`crate::MAX_SELECTED_RUNS`]
+    /// (the verb cap stays verb-only). A cursor that is not the codec's
+    /// form is the typed `invalid-cursor` refusal. Reads only (registry
+    /// lock, read-only connection) — this is `hekma ps`'s read.
+    pub async fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .list_runs(&query)
+        })
+        .await
+    }
+
     /// Every stored Policy (story 21-3, PRD FR-60), the `default` Policy
     /// included, ordered by name. Reads only.
     pub async fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
@@ -2731,6 +2765,11 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::select_runs`].
     pub fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
+    }
+
+    /// Blocking twin of [`Engine::list_runs`] — `hekma ps`'s read.
+    pub fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
+        self.engine.rt.block_on(self.engine.list_runs(query))
     }
 
     /// Blocking twin of [`Engine::policies`].

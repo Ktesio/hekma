@@ -94,6 +94,11 @@ pub use registry::{Registry, RemoveDisposition};
 pub use registry_policy::{PolicyChange, PolicyOutcome};
 pub use resync::{ResyncBatch, ResyncCursor};
 pub use runs::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
+pub use runs::{
     validate_label_key, validate_label_value, verb_cell, Anomaly, CellBehavior, ChildRunRequest,
     ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, RunEvent,
     RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage, RunVerb, RunView, Selector,

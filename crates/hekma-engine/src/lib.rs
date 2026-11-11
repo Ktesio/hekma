@@ -140,6 +140,12 @@ pub use domain::{
     RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
     MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
+// Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
+pub use domain::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
 // Story 21-3: Policies — the request and outcome of a Policy change, the
 // stored Policy, its limits and events, and the resolution a Run carries.
 pub use domain::{

@@ -275,6 +275,11 @@ impl RunListing {
 /// only inside the window) or a `held`/`silent`/`stale` status. `silent`
 /// and `stale` are STORED statuses — the predicate matches them the moment
 /// a producer exists and never computes either at read (AD-25).
+///
+/// The READ side is the SQL in `store/runs_sqlite.rs` (the v16 partial
+/// indexes' arms); this pure predicate is the SPECIFICATION the store
+/// tests cross-check the SQL against, row shape by row shape.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_exception(
     status: &str,
     anomalies: &str,
@@ -288,13 +293,17 @@ pub(crate) fn is_exception(
 }
 
 /// Whether a row is listed in the ALL view: not ended, or ended inside the
-/// window.
+/// window. The specification oracle for the SQL arm — see
+/// [`is_exception`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn in_all_view(status: &str, ended_at: Option<&str>, cutoff: &str) -> bool {
     status != "ended" || ended_at.is_some_and(|ended| ended >= cutoff)
 }
 
 /// Whether a row counts as a HEALTHY open Run (counted, never listed in the
-/// exceptions view): `active` with no Anomaly.
+/// exceptions view): `active` with no Anomaly. The specification oracle for
+/// the count SQL.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_healthy_open(status: &str, anomalies: &str) -> bool {
     status == "active" && anomalies.is_empty()
 }
@@ -504,6 +513,64 @@ pub(crate) fn latched_breaches(
         .collect();
     breaches.sort_by_key(|breach| (breach.dimension.as_str(), breach.scope.as_str()));
     breaches
+}
+
+/// Assemble a page's rows from their stored facts (story 21-5): each row's
+/// labels, stored resolution, subtree rollup and latches are BOUNDED POINT
+/// READS (primary-key probes) over the page (≤ [`LISTING_MAX_LIMIT`] rows),
+/// plus — on process-owning rows only — the instance's cumulative rollup.
+/// An instance-less Run (a wire Run) reads zero usage until the shared
+/// proxy re-keys the rollups: a recorded seam, never a fabricated figure.
+pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?Sized>(
+    store: &S,
+    records: Vec<RunRecord>,
+) -> Result<Vec<RunSummary>, crate::ports::StoreError> {
+    let usage_of = |rollup: crate::ports::Rollup| RunUsage {
+        input_tokens: rollup.totals.input_tokens,
+        output_tokens: rollup.totals.output_tokens,
+        cached_tokens: rollup.totals.cached_tokens,
+        cost_micros: rollup.cost,
+        estimate: EstimateLabel::Estimated,
+    };
+    let mut items = Vec::with_capacity(records.len());
+    for record in records {
+        let run_id = record.run_id.clone();
+        let instance = record.instance.clone();
+        let process_owner = record.process_owner;
+        let labels = store.run_labels(&run_id)?;
+        let resolution = store.run_policy(&run_id)?.map(|row| row.resolution);
+        let latches = latched_breaches(&store.latches(&run_id)?);
+        let (usage, cumulative_usage) = match instance.as_deref() {
+            Some(name) => {
+                let iname = crate::domain::InstanceName::new(name).map_err(|err| {
+                    crate::ports::StoreError::CorruptRow {
+                        name: name.to_string(),
+                        detail: format!("invalid instance name on a Run: {err}"),
+                    }
+                })?;
+                let subtree = usage_of(store.run_rollup(&iname, &run_id)?);
+                let cumulative = process_owner
+                    .then(|| store.instance_rollup(&iname).map(&usage_of))
+                    .transpose()?;
+                (subtree, cumulative)
+            }
+            None => (RunUsage::default(), None),
+        };
+        let kept_on_pause = match instance.as_deref() {
+            Some(name) => store.breach_default_kept(name)?,
+            None => false,
+        };
+        items.push(summarize(
+            record,
+            labels,
+            usage,
+            cumulative_usage,
+            latches,
+            resolution.as_ref(),
+            kept_on_pause,
+        ));
+    }
+    Ok(items)
 }
 
 #[cfg(test)]

@@ -1112,3 +1112,97 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
         assert_eq!(present, 1, "{index}");
     }
 }
+
+#[test]
+fn the_view_sql_matches_the_specification_predicates_row_by_row() {
+    // The pure predicates in `domain/runs/listing.rs` are the views'
+    // specification; the SQL arms (the partial indexes' reads) are the
+    // implementation. Seed EVERY row shape the views distinguish and
+    // cross-check the SQL's answer against the oracle, row by row — a
+    // planner or arm change that drifts from the spec fails here.
+    use crate::domain::runs::listing::{in_all_view, is_exception, is_healthy_open};
+
+    let (_tmp, store) = store();
+    let mut index = 0;
+    let mut expected_exceptions = Vec::new();
+    let mut expected_all = Vec::new();
+    let mut expected_healthy = 0u64;
+    let shapes: &[(&str, RunStatus, &[Anomaly], Option<&str>)] = &[
+        ("active-clean", RunStatus::Active, &[], None),
+        ("active-breach", RunStatus::Active, &[Anomaly::Breach], None),
+        ("active-failed", RunStatus::Active, &[Anomaly::Failed], None),
+        ("held", RunStatus::Held, &[], None),
+        ("silent", RunStatus::Silent, &[], None),
+        ("stale", RunStatus::Stale, &[], None),
+        (
+            "ended-clean-new",
+            RunStatus::Ended,
+            &[],
+            Some("2026-11-10T00:00:00Z"),
+        ),
+        (
+            "ended-clean-old",
+            RunStatus::Ended,
+            &[],
+            Some("2026-10-01T00:00:00Z"),
+        ),
+        (
+            "ended-failed-new",
+            RunStatus::Ended,
+            &[Anomaly::Failed],
+            Some("2026-11-10T00:00:00Z"),
+        ),
+        (
+            "ended-breach-old",
+            RunStatus::Ended,
+            &[Anomaly::Breach],
+            Some("2026-10-01T00:00:00Z"),
+        ),
+        ("ended-null-at", RunStatus::Ended, &[Anomaly::Failed], None),
+    ];
+    for (label, status, anomalies, ended_at) in shapes {
+        let id = format!("run_P{index:03}{label}");
+        index += 1;
+        insert(
+            &store,
+            shaped_owner(&id, "a", false, *status, anomalies, *ended_at),
+            Vec::new(),
+            RunLimits::default(),
+        );
+        let anomalies_text = Anomaly::encode(anomalies);
+        if is_exception(status.as_str(), &anomalies_text, *ended_at, FIXTURE_CUTOFF) {
+            expected_exceptions.push(id.clone());
+        }
+        if in_all_view(status.as_str(), *ended_at, FIXTURE_CUTOFF) {
+            expected_all.push(id.clone());
+        }
+        if is_healthy_open(status.as_str(), &anomalies_text) {
+            expected_healthy += 1;
+        }
+    }
+    let (rows, _) = store
+        .list_runs(ListingView::Exceptions, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let mut listed: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.run_id.as_str().to_string())
+        .collect();
+    listed.sort();
+    expected_exceptions.sort();
+    assert_eq!(listed, expected_exceptions);
+    let (rows, _) = store
+        .list_runs(ListingView::All, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let mut listed: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.run_id.as_str().to_string())
+        .collect();
+    listed.sort();
+    expected_all.sort();
+    assert_eq!(listed, expected_all);
+    let counts = store
+        .listing_counts(ListingView::All, None, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.healthy_open, expected_healthy);
+    assert_eq!(counts.listed, expected_all.len() as u64);
+}
