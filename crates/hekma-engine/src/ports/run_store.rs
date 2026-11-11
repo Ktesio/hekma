@@ -21,8 +21,8 @@
 use super::StoreError;
 use crate::domain::{
     BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, Label, LabelSource, LatchKey,
-    Micros, OutboxEntry, Rate, RecordOutcome, RunId, RunLimits, RunRecord, TransitionEvent,
-    UsageEvent, UsageTotals,
+    Micros, OutboxEntry, Rate, RecordOutcome, RunId, RunLimits, RunRecord, Selector,
+    TransitionEvent, UsageEvent, UsageTotals,
 };
 
 /// The largest page any keyset read returns, whatever the caller asks for.
@@ -216,13 +216,26 @@ pub(crate) trait RunRecords {
     /// end fields, update time).
     fn save_run(&self, record: &RunRecord) -> Result<(), StoreError>;
 
-    /// Replace every label of one source on a Run.
+    /// Replace every label of one source on a Run. A Caller write never
+    /// replaces a bound row (story 21-9): a Caller label on a key already
+    /// bound is skipped at the SQL level, behind the domain's
+    /// `check_caller_labels` refusal. The Caller-label write the announce and
+    /// identity-header paths will use; tests exercise it until they land.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn replace_labels(
         &self,
         run_id: &RunId,
         source: LabelSource,
         labels: &[Label],
     ) -> Result<(), StoreError>;
+
+    /// Replace one Run's whole label set (story 21-9): the label verb's and
+    /// the configuration re-sync's one write.
+    fn set_run_labels(&self, run_id: &RunId, labels: &[Label]) -> Result<(), StoreError>;
+
+    /// The non-ended Runs carrying every `key=value` term of `selector`
+    /// (bound or Caller), ordered by run id, at most `limit` (story 21-9).
+    fn select_runs(&self, selector: &Selector, limit: usize) -> Result<Vec<RunRecord>, StoreError>;
 
     /// The Run an external id maps to under a binding.
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError>;

@@ -306,14 +306,22 @@ impl From<RunError> for ApiError {
     fn from(err: RunError) -> Self {
         let message = err.to_string();
         let kind = match &err {
-            RunError::NotFound { .. } => ApiErrorKind::NotFound,
+            RunError::NotFound { .. } | RunError::InstanceNotFound { .. } => {
+                ApiErrorKind::NotFound
+            }
             // The Run's (or its parent's) state forbids the request.
             RunError::NoOpenRun { .. }
             | RunError::ParentEnded { .. }
-            | RunError::OwnsProcess { .. } => ApiErrorKind::Conflict,
+            | RunError::OwnsProcess { .. }
+            // Story 21-9: the Run's labels or state forbid the label change.
+            | RunError::RunEnded { .. }
+            | RunError::LabelFromConfig { .. }
+            | RunError::LabelNotBound { .. }
+            | RunError::LabelBound { .. } => ApiErrorKind::Conflict,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
+            | RunError::TooManyRuns { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
             RunError::Store(_) => ApiErrorKind::Internal,
         };
@@ -689,6 +697,57 @@ mod tests {
         });
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(kind, "internal");
+    }
+
+    #[test]
+    fn label_refusals_map_to_their_classes_with_the_engine_code() {
+        let cases = [
+            (
+                RunError::RunEnded {
+                    run_id: "run_X".into(),
+                },
+                StatusCode::CONFLICT,
+                "run-ended",
+            ),
+            (
+                RunError::LabelFromConfig {
+                    run_id: "run_X".into(),
+                    key: "team".into(),
+                    instance: "a".into(),
+                },
+                StatusCode::CONFLICT,
+                "label-from-config",
+            ),
+            (
+                RunError::LabelNotBound {
+                    run_id: "run_X".into(),
+                    key: "task".into(),
+                },
+                StatusCode::CONFLICT,
+                "label-not-bound",
+            ),
+            (
+                RunError::LabelBound {
+                    run_id: "run_X".into(),
+                    key: "team".into(),
+                },
+                StatusCode::CONFLICT,
+                "label-bound",
+            ),
+            (
+                RunError::TooManyRuns {
+                    selector: "a=b".into(),
+                    max: 1000,
+                },
+                StatusCode::BAD_REQUEST,
+                "too-many-runs",
+            ),
+        ];
+        for (err, status, code) in cases {
+            let api: ApiError = err.into();
+            assert_eq!(api.kind.status(), status, "{code}");
+            assert_eq!(api.code, Some(code));
+        }
     }
 
     #[test]

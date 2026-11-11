@@ -126,7 +126,7 @@ fn a_child_run_opens_shows_and_closes_under_a_detached_agent_unix() {
         run.stdout
     );
     assert!(
-        run.stdout.contains("team=payments (bound)"),
+        run.stdout.contains("team=payments (bound, config)"),
         "{}",
         run.stdout
     );

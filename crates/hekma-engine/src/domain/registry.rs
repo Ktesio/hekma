@@ -377,6 +377,70 @@ impl Registry {
             .snapshot(|store| Ok(crate::domain::runs::ops::view(store, run_id)))?
     }
 
+    /// One Run's row, read on the read-only connection (story 21-9).
+    pub(crate) fn run_record(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<Option<crate::domain::RunRecord>, crate::domain::RunError> {
+        use crate::ports::RunRecords;
+        Ok(self.store.snapshot(|store| store.run_record(run_id))?)
+    }
+
+    /// The instance's open process-owning Run, read on the read-only
+    /// connection (story 21-9): `InstanceNotFound` when no instance has the
+    /// name, `NoOpenRun` when it has no open Run.
+    pub(crate) fn instance_run(
+        &self,
+        instance: &str,
+    ) -> Result<crate::domain::RunView, crate::domain::RunError> {
+        use crate::ports::{RunRecords, StateStore};
+        let name = InstanceName::new(instance).map_err(|e| crate::domain::RunError::Invalid {
+            field: "instance".to_string(),
+            reason: e.to_string(),
+        })?;
+        self.store.snapshot(|store| {
+            Ok(match store.open_process_run(&name)? {
+                Some(record) => crate::domain::runs::ops::view(store, &record.run_id),
+                None if store.get_instance(&name)?.is_none() => {
+                    Err(crate::domain::RunError::InstanceNotFound {
+                        instance: instance.to_string(),
+                    })
+                }
+                None => Err(crate::domain::RunError::NoOpenRun {
+                    instance: instance.to_string(),
+                }),
+            })
+        })?
+    }
+
+    /// Plan a label-verb change on the read-only connection (story 21-9):
+    /// the dry run, which writes nothing and so needs no store writer (a
+    /// read-only engine plans as well as the data-path owner).
+    pub(crate) fn plan_run_labels(
+        &self,
+        run_id: &crate::domain::RunId,
+        change: &crate::domain::LabelChange,
+        config: &[crate::domain::Label],
+    ) -> Result<crate::domain::LabelOutcome, crate::domain::RunError> {
+        let at = crate::time::now_rfc3339();
+        self.store.snapshot(|store| {
+            Ok(
+                crate::domain::runs::ops::label(store, run_id, change, config, true, &at)
+                    .map(|(outcome, _)| outcome),
+            )
+        })?
+    }
+
+    /// Resolve a Selector over the non-ended Runs on the read-only
+    /// connection (story 21-9): one indexed read, capped.
+    pub(crate) fn select_runs(
+        &self,
+        selector: &crate::domain::Selector,
+    ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
+        self.store
+            .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
     /// Open a READ-ONLY registry (story 21-4): no directory is created, no
     /// migration runs, no legacy import happens, and the store writer is
     /// CLOSED (every write answers a typed refusal). A missing state.db reads
