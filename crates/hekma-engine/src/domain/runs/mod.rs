@@ -31,6 +31,7 @@ use super::usage::RunId;
 use crate::ports::StoreError;
 
 pub(crate) mod labels;
+pub(crate) mod listing;
 pub(crate) mod ops;
 pub(crate) mod policy;
 pub mod selector;
@@ -38,6 +39,11 @@ pub(crate) mod snapshot;
 pub mod verbs;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
+pub use listing::{
+    decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
+    ListingView, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
+};
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
     PolicyLimits, PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy, ScentCheckMode,
@@ -739,6 +745,15 @@ pub enum RunError {
         /// The refused mode.
         mode: String,
     },
+    /// A listing cursor that is not the codec's form (story 21-5): a bad
+    /// base64url body, a foreign version prefix, an empty run id. The typed
+    /// `invalid-cursor` refusal — a future key shape never mispages, it
+    /// refuses.
+    #[error("{detail}")]
+    InvalidCursor {
+        /// Why the cursor cannot be used.
+        detail: String,
+    },
     /// A malformed request field.
     #[error("{field}: {reason}")]
     Invalid {
@@ -772,6 +787,7 @@ impl RunError {
             RunError::PolicyExists { .. } => "policy-exists",
             RunError::PolicyDefault { .. } => "policy-default",
             RunError::ScentUnavailable { .. } => "scent-unavailable",
+            RunError::InvalidCursor { .. } => "invalid-cursor",
             RunError::Invalid { .. } => "invalid-request",
             RunError::Store(_) => "store",
         }
