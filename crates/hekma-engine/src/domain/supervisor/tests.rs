@@ -10049,6 +10049,109 @@ fn a_relaunch_re_applies_a_latched_process_breach_action() {
 }
 
 #[test]
+fn a_relaunch_does_not_re_apply_a_breach_the_operator_raised_away() {
+    // Round 3, L3: the relaunch re-applies only breaches whose
+    // `(dimension, scope)` is STILL latched. The Operator raising the
+    // ceiling (or clearing it) unlatches; re-applying the spent breach
+    // once re-paused a relaunched agent under a ceiling it no longer
+    // crosses.
+    let state = tempfile::TempDir::new().unwrap();
+    let manifest = tempfile::TempDir::new().unwrap();
+    write_pause_guaranteed_manifest(manifest.path(), "rununlatch", &["--crash-after-ms", "450"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "rununlatch",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("rununlatch").unwrap();
+    registry
+        .set_restart_policy(&name, RestartPolicy::OnFailure)
+        .unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    // The Policy (pause: the breach pauses without ending the Run) exists
+    // before the start.
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "relatch".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(10),
+                breach_action: Some(BreachAction::Pause),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    sup.start(&registry, "rununlatch").unwrap();
+    let run = open_run(&registry, "rununlatch").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 12,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    use crate::ports::RunStore as _;
+    assert_eq!(registry.reader().latches(&run).unwrap().len(), 1);
+    // The agent resumes, then crashes into the backoff window (the
+    // instance leaves `running` while its Run stays open). Poll until it
+    // does — bounded.
+    sup.resume(&registry, "rununlatch").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sup.running.contains_key(&name) {
+        sup.poll_once(&registry);
+        assert!(Instant::now() < deadline, "the crash was never detected");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The Operator RAISES the ceiling above the usage during the backoff:
+    // the latch re-arms away (no supervised context, but the unlatch is a
+    // shared-DB write), and the relaunch must NOT re-apply the spent
+    // `pause`.
+    let outcome = sup
+        .change_policy(
+            &registry,
+            crate::domain::PolicyChange {
+                name: "relatch".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(10_000_000),
+                    breach_action: Some(BreachAction::Pause),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(outcome.matched, 1, "{:?}", outcome.notes);
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the raise unlatched the spent breach"
+    );
+    sup.restart(&registry, "rununlatch", 1, Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(
+        state_of(&registry, "rununlatch"),
+        LifecycleState::Running,
+        "the spent breach is not re-applied after the raise"
+    );
+    let _ = sup.stop(&registry, "rununlatch", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_breach_on_a_replaced_run_never_acts_on_the_new_process() {
     // Review round 1 (finding 8): usage attributed to a child of an ENDED
     // process-owning Run records that Run's breach but acts on nothing.

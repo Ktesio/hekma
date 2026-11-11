@@ -29,9 +29,8 @@ use crate::domain::outbox::OUTBOX_MAX_BYTES;
 use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
-    self, BreachDefaultUpgradedEvent, LimitSource, PolicyEvent, PolicyEventKind, PolicyLimits,
-    PolicyRecord, ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME,
-    POLICY_EVENT_SCHEMA_VERSION,
+    self, BreachDefaultUpgradedEvent, PolicyEvent, PolicyEventKind, PolicyLimits, PolicyRecord,
+    ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
@@ -424,13 +423,24 @@ impl Registry {
             policies: policies.as_ref().clone(),
         });
         if let Some(note) = fail_closed {
-            // Fail closed WITHOUT disarming: every arm the reads could
-            // still resolve stays enforced; only the action degrades, to
-            // `pause`.
-            resolution.action = BreachAction::Pause;
-            resolution.effective_action = BreachAction::Pause;
-            resolution.fallback = None;
-            resolution.sources.breach_action = LimitSource::Instance;
+            // Fail closed WITHOUT disarming and WITHOUT loosening: every
+            // arm the reads could still resolve stays enforced, and the
+            // action only TIGHTENS — `pause` at minimum, but an already
+            // tighter explicit `stop` or `block` stays (an explicit
+            // `block` keeps its Run-start fence through a degraded read;
+            // the round-3 L2 fix replaced an unconditional pause that
+            // quietly downgraded it). The source label stays honest.
+            let tighten = |action: BreachAction| {
+                if crate::domain::runs::policy::action_tightness(action)
+                    < crate::domain::runs::policy::action_tightness(BreachAction::Pause)
+                {
+                    BreachAction::Pause
+                } else {
+                    action
+                }
+            };
+            resolution.action = tighten(resolution.action);
+            resolution.effective_action = tighten(resolution.effective_action);
             resolution.fail_closed = Some(note);
         }
         resolution
@@ -1164,9 +1174,17 @@ impl Registry {
         let mut inputs_by_instance: HashMap<String, ResolveInputs> = HashMap::new();
         for run in &runs {
             if let Some(instance) = &run.instance {
+                // The fail-closed read (round 3, L6): an unreadable config
+                // carries its reason as the malformed note (action pause)
+                // instead of silently resolving as if nothing were set —
+                // the stored row feeds child levels and change-job arms.
                 inputs_by_instance
                     .entry(instance.clone())
-                    .or_insert_with(|| self.resolve_inputs_for(instance));
+                    .or_insert_with(|| {
+                        InstanceName::new(instance)
+                            .map(|name| self.resolve_inputs_fail_closed(&name))
+                            .unwrap_or_default()
+                    });
             }
         }
         let publisher = Arc::clone(&self.run_snapshot);

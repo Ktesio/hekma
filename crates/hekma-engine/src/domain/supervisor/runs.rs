@@ -131,7 +131,10 @@ impl Supervisor {
     /// match the config the operator sees. An instance with no open Run
     /// resolves nothing (the next start resolves at creation).
     pub(crate) fn sync_run_policy(&self, registry: &Registry, name: &InstanceName) {
-        let inputs = registry.resolve_inputs_for(name.as_str());
+        // The fail-closed read (round 3, L6): an unreadable configuration
+        // is carried as the malformed note (action pause), never resolved
+        // as if the instance had set nothing.
+        let inputs = registry.resolve_inputs_fail_closed(name);
         let instance = name.clone();
         let result = registry.run_job(move |store| {
             use crate::ports::RunRecords;

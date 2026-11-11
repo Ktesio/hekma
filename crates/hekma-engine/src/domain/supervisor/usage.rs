@@ -1447,6 +1447,14 @@ impl Supervisor {
                 return;
             }
         };
+        // Round 3, L3: only breaches whose `(dimension, scope)` is STILL
+        // latched re-apply — the Operator may have raised the ceiling
+        // since (the raise unlatches), and re-applying a spent breach
+        // paused a relaunched agent under a ceiling it no longer crosses.
+        let latch_rows: Vec<crate::domain::LatchKey> = registry
+            .latches(run_id)
+            .map(|rows| rows.into_iter().map(|(key, _)| key).collect())
+            .unwrap_or_default();
         let latched = breaches.into_iter().rev().find(|event| {
             let configured = match event.dimension {
                 BreachDimension::Tokens => token_action,
@@ -1454,6 +1462,7 @@ impl Supervisor {
             };
             event.action == configured
                 && matches!(event.action, BreachAction::Pause | BreachAction::Stop)
+                && latch_rows.contains(&crate::domain::LatchKey::new(event.dimension, event.scope))
         });
         let Some(event) = latched else {
             return;

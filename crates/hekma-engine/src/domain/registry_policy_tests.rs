@@ -1956,6 +1956,52 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
 }
 
 #[test]
+fn a_degraded_cache_keeps_an_explicit_block_and_its_fence_action() {
+    // Round 3, L2: the fail-closed action only TIGHTENS — an explicit
+    // `block` stays `block` (and keeps its Run-start fence) through a
+    // degraded read; the source label stays honest. The round-2 fix
+    // forced `pause` unconditionally, quietly downgrading block.
+    let seeded = seed(1_000);
+    let name = InstanceName::new("money").unwrap();
+    let config = seeded.registry.paths().instance_config(&name);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 100\n",
+    )
+    .unwrap();
+    seeded
+        .registry
+        .policies
+        .degrade("the Policies could not be read (test)".to_string());
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert_eq!(
+        resolution.action,
+        BreachAction::Block,
+        "block is tighter than pause"
+    );
+    assert_eq!(resolution.effective_action, BreachAction::Block);
+    assert!(
+        resolution.fail_closed.is_some(),
+        "the degradation is still noted"
+    );
+    // The source stays honest: the explicit config, not a fake instance
+    // relabel.
+    assert!(matches!(
+        resolution.sources.breach_action,
+        crate::domain::runs::LimitSource::Instance
+    ));
+    // A pause-level action still tightens up from warn.
+    std::fs::write(
+        &config,
+        "[budget]\nbreach_action = \"warn\"\n[budget.tokens]\nper_run = 100\n",
+    )
+    .unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+}
+
+#[test]
 fn a_second_engines_policy_change_is_visible_after_one_refresh() {
     // The cross-process staleness check: engine B (its own writer and
     // cache) creates a Policy with a ceiling; engine A's cached set is

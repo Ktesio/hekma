@@ -929,6 +929,13 @@ pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
 /// is treated as ABSENT for that scope/action rather than erroring — the honest
 /// degrade is "no ceiling / default action", never a panic mid-ingestion. Write
 /// validation ([`validate_write`]) is the primary gate; this read is defensive.
+///
+/// NOT the resolution (story 21-3): this legacy reader sees only the
+/// configuration. An absent action answers `warn` — the seeded `default`
+/// Policy's value — but an EDITED default Policy or the kept-on-pause
+/// marker changes the truth, and only
+/// [`crate::domain::runs::policy::resolve`] knows it. Embedders should
+/// resolve through the engine; this remains for the pre-Policy surfaces.
 pub fn resolve_token_budget(effective: &EffectiveConfig) -> (TokenBudget, BreachAction) {
     let per_run = budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY);
     let cumulative = budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY);
@@ -988,6 +995,13 @@ fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
 /// `config.toml`) is treated as ABSENT for that direction/scope rather than
 /// erroring — the honest degrade is "no Rate / no ceiling", never a panic
 /// mid-ingestion. [`validate_write`] is the primary gate; this read is defensive.
+///
+/// NOT the resolution (story 21-3): these legacy readers see only the
+/// configuration. An absent action answers `warn` — the seeded `default`
+/// Policy's value — but an EDITED default Policy or the kept-on-pause
+/// marker changes the truth, and only
+/// [`crate::domain::runs::policy::resolve`] knows it. Embedders should
+/// resolve through the engine; these remain for the pre-Policy surfaces.
 pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, BreachAction) {
     // Both directions required for a "supplied" Rate (AC6/AC-B). A missing or
     // malformed direction → no Rate (inert).
