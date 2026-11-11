@@ -139,6 +139,8 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action` and `external_id` | 201 + `Location: /v0/runs/{id}` + the Run |
 | `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
+| `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
+| `PATCH` | `/v0/runs/{id}/labels` | Bind and unbind labels as the Operator (below): `{"set": {…}, "remove": […], "dry_run": bool}` | 200 + the labels after |
 
 The identity-bearing reads return the engine's own documents — the same wire
 shapes (and schema versions) the CLI already renders. A `POST` lifecycle verb
@@ -192,6 +194,37 @@ Run refusals carry a stable `error.code` beside the `kind`:
 | `nesting-too-deep` | 400 | The child would nest more than 8 levels deep |
 | `action-unavailable` | 400 | The Breach Action cannot execute at the child's depth; the message names the depth and the Metering Source |
 | `invalid-request` | 400 | A malformed label or field |
+| `run-ended` | 409 | The Run has ended, so its labels cannot change |
+| `label-from-config` | 409 | `remove` names a label the agent's `labels.<key>` configuration binds; the message names the key and how to change it |
+| `label-not-bound` | 409 | `remove` names a label the Run set about itself (a caller label) |
+| `label-bound` | 409 | A caller label names a key already bound on the Run |
+| `instance-not-found` | 404 | No agent has the name given as a label target |
+
+### Bound labels
+
+`PATCH /v0/runs/{id}/labels` binds and unbinds labels on one Run with the
+Operator's bearer — the same verb as `hekma label` (see
+[Runs](runs.md#bound-labels)):
+
+```text
+PATCH /v0/runs/run_01JZ6Q9G3S8V2X7K4M1N5P0R2T/labels
+{"set": {"team": "core"}, "remove": ["tier"], "dry_run": false}
+```
+
+A label in `set` is bound with origin `label-verb`; it outranks the agent's
+`labels.<key>` configuration and any caller label on the same key. A key in
+`remove` takes back a label set this way, and if the agent's configuration
+binds the same key, its value returns (origin `config`) in the same change. An
+absent key is unchanged. The request is all or nothing; `dry_run` answers with
+the labels the change would leave and writes nothing. The answer is
+`{"schema_version": 1, "run_id", "labels", "prior_labels", "changed",
+"dry_run"}`: the Run's labels after (or as planned) and before, bound and
+caller. An empty change, a malformed key or value, or a key both set and
+removed is a `400 invalid_body`. Unlike the other bodies, an unknown field is
+refused (`422 invalid_body`), so a misspelled `dry_run` never becomes a real
+write. A change commits one `labels-changed` Run
+event; repeating it changes nothing and emits nothing.
+`GET /v0/runs/{id}/labels` answers `{"schema_version": 1, "run_id", "labels"}`.
 
 ## Documents and versions
 

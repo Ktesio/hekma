@@ -9,11 +9,12 @@
 
 use std::sync::Arc;
 
+use super::labels::{self, LabelRefusal};
 use super::snapshot::{RunEntry, SnapshotPublisher};
 use super::{
-    Anomaly, ChildRunRequest, ControlDepth, Label, LabelSource, RunError, RunEvent, RunEventKind,
-    RunParent, RunRecord, RunStatus, RunUsage, RunView, HOST_IDENTITY_BINDING, MAX_RUN_NESTING,
-    RUN_EVENT_SCHEMA_VERSION,
+    policy, Anomaly, ChildRunRequest, ControlDepth, Label, LabelChange, LabelOutcome, RunError,
+    RunEvent, RunEventKind, RunParent, RunRecord, RunStatus, RunUsage, RunView, Selector,
+    HOST_IDENTITY_BINDING, MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION,
 };
 use crate::domain::budget::BreachAction;
 use crate::domain::bus::EngineEvent;
@@ -30,12 +31,17 @@ use crate::store::WriterCtx;
 pub(crate) struct RunChanges {
     pub events: Vec<RunEvent>,
     pub entries: Vec<RunEntry>,
+    /// Test-only: the Runs whose Policy hook ran in this operation.
+    #[cfg(test)]
+    pub policy_resolved: Vec<RunId>,
 }
 
 impl RunChanges {
     fn extend(&mut self, other: RunChanges) {
         self.events.extend(other.events);
         self.entries.extend(other.entries);
+        #[cfg(test)]
+        self.policy_resolved.extend(other.policy_resolved);
     }
 }
 
@@ -100,11 +106,8 @@ fn note<S: RunRecords + ?Sized>(
         prior_control_depth: prior.depth,
         prior_wire_path: prior.wire_path,
         anomalies: record.anomalies.clone(),
-        labels: labels
-            .iter()
-            .filter(|label| label.source == LabelSource::Bound)
-            .cloned()
-            .collect(),
+        labels: bound_only(&labels),
+        prior_labels: prior.labels,
         cause,
         at: record.updated_at.clone(),
     });
@@ -121,6 +124,16 @@ struct Prior {
     status: Option<RunStatus>,
     depth: Option<ControlDepth>,
     wire_path: Option<bool>,
+    labels: Option<Vec<Label>>,
+}
+
+/// The bound subset of `labels` (what a Run event carries).
+fn bound_only(labels: &[Label]) -> Vec<Label> {
+    labels
+        .iter()
+        .filter(|label| label.is_bound())
+        .cloned()
+        .collect()
 }
 
 /// Move `record` to `status` with `anomalies`, saving it and noting the
@@ -417,7 +430,7 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     let prior = Prior {
         depth: Some(record.control_depth),
         wire_path: Some(record.wire_path),
-        status: None,
+        ..Prior::default()
     };
     record.control_depth = depth;
     record.wire_path = wire_path;
@@ -443,40 +456,145 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
     Ok(changes)
 }
 
-/// Replace a Run's bound labels; one `labels-changed` event when the set
-/// changed.
+/// Re-sync a Run's configuration-bound labels to `config` (the instance's
+/// `labels.*` now) — a config write, a relaunch or an adoption. Only
+/// `config`-origin rows are replaced; a `label-verb` key is kept and a
+/// configured key replaces a Caller row ([`labels::plan_config_sync`]). One
+/// `labels-changed` event (cause `config`) and one Policy re-resolution when
+/// the set changed; nothing at all when it did not or the Run has no row.
 pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     store: &S,
     run_id: &RunId,
-    labels: &[Label],
+    config: &[Label],
     at: &str,
 ) -> Result<RunChanges, StoreError> {
     let mut changes = RunChanges::default();
-    let current: Vec<Label> = store
-        .run_labels(run_id)?
-        .into_iter()
-        .filter(|label| label.source == LabelSource::Bound)
-        .collect();
-    let mut wanted = labels.to_vec();
-    wanted.sort();
-    if current == wanted {
-        return Ok(changes);
-    }
-    let Some(mut record) = store.run_record(run_id)? else {
+    let Some(record) = store.run_record(run_id)? else {
         return Ok(changes);
     };
-    store.replace_labels(run_id, LabelSource::Bound, &wanted)?;
+    let current = store.run_labels(run_id)?;
+    let next = labels::plan_config_sync(&current, config);
+    if next == current {
+        return Ok(changes);
+    }
+    write_labels(store, &mut changes, record, &current, &next, "config", at)?;
+    Ok(changes)
+}
+
+/// Write a Run's next label set (`next`, from a planner), then run the
+/// Policy hook inside the same job, then note the `labels-changed` event
+/// (bound labels before and after) and the snapshot entry — so a Policy
+/// re-resolution commits and publishes with the label change (AD-25).
+fn write_labels<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    mut record: RunRecord,
+    current: &[Label],
+    next: &[Label],
+    cause: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    store.set_run_labels(&record.run_id, next)?;
     record.updated_at = at.to_string();
     store.save_run(&record)?;
+    let resolved = policy::labels_changed(store, &record.run_id, at)?;
+    // Both planners only ever change bound rows (a verb write, a config
+    // row, a bound key replacing a Caller's), so a changed set is a changed
+    // bound set.
     note(
         store,
-        &mut changes,
+        changes,
         &record,
         RunEventKind::LabelsChanged,
-        Prior::default(),
-        None,
+        Prior {
+            labels: Some(bound_only(current)),
+            ..Prior::default()
+        },
+        Some(cause.to_string()),
     )?;
-    Ok(changes)
+    changes.extend(resolved);
+    Ok(())
+}
+
+/// The label verb (story 21-9, FR-49): bind and unbind labels on one
+/// non-ended Run as the Operator. `config` is what the instance
+/// configuration binds the Run today — the caller resolves it for a
+/// process-owning Run before the job (empty otherwise), so removing a verb
+/// label restores a value it shadowed. All-or-nothing; a dry run plans and
+/// writes nothing; an unchanged set writes and emits nothing.
+pub(crate) fn label<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    change: &LabelChange,
+    config: &[Label],
+    dry_run: bool,
+    at: &str,
+) -> Result<(LabelOutcome, RunChanges), RunError> {
+    change.validate()?;
+    let mut changes = RunChanges::default();
+    let record = store
+        .run_record(run_id)?
+        .ok_or_else(|| RunError::NotFound {
+            run_id: run_id.as_str().to_string(),
+        })?;
+    if record.is_ended() {
+        return Err(RunError::RunEnded {
+            run_id: run_id.as_str().to_string(),
+        });
+    }
+    let config: &[Label] = if record.process_owner { config } else { &[] };
+    let current = store.run_labels(run_id)?;
+    let next =
+        labels::plan_label_change(&current, change, config).map_err(|refusal| match refusal {
+            LabelRefusal::FromConfig(key) => RunError::LabelFromConfig {
+                run_id: run_id.as_str().to_string(),
+                key,
+                instance: record.instance.clone().unwrap_or_default(),
+            },
+            LabelRefusal::NotBound(key) => RunError::LabelNotBound {
+                run_id: run_id.as_str().to_string(),
+                key,
+            },
+        })?;
+    let changed = next != current;
+    if changed && !dry_run {
+        write_labels(
+            store,
+            &mut changes,
+            record,
+            &current,
+            &next,
+            "label-verb",
+            at,
+        )?;
+    }
+    Ok((
+        LabelOutcome {
+            run_id: run_id.clone(),
+            labels: next,
+            prior_labels: current,
+            changed,
+            dry_run,
+        },
+        changes,
+    ))
+}
+
+/// Resolve a Selector over the non-ended Runs (story 21-9): every Run
+/// carrying all its terms, bound or Caller, ordered by run id. More than
+/// [`MAX_SELECTED_RUNS`] matches is refused (`too-many-runs`), never cut.
+pub(crate) fn select<S: RunRecords + ?Sized>(
+    store: &S,
+    selector: &Selector,
+) -> Result<Vec<RunRecord>, RunError> {
+    let runs = store.select_runs(selector, MAX_SELECTED_RUNS + 1)?;
+    if runs.len() > MAX_SELECTED_RUNS {
+        return Err(RunError::TooManyRuns {
+            selector: selector.to_string(),
+            max: MAX_SELECTED_RUNS,
+        });
+    }
+    Ok(runs)
 }
 
 /// Raise the `breach` Anomaly on a Run that recorded a breach (FR-21's loud
@@ -607,6 +725,9 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
         labels.push(Label::caller(key.clone(), value.clone()));
     }
     labels.sort();
+    // The Caller guard (FR-49): every Caller-label write goes through it —
+    // vacuous for a fresh Run, which has no bound label yet.
+    labels::check_caller_labels(&run_id, &store.run_labels(&run_id)?, &labels)?;
     // A child opened under a held parent starts held, as the cascade would
     // have left it.
     let held = parent.status == RunStatus::Held;
