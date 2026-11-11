@@ -1119,10 +1119,28 @@ impl Supervisor {
             // The common un-governed path: nothing to evaluate, no writer trip.
             return;
         }
-        match registry
+        // cfg(test) FAULT-INJECTION SEAM (the `transition_fault_names`
+        // precedent, story 21-1): an instance armed in
+        // `usage_eval_fault_names` fails the evaluation's writer job ITSELF —
+        // before any breach is built — so the surfaced Err arm below (no
+        // breach recorded, the next usage event evaluates again) runs
+        // deterministically without staging a real store outage. No-op in
+        // every non-test build.
+        #[cfg(test)]
+        let evaluation = if self.usage_eval_fault_names.contains(name) {
+            Err(crate::ports::StoreError::Backend(
+                "injected usage-evaluation fault (test seam)".to_string(),
+            ))
+        } else {
+            registry
+                .writer()
+                .call(move |ctx| pipeline::evaluate(ctx, &input))
+        };
+        #[cfg(not(test))]
+        let evaluation = registry
             .writer()
-            .call(move |ctx| pipeline::evaluate(ctx, &input))
-        {
+            .call(move |ctx| pipeline::evaluate(ctx, &input));
+        match evaluation {
             Ok(evaluation) => self.apply_evaluation(registry, name, evaluation),
             Err(err) => self.log_enforcement_diagnostic(
                 registry,
@@ -1564,10 +1582,20 @@ impl Supervisor {
         event: &BudgetBreachEvent,
     ) {
         let job_event = event.clone();
-        match registry
-            .writer()
-            .call(move |ctx| pipeline::record_breach(ctx, &job_event))
-        {
+        // FAULT-INJECTION SEAM (the `usage_eval_fault_names` twin): an armed
+        // name fails the breach-record writer job ITSELF, driving the
+        // mandated-record-lost Err arm deterministically. Both the seam field
+        // and this whole helper are test-only, so no cfg split is needed.
+        let committed = if self.breach_record_fault_names.contains(name) {
+            Err(crate::ports::StoreError::Backend(
+                "injected breach-record fault (test seam)".to_string(),
+            ))
+        } else {
+            registry
+                .writer()
+                .call(move |ctx| pipeline::record_breach(ctx, &job_event))
+        };
+        match committed {
             Ok(append) => {
                 self.mirror_breach(registry, name, event);
                 self.note_outbox_append(&append);
