@@ -1923,7 +1923,13 @@ pub fn logs(name: &str, follow: bool, json: bool) -> Result<(), Box<dyn std::err
                     return Ok(());
                 }
                 raw_cursor = next_raw_cursor;
-                if (more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
+                // Break when a poll FOUND content (either stream — the late
+                // engine-line write the drain exists to catch), or when the
+                // bound elapsed — RETRY while the poll comes back empty.
+                // (Restored from the inverted form that broke on the FIRST
+                // empty read, which re-exposed the exact cross-process race
+                // FOLLOW_FINAL_DRAIN_BOUND's docs say the retry closes.)
+                if !(more.is_empty() && raw_more.is_empty()) || Instant::now() >= final_deadline {
                     break;
                 }
                 std::thread::sleep(FOLLOW_FINAL_DRAIN_POLL_INTERVAL);
