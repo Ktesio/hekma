@@ -485,18 +485,18 @@ impl Registry {
         })?
     }
 
-    /// The instance's open process-owning Run id, read on the read-only
-    /// connection (story 21-3: the enforcement arms resolve for the process
-    /// level, so a child Run's own limits never leak into them).
-    pub(crate) fn open_process_run(
+    /// The Rate one Run's own resolution carries (story 21-3, review
+    /// round 2): the per-Run pricing read for usage attributed to a child
+    /// Run — its Policy's flat Rate, priced onto its own ledger rows.
+    pub(crate) fn run_rate(
         &self,
-        name: &InstanceName,
-    ) -> Result<Option<crate::domain::usage::RunId>, StoreError> {
-        use crate::ports::RunRecords;
+        run: &crate::domain::usage::RunId,
+    ) -> Result<Option<crate::domain::cost::Rate>, StoreError> {
+        use crate::ports::PolicyRecords as _;
         Ok(self
             .store
-            .snapshot(|store| store.open_process_run(name))?
-            .map(|record| record.run_id))
+            .snapshot(|store| store.run_policy(run))?
+            .and_then(|row| row.resolution.rate))
     }
 
     /// Resolve a Selector over the non-ended Runs on the read-only

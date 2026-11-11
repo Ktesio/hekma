@@ -910,9 +910,33 @@ impl Supervisor {
             .running
             .get(name)
             .map_or(0, |supervised| supervised.launch_generation);
+        // Story 21-3 (review round 2): usage attributed to a CHILD Run
+        // prices at the child's OWN resolved Rate (its Policy's flat Rate)
+        // — the ledger is per-Run priced, so a child-only Policy Cost Cap
+        // sees cost priced at the child's Rate, not the owner's (or none).
+        // The owner's own usage prices at the evaluator's Rate as before.
+        let row_rate = if self.running.get(name).map(|s| &s.run_id) == Some(run_id) {
+            None
+        } else {
+            match registry.run_rate(run_id) {
+                Ok(rate) => rate,
+                Err(err) => {
+                    // Best effort with a surfaced note: the row prices at
+                    // the owner's Rate (or unpriced) — never silently, and
+                    // no retro-repricing exists to repair it later.
+                    self.emit_diagnostic(&format!(
+                        "{}: the attributed Run's Rate could not be read ({err}); its usage row \
+                         prices at the owning Run's Rate",
+                        name.as_str(),
+                    ));
+                    None
+                }
+            }
+        };
         let job = pipeline::UsageJob {
             event,
             generation,
+            row_rate,
             eval: self.eval_input(registry, name, run_id, metering_source),
         };
         match registry

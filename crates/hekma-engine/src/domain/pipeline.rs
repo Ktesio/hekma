@@ -106,6 +106,12 @@ pub(crate) struct UsageJob {
     pub event: UsageEvent,
     pub generation: u64,
     pub eval: EvalInput,
+    /// The Rate the ROW prices at when it differs from the evaluator's
+    /// (story 21-3, review round 2): usage attributed to a CHILD Run
+    /// prices at the child's own resolved Rate (its Policy's flat Rate),
+    /// while the evaluator's Rate stays the process-owning Run's. `None`
+    /// prices at `eval.rate` (the owner's own usage).
+    pub row_rate: Option<Rate>,
 }
 
 /// What [`commit_usage`] committed.
@@ -121,9 +127,10 @@ pub(crate) fn commit_usage(
     ctx: &mut WriterCtx<'_>,
     job: UsageJob,
 ) -> Result<UsageCommit, StoreError> {
+    let row_rate = job.row_rate.or(job.eval.rate);
     let outcome = ctx
         .store()
-        .insert_usage(&job.event, job.eval.rate, job.generation)?;
+        .insert_usage(&job.event, row_rate, job.generation)?;
     if outcome == RecordOutcome::DuplicateReplay {
         // Nothing new committed: no event, no evaluation (AC-A).
         return Ok(UsageCommit {

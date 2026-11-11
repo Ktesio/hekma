@@ -8725,6 +8725,7 @@ fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
     };
     // The previous attach's committed sequence 0.
     let first = crate::domain::pipeline::UsageJob {
+        row_rate: None,
         event: assemble_usage_event(
             &usage,
             name.as_str(),
@@ -9087,6 +9088,101 @@ fn the_policy_delete_dry_run_reports_and_default_is_refused_at_the_supervisor() 
     assert_eq!(applied.matched, 0);
     assert!(registry.policy("gone").unwrap().is_none());
     let _ = sup.stop(&registry, "poldel", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_child_priced_by_its_own_policy_rate_breaches_its_own_dollar_cap() {
+    // Round 2, N4: the owner Run is UNPRICED (no instance Rate, no table
+    // entry). A child bound `team=core` sits under a Policy with a flat
+    // Rate ($1/$1 per 1M) and a child-only per-run Cost Cap. The child's
+    // usage rows price at the CHILD's resolved Rate, so its own dollar
+    // arm sees real cost and FIRES — before the fix the rows priced at
+    // the owner's Rate (none), the cost stayed 0, the cap never fired and
+    // no `unpriced-model` Anomaly existed to say so.
+    let (_state, _manifest, registry) = setup_fake("poldchild", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("poldchild").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "poldchild").unwrap();
+    let owner = open_run(&registry, "poldchild").record.run_id;
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "poldchild".to_string(),
+            )),
+        )
+        .unwrap();
+    let child_id = child.record.run_id.clone();
+    registry
+        .run_job(move |store| {
+            crate::domain::runs::ops::label(
+                store,
+                &child_id,
+                &crate::domain::LabelChange::set([("team", "core")]),
+                &[],
+                false,
+                &crate::time::now_rfc3339(),
+            )
+        })
+        .unwrap();
+    // The Policy: $1/$1 per 1M, a 100-micro-dollar per-run cap on the
+    // child's own level (warn — a child breach never acts on the process).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "kidrate".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                dollars_per_run_micros: Some(100),
+                rate: Some(crate::domain::Rate::new(1_000_000, 1_000_000)),
+                breach_action: Some(BreachAction::Warn),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // 150 tokens on the child = 150 micro-dollars at the child's Rate —
+    // over the 100-micro cap.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &child.record.run_id,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // The child's ledger rows priced at its own Rate: the derived cost is
+    // real, the child's dollar arm fired, and the owner (no cap) stayed
+    // quiet.
+    let child_view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(child_view.usage.cost_micros, crate::domain::Micros(150));
+    let breaches = Supervisor::read_breach_events(&registry, "poldchild").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].run_id, child.record.run_id.as_str());
+    assert_eq!(
+        breaches[0].dimension,
+        crate::domain::BreachDimension::Dollars
+    );
+    assert_eq!(breaches[0].limit, 100);
+    assert_eq!(breaches[0].action, BreachAction::Warn);
+    assert!(child_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    let owner_view = registry.run_view(&owner).unwrap();
+    assert!(!owner_view
+        .record
+        .anomalies
+        .contains(&crate::domain::Anomaly::Breach));
+    assert_eq!(state_of(&registry, "poldchild"), LifecycleState::Running);
+    let _ = sup.stop(&registry, "poldchild", Some(Duration::from_secs(5)));
 }
 
 #[test]

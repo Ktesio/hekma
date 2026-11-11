@@ -1452,7 +1452,7 @@ fn a_fail_closed_resolution_keeps_the_arms_it_can_still_resolve() {
 /// A minimal `fake_agent` manifest dir for the registry-level fixtures.
 fn fake_manifest(name: &str) -> std::path::PathBuf {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.into_path();
+    let path = dir.keep();
     hekma_conformance::test_support::ManifestFixture::new(name, &["--linger-ms", "600000"])
         .guaranteed_on_all_oses("interaction")
         .guaranteed_on_all_oses("pause")
