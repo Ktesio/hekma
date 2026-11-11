@@ -492,13 +492,52 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
 skip the metering listener), status, Anomalies, parent, instance, labels with
-their source, limits, subtree usage and open children. A child's usage counts
+their source (`bound, config`, `bound, label-verb` or `caller`), limits, subtree usage and open children. A child's usage counts
 on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
 child Run (closing an ended one changes nothing); a Run that owns an agent's
 process is stopped with `hekma agent stop`, never closed. Exit codes: `3` when
 no Run has the id, `4` when the agent has no open Run, the parent has ended or
 the Run owns a process, `2` for a malformed flag, more than 8 levels of
 nesting, or a Breach Action the child cannot execute.
+
+## `hekma label set|remove <run-id|agent|--selector <selector>> <labels>... [--dry-run] [--yes] [--json]`
+
+Bind and unbind labels on Runs (see [Runs](runs.md#bound-labels)). `set`
+takes `key=value` labels; `remove` takes keys.
+
+```bash
+hekma label set my-agent team=core
+hekma label set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T env=prod tier=gold --json
+hekma label set --selector team=core,env=prod tier=gold --dry-run
+hekma label remove --selector team=core tier --yes
+```
+
+| Argument / flag | Meaning |
+|---|---|
+| `<run-id\|agent>` | The target, unless `--selector` is given: a run id, or an agent name (its open Run) |
+| `--selector key=value[,key=value...]` | Every open Run carrying all these labels, bound or caller (at most 1000) |
+| `--dry-run` | Show each Run's planned change; write nothing |
+| `--yes` | Do not ask before acting on several Runs |
+| `--json` | Print `{"schema_version": 1, "dry_run", "matched", "results": [{"run_id", "outcome", "labels", "prior_labels", "error"}]}` |
+
+A label set here is bound with origin `label-verb`: it outranks the agent's
+`labels.<key>` configuration and any caller label on the key, and stays with
+the Run across a relaunch. `remove` takes back such a label; when the
+configuration binds the same key, its value returns. Removing a label that
+comes from configuration is refused, naming the `labels.<key>` key to change
+with `hekma agent config set`; removing a caller label is refused; removing an
+absent key changes nothing. When a Selector matches more than one Run, the set
+is listed and you are asked to confirm; without a terminal the command is
+refused unless `--yes` is given. Each Run prints one line (`labeled`,
+`unchanged`, `would label`, or its refusal on stderr) and a refusal does not
+stop the others. No match exits `0` with a note. The target and the Selector
+are read from the state directory, and so is a `--dry-run`, which starts
+nothing; each change goes through the local Service Host, started if none is
+running, like every other write. Exit codes are the first failure's: `3` when
+no Run has the id or no agent has the name, `4` when the agent has no open Run,
+the Run has ended or the label cannot be removed, `2` for a malformed label
+or Selector, a Selector matching more than 1000 Runs, or several matches with
+no terminal and no `--yes`.
 
 ## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
@@ -607,7 +646,7 @@ Every `hekma` command returns one of these numeric exit codes, so failures can b
 | `0` | Success | The command completed; `--help` and `--version` also exit `0` |
 | `1` | General error | An internal or unexpected failure: filesystem/IO, state store, config load, launch failure, an invalid or unreadable adapter manifest, an adapter manifest whose `contract_version` major does not match this engine's (the FR-30 negotiation gate — the error names both versions and the rule), an adapter declaring no capabilities or no metering source, a failed self-update, a `hekma serve` that could not START (state-dir creation, lock I/O, engine open, runtime build, signal registration — an environment/system failure, not an invocation error), or a local Service Host that could not be found, started, or stopped answering for a write (the diagnostic names `<state-dir>/serve.log`) |
 | `2` | Usage error | An invalid invocation: an unknown flag or a missing/invalid argument, an invalid instance name, an unknown adapter kind, an unknown config key, a duplicate instance name, a `hekma serve` on a state directory another host already serves (the diagnostic names the live holder PID and the stop-it-or-switch-roots remediation), or a serve option value outside its documented bounds (e.g. `--stop-window` outside `1..=86400`, a non-loopback `--listen` without `--tls-cert`/`--tls-key`, or an unreadable TLS PEM file) |
-| `3` | Not found | The named Agent Instance does not exist, or no `adapter.toml` was found at the given `--manifest` path |
+| `3` | Not found | The named Agent Instance does not exist, no `adapter.toml` was found at the given `--manifest` path, or no Run has the given run id |
 | `4` | Invalid state | The instance is not in a state that permits the operation: not running, an invalid lifecycle transition, removing a running instance without `--force`, attaching/detaching a Memory Backing on a non-terminal instance, attaching a different kind than the one already attached, a stop that could not be confirmed, or a second `send` to an `acp` instance while an ACP turn is still in flight (the first turn is unaffected) |
 | `5` | Unsupported capability | Either the agent's Capability Declaration forbids the operation on this OS (e.g. `pause` or `send` declared `unsupported`), or the operation needs a live interaction channel this session cannot reach — `hekma agent send` to an instance adopted from an earlier session has no recoverable stdin pipe. `hekma agent resume` of a `paused` instance whose CURRENT pause declaration reads `unsupported` lands here too (the dedicated resume diagnostic names the state + the `stop`/`start` recovery), and so does `hekma agent start --detach` of an `engine-observed` instance (its loopback listener dies with the starting command — the refusal fires before anything changes) |
 | `6` | Timed out | A bounded operation exceeded its deadline (e.g. `send` when the agent is not draining its input) |
