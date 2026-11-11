@@ -9091,6 +9091,69 @@ fn the_policy_delete_dry_run_reports_and_default_is_refused_at_the_supervisor() 
 }
 
 #[test]
+fn a_child_prices_at_the_evaluators_rate_when_its_stored_rate_is_instance_sourced() {
+    // Round 3, L5: only a POLICY-sourced Rate rides the child's stored
+    // resolution onto its ledger rows. An instance-sourced one can go
+    // stale after a `cost.rate.*` write (only the process-owning Run
+    // re-resolves then), so those rows price at the evaluator's FRESH
+    // Rate — never at a price the config no longer carries.
+    let (_state, _manifest, registry) = setup_fake("stalechild", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("stalechild").unwrap();
+    registry
+        .set_config(&name, "cost.rate.input", "2.00")
+        .unwrap();
+    registry
+        .set_config(&name, "cost.rate.output", "2.00")
+        .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "stalechild").unwrap();
+    let child = sup
+        .open_child_run(
+            &registry,
+            crate::domain::ChildRunRequest::under(crate::domain::RunParent::Instance(
+                "stalechild".to_string(),
+            )),
+        )
+        .unwrap();
+    // The child's stored resolution carries the INSTANCE rate ($2/$2).
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().rate,
+        Some(crate::domain::Rate::new(2_000_000, 2_000_000)),
+        "the stored resolution is instance-priced"
+    );
+    // The operator then changes the instance rate; only the owner
+    // re-resolves — the child's stored row is now stale.
+    registry
+        .set_config(&name, "cost.rate.input", "1.00")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().rate,
+        Some(crate::domain::Rate::new(2_000_000, 2_000_000)),
+        "the child's stored row is one read behind (by design)"
+    );
+    // The child's usage rows price at the evaluator's FRESH $1/$2 rate.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &child.record.run_id,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let view = registry.run_view(&child.record.run_id).unwrap();
+    // 1M input at $1/1M = $1 = 1,000,000 micros (not the stale $2).
+    assert_eq!(view.usage.cost_micros, crate::domain::Micros(1_000_000));
+    let _ = sup.stop(&registry, "stalechild", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_child_priced_by_its_own_policy_rate_breaches_its_own_dollar_cap() {
     // Round 2, N4: the owner Run is UNPRICED (no instance Rate, no table
     // entry). A child bound `team=core` sits under a Policy with a flat
