@@ -9,6 +9,17 @@ Release automation updates this file with a pull request after each `vMAJOR.MINO
 >
 > - **A signal-killed paused detached agent is no longer recorded as an adopted process when the engine releases it.** At shutdown the engine reconciles a paused detached agent that had already exited to `failed`; when that agent was spawned by this engine and died by a signal, the recorded cause now says "terminated by signal". Only an agent adopted from a previous engine — whose exit code this engine structurally cannot read — keeps the "exit code unavailable — adopted process is not this engine's child" wording. The `paused → failed` transition, the record settlement, and the coded-exit wording are unchanged.
 
+> **Unreleased — bound labels: `hekma label` (hekma-engine 0.12.0).**
+> Announced ahead of the release that ships it:
+>
+> - **`hekma label set|remove`** binds and unbinds labels on one Run (by run id), on an agent's open Run (by name), or on every open Run a `--selector key=value[,key=value…]` matches, bound or caller labels alike. Several matches are listed and confirmed (`--yes` skips the question; without a terminal the command is refused unless `--yes` is given, so scripts never hang), `--dry-run` shows each Run's planned change and writes nothing, and `--json` prints one result per Run. A refusal on one Run does not stop the others; the exit code is the first failure's (`3`, `4` or `2`). No match exits `0` with a note; more than 1000 matches is refused.
+> - **Precedence.** A label set with the verb is bound with origin `label-verb` and, per key, outranks the agent's `labels.<key>` configuration (origin `config`) and any caller label; a later configuration write, a crash relaunch or an adoption keeps it. Removing it restores the configured value in the same change. Removing a configured label (`label-from-config`, naming the key to change) or a caller label (`label-not-bound`) is refused, as is any change to an ended Run (`run-ended`). Labels belong to the Run: a new `start` opens a Run without them.
+> - **A Caller cannot set a bound key.** A caller label on a key already bound on the Run is refused (`label-bound`), and the store never turns a bound label into a caller label.
+> - **Control API.** `GET /v0/runs/{id}/labels` and `PATCH /v0/runs/{id}/labels` (`{"set": {…}, "remove": […], "dry_run": bool}` → the labels after, the labels before, `changed`), Operator bearer only; refusals carry the codes above as `409`, an unknown agent target is `404 instance-not-found`, a malformed change is `400 invalid_body`, and an unknown body field is refused so a misspelled `dry_run` never writes.
+> - **Events.** A `labels-changed` Run event gains `prior_labels` (the bound labels before) and a cause (`label-verb` or `config`); every bound label on every surface gains `origin`. Additive; the Run event schema stays 1.
+> - **One-way upgrade.** The first open migrates `state.db` to schema 14, recording `config` as the origin of every bound label.
+> - **Engine surface (within the unreleased 0.12.0):** `Engine::label_run`, `select_runs` and `instance_run` (async and blocking), `LabelChange`, `LabelOutcome`, `LabelOrigin`, `Selector`, `SelectorScope` and `MAX_SELECTED_RUNS`; `Label` gains `origin`, `RunEvent` gains `prior_labels`, and `RunError` gains `RunEnded`, `LabelFromConfig`, `LabelNotBound`, `LabelBound` and `TooManyRuns`.
+
 > **Unreleased — Runs as first-class entities (hekma-engine 0.12.0).**
 > Announced ahead of the release that ships it:
 >
