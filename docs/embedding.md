@@ -117,6 +117,7 @@ surface `hekma` uses. The capabilities you will reach for first:
 | `fleet` / `instance_status` | Read per-instance rows — state, usage, budget remaining, metering source — what `hekma agent list` renders. |
 | `budget_breach_events` / `transition_events` / `read_agent_log` | Query the durable records directly (a `subscribe` sees only later commits; the query APIs reach the past). |
 | `open_child_run` / `close_run` / `run` | Open a child Run under a supervised Run for one unit of your own work (`ChildRunRequest`: parent, caller labels, per-run ceilings, an external id for idempotent retries), close it, and read any Run (`RunView`: depth, status, Anomalies, labels, limits, subtree usage). Refusals are a typed `RunError` with a stable `code()`. See [Runs](runs.md). |
+| `label_run` / `select_runs` / `instance_run` | Bind and unbind labels on one Run as the Operator (`LabelChange`: `set` and `remove`, plus a dry run), returning a `LabelOutcome` (the labels after and before, and whether they changed); resolve a `Selector` (`key=value,…`) to the open Runs carrying every term (at most `MAX_SELECTED_RUNS`, else `RunError::TooManyRuns`); and read the open Run of an agent. Each bound `Label` carries its `origin` (`config` or `label-verb`). See [Runs](runs.md#bound-labels). |
 | `send_input` / `attach_memory` / `detach_memory` | Interaction and memory wiring, where the adapter declares support. For an `acp` instance `send_input` dispatches one ACP `session/prompt` turn and returns immediately (the turn streams asynchronously); a second prompt while a turn is in flight is refused with `EngineError::AcpTurnInFlight`. |
 
 Every method returns a typed `Result` — the engine reports partial failures
@@ -161,7 +162,9 @@ Four rules cover the whole contract:
    and is one of: a lifecycle transition, a budget breach, a committed usage
    measurement, or a Run event (`EngineEvent::Run`: a Run created, its depth,
    status, Anomalies or bound labels changed, or ended — published right after
-   the event that caused it) — the exact wire shapes `hekma --json` documents.
+   the event that caused it; a `labels-changed` event carries the bound labels
+   after and before (`prior_labels`) and its cause, `label-verb` or `config`)
+   — the exact wire shapes `hekma --json` documents.
 3. **A slow subscriber never stalls supervision.** The bus is bounded; if you
    fall more than its capacity behind, your next receive observes `Lagged` and
    resynchronizes at the tail — the dropped events stay readable in the

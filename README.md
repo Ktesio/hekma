@@ -120,7 +120,7 @@ Letting an agent loose in CI? The [Agents in GitHub Actions](https://hekma.ktesi
 | `hekma agent remove` | Remove an agent |
 | `hekma self-update` | Update Hekma through the channel you installed it with |
 
-Coming with Runs and Policies *(in development)*: `hekma ps`, `hekma label` and `hekma policy`, with `--selector` on every verb.
+Coming with Runs and Policies: `hekma run` and `hekma label` are on the main branch for the next release; `hekma ps` and `hekma policy`, with `--selector` on every verb, are in development.
 
 The [CLI reference](https://hekma.ktesio.dev/docs/commands/) has every flag, the [exit codes](https://hekma.ktesio.dev/docs/exit-codes/) and the [JSON documents](https://hekma.ktesio.dev/docs/json-output/).
 

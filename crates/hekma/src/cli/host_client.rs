@@ -281,6 +281,11 @@ impl HostClient {
                 .post(&url)
                 .header("Authorization", &auth)
                 .send_json(json),
+            ("PATCH", Some(json)) => self
+                .agent
+                .patch(&url)
+                .header("Authorization", &auth)
+                .send_json(json),
             ("POST", None) => self
                 .agent
                 .post(&url)

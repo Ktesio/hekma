@@ -514,6 +514,56 @@ pub(crate) struct RunOpenRequest {
     pub external_id: Option<String>,
 }
 
+/// `GET /v0/runs/{id}/labels` (story 21-9): one Run's labels, bound and
+/// Caller, each with its source and (bound) origin.
+#[derive(Serialize)]
+pub(crate) struct RunLabelsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: hekma_engine::RunId,
+    /// Its labels, sorted by key.
+    pub labels: Vec<hekma_engine::Label>,
+}
+
+/// `PATCH /v0/runs/{id}/labels` (story 21-9): bind (`set`) and unbind
+/// (`remove`) labels as the Operator; `dry_run` plans without writing. An
+/// empty change, a malformed key or value, or a key both set and removed is
+/// a `400 invalid_body`. Unlike the other bodies, an unknown field is
+/// refused: a misspelled `dry_run` (`dry-run`, `dryRun`) would otherwise
+/// turn a preview into a real write.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunLabelsPatch {
+    /// `key: value` labels to bind.
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Keys to unbind.
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Plan only: answer with the labels the change would leave.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The `PATCH /v0/runs/{id}/labels` answer: the labels after the change (or
+/// as planned), the labels before, and whether the set changed.
+#[derive(Serialize)]
+pub(crate) struct RunLabelsChangeDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: hekma_engine::RunId,
+    /// Its labels after the change (or as planned).
+    pub labels: Vec<hekma_engine::Label>,
+    /// Its labels before the change.
+    pub prior_labels: Vec<hekma_engine::Label>,
+    /// Whether the label set changed (or would change).
+    pub changed: bool,
+    /// Whether this was a dry run (nothing written).
+    pub dry_run: bool,
+}
+
 /// `GET /v0/runs/{id}` and the Run verbs' read-back: one Run under the
 /// Control API schema version.
 #[derive(Serialize)]
