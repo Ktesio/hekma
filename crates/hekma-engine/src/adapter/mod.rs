@@ -2626,9 +2626,12 @@ max_age_ms = 5000
         // with ManifestUnreadable echoing the path and the io detail —
         // never a panic, never a silently-defaulted plan. The errno text
         // itself is platform-worded (Windows says "cannot find the file"),
-        // so the pin is the stable raw code, not the prose.
+        // so the pin is the stable raw code, not the prose. The absent
+        // file sits DIRECTLY under the temp dir: a missing PARENT would
+        // surface Windows' path-not-found (os error 3) instead, and the
+        // raw code would stop being cross-OS stable.
         let tmp = TempDir::new().unwrap();
-        let absent = tmp.path().join("absent").join(MANIFEST_FILE);
+        let absent = tmp.path().join(MANIFEST_FILE);
         let err = resolve_readiness_probe("demo", Some(&absent)).unwrap_err();
         match &err {
             LaunchResolveError::ManifestUnreadable { path, detail } => {
