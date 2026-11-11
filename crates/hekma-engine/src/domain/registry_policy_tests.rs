@@ -1264,6 +1264,53 @@ fn a_store_set_without_its_default_row_degrades_the_cache_at_load() {
 }
 
 #[test]
+fn a_rate_with_a_zero_direction_is_refused_everywhere() {
+    // Round 2, N5: a $0 direction understates cost and passes every Cost
+    // Cap — refused on the flat Rate and on every table entry alike.
+    let seeded = seed(1_000);
+    for (set_rate, table_rate, field) in [
+        (Some(Rate::new(0, 1_000_000)), None, "rate"),
+        (Some(Rate::new(1_000_000, 0)), None, "rate"),
+        // The table entry lives on `default` (the table's owner).
+        (None, Some(Rate::new(0, 0)), "rates"),
+    ] {
+        let is_default = table_rate.is_some();
+        let refusal = seeded
+            .registry
+            .apply_policy_change(
+                None,
+                PolicyChange {
+                    name: if is_default {
+                        "default".to_string()
+                    } else {
+                        "priced".to_string()
+                    },
+                    selector: if is_default {
+                        None
+                    } else {
+                        Some("team=core".parse().unwrap())
+                    },
+                    set: PolicyLimits {
+                        rate: set_rate,
+                        ..PolicyLimits::default()
+                    },
+                    clear: Vec::new(),
+                    rates: table_rate
+                        .map(|rate| BTreeMap::from([("gpt-demo".to_string(), Some(rate))]))
+                        .unwrap_or_default(),
+                },
+                contexts(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, RunError::Invalid { field: f, .. } if f == field),
+            "{refusal}"
+        );
+        assert!(refusal.to_string().contains("above zero"), "{refusal}");
+    }
+}
+
+#[test]
 fn a_flat_rate_on_the_default_policy_is_refused() {
     // The default Policy prices through its model-keyed table; a flat rate
     // on it would be stored and shown but never apply — refuse it.

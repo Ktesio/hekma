@@ -3792,6 +3792,27 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
         }}})),
     );
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // A Rate needs BOTH directions in the body: a missing one (or an
+    // empty object) is a 422, never an implicit $0; a $0 direction is the
+    // engine's 400 refusal.
+    for body in [
+        serde_json::json!({"rates": {"set": {"gpt-x": {"input_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {"output_micros_per_1m": 3_000_000}}}}),
+        serde_json::json!({"rates": {"set": {"gpt-x": {}}}}),
+        serde_json::json!({"set": {"rate": {"input_micros_per_1m": 1}}}),
+    ] {
+        let response = call(&client, "PATCH", &format!("{base}/nightly"), Some(body));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let mut response = call(
+        &client,
+        "PATCH",
+        &format!("{base}/nightly"),
+        Some(serde_json::json!({"set": {"rate": {
+            "input_micros_per_1m": 0, "output_micros_per_1m": 1_000_000,
+        }}})),
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let mut response = call(
         &client,
         "PATCH",

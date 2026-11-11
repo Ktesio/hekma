@@ -723,11 +723,11 @@ impl PolicyLimitsPatch {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RatePatch {
-    /// Input micro-dollars per 1M tokens.
-    #[serde(default)]
+    /// Input micro-dollars per 1M tokens (REQUIRED: a half-priced Rate
+    /// understates cost and passes every cap — a missing direction is a
+    /// 422, never an implicit $0).
     pub input_micros_per_1m: u64,
-    /// Output micro-dollars per 1M tokens.
-    #[serde(default)]
+    /// Output micro-dollars per 1M tokens (REQUIRED, same rule).
     pub output_micros_per_1m: u64,
     /// Cached-token micro-dollars per 1M tokens (optional; defaults to
     /// the input rate).

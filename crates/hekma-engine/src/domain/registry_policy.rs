@@ -487,6 +487,36 @@ impl Registry {
                     .to_string(),
             ));
         }
+        // A Rate with a $0 direction is refused on every surface: a
+        // half-priced or free model would understate cost and pass every
+        // Cost Cap (the instance rule — both directions or no Rate —
+        // applied to the Policy writes; the API body makes a missing
+        // direction a 422, the engine makes a zero one a refusal).
+        let rate_shape =
+            |rate: &Rate| rate.input_micros_per_1m != 0 && rate.output_micros_per_1m != 0;
+        if let Some(rate) = change.set.rate {
+            if !rate_shape(&rate) {
+                return Err(invalid(
+                    "rate",
+                    "a Rate needs both directions priced above zero — a $0 direction \
+                     understates cost and passes every Cost Cap"
+                        .to_string(),
+                ));
+            }
+        }
+        for (model, rate) in &change.rates {
+            if let Some(rate) = rate {
+                if !rate_shape(rate) {
+                    return Err(invalid(
+                        "rates",
+                        format!(
+                            "the Rate for model `{model}` needs both directions priced above \
+                             zero — a $0 direction understates cost and passes every Cost Cap"
+                        ),
+                    ));
+                }
+            }
+        }
         // The default Policy prices through its model-keyed table
         // (`--rate-for` / the PATCH `rates` part); a FLAT rate on it would
         // be stored and shown but never apply — refuse it (point at the
