@@ -485,6 +485,13 @@ impl Registry {
         })?
     }
 
+    /// Every non-ended Run (the change facade's context sweep: an
+    /// unsupervised instance's stored resolution still gets fresh inputs).
+    pub(crate) fn open_runs(&self) -> Result<Vec<crate::domain::runs::RunRecord>, StoreError> {
+        use crate::ports::RunRecords;
+        self.store.snapshot(|store| store.open_runs())
+    }
+
     /// The Rate one Run's own resolution carries (story 21-3, review
     /// round 2): the per-Run pricing read for usage attributed to a child
     /// Run — its Policy's flat Rate, priced onto its own ledger rows.

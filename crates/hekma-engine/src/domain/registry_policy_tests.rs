@@ -94,6 +94,7 @@ fn contexts() -> HashMap<String, InstanceContext> {
         InstanceContext {
             fence: None,
             metering_source: "self-reported".to_string(),
+            supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
         },
     )])
@@ -334,6 +335,7 @@ fn the_fence_clears_per_reason_only() {
         InstanceContext {
             fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
+            supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
         },
     );
@@ -485,6 +487,7 @@ fn an_unreadable_instance_config_skips_the_runs_money_half_fail_closed() {
         InstanceContext {
             fence: None,
             metering_source: "self-reported".to_string(),
+            supervised: true,
             inputs: Some(Err("the configuration could not be read".to_string())),
         },
     );
@@ -953,6 +956,7 @@ fn a_multi_run_instance_never_re_arms_a_cumulative_ceiling_on_the_run_totals() {
         InstanceContext {
             fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
+            supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
         },
     );
@@ -1055,6 +1059,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
         InstanceContext {
             fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
+            supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
         },
     );
@@ -1809,6 +1814,7 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
         InstanceContext {
             fence: None,
             metering_source: "self-reported".to_string(),
+            supervised: true,
             inputs: Some(Ok(crate::domain::config::explicit_limits(
                 &seeded
                     .registry

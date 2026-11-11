@@ -90,6 +90,11 @@ pub(crate) struct InstanceContext {
     pub fence: Option<WireFence>,
     /// The instance's metering source (the breach records name it).
     pub metering_source: String,
+    /// Whether THIS engine supervises the instance right now: only a
+    /// supervised instance's money half runs (the breach-at-once latch
+    /// must be executable by the engine that records it); an unsupervised
+    /// instance still gets FRESH inputs for its stored resolution.
+    pub supervised: bool,
     /// The instance's explicit limits and model, read fresh from its
     /// configuration by the caller; `Err` names why they could not be read
     /// (the Run is then skipped, never resolved as if nothing were set).
@@ -1302,7 +1307,7 @@ fn re_resolve_matched(
         if !run.is_ended() {
             if let Some(instance) = &run.instance {
                 match contexts.get(instance) {
-                    Some(context) => {
+                    Some(context) if context.supervised => {
                         if let Ok(name) = InstanceName::new(instance) {
                             re_arm(
                                 store,
@@ -1317,7 +1322,7 @@ fn re_resolve_matched(
                             )?;
                         }
                     }
-                    None => {
+                    _ => {
                         notes.push(format!(
                             "Run `{}` (agent `{instance}`) was not breach-checked here: this \
                              engine does not supervise the agent, so its supervising engine's \

@@ -1474,12 +1474,14 @@ mod tests {
         // (the vectors' bytes stay stable) and a SET one is never dropped
         // (the pre-fix skip was inverted — it dropped exactly the values
         // a future caller-limit case would carry).
-        let unset = serde_json::to_value(&ResolutionInput::default()).unwrap();
+        let unset = serde_json::to_value(ResolutionInput::default()).unwrap();
         assert!(unset.get("caller_limits").is_none(), "{unset}");
-        let mut set = ResolutionInput::default();
-        set.caller_limits = PolicyLimits {
-            tokens_per_run: Some(5_000),
-            ..PolicyLimits::default()
+        let set = ResolutionInput {
+            caller_limits: PolicyLimits {
+                tokens_per_run: Some(5_000),
+                ..PolicyLimits::default()
+            },
+            ..ResolutionInput::default()
         };
         let set = serde_json::to_value(&set).unwrap();
         assert_eq!(

@@ -166,7 +166,11 @@ impl Supervisor {
         &self,
         registry: &Registry,
     ) -> std::collections::HashMap<String, crate::domain::registry_policy::InstanceContext> {
-        self.running
+        let mut contexts: std::collections::HashMap<
+            String,
+            crate::domain::registry_policy::InstanceContext,
+        > = self
+            .running
             .iter()
             .map(|(name, supervised)| {
                 (
@@ -177,11 +181,36 @@ impl Supervisor {
                             .as_ref()
                             .map(crate::metering::ObservedListener::fence),
                         metering_source: supervised.metering_source.clone(),
+                        supervised: true,
                         inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
                     },
                 )
             })
-            .collect()
+            .collect();
+        // Every OTHER instance with an open Run gets fresh inputs too (its
+        // stored resolution must not run one config read behind), with no
+        // fence and `supervised: false` — its money half never runs here
+        // (the supervising engine owns the latch), but its re-resolve is
+        // as true as any other's.
+        if let Ok(open_runs) = registry.open_runs() {
+            for record in open_runs {
+                if let Some(instance) = record.instance.as_deref() {
+                    if contexts.contains_key(instance) {
+                        continue;
+                    }
+                    contexts.insert(
+                        instance.to_string(),
+                        crate::domain::registry_policy::InstanceContext {
+                            fence: None,
+                            metering_source: String::new(),
+                            supervised: false,
+                            inputs: Some(registry.try_resolve_inputs_for(instance)),
+                        },
+                    );
+                }
+            }
+        }
+        contexts
     }
 
     /// Create or change a Policy (story 21-3, PRD FR-60): one writer job

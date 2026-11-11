@@ -3804,7 +3804,7 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
         let response = call(&client, "PATCH", &format!("{base}/nightly"), Some(body));
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let mut response = call(
+    let response = call(
         &client,
         "PATCH",
         &format!("{base}/nightly"),

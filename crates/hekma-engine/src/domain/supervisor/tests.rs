@@ -9286,6 +9286,75 @@ fn a_foreign_engines_change_leaves_the_breach_to_the_supervising_engine() {
 }
 
 #[test]
+fn an_unsupervised_instances_re_resolve_uses_fresh_inputs() {
+    // Round 2, N16: a matched Run whose instance this engine does NOT
+    // supervise still re-resolves with FRESH inputs (the change facade
+    // builds contexts for every instance with an open Run) — its stored
+    // row does not run one config read behind, and a ceiling the operator
+    // set between changes shows up on the next change. The money half
+    // still never runs for it (the supervising engine owns the latch).
+    let (_state, _manifest, registry) = setup_fake("staleinputs", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("staleinputs").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    // An open process-owning Run for an instance that is NOT running here.
+    let ghost = RunId::mint();
+    let run = crate::domain::runs::ops::SupervisedRun {
+        instance: name.clone(),
+        run_id: ghost.clone(),
+        wire_path: false,
+        labels: vec![crate::domain::Label::bound("team", "ghost")],
+        fresh: true,
+        inputs: None,
+    };
+    registry.ensure_supervised_run(run).unwrap();
+    // A first change resolves and stores a row (no explicit inputs yet).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostact".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // The operator then sets an explicit ceiling in the config — the
+    // stored row knows nothing of it.
+    std::fs::create_dir_all(registry.paths().instance_config(&name).parent().unwrap()).unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget.tokens]\nper_run = 400\n",
+    )
+    .unwrap();
+    // Any later change re-resolves with the FRESH inputs: the row carries
+    // the explicit 400 (the stored inputs would have stayed empty).
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "ghostact2".to_string(),
+            selector: Some("team=ghost".parse().unwrap()),
+            set: crate::domain::PolicyLimits::default(),
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let view = registry.run_view(&ghost).unwrap();
+    assert_eq!(
+        view.policy.as_ref().unwrap().tokens.per_run,
+        Some(400),
+        "the fresh inputs resolved for the unsupervised instance"
+    );
+    // And no breach/latch was recorded here (the money half did not run).
+    assert!(Supervisor::read_breach_events(&registry, "staleinputs")
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn a_policy_change_publishes_on_the_bus_in_commit_order() {
     // Round 2, N7: bus order == outbox (commit) order. A change that fires
     // a breach appends the BREACH row first (inside the re-resolution),
