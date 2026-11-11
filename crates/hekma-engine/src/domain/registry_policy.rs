@@ -807,7 +807,19 @@ impl Registry {
                 // CHANGE over a row deleted meanwhile is `not-found`. A
                 // change re-merges over the FRESH row, so a concurrent
                 // edit to another field is kept rather than overwritten.
-                let fresh = store.policy(&change.name).map_err(RunError::Store)?;
+                // A CORRUPT `default` row reads as the SEED here: the
+                // caller's seed fallback (the restore semantics) carries
+                // through — `change default` is the one write that can
+                // heal the row.
+                let fresh = match store.policy(&change.name) {
+                    Ok(fresh) => fresh,
+                    Err(crate::ports::StoreError::CorruptRow { .. })
+                        if change.name == DEFAULT_POLICY_NAME =>
+                    {
+                        Some(PolicyRecord::default_policy())
+                    }
+                    Err(other) => return Err(RunError::Store(other)),
+                };
                 let record = match (&existing, fresh) {
                     (None, Some(_)) => {
                         return Err(RunError::PolicyExists {
