@@ -3367,11 +3367,27 @@ mod tests {
         let run = facade.run(owner.as_str()).unwrap();
         assert_eq!(run.policy.as_ref().unwrap().tokens.per_run, Some(1_234));
         // A `budget.breach_action` write is the FR-21 marker-clearing
-        // key: the action re-resolves (and a kept-on-pause marker, had
-        // one existed, clears in the same write).
+        // key: the action re-resolves, and a kept-on-pause marker (one is
+        // seeded here as the upgrade would leave it) clears in the same
+        // write.
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .writer
+                .call(|ctx| {
+                    ctx.store().execute_batch_for_test(
+                        "INSERT INTO breach_default_upgrade (instance_id, listed_at, done_at) \
+                         VALUES ((SELECT id FROM agent_instances WHERE name = 'demo'), 't', 't')",
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(facade.fleet().unwrap()[0].breach_default_upgraded);
         facade
             .set_config("demo", "budget.breach_action", "warn")
             .unwrap();
+        assert!(!facade.fleet().unwrap()[0].breach_default_upgraded);
         let run = facade.run(owner.as_str()).unwrap();
         assert_eq!(
             run.policy.as_ref().unwrap().effective_action,

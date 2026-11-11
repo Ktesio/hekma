@@ -1514,6 +1514,36 @@ mod tests {
         assert!(cache.stale_at("v2"), "a moved fingerprint is stale");
         cache.publish(Vec::new());
         assert!(cache.current().is_ok());
+        // The remaining poisoned arms: publish, degrade and stamp all
+        // recover a poisoned lock rather than wedging.
+        {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = cache.degraded.write().unwrap();
+                panic!("poison");
+            });
+            std::panic::set_hook(previous);
+        }
+        cache.degrade("poisoned".to_string());
+        cache.stamp("v".to_string());
+        assert!(!cache.stale_at("v"));
+        cache.publish(Vec::new());
+    }
+
+    #[test]
+    fn the_tightness_orders_are_total() {
+        // The tail arms (stop/block, shadow/enforce) the refusal-gated
+        // surfaces never reach — the orders are total regardless.
+        assert_eq!(
+            scent_tightness(ScentCheckMode::Shadow) < scent_tightness(ScentCheckMode::Enforce),
+            ScentCheckMode::ALL[1] < ScentCheckMode::ALL[2]
+        );
+        assert!(action_tightness(BreachAction::Stop) < action_tightness(BreachAction::Block));
+        let unavailable = PolicyCacheUnavailable {
+            reason: "r".to_string(),
+        };
+        assert_eq!(unavailable.to_string(), "r");
     }
 
     #[test]

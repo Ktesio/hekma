@@ -492,27 +492,13 @@ pub(crate) fn sync_depth<S: RunRecords + ?Sized>(
         prior,
         None,
     )?;
+    // The resolution's own `store_changes` raises the `depth-fallback`
+    // Anomaly for BOTH sources — a POLICY-sourced action per the
+    // resolver, a directly set one per the 21-2 rule (round 3: the
+    // duplicate re-raise that used to live here was dead code once
+    // store_changes owned the directly set arm; removed, not tested
+    // around).
     changes.extend(policy::resolve_run(store, &record.run_id, None, at)?);
-    // The 21-2 directly-set arm: re-read the record the resolution just
-    // rewrote (it owns the Policy-sourced Anomalies) and raise the
-    // `depth-fallback` Anomaly for a directly set action the new depth
-    // cannot execute.
-    if let Some(record) = store.run_record(&record.run_id)? {
-        let limits = store.run_limits(&record.run_id)?;
-        if limits.is_armed()
-            && limits.action() != BreachAction::Warn
-            && !record.process_owner
-            && action_refusal(limits.action(), depth, wire_path).is_some()
-            && !record.anomalies.contains(&Anomaly::DepthFallback)
-        {
-            let mut updated = record;
-            updated.anomalies.push(Anomaly::DepthFallback);
-            updated.anomalies.sort();
-            updated.updated_at = at.to_string();
-            store.save_run(&updated)?;
-            note_anomalies_changed(store, &mut changes, &updated, at)?;
-        }
-    }
     Ok(changes)
 }
 

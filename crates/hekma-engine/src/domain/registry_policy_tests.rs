@@ -2019,6 +2019,56 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
 }
 
 #[test]
+fn a_fingerprint_read_failure_degrades_and_the_next_tick_retries() {
+    // The refresh's OWN read can fail (the table gone or the store
+    // unreadable): the cache degrades with the surfaced note (arms kept,
+    // action forced to pause), and because nothing was stamped the NEXT
+    // tick retries — restoring the table heals it.
+    let seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test("DROP TABLE policies");
+            Ok(())
+        })
+        .unwrap();
+    let refresh = seeded.registry.refresh_policy_cache();
+    let note = refresh.degraded.expect("the read failure degrades");
+    assert!(note.contains("could not be read"), "{note}");
+    assert!(!refresh.reloaded);
+    // The arms stay enforced: the resolution carries the fail-closed note.
+    let name = InstanceName::new("money").unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert!(resolution.fail_closed.is_some());
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    // Restore the table (the v15 shape with its default row): the next
+    // tick's retry reloads and heals.
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "CREATE TABLE policies (\
+                   name TEXT PRIMARY KEY, selector TEXT, tokens_per_run INTEGER, \
+                   tokens_cumulative INTEGER, dollars_per_run_micros INTEGER, \
+                   dollars_cumulative_micros INTEGER, breach_action TEXT, \
+                   scent_check TEXT NOT NULL DEFAULT 'off', rate_input_micros INTEGER, \
+                   rate_output_micros INTEGER, rate_cached_micros INTEGER, \
+                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL\
+                 ); \
+                 INSERT INTO policies (name, scent_check, created_at, updated_at) \
+                 VALUES ('default', 'off', 't', 't');",
+            );
+            Ok(())
+        })
+        .unwrap();
+    let refresh = seeded.registry.refresh_policy_cache();
+    assert!(refresh.degraded.is_none(), "the retry healed: {refresh:?}");
+    assert!(refresh.reloaded);
+}
+
+#[test]
 fn a_same_second_change_to_one_policy_still_moves_the_fingerprint() {
     // Round 3, L1: `updated_at` has whole-second resolution, so the old
     // name+timestamp fingerprint missed a second change to the same
