@@ -911,7 +911,8 @@ jobs:
             printf '| %s | %s | %s | %s | %s | %s | — (no rate configured) |\n' \
               ci-breach "$state" "$limit" "$remaining" "$action" "$total"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-          "$hekma" agent stop ci-breach --timeout 0
+          # No teardown stop: the breach's `stop` already stopped the agent
+          # (asserted above), and stopping a stopped agent is refused (exit 4).
 
   docs:
     name: docs
