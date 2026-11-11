@@ -195,14 +195,6 @@ fn usage_under_a_named_policy_enforces_the_dollar_scopes_with_its_flat_rate() {
             LifecycleState::Paused,
             Duration::from_secs(30),
         );
-        let dbg = engine.blocking().fleet().unwrap();
-        let dbg_entry = dbg.iter().find(|e| e.name.as_str() == "poldlr").unwrap();
-        eprintln!(
-            "DEBUG budget={:?} usage={:?} breaches={:?}",
-            dbg_entry.budget,
-            dbg_entry.usage,
-            engine.blocking().budget_breach_events("poldlr")
-        );
         let breach = one_breach(&engine, "poldlr");
         assert_eq!(breach.dimension, BreachDimension::Dollars);
         assert_eq!(breach.scope, scope);

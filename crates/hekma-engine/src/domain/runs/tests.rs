@@ -419,16 +419,18 @@ fn labels_sync_once_and_breach_marks_once() {
     let (_tmp, store) = store();
     let run = RunId::mint();
     ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
-    let same =
-        ops::sync_bound_labels(&store, &run, &[Label::bound("team", "payments")], AT).unwrap();
+    let same = ops::sync_bound_labels(&store, &run, &[Label::bound("team", "payments")], None, AT)
+        .unwrap();
     assert!(same.events.is_empty());
-    let moved = ops::sync_bound_labels(&store, &run, &[Label::bound("team", "core")], AT).unwrap();
+    let moved =
+        ops::sync_bound_labels(&store, &run, &[Label::bound("team", "core")], None, AT).unwrap();
     assert_eq!(moved.events[0].change, RunEventKind::LabelsChanged);
     assert_eq!(moved.events[0].labels, vec![Label::bound("team", "core")]);
     assert!(ops::sync_bound_labels(
         &store,
         &RunId::from_wire("gone"),
         &[Label::bound("x", "y")],
+        None,
         AT
     )
     .unwrap()
@@ -699,6 +701,83 @@ fn runs_of_agents_with_no_process_end_with_their_children() {
 // ---- Story 21-3 (review round 1): creation and depth changes resolve ----
 
 #[test]
+fn a_directly_set_depth_fallback_survives_a_label_change_re_resolve() {
+    // Round 2, N8: a child Run whose run_limits carry a directly set
+    // action its depth cannot execute keeps the 21-2 `depth-fallback`
+    // Anomaly through every re-resolve — the resolver raises it only for
+    // POLICY-sourced actions, and a label change once stripped the
+    // directly set signal while the Run still could not execute.
+    // (open_child refuses such an action at creation, so the row is
+    // seeded directly — the defensive pin.)
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let kid = child(&store, RunParent::Run(owner.clone())).unwrap();
+    // A directly set per-run ceiling with `pause` on the ANNOUNCED child.
+    store.execute_batch_for_test(&format!(
+        "INSERT INTO run_limits (run_id, dimension, scope, limit_value, action, source, \
+         set_at) VALUES ('{}', 'tokens', 'per-run', 100, 'pause', 'host', 't')",
+        kid.as_str()
+    ));
+    // A depth change to the (still unexecutable) announced depth raises
+    // the 21-2 Anomaly.
+    let record = store.run_record(&kid).unwrap().unwrap();
+    ops::sync_depth(&store, record, ControlDepth::Supervised, false, AT).unwrap();
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        record.anomalies.contains(&Anomaly::DepthFallback),
+        "the directly set action raises the 21-2 signal: {:?}",
+        record.anomalies
+    );
+    // A label change re-resolves: the signal SURVIVES (the pre-fix
+    // store_changes stripped every DepthFallback it did not re-raise).
+    verb(&store, &kid, set(&[("env", "prod")]), &[], false).unwrap();
+    let record = store.run_record(&kid).unwrap().unwrap();
+    assert!(
+        record.anomalies.contains(&Anomaly::DepthFallback),
+        "the directly set signal survives the re-resolve: {:?}",
+        record.anomalies
+    );
+}
+
+#[test]
+fn a_kept_run_whose_labels_changed_resolves_with_the_fresh_inputs() {
+    // Round 2, N9: an adoption/relaunch re-syncs the kept Run's bound
+    // labels against a config it just read — the re-resolution uses the
+    // caller's FRESH inputs, not the row's stored ones (which are one
+    // read stale), so the stored row and the snapshot agree with live
+    // enforcement.
+    let (_tmp, store) = store();
+    let run = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
+    let inputs = |ceiling: u64| super::policy::ResolveInputs {
+        explicit: super::PolicyLimits {
+            tokens_per_run: Some(ceiling),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // A kept Run whose labels CHANGED resolves with the fresh inputs.
+    let mut kept = supervised(&run, true, false);
+    kept.labels = vec![Label::bound("team", "fresh")];
+    kept.inputs = Some(inputs(200));
+    ops::ensure_supervised(&store, &kept, AT).unwrap();
+    let row = store.run_policy(&run).unwrap().unwrap();
+    assert_eq!(
+        row.resolution.tokens.per_run,
+        Some(200),
+        "the fresh inputs resolved, not the stored row's"
+    );
+    // A kept Run whose labels did NOT change resolves with the fresh
+    // inputs too (the separate resolve half).
+    let mut same = supervised(&run, true, false);
+    same.inputs = Some(inputs(300));
+    ops::ensure_supervised(&store, &same, AT).unwrap();
+    let row = store.run_policy(&run).unwrap().unwrap();
+    assert_eq!(row.resolution.tokens.per_run, Some(300));
+}
+
+#[test]
 fn a_created_run_resolves_against_the_policies_in_its_creation_job() {
     // The 21-9 deferral, filled: a fresh Run's resolution is stored in the
     // creation job itself (a Policy created while this engine was off, a
@@ -866,10 +945,10 @@ fn a_verb_label_outranks_config_across_syncs_and_its_removal_restores_config() {
     ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
     verb(&store, &run, set(&[("team", "core")]), &config, false).unwrap();
     // A config write, a relaunch and an adoption all keep the verb's value.
-    let synced = ops::sync_bound_labels(&store, &run, &config, AT).unwrap();
+    let synced = ops::sync_bound_labels(&store, &run, &config, None, AT).unwrap();
     assert!(synced.events.is_empty());
     let changed_config = [Label::bound("team", "other"), Label::bound("tier", "gold")];
-    let synced = ops::sync_bound_labels(&store, &run, &changed_config, AT).unwrap();
+    let synced = ops::sync_bound_labels(&store, &run, &changed_config, None, AT).unwrap();
     assert_eq!(synced.events.len(), 1, "tier is new");
     assert_eq!(synced.events[0].cause.as_deref(), Some("config"));
     let mut relaunch = supervised(&run, true, false);
@@ -1048,7 +1127,7 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     // A config write's re-sync.
     let r = run.clone();
     let (resolved, _) = job(Box::new(move |s| {
-        ops::sync_bound_labels(s, &r, &[Label::bound("team", "core")], AT).unwrap()
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "core")], None, AT).unwrap()
     }));
     assert_eq!(resolved, vec![run.clone()]);
     // A relaunch and an adoption (both keep the Run through
@@ -1065,7 +1144,7 @@ fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
     // Nothing changed: no hook.
     let r = run.clone();
     let (resolved, events) = job(Box::new(move |s| {
-        ops::sync_bound_labels(s, &r, &[Label::bound("team", "again")], AT).unwrap()
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "again")], None, AT).unwrap()
     }));
     assert!(resolved.is_empty() && events == 0);
     // A dry run never calls it.

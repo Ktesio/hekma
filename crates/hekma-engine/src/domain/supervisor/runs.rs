@@ -105,8 +105,13 @@ impl Supervisor {
             let Some(open) = store.open_process_run(&instance)? else {
                 return Ok(((), ops::RunChanges::default()));
             };
-            let changes =
-                ops::sync_bound_labels(store, &open.run_id, &labels, &crate::time::now_rfc3339())?;
+            let changes = ops::sync_bound_labels(
+                store,
+                &open.run_id,
+                &labels,
+                None,
+                &crate::time::now_rfc3339(),
+            )?;
             Ok(((), changes))
         });
         match result {
@@ -246,13 +251,7 @@ impl Supervisor {
         }
         if dry_run {
             if let Some(existing) = &read {
-                let plan = registry.plan_policy_change(
-                    Some(existing),
-                    &crate::domain::PolicyChange {
-                        name: existing.name.clone(),
-                        ..Default::default()
-                    },
-                )?;
+                let plan = registry.plan_policy_delete(existing)?;
                 return Ok(crate::domain::PolicyOutcome {
                     record: None,
                     ..plan
@@ -280,57 +279,75 @@ impl Supervisor {
         Ok(self.finish_policy_applied(registry, applied))
     }
 
-    /// Publish what a committed Policy write produced, in commit order (the
-    /// Policy event, the Runs it re-resolved, then the breaches it fired),
-    /// and execute each breach's process action through the lifecycle.
+    /// Publish what a committed Policy write produced, in COMMIT order
+    /// (the breaches the change fired — their outbox rows were appended
+    /// first, inside the re-resolution — then the Policy event, then the
+    /// Run events the re-resolutions caused; the bus invariant is bus
+    /// order == outbox order), and execute each breach's process action
+    /// through the lifecycle AFTER the publishes (the breaches are
+    /// durable; a failing pause never loses the record, and the
+    /// lifecycle's own transition events then land last, as they do on
+    /// the outbox).
     fn finish_policy_applied(
         &mut self,
         registry: &Registry,
         applied: crate::domain::registry_policy::PolicyApplied,
     ) -> crate::domain::PolicyOutcome {
+        let mut actions: Vec<(InstanceName, Vec<crate::domain::pipeline::CommittedBreach>)> =
+            Vec::new();
+        for breach in applied.breaches {
+            let instance = breach.event.instance.clone();
+            let name = match InstanceName::new(&instance) {
+                Ok(name) => name,
+                Err(err) => {
+                    // The breach is durable and can be published, but its
+                    // instance name is not even parseable — say so, never
+                    // a silent drop.
+                    self.note_outbox_append(&breach.outbox);
+                    self.publish(crate::domain::EngineEvent::BudgetBreach(
+                        breach.event.clone(),
+                    ));
+                    self.emit_diagnostic(&format!(
+                        "a Policy change fired a breach on `{instance}`, which is not a valid \
+                         agent name ({err}); the breach is recorded but its action was not \
+                         executed"
+                    ));
+                    continue;
+                }
+            };
+            self.mirror_breach(registry, &name, &breach.event);
+            self.note_outbox_append(&breach.outbox);
+            self.publish(crate::domain::EngineEvent::BudgetBreach(
+                breach.event.clone(),
+            ));
+            match actions.iter_mut().find(|(at, _)| *at == name) {
+                Some((_, list)) => list.push(breach),
+                None => actions.push((name, vec![breach])),
+            }
+        }
         for (event, outbox) in applied.events {
             self.note_outbox_append(&outbox);
             self.publish(crate::domain::EngineEvent::Policy(event));
         }
         self.publish_run_events(applied.run_events);
-        let mut by_instance: std::collections::BTreeMap<
-            String,
-            Vec<crate::domain::pipeline::CommittedBreach>,
-        > = std::collections::BTreeMap::new();
-        for breach in applied.breaches {
-            by_instance
-                .entry(breach.event.instance.clone())
-                .or_default()
-                .push(breach);
-        }
-        for (instance, breaches) in by_instance {
-            match InstanceName::new(&instance) {
-                Ok(name) => {
-                    // Only a supervised instance's process actions execute
-                    // (D2: the caller applies them): a matched Run whose
-                    // instance this engine does not supervise keeps its
-                    // breaches RECORDED (they latched; the next start or
-                    // adoption re-applies them), with one honest diagnostic
-                    // instead of a failed pause per breach.
-                    if !self.running.contains_key(&name) {
-                        self.publish_and_note_unsupervised_breaches(registry, &name, breaches);
-                        continue;
-                    }
-                    self.apply_evaluation(
-                        registry,
-                        &name,
-                        crate::domain::pipeline::Evaluation {
-                            breaches,
-                            ..Default::default()
-                        },
-                    )
-                }
-                Err(err) => self.emit_diagnostic(&format!(
-                    "a Policy change fired a breach on `{instance}`, which is not a valid \
-                     instance name ({err}); the breach is recorded but its action was not \
-                     executed"
-                )),
+        // Then the process actions (only for instances this engine
+        // supervises; D2: the caller applies them).
+        for (name, breaches) in actions {
+            if !self.running.contains_key(&name) {
+                // Not ours to act on (a foreign engine supervises the
+                // agent, or the process is gone): the breach stays
+                // recorded and published, and ONE diagnostic says so —
+                // never a failed pause per breach.
+                self.emit_diagnostic(&format!(
+                    "{}: a Policy change fired {} breach(es) on a Run of an agent this engine \
+                     does not supervise; the breaches are recorded, and the supervising engine \
+                     applies the action",
+                    name.as_str(),
+                    breaches.len(),
+                ));
+                continue;
             }
+            self.execute_breach_actions(registry, &name, breaches);
         }
         for note in &applied.outcome.notes {
             self.emit_diagnostic(note);
@@ -338,31 +355,50 @@ impl Supervisor {
         applied.outcome
     }
 
-    /// Publish and mirror the breaches a Policy change fired on an
-    /// instance this engine does NOT supervise, and say so once: the
-    /// breaches are recorded and latched (they re-apply at the next start
-    /// or adoption), but no process action executes here — surfaced, not
-    /// silent (AI-18; the 21-3 review round 1 finding).
-    fn publish_and_note_unsupervised_breaches(
+    /// Execute already-published breaches' process actions (the action
+    /// half of [`Self::apply_evaluation`] without its publishing — the
+    /// publish half ran in commit order above). Only a process-level
+    /// breach acts; each executes its action in commit order.
+    fn execute_breach_actions(
         &mut self,
         registry: &Registry,
         name: &InstanceName,
         breaches: Vec<crate::domain::pipeline::CommittedBreach>,
     ) {
-        let count = breaches.len();
-        for committed in &breaches {
-            self.mirror_breach(registry, name, &committed.event);
-            self.note_outbox_append(&committed.outbox);
-            self.publish(crate::domain::EngineEvent::BudgetBreach(
-                committed.event.clone(),
-            ));
+        for committed in breaches
+            .into_iter()
+            .filter(|committed| committed.process_level)
+        {
+            let decision = committed.decision;
+            if decision.action == crate::domain::BreachAction::Block {
+                self.note_block(registry, name, decision.dimension, decision.scope);
+                continue;
+            }
+            let cause = match decision.dimension {
+                crate::domain::BreachDimension::Tokens => {
+                    crate::domain::TransitionCause::budget_exceeded(
+                        decision.scope,
+                        decision.limit,
+                        decision.observed,
+                    )
+                }
+                // v1 the estimate label is always `estimated`.
+                crate::domain::BreachDimension::Dollars => {
+                    crate::domain::TransitionCause::cost_cap_exceeded(
+                        decision.scope,
+                        crate::domain::Micros(decision.limit as i64),
+                        crate::domain::Micros(decision.observed as i64),
+                        crate::domain::EstimateLabel::Estimated,
+                    )
+                }
+            };
+            match decision.action {
+                // No lifecycle transition — the breach event is the whole guardrail.
+                crate::domain::BreachAction::Warn | crate::domain::BreachAction::Block => {}
+                crate::domain::BreachAction::Pause => self.enforce_pause(registry, name, cause),
+                crate::domain::BreachAction::Stop => self.enforce_stop(registry, name, cause),
+            }
         }
-        self.emit_diagnostic(&format!(
-            "{}: a Policy change fired {count} breach(es) on a Run of an agent this engine \
-             does not supervise — each is recorded and latched, and its process action will \
-             apply at the agent's next start or adoption",
-            name.as_str(),
-        ));
     }
 
     /// Open a child Run (FR-43, FR-49) and publish its `created` event.

@@ -919,7 +919,9 @@ pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
 /// changed while `running` is reflected on the very next `UsageEvent` (AC-B
 /// "changes apply immediately") because the supervisor re-resolves + re-reads here
 /// each time. Absent scopes → `None` (never breach); an absent action →
-/// [`BreachAction::default`] (`pause`).
+/// `warn` (the stored `default` Policy's value — these legacy readers no
+/// longer own a default of their own; the ONE resolution every enforcement
+/// and surface call goes through is [`crate::domain::runs::policy::resolve`]).
 ///
 /// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
 /// somehow present but MALFORMED (e.g. a negative or non-integer that slipped past
@@ -930,11 +932,14 @@ pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
 pub fn resolve_token_budget(effective: &EffectiveConfig) -> (TokenBudget, BreachAction) {
     let per_run = budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY);
     let cumulative = budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY);
-    let action = effective
-        .value(BUDGET_BREACH_ACTION_KEY)
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.trim().parse::<BreachAction>().ok())
-        .unwrap_or_default();
+    // Absent → `warn` (the stored `default` Policy's value — this legacy
+    // reader no longer owns a default); present-but-malformed → `pause`
+    // (the fail-closed rule, AD-7).
+    let action = match read_breach_action(effective) {
+        ActionRead::Present(action) => action,
+        ActionRead::Malformed(_) => BreachAction::Pause,
+        ActionRead::Absent => BreachAction::Warn,
+    };
     (
         TokenBudget {
             per_run,
@@ -1006,13 +1011,14 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
         per_run: cost_micros_leaf(effective, BUDGET_DOLLARS_PER_RUN_KEY),
         cumulative: cost_micros_leaf(effective, BUDGET_DOLLARS_CUMULATIVE_KEY),
     };
-    // The SAME breach-action key governs dollar breaches too (story 3-3): resolve it
-    // exactly as `resolve_token_budget` does (absent → the ratified `pause` default).
-    let action = effective
-        .value(BUDGET_BREACH_ACTION_KEY)
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.trim().parse::<BreachAction>().ok())
-        .unwrap_or_default();
+    // The SAME breach-action key governs dollar breaches too (story 3-3):
+    // resolved exactly as `resolve_token_budget` does (absent → `warn`,
+    // the stored `default` Policy's value; malformed → `pause`).
+    let action = match read_breach_action(effective) {
+        ActionRead::Present(action) => action,
+        ActionRead::Malformed(_) => BreachAction::Pause,
+        ActionRead::Absent => BreachAction::Warn,
+    };
     (rate, cap, action)
 }
 
@@ -2172,15 +2178,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_token_budget_absent_keys_yield_none_and_pause_default() {
-        // Absent scopes → None (never breach); absent action → Pause (the ratified
-        // default).
+    fn resolve_token_budget_absent_keys_yield_none_and_the_warn_default() {
+        // Absent scopes → None (never breach); absent action → warn (the
+        // stored `default` Policy's value — the legacy readers stopped
+        // owning a `pause` default of their own).
         let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
         let (budget, action) = resolve_token_budget(&eff);
         assert_eq!(budget.per_run, None);
         assert_eq!(budget.cumulative, None);
         assert!(!budget.is_set());
-        assert_eq!(action, BreachAction::Pause);
+        assert_eq!(action, BreachAction::Warn);
+        let (_, _, cost_action) = resolve_cost(&eff);
+        assert_eq!(cost_action, BreachAction::Warn);
     }
 
     #[test]
@@ -2470,12 +2479,14 @@ mod tests {
 
     #[test]
     fn resolve_cost_absent_yields_no_rate_no_cap_default_action() {
-        // AC-B: nothing configured → no Rate, no cap, the ratified `pause` default.
+        // AC-B: nothing configured → no Rate, no cap, and the `warn` the
+        // stored `default` Policy carries (this legacy reader no longer
+        // owns a `pause` default of its own).
         let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
         let (rate, cap, action) = resolve_cost(&eff);
         assert_eq!(rate, None);
         assert!(!cap.is_set());
-        assert_eq!(action, BreachAction::Pause);
+        assert_eq!(action, BreachAction::Warn);
     }
 
     #[test]

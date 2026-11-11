@@ -141,6 +141,13 @@ impl PolicyLimits {
             || self.rate.is_some()
     }
 
+    /// Whether NO field is set (the serde skip for the always-empty
+    /// caller-limits field: an unset set stays off the wire, a SET one
+    /// must never be dropped from a serialized resolution input).
+    pub fn is_unset(&self) -> bool {
+        !self.is_set()
+    }
+
     /// The ceiling for `limit`, if this set carries it.
     pub fn ceiling(&self, limit: LimitKind) -> Option<u64> {
         match limit {
@@ -239,7 +246,7 @@ pub struct ResolutionInput {
     /// they apply per limit only where tighter than the resolved value).
     /// No surface supplies them yet; the field is threaded so 22.x wires
     /// in without touching the function's shape.
-    #[serde(default, skip_serializing_if = "PolicyLimits::is_set")]
+    #[serde(default, skip_serializing_if = "PolicyLimits::is_unset")]
     pub caller_limits: PolicyLimits,
     /// The instance is kept on `pause` by the FR-21 upgrade (its marker
     /// row): the action resolves `pause` at the explicit level until a
@@ -1025,6 +1032,24 @@ fn store_changes<S: RunRecords + ?Sized>(
         .filter(|anomaly| !owned.contains(anomaly))
         .collect();
     anomalies.extend(raised);
+    // A DIRECTLY SET action (on the Run's limits) that this Run's (depth,
+    // wire path) cannot execute keeps its 21-2 loud signal through every
+    // re-resolve — the resolver raises `depth-fallback` only for
+    // POLICY-sourced actions, and a label change or Policy edit once
+    // stripped the directly set Anomaly while the Run still could not
+    // execute (21-3 review round 2, N8).
+    if !record.process_owner {
+        let action = run_limits.action();
+        if run_limits.is_armed()
+            && action != crate::domain::budget::BreachAction::Warn
+            && super::ops::action_refusal(action, record.control_depth, record.wire_path).is_some()
+            && !anomalies.contains(&Anomaly::DepthFallback)
+        {
+            anomalies.push(Anomaly::DepthFallback);
+            anomalies.sort();
+            anomalies.dedup();
+        }
+    }
     anomalies.sort();
     anomalies.dedup();
     if anomalies != record.anomalies {
@@ -1040,14 +1065,17 @@ fn store_changes<S: RunRecords + ?Sized>(
 /// 21-9 hook, filled. Runs inside the label write's own writer job, after
 /// the label write and before the snapshot entry is built, so the
 /// re-resolution commits and publishes together with the label change that
-/// caused it. The stored inputs are reused (a label change cannot change
-/// the instance's explicit limits or model).
+/// caused it. `inputs` is the caller's FRESH instance facts when the
+/// caller has them (an adoption or relaunch re-syncs labels with a config
+/// it just read); `None` reuses the Run's stored inputs (a plain label
+/// verb cannot change the instance's explicit limits or model).
 pub(crate) fn labels_changed<S: RunRecords + ?Sized>(
     store: &S,
     run: &RunId,
+    inputs: Option<crate::domain::runs::ResolveInputs>,
     at: &str,
 ) -> Result<RunChanges, StoreError> {
-    resolve_run(store, run, None, at)
+    resolve_run(store, run, inputs, at)
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,7 +1108,10 @@ pub struct PolicyEvent {
     /// The model-keyed Rate table after the change (`default`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rates: BTreeMap<String, Rate>,
-    /// How many non-ended Runs the (new) Selector matches.
+    /// How many non-ended Runs the change RE-RESOLVED: the new
+    /// Selector's matches, plus (when the Selector moved) the old
+    /// Selector's — the Runs that loosened. A create names its Selector's
+    /// matches; a delete the deleted Selector's.
     pub matched: usize,
     /// How many matched Runs fall back to `warn` at their depth.
     pub fallbacks: usize,
@@ -1435,6 +1466,26 @@ mod tests {
         let mut with_instance = input.clone();
         with_instance.inputs.explicit.scent_check = Some(ScentCheckMode::Off);
         assert_eq!(resolve(&with_instance).scent_check, ScentCheckMode::Off);
+    }
+
+    #[test]
+    fn the_caller_limits_field_serializes_only_when_set() {
+        // Round 2, N11: an UNSET caller-limits field stays off the wire
+        // (the vectors' bytes stay stable) and a SET one is never dropped
+        // (the pre-fix skip was inverted — it dropped exactly the values
+        // a future caller-limit case would carry).
+        let unset = serde_json::to_value(&ResolutionInput::default()).unwrap();
+        assert!(unset.get("caller_limits").is_none(), "{unset}");
+        let mut set = ResolutionInput::default();
+        set.caller_limits = PolicyLimits {
+            tokens_per_run: Some(5_000),
+            ..PolicyLimits::default()
+        };
+        let set = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            set["caller_limits"]["tokens_per_run"],
+            serde_json::json!(5_000)
+        );
     }
 
     #[test]

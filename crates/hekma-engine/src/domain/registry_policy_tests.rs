@@ -1237,6 +1237,100 @@ fn the_dry_run_reports_the_planned_sets_fallback_count() {
 }
 
 #[test]
+fn the_dry_run_counts_what_the_real_change_re_resolves_on_a_selector_move() {
+    // Round 2, N10: a Selector change re-resolves old ∪ new, and the dry
+    // run must count the SAME set (it once counted only the new
+    // Selector's matches); the delete dry run counts fallbacks under the
+    // set WITHOUT the Policy (it once resolved with the Policy still in).
+    let seeded = seed(1_000);
+    // A second Run only the OLD Selector matches.
+    let other = RunId::mint();
+    let other_record = RunRecord {
+        run_id: other.clone(),
+        control_depth: ControlDepth::Announced,
+        wire_path: true,
+        status: crate::domain::runs::RunStatus::Active,
+        anomalies: Vec::new(),
+        parent_run_id: Some(seeded.run.clone()),
+        instance: Some("money".to_string()),
+        process_owner: false,
+        end_cause: None,
+        created_at: "t".to_string(),
+        updated_at: "t".to_string(),
+        ended_at: None,
+    };
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _};
+            ctx.store().insert_run(&NewRun {
+                record: other_record,
+                labels: vec![crate::domain::runs::Label::bound("team", "other")],
+                limits: Default::default(),
+                identity: None,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    change(
+        &seeded.registry,
+        "mover",
+        "team=core",
+        PolicyLimits {
+            breach_action: Some(BreachAction::Warn),
+            ..PolicyLimits::default()
+        },
+    );
+    // Move the Selector to team=other: the dry run must report BOTH Runs
+    // (old ∪ new), and the real change must agree.
+    let existing = seeded.registry.policy("mover").unwrap().unwrap();
+    let dry = seeded
+        .registry
+        .plan_policy_change(
+            Some(&existing),
+            &PolicyChange {
+                name: "mover".to_string(),
+                selector: Some("team=other".parse().unwrap()),
+                set: PolicyLimits::default(),
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(dry.matched, 2, "old ∪ new: {dry:?}");
+    let real = change(
+        &seeded.registry,
+        "mover",
+        "team=other",
+        PolicyLimits {
+            breach_action: Some(BreachAction::Warn),
+            ..PolicyLimits::default()
+        },
+    );
+    assert_eq!(real.matched, 2, "the real change agrees");
+    // The delete dry run counts fallbacks under the set WITHOUT the
+    // Policy: `pause` under the mover Policy, `warn` (no fallback) once
+    // it is gone.
+    change(
+        &seeded.registry,
+        "mover",
+        "team=other",
+        PolicyLimits {
+            breach_action: Some(BreachAction::Pause),
+            ..PolicyLimits::default()
+        },
+    );
+    let existing = seeded.registry.policy("mover").unwrap().unwrap();
+    let dry_delete = seeded.registry.plan_policy_delete(&existing).unwrap();
+    assert_eq!(dry_delete.matched, 1);
+    assert_eq!(
+        dry_delete.fallbacks, 0,
+        "without the Policy both Runs resolve the warn default: {dry_delete:?}"
+    );
+}
+
+#[test]
 fn a_selector_change_re_resolves_the_runs_only_the_old_selector_matched() {
     // Runs ONLY the OLD Selector matched must re-resolve on a Selector
     // change (they loosen): the pre-fix change re-resolved the new

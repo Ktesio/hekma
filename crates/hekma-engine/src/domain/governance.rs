@@ -1208,6 +1208,38 @@ fn block_fence_cases() -> Vec<Case> {
                 latched: vec![key(BreachDimension::Tokens, BreachScope::PerRun)],
             },
         ),
+        // ---- block-fence: no raised reason → the call passes ----
+        fence_case("fence-no-reason-passes", &[]),
+        // ---- block-fence: a single reason is reported as itself ----
+        fence_case(
+            "fence-single-dollar-cumulative",
+            &[key(BreachDimension::Dollars, BreachScope::Cumulative)],
+        ),
+        // ---- block-fence: tokens are reported before dollars, whatever the
+        // raise order ----
+        fence_case(
+            "fence-reports-tokens-before-dollars",
+            &[
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+                key(BreachDimension::Tokens, BreachScope::Cumulative),
+            ],
+        ),
+        // ---- block-fence: per-run is reported before cumulative ----
+        fence_case(
+            "fence-reports-per-run-before-cumulative",
+            &[
+                key(BreachDimension::Tokens, BreachScope::Cumulative),
+                key(BreachDimension::Tokens, BreachScope::PerRun),
+            ],
+        ),
+        // ---- block-fence: a repeated reason behaves like a single one ----
+        fence_case(
+            "fence-duplicate-reason-is-one-reason",
+            &[
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+                key(BreachDimension::Dollars, BreachScope::PerRun),
+            ],
+        ),
         // ---- policy-resolution: a ceiling LOWERED below usage breaches at
         // once even while ANOTHER scope's latch holds — the latch is per
         // (dimension, scope), so the lowered scope fires now (the
@@ -1248,38 +1280,6 @@ fn block_fence_cases() -> Vec<Case> {
                 dollar: None,
                 latched: vec![],
             },
-        ),
-        // ---- block-fence: no raised reason → the call passes ----
-        fence_case("fence-no-reason-passes", &[]),
-        // ---- block-fence: a single reason is reported as itself ----
-        fence_case(
-            "fence-single-dollar-cumulative",
-            &[key(BreachDimension::Dollars, BreachScope::Cumulative)],
-        ),
-        // ---- block-fence: tokens are reported before dollars, whatever the
-        // raise order ----
-        fence_case(
-            "fence-reports-tokens-before-dollars",
-            &[
-                key(BreachDimension::Dollars, BreachScope::PerRun),
-                key(BreachDimension::Tokens, BreachScope::Cumulative),
-            ],
-        ),
-        // ---- block-fence: per-run is reported before cumulative ----
-        fence_case(
-            "fence-reports-per-run-before-cumulative",
-            &[
-                key(BreachDimension::Tokens, BreachScope::Cumulative),
-                key(BreachDimension::Tokens, BreachScope::PerRun),
-            ],
-        ),
-        // ---- block-fence: a repeated reason behaves like a single one ----
-        fence_case(
-            "fence-duplicate-reason-is-one-reason",
-            &[
-                key(BreachDimension::Dollars, BreachScope::PerRun),
-                key(BreachDimension::Dollars, BreachScope::PerRun),
-            ],
         ),
     ]
 }

@@ -557,7 +557,10 @@ impl Registry {
     }
 
     /// Plan a create/change (the dry run): validate, merge, and report the
-    /// matched set and the fallback count. Writes nothing.
+    /// matched set and the fallback count. Writes nothing. The counts are
+    /// the REAL change's: when the Selector MOVES, the matched set is old
+    /// ∪ new (the Runs only the old Selector matched loosen too — the
+    /// committed change re-resolves exactly those).
     pub(crate) fn plan_policy_change(
         &self,
         existing: Option<&PolicyRecord>,
@@ -565,7 +568,10 @@ impl Registry {
     ) -> Result<PolicyOutcome, RunError> {
         Self::validate_change(existing, change)?;
         let record = merge(existing, change);
-        let (matched, fallbacks) = self.matched_fallbacks(&record)?;
+        let prior_selector = existing
+            .filter(|prior| prior.name == record.name)
+            .and_then(|prior| prior.selector.clone());
+        let (matched, fallbacks) = self.matched_fallbacks(&record, prior_selector.as_ref())?;
         Ok(PolicyOutcome {
             record: Some(record),
             matched,
@@ -574,15 +580,65 @@ impl Registry {
         })
     }
 
+    /// Plan a DELETE (the dry run): the Runs the deleted Selector matches
+    /// under the set WITHOUT the Policy (the loosened set the real delete
+    /// resolves against), so the fallback count answers what the delete
+    /// leaves behind — not what the still-present Policy produces.
+    pub(crate) fn plan_policy_delete(
+        &self,
+        existing: &PolicyRecord,
+    ) -> Result<PolicyOutcome, RunError> {
+        let mut policies = self
+            .policies
+            .current()
+            .map_err(|unavailable| RunError::Store(StoreError::Backend(unavailable.to_string())))?
+            .as_ref()
+            .clone();
+        policies.retain(|policy| policy.name != existing.name);
+        let runs = self.matched_runs(existing)?;
+        let mut fallbacks = 0;
+        for run in &runs {
+            let resolution = self.resolve_record(run, &policies);
+            if resolution.fallback.is_some() {
+                fallbacks += 1;
+            }
+        }
+        Ok(PolicyOutcome {
+            record: None,
+            matched: runs.len(),
+            fallbacks,
+            notes: Vec::new(),
+        })
+    }
+
     /// The matched-set and fallback counts for `record` (reads only). The
-    /// `default` Policy matches every non-ended Run. The fallback count
-    /// resolves against the PLANNED set (the cache with `record` merged
-    /// in), so the dry run reports what the real change would produce —
-    /// the pre-change cache under-counted (the 21-3 review round 1
-    /// finding).
-    fn matched_fallbacks(&self, record: &PolicyRecord) -> Result<(usize, usize), RunError> {
+    /// `default` Policy matches every non-ended Run; a Selector CHANGE
+    /// matches old ∪ new (`prior_selector`, the real change's set). The
+    /// fallback count resolves against the PLANNED set (the cache with
+    /// `record` merged in), so the dry run reports what the real change
+    /// would produce — the pre-change cache under-counted (the 21-3
+    /// review round 1 finding).
+    fn matched_fallbacks(
+        &self,
+        record: &PolicyRecord,
+        prior_selector: Option<&Selector>,
+    ) -> Result<(usize, usize), RunError> {
         let policies = self.planned_policy_set(record)?;
-        let runs = self.matched_runs(record)?;
+        let mut runs = self.matched_runs(record)?;
+        if let Some(prior) = prior_selector {
+            if Some(prior) != record.selector.as_ref() {
+                let prior = prior.clone();
+                for run in self
+                    .store
+                    .snapshot(move |store| policy_matched_runs(store, &prior))
+                    .map_err(RunError::Store)?
+                {
+                    if !runs.iter().any(|other| other.run_id == run.run_id) {
+                        runs.push(run);
+                    }
+                }
+            }
+        }
         let mut fallbacks = 0;
         for run in &runs {
             let resolution = self.resolve_record(run, &policies);

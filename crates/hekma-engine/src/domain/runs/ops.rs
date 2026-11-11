@@ -393,14 +393,16 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 run.wire_path,
                 at,
             )?);
-            let label_changes = sync_bound_labels(store, &run.run_id, &run.labels, at)?;
+            let label_changes =
+                sync_bound_labels(store, &run.run_id, &run.labels, run.inputs.clone(), at)?;
             let labels_changed = !label_changes.entries.is_empty();
             changes.extend(label_changes);
-            // Story 21-3: the kept Run re-resolves with the caller's fresh
-            // inputs when it has them (an adoption's depth/wire facts may
-            // have shifted the resolution), else its stored inputs. A label
-            // change already resolved inside its own hook (with the same
-            // fresh inputs) — never resolve twice for one job.
+            // Story 21-3: the kept Run's label sync resolves with the
+            // caller's FRESH inputs when it has them (an adoption re-syncs
+            // labels against a config it just read — the stored inputs
+            // would be one read stale); the stored inputs otherwise. A
+            // label change already resolved inside its own hook — never
+            // resolve twice for one job.
             if !labels_changed {
                 changes.extend(policy::resolve_run(
                     store,
@@ -524,6 +526,7 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     store: &S,
     run_id: &RunId,
     config: &[Label],
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<RunChanges, StoreError> {
     let mut changes = RunChanges::default();
@@ -535,7 +538,16 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     if next == current {
         return Ok(changes);
     }
-    write_labels(store, &mut changes, record, &current, &next, "config", at)?;
+    write_labels(
+        store,
+        &mut changes,
+        record,
+        &current,
+        &next,
+        "config",
+        inputs,
+        at,
+    )?;
     Ok(changes)
 }
 
@@ -543,6 +555,7 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
 /// Policy hook inside the same job, then note the `labels-changed` event
 /// (bound labels before and after) and the snapshot entry — so a Policy
 /// re-resolution commits and publishes with the label change (AD-25).
+#[allow(clippy::too_many_arguments)]
 fn write_labels<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -550,12 +563,13 @@ fn write_labels<S: RunRecords + ?Sized>(
     current: &[Label],
     next: &[Label],
     cause: &str,
+    inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(), StoreError> {
     store.set_run_labels(&record.run_id, next)?;
     record.updated_at = at.to_string();
     store.save_run(&record)?;
-    let resolved = policy::labels_changed(store, &record.run_id, at)?;
+    let resolved = policy::labels_changed(store, &record.run_id, inputs, at)?;
     // Both planners only ever change bound rows (a verb write, a config
     // row, a bound key replacing a Caller's), so a changed set is a changed
     // bound set.
@@ -642,6 +656,7 @@ pub(crate) fn label<S: RunRecords + ?Sized>(
             &current,
             &next,
             "label-verb",
+            None,
             at,
         )?;
     }

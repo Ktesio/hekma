@@ -928,76 +928,6 @@
       }
     },
     {
-      "kind": "decision",
-      "id": "decision-policy-lowered-per-run-fires-while-cumulative-latched",
-      "covers": [
-        "policy-resolution",
-        "latch-per-scope"
-      ],
-      "input": {
-        "token": {
-          "run_total": 2000,
-          "cumulative_total": 9000,
-          "budget": {
-            "per_run": 1000,
-            "cumulative": 5000
-          },
-          "action": "pause"
-        },
-        "latched": [
-          {
-            "dimension": "tokens",
-            "scope": "cumulative"
-          }
-        ]
-      },
-      "expected": {
-        "decisions": [
-          {
-            "dimension": "tokens",
-            "scope": "per-run",
-            "action": "pause",
-            "limit": 1000,
-            "observed": 2000
-          }
-        ],
-        "latched_after": [
-          {
-            "dimension": "tokens",
-            "scope": "cumulative"
-          },
-          {
-            "dimension": "tokens",
-            "scope": "per-run"
-          }
-        ]
-      }
-    },
-    {
-      "kind": "decision",
-      "id": "decision-policy-raised-then-recrossed-refires",
-      "covers": [
-        "policy-resolution",
-        "latch-re-arm"
-      ],
-      "input": {
-        "token": {
-          "run_total": 4000,
-          "cumulative_total": 0,
-          "budget": {
-            "per_run": 5000,
-            "cumulative": null
-          },
-          "action": "pause"
-        },
-        "latched": []
-      },
-      "expected": {
-        "decisions": [],
-        "latched_after": []
-      }
-    },
-    {
       "kind": "fence",
       "id": "fence-no-reason-passes",
       "covers": [
@@ -1096,6 +1026,76 @@
         "code": "dollars_per_run",
         "dimension": "dollars",
         "scope": "per-run"
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-policy-lowered-per-run-fires-while-cumulative-latched",
+      "covers": [
+        "policy-resolution",
+        "latch-per-scope"
+      ],
+      "input": {
+        "token": {
+          "run_total": 2000,
+          "cumulative_total": 9000,
+          "budget": {
+            "per_run": 1000,
+            "cumulative": 5000
+          },
+          "action": "pause"
+        },
+        "latched": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          }
+        ]
+      },
+      "expected": {
+        "decisions": [
+          {
+            "dimension": "tokens",
+            "scope": "per-run",
+            "action": "pause",
+            "limit": 1000,
+            "observed": 2000
+          }
+        ],
+        "latched_after": [
+          {
+            "dimension": "tokens",
+            "scope": "cumulative"
+          },
+          {
+            "dimension": "tokens",
+            "scope": "per-run"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "decision",
+      "id": "decision-policy-raised-then-recrossed-refires",
+      "covers": [
+        "policy-resolution",
+        "latch-re-arm"
+      ],
+      "input": {
+        "token": {
+          "run_total": 4000,
+          "cumulative_total": 0,
+          "budget": {
+            "per_run": 5000,
+            "cumulative": null
+          },
+          "action": "pause"
+        },
+        "latched": []
+      },
+      "expected": {
+        "decisions": [],
+        "latched_after": []
       }
     },
     {
@@ -1478,7 +1478,6 @@
             "breach_action": "pause"
           }
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -1546,7 +1545,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -1633,7 +1631,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -1708,7 +1705,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": []
       },
@@ -1751,7 +1747,6 @@
           "explicit": {},
           "malformed_action": "throttle"
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -1815,7 +1810,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": true,
         "policies": [
           {
@@ -1878,7 +1872,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -1948,7 +1941,6 @@
           "explicit": {},
           "model": "gpt-demo"
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -2026,7 +2018,6 @@
           "explicit": {},
           "model": "gpt-demo"
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -2095,7 +2086,6 @@
         "inputs": {
           "explicit": {}
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -2167,7 +2157,6 @@
           "malformed_action": "throttle",
           "model": "gpt-demo"
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {
@@ -2238,7 +2227,6 @@
           "explicit": {},
           "malformed_action": "1"
         },
-        "caller_limits": {},
         "kept_on_pause": false,
         "policies": [
           {

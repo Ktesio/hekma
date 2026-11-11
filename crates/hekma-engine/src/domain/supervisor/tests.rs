@@ -9286,6 +9286,98 @@ fn a_foreign_engines_change_leaves_the_breach_to_the_supervising_engine() {
 }
 
 #[test]
+fn a_policy_change_publishes_on_the_bus_in_commit_order() {
+    // Round 2, N7: bus order == outbox (commit) order. A change that fires
+    // a breach appends the BREACH row first (inside the re-resolution),
+    // then the Policy event, then the Run events — the bus must publish
+    // them in that same order (the pre-fix order was Policy, Runs,
+    // breaches, so SSE and export consumers saw different sequences).
+    let (_state, _manifest, registry) = setup_fake("polbus", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polbus").unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "polbus").unwrap();
+    let run = open_run(&registry, "polbus").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let mut receiver = sup.events.subscribe();
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "buscap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(500),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    // Drain what the change published and reduce to the three families.
+    let mut order: Vec<&'static str> = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        let family = match event {
+            crate::domain::EngineEvent::BudgetBreach(_) => "breach",
+            crate::domain::EngineEvent::Policy(_) => "policy",
+            crate::domain::EngineEvent::Run(_) => "run",
+            _ => continue,
+        };
+        if order.last().copied() != Some(family) {
+            order.push(family);
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["breach", "policy", "run"],
+        "the bus publishes in outbox order"
+    );
+    // The outbox itself agrees (the durable order the bus mirrors) —
+    // from the change's own first row on (the earlier history is the
+    // start's, not the change's).
+    let batch = crate::domain::export_core(&registry, None, 0).unwrap();
+    let first_change_seq = batch
+        .events
+        .iter()
+        .position(|entry| {
+            matches!(
+                &entry.event,
+                crate::domain::EngineEvent::BudgetBreach(breach) if breach.limit == 500
+            )
+        })
+        .expect("the change's breach row");
+    let durable: Vec<&'static str> = batch.events[first_change_seq..]
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            crate::domain::EngineEvent::BudgetBreach(_) => Some("breach"),
+            crate::domain::EngineEvent::Policy(_) => Some("policy"),
+            crate::domain::EngineEvent::Run(_) => Some("run"),
+            _ => None,
+        })
+        .collect();
+    let mut reduced: Vec<&'static str> = Vec::new();
+    for family in durable {
+        if reduced.last().copied() != Some(family) {
+            reduced.push(family);
+        }
+    }
+    assert_eq!(reduced, vec!["breach", "policy", "run"], "the outbox order");
+    let _ = sup.stop(&registry, "polbus", Some(Duration::from_secs(5)));
+}
+
+#[test]
 fn a_degraded_cache_still_breaches_an_explicit_instance_ceiling() {
     // The N1 end-to-end pin: a corrupt Policy row degrades the cache, and
     // the instance carries an EXPLICIT token ceiling in its config. The

@@ -1284,7 +1284,7 @@ impl Supervisor {
     /// listener could not be re-bound — cannot be fenced: the breach stays
     /// recorded, acts as `warn`, and the diagnostic says so loudly (AI-18;
     /// never a silent no-op).
-    fn note_block(
+    pub(super) fn note_block(
         &self,
         registry: &Registry,
         name: &InstanceName,
@@ -1347,7 +1347,12 @@ impl Supervisor {
     /// silently escalate to stop (AC6), we surface the honest diagnostic on the
     /// engine log (the breach event already captured the fact). All best-effort:
     /// never a supervisor crash.
-    fn enforce_pause(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+    pub(super) fn enforce_pause(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) {
         match self.pause_with_cause(registry, name, cause) {
             Ok(_) => {}
             Err(e) => {
@@ -1441,7 +1446,12 @@ impl Supervisor {
     /// as the WHY marker on the `running → stopping` edge (the stop path itself
     /// records the graceful/forced escalation on the terminal edge). Best-effort:
     /// a stop error is logged, never a crash (the breach is already recorded).
-    fn enforce_stop(&mut self, registry: &Registry, name: &InstanceName, cause: TransitionCause) {
+    pub(super) fn enforce_stop(
+        &mut self,
+        registry: &Registry,
+        name: &InstanceName,
+        cause: TransitionCause,
+    ) {
         match self.stop_with_cause(registry, name, cause) {
             Ok(_) => {}
             Err(e) => {
