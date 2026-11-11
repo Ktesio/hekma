@@ -14,12 +14,64 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
+use crate::domain::runs::listing::{ListingCounts, ListingView};
 use crate::domain::runs::policy::{PolicyRecord, RunPolicy, ScentCheckMode, DEFAULT_POLICY_NAME};
 use crate::domain::{
     Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelOrigin, LabelSource, Micros,
     Rate, RunId, RunLimits, RunRecord, RunStatus, Selector,
 };
 use crate::ports::{NewRun, PolicyRecords, RunRecords, StoreError};
+
+/// The view arms' `run_id` selection (the v16 partial indexes' shape, story
+/// 21-5): two disjoint arms whose WHERE clauses name the partial predicates
+/// verbatim, merged `UNION ALL`, newest run id first. `?1` is the window
+/// cutoff; `?2` (when `after`) is the cursor's run id — the caller binds
+/// `cutoff` first, then the cursor, then any Selector arms' parameters.
+pub(super) fn view_arms_sql(view: ListingView, after: bool, limit: Option<usize>) -> String {
+    let keyset = if after { " AND run_id < ?2" } else { "" };
+    let page = limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    match view {
+        ListingView::Exceptions => format!(
+            "SELECT run_id FROM runs WHERE status <> 'ended' \
+             AND (anomalies <> '' OR status IN ('held','silent','stale')){keyset} \
+             UNION ALL SELECT run_id FROM runs INDEXED BY idx_runs_ended_at \
+             WHERE status = 'ended' AND ended_at >= ?1 AND anomalies <> ''{keyset} \
+             ORDER BY run_id DESC{page}"
+        ),
+        ListingView::All => format!(
+            "SELECT run_id FROM runs WHERE status <> 'ended'{keyset} \
+             UNION ALL SELECT run_id FROM runs INDEXED BY idx_runs_ended_at \
+             WHERE status = 'ended' AND ended_at >= ?1{keyset} ORDER BY run_id DESC{page}"
+        ),
+    }
+}
+
+/// The Selector arms' `run_id` selection (the 21-9 `select_runs` shape,
+/// minus its status filter and limit — the view predicate composes beside
+/// it): the first term drives `idx_run_labels_kv`, every other probes the
+/// `run_labels` primary key. Returns the SQL and the parameters it binds.
+pub(super) fn selector_arms_sql(selector: &Selector) -> (String, Vec<String>) {
+    let terms = selector.terms();
+    let Some(((first_key, first_value), rest)) = terms.split_first() else {
+        // Unreachable (a Selector always carries a term); an impossible arm
+        // keeps the composition total anyway.
+        return ("SELECT NULL AS run_id WHERE 0".to_string(), Vec::new());
+    };
+    let mut sql =
+        String::from("SELECT l0.run_id FROM run_labels l0 WHERE l0.key = ? AND l0.value = ?");
+    let mut params = vec![first_key.clone(), first_value.clone()];
+    for (key, value) in rest {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM run_labels lx WHERE lx.run_id = l0.run_id \
+             AND lx.key = ? AND lx.value = ?)",
+        );
+        params.push(key.clone());
+        params.push(value.clone());
+    }
+    (sql, params)
+}
 
 /// Schema v13 DDL (story 21-2): the Run registry's tables.
 ///
@@ -336,6 +388,54 @@ pub(super) fn migrate_v15(
             }
         }
         conn.execute_batch("PRAGMA user_version = 15")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
+/// Schema v16 (story 21-5): the Run listing's three partial indexes.
+///
+/// * `idx_runs_open` serves the `all` view's open arm and the open/healthy
+///   counts.
+/// * `idx_runs_exception` serves the exceptions view's arms.
+/// * `idx_runs_ended_at` bounds the ended-inside-window arm by the window
+///   (the exception index alone would walk every historical anomalous row).
+///
+/// Additive DDL only, one crash-atomic step like every step before it.
+const SCHEMA_V16: &str = "\
+CREATE INDEX idx_runs_open ON runs(run_id) WHERE status <> 'ended';
+CREATE INDEX idx_runs_exception ON runs(run_id)
+    WHERE anomalies <> '' OR status IN ('held','silent','stale');
+CREATE INDEX idx_runs_ended_at ON runs(ended_at) WHERE status = 'ended';
+";
+
+/// Run the v16 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
+/// when another process finished it while this one waited.
+pub(super) fn migrate_v16(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 16 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V16).map_err(backend)?;
+        conn.execute_batch("PRAGMA user_version = 16")
             .map_err(backend)?;
         Ok(true)
     };
@@ -843,6 +943,89 @@ impl RunRecords for SqliteStore {
 
     fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         self.records("WHERE r.status <> 'ended' ORDER BY r.run_id", [])
+    }
+
+    fn list_runs(
+        &self,
+        view: ListingView,
+        selector: Option<&Selector>,
+        after: Option<&str>,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<(Vec<RunRecord>, Option<String>), StoreError> {
+        // The view arms read the v16 partial indexes (each arm's WHERE names
+        // an index predicate verbatim); the outer row read probes the runs
+        // primary key per id. `run_id` DESC is newest-first (ULID ids encode
+        // creation time; legacy `run-…` ids sort below every `run_…` id and
+        // land last).
+        let mut params: Vec<String> = vec![cutoff.to_string()];
+        if let Some(after) = after {
+            params.push(after.to_string());
+        }
+        let mut sql = format!(
+            "WHERE r.run_id IN ({})",
+            view_arms_sql(view, after.is_some(), Some(limit))
+        );
+        if let Some(selector) = selector {
+            let (arms, mut selector_params) = selector_arms_sql(selector);
+            sql.push_str(&format!(" AND r.run_id IN ({arms})"));
+            params.append(&mut selector_params);
+        }
+        sql.push_str(" ORDER BY r.run_id DESC");
+        let mut rows = self.records(&sql, rusqlite::params_from_iter(params))?;
+        // A full page carries its last key as the next cursor; a short one
+        // ends the read (the Page::from_rows rule, over TEXT keys).
+        let next = if rows.len() == limit {
+            rows.last().map(|record| record.run_id.as_str().to_string())
+        } else {
+            None
+        };
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok((rows, next))
+    }
+
+    fn listing_counts(
+        &self,
+        view: ListingView,
+        selector: Option<&Selector>,
+        cutoff: &str,
+    ) -> Result<ListingCounts, StoreError> {
+        let mut params: Vec<String> = vec![cutoff.to_string()];
+        let mut sql = format!(
+            "SELECT COUNT(*) FROM runs WHERE run_id IN ({})",
+            view_arms_sql(view, false, None)
+        );
+        if let Some(selector) = selector {
+            let (arms, mut selector_params) = selector_arms_sql(selector);
+            sql.push_str(&format!(" AND run_id IN ({arms})"));
+            params.append(&mut selector_params);
+        }
+        let listed: i64 = self
+            .conn()
+            .query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+            .map_err(backend)?;
+        // The healthy count rides `idx_runs_open` (its `status <> 'ended'`
+        // conjunct names the partial predicate verbatim; `active` implies
+        // it, and the explicit conjunct is what makes the index usable).
+        let mut params: Vec<String> = Vec::new();
+        let mut sql = "SELECT COUNT(*) FROM runs WHERE status <> 'ended' AND status = 'active' \
+                       AND anomalies = ''"
+            .to_string();
+        if let Some(selector) = selector {
+            let (arms, mut selector_params) = selector_arms_sql(selector);
+            sql.push_str(&format!(" AND run_id IN ({arms})"));
+            params.append(&mut selector_params);
+        }
+        let healthy: i64 = self
+            .conn()
+            .query_row(&sql, rusqlite::params_from_iter(params), |row| row.get(0))
+            .map_err(backend)?;
+        Ok(ListingCounts {
+            listed: listed.max(0) as u64,
+            healthy_open: healthy.max(0) as u64,
+        })
     }
 
     fn ensure_run_row(&self, run_id: &RunId, instance: &InstanceName) -> Result<(), StoreError> {

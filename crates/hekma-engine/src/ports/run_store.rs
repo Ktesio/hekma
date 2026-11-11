@@ -323,6 +323,29 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// (bound or Caller), ordered by run id, at most `limit` (story 21-9).
     fn select_runs(&self, selector: &Selector, limit: usize) -> Result<Vec<RunRecord>, StoreError>;
 
+    /// One keyset page of the Run listing (story 21-5): the view's rows
+    /// after `after` (the decoded cursor's run id, `None` = the first
+    /// page), newest run id first, plus the run id the next page resumes
+    /// after (`None` when the read is exhausted). Reads the v16 partial
+    /// indexes — no `SCAN` on `runs` (pinned by tests).
+    fn list_runs(
+        &self,
+        view: crate::domain::runs::ListingView,
+        selector: Option<&Selector>,
+        after: Option<&str>,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<(Vec<RunRecord>, Option<String>), StoreError>;
+
+    /// The listing's counts (story 21-5): how many Runs the view lists and
+    /// how many are healthy and open, both subject to `selector`.
+    fn listing_counts(
+        &self,
+        view: crate::domain::runs::ListingView,
+        selector: Option<&Selector>,
+        cutoff: &str,
+    ) -> Result<crate::domain::runs::ListingCounts, StoreError>;
+
     /// The Run an external id maps to under a binding.
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError>;
 
