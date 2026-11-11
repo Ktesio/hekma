@@ -536,7 +536,7 @@ impl Registry {
                     crate::domain::runs::LimitSource::Policy(_)
                         | crate::domain::runs::LimitSource::Default
                 );
-                sourced.then(|| row.resolution.rate).flatten()
+                sourced.then_some(row.resolution.rate).flatten()
             }))
     }
 

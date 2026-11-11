@@ -2029,10 +2029,7 @@ fn a_same_second_change_to_one_policy_still_moves_the_fingerprint() {
     let read = |registry: &Registry| {
         registry
             .writer
-            .call(|ctx| {
-                use crate::ports::PolicyRecords as _;
-                Ok::<_, crate::ports::StoreError>(ctx.store().policies_fingerprint())
-            })
+            .call(|ctx| Ok::<_, crate::ports::StoreError>(ctx.store().policies_fingerprint()))
             .unwrap()
             .expect("the fingerprint reads")
     };
