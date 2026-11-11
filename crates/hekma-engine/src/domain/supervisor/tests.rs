@@ -9577,6 +9577,52 @@ fn the_tick_degradation_notice_latches_and_re_arms() {
 }
 
 #[test]
+fn a_corrupt_default_row_is_restored_by_a_change() {
+    // Round 3, M2's corrupt-default arm: the row cannot be read or
+    // deleted (the name is reserved), so `change default` (the CLI's
+    // route) falls back to the KNOWN SEED as the prior and restores it —
+    // the one write that can heal the cache.
+    let (_state, _manifest, registry) = setup_fake("healdefault", &["--linger-ms", "600000"]);
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "UPDATE policies SET scent_check = 'maybe' WHERE name = 'default'",
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(registry.policy("default").is_err());
+    let note = registry
+        .load_policy_cache()
+        .expect("the corrupt default degrades the load");
+    assert!(note.contains("could not be read"), "{note}");
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let outcome = sup
+        .change_policy(
+            &registry,
+            crate::domain::PolicyChange {
+                name: "default".to_string(),
+                selector: None,
+                set: crate::domain::PolicyLimits {
+                    breach_action: Some(BreachAction::Warn),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            false,
+        )
+        .expect("the change falls back to the seed and restores the row");
+    assert_eq!(outcome.record.as_ref().unwrap().name, "default");
+    assert!(registry.policy("default").unwrap().is_some());
+    assert!(
+        registry.load_policy_cache().is_none(),
+        "the change healed the cache"
+    );
+}
+
+#[test]
 fn a_foreign_raise_re_arms_the_supervising_engines_latched_run() {
     // Round 3, M1: engine A supervises `x` and latches a per-run breach at
     // 500 tokens. The Operator RAISES the Policy to 2M through engine B

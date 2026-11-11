@@ -226,7 +226,20 @@ impl Supervisor {
         change: crate::domain::PolicyChange,
         dry_run: bool,
     ) -> Result<crate::domain::PolicyOutcome, RunError> {
-        let existing = registry.policy(&change.name).map_err(RunError::Store)?;
+        let existing = match registry.policy(&change.name) {
+            Ok(existing) => existing,
+            // A CORRUPT `default` row cannot be deleted (the name is
+            // reserved) and cannot be read: the change falls back to the
+            // KNOWN SEED as the prior — `change default` is the one write
+            // that can restore the row and heal the cache (any other
+            // corrupt row is deleted by name and recreated).
+            Err(crate::ports::StoreError::CorruptRow { .. })
+                if change.name == crate::domain::DEFAULT_POLICY_NAME =>
+            {
+                Some(crate::domain::PolicyRecord::default_policy())
+            }
+            Err(other) => return Err(RunError::Store(other)),
+        };
         if dry_run {
             return registry.plan_policy_change(existing.as_ref(), &change);
         }

@@ -1667,6 +1667,103 @@ fn a_corrupt_policy_row_is_deletable_and_the_delete_heals_the_cache() {
 }
 
 #[test]
+fn a_failed_reload_retries_next_tick_and_a_create_heals_the_cache() {
+    // Round 3, M2: a failed tick reload is RETRIED (the fingerprint is
+    // stamped only after a successful load — a transient read error once
+    // stuck the fleet at forced pause until a restart), and while the
+    // cache is degraded a CREATE still plans against the last good set —
+    // `create default` is the write that restores a deleted `default`
+    // row and heals the cache.
+    let seeded = seed(1_000);
+    // A TRANSIENT read failure (a busy error): the table is untouched,
+    // the cache degrades — and the very next tick retries (a degraded
+    // cache retries unconditionally, whatever the fingerprint says).
+    seeded
+        .registry
+        .policies
+        .degrade("a transient read error (test)".to_string());
+    let refresh = seeded.registry.refresh_policy_cache();
+    assert!(
+        refresh.degraded.is_none(),
+        "the retry recovered: {refresh:?}"
+    );
+    assert!(refresh.reloaded, "the recovery is a reload");
+    // A PERSISTENT failure: a corrupt row degrades the load.
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    let refresh = seeded.registry.refresh_policy_cache();
+    assert!(refresh.degraded.is_some(), "the corrupt row degrades");
+    assert!(!refresh.reloaded);
+    // The failure heals behind the cache's back; the NEXT tick retries
+    // (unstamped fingerprint) and recovers.
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("DELETE FROM policies WHERE name = 'broken'");
+            Ok(())
+        })
+        .unwrap();
+    let refresh = seeded.registry.refresh_policy_cache();
+    assert!(
+        refresh.degraded.is_none(),
+        "the retry recovered: {refresh:?}"
+    );
+    assert!(refresh.reloaded);
+
+    // The degraded-create half: delete the `default` row (the cache
+    // degrades), then `create default` plans against the LAST GOOD set,
+    // writes the row, and the post-commit publish heals the cache.
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("DELETE FROM policies WHERE name = 'default'");
+            Ok(())
+        })
+        .unwrap();
+    let refresh = seeded.registry.refresh_policy_cache();
+    assert!(refresh.degraded.is_some(), "the missing default degrades");
+    seeded
+        .registry
+        .apply_policy_change(
+            None,
+            PolicyChange {
+                name: "default".to_string(),
+                selector: None,
+                set: PolicyLimits {
+                    breach_action: Some(BreachAction::Warn),
+                    scent_check: Some(crate::domain::runs::ScentCheckMode::Off),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            HashMap::new(),
+        )
+        .expect("the create plans against the last good set");
+    assert!(
+        seeded.registry.policy("default").unwrap().is_some(),
+        "the default row is restored"
+    );
+    assert!(
+        seeded.registry.load_policy_cache().is_none(),
+        "the create healed the cache"
+    );
+}
+
+#[test]
 fn a_fail_closed_resolution_keeps_the_arms_it_can_still_resolve() {
     // The N1 core: a degraded cache must never disarm the fleet. With an
     // explicit instance ceiling and an explicit Rate set, a degraded cache

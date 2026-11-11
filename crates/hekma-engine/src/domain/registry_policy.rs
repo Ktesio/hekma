@@ -193,7 +193,12 @@ impl Registry {
                 };
             }
         };
-        if !self.policies.stale_at(&fingerprint) {
+        // A healthy, unchanged table costs nothing further. A DEGRADED
+        // cache always retries: whatever failed (a transient read error)
+        // may have healed without moving the fingerprint, and one failed
+        // load must never hold the fleet at forced `pause` (the 21-3
+        // review round 3 finding M2).
+        if !self.policies.stale_at(&fingerprint) && self.policies.current().is_ok() {
             return PolicyRefresh::default();
         }
         match self.load_policy_cache() {
@@ -615,12 +620,8 @@ impl Registry {
         &self,
         existing: &PolicyRecord,
     ) -> Result<PolicyOutcome, RunError> {
-        let mut policies = self
-            .policies
-            .current()
-            .map_err(|unavailable| RunError::Store(StoreError::Backend(unavailable.to_string())))?
-            .as_ref()
-            .clone();
+        let (set, _degraded) = self.policies.current_or_last_good();
+        let mut policies = set.as_ref().clone();
         policies.retain(|policy| policy.name != existing.name);
         let runs = self.matched_runs(existing)?;
         let mut fallbacks = 0;
@@ -678,13 +679,15 @@ impl Registry {
 
     /// The cached policy set with `record` merged in (a create pushes it,
     /// a change replaces its row): the set the change will produce.
+    /// Plans against the LAST GOOD set while the cache is degraded (a
+    /// degraded cache once refused every create and change, so one
+    /// transient read error locked the Operator out of the very writes
+    /// that heal it — `create default` above all; the 21-3 review round 3
+    /// finding M2). The change's own commit publishes a freshly-read set,
+    /// which clears the degradation.
     fn planned_policy_set(&self, record: &PolicyRecord) -> Result<Vec<PolicyRecord>, RunError> {
-        let mut policies = self
-            .policies
-            .current()
-            .map_err(|unavailable| RunError::Store(StoreError::Backend(unavailable.to_string())))?
-            .as_ref()
-            .clone();
+        let (set, _degraded) = self.policies.current_or_last_good();
+        let mut policies = set.as_ref().clone();
         match policies
             .iter()
             .position(|policy| policy.name == record.name)
