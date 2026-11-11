@@ -658,6 +658,26 @@ impl Registry {
             .map_err(crate::domain::RunError::Store)
     }
 
+    /// Seed bench Run rows under one instance through the store writer
+    /// (story 21-5's perf harness; `#[doc(hidden)]` engine surface is the
+    /// only caller). No events, no snapshot publish.
+    pub(crate) fn seed_perf_rows(
+        &self,
+        instance: &str,
+        rows: &[crate::domain::runs::listing::PerfRunRow],
+    ) -> Result<(), crate::domain::RunError> {
+        let instance = instance.to_string();
+        let rows = rows.to_vec();
+        self.writer
+            .call_weighted(
+                rows.len().max(1),
+                move |ctx| {
+                    crate::domain::runs::listing::seed_perf_rows(ctx.store(), &instance, &rows)
+                },
+            )
+            .map_err(crate::domain::RunError::Store)
+    }
+
     /// Open a READ-ONLY registry (story 21-4): no directory is created, no
     /// migration runs, no legacy import happens, and the store writer is
     /// CLOSED (every write answers a typed refusal). A missing state.db reads

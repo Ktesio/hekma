@@ -582,6 +582,31 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The bench seeding's rollup write (story 21-5, `#[doc(hidden)]`
+    /// engine surface): one `usage_rollup_run` row, exactly the shape the
+    /// usage pipeline's fold would leave.
+    pub(crate) fn seed_rollup_for_perf(
+        &self,
+        instance: &InstanceName,
+        run_id: &RunId,
+        tokens: u64,
+    ) -> Result<(), StoreError> {
+        let instance_id: i64 = self
+            .instance_id(instance)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: instance.as_str().to_string(),
+            })?;
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO usage_rollup_run (instance_id, run_id, events, \
+                 input_tokens, output_tokens, cached_tokens, cached_unknown, cost_micros) \
+                 VALUES (?1, ?2, 1, ?3, 0, 0, 0, 0)",
+                rusqlite::params![instance_id, run_id.as_str(), tokens as i64],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     fn records(
         &self,
         sql_tail: &str,

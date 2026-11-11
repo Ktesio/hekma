@@ -1893,6 +1893,28 @@ impl Engine {
         .await
     }
 
+    /// Seed bench Run rows under one instance (story 21-5's perf harness,
+    /// `#[doc(hidden)]`): written directly through the store writer — no
+    /// events, no snapshot publish, no processes. NOT a supported
+    /// embedding surface; the `perf-budgets` example is the only caller.
+    #[doc(hidden)]
+    pub async fn seed_runs_for_perf(
+        &self,
+        instance: &str,
+        rows: Vec<crate::domain::runs::PerfRunRow>,
+    ) -> Result<(), RunError> {
+        let instance = instance.to_string();
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .seed_perf_rows(&instance, &rows)
+        })
+        .await
+    }
+
     /// The subject Run of `event` and the labels it carries NOW (story
     /// 21-5): the SSE Selector filter's one read per filtered event —
     /// snapshot first (no SQL), one read-only store read when the Run is
@@ -2794,10 +2816,24 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
     }
 
+    /// Blocking twin of [`Engine::seed_runs_for_perf`] (the perf harness's
+    /// `#[doc(hidden)]` seeding seam).
+    #[doc(hidden)]
+    pub fn seed_runs_for_perf(
+        &self,
+        instance: &str,
+        rows: Vec<crate::domain::runs::PerfRunRow>,
+    ) -> Result<(), RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.seed_runs_for_perf(instance, rows))
+    }
+
     /// Blocking twin of [`Engine::list_runs`] — `hekma ps`'s read.
     pub fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
         self.engine.rt.block_on(self.engine.list_runs(query))
     }
+
 
     /// Blocking twin of [`Engine::policies`].
     pub fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {

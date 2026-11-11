@@ -573,6 +573,103 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
     Ok(items)
 }
 
+/// A bench seed row for the perf harness's Run-scale scenario (story
+/// 21-5's `--ps-seed`): one `runs` row with its labels, an optional stored
+/// resolution and a subtree rollup, written DIRECTLY through the store
+/// writer — no events, no snapshot publish, no processes (Windows-safe).
+/// `#[doc(hidden)]`: the perf example is its only consumer; it is not a
+/// supported embedding surface.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PerfRunRow {
+    /// The run id.
+    pub run_id: String,
+    /// The status wire form (`active`, `held`, `ended`, …).
+    pub status: String,
+    /// The anomalies as the stored comma list (`""` for none).
+    pub anomalies: String,
+    /// RFC 3339 end time (ended rows only).
+    pub ended_at: Option<String>,
+    /// `(key, value)` bound labels.
+    pub labels: Vec<(String, String)>,
+    /// A stored resolution (the `run_policy` row).
+    pub resolution: Option<crate::domain::runs::PolicyResolution>,
+    /// Subtree usage written into the Run's rollup.
+    pub subtree_tokens: u64,
+}
+
+/// Seed bench rows under one instance (story 21-5's perf harness, the
+/// `#[doc(hidden)]` writer behind [`Engine::seed_runs_for_perf`]):
+/// one writer job per chunk, no events and no snapshot publish — the
+/// harness seeds scale, not history. The SQLite store directly: the rows
+/// and the rollup shape are written as the store sees them.
+pub(crate) fn seed_perf_rows(
+    store: &crate::store::SqliteStore,
+    instance: &str,
+    rows: &[PerfRunRow],
+) -> Result<(), crate::ports::StoreError> {
+    use crate::ports::{PolicyRecords, RunRecords};
+
+    let at = crate::time::now_rfc3339();
+    for row in rows {
+        store.insert_run(&crate::ports::NewRun {
+            record: RunRecord {
+                run_id: crate::domain::usage::RunId::from_wire(row.run_id.clone()),
+                control_depth: crate::domain::ControlDepth::Announced,
+                wire_path: false,
+                status: crate::domain::RunStatus::from_wire(&row.status).ok_or_else(
+                    || crate::ports::StoreError::CorruptRow {
+                        name: row.run_id.clone(),
+                        detail: format!("unknown bench status {}", row.status),
+                    },
+                )?,
+                anomalies: crate::domain::Anomaly::decode(&row.anomalies),
+                parent_run_id: None,
+                instance: Some(instance.to_string()),
+                process_owner: false,
+                end_cause: row.ended_at.as_deref().map(|_| "bench".to_string()),
+                created_at: at.clone(),
+                updated_at: at.clone(),
+                ended_at: row.ended_at.clone(),
+            },
+            labels: row
+                .labels
+                .iter()
+                .map(|(key, value)| Label::bound(key, value))
+                .collect(),
+            limits: Default::default(),
+            identity: None,
+        })?;
+        if let Some(resolution) = &row.resolution {
+            store.set_run_policy(
+                &crate::domain::usage::RunId::from_wire(row.run_id.clone()),
+                resolution,
+                &Default::default(),
+                &at,
+            )?;
+        }
+    }
+    // The subtree rollups: written directly (the usage pipeline's fold is
+    // not what this measures).
+    let iname = crate::domain::InstanceName::new(instance).map_err(|err| {
+        crate::ports::StoreError::CorruptRow {
+            name: instance.to_string(),
+            detail: err.to_string(),
+        }
+    })?;
+    for row in rows {
+        if row.subtree_tokens == 0 {
+            continue;
+        }
+        store.seed_rollup_for_perf(
+            &iname,
+            &crate::domain::usage::RunId::from_wire(row.run_id.clone()),
+            row.subtree_tokens,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

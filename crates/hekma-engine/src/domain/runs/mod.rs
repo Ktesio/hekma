@@ -41,7 +41,7 @@ pub mod verbs;
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use listing::{
     decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
     ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
 pub use policy::{

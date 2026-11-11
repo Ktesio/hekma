@@ -143,9 +143,12 @@ pub use domain::{
 // Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
 pub use domain::{
     decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
-    ListingView, RunBudgetView, RunListing, RunListingDocument, RunSummary,
+    ListingView, PerfRunRow, RunBudgetView, RunListing, RunListingDocument, RunSummary,
     ENDED_RUN_RETENTION_DAYS, LISTING_DEFAULT_LIMIT, LISTING_MAX_LIMIT, RUN_LISTING_SCHEMA_VERSION,
 };
+// The RFC 3339 formatters behind the window arithmetic (story 21-5: the
+// bench seeds ended rows at fixed distances from now).
+pub use crate::time::{format_rfc3339, now_unix_secs};
 // Story 21-3: Policies — the request and outcome of a Policy change, the
 // stored Policy, its limits and events, and the resolution a Run carries.
 pub use domain::{

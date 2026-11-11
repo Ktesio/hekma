@@ -1845,6 +1845,270 @@ fn serve_shape_json(
 /// `--help`/`-h`, parsed in the example's plain std style — no dependencies,
 /// no clap. Invalid usage is a LOUD stderr error + exit 2 in `main`, never a
 /// silent ignore; diagnostics go to stderr (CLI-first).
+// ---------------------------------------------------------------------------
+// Story 21-5: the Run-scale listing scenario (--ps-seed <N>)
+// ---------------------------------------------------------------------------
+
+/// The listing gate's name (story 21-5): the first exceptions page (default
+/// limit) plus its counts, p99 < 1 s STRICT — the read path that must stay
+/// bounded as Runs accumulate (NFR-4's Run-scale ladder starts here; the
+/// 10k/100k/1M ladder is the scale story's).
+const PS_FIRST_PAGE_BUDGET_MS: f64 = 1000.0;
+
+/// The ps gates' names (story 21-5), OUT of the default gated set (the same
+/// mode-aware rule the serve gates carry): they bind only on `--ps-seed`
+/// runs, against a ps-carrying baseline.
+const PS_GATED_METRICS: [&str; 1] = ["ps_first_page_p99_lt_1s"];
+
+/// The default measurement iterations for the listing reads (p50/p95/p99
+/// over a meaningful sample without re-opening the store hundreds of
+/// times at the 100k seed).
+const PS_DEFAULT_ITERATIONS: usize = 40;
+
+/// How many seed rows one writer job carries (bounded batches; the batch
+/// event bound is 512).
+const PS_SEED_CHUNK: usize = 500;
+
+/// Everything the `ps_listing` report block and its gate need (story
+/// 21-5).
+struct PsListingOutcome {
+    seed: u64,
+    iterations: usize,
+    /// The read-only open, per iteration (ms).
+    open_ms: Vec<f64>,
+    /// The first exceptions page (default limit) PLUS its counts — the
+    /// exact read `hekma ps` runs — per iteration (ms).
+    page_ms: Vec<f64>,
+    /// The counts the listing reported (from the LAST measured page).
+    listed: u64,
+    healthy_open: u64,
+}
+
+impl PsListingOutcome {
+    fn open_p(&self, pct: f64) -> f64 {
+        let mut sorted = self.open_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite samples"));
+        percentile(&sorted, pct * 100.0)
+    }
+    fn page_p(&self, pct: f64) -> f64 {
+        let mut sorted = self.page_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite samples"));
+        percentile(&sorted, pct * 100.0)
+    }
+}
+
+/// Build the seed rows for index range (deterministic, no RNG): the mix
+/// named in docs/testing.md — 2% active with the `breach` Anomaly, 2%
+/// `held`, 2% ended with an Anomaly inside the window, 20% ended clean
+/// inside, 10% ended older than the window, the rest active healthy — each
+/// with two bound labels, a stored resolution and a subtree rollup on
+/// every tenth row.
+fn ps_seed_rows(start: u64, count: usize, now_unix: u64) -> Vec<hekma_engine::PerfRunRow> {
+    use hekma_engine::{
+        BreachAction, CostCap, LimitSource, LimitSources, PerfRunRow, PolicyResolution,
+        ScentCheckMode, TokenBudget,
+    };
+    let inside_window = hekma_engine::format_rfc3339(now_unix.saturating_sub(2 * 86_400));
+    let outside_window = hekma_engine::format_rfc3339(now_unix.saturating_sub(20 * 86_400));
+    (0..count)
+        .map(|offset| {
+            let index = start + offset as u64;
+            let bucket = index % 100;
+            let (status, anomalies, ended_at) = if (0..2).contains(&bucket) {
+                ("active", "breach", None)
+            } else if (2..4).contains(&bucket) {
+                ("held", "", None)
+            } else if (4..6).contains(&bucket) {
+                ("ended", "failed", Some(inside_window.as_str()))
+            } else if (6..26).contains(&bucket) {
+                ("ended", "", Some(inside_window.as_str()))
+            } else if (26..36).contains(&bucket) {
+                ("ended", "", Some(outside_window.as_str()))
+            } else {
+                ("active", "", None)
+            };
+            let resolution = (index % 10 == 0).then(|| PolicyResolution {
+                tokens: TokenBudget {
+                    per_run: Some(200),
+                    cumulative: None,
+                },
+                dollars: CostCap::none(),
+                action: BreachAction::Warn,
+                effective_action: BreachAction::Warn,
+                scent_check: ScentCheckMode::Off,
+                rate: None,
+                sources: LimitSources {
+                    tokens_per_run: LimitSource::Policy("ps-tight".to_string()),
+                    tokens_cumulative: LimitSource::Unset,
+                    dollars_per_run: LimitSource::Unset,
+                    dollars_cumulative: LimitSource::Unset,
+                    breach_action: LimitSource::Default,
+                    scent_check: LimitSource::Default,
+                    rate: LimitSource::Unset,
+                },
+                fallback: None,
+                unpriced: None,
+                fail_closed: None,
+            });
+            PerfRunRow {
+                run_id: format!("run_bench{index:08}"),
+                status: status.to_string(),
+                anomalies: anomalies.to_string(),
+                ended_at: ended_at.map(str::to_string),
+                labels: vec![
+                    (
+                        "team".to_string(),
+                        if index % 2 == 0 { "core" } else { "edge" }.to_string(),
+                    ),
+                    (
+                        "env".to_string(),
+                        if index % 3 == 0 { "prod" } else { "dev" }.to_string(),
+                    ),
+                ],
+                resolution,
+                subtree_tokens: (index % 10 == 0).then_some(300 + index % 1_000).unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
+/// Run the Run-scale listing scenario (story 21-5, `--ps-seed <N>`): seed
+/// `seed` Runs into the harness's state store through the writer (no
+/// processes — Windows-safe), then measure `Engine::open_read_only` and
+/// the first exceptions page (default limit) plus its counts per
+/// iteration. CI mode retries the gate ONCE after a cool-down (the read
+/// gate's policy — a co-tenant stall must not red an ordinary PR).
+fn run_ps_scenario(
+    engine: &Arc<Engine>,
+    names: &[String],
+    state_base: &std::path::Path,
+    seed: u64,
+    iterations: usize,
+    ci: bool,
+) -> Result<PsListingOutcome, String> {
+    use hekma_engine::ListRunsQuery;
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Seed round-robin over the registered instances in bounded chunks.
+    let facade = engine.blocking();
+    let mut seeded = 0u64;
+    while seeded < seed {
+        let count = ((seed - seeded) as usize).min(PS_SEED_CHUNK);
+        let rows = ps_seed_rows(seeded, count, now_unix);
+        let instance = &names[(seeded as usize) % names.len()];
+        facade
+            .seed_runs_for_perf(instance, rows)
+            .map_err(|err| format!("the ps seeding failed at {seeded}: {err}"))?;
+        seeded += count as u64;
+    }
+    note(&format!(
+        "ps-seed run (story 21-5): {seed} Runs seeded across {} agents; measuring the \
+         listing over {iterations} iterations",
+        names.len()
+    ));
+
+    let measure = |outcome: &mut PsListingOutcome| -> Result<(), String> {
+        let opened = Instant::now();
+        let reader = Engine::open_read_only(Some(state_base.to_path_buf()))
+            .map_err(|err| format!("the read-only open failed: {err}"))?;
+        outcome.open_ms.push(opened.elapsed().as_secs_f64() * 1000.0);
+        let page = Instant::now();
+        let listing = reader
+            .blocking()
+            .list_runs(ListRunsQuery::exceptions())
+            .map_err(|err| format!("the listing read failed: {err}"))?;
+        outcome.page_ms.push(page.elapsed().as_secs_f64() * 1000.0);
+        outcome.listed = listing.counts.listed;
+        outcome.healthy_open = listing.counts.healthy_open;
+        Ok(())
+    };
+
+    let mut outcome = PsListingOutcome {
+        seed,
+        iterations,
+        open_ms: Vec::with_capacity(iterations),
+        page_ms: Vec::with_capacity(iterations),
+        listed: 0,
+        healthy_open: 0,
+    };
+    measure(&mut outcome)?;
+    // The CI once-retry (the read gate's policy): a first measurement past
+    // the strict budget cools down and re-measures from scratch; the gate
+    // applies to the SECOND run.
+    let first_p99 = outcome.page_p(0.99);
+    if ci && first_p99 >= PS_FIRST_PAGE_BUDGET_MS {
+        note(&format!(
+            "ps gate at-or-over budget on CI (p99 {first_p99:.3} ms; the gate is strict <) — \
+             cooling down {:?} and retrying ONCE (the gate applies to the second run)",
+            READ_RETRY_COOLDOWN
+        ));
+        std::thread::sleep(READ_RETRY_COOLDOWN);
+        outcome = PsListingOutcome {
+            seed,
+            iterations,
+            open_ms: Vec::with_capacity(iterations),
+            page_ms: Vec::with_capacity(iterations),
+            listed: 0,
+            healthy_open: 0,
+        };
+        measure(&mut outcome)?;
+    }
+    for _ in 1..iterations {
+        measure(&mut outcome)?;
+    }
+    Ok(outcome)
+}
+
+/// The `ps_listing` report block (story 21-5) — present ONLY on `--ps-seed`
+/// runs (the default invocation's report stays byte-equivalent). Pure.
+fn ps_listing_json(outcome: &PsListingOutcome, gates: &GateReport) -> serde_json::Value {
+    let verdicts: Vec<serde_json::Value> = gates
+        .verdicts
+        .iter()
+        .map(|verdict| {
+            let mut json = verdict_json(verdict);
+            json["hard"] = serde_json::json!(true);
+            json
+        })
+        .collect();
+    serde_json::json!({
+        "story": "21-5",
+        "budget_source": "NFR-4 (the Run-scale read that must stay bounded; the \
+             10k/100k/1M ladder belongs to the scale story)",
+        "seed": outcome.seed,
+        "iterations": outcome.iterations,
+        "seed_mix": "2% active+breach, 2% held, 2% ended+anomaly inside the window, \
+             20% ended clean inside, 10% ended older, the rest active healthy; two bound \
+             labels each, a stored resolution and a subtree rollup on every tenth row",
+        "open_read_only_ms": {
+            "p50": outcome.open_p(0.50),
+            "p95": outcome.open_p(0.95),
+            "p99": outcome.open_p(0.99),
+        },
+        "first_page_ms": {
+            "note": "the first exceptions page (default limit 50) PLUS its counts — the \
+                 exact read `hekma ps` runs, through the read-only engine",
+            "p50": outcome.page_p(0.50),
+            "p95": outcome.page_p(0.95),
+            "p99": outcome.page_p(0.99),
+        },
+        "counts": {
+            "listed": outcome.listed,
+            "healthy_open": outcome.healthy_open,
+        },
+        "baseline_rule": "the ps gate binds ONLY on --ps-seed runs; the DEFAULT \
+             gated-metric set never carries ps names. A ps run trends the ps gate too — \
+             but only against a ps-carrying baseline (seeded per docs/testing.md): the \
+             mode-aware coverage check hard-fails a ps run whose --baseline lacks the \
+             ps metric, never a silent pass",
+        "gates": verdicts,
+        "status": if gates.passed { "pass" } else { "fail" },
+    })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CliArgs {
     baseline: Option<String>,
@@ -1854,6 +2118,11 @@ struct CliArgs {
     /// flag: any `=`-carrying form (`--serve-shape=bogus`) is a named usage
     /// error + exit 2, never a silently-ignored value.
     serve_shape: bool,
+    /// Story 21-5: run the Run-scale listing scenario AFTER the default
+    /// (and serve) phases — seed N Runs into the state store and measure
+    /// the listing's first page + counts — adding the `ps_listing` report
+    /// block + its gate (bound only on ps runs).
+    ps_seed: Option<u64>,
     help: bool,
 }
 
@@ -1926,7 +2195,8 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             // including one carrying '=': never a split-on-= attempt.
             return Err(format!(
                 "unknown argument {raw:?} \
-                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, --help)"
+                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
+                 --ps-seed <N>, --help)"
             ));
         };
         if flag == "--serve-shape" {
@@ -1946,10 +2216,34 @@ fn parse_cli_args(argv: &[String]) -> Result<CliArgs, String> {
             index += 1;
             continue;
         }
+        if flag == "--ps-seed" {
+            let value = match inline_value {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    argv.get(index).cloned().ok_or_else(|| {
+                        "--ps-seed requires a count (usage: --ps-seed <N>)".to_string()
+                    })?
+                }
+            };
+            let count: u64 = value.parse().map_err(|_| {
+                format!("--ps-seed requires a whole number of Runs (got {value:?})")
+            })?;
+            if count == 0 {
+                return Err("--ps-seed requires a count of at least 1".to_string());
+            }
+            if parsed.ps_seed.is_some() {
+                return Err("--ps-seed given more than once".to_string());
+            }
+            parsed.ps_seed = Some(count);
+            index += 1;
+            continue;
+        }
         if flag != "--baseline" && flag != "--write-baseline" {
             return Err(format!(
                 "unknown argument {raw:?} \
-                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, --help)"
+                 (supported: --baseline <file>, --write-baseline <file>, --serve-shape, \
+                 --ps-seed <N>, --help)"
             ));
         }
         let value = match inline_value {
@@ -2630,8 +2924,13 @@ fn baseline_report_json(
 /// test that fails if it is deleted): an absolute-budget failure, a ratchet
 /// failure, or a serve-gate failure reds the run (exit 1); only a fully
 /// green run exits 0. Pure; pinned by tests.
-fn run_exit_code(gates_passed: bool, ratchet_failed: bool, serve_failed: bool) -> i32 {
-    if gates_passed && !ratchet_failed && !serve_failed {
+fn run_exit_code(
+    gates_passed: bool,
+    ratchet_failed: bool,
+    serve_failed: bool,
+    ps_failed: bool,
+) -> i32 {
+    if gates_passed && !ratchet_failed && !serve_failed && !ps_failed {
         0
     } else {
         1
@@ -2647,6 +2946,7 @@ fn run_exit_code(gates_passed: bool, ratchet_failed: bool, serve_failed: bool) -
 fn baseline_write_refusal(
     gates_passed: bool,
     serve_failed: bool,
+    ps_failed: bool,
     ratchet_failed: bool,
 ) -> Option<&'static str> {
     if !gates_passed {
@@ -2660,6 +2960,13 @@ fn baseline_write_refusal(
             "--write-baseline REFUSED: the SERVE budgets FAILED this run — a red \
              run's regressed figures must never become the canonical baseline (a \
              serve-carrying baseline included); fix the regression first (the \
+             report above is the measured record)",
+        )
+    } else if ps_failed {
+        Some(
+            "--write-baseline REFUSED: the PS listing budget FAILED this run — a red \
+             run's regressed figures must never become the canonical baseline (a \
+             ps-carrying baseline included); fix the regression first (the \
              report above is the measured record)",
         )
     } else if ratchet_failed {
@@ -2715,10 +3022,22 @@ fn main() {
                 // minute of measurement is wasted), never a silent pass and
                 // never a fabricated zero. A default run's set is exactly
                 // GATED_METRICS (the serve names are not in it — pinned).
-                let expected_gated: Vec<&str> = if cli.serve_shape {
+                let expected_gated: Vec<&str> = if cli.serve_shape || cli.ps_seed.is_some() {
                     GATED_METRICS
                         .iter()
-                        .chain(SERVE_GATED_METRICS.iter())
+                        .chain(
+                            cli.serve_shape
+                                .then(|| SERVE_GATED_METRICS.iter())
+                                .into_iter()
+                                .flatten(),
+                        )
+                        .chain(
+                            cli.ps_seed
+                                .is_some()
+                                .then(|| PS_GATED_METRICS.iter())
+                                .into_iter()
+                                .flatten(),
+                        )
                         .copied()
                         .collect()
                 } else {
@@ -2978,11 +3297,39 @@ fn main() {
         None
     };
 
+    // ---- Story 21-5: the Run-scale listing scenario — ONLY on --ps-seed
+    // runs (the default invocation stops here and stays byte-equivalent).
+    // Runs AFTER every other phase so it cannot contaminate them. An Err
+    // (the seeding or a read failed) is carried as a NAMED scenario error,
+    // exactly like the serve slot above. ----
+    let mut ps_scenario_error: Option<String> = None;
+    let ps = if let Some(seed) = cli.ps_seed {
+        let iterations = env_u64("PERF_BUDGETS_PS_ITERATIONS", PS_DEFAULT_ITERATIONS as u64)
+            as usize;
+        match run_ps_scenario(
+            &engine,
+            &names,
+            state.path(),
+            seed,
+            iterations,
+            config.ci,
+        ) {
+            Ok(outcome) => Some(outcome),
+            Err(reason) => {
+                ps_scenario_error = Some(reason);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // The exit fold's inputs, hoisted out of the record block so the tail can
     // fold them through the pinned `run_exit_code` (review round 3).
     let mut gates_passed = true;
     let mut ratchet_failed = false;
     let mut serve_failed = false;
+    let mut ps_failed = false;
     let mut baseline_write_failed = false;
 
     // ---- The measured record + every verdict. Breaks early on a named
@@ -2990,6 +3337,10 @@ fn main() {
     // exit-2 fires after it. ----
     'record: {
         if let Some(reason) = &serve_scenario_error {
+            note(reason);
+            break 'record;
+        }
+        if let Some(reason) = &ps_scenario_error {
             note(reason);
             break 'record;
         }
@@ -3082,6 +3433,48 @@ fn main() {
             }
             serve_gates_for_trend = Some(serve_gates);
         }
+        // ---- Story 21-5: the ps gate + the ps_listing report block, ADDITIVE
+        // and only on --ps-seed runs — platform-unconditional (SQLite reads,
+        // no processes), with the CI once-retry inside the scenario. The ps
+        // gate rides the mode-aware trend below, like the serve gates. ----
+        let mut ps_gates_for_trend: Option<GateReport> = None;
+        if let Some(outcome) = &ps {
+            // STRICT `<` at the budget on every platform (SQLite reads; no
+            // process timing), the CI once-retry already inside the
+            // scenario's measurement.
+            let ps_gates = GateReport {
+                passed: gate(
+                    "ps_first_page_p99_lt_1s",
+                    outcome.page_p(0.99),
+                    PS_FIRST_PAGE_BUDGET_MS,
+                    1.0,
+                    GateBound::Lt,
+                )
+                .passed,
+                verdicts: vec![gate(
+                    "ps_first_page_p99_lt_1s",
+                    outcome.page_p(0.99),
+                    PS_FIRST_PAGE_BUDGET_MS,
+                    1.0,
+                    GateBound::Lt,
+                )],
+            };
+            ps_failed = !ps_gates.passed;
+            report["ps_listing"] = ps_listing_json(outcome, &ps_gates);
+            if ps_failed {
+                report["status"] = serde_json::json!("fail");
+            }
+            for verdict in &ps_gates.verdicts {
+                note(&format!(
+                    "ps gate {} measured {:.4} vs effective budget {:.4} — {}",
+                    verdict.name,
+                    verdict.measured,
+                    verdict.effective_budget,
+                    if verdict.passed { "PASS" } else { "FAIL" },
+                ));
+            }
+            ps_gates_for_trend = Some(ps_gates);
+        }
         // ---- The trend block + ratchet (story 15-5), ADDITIVE to the gates:
         // inserted only when --baseline was given, so the default report stays
         // byte-equivalent. The ratchet fails the run (exit 1 below) only on its
@@ -3099,6 +3492,11 @@ fn main() {
                 trend_gates
                     .verdicts
                     .extend(serve_gates.verdicts.iter().cloned());
+            }
+            if let Some(ps_gates) = &ps_gates_for_trend {
+                trend_gates
+                    .verdicts
+                    .extend(ps_gates.verdicts.iter().cloned());
             }
             match evaluate_trend(&trend_gates, figures, path, config.ci) {
                 Ok(trend) => {
@@ -3128,7 +3526,8 @@ fn main() {
         if let Some(path) = &cli.write_baseline {
             // Story 17-1: a red SERVE run refuses the write too — a failed run's
             // figures must never become canonical, whatever gated them.
-            if let Some(reason) = baseline_write_refusal(gates_passed, serve_failed, ratchet_failed)
+            if let Some(reason) =
+                baseline_write_refusal(gates_passed, serve_failed, ps_failed, ratchet_failed)
             {
                 // Deferred like the write-failure flag below: the note fires
                 // here, the exit happens after teardown (process::exit skips
@@ -3207,7 +3606,7 @@ fn main() {
     // perf-budgets job (and any local gate runner) fails on the regression —
     // an absolute-budget failure, a ratchet failure, OR a serve-gate failure
     // (story 17-1). The fold itself is the pinned `run_exit_code`.
-    std::process::exit(run_exit_code(gates_passed, ratchet_failed, serve_failed));
+    std::process::exit(run_exit_code(gates_passed, ratchet_failed, serve_failed, ps_failed));
 }
 
 // ---------------------------------------------------------------------------
@@ -4786,6 +5185,7 @@ mod tests {
                 baseline: Some("b.json".into()),
                 write_baseline: Some("w.json".into()),
                 serve_shape: false,
+                ps_seed: None,
                 help: false,
             }
         );
@@ -4799,6 +5199,7 @@ mod tests {
                 baseline: Some("b.json".into()),
                 write_baseline: Some("w.json".into()),
                 serve_shape: false,
+                ps_seed: None,
                 help: false,
             }
         );
@@ -4814,6 +5215,7 @@ mod tests {
                 baseline: Some("only.json".into()),
                 write_baseline: None,
                 serve_shape: false,
+                ps_seed: None,
                 help: false,
             }
         );
@@ -5309,31 +5711,141 @@ mod tests {
         // 3: the serve token is its OWN arm — deleting it cannot pass the
         // battery.
         let gates_red =
-            baseline_write_refusal(false, false, false).expect("a red absolute run refuses");
+            baseline_write_refusal(false, false, false, false).expect("a red absolute run refuses");
         assert!(gates_red.contains("absolute budgets FAILED"), "{gates_red}");
-        let serve_red = baseline_write_refusal(true, true, false).expect("a red serve run refuses");
+        let serve_red = baseline_write_refusal(true, true, false, false).expect("a red serve run refuses");
         assert!(serve_red.contains("SERVE budgets FAILED"), "{serve_red}");
-        let ratchet_red = baseline_write_refusal(true, false, true).expect("a red ratchet refuses");
+        let ratchet_red = baseline_write_refusal(true, false, false, true).expect("a red ratchet refuses");
         assert!(ratchet_red.contains("ratchet FAILED"), "{ratchet_red}");
         assert!(ratchet_red.contains("docs/testing.md"), "{ratchet_red}");
         // Both absolute families red at once names the default-budget
         // failure first; red-both-with-ratchet never reaches the ratchet arm.
-        let both = baseline_write_refusal(false, true, true).expect("red-both refuses");
+        let both = baseline_write_refusal(false, true, false, true).expect("red-both refuses");
         assert!(both.contains("absolute budgets FAILED"), "{both}");
         // A fully green run is the only write path.
-        assert_eq!(baseline_write_refusal(true, false, false), None);
+        assert_eq!(baseline_write_refusal(true, false, false, false), None);
     }
 
     #[test]
+    #[test]
+    fn the_ps_percentiles_rank_over_varied_samples() {
+        // Pinned after a real bug: the fraction-vs-percent convention
+        // collapsed every rank to the minimum (p50 == p95 == p99 == min).
+        // The ranks must be the nearest-rank percentiles over the ASCENDING
+        // sort: p99 = the max, p50 = the upper median of twelve.
+        let outcome = PsListingOutcome {
+            seed: 10,
+            iterations: 12,
+            open_ms: vec![1.0; 12],
+            page_ms: vec![5.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            listed: 0,
+            healthy_open: 0,
+        };
+        assert_eq!(outcome.page_p(0.99), 12.0);
+        assert_eq!(outcome.page_p(0.95), 12.0);
+        assert_eq!(outcome.page_p(0.50), 6.0);
+        assert_eq!(outcome.open_p(0.99), 1.0, "constant samples rank constant");
+    }
+
+    #[test]
+    fn the_ps_seed_flag_parses_and_refuses_bad_usage() {
+        // Story 21-5, the --serve-shape discipline for a VALUE flag: the
+        // inline and spaced forms parse, a non-numeric or zero count is a
+        // named usage error, and the flag cannot repeat.
+        let argv: Vec<String> = ["--ps-seed", "10000"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(parse_cli_args(&argv).unwrap().ps_seed, Some(10_000));
+        let argv: Vec<String> = ["--ps-seed=500"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_cli_args(&argv).unwrap().ps_seed, Some(500));
+        for bad in [
+            vec!["--ps-seed"],
+            vec!["--ps-seed", "many"],
+            vec!["--ps-seed", "0"],
+            vec!["--ps-seed", "10", "--ps-seed", "20"],
+        ] {
+            let argv: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(parse_cli_args(&argv).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_ps_seed_mix_matches_the_documented_percentages() {
+        // Story 21-5: 2% active+breach, 2% held, 2% ended+anomaly inside
+        // the window, 20% ended clean inside, 10% ended older, the rest
+        // active healthy — over a full century bucket.
+        let rows = ps_seed_rows(0, 10_000, 1_794_355_200);
+        let count = |predicate: &dyn Fn(&hekma_engine::PerfRunRow) -> bool| {
+            rows.iter().filter(|row| predicate(row)).count()
+        };
+        assert_eq!(
+            count(&|row| row.status == "active" && row.anomalies == "breach"),
+            200
+        );
+        assert_eq!(count(&|row| row.status == "held"), 200);
+        assert_eq!(
+            count(&|row| {
+                row.status == "ended" && !row.anomalies.is_empty() && row.ended_at.is_some()
+            }),
+            200
+        );
+        let ended_clean = count(&|row| row.status == "ended" && row.anomalies.is_empty());
+        assert_eq!(ended_clean, 3_000, "20% inside + 10% outside");
+        assert_eq!(count(&|row| row.subtree_tokens > 0), 1_000, "10% rollups");
+        assert_eq!(
+            count(&|row| row.resolution.is_some()),
+            1_000,
+            "10% stored resolutions"
+        );
+        // Every row carries two bound labels.
+        assert!(rows.iter().all(|row| row.labels.len() == 2));
+        // The ids are zero-padded: DESC listing order is seeding order
+        // reversed.
+        assert!(rows[0].run_id < rows[1].run_id);
+    }
+
+    #[test]
+    fn the_ps_listing_block_carries_the_gate_and_the_counts() {
+        let outcome = PsListingOutcome {
+            seed: 10_000,
+            iterations: 40,
+            open_ms: vec![1.0; 40],
+            page_ms: vec![2.0; 40],
+            listed: 400,
+            healthy_open: 6_400,
+        };
+        let gates = GateReport {
+            passed: true,
+            verdicts: vec![gate(
+                "ps_first_page_p99_lt_1s",
+                2.0,
+                PS_FIRST_PAGE_BUDGET_MS,
+                1.0,
+                GateBound::Lt,
+            )],
+        };
+        let json = ps_listing_json(&outcome, &gates);
+        assert_eq!(json["seed"], 10_000);
+        assert_eq!(json["counts"]["listed"], 400);
+        assert_eq!(json["counts"]["healthy_open"], 6_400);
+        assert_eq!(json["first_page_ms"]["p99"], 2.0);
+        assert_eq!(json["gates"][0]["name"], "ps_first_page_p99_lt_1s");
+        assert_eq!(json["gates"][0]["hard"], true);
+        assert_eq!(json["status"], "pass");
+        assert_eq!(PS_GATED_METRICS, ["ps_first_page_p99_lt_1s"]);
+    }
+
     fn run_exit_code_folds_all_three_red_sources() {
         // Review round 3, pinned so each token has a test that fails if it
         // is deleted: only a fully green run exits 0; ANY one of the three
         // red sources (absolute gates, ratchet, serve gates) reds the run.
-        assert_eq!(run_exit_code(true, false, false), 0);
-        assert_eq!(run_exit_code(false, false, false), 1, "absolute gates red");
-        assert_eq!(run_exit_code(true, true, false), 1, "ratchet red");
-        assert_eq!(run_exit_code(true, false, true), 1, "serve gates red");
-        assert_eq!(run_exit_code(false, true, true), 1, "all red");
+        assert_eq!(run_exit_code(true, false, false, false), 0);
+        assert_eq!(run_exit_code(false, false, false, false), 1, "absolute gates red");
+        assert_eq!(run_exit_code(true, true, false, false), 1, "ratchet red");
+        assert_eq!(run_exit_code(true, false, true, false), 1, "serve gates red");
+        assert_eq!(run_exit_code(true, false, false, true), 1, "ps gate red");
+        assert_eq!(run_exit_code(false, true, true, true), 1, "all red");
     }
 
     #[test]

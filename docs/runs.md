@@ -1,11 +1,11 @@
 ---
 title: "Runs, Control Depth, ps and top"
-description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs, child Runs and hekma label are on main; hekma ps, Selectors on every verb and hekma top are in development."
+description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs, child Runs, hekma label and hekma ps are on main; Selectors on every other verb and hekma top are in development."
 ---
 
 # Runs, Control Depth, ps and top
 
-> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run` and `hekma label` are on main and ship in the next release. `hekma ps`, Selectors on every other verb, `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run`, `hekma label` and `hekma ps` are on main and ship in the next release. Selectors on every other verb, `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/runs/](https://hekma.ktesio.dev/docs/runs/), where it is kept current.
 
@@ -54,6 +54,20 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 
 Until model calls carry a Run's identity, usage reaches child Runs only from Hosts embedding the engine; the shared Metering Proxy will attribute calls to them.
 
+**`hekma ps` — the Runs that need you, newest first.** One exception-first listing over every Run in the state directory ([the command reference](commands.md#hekma-ps---selector-sel--all---limit-n---cursor-c---json)):
+
+```bash
+hekma ps
+hekma ps --selector team=core,env=prod
+hekma ps --all --limit 100
+```
+
+A Run is listed when it carries an **Anomaly** (an ended Run only within seven days of its end) or a `held`, `silent` or `stale` status; healthy open Runs are counted in the footer, not listed, and `--all` lists every Run inside that window. The window is a read-side bound of seven days (FR-49's assumed default) until compaction lands; older ended Runs stay in the store and are reachable by id, they just age out of listings. Rows are ordered by run id, newest first — ULID ids encode creation time, so the order is the creation order — and a `--cursor` value the footer prints pages without duplicates: a Run that changes status between two pages neither moves nor repeats, a Run deleted between pages is skipped, and one that starts matching below the cursor is not chased. Legacy `run-…` ids sort below every `run_…` id and therefore land last.
+
+Each row carries the CONTROL depth (`supervised (no wire)` for an agent whose model calls skip the metering listener), the Run Status, the Anomalies with each latched Breach Action (`breach[block]` — a fenced agent never reads as merely healthy), the labels (a caller label is suffixed), the Run's subtree usage, and its headroom against the **resolved** limits — naming the Policy that set them, with the cumulative token headroom on process-owning rows and no dollar figure where no Rate prices one. The RUN column shows the agent's name on process-owning rows and the run id on child Runs. `--json` carries every figure whole: each row's labels with source and origin, its latches, its resolved limits with each limit's source, the effective Breach Action after the depth fallback, and the `kept_on_pause` marker where the breach-default upgrade holds an agent on `pause`.
+
+`--selector` matches bound and caller labels alike in either view, and a listing pages past the 1000-Run cap the label verb carries (a listing never loads the whole Run set). `--limit` defaults to 50 and serves at most 1000 (`0` means the maximum; above the cap it clamps with a note). A read-only read: `hekma ps` opens the state database read-only, never starts a host, creates nothing, and exits `0` with a note when nothing needs attention. Exit `2` is an invalid selector, cursor or limit; `1` a store failure.
+
 ## What is coming
 
 A **Run** is one unit of agent work with a stable run id, a Control Depth, labels, budgets and a Run Status, whether or not Hekma started its process: a supervised agent, a child Run inside a Host or framework flow, or a client Hekma found.
@@ -61,7 +75,8 @@ A **Run** is one unit of agent work with a stable run id, a Control Depth, label
 | Part | Stage |
 |---|---|
 | Runs for supervised agents, run ids, labels from configuration, parent and child Runs, `hekma label` with `--selector`, `--dry-run` and `--yes` | On main |
-| `hekma ps`, Selectors and `--dry-run` on every other verb | In development |
+| `hekma ps`, Selectors on listings | On main |
+| Selectors and `--dry-run` on every other verb | In development |
 | `hekma top` | Planned |
 | Runs Hekma did not start (depths `wire`, `announced`, `observed`) | Planned |
 
@@ -92,25 +107,11 @@ by name, or the default Policy) — plus the `depth-fallback` and
 
 **Parent Runs.** Runs are flat unless one names a parent (on main, as above). A verb on a parent will reach its children only through a Selector, except that stopping or pausing the Run that owns a supervised process also stops or pauses the child Runs inside it.
 
-**`hekma ps`** is exception-first: Runs with an Anomaly or a `held`, `silent` or `stale` status are listed, healthy ones are counted, and `--all` lists everything. The CONTROL column shows the depth, `--json` each label's source, and `--limit` with a cursor pages.
+A **Selector** (`key=value,…`) names a set of Runs on any listing or verb, as it already does for `hekma label` and `hekma ps`. When it matches more than one Run on a verb, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it. Listing Selectors page past the 1000-Run cap the verbs keep.
 
-A **Selector** (`key=value,…`) names a set of Runs on any listing or verb, as it already does for `hekma label`. When it matches more than one Run, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it.
+**`hekma top`** will show each Run's status, depth, tokens per second, burn rate and budget left, live. Hotkeys will pause, stop, hold, raise a limit and attach, confirming as the matching command does. It can watch a remote `hekma serve`; the `/v0/events` stream's Selector filter and resume (see the [Control API](control-api.md)) are the seam it builds on.
 
-A sketch of the planned commands; the final flags and output may differ:
-
-```text
-$ hekma ps --selector team=support
-RUN                             CONTROL     STATUS  ANOMALIES      LABELS
-run_01JBX7Q2M4V8K3N6P9R2T5W8YZ  supervised  held    budget-breach  team=support,flow=triage
-run_01JBX7R5C8D1F4G7H0J3K6M9NP  wire        silent  silent         team=support,flow=replies
-212 healthy Runs not shown (--all lists them)
-
-$ hekma agent pause --selector flow=replies,env=prod --dry-run
-```
-
-**`hekma top`** will show each Run's status, depth, tokens per second, burn rate and budget left, live. Hotkeys will pause, stop, hold, raise a limit and attach, confirming as the matching command does. It can watch a remote `hekma serve`.
-
-Every filter, Selector and page parameter will have a [Control API](https://hekma.ktesio.dev/docs/control-api/) equivalent, so teams can work from scripts and their own observability stack. The goal is that listing stays fast from thousands to millions of Runs.
+Every filter, Selector and page parameter of `hekma ps` has a [Control API](https://hekma.ktesio.dev/docs/control-api/) equivalent — `GET /v0/runs?selector=&view=&limit=&cursor=` — so teams can work from scripts and their own observability stack. The goal is that listing stays fast from thousands to millions of Runs.
 
 ## Open questions
 

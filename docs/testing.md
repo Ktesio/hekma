@@ -316,6 +316,42 @@ The measured serve record (local runs; CI serve runs append their own via the jo
 
 (The serve table is separate from the default record above: the shape differs — one 12 s window under load, a pathological bounded stop, a subscribed follower — so its rows are not comparable to the default rows, and the columns are the serve gates' own figures.)
 
+### The Run-scale listing scenario (`--ps-seed <N>`)
+
+The listing is the read path that must stay **bounded as Runs accumulate**
+(`hekma ps`, `GET /v0/runs`). `--ps-seed <N>` extends the harness
+**additively** after every other phase (the default no-flag invocation
+stays byte-equivalent; the `ps_listing` report block exists only on seed
+runs): it seeds N Run rows straight into the state store through the
+writer — no processes, so it is Windows-safe — and then measures, over
+bounded iterations on a fresh **read-only engine** each time, the
+read-only open and the **first exceptions page (default limit) plus its
+counts** — the exact read `hekma ps` runs.
+
+The seed mix is fixed and documented: 2% active Runs with the `breach`
+Anomaly, 2% `held`, 2% ended with an Anomaly inside the ended-Run window,
+20% ended clean inside the window, 10% ended older than the window, the
+rest active healthy — each with two bound labels, a stored Policy
+resolution and a subtree rollup on every tenth row. The gate —
+`ps_first_page_p99_lt_1s`, strict `<` — binds only on `--ps-seed` runs
+(the default gated-metric set never carries ps names), with the same CI
+once-retry policy as the read gate. The CI seed is 10000. The
+10k/100k/1M ladder belongs to the scale substrate story; the numbers
+below are this harness's own record.
+
+The measured record (local runs; the CI seed leg appends its own via the
+job):
+
+| Date | Platform | seed | open p99 (ms) | first page + counts p50/p95/p99 (ms) | listed / healthy | Verdict |
+|---|---|---|---|---|---|---|
+| 2026-11-12 | macOS arm64 (this development machine), dev profile | 10 000 | 0.87 | 5.55 / 5.73 / 6.08 | 600 / 6 410 | PASS (budget < 1000) |
+| 2026-11-12 | macOS arm64 (same), dev profile | 100 000 | 0.87 | 28.62 / 29.85 / 30.06 | 6 000 / 64 010 | the ps gate holds at 30.06 ms; recorded for the ladder |
+
+Invocation: `cargo run -p hekma-engine --example perf-budgets -- --ps-seed
+10000` (exit 0 green, 1 red, 2 usage/scenario error — the same fold as
+the serve scenario). `PERF_BUDGETS_PS_ITERATIONS` (default 40) bounds the
+measurement iterations.
+
 ## Cross-platform testing (3-OS matrix)
 
 The per-OS process-control code lives only under `crates/hekma-engine/src/backends/{unix,windows}` (the sole place OS-conditional compilation is allowed). This code cannot be verified on a single operating system — the Windows Job-Object backend does not even compile on Linux. The CI `test` job therefore runs on a matrix of `ubuntu-latest`, `macos-latest`, and `windows-latest`:
