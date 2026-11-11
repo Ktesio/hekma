@@ -8989,34 +8989,29 @@ fn the_policy_delete_dry_run_reports_and_default_is_refused_at_the_supervisor() 
 }
 
 #[test]
-fn a_change_fired_breach_on_an_unsupervised_instance_is_recorded_not_acted_on() {
-    // A matched open Run whose instance this engine does NOT supervise
-    // (registered, seeded through the registry, never started): the Policy
-    // change's breach records and latches, the event is published and
-    // mirrored, and ONE diagnostic says the process action will apply at
-    // the agent's next start or adoption — nothing is handed to the
-    // lifecycle (the process is not ours to act on).
+fn a_foreign_engines_change_leaves_the_breach_to_the_supervising_engine() {
+    // Round 2, N2, end to end: engine B (no supervision of the agent)
+    // lowers a Policy below a Run's usage — it must NOT latch or record
+    // the breach (a foreign latch once spent the scope for the
+    // supervising engine's decide, and the crossing never fired). Engine
+    // A — the supervising engine — picks the new set up at its next tick
+    // and its own live evaluation fires the breach under its own fence
+    // and lifecycle.
     let (_state, _manifest, registry) = setup_fake("polghost", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("polghost").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    // An open process-owning Run for an instance that is NOT running here.
-    let ghost = RunId::mint();
-    let run = crate::domain::runs::ops::SupervisedRun {
-        instance: InstanceName::new("polghost").unwrap(),
-        run_id: ghost.clone(),
-        wire_path: false,
-        labels: vec![crate::domain::Label::bound("team", "ghost")],
-        fresh: true,
-        inputs: None,
-    };
-    registry.ensure_supervised_run(run).unwrap();
-    let buffer = install_capture_sink(&mut sup);
+    sup.start(&registry, "polghost").unwrap();
+    let run = open_run(&registry, "polghost").record.run_id;
+    registry.set_config(&name, "labels.team", "ghost").unwrap();
+    sup.sync_run_labels(&registry, &name);
+    // Spend under a high ceiling.
     sup.change_policy(
         &registry,
         crate::domain::PolicyChange {
             name: "ghostcap".to_string(),
             selector: Some("team=ghost".parse().unwrap()),
             set: crate::domain::PolicyLimits {
-                tokens_per_run: Some(10),
+                tokens_per_run: Some(1_000_000),
                 ..Default::default()
             },
             clear: Vec::new(),
@@ -9025,37 +9020,72 @@ fn a_change_fired_breach_on_an_unsupervised_instance_is_recorded_not_acted_on() 
         false,
     )
     .unwrap();
-    // The breach recorded (the seeded usage? none — so lower below zero
-    // usage: any ceiling at/below 0 fires; use 0).
-    // (The ceiling of 10 with no usage does NOT breach; re-arm with 0.)
-    sup.change_policy(
+    sup.commit_run_usage(
         &registry,
-        crate::domain::PolicyChange {
-            name: "ghostcap2".to_string(),
-            selector: Some("team=ghost".parse().unwrap()),
-            set: crate::domain::PolicyLimits {
-                tokens_per_run: Some(0),
-                ..Default::default()
-            },
-            clear: Vec::new(),
-            rates: Default::default(),
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 2_000,
+            output_tokens: 0,
+            cached_tokens: 0,
         },
-        false,
+    )
+    .unwrap();
+    assert!(Supervisor::read_breach_events(&registry, "polghost")
+        .unwrap()
+        .is_empty());
+    // ENGINE B: a second registry on the same state dir lowers the
+    // ceiling below the usage. No breach may be recorded or latched.
+    let second = Registry::open(Some(_state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("ghostcap").unwrap(),
+            crate::domain::PolicyChange {
+                name: "ghostcap".to_string(),
+                selector: Some("team=ghost".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(1_000),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    assert!(
+        Supervisor::read_breach_events(&registry, "polghost")
+            .unwrap()
+            .is_empty(),
+        "the foreign engine recorded nothing"
+    );
+    use crate::ports::RunStore as _;
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign engine latched nothing"
+    );
+    // ENGINE A: one tick refreshes its set, and the very next usage event
+    // fires the breach under A's own lifecycle (warn action: recorded,
+    // process untouched).
+    registry.refresh_policy_cache();
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 2,
+            input_tokens: 1,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
     )
     .unwrap();
     let breaches = Supervisor::read_breach_events(&registry, "polghost").unwrap();
     assert_eq!(breaches.len(), 1, "{breaches:?}");
-    assert_eq!(breaches[0].run_id, ghost.as_str());
-    let text = sink_text(&buffer);
-    assert!(
-        text.contains("does not supervise"),
-        "the diagnostic says the action was not executed: {text}"
-    );
-    assert_eq!(
-        state_of(&registry, "polghost"),
-        LifecycleState::Registered,
-        "nothing was handed to the lifecycle"
-    );
+    assert_eq!(breaches[0].limit, 1_000);
+    assert_eq!(breaches[0].run_id, run.as_str());
+    let _ = sup.stop(&registry, "polghost", Some(Duration::from_secs(5)));
 }
 
 #[test]
@@ -9068,11 +9098,7 @@ fn a_degraded_cache_still_breaches_an_explicit_instance_ceiling() {
     // forced action really applies.)
     let state = tempfile::TempDir::new().unwrap();
     let manifest = tempfile::TempDir::new().unwrap();
-    write_pause_guaranteed_manifest(
-        manifest.path(),
-        "keeparms",
-        &["--linger-ms", "600000"],
-    );
+    write_pause_guaranteed_manifest(manifest.path(), "keeparms", &["--linger-ms", "600000"]);
     let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     registry
         .register_with_adapter(

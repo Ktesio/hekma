@@ -1418,7 +1418,12 @@ fn a_fail_closed_resolution_keeps_the_arms_it_can_still_resolve() {
     let state = tempfile::TempDir::new().unwrap();
     let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     let name = InstanceName::new("keep").unwrap();
-    registry.register_with_adapter("keep", &crate::adapter::AdapterRef::Manifest(fake_manifest("keep"))).unwrap();
+    registry
+        .register_with_adapter(
+            "keep",
+            &crate::adapter::AdapterRef::Manifest(fake_manifest("keep")),
+        )
+        .unwrap();
     std::fs::write(
         registry.paths().instance_config(&name),
         "[budget.tokens]\nper_run = 1000\n[budget.dollars]\nper_run = \"1\"\n[cost.rate]\ninput = \"1\"\noutput = \"2\"\n",
@@ -1453,6 +1458,145 @@ fn fake_manifest(name: &str) -> std::path::PathBuf {
         .guaranteed_on_all_oses("pause")
         .write(&path);
     path
+}
+
+#[test]
+fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
+    // Round 2, N14: a Policy armed a CHILD Run at 50 and it latched at 60.
+    // The operator then sets an INSTANCE per-run ceiling of 40 — which
+    // outranks the Policy, so the child's per-run resolution becomes
+    // instance-sourced, a ceiling the child's OWN level never enforces
+    // (instance ceilings arm the process level alone). The next Policy
+    // change must re-arm the child's latch (`40 > 60` is false, but 40 is
+    // not a ceiling this level enforces) instead of letting it — and the
+    // `breach` Anomaly — stick for the rest of the Run.
+    let seeded = seed(1_000);
+    let name = InstanceName::new("money").unwrap();
+    // A child Run bound team=core with its own usage of 60.
+    let child = RunId::mint();
+    let child_record = RunRecord {
+        run_id: child.clone(),
+        control_depth: ControlDepth::Announced,
+        wire_path: true,
+        status: crate::domain::runs::RunStatus::Active,
+        anomalies: Vec::new(),
+        parent_run_id: Some(seeded.run.clone()),
+        instance: Some("money".to_string()),
+        process_owner: false,
+        end_cause: None,
+        created_at: "t".to_string(),
+        updated_at: "t".to_string(),
+        ended_at: None,
+    };
+    let usage_child = child.clone();
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _, RunStore as _};
+            let store = ctx.store();
+            store.insert_run(&NewRun {
+                record: child_record,
+                labels: vec![crate::domain::runs::Label::bound("team", "core")],
+                limits: Default::default(),
+                identity: None,
+            })?;
+            store.insert_usage(
+                &crate::domain::usage::UsageEvent {
+                    instance: "money".to_string(),
+                    run_id: usage_child,
+                    input_tokens: 30,
+                    output_tokens: 30,
+                    cached_tokens: Some(0),
+                    metering_source: "self-reported".to_string(),
+                    sequence: 1,
+                    occurred_at: "t".to_string(),
+                },
+                None,
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The Policy arms the child's own level at 50 — below its 60 — and
+    // the change job breaches at once (the instance has a context).
+    let existing = seeded.registry.policy("kidcap").unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            existing,
+            PolicyChange {
+                name: "kidcap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(50),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            contexts(),
+        )
+        .unwrap();
+    use crate::ports::RunStore as _;
+    assert_eq!(
+        seeded.registry.reader().latches(&child).unwrap().len(),
+        1,
+        "the child's own level latched at 50"
+    );
+    // The operator sets an instance ceiling of 40 (outranking the Policy).
+    let config = seeded.registry.paths().instance_config(&name);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[budget.tokens]\nper_run = 40\n").unwrap();
+    // Any later Policy change re-resolves and re-arms the child's now
+    // unenforced level-latch.
+    let mut fresh = contexts();
+    fresh.insert(
+        "money".to_string(),
+        InstanceContext {
+            fence: None,
+            metering_source: "self-reported".to_string(),
+            inputs: Some(Ok(crate::domain::config::explicit_limits(
+                &seeded
+                    .registry
+                    .effective_config(&name, crate::domain::ConfigLayer::empty())
+                    .unwrap(),
+            ))),
+        },
+    );
+    let existing = seeded.registry.policy("kidcap").unwrap().unwrap();
+    seeded
+        .registry
+        .apply_policy_change(
+            Some(existing),
+            PolicyChange {
+                name: "kidcap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: PolicyLimits {
+                    tokens_per_run: Some(50),
+                    ..PolicyLimits::default()
+                },
+                clear: Vec::new(),
+                rates: BTreeMap::new(),
+            },
+            fresh,
+        )
+        .unwrap();
+    assert!(
+        seeded.registry.reader().latches(&child).unwrap().is_empty(),
+        "the latch re-armed: the child's level no longer enforces any per-run ceiling"
+    );
+    let view = seeded.registry.run_view(&child).unwrap();
+    assert!(
+        !view
+            .record
+            .anomalies
+            .contains(&crate::domain::runs::Anomaly::Breach),
+        "the Anomaly cleared: {:?}",
+        view.record.anomalies
+    );
+    // The stored resolution itself is honestly instance-sourced at 40.
+    assert_eq!(view.policy.as_ref().unwrap().tokens.per_run, Some(40));
 }
 
 #[test]
@@ -1506,14 +1650,17 @@ fn a_second_engines_policy_change_is_visible_after_one_refresh() {
 }
 
 #[test]
-fn a_breach_on_an_unsupervised_instance_names_the_unknown_source() {
-    // A matched Run whose instance this engine does not supervise (no
-    // context) still breaches at once (its stored inputs arm the money
-    // half) — and its breach record names the honest `unknown` metering
-    // source, never a fabricated empty one.
+fn a_change_by_an_engine_that_does_not_supervise_leaves_the_breach_unlatched() {
+    // Round 2, N2: a Policy change by an engine with NO context for the
+    // instance (it does not supervise the agent) must not record or latch
+    // a breach it cannot act on — a foreign latch once spent the
+    // (dimension, scope) for the supervising engine's own decide, so the
+    // crossing NEVER fired and spend ran unbounded for the rest of the
+    // Run. The re-resolve still happens (the row and snapshot stay true)
+    // with a note naming who will fire it instead.
     let seeded = seed(1_000);
-    // Above the usage first, WITH a context: the Run's resolution is
-    // stored (the money half can later reuse it).
+    // Create the Policy WITH a context first (a supervised engine's
+    // change), then lower it WITHOUT one (a foreign engine's change).
     change(
         &seeded.registry,
         "cap",
@@ -1523,10 +1670,8 @@ fn a_breach_on_an_unsupervised_instance_names_the_unknown_source() {
             ..PolicyLimits::default()
         },
     );
-    // Then LOWER it with an EMPTY context map (the instance is not
-    // supervised here): the breach still fires from the stored inputs.
     let existing = seeded.registry.policy("cap").unwrap().unwrap();
-    seeded
+    let applied = seeded
         .registry
         .apply_policy_change(
             Some(existing),
@@ -1543,9 +1688,33 @@ fn a_breach_on_an_unsupervised_instance_names_the_unknown_source() {
             HashMap::new(),
         )
         .unwrap();
-    let events = breaches(&seeded.registry, &seeded.run);
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].metering_source, "unknown");
+    // No breach, no latch — the supervising engine's live evaluation owns
+    // the crossing.
+    assert!(
+        breaches(&seeded.registry, &seeded.run).is_empty(),
+        "{:?}",
+        breaches(&seeded.registry, &seeded.run)
+    );
+    use crate::ports::RunStore as _;
+    assert!(seeded
+        .registry
+        .reader()
+        .latches(&seeded.run)
+        .unwrap()
+        .is_empty());
+    // The note says exactly that.
+    assert!(
+        applied
+            .outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("supervising engine")),
+        "{:?}",
+        applied.outcome.notes
+    );
+    // The stored resolution DID update (the row stays true for surfaces).
+    let view = seeded.registry.run_view(&seeded.run).unwrap();
+    assert_eq!(view.policy.as_ref().unwrap().tokens.per_run, Some(500));
 }
 
 impl LimitField {
