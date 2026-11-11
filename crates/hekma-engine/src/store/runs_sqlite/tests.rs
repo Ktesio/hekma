@@ -241,7 +241,10 @@ fn saving_an_unknown_run_is_not_found_and_corrupt_rows_are_typed() {
              VALUES ('bad2', 'wire', 'sideways', 't', 't'); \
              INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
              VALUES ('bad3', 'wire', 'active', 't', 't'); \
-             INSERT INTO run_labels VALUES ('bad3', 'k', 'v', 'nobody'); \
+             INSERT INTO run_labels (run_id, key, value, source) VALUES ('bad3', 'k', 'v', 'nobody'); \
+             INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+             VALUES ('bad4', 'wire', 'active', 't', 't'); \
+             INSERT INTO run_labels VALUES ('bad4', 'k', 'v', 'bound', 'nowhere'); \
              INSERT INTO run_limits VALUES ('bad3', 'tokens', 'per-run', 1, 'explode', 'host', 't');",
         )
         .unwrap();
@@ -258,6 +261,10 @@ fn saving_an_unknown_run_is_not_found_and_corrupt_rows_are_typed() {
     ));
     assert!(matches!(
         store.run_limits(&bad3),
+        Err(StoreError::CorruptRow { .. })
+    ));
+    assert!(matches!(
+        store.run_labels(&RunId::from_wire("bad4")),
         Err(StoreError::CorruptRow { .. })
     ));
     store
@@ -411,5 +418,150 @@ fn the_v13_step_backfills_live_and_historical_runs_and_references_latches() {
     assert_eq!(
         store.latches(&RunId::from_wire("run-ghost")).unwrap().len(),
         1
+    );
+}
+
+#[test]
+fn a_caller_write_never_replaces_a_bound_row() {
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        record("run_P", None, "a", true),
+        vec![Label::verb("team", "core"), Label::bound("env", "prod")],
+        RunLimits::default(),
+    );
+    let id = RunId::from_wire("run_P");
+    store
+        .replace_labels(
+            &id,
+            LabelSource::Caller,
+            &[Label::caller("team", "mine"), Label::caller("task", "t")],
+        )
+        .unwrap();
+    assert_eq!(
+        store.run_labels(&id).unwrap(),
+        vec![
+            Label::bound("env", "prod"),
+            Label::caller("task", "t"),
+            Label::verb("team", "core"),
+        ]
+    );
+}
+
+#[test]
+fn set_run_labels_replaces_the_whole_set_with_origins() {
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        record("run_P", None, "a", true),
+        vec![Label::bound("team", "x"), Label::caller("task", "t")],
+        RunLimits::default(),
+    );
+    let id = RunId::from_wire("run_P");
+    let next = vec![Label::caller("flow", "f"), Label::verb("team", "core")];
+    store.set_run_labels(&id, &next).unwrap();
+    assert_eq!(store.run_labels(&id).unwrap(), next);
+    let origin: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT origin FROM run_labels WHERE run_id = 'run_P' AND key = 'flow'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(origin, None, "a Caller row has no origin");
+}
+
+#[test]
+fn select_runs_reads_open_runs_matching_every_term() {
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        record("run_B", None, "a", true),
+        vec![Label::bound("team", "core"), Label::caller("env", "prod")],
+        RunLimits::default(),
+    );
+    insert(
+        &store,
+        record("run_A", Some("run_B"), "a", false),
+        vec![Label::verb("team", "core"), Label::verb("env", "prod")],
+        RunLimits::default(),
+    );
+    insert(
+        &store,
+        record("run_C", Some("run_B"), "a", false),
+        vec![Label::verb("team", "core")],
+        RunLimits::default(),
+    );
+    let mut ended = record("run_D", Some("run_B"), "a", false);
+    ended.status = RunStatus::Ended;
+    insert(
+        &store,
+        ended,
+        vec![Label::verb("team", "core"), Label::verb("env", "prod")],
+        RunLimits::default(),
+    );
+    let ids = |raw: &str, limit: usize| -> Vec<String> {
+        store
+            .select_runs(&Selector::parse(raw).unwrap(), limit)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id.as_str().to_string())
+            .collect()
+    };
+    assert_eq!(ids("team=core,env=prod", 10), vec!["run_A", "run_B"]);
+    assert_eq!(ids("team=core", 10), vec!["run_A", "run_B", "run_C"]);
+    assert_eq!(ids("team=core", 2), vec!["run_A", "run_B"]);
+    assert!(ids("team=other", 10).is_empty());
+}
+
+#[test]
+fn the_v14_step_records_config_as_the_origin_of_every_bound_label() {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("state.db");
+    let conn = crate::store::create_v11_for_test(&db);
+    conn.execute_batch(
+        "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, updated_at) \
+         VALUES (1, 'live', 'mock', 'running', '/h', 't', 't'); \
+         INSERT INTO agent_runtime (instance_id, pid, start_time, restart_policy, run_id) \
+         VALUES (1, 10, 1, 'on-failure', 'run-live');",
+    )
+    .unwrap();
+    migrate_v12(&conn, &NoLegacy).unwrap();
+    migrate_v13(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO run_labels VALUES ('run-live', 'team', 'payments', 'bound'), \
+                                       ('run-live', 'task', 'x', 'caller');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&db).unwrap();
+    let version: i64 = store
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 14);
+    let origins: Vec<(String, Option<String>)> = store
+        .conn()
+        .prepare("SELECT key, origin FROM run_labels ORDER BY key")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        origins,
+        vec![
+            ("task".to_string(), None),
+            ("team".to_string(), Some("config".to_string()))
+        ]
+    );
+    // A second run of the step steps aside.
+    migrate_v14(store.conn()).unwrap();
+    drop(store);
+    let reopened = SqliteStore::open(&db).unwrap();
+    assert_eq!(
+        reopened.run_labels(&RunId::from_wire("run-live")).unwrap(),
+        vec![Label::caller("task", "x"), Label::bound("team", "payments")]
     );
 }
