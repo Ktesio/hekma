@@ -89,7 +89,9 @@ use crate::ports::{
 /// [`super::run_store_sqlite::SCHEMA_V12`].
 /// v13 (story 21-2, AD-25): the Run registry's tables and their backfill —
 /// see [`super::runs_sqlite`].
-const SCHEMA_VERSION: i64 = 13;
+/// v14 (story 21-9): `run_labels.origin`, each bound label's origin —
+/// see [`super::runs_sqlite`].
+const SCHEMA_VERSION: i64 = 14;
 
 /// Schema v1 DDL: registry+lifecycle table and the append-only Usage Ledger.
 ///
@@ -700,6 +702,11 @@ fn migrate(conn: &Connection, legacy: &dyn LegacySource) -> Result<OpenNotes, St
     // recorded (one crash-atomic step).
     if version < 13 {
         super::runs_sqlite::migrate_v13(conn)?;
+    }
+    // Story 21-9: v14 records each bound label's origin, backfilling
+    // `config` (one crash-atomic step).
+    if version < 14 {
+        super::runs_sqlite::migrate_v14(conn)?;
     }
     Ok(notes)
 }

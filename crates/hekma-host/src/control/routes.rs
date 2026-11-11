@@ -21,8 +21,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use hekma_engine::{
-    AdapterRef, BreachAction, ChildRunRequest, ConfigLayer, FleetListing, RegistryError,
-    RemoveDisposition, ResyncCursor, RunLimits, RunParent,
+    AdapterRef, BreachAction, ChildRunRequest, ConfigLayer, FleetListing, LabelChange,
+    RegistryError, RemoveDisposition, ResyncCursor, RunLimits, RunParent,
 };
 use serde::Deserialize;
 
@@ -717,5 +717,47 @@ pub(crate) async fn run_close(
     Ok(Json(dto::RunDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run: view,
+    }))
+}
+
+/// `GET /v0/runs/{id}/labels` — one Run's labels (story 21-9), bound and
+/// Caller, each with its source and (bound) origin.
+pub(crate) async fn run_labels_get(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunLabelsDocument>> {
+    let view = state.engine.run(&run_id).await?;
+    Ok(Json(dto::RunLabelsDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: view.record.run_id,
+        labels: view.labels,
+    }))
+}
+
+/// `PATCH /v0/runs/{id}/labels` — bind and unbind labels on one Run as the
+/// Operator (story 21-9). `200` with the labels after (or as planned on a
+/// dry run); a refusal is `404 run-not-found` or `409` (`run-ended`,
+/// `label-from-config`, `label-not-bound`), and a malformed change is
+/// `400 invalid_body`.
+pub(crate) async fn run_labels_patch(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    ApiJson(request): ApiJson<dto::RunLabelsPatch>,
+) -> ApiResult<Json<dto::RunLabelsChangeDocument>> {
+    let change = LabelChange {
+        set: request.set,
+        remove: request.remove,
+    };
+    let outcome = state
+        .engine
+        .label_run(&run_id, change, request.dry_run)
+        .await?;
+    Ok(Json(dto::RunLabelsChangeDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: outcome.run_id,
+        labels: outcome.labels,
+        prior_labels: outcome.prior_labels,
+        changed: outcome.changed,
+        dry_run: outcome.dry_run,
     }))
 }
