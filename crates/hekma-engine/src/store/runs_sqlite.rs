@@ -5,13 +5,18 @@
 //! live and historical run ids into `runs`, and the `run_latches` rebuild
 //! with its foreign key commit with the `user_version = 13` stamp, or none of
 //! it does.
+//!
+//! v14 (story 21-9) records each bound label's origin (`run_labels.origin`:
+//! `config` or `label-verb`, NULL on a Caller row) and backfills `config` on
+//! every bound row — the only bound source before it. One crash-atomic step,
+//! like v13.
 
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
 use crate::domain::{
-    Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelSource, Micros, RunId,
-    RunLimits, RunRecord, RunStatus,
+    Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelOrigin, LabelSource, Micros,
+    RunId, RunLimits, RunRecord, RunStatus, Selector,
 };
 use crate::ports::{NewRun, RunRecords, StoreError};
 
@@ -169,6 +174,46 @@ pub(super) fn migrate_v13(conn: &Connection) -> Result<(), StoreError> {
     }
 }
 
+/// Schema v14 (story 21-9): each bound label's origin, backfilled `config`
+/// on every bound row (the only bound source v13 wrote); a Caller row keeps
+/// NULL.
+const SCHEMA_V14: &str = "\
+ALTER TABLE run_labels ADD COLUMN origin TEXT;
+UPDATE run_labels SET origin = 'config' WHERE source = 'bound';
+";
+
+/// Run the v14 step (DDL + backfill + stamp) in one `BEGIN IMMEDIATE`,
+/// stepping aside when another process finished it while this one waited.
+pub(super) fn migrate_v14(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 14 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V14).map_err(backend)?;
+        conn.execute_batch("PRAGMA user_version = 14")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// The columns a [`RunRecord`] reads, joined to the instance name.
 const RUN_COLUMNS: &str = "r.run_id, r.control_depth, r.wire_path, r.status, r.anomalies, \
      r.parent_run_id, i.name, r.process_owner, r.end_cause, r.created_at, r.updated_at, \
@@ -259,6 +304,24 @@ impl SqliteStore {
             })
     }
 
+    /// Insert one label row with its source and, when bound, its origin.
+    fn insert_label(&self, run_id: &RunId, label: &Label) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "INSERT INTO run_labels (run_id, key, value, source, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    run_id.as_str(),
+                    label.key,
+                    label.value,
+                    label.source.as_str(),
+                    label.bound_origin().map(|o| o.as_str()),
+                ],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     fn records(
         &self,
         sql_tail: &str,
@@ -299,17 +362,7 @@ impl RunRecords for SqliteStore {
             )
             .map_err(backend)?;
         for label in &run.labels {
-            self.conn()
-                .execute(
-                    "INSERT INTO run_labels (run_id, key, value, source) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        record.run_id.as_str(),
-                        label.key,
-                        label.value,
-                        label.source.as_str()
-                    ],
-                )
-                .map_err(backend)?;
+            self.insert_label(&record.run_id, label)?;
         }
         let action = run.limits.action();
         let limits = [
@@ -369,7 +422,9 @@ impl RunRecords for SqliteStore {
     fn run_labels(&self, run_id: &RunId) -> Result<Vec<Label>, StoreError> {
         let mut stmt = self
             .conn()
-            .prepare("SELECT key, value, source FROM run_labels WHERE run_id = ?1 ORDER BY key")
+            .prepare(
+                "SELECT key, value, source, origin FROM run_labels WHERE run_id = ?1 ORDER BY key",
+            )
             .map_err(backend)?;
         let rows = stmt
             .query_map([run_id.as_str()], |row| {
@@ -377,17 +432,37 @@ impl RunRecords for SqliteStore {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(backend)?;
         let mut labels = Vec::new();
         for row in rows {
-            let (key, value, source) = row.map_err(backend)?;
+            let (key, value, source, origin) = row.map_err(backend)?;
             let source = LabelSource::from_wire(&source).ok_or_else(|| StoreError::CorruptRow {
                 name: "run_labels".to_string(),
                 detail: format!("Run `{run_id}` label `{key}` has an unknown source `{source}`"),
             })?;
-            labels.push(Label { key, value, source });
+            let origin = match (source, origin) {
+                (LabelSource::Caller, _) => None,
+                // A bound row with no origin predates origins: configuration
+                // was the only bound source then.
+                (LabelSource::Bound, None) => Some(LabelOrigin::Config),
+                (LabelSource::Bound, Some(raw)) => Some(LabelOrigin::from_wire(&raw).ok_or_else(
+                    || StoreError::CorruptRow {
+                        name: "run_labels".to_string(),
+                        detail: format!(
+                            "Run `{run_id}` label `{key}` has an unknown origin `{raw}`"
+                        ),
+                    },
+                )?),
+            };
+            labels.push(Label {
+                key,
+                value,
+                source,
+                origin,
+            });
         }
         Ok(labels)
     }
@@ -515,18 +590,72 @@ impl RunRecords for SqliteStore {
             )
             .map_err(backend)?;
         for label in labels {
-            // A key set at the other source is replaced: a bound key always
-            // wins over a caller's (FR-49).
+            // A key held at the other source: a bound write replaces a
+            // Caller's row (bound wins, FR-49), and a Caller write never
+            // replaces a bound row — the `WHERE` makes the upsert a no-op
+            // (story 21-9's defense in depth behind `check_caller_labels`).
+            let origin = match source {
+                LabelSource::Bound => Some(label.origin.unwrap_or(LabelOrigin::Config).as_str()),
+                LabelSource::Caller => None,
+            };
             self.conn()
                 .execute(
-                    "INSERT INTO run_labels (run_id, key, value, source) VALUES (?1, ?2, ?3, ?4) \
+                    "INSERT INTO run_labels (run_id, key, value, source, origin) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
                      ON CONFLICT(run_id, key) DO UPDATE SET value = excluded.value, \
-                     source = excluded.source",
-                    rusqlite::params![run_id.as_str(), label.key, label.value, source.as_str()],
+                     source = excluded.source, origin = excluded.origin \
+                     WHERE excluded.source = 'bound'",
+                    rusqlite::params![
+                        run_id.as_str(),
+                        label.key,
+                        label.value,
+                        source.as_str(),
+                        origin
+                    ],
                 )
                 .map_err(backend)?;
         }
         Ok(())
+    }
+
+    fn set_run_labels(&self, run_id: &RunId, labels: &[Label]) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM run_labels WHERE run_id = ?1",
+                [run_id.as_str()],
+            )
+            .map_err(backend)?;
+        for label in labels {
+            self.insert_label(run_id, label)?;
+        }
+        Ok(())
+    }
+
+    fn select_runs(&self, selector: &Selector, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+        // The first term drives through `idx_run_labels_kv`; every other term
+        // probes the (run_id, key) primary key. Non-ended Runs only, ordered
+        // by run id, at most `limit` rows.
+        let terms = selector.terms();
+        let Some(((first_key, first_value), rest)) = terms.split_first() else {
+            return Ok(Vec::new());
+        };
+        let mut sql = String::from(
+            "WHERE r.run_id IN (SELECT l0.run_id FROM run_labels l0 \
+             WHERE l0.key = ? AND l0.value = ?",
+        );
+        let mut params: Vec<&str> = vec![first_key, first_value];
+        for (key, value) in rest {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM run_labels lx WHERE lx.run_id = l0.run_id \
+                 AND lx.key = ? AND lx.value = ?)",
+            );
+            params.push(key);
+            params.push(value);
+        }
+        let limit = limit.min(i64::MAX as usize).to_string();
+        sql.push_str(") AND r.status <> 'ended' ORDER BY r.run_id LIMIT ");
+        sql.push_str(&limit);
+        self.records(&sql, rusqlite::params_from_iter(params))
     }
 
     fn identity_run(&self, binding: &str, external_id: &str) -> Result<Option<RunId>, StoreError> {
