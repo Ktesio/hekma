@@ -3366,6 +3366,17 @@ mod tests {
             .unwrap();
         let run = facade.run(owner.as_str()).unwrap();
         assert_eq!(run.policy.as_ref().unwrap().tokens.per_run, Some(1_234));
+        // A `budget.breach_action` write is the FR-21 marker-clearing
+        // key: the action re-resolves (and a kept-on-pause marker, had
+        // one existed, clears in the same write).
+        facade
+            .set_config("demo", "budget.breach_action", "warn")
+            .unwrap();
+        let run = facade.run(owner.as_str()).unwrap();
+        assert_eq!(
+            run.policy.as_ref().unwrap().effective_action,
+            crate::domain::BreachAction::Warn
+        );
         // The delete dry run plans; the real delete removes it.
         let dry = facade.delete_policy("cap", true).unwrap();
         assert!(dry.record.is_none());

@@ -600,6 +600,75 @@ mod tests {
     }
 
     #[test]
+    fn a_create_without_a_selector_is_refused_before_anything_is_opened() {
+        let err = change_from(
+            &WriteArgs {
+                name: "cap".to_string(),
+                selector: None,
+                limits: LimitFlags::default(),
+                clear: Vec::new(),
+                rate_for: None,
+                dry_run: true,
+                json: false,
+            },
+            true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--selector"), "{err}");
+        assert!(
+            err.to_string().contains("change the default"),
+            "the error points at the default Policy: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_clear_entry_is_skipped_not_refused() {
+        // A trailing comma (`--clear rate:gpt-demo,`) yields an empty
+        // entry that is skipped, not a refusal; `rate:` with an empty
+        // model is a refusal (an unknown clear name), never a clear of
+        // the whole flat Rate.
+        let change = change_from(
+            &args(
+                LimitFlags::default(),
+                vec!["rate:gpt-demo,".to_string(), ",,tokens-per-run".to_string()],
+                None,
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(change.clear, vec!["tokens-per-run".to_string()]);
+        assert!(change.rates.contains_key("gpt-demo"));
+        let err = change_from(
+            &args(LimitFlags::default(), vec!["rate:".to_string()], None),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--clear"), "{err}");
+    }
+
+    #[test]
+    fn print_outcome_renders_the_human_and_json_shapes() {
+        // The human line names the counts and echoes the notes on stderr;
+        // the --json document carries the record, counts, notes and the
+        // dry-run flag.
+        let outcome = PolicyOutcome {
+            record: Some(PolicyRecord {
+                name: "cap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                limits: PolicyLimits::default(),
+                rates: Default::default(),
+            }),
+            matched: 3,
+            fallbacks: 1,
+            notes: vec!["a note".to_string()],
+        };
+        print_outcome("change", "cap", &outcome, false, false).unwrap();
+        print_outcome("delete", "cap", &PolicyOutcome::default(), true, false).unwrap();
+        print_outcome("create", "cap", &outcome, true, true).unwrap();
+        print_outcome("delete", "cap", &PolicyOutcome::default(), false, false).unwrap();
+    }
+
+    #[test]
     fn an_outcome_is_read_from_a_routed_document_or_its_absence() {
         let document = serde_json::json!({
             "policy": {"name": "cap", "limits": {}, "rates": {}},

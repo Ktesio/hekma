@@ -9786,6 +9786,120 @@ fn a_foreign_raise_re_arms_the_supervising_engines_latched_run() {
 }
 
 #[test]
+fn the_supervisors_delete_of_a_corrupt_policy_row_plans_and_deletes_by_name() {
+    // Round 3, coverage of the supervisor delete path's corrupt-row arm:
+    // the dry run reports the unreadable scope instead of failing, and
+    // the real delete removes the row by name and heals the cache.
+    let (_state, _manifest, registry) = setup_fake("delcorrupt", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // The dry run answers with the unreadable-scope note.
+    let dry = sup.delete_policy(&registry, "broken", true).unwrap();
+    assert_eq!(dry.matched, 0);
+    assert!(
+        dry.notes
+            .iter()
+            .any(|note| note.contains("unreadable shape")),
+        "{:?}",
+        dry.notes
+    );
+    // The real delete removes it and heals the cache.
+    let applied = sup.delete_policy(&registry, "broken", false).unwrap();
+    assert!(
+        applied
+            .notes
+            .iter()
+            .any(|note| note.contains("unreadable Selector")),
+        "{:?}",
+        applied.notes
+    );
+    assert!(registry.policy("broken").unwrap().is_none());
+    assert!(registry.load_policy_cache().is_none(), "healed");
+}
+
+#[test]
+fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
+    // Round 3, M1's fence half: engine A's listener fence holds a `block`
+    // reason whose latch engine B's raise removed. A's tick reload clears
+    // the orphaned fence reason — the fence comes DOWN without a new
+    // breach.
+    let upstream = start_fence_upstream();
+    let (state, _manifest, registry, rt, name) =
+        setup_block_instance("fencreload", &upstream.base_url, &[("labels.team", "core")]);
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "fencreload").unwrap();
+    let base = fence_listener_url(&sup, &name);
+    let run = open_run(&registry, "fencreload").record.run_id;
+    // One proxied call generates the observed usage the breach needs.
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 200);
+    // A `block` Policy at 10 tokens per run: the observed usage breaches
+    // and the fence goes up.
+    sup.change_policy(
+        &registry,
+        crate::domain::PolicyChange {
+            name: "fencecap".to_string(),
+            selector: Some("team=core".parse().unwrap()),
+            set: crate::domain::PolicyLimits {
+                tokens_per_run: Some(10),
+                breach_action: Some(BreachAction::Block),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+            rates: Default::default(),
+        },
+        false,
+    )
+    .unwrap();
+    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencreload", 1);
+    assert_eq!(breaches[0].action, BreachAction::Block);
+    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 402, "the block breach fenced the listener");
+    // ENGINE B (no supervision of the agent) RAISES the ceiling above the
+    // usage: the latch unlatches, and engine A's tick clears the orphaned
+    // fence reason.
+    let second = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    second
+        .apply_policy_change(
+            second.policy("fencecap").unwrap(),
+            crate::domain::PolicyChange {
+                name: "fencecap".to_string(),
+                selector: Some("team=core".parse().unwrap()),
+                set: crate::domain::PolicyLimits {
+                    tokens_per_run: Some(10_000_000),
+                    breach_action: Some(BreachAction::Block),
+                    ..Default::default()
+                },
+                clear: Vec::new(),
+                rates: Default::default(),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    use crate::ports::RunStore as _;
+    assert!(
+        registry.reader().latches(&run).unwrap().is_empty(),
+        "the foreign raise unlatched"
+    );
+    // Engine A's TICK (the reaper cadence): the reload's re-check clears
+    // the fence reason whose latch is gone.
+    sup.drain_usage_all(&registry);
+    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
+    assert_eq!(status, 200, "the fence lifted on the reload: {body}");
+    sup.stop(&registry, "fencreload", Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+#[test]
 fn a_foreign_lowering_fires_on_the_supervising_engines_tick() {
     // Round 3, M1's other half: engine B lowers the Policy below the
     // usage of an agent engine A supervises (B cannot latch what it
