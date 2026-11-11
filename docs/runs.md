@@ -1,11 +1,11 @@
 ---
 title: "Runs, Control Depth, ps and top"
-description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs and child Runs are on main; hekma ps, Selectors and hekma top are in development."
+description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs, child Runs and hekma label are on main; hekma ps, Selectors on every verb and hekma top are in development."
 ---
 
 # Runs, Control Depth, ps and top
 
-> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration and `hekma run` are on main and ship in the next release. `hekma ps`, Selectors, `hekma label`, `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run` and `hekma label` are on main and ship in the next release. `hekma ps`, Selectors on every other verb, `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/runs/](https://hekma.ktesio.dev/docs/runs/), where it is kept current.
 
@@ -25,7 +25,22 @@ With a dozen agents on a laptop, you want one list of those that need you. With 
 hekma agent config set my-agent labels.team payments
 ```
 
-Keys start with a lowercase letter and use `a-z`, `0-9`, `_`, `.` and `-` (at most 63 characters); values are 1 to 128 letters, digits or `_ . : / @ + -`, and never a `secret:` reference. Labels merge per key across configuration layers, like any key. Setting a label with `hekma agent config set` while the agent runs updates its Run at once; a label in another layer applies at the next start.
+Keys start with a lowercase letter and use `a-z`, `0-9`, `_`, `.` and `-` (at most 63 characters); values are 1 to 128 letters, digits or `_ . : / @ + -`, and never a `secret:` reference. Labels merge per key across configuration layers, like any key. Setting a label with `hekma agent config set` while the agent runs updates its Run at once; a label in another layer applies at the next start. Use the `labels` key for labels every future Run of an agent should carry.
+
+<a id="bound-labels"></a>**Bound labels on a Run (`hekma label`).** Bind a label to one Run, to an agent's open Run, or to every open Run a Selector matches:
+
+```bash
+hekma label set my-agent team=core
+hekma label set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T env=prod tier=gold --json
+hekma label set --selector team=core,env=prod tier=gold --dry-run
+hekma label remove --selector team=core tier --yes
+```
+
+A label set this way is bound to the Run and records its origin, `label-verb`. Per key it outranks the agent's `labels` configuration (origin `config`) and any label the Run set about itself, so a later `labels.*` write, a crash relaunch or a restart of Hekma never overwrites it. Labels belong to the Run: a relaunch keeps them, and a new `start` opens a new Run without them. `hekma label remove` takes back a label set this way; if the configuration binds the same key, its value returns in the same change. A label that comes from configuration is changed with `hekma agent config set` (or overridden on the Run with `hekma label set`), and a label the Run set about itself cannot be removed here. Removing an absent key changes nothing, and a Run that has ended is refused. Each change is one `labels-changed` Run event naming the bound labels before and after.
+
+`--selector key=value[,key=value…]` matches every open Run carrying all those labels, bound or caller. When it matches more than one Run, the set is listed and you are asked to confirm; `--yes` skips the question, and without a terminal the command is refused unless `--yes` is given, so a script never hangs. `--dry-run` lists each Run's planned change and writes nothing. Each Run reports its own result (`labeled`, `unchanged`, `would label`, or why it was refused), a refusal does not stop the others, and the exit code is the first failure's: `3` no such Run, `4` refused by the Run's state or labels, `2` an invalid request. A Selector that matches no Run is a success with a note; one that matches more than 1000 Runs is refused. `--json` prints `{schema_version, dry_run, matched, results}`. The same verb is on the [Control API](control-api.md#bound-labels) as `PATCH /v0/runs/{id}/labels`.
+
+A Caller cannot set a key that is already bound: a caller label on a bound key is refused (`label-bound`).
 
 **Child Runs.** A Host can open a child Run under an agent's Run for one unit of its own work, with its own ceilings:
 
@@ -45,8 +60,8 @@ A **Run** is one unit of agent work with a stable run id, a Control Depth, label
 
 | Part | Stage |
 |---|---|
-| Runs for supervised agents, run ids, labels from configuration, parent and child Runs | On main |
-| `hekma ps`, Selectors on every verb, `--dry-run`, `hekma label` | In development |
+| Runs for supervised agents, run ids, labels from configuration, parent and child Runs, `hekma label` with `--selector`, `--dry-run` and `--yes` | On main |
+| `hekma ps`, Selectors and `--dry-run` on every other verb | In development |
 | `hekma top` | Planned |
 | Runs Hekma did not start (depths `wire`, `announced`, `observed`) | Planned |
 
@@ -68,13 +83,13 @@ Which verbs work depends on the depth; “no” means the verb fails at once wit
 
 ## How it will work
 
-**Labels** are `key=value` pairs that record their source. Bound labels come from you or your Host: an agent's `labels` config key (on main), a [Run Key](run-keys.md), a Metering Proxy endpoint, or `hekma label`. Caller labels come from the agent or framework itself (a **Caller**). A Caller cannot set a bound key, and only bound labels select Policies, so an agent cannot label its way into looser limits.
+**Labels** are `key=value` pairs that record their source. Bound labels come from you or your Host: an agent's `labels` config key and `hekma label` (both on main), a [Run Key](run-keys.md), or a Metering Proxy endpoint. Caller labels come from the agent or framework itself (a **Caller**). A Caller cannot set a bound key, and only bound labels select Policies, so an agent cannot label its way into looser limits.
 
 **Parent Runs.** Runs are flat unless one names a parent (on main, as above). A verb on a parent will reach its children only through a Selector, except that stopping or pausing the Run that owns a supervised process also stops or pauses the child Runs inside it.
 
 **`hekma ps`** is exception-first: Runs with an Anomaly or a `held`, `silent` or `stale` status are listed, healthy ones are counted, and `--all` lists everything. The CONTROL column shows the depth, `--json` each label's source, and `--limit` with a cursor pages.
 
-A **Selector** (`key=value,…`) names a set of Runs on any listing or verb. When it matches more than one Run, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it.
+A **Selector** (`key=value,…`) names a set of Runs on any listing or verb, as it already does for `hekma label`. When it matches more than one Run, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it.
 
 A sketch of the planned commands; the final flags and output may differ:
 
@@ -85,7 +100,7 @@ run_01JBX7Q2M4V8K3N6P9R2T5W8YZ  supervised  held    budget-breach  team=support,
 run_01JBX7R5C8D1F4G7H0J3K6M9NP  wire        silent  silent         team=support,flow=replies
 212 healthy Runs not shown (--all lists them)
 
-$ hekma label --selector flow=replies env=prod --dry-run
+$ hekma agent pause --selector flow=replies,env=prod --dry-run
 ```
 
 **`hekma top`** will show each Run's status, depth, tokens per second, burn rate and budget left, live. Hotkeys will pause, stop, hold, raise a limit and attach, confirming as the matching command does. It can watch a remote `hekma serve`.

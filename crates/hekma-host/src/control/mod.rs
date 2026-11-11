@@ -211,6 +211,13 @@ fn router(state: ApiState) -> Router {
         .route("/v0/runs", post(routes::run_open))
         .route("/v0/runs/{id}", get(routes::run_show))
         .route("/v0/runs/{id}/close", post(routes::run_close))
+        // Bound labels (story 21-9): read a Run's labels, bind and unbind
+        // them as the Operator (this bearer is the Operator's; the Run Key
+        // and announce credential classes never reach these routes).
+        .route(
+            "/v0/runs/{id}/labels",
+            get(routes::run_labels_get).patch(routes::run_labels_patch),
+        )
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

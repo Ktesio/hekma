@@ -532,6 +532,18 @@ fn the_wire_vocabulary_is_stable() {
     assert_eq!(LabelSource::from_wire("caller"), Some(LabelSource::Caller));
     assert_eq!(LabelSource::from_wire("x"), None);
     assert_eq!(LabelSource::Caller.as_str(), "caller");
+    for origin in [LabelOrigin::Config, LabelOrigin::LabelVerb] {
+        assert_eq!(LabelOrigin::from_wire(origin.as_str()), Some(origin));
+        assert_eq!(
+            serde_json::to_string(&origin).unwrap(),
+            format!("\"{}\"", origin.as_str())
+        );
+    }
+    assert_eq!(LabelOrigin::from_wire("x"), None);
+    assert_eq!(Label::caller("k", "v").bound_origin(), None);
+    // A Caller label serializes no origin (additive on every surface).
+    let json = serde_json::to_value(Label::caller("k", "v")).unwrap();
+    assert!(json.get("origin").is_none(), "{json}");
     for kind in [
         RunEventKind::Created,
         RunEventKind::DepthChanged,
@@ -572,6 +584,28 @@ fn the_wire_vocabulary_is_stable() {
         }
         .code(),
         RunError::Store(crate::ports::StoreError::Backend("b".into())).code(),
+        RunError::RunEnded { run_id: "x".into() }.code(),
+        RunError::LabelFromConfig {
+            run_id: "x".into(),
+            key: "k".into(),
+            instance: "a".into(),
+        }
+        .code(),
+        RunError::LabelNotBound {
+            run_id: "x".into(),
+            key: "k".into(),
+        }
+        .code(),
+        RunError::LabelBound {
+            run_id: "x".into(),
+            key: "k".into(),
+        }
+        .code(),
+        RunError::TooManyRuns {
+            selector: "a=b".into(),
+            max: 1,
+        }
+        .code(),
     ];
     assert_eq!(
         codes,
@@ -582,7 +616,12 @@ fn the_wire_vocabulary_is_stable() {
             "nesting-too-deep",
             "owns-process",
             "invalid-request",
-            "store"
+            "store",
+            "run-ended",
+            "label-from-config",
+            "label-not-bound",
+            "label-bound",
+            "too-many-runs",
         ]
     );
 }
@@ -641,4 +680,294 @@ fn runs_of_agents_with_no_process_end_with_their_children() {
         Some("relaunch-not-run")
     );
     assert_eq!(status(&store, &c).2.as_deref(), Some("parent-ended"));
+}
+
+// ---- Story 21-9: bound labels and the label verb ----
+
+fn verb(
+    store: &SqliteStore,
+    run: &RunId,
+    change: LabelChange,
+    config: &[Label],
+    dry_run: bool,
+) -> Result<(LabelOutcome, ops::RunChanges), RunError> {
+    ops::label(store, run, &change, config, dry_run, AT)
+}
+
+fn set(pairs: &[(&str, &str)]) -> LabelChange {
+    LabelChange::set(pairs.iter().copied())
+}
+
+fn remove(keys: &[&str]) -> LabelChange {
+    LabelChange::remove(keys.iter().copied())
+}
+
+#[test]
+fn the_label_verb_binds_once_with_one_event_and_a_repeat_changes_nothing() {
+    let (_tmp, store) = store();
+    let run = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
+    let config = [Label::bound("team", "payments")];
+    let (outcome, changes) = verb(&store, &run, set(&[("env", "prod")]), &config, false).unwrap();
+    assert!(outcome.changed);
+    assert!(!outcome.dry_run);
+    assert_eq!(
+        outcome.labels,
+        vec![Label::verb("env", "prod"), Label::bound("team", "payments")]
+    );
+    assert_eq!(outcome.prior_labels, vec![Label::bound("team", "payments")]);
+    assert_eq!(changes.events.len(), 1);
+    let event = &changes.events[0];
+    assert_eq!(event.change, RunEventKind::LabelsChanged);
+    assert_eq!(event.cause.as_deref(), Some("label-verb"));
+    assert_eq!(event.labels, outcome.labels);
+    assert_eq!(
+        event.prior_labels.as_deref(),
+        Some(&[Label::bound("team", "payments")][..])
+    );
+    assert_eq!(changes.entries.len(), 1);
+    assert_eq!(changes.entries[0].labels, outcome.labels);
+    let json = serde_json::to_value(event).unwrap();
+    assert_eq!(json["labels"][0]["origin"], "label-verb");
+    assert_eq!(json["prior_labels"][0]["origin"], "config");
+    // The same set again: unchanged, nothing emitted.
+    let (again, changes) = verb(&store, &run, set(&[("env", "prod")]), &config, false).unwrap();
+    assert!(!again.changed);
+    assert!(changes.events.is_empty() && changes.entries.is_empty());
+    assert_eq!(store.run_labels(&run).unwrap(), outcome.labels);
+}
+
+#[test]
+fn a_dry_run_plans_and_writes_nothing() {
+    let (_tmp, store) = store();
+    let run = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
+    let before = store.run_labels(&run).unwrap();
+    let (outcome, changes) = verb(&store, &run, set(&[("team", "core")]), &[], true).unwrap();
+    assert!(outcome.changed && outcome.dry_run);
+    assert_eq!(outcome.labels, vec![Label::verb("team", "core")]);
+    assert!(changes.events.is_empty());
+    assert_eq!(store.run_labels(&run).unwrap(), before);
+}
+
+#[test]
+fn a_verb_label_outranks_config_across_syncs_and_its_removal_restores_config() {
+    let (_tmp, store) = store();
+    let run = RunId::mint();
+    let config = [Label::bound("team", "payments")];
+    ops::ensure_supervised(&store, &supervised(&run, true, true), AT).unwrap();
+    verb(&store, &run, set(&[("team", "core")]), &config, false).unwrap();
+    // A config write, a relaunch and an adoption all keep the verb's value.
+    let synced = ops::sync_bound_labels(&store, &run, &config, AT).unwrap();
+    assert!(synced.events.is_empty());
+    let changed_config = [Label::bound("team", "other"), Label::bound("tier", "gold")];
+    let synced = ops::sync_bound_labels(&store, &run, &changed_config, AT).unwrap();
+    assert_eq!(synced.events.len(), 1, "tier is new");
+    assert_eq!(synced.events[0].cause.as_deref(), Some("config"));
+    let mut relaunch = supervised(&run, true, false);
+    relaunch.labels = config.to_vec();
+    ops::ensure_supervised(&store, &relaunch, AT).unwrap();
+    assert_eq!(
+        store.run_labels(&run).unwrap(),
+        vec![Label::verb("team", "core")]
+    );
+    // Removing the verb label restores the configured value in one change.
+    let (outcome, changes) = verb(&store, &run, remove(&["team"]), &config, false).unwrap();
+    assert_eq!(outcome.labels, vec![Label::bound("team", "payments")]);
+    assert_eq!(changes.events.len(), 1);
+    assert_eq!(
+        changes.events[0].prior_labels.as_deref(),
+        Some(&[Label::verb("team", "core")][..])
+    );
+    // Now the key is bound by configuration only: removing it is refused,
+    // naming the config key and the remediation.
+    let refused = verb(&store, &run, remove(&["team"]), &config, false).unwrap_err();
+    assert_eq!(refused.code(), "label-from-config");
+    let message = refused.to_string();
+    assert!(message.contains("labels.team"), "{message}");
+    assert!(
+        message.contains("hekma agent config set a labels.team"),
+        "{message}"
+    );
+    assert_eq!(
+        store.run_labels(&run).unwrap(),
+        vec![Label::bound("team", "payments")]
+    );
+}
+
+#[test]
+fn the_verb_replaces_a_caller_value_but_never_removes_a_caller_label() {
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
+    request.labels = vec![
+        ("task".to_string(), "x".to_string()),
+        ("flow".to_string(), "f".to_string()),
+    ];
+    let (child, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    // Configuration never reaches a child: the planner is given none.
+    let config = [Label::bound("task", "cfg")];
+    let (outcome, changes) = verb(&store, &child, set(&[("task", "y")]), &config, false).unwrap();
+    assert!(outcome.prior_labels.contains(&Label::caller("task", "x")));
+    assert!(outcome.labels.contains(&Label::verb("task", "y")));
+    assert_eq!(changes.events[0].prior_labels.as_deref(), Some(&[][..]));
+    let refused = verb(&store, &child, remove(&["flow"]), &[], false).unwrap_err();
+    assert_eq!(refused.code(), "label-not-bound");
+    let (absent, changes) = verb(&store, &child, remove(&["nope"]), &[], false).unwrap();
+    assert!(!absent.changed);
+    assert!(changes.events.is_empty());
+    // Removing the verb label leaves no value (no config on a child).
+    let (gone, _) = verb(&store, &child, remove(&["task"]), &config, false).unwrap();
+    assert_eq!(gone.labels, vec![Label::caller("flow", "f")]);
+}
+
+#[test]
+fn the_verb_refuses_ended_missing_runs_and_invalid_changes() {
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    let c = child(&store, RunParent::Run(owner.clone())).unwrap();
+    ops::close(&store, &c, AT).unwrap();
+    let ended = verb(&store, &c, set(&[("team", "core")]), &[], false).unwrap_err();
+    assert_eq!(ended.code(), "run-ended");
+    let missing = verb(
+        &store,
+        &RunId::from_wire("run_none"),
+        set(&[("team", "core")]),
+        &[],
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(missing.code(), "run-not-found");
+    let invalid = verb(&store, &owner, LabelChange::default(), &[], false).unwrap_err();
+    assert_eq!(invalid.code(), "invalid-request");
+}
+
+#[test]
+fn a_selector_matches_open_runs_by_any_label_in_run_id_order() {
+    let (_tmp, store) = store();
+    let owner = RunId::mint();
+    ops::ensure_supervised(&store, &supervised(&owner, true, true), AT).unwrap();
+    verb(&store, &owner, set(&[("env", "prod")]), &[], false).unwrap();
+    let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
+    request.labels = vec![
+        ("team".to_string(), "payments".to_string()),
+        ("env".to_string(), "prod".to_string()),
+    ];
+    let (c1, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    let (c2, _) = ops::open_child(&store, &request, RunId::mint(), AT).unwrap();
+    ops::close(&store, &c2, AT).unwrap();
+    let selector = Selector::parse("team=payments,env=prod").unwrap();
+    let mut expected = vec![owner.clone(), c1.clone()];
+    expected.sort();
+    let matched: Vec<RunId> = ops::select(&store, &selector)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.run_id)
+        .collect();
+    assert_eq!(matched, expected, "bound and Caller labels both match");
+    let none = Selector::parse("team=nobody").unwrap();
+    assert!(ops::select(&store, &none).unwrap().is_empty());
+}
+
+#[test]
+fn a_selector_matching_more_than_the_cap_is_refused() {
+    let (_tmp, store) = store();
+    let mut sql = String::from("BEGIN;");
+    for i in 0..=MAX_SELECTED_RUNS {
+        sql.push_str(&format!(
+            "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+             VALUES ('run-cap-{i:05}', 'announced', 'active', 't', 't'); \
+             INSERT INTO run_labels (run_id, key, value, source) \
+             VALUES ('run-cap-{i:05}', 'flow', 'bulk', 'caller');"
+        ));
+    }
+    sql.push_str("COMMIT;");
+    store.execute_batch_for_test(&sql);
+    let selector = Selector::parse("flow=bulk").unwrap();
+    let refused = ops::select(&store, &selector).unwrap_err();
+    assert_eq!(refused.code(), "too-many-runs");
+    assert!(refused.to_string().contains("1000"), "{refused}");
+    // One fewer fits exactly.
+    store.execute_batch_for_test("UPDATE runs SET status = 'ended' WHERE run_id = 'run-cap-00000'");
+    assert_eq!(
+        ops::select(&store, &selector).unwrap().len(),
+        MAX_SELECTED_RUNS
+    );
+}
+
+#[test]
+fn every_bound_label_path_calls_the_policy_hook_inside_the_writer_job() {
+    let tmp = TempDir::new().unwrap();
+    let store = SqliteStore::open(&tmp.path().join("state.db")).unwrap();
+    store.execute_batch_for_test(
+        "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, updated_at) \
+         VALUES ('a', 'mock', 'running', '/h', 't', 't')",
+    );
+    let writer = StoreWriter::spawn(store).unwrap();
+    let publisher = Arc::new(SnapshotPublisher::default());
+    let run = RunId::mint();
+    // Each operation runs as one writer job; the job returns the Runs whose
+    // Policy hook ran inside it, plus the events it committed.
+    type Op = Box<dyn FnOnce(&SqliteStore) -> ops::RunChanges + Send>;
+    let job = |op: Op| -> (Vec<RunId>, usize) {
+        let p = Arc::clone(&publisher);
+        writer
+            .call(move |ctx| {
+                let changes = op(ctx.store());
+                let resolved = changes.policy_resolved.clone();
+                let events = ops::commit(ctx, &p, changes)?;
+                Ok((resolved, events.len()))
+            })
+            .unwrap()
+    };
+    let r = run.clone();
+    let (resolved, _) = job(Box::new(move |s| {
+        ops::ensure_supervised(s, &supervised(&r, true, true), AT).unwrap()
+    }));
+    assert!(resolved.is_empty(), "creation is not a label change");
+    // The verb.
+    let r = run.clone();
+    let (resolved, events) = job(Box::new(move |s| {
+        ops::label(s, &r, &set(&[("env", "prod")]), &[], false, AT)
+            .unwrap()
+            .1
+    }));
+    assert_eq!((resolved, events), (vec![run.clone()], 1));
+    // A config write's re-sync.
+    let r = run.clone();
+    let (resolved, _) = job(Box::new(move |s| {
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "core")], AT).unwrap()
+    }));
+    assert_eq!(resolved, vec![run.clone()]);
+    // A relaunch and an adoption (both keep the Run through
+    // `ensure_supervised` with `fresh: false`) whose configuration moved.
+    for value in ["other", "again"] {
+        let r = run.clone();
+        let (resolved, _) = job(Box::new(move |s| {
+            let mut kept = supervised(&r, true, false);
+            kept.labels = vec![Label::bound("team", value)];
+            ops::ensure_supervised(s, &kept, AT).unwrap()
+        }));
+        assert_eq!(resolved, vec![run.clone()], "{value}");
+    }
+    // Nothing changed: no hook.
+    let r = run.clone();
+    let (resolved, events) = job(Box::new(move |s| {
+        ops::sync_bound_labels(s, &r, &[Label::bound("team", "again")], AT).unwrap()
+    }));
+    assert!(resolved.is_empty() && events == 0);
+    // A dry run never calls it.
+    let r = run.clone();
+    let (resolved, _) = job(Box::new(move |s| {
+        ops::label(s, &r, &set(&[("env", "dev")]), &[], true, AT)
+            .unwrap()
+            .1
+    }));
+    assert!(resolved.is_empty());
+    // The snapshot carries the verb label after commit.
+    let snapshot = publisher.current();
+    let entry = snapshot.run(&run).unwrap();
+    assert!(entry.labels.contains(&Label::verb("env", "prod")));
 }

@@ -17,7 +17,7 @@ A **Policy** is that rule: standing limits that apply to every [Run](runs.md) it
 
 In Hekma 0.11.0, limits are per-agent [config keys](https://hekma.ktesio.dev/docs/budgets/#set-a-budget): `budget.tokens.*`, `budget.dollars.*`, `cost.rate.*`, and one `budget.breach_action` for all of an agent's caps. The Breach Action defaults to `pause`, and `warn` only writes a line to `logs/breaches.log`. A cap fires once per run, and [raising it does not re-arm it](https://hekma.ktesio.dev/docs/budgets/#resume).
 
-On main, the [Control API](https://hekma.ktesio.dev/docs/control-api/) can set the same keys over HTTP. `budget.breach_action` also accepts `block`, the wire fence, on agents whose usage is read off the wire (see [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/)). There are no Policies or labels yet.
+On main, the [Control API](https://hekma.ktesio.dev/docs/control-api/) can set the same keys over HTTP. `budget.breach_action` also accepts `block`, the wire fence, on agents whose usage is read off the wire (see [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/)). There are no Policies yet; bound labels for them to select are on main (an agent's `labels` key and [`hekma label`](runs.md#bound-labels)).
 
 ## What is coming
 

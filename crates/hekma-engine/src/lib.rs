@@ -131,11 +131,14 @@ pub use domain::{
 };
 // Story 21-2: Runs as first-class entities (AD-25) — the Run model, its
 // events and errors, and the verb × Control Depth table.
+// Story 21-9: bound labels — the label verb's request and outcome, label
+// origins, and Selectors.
 pub use domain::{
     parse_dollars_to_micros, validate_label_key, validate_label_value, verb_cell, Anomaly,
-    CellBehavior, ChildRunRequest, ControlDepth, Label, LabelSource, RunError, RunEvent,
-    RunEventKind, RunLimits, RunParent, RunRecord, RunStatus, RunUsage, RunVerb, RunView, VerbCell,
-    HOST_IDENTITY_BINDING, MAX_RUN_NESTING, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
+    CellBehavior, ChildRunRequest, ControlDepth, Label, LabelChange, LabelOrigin, LabelOutcome,
+    LabelSource, RunError, RunEvent, RunEventKind, RunLimits, RunParent, RunRecord, RunStatus,
+    RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
+    MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
