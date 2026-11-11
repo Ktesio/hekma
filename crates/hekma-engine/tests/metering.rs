@@ -403,9 +403,16 @@ fn only_the_commit_choke_point_writes_the_usage_ledger() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut writer_files = std::collections::BTreeSet::new();
     visit_rs(&src, &mut |path, text| {
-        // A test module file (`…/tests.rs`) seeds the ledger as a fixture; it
-        // is not a production writer.
-        if path.file_name().is_some_and(|name| name == "tests.rs") {
+        // A test module seeds the ledger as a fixture; it is not a
+        // production writer. Two shapes in this crate: a `…/tests.rs`
+        // child module and a sibling `…_tests.rs` module (both declared
+        // `#[cfg(test)]` — e.g. `domain/registry_policy_tests.rs`, whose
+        // fixture builds a seeded fleet directly through the writer).
+        let is_test_module = path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name == "tests.rs" || name.ends_with("_tests.rs")
+        });
+        if is_test_module {
             return;
         }
         for line in text.lines() {

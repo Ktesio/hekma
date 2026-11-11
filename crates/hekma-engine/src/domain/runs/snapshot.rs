@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::{Label, RunLimits, RunRecord};
+use super::{Label, PolicyResolution, RunLimits, RunRecord};
 use crate::domain::usage::RunId;
 
 /// One non-ended Run as the data path sees it.
@@ -25,6 +25,26 @@ pub(crate) struct RunEntry {
     pub record: RunRecord,
     pub labels: Vec<Label>,
     pub limits: RunLimits,
+    /// The Run's stored Policy resolution (story 21-3, AD-25: resolved
+    /// Policies join the published snapshot, so the data path never
+    /// re-implements resolution). `None` before the first resolution.
+    pub policy: Option<PolicyResolution>,
+}
+
+/// Build one snapshot entry: the record, its labels and limits, and its
+/// stored resolution when one exists.
+pub(crate) fn entry_of(
+    record: &RunRecord,
+    labels: &[Label],
+    limits: RunLimits,
+    resolution: Option<&PolicyResolution>,
+) -> RunEntry {
+    RunEntry {
+        record: record.clone(),
+        labels: labels.to_vec(),
+        limits,
+        policy: resolution.cloned(),
+    }
 }
 
 /// An immutable view of every non-ended Run.
@@ -135,6 +155,7 @@ mod tests {
             },
             labels: vec![Label::bound("team", "a")],
             limits: RunLimits::default(),
+            policy: None,
         }
     }
 

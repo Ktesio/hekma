@@ -919,7 +919,9 @@ pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
 /// changed while `running` is reflected on the very next `UsageEvent` (AC-B
 /// "changes apply immediately") because the supervisor re-resolves + re-reads here
 /// each time. Absent scopes → `None` (never breach); an absent action →
-/// [`BreachAction::default`] (`pause`).
+/// `warn` (the stored `default` Policy's value — these legacy readers no
+/// longer own a default of their own; the ONE resolution every enforcement
+/// and surface call goes through is [`crate::domain::runs::policy::resolve`]).
 ///
 /// ROBUSTNESS (AD-12 — enforcement must never crash ingestion): a value that is
 /// somehow present but MALFORMED (e.g. a negative or non-integer that slipped past
@@ -927,14 +929,24 @@ pub fn parse_dollars_to_micros(value: &str) -> Result<Micros, String> {
 /// is treated as ABSENT for that scope/action rather than erroring — the honest
 /// degrade is "no ceiling / default action", never a panic mid-ingestion. Write
 /// validation ([`validate_write`]) is the primary gate; this read is defensive.
+///
+/// NOT the resolution (story 21-3): this legacy reader sees only the
+/// configuration. An absent action answers `warn` — the seeded `default`
+/// Policy's value — but an EDITED default Policy or the kept-on-pause
+/// marker changes the truth, and only
+/// [`crate::domain::runs::policy::resolve`] knows it. Embedders should
+/// resolve through the engine; this remains for the pre-Policy surfaces.
 pub fn resolve_token_budget(effective: &EffectiveConfig) -> (TokenBudget, BreachAction) {
     let per_run = budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY);
     let cumulative = budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY);
-    let action = effective
-        .value(BUDGET_BREACH_ACTION_KEY)
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.trim().parse::<BreachAction>().ok())
-        .unwrap_or_default();
+    // Absent → `warn` (the stored `default` Policy's value — this legacy
+    // reader no longer owns a default); present-but-malformed → `pause`
+    // (the fail-closed rule, AD-7).
+    let action = match read_breach_action(effective) {
+        ActionRead::Present(action) => action,
+        ActionRead::Malformed(_) => BreachAction::Pause,
+        ActionRead::Absent => BreachAction::Warn,
+    };
     (
         TokenBudget {
             per_run,
@@ -983,6 +995,13 @@ fn budget_u64(effective: &EffectiveConfig, key: &str) -> Option<u64> {
 /// `config.toml`) is treated as ABSENT for that direction/scope rather than
 /// erroring — the honest degrade is "no Rate / no ceiling", never a panic
 /// mid-ingestion. [`validate_write`] is the primary gate; this read is defensive.
+///
+/// NOT the resolution (story 21-3): these legacy readers see only the
+/// configuration. An absent action answers `warn` — the seeded `default`
+/// Policy's value — but an EDITED default Policy or the kept-on-pause
+/// marker changes the truth, and only
+/// [`crate::domain::runs::policy::resolve`] knows it. Embedders should
+/// resolve through the engine; these remain for the pre-Policy surfaces.
 pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, BreachAction) {
     // Both directions required for a "supplied" Rate (AC6/AC-B). A missing or
     // malformed direction → no Rate (inert).
@@ -1006,14 +1025,94 @@ pub fn resolve_cost(effective: &EffectiveConfig) -> (Option<Rate>, CostCap, Brea
         per_run: cost_micros_leaf(effective, BUDGET_DOLLARS_PER_RUN_KEY),
         cumulative: cost_micros_leaf(effective, BUDGET_DOLLARS_CUMULATIVE_KEY),
     };
-    // The SAME breach-action key governs dollar breaches too (story 3-3): resolve it
-    // exactly as `resolve_token_budget` does (absent → the ratified `pause` default).
-    let action = effective
-        .value(BUDGET_BREACH_ACTION_KEY)
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.trim().parse::<BreachAction>().ok())
-        .unwrap_or_default();
+    // The SAME breach-action key governs dollar breaches too (story 3-3):
+    // resolved exactly as `resolve_token_budget` does (absent → `warn`,
+    // the stored `default` Policy's value; malformed → `pause`).
+    let action = match read_breach_action(effective) {
+        ActionRead::Present(action) => action,
+        ActionRead::Malformed(_) => BreachAction::Pause,
+        ActionRead::Absent => BreachAction::Warn,
+    };
     (rate, cap, action)
+}
+
+/// How the `budget.breach_action` key reads from a resolved config
+/// (story 21-3): present and valid, PRESENT BUT MALFORMED (fails closed to
+/// `pause` with a surfaced note — AD-7, never the new default), or absent
+/// (the Policy resolution fills it). A value of the WRONG TYPE (an integer,
+/// a boolean, an array) is malformed, not absent — a hand-edited
+/// `breach_action = 1` must never fall through to the default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActionRead {
+    Present(BreachAction),
+    Malformed(String),
+    Absent,
+}
+
+/// Render a non-string TOML value for the malformed note (never a Debug
+/// dump — a short, human-readable rendering).
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Datetime(d) => d.to_string(),
+        Value::Array(_) => "[…]".to_string(),
+        Value::Table(_) => "{…}".to_string(),
+    }
+}
+
+/// Read the `budget.breach_action` key with absent/malformed distinguished
+/// (the resolution's action precedence needs all three).
+pub(crate) fn read_breach_action(effective: &EffectiveConfig) -> ActionRead {
+    match effective.value(BUDGET_BREACH_ACTION_KEY) {
+        Some(Value::String(raw)) => match raw.trim().parse::<BreachAction>() {
+            Ok(action) => ActionRead::Present(action),
+            Err(_) => ActionRead::Malformed(raw.trim().to_string()),
+        },
+        // Present but not a string: malformed (fail closed to pause).
+        Some(other) => ActionRead::Malformed(render_value(other)),
+        None => ActionRead::Absent,
+    }
+}
+
+/// The explicit instance limits and model key the Policy resolution needs
+/// (story 21-3): the layer-merged `budget.*` ceilings, the
+/// present/malformed/absent action, the `cost.rate.*` Rate (both
+/// directions or absent — a half-configured Rate falls through, FR-20's
+/// documented "no Rate yet"), and the resolved `model` (the default
+/// Policy's Rate-table lookup key). A malformed ceiling degrades to absent
+/// (the defensive read); a malformed ACTION is carried as malformed (fail
+/// closed) while every OTHER explicit input survives — only the action
+/// fails closed, never the ceilings, the Rate or the model (a malformed
+/// action once dropped them all, recording usage unpriced and unceilinged:
+/// the 21-3 review round 1 finding).
+pub(crate) fn explicit_limits(effective: &EffectiveConfig) -> crate::domain::runs::ResolveInputs {
+    let (action, malformed) = match read_breach_action(effective) {
+        ActionRead::Present(action) => (Some(action), None),
+        ActionRead::Malformed(raw) => (None, Some(raw)),
+        ActionRead::Absent => (None, None),
+    };
+    let (rate, cap, _) = resolve_cost(effective);
+    let model = effective
+        .value("model")
+        .and_then(|value| value.as_str())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty() && !is_secret_ref(raw));
+    crate::domain::runs::ResolveInputs {
+        explicit: crate::domain::runs::PolicyLimits {
+            tokens_per_run: budget_u64(effective, BUDGET_TOKENS_PER_RUN_KEY),
+            tokens_cumulative: budget_u64(effective, BUDGET_TOKENS_CUMULATIVE_KEY),
+            dollars_per_run_micros: cap.per_run.map(|micros| micros.get() as u64),
+            dollars_cumulative_micros: cap.cumulative.map(|micros| micros.get() as u64),
+            breach_action: action,
+            scent_check: None,
+            rate,
+        },
+        malformed_action: malformed,
+        model,
+    }
 }
 
 /// Resolve the ENGINE-OBSERVED upstream provider base URL from an already-resolved
@@ -1285,6 +1384,67 @@ mod tests {
     }
 
     // ---- resolve(): key present in exactly one layer (×4) ----
+
+    #[test]
+    fn a_malformed_action_keeps_the_explicit_ceilings_rate_and_model() {
+        // The 21-3 review round 1 finding: only the ACTION fails closed —
+        // the explicit ceilings, the Rate and the model key survive a
+        // malformed `breach_action` (dropping them once left the usage
+        // unpriced and unceilinged beside the pause).
+        let eff = resolve(one_layer(
+            SourceLayer::Instance,
+            "model = \"gpt-demo\"\n[budget]\nbreach_action = \"throttle\"\n[budget.tokens]\nper_run = 250\ncumulative = 2500\n[budget.dollars]\nper_run = \"3\"\n[cost.rate]\ninput = \"1\"\noutput = \"2\"",
+        ));
+        let inputs = explicit_limits(&eff);
+        assert_eq!(inputs.malformed_action.as_deref(), Some("throttle"));
+        assert_eq!(inputs.explicit.tokens_per_run, Some(250));
+        assert_eq!(inputs.explicit.tokens_cumulative, Some(2_500));
+        assert_eq!(inputs.explicit.dollars_per_run_micros, Some(3_000_000));
+        assert_eq!(
+            inputs.explicit.rate,
+            Some(crate::domain::cost::Rate::new(1_000_000, 2_000_000))
+        );
+        assert_eq!(inputs.model.as_deref(), Some("gpt-demo"));
+        // And the resolution pauses (fail closed) WITH the ceilings armed.
+        let resolution =
+            crate::domain::runs::policy::resolve(&crate::domain::runs::policy::ResolutionInput {
+                inputs,
+                ..Default::default()
+            });
+        assert_eq!(resolution.action, BreachAction::Pause);
+        assert_eq!(resolution.tokens.per_run, Some(250));
+        assert!(resolution.fail_closed.is_some());
+    }
+
+    #[test]
+    fn a_non_string_breach_action_reads_as_malformed_not_absent() {
+        // A hand-edited `breach_action = 1` (or `true`, or a list) is
+        // PRESENT but malformed: it fails closed to `pause`, never falls
+        // through to the default as if nothing were set.
+        for text in [
+            "[budget]\nbreach_action = 1\n",
+            "[budget]\nbreach_action = true\n",
+            "[budget]\nbreach_action = [\"stop\"]\n",
+            "[budget]\nbreach_action = 1.5\n",
+            "[budget]\nbreach_action = 1979-05-27T07:32:00Z\n",
+        ] {
+            let eff = resolve(one_layer(SourceLayer::Instance, text));
+            assert!(
+                matches!(read_breach_action(&eff), ActionRead::Malformed(_)),
+                "{text}: a non-string value is malformed, not absent"
+            );
+            let inputs = explicit_limits(&eff);
+            assert!(inputs.malformed_action.is_some(), "{text}");
+            assert!(inputs.explicit.breach_action.is_none(), "{text}");
+            let resolution = crate::domain::runs::policy::resolve(
+                &crate::domain::runs::policy::ResolutionInput {
+                    inputs,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(resolution.action, BreachAction::Pause, "{text}");
+        }
+    }
 
     #[test]
     fn key_in_only_engine_default_resolves_to_it() {
@@ -2032,15 +2192,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_token_budget_absent_keys_yield_none_and_pause_default() {
-        // Absent scopes → None (never breach); absent action → Pause (the ratified
-        // default).
+    fn resolve_token_budget_absent_keys_yield_none_and_the_warn_default() {
+        // Absent scopes → None (never breach); absent action → warn (the
+        // stored `default` Policy's value — the legacy readers stopped
+        // owning a `pause` default of their own).
         let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
         let (budget, action) = resolve_token_budget(&eff);
         assert_eq!(budget.per_run, None);
         assert_eq!(budget.cumulative, None);
         assert!(!budget.is_set());
-        assert_eq!(action, BreachAction::Pause);
+        assert_eq!(action, BreachAction::Warn);
+        let (_, _, cost_action) = resolve_cost(&eff);
+        assert_eq!(cost_action, BreachAction::Warn);
     }
 
     #[test]
@@ -2330,12 +2493,14 @@ mod tests {
 
     #[test]
     fn resolve_cost_absent_yields_no_rate_no_cap_default_action() {
-        // AC-B: nothing configured → no Rate, no cap, the ratified `pause` default.
+        // AC-B: nothing configured → no Rate, no cap, and the `warn` the
+        // stored `default` Policy carries (this legacy reader no longer
+        // owns a `pause` default of its own).
         let eff = resolve(one_layer(SourceLayer::Instance, "model = \"x\"\n"));
         let (rate, cap, action) = resolve_cost(&eff);
         assert_eq!(rate, None);
         assert!(!cap.is_set());
-        assert_eq!(action, BreachAction::Pause);
+        assert_eq!(action, BreachAction::Warn);
     }
 
     #[test]

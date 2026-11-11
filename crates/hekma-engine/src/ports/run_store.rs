@@ -19,6 +19,7 @@
 //! Run and Policy tables of stories 21.2 and 21.3 settle its surface.
 
 use super::StoreError;
+use crate::domain::runs::policy::{PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy};
 use crate::domain::{
     BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, Label, LabelSource, LatchKey,
     Micros, OutboxEntry, Rate, RecordOutcome, RunId, RunLimits, RunRecord, Selector,
@@ -159,6 +160,15 @@ pub(crate) trait RunStore {
         at: &str,
     ) -> Result<(), StoreError>;
 
+    /// Unlatch one `(dimension, scope)` under `action` (the raise re-arm,
+    /// story 21-3): the pair may fire again under the same action.
+    fn unlatch(
+        &self,
+        run_id: &RunId,
+        key: LatchKey,
+        action: BreachAction,
+    ) -> Result<(), StoreError>;
+
     /// Every latch recorded for a Run.
     fn latches(&self, run_id: &RunId) -> Result<Vec<(LatchKey, BreachAction)>, StoreError>;
 
@@ -186,10 +196,86 @@ pub(crate) struct NewRun {
     pub identity: Option<(String, String)>,
 }
 
+/// The Policies and their per-Run resolutions (story 21-3, schema v15).
+/// Reads run on either connection; writes run inside the store writer's
+/// batch, like [`RunRecords`]'.
+pub(crate) trait PolicyRecords {
+    /// Every Policy, `default` included, ordered by name.
+    fn policies(&self) -> Result<Vec<PolicyRecord>, StoreError>;
+
+    /// One Policy by name.
+    fn policy(&self, name: &str) -> Result<Option<PolicyRecord>, StoreError>;
+
+    /// The RAW stored Selector text of one Policy, undecoded (`None` when
+    /// no row has the name) — the corrupt-row delete path's read: a row
+    /// whose Selector no longer parses fails every DECODED read, so the
+    /// remediation (delete by name) must not depend on decoding.
+    fn policy_selector_raw(&self, name: &str) -> Result<Option<Option<String>>, StoreError>;
+
+    /// Insert or update a Policy and its Rate table.
+    fn put_policy(&self, record: &PolicyRecord) -> Result<(), StoreError>;
+
+    /// Delete a Policy (`default` is refused above this layer).
+    fn delete_policy(&self, name: &str) -> Result<(), StoreError>;
+
+    /// A Run's stored resolution, with the inputs that produced it.
+    fn run_policy(&self, run_id: &RunId) -> Result<Option<RunPolicy>, StoreError>;
+
+    /// Write a Run's stored resolution (replace wholesale).
+    fn set_run_policy(
+        &self,
+        run_id: &RunId,
+        resolution: &PolicyResolution,
+        inputs: &ResolveInputs,
+        at: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Whether the instance is kept on `pause` by the FR-21 upgrade (a
+    /// pending or finished marker row): the action resolves `pause` at the
+    /// explicit level until a Breach Action is set explicitly.
+    fn breach_default_kept(&self, instance: &str) -> Result<bool, StoreError>;
+
+    /// The instances whose upgrade has not finished (the resume list).
+    fn breach_default_pending(&self) -> Result<Vec<String>, StoreError>;
+
+    /// Mark the named instances' upgrade finished, claiming only rows
+    /// still pending, and return the names THIS call finished (stage 3's
+    /// cross-open idempotence: the event fires for exactly these).
+    fn finish_breach_default(
+        &self,
+        written: &[(String, bool)],
+        at: &str,
+    ) -> Result<Vec<String>, StoreError>;
+
+    /// Clear an instance's marker (an explicit `budget.breach_action` write).
+    fn clear_breach_default(&self, instance: &str) -> Result<(), StoreError>;
+
+    /// One Run's resolution facts in one read: its row, labels, Run limits
+    /// and whether its instance is kept on `pause` by the upgrade (the
+    /// pipeline's live per-event resolution).
+    fn run_resolution_facts(&self, run_id: &RunId) -> Result<Option<ResolutionFacts>, StoreError>;
+}
+
+/// One Run's resolution facts (story 21-3): everything the live per-event
+/// resolution reads in one store pass. The `labels` and `kept_on_pause`
+/// arms are read by the stored-resolution path (`resolve_run`), which
+/// re-reads them through its own store handle today.
+#[allow(dead_code)]
+pub(crate) struct ResolutionFacts {
+    /// The Run's row.
+    pub record: RunRecord,
+    /// Its labels, sorted by key.
+    pub labels: Vec<Label>,
+    /// The limits set directly on it.
+    pub limits: RunLimits,
+    /// Its instance is kept on `pause` by the FR-21 upgrade.
+    pub kept_on_pause: bool,
+}
+
 /// The Run registry's storage (story 21-2, AD-25): the Run rows, their labels,
 /// limits and identities. Writes run inside the store writer's batch, like
-/// [`RunStore`]'s.
-pub(crate) trait RunRecords {
+/// [`RunStore`]'s. Policies and their resolutions (21-3) ride along.
+pub(crate) trait RunRecords: PolicyRecords {
     /// Insert a new Run with its labels, limits and identity.
     fn insert_run(&self, run: &NewRun) -> Result<(), StoreError>;
 

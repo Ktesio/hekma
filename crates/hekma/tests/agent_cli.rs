@@ -4271,12 +4271,14 @@ fn list_budget_dollar_label_lives_in_the_header_not_the_truncatable_cell() {
         human.stdout
     );
     // (3) The Budget cell renders BARE dollar figures whose only trailing
-    // parenthetical is the Breach Action `(pause)` — NEVER an inline `(estimated)`
+    // parenthetical is the Breach Action — NEVER an inline `(estimated)`
     // (which truncation could mangle into `(esti…` glued to a dollar). The exact
-    // `cum $5.00/$5.00 (pause)` cell is proof: the `$` cap + remaining are bare, the
+    // `cum $5.00/$5.00 (warn)` cell is proof: the `$` cap + remaining are bare, the
     // estimate label is not in the cell at all, so no mangled label can appear here.
+    // (`warn` is the resolved default since Policies landed; this instance sets no
+    // Breach Action.)
     assert!(
-        human.stdout.contains("cum $5.00/$5.00 (pause)"),
+        human.stdout.contains("cum $5.00/$5.00 (warn)"),
         "the Budget cell must render bare dollars + only the breach action (no inline \
          estimate label to truncate); stdout=\n{}",
         human.stdout
@@ -4437,9 +4439,10 @@ fn show_and_config_get_render_whole_headers_and_grow_value_cells_with_the_termin
         "the Capabilities header must render whole; stdout=\n{}",
         show.stdout
     );
+    // (`warn` is the resolved default since Policies landed.)
     assert!(
         show.stdout
-            .contains("cum 150000/150000 tok, cum $5.00/$5.00 (estimated) (pause)"),
+            .contains("cum 150000/150000 tok, cum $5.00/$5.00 (estimated) (warn)"),
         "the Budget cell must render whole, its inline estimate label intact; \
          stdout=\n{}",
         show.stdout
@@ -6642,6 +6645,9 @@ const BUDGET_VIEW_PRICED_KEYS: &[&str] = &[
     "per_run_dollars_remaining",
     "per_run_limit",
     "per_run_remaining",
+    // The Policies that supplied a limit in this view (Policies shipped;
+    // `default` supplies the action when nothing tighter does).
+    "policies",
 ];
 
 // ---------------------------------------------------------------------------
@@ -6964,8 +6970,20 @@ fn budget_view_key_set_is_frozen_on_the_json_wire() {
     );
     assert_frozen_keys(
         budget,
-        &["breach_action", "cumulative_limit", "cumulative_remaining"],
+        &[
+            "breach_action",
+            "cumulative_limit",
+            "cumulative_remaining",
+            // The default Policy supplied the action (no explicit action
+            // anywhere): the view names its source.
+            "policies",
+        ],
         "BudgetView",
+    );
+    assert_eq!(
+        budget["policies"],
+        serde_json::json!(["default"]),
+        "the default Policy names itself as the action's source: {budget}"
     );
     // Dollars are integer micros + a label on the wire, NEVER a `$` string
     // (AD-8/AD-14) — with no Rate the dollar dimension is absent entirely.

@@ -114,6 +114,12 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::BudgetBreach(e) => assert_eq!(e.schema_version, BUDGET_SCHEMA_VERSION),
         EngineEvent::UsageUpdate(e) => assert_eq!(e.schema_version, USAGE_SCHEMA_VERSION),
         EngineEvent::Run(e) => assert_eq!(e.schema_version, hekma_engine::RUN_EVENT_SCHEMA_VERSION),
+        EngineEvent::Policy(e) => {
+            assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION)
+        }
+        EngineEvent::BreachDefaultUpgraded(e) => {
+            assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION)
+        }
     }
 }
 

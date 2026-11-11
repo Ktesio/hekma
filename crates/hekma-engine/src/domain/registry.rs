@@ -23,7 +23,7 @@ use crate::paths::EnginePaths;
 use crate::ports::RunStore;
 use crate::ports::{
     CompositeSecretResolver, GuaranteeLevel, MemoryBacking, MemoryBackingKind, MemoryBackingStatus,
-    SecretError, SpawnRecord, StateStore, StoreError,
+    PolicyRecords, SecretError, SpawnRecord, StateStore, StoreError,
 };
 use crate::store::{LegacyLogs, LegacyOutbox, LegacySource, SqliteStore, StoreWriter};
 use crate::time::now_rfc3339;
@@ -255,18 +255,25 @@ pub enum RemoveDisposition {
 /// Owns a resolved [`EnginePaths`] (path authority) and a [`StateStore`]. Open
 /// one with [`Registry::open`]; each call is self-contained.
 pub struct Registry {
-    paths: EnginePaths,
+    pub(crate) paths: EnginePaths,
     /// The READ-ONLY connection (story 21-1, AD-27): every read the registry
     /// and the supervisor do. SQLite refuses a write on it (`query_only`).
-    store: SqliteStore,
+    pub(crate) store: SqliteStore,
     /// The store writer: the only state.db writer in this engine process.
-    writer: StoreWriter,
+    pub(crate) writer: StoreWriter,
     /// Import notes from a v12 upgrade on this open, drained once by the
     /// engine onto its diagnostic surface.
-    open_notes: std::sync::Mutex<Vec<String>>,
+    pub(crate) open_notes: std::sync::Mutex<Vec<String>>,
     /// The published Run snapshot (story 21-2, AD-25). Only store-writer
     /// post-commit hooks publish into it.
-    run_snapshot: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+    pub(crate) run_snapshot: std::sync::Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+    /// The cached policy set (story 21-3, amendment 3): loaded at open,
+    /// swapped only by a policy-change job's post-commit hook.
+    pub(crate) policies: std::sync::Arc<crate::domain::runs::policy::PolicyCache>,
+    /// Events an open produced (the policy sweep's Run events, the FR-21
+    /// upgrade event) for `Engine::open` to publish on the bus; they are
+    /// already durable in the outbox.
+    pub(crate) open_events: std::sync::Mutex<Vec<crate::domain::bus::EngineEvent>>,
 }
 
 impl Registry {
@@ -287,13 +294,20 @@ impl Registry {
         // pre-v12 event files once; then the read-only connection opens on
         // the migrated database.
         let legacy = LegacyFiles { paths: &paths };
-        let (write_store, notes) = SqliteStore::open_with_legacy(&paths.state_db(), &legacy)
-            .map_err(|err| match err {
-                StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
-                    RegistryError::OutboxOpenRefused { detail }
-                }
-                other => RegistryError::Store(other),
-            })?;
+        // Story 21-3: the v15 step reads the persisted config layers
+        // through the REAL resolution (engine defaults, kind defaults,
+        // instance config.toml) to build the FR-21 upgrade's pending list.
+        let (write_store, notes) = SqliteStore::open_with_legacy(
+            &paths.state_db(),
+            &legacy,
+            &super::registry_policy::RegistryBreachDefault,
+        )
+        .map_err(|err| match err {
+            StoreError::Backend(detail) if detail.starts_with("outbox import refused") => {
+                RegistryError::OutboxOpenRefused { detail }
+            }
+            other => RegistryError::Store(other),
+        })?;
         legacy.retire_outbox_files();
         let writer = StoreWriter::spawn(write_store)?;
         let store = SqliteStore::open_read_only(&paths.state_db())?;
@@ -315,13 +329,65 @@ impl Registry {
                  starts empty and fills as Runs change"
             ));
         }
-        Ok(Self {
+        let mut registry = Self {
             paths,
             store,
             writer,
             open_notes: std::sync::Mutex::new(notes),
             run_snapshot,
-        })
+            policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
+            open_events: std::sync::Mutex::new(Vec::new()),
+        };
+        // Story 21-3: the cached policy set loads, the FR-21 upgrade
+        // finishes (pending list → config writes → markers + one event),
+        // and every open Run resolves once so the stored resolutions and
+        // the snapshot start true. All fail soft (open notes), and the
+        // events ride `open_events` to the bus.
+        // The open's own load is the BASELINE: stamp the fingerprint so
+        // the first reaper tick does not read as a foreign change and
+        // re-check every supervised Run for nothing (a reload means "the
+        // policy table moved since we loaded" — the round-3 M1 lesson,
+        // found by the adoption suite's mid-configuration window). The
+        // fingerprint is read BEFORE the load: a change another engine
+        // commits between the two then reads as stale at the first tick
+        // and reloads, instead of being stamped as already seen.
+        let baseline = registry.store.policies_fingerprint();
+        if let Some(note) = registry.load_policy_cache() {
+            registry.push_open_note(note);
+        }
+        if let Ok(fingerprint) = baseline {
+            registry.policies.stamp(fingerprint);
+        }
+        registry.finish_breach_default_upgrade();
+        registry.initial_policy_sweep();
+        Ok(registry)
+    }
+
+    /// Whether the instance carries the FR-21 "kept on pause by upgrade"
+    /// marker (story 21-3): the Fleet and Run surfaces render the note from
+    /// this read.
+    pub(crate) fn breach_default_upgraded(&self, name: &InstanceName) -> Result<bool, StoreError> {
+        self.store
+            .snapshot(|store| store.breach_default_kept(name.as_str()))
+    }
+
+    /// Clear an instance's FR-21 upgrade marker (story 21-3): an explicit
+    /// `budget.breach_action` write ends the "kept on pause by upgrade"
+    /// note. Best-effort — a failure returns a warning note (the marker
+    /// stays, harmless: the action already resolves from the explicit key
+    /// the write just set, and the note clears on the next write).
+    pub(crate) fn clear_breach_default_marker(&self, name: &InstanceName) -> Option<String> {
+        let instance = name.as_str().to_string();
+        match self
+            .writer
+            .call(move |ctx| ctx.store().clear_breach_default(&instance))
+        {
+            Ok(()) => None,
+            Err(err) => Some(format!(
+                "the upgrade note could not be cleared ({err}); the action already resolves \
+                 from the key you set, and the note clears on the next config write"
+            )),
+        }
     }
 
     /// The Run snapshot publisher (story 21-2): writer jobs that change a
@@ -431,6 +497,61 @@ impl Registry {
         })?
     }
 
+    /// The instance's open process-owning Run id, read on the read-only
+    /// connection (the supervision surfaces' post-reload re-check).
+    pub(crate) fn open_process_run(
+        &self,
+        name: &InstanceName,
+    ) -> Result<Option<crate::domain::usage::RunId>, StoreError> {
+        use crate::ports::RunRecords;
+        Ok(self
+            .store
+            .snapshot(|store| store.open_process_run(name))?
+            .map(|record| record.run_id))
+    }
+
+    /// One Run's latch rows, read on the read-only connection.
+    pub(crate) fn latches(
+        &self,
+        run: &crate::domain::usage::RunId,
+    ) -> Result<Vec<(crate::domain::LatchKey, crate::domain::BreachAction)>, StoreError> {
+        use crate::ports::RunStore as _;
+        self.store.snapshot(|store| store.latches(run))
+    }
+
+    /// Every non-ended Run (the change facade's context sweep: an
+    /// unsupervised instance's stored resolution still gets fresh inputs).
+    pub(crate) fn open_runs(&self) -> Result<Vec<crate::domain::runs::RunRecord>, StoreError> {
+        use crate::ports::RunRecords;
+        self.store.snapshot(|store| store.open_runs())
+    }
+
+    /// The Rate one Run's own resolution carries (story 21-3, review
+    /// round 2): the per-Run pricing read for usage attributed to a child
+    /// Run — its Policy's flat Rate, priced onto its own ledger rows.
+    /// Only a POLICY-sourced Rate rides the row (round 3, L5): an
+    /// instance- or table-sourced one goes stale after a `cost.rate.*` or
+    /// `model` write (only the process-owning Run re-resolves on the
+    /// config write), so those price at the evaluator's fresh Rate
+    /// instead.
+    pub(crate) fn run_rate(
+        &self,
+        run: &crate::domain::usage::RunId,
+    ) -> Result<Option<crate::domain::cost::Rate>, StoreError> {
+        use crate::ports::PolicyRecords as _;
+        Ok(self
+            .store
+            .snapshot(|store| store.run_policy(run))?
+            .and_then(|row| {
+                let sourced = matches!(
+                    row.resolution.sources.rate,
+                    crate::domain::runs::LimitSource::Policy(_)
+                        | crate::domain::runs::LimitSource::Default
+                );
+                sourced.then_some(row.resolution.rate).flatten()
+            }))
+    }
+
     /// Resolve a Selector over the non-ended Runs on the read-only
     /// connection (story 21-9): one indexed read, capped.
     pub(crate) fn select_runs(
@@ -455,7 +576,7 @@ impl Registry {
         } else {
             SqliteStore::open_empty_read_only()?
         };
-        Ok(Self {
+        let registry = Self {
             paths,
             store,
             writer: StoreWriter::closed(),
@@ -465,7 +586,20 @@ impl Registry {
             run_snapshot: std::sync::Arc::new(
                 crate::domain::runs::snapshot::SnapshotPublisher::default(),
             ),
-        })
+            // Reads still resolve Policies (the dry run, `hekma policy
+            // list`): the cache loads from the read-only connection.
+            policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
+            open_events: std::sync::Mutex::new(Vec::new()),
+        };
+        // Fingerprint first, then load (see the writer open above).
+        let baseline = registry.store.policies_fingerprint();
+        if let Some(note) = registry.load_policy_cache() {
+            registry.push_open_note(note);
+        }
+        if let Ok(fingerprint) = baseline {
+            registry.policies.stamp(fingerprint);
+        }
+        Ok(registry)
     }
 
     /// Resolve the state paths WITHOUT opening anything (story 21-4: the
@@ -1571,7 +1705,9 @@ impl Registry {
     /// Holding the returned [`std::fs::File`] IS holding the lock — drop ends
     /// it. The residue file itself is intentionally left behind (the
     /// `host.lock` precedent: the LOCK decides, never the content).
-    fn acquire_config_write_lock(path: &std::path::Path) -> Result<std::fs::File, String> {
+    pub(crate) fn acquire_config_write_lock(
+        path: &std::path::Path,
+    ) -> Result<std::fs::File, String> {
         use std::io::Write;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -2192,7 +2328,7 @@ fn memory_store_error(err: StoreError) -> RegistryError {
 /// (story 2-1, Decision 1). A parse failure is an ENGINE BUG (the source is a
 /// compile-time [`ENGINE_DEFAULTS_TOML`] constant), surfaced as a typed
 /// [`ConfigError::MalformedLayer`] rather than a panic.
-fn engine_defaults_layer() -> Result<ConfigLayer, ConfigError> {
+pub(crate) fn engine_defaults_layer() -> Result<ConfigLayer, ConfigError> {
     ConfigLayer::parse(
         SourceLayer::EngineDefault,
         ENGINE_DEFAULTS_LABEL,
@@ -2209,7 +2345,7 @@ fn engine_defaults_layer() -> Result<ConfigLayer, ConfigError> {
 /// (already looked up by the caller) so the seam is real — a later story maps
 /// `kind` → real per-kind defaults here WITHOUT changing `effective_config`. Pure
 /// (no I/O), so it adds no error branch.
-fn kind_defaults_layer(_kind: &str) -> ConfigLayer {
+pub(crate) fn kind_defaults_layer(_kind: &str) -> ConfigLayer {
     ConfigLayer::empty()
 }
 
@@ -2227,7 +2363,7 @@ fn kind_defaults_layer(_kind: &str) -> ConfigLayer {
 /// WRITE-time rule; the READ-time resolver still masks such collisions across
 /// layers (a strong scalar prunes a weak subtree) — but a single instance-layer
 /// write must never clobber its own existing value.
-fn set_dotted(
+pub(crate) fn set_dotted(
     table: &mut toml::value::Table,
     dotted_key: &str,
     value: toml::Value,
@@ -4738,11 +4874,18 @@ source = "self-reported"
         // The outbox: seqs and the ack carry over; the next seq continues.
         let batch = crate::domain::export_core(&reg, None, 0).unwrap();
         let seqs: Vec<u64> = batch.events.iter().map(|e| e.seq).collect();
+        // Story 21-3: the open's FR-21 upgrade finish emits its ONE event
+        // after the imported tail — the fixture's instance carries no
+        // explicit Breach Action, so it was kept on `pause` (seq 8).
         assert_eq!(
             seqs,
-            vec![7],
-            "the default pull resumes after the imported ack"
+            vec![7, 8],
+            "the default pull resumes after the imported ack, then the upgrade event"
         );
+        assert!(matches!(
+            batch.events[1].event,
+            EngineEvent::BreachDefaultUpgraded(_)
+        ));
         assert_eq!(batch.retained_from, 5);
         let event = batch.events[0].event.clone();
         let next = reg
@@ -4752,7 +4895,7 @@ source = "self-reported"
                     .append_outbox(&event, crate::domain::OUTBOX_MAX_BYTES)
             })
             .unwrap();
-        assert_eq!(next.seq, 8);
+        assert_eq!(next.seq, 9);
         assert!(matches!(batch.events[0].event, EngineEvent::Transition(_)));
 
         // The journal pair is retired; the log files stay as mirrors.

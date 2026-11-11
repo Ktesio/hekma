@@ -540,7 +540,11 @@ fn the_v14_step_records_config_as_the_origin_of_every_bound_label() {
         .conn()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    // The open runs EVERY remaining migration step, so a fully-opened DB
+    // reads the current schema version (15 since Policies; the assertion
+    // pins "the v14 step ran to completion on the way", which the origins
+    // query below proves, not "nothing newer exists").
+    assert_eq!(version, crate::store::SCHEMA_VERSION);
     let origins: Vec<(String, Option<String>)> = store
         .conn()
         .prepare("SELECT key, origin FROM run_labels ORDER BY key")
@@ -564,4 +568,38 @@ fn the_v14_step_records_config_as_the_origin_of_every_bound_label() {
         reopened.run_labels(&RunId::from_wire("run-live")).unwrap(),
         vec![Label::caller("task", "x"), Label::bound("team", "payments")]
     );
+}
+
+#[test]
+fn corrupt_policy_rows_are_typed_and_fail_the_read_closed() {
+    // Money code never silently drops a standing limit: every corrupt
+    // Policy row shape answers a typed CorruptRow, and the whole `policies`
+    // read fails rather than skipping the row.
+    let (_tmp, store) = store();
+    use crate::ports::PolicyRecords as _;
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO policies (name, selector, created_at, updated_at) \
+               VALUES ('noselector', NULL, 't', 't'); \
+             INSERT INTO policies (name, selector, created_at, updated_at) \
+               VALUES ('badsel', 'team=!', 't', 't'); \
+             INSERT INTO policies (name, selector, breach_action, created_at, updated_at) \
+               VALUES ('badaction', 'team=core', 'explode', 't', 't'); \
+             INSERT INTO policies (name, selector, scent_check, created_at, updated_at) \
+               VALUES ('badmode', 'team=core', 'maybe', 't', 't');",
+        )
+        .unwrap();
+    for name in ["noselector", "badsel", "badaction", "badmode"] {
+        let err = store.policy(name).unwrap_err();
+        assert!(
+            matches!(err, StoreError::CorruptRow { .. }),
+            "{name}: {err}"
+        );
+        assert!(err.to_string().contains(name), "{err}");
+    }
+    assert!(matches!(
+        store.policies(),
+        Err(StoreError::CorruptRow { .. })
+    ));
 }
