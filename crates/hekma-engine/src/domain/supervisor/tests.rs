@@ -9059,6 +9059,140 @@ fn a_change_fired_breach_on_an_unsupervised_instance_is_recorded_not_acted_on() 
 }
 
 #[test]
+fn a_degraded_cache_still_breaches_an_explicit_instance_ceiling() {
+    // The N1 end-to-end pin: a corrupt Policy row degrades the cache, and
+    // the instance carries an EXPLICIT token ceiling in its config. The
+    // usage event must still breach at that ceiling — action held at
+    // `pause`, arms kept — never the armless fail-open that turned every
+    // budget in the fleet off. (Pause is guaranteed on this OS so the
+    // forced action really applies.)
+    let state = tempfile::TempDir::new().unwrap();
+    let manifest = tempfile::TempDir::new().unwrap();
+    write_pause_guaranteed_manifest(
+        manifest.path(),
+        "keeparms",
+        &["--linger-ms", "600000"],
+    );
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "keeparms",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("keeparms").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget.tokens]\nper_run = 100\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "keeparms").unwrap();
+    let run = open_run(&registry, "keeparms").record.run_id;
+    // A corrupt Policy row degrades the cache (the whole policies read
+    // fails on it).
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    let note = registry
+        .load_policy_cache()
+        .expect("the corrupt row degrades the cache");
+    assert!(note.contains("could not be read"), "{note}");
+    // The usage event breaches the EXPLICIT ceiling under the degraded
+    // cache, and the forced `pause` applies.
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &run,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 150,
+            output_tokens: 0,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    let breaches = Supervisor::read_breach_events(&registry, "keeparms").unwrap();
+    assert_eq!(breaches.len(), 1, "{breaches:?}");
+    assert_eq!(breaches[0].limit, 100);
+    assert_eq!(breaches[0].action, BreachAction::Pause);
+    assert_eq!(state_of(&registry, "keeparms"), LifecycleState::Paused);
+    let _ = sup.stop(&registry, "keeparms", Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn the_tick_degradation_notice_latches_and_re_arms() {
+    // The tick-time reload failure surfaces ONCE per continuous degraded
+    // state (never an unbounded open-notes growth), and the notice
+    // re-arms once the cache reads healthy again.
+    let (_state, _manifest, registry) = setup_fake("ticknote", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let buffer = install_capture_sink(&mut sup);
+    let insert_corrupt = |registry: &Registry| {
+        registry
+            .writer
+            .call(|ctx| {
+                ctx.store().execute_batch_for_test(
+                    "INSERT INTO policies (name, selector, created_at, updated_at) \
+                     VALUES ('broken', 'team=', 't', 't')",
+                );
+                Ok(())
+            })
+            .unwrap()
+    };
+    let remove_corrupt = |registry: &Registry| {
+        registry
+            .writer
+            .call(|ctx| {
+                ctx.store()
+                    .execute_batch_for_test("DELETE FROM policies WHERE name = 'broken'");
+                Ok(())
+            })
+            .unwrap()
+    };
+    // A healthy tick says nothing.
+    sup.drain_usage_all(&registry);
+    assert!(!sink_text(&buffer).contains("Policies could not be reloaded"));
+    // A corrupt row moves the fingerprint: the next tick's reload fails,
+    // and the FIRST failing tick says so while the second stays quiet.
+    insert_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    let first = sink_text(&buffer);
+    assert!(
+        first.contains("Policies could not be reloaded"),
+        "the degradation is surfaced: {first}"
+    );
+    assert!(
+        first.contains("last good set"),
+        "the notice says enforcement continues: {first}"
+    );
+    sup.drain_usage_all(&registry);
+    assert_eq!(
+        sink_text(&buffer),
+        first,
+        "the notice latches: no second emission while the state holds"
+    );
+    // Removing the row heals the cache; a later degradation says so again
+    // (the latch re-armed on the healthy tick).
+    remove_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    let healthy_len = sink_text(&buffer).len();
+    insert_corrupt(&registry);
+    sup.drain_usage_all(&registry);
+    assert!(
+        sink_text(&buffer).len() > healthy_len,
+        "the re-armed notice fires on the next degradation"
+    );
+}
+
+#[test]
 fn a_child_run_bound_into_a_policy_breaches_from_its_own_usage() {
     // Story 21-3 (review round 1, finding 2): a child Run bound into a
     // Policy BY LABEL (the verb — the announce path's labels are Caller

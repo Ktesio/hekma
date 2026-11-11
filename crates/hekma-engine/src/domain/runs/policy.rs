@@ -795,23 +795,25 @@ fn maximal_candidates<'a>(candidates: &[&'a PolicyRecord]) -> Vec<&'a PolicyReco
 /// committed set). [`PolicyCache::current`] is one `Arc` clone — the
 /// per-usage-event resolution reads no SQL.
 ///
-/// **Degraded reads fail closed (21-3 review round 1):** a load that
-/// failed leaves the DEGRADED marker set — every resolution through the
-/// cache then fails closed to `pause` with a note until a later load
-/// succeeds (AD-7: a read failure must never resolve the `warn` default
-/// by accident). The marker also covers a cached set whose `default` row
-/// is missing (a corrupt row drops it): [`PolicyCache::current`] answers
-/// `Err` and the caller fails closed the same way.
+/// **Degraded reads fail closed WITHOUT disarming (21-3 review rounds 1
+/// and 2):** a load that failed — or a set whose `default` row went
+/// missing — marks the cache DEGRADED and keeps the LAST GOOD set. A
+/// resolution through a degraded cache then resolves against that last
+/// good set with the action FORCED to `pause` and a note naming why: the
+/// ceilings stay enforced (the last thing known beats nothing, which once
+/// turned every budget in the fleet off), while the action never falls
+/// back to `warn` by accident (AD-7).
 #[derive(Debug, Default)]
 pub(crate) struct PolicyCache {
     current: std::sync::RwLock<std::sync::Arc<Vec<PolicyRecord>>>,
     degraded: std::sync::RwLock<Option<String>>,
-    loaded_data_version: std::sync::RwLock<Option<u64>>,
+    loaded_fingerprint: std::sync::RwLock<Option<String>>,
 }
 
 impl PolicyCache {
     /// The current policy set (a cheap `Arc` clone). `Err` carries the
-    /// reason the set cannot be trusted (fail closed to `pause`).
+    /// reason the set cannot be trusted; the caller fails closed WITH the
+    /// last good set ([`Self::current_or_last_good`]).
     pub(crate) fn current(
         &self,
     ) -> Result<std::sync::Arc<Vec<PolicyRecord>>, PolicyCacheUnavailable> {
@@ -828,10 +830,29 @@ impl PolicyCache {
         }
     }
 
+    /// The set a resolution should use: the current one when healthy, the
+    /// LAST GOOD one when degraded — plus the degradation reason when it
+    /// applies (the caller forces the action to `pause` and notes it).
+    /// Never answers a set it never successfully loaded (an empty vec
+    /// before the first load; the caller treats that as fail-closed too).
+    pub(crate) fn current_or_last_good(
+        &self,
+    ) -> (std::sync::Arc<Vec<PolicyRecord>>, Option<String>) {
+        let reason = match self.degraded.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let set = match self.current.read() {
+            Ok(guard) => std::sync::Arc::clone(&guard),
+            Err(poisoned) => std::sync::Arc::clone(&poisoned.into_inner()),
+        };
+        (set, reason)
+    }
+
     /// Publish the next policy set, clear the degraded marker and stamp
-    /// the `data_version` it was read at (the cross-process staleness
-    /// check's baseline). Called only from a store-writer post-commit hook
-    /// or the open/tick load, so swaps follow commit order.
+    /// the fingerprint it was read at (the cross-process staleness check's
+    /// baseline). Called only from a store-writer post-commit hook or the
+    /// open/tick load, so swaps follow commit order.
     pub(crate) fn publish(&self, policies: Vec<PolicyRecord>) {
         let mut guard = match self.current.write() {
             Ok(guard) => guard,
@@ -844,8 +865,8 @@ impl PolicyCache {
         }
     }
 
-    /// Mark the cache untrustworthy (a failed load): every resolution
-    /// through it fails closed to `pause` with this reason until a
+    /// Mark the cache untrustworthy (a failed load): the LAST good set
+    /// stays for enforcement (the action forced to `pause`) until a
     /// successful publish clears it.
     pub(crate) fn degrade(&self, reason: String) {
         let mut degraded = match self.degraded.write() {
@@ -855,23 +876,23 @@ impl PolicyCache {
         *degraded = Some(reason);
     }
 
-    /// The `data_version` the cache was last (re)loaded at, and whether a
-    /// reload is therefore needed (the caller just read `now`). Our own
-    /// policy-change jobs call [`Self::publish`] in their post-commit hook
-    /// WITHOUT stamping a version — the next tick's check then reloads
-    /// once (harmless: the set is already current) and stamps its baseline
-    /// — while a DIFFERENT process's change moves `data_version` and is
-    /// picked up within a tick.
-    pub(crate) fn stale_at(&self, now: u64) -> bool {
-        match self.loaded_data_version.read() {
-            Ok(guard) => *guard != Some(now),
-            Err(poisoned) => *poisoned.into_inner() != Some(now),
+    /// Whether the policy table's fingerprint moved since the last load
+    /// (the caller just read `now`). The fingerprint covers every row's
+    /// name and update time, so ANY committed change — this engine's own
+    /// (the writer is a different connection, so its commits move the
+    /// read-only connection's change counters too) or another engine's —
+    /// forces one reload; an unchanged table costs one tiny aggregate read
+    /// per tick and nothing else.
+    pub(crate) fn stale_at(&self, now: &str) -> bool {
+        match self.loaded_fingerprint.read() {
+            Ok(guard) => guard.as_deref() != Some(now),
+            Err(poisoned) => poisoned.into_inner().as_deref() != Some(now),
         }
     }
 
-    /// Stamp the `data_version` the current set was read at.
-    pub(crate) fn stamp(&self, version: u64) {
-        let mut guard = match self.loaded_data_version.write() {
+    /// Stamp the fingerprint the current set was read at.
+    pub(crate) fn stamp(&self, version: String) {
+        let mut guard = match self.loaded_fingerprint.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -1435,9 +1456,9 @@ mod tests {
             std::panic::set_hook(previous);
         }
         assert!(cache.current().is_ok(), "a poisoned lock still answers");
-        cache.stamp(7);
-        assert!(!cache.stale_at(7), "the stamped version is current");
-        assert!(cache.stale_at(8), "a moved version is stale");
+        cache.stamp("v1".to_string());
+        assert!(!cache.stale_at("v1"), "the stamped fingerprint is current");
+        assert!(cache.stale_at("v2"), "a moved fingerprint is stale");
         cache.publish(Vec::new());
         assert!(cache.current().is_ok());
     }

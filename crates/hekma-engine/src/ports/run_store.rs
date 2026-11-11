@@ -206,6 +206,12 @@ pub(crate) trait PolicyRecords {
     /// One Policy by name.
     fn policy(&self, name: &str) -> Result<Option<PolicyRecord>, StoreError>;
 
+    /// The RAW stored Selector text of one Policy, undecoded (`None` when
+    /// no row has the name) — the corrupt-row delete path's read: a row
+    /// whose Selector no longer parses fails every DECODED read, so the
+    /// remediation (delete by name) must not depend on decoding.
+    fn policy_selector_raw(&self, name: &str) -> Result<Option<Option<String>>, StoreError>;
+
     /// Insert or update a Policy and its Rate table.
     fn put_policy(&self, record: &PolicyRecord) -> Result<(), StoreError>;
 

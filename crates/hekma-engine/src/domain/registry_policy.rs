@@ -20,18 +20,17 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::domain::budget::{BreachAction, TokenBudget};
+use crate::domain::budget::BreachAction;
 use crate::domain::bus::EngineEvent;
 use crate::domain::config::{self, ConfigLayer, SourceLayer};
-use crate::domain::cost::{CostCap, Rate};
+use crate::domain::cost::Rate;
 use crate::domain::name::InstanceName;
 use crate::domain::outbox::OUTBOX_MAX_BYTES;
 use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
-    self, BreachDefaultUpgradedEvent, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
-    PolicyLimits, PolicyRecord, ResolveInputs, ScentCheckMode, UpgradedInstance,
-    DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+    self, BreachDefaultUpgradedEvent, LimitSource, PolicyEvent, PolicyEventKind, PolicyLimits,
+    PolicyRecord, ResolveInputs, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
@@ -115,60 +114,85 @@ impl Registry {
 
     /// Load the policy cache from the store (at writer open, after the
     /// migration seeded the default Policy). A failed read — or a set
-    /// without its `default` row — DEGRADES the cache: every resolution
-    /// through it fails closed to `pause` with a note until a later load
-    /// succeeds (AD-7; the pre-fix empty cache silently resolved the
-    /// seeded `warn`, the 21-3 review round 1 finding).
-    pub(crate) fn load_policy_cache(&self) {
+    /// without its `default` row — DEGRADES the cache while KEEPING the
+    /// last good set for enforcement: every resolution then carries the
+    /// arms that set could resolve with the action forced to `pause`
+    /// (AD-7; the pre-fix empty cache silently resolved the seeded
+    /// `warn`, and an armless fail-close turned enforcement off — the
+    /// 21-3 review rounds). Returns the degradation note when the cache
+    /// is degraded (the OPEN path surfaces it as an open note; the tick
+    /// path hands it to the supervisor's diagnostic surface).
+    pub(crate) fn load_policy_cache(&self) -> Option<String> {
         match self.store.snapshot(|store| store.policies()) {
             Ok(policies) => {
                 if policies.iter().any(|policy| policy.is_default()) {
                     self.policies.publish(policies);
+                    None
                 } else {
                     self.policies.degrade(
                         "the default Policy row is missing from the stored set".to_string(),
                     );
-                    self.push_open_note(
+                    Some(
                         "the stored Policies carry no `default` row, so every limit resolves \
-                         fail-closed to pause until one is restored (a Policy change reloads \
-                         the set)"
+                         fail-closed to pause (the last good set still arms its ceilings) \
+                         until one is restored"
                             .to_string(),
-                    );
+                    )
                 }
             }
             Err(err) => {
                 self.policies
                     .degrade(format!("the Policies could not be read ({err})"));
-                self.push_open_note(format!(
+                Some(format!(
                     "the Policies could not be read into the cached set ({err}); limits resolve \
-                     fail closed to pause until a Policy change reloads them"
+                     fail closed to pause (the last good set still arms its ceilings) until the \
+                     read succeeds"
                 ))
             }
         }
     }
 
-    /// Re-read the policy set when the database moved underneath this
-    /// process (story 21-3, the cross-process staleness check): SQLite's
-    /// `data_version` on the read connection changes when ANY OTHER
-    /// connection or process commits — this engine's own changes swap the
-    /// cache in their own post-commit hook — so one pragma read per tick
-    /// (never per event) picks up a second engine's Policy change within a
-    /// tick. Best-effort: a failed check leaves the cached set standing
-    /// (the next tick retries); a failed reload degrades the cache
-    /// (fail-closed resolution) exactly like the open load.
-    pub(crate) fn refresh_policy_cache(&self) {
-        let version = match self.store.data_version() {
-            Ok(version) => version,
-            Err(_) => return,
+    /// Re-read the policy set when the policy table moved underneath this
+    /// process (story 21-3, the cross-process staleness check): the
+    /// table's fingerprint (every row's name and update time) changes on
+    /// ANY committed Policy change — this engine's own writer's (a
+    /// different connection, so its commits move the read-only
+    /// connection's counters too; harmless, one redundant reload) or
+    /// another engine's — so one tiny aggregate read per tick (never per
+    /// event) picks a second engine's change up within a tick. A failed
+    /// reload degrades the cache exactly like a failed open load; the
+    /// returned note is the caller's to surface (the supervisor emits it
+    /// ONCE per continuous degraded state, re-armed on recovery).
+    pub(crate) fn refresh_policy_cache(&self) -> Option<String> {
+        let fingerprint = match self.store.policies_fingerprint() {
+            Ok(fingerprint) => fingerprint,
+            Err(err) => {
+                // The check itself failed: treat it as a reload failure
+                // (degrade, keep the last good set) rather than silently
+                // standing still.
+                self.policies
+                    .degrade(format!("the policy table could not be read ({err})"));
+                return Some(format!(
+                    "the policy table could not be read ({err}); limits resolve fail closed to \
+                     pause (the last good set still arms its ceilings) until the read succeeds"
+                ));
+            }
         };
-        if !self.policies.stale_at(version) {
-            return;
+        if !self.policies.stale_at(&fingerprint) {
+            return None;
         }
-        self.load_policy_cache();
-        self.policies.stamp(version);
+        let note = self.load_policy_cache();
+        self.policies.stamp(fingerprint);
+        note
     }
 
-    fn push_open_note(&self, note: String) {
+    /// Whether the policy cache is currently degraded (the supervisor's
+    /// once-per-state diagnostic re-arms on a healthy tick).
+    pub(crate) fn policy_cache_degraded(&self) -> bool {
+        self.policies.current().is_err()
+    }
+
+    pub(crate) fn push_open_note(&self, note: String) {
         self.open_notes
             .lock()
             .expect("open-notes mutex poisoned")
@@ -218,65 +242,105 @@ impl Registry {
     /// The resolved limits for one instance and Run (story 21-3): the one
     /// pure resolver over the Run's facts, the instance's explicit config,
     /// the kept-on-pause marker and the cached policy set. `run` may be
-    /// `None` (an instance-shaped read: the Fleet and status surfaces) or
-    /// have no row (resolves with no Run limits). This is the LIVE
-    /// enforcement read (`eval_input`) and the surface read — one function,
-    /// never re-implemented. A failed config, store or cache read fails
-    /// CLOSED (AD-7: never the new default by accident) — the arms stay
-    /// unset, the action pauses and the fail-closed note names the reason.
-    /// The Run's BOUND labels ride the facts read (a named Policy selects
-    /// through them — without them no named Policy ever applied, the 21-3
-    /// review round 1 finding).
+    /// `None` (an instance-shaped read: the Fleet and status surfaces —
+    /// then the open process-owning Run's facts are used when one exists,
+    /// else the labels the instance's configuration BINDS, so a fresh
+    /// start's fence and the Fleet see the Policies the next Run will
+    /// carry) or have no row (same fallback). This is the LIVE enforcement
+    /// read (`eval_input`) and the surface read — one function, never
+    /// re-implemented.
+    ///
+    /// **Fail closed WITHOUT disarming (AD-7; 21-3 review round 2):** a
+    /// failed facts, kept-marker or policy-cache read never returns an
+    /// armless resolution — that once turned every budget in the fleet
+    /// off, explicit instance ceilings included. Instead the resolution
+    /// keeps every arm it CAN still resolve (the explicit Run limits, the
+    /// explicit instance config, the Rate, and the LAST GOOD policy set
+    /// when the cache is degraded), forces the action to `pause`, and
+    /// carries a fail-closed note naming the reason.
     pub(crate) fn resolved_limits(
         &self,
         name: &InstanceName,
         run: Option<&RunId>,
     ) -> PolicyResolution {
-        let facts = match run {
-            None => None,
-            Some(run_id) => match self
+        let mut fail_closed = None;
+        // The Run facts: the named Run's, else the instance's open
+        // process-owning Run's, else none (a fresh start before its Run
+        // row exists).
+        let mut facts = None;
+        if let Some(run_id) = run {
+            match self
                 .store
                 .snapshot(|store| store.run_resolution_facts(run_id))
             {
-                Ok(facts) => facts,
+                Ok(Some(read)) => facts = Some(read),
+                Ok(None) => {}
                 Err(err) => {
-                    return fail_closed_resolution(format!(
+                    fail_closed = Some(format!(
                         "this Run's resolution facts could not be read ({err}), so its limits \
                          fail closed to pause until the read succeeds"
                     ))
                 }
-            },
-        };
+            }
+        }
+        if facts.is_none() && fail_closed.is_none() {
+            match self.store.snapshot(|store| store.open_process_run(name)) {
+                Ok(Some(owner)) => match self
+                    .store
+                    .snapshot(|store| store.run_resolution_facts(&owner.run_id))
+                {
+                    Ok(Some(read)) => facts = Some(read),
+                    Ok(None) => {}
+                    Err(err) => {
+                        fail_closed = Some(format!(
+                            "this Run's resolution facts could not be read ({err}), so its \
+                             limits fail closed to pause until the read succeeds"
+                        ))
+                    }
+                },
+                Ok(None) => {}
+                Err(err) => {
+                    fail_closed = Some(format!(
+                        "the open Run could not be read ({err}), so the limits fail closed to \
+                         pause until the read succeeds"
+                    ))
+                }
+            }
+        }
         let kept_instance = facts
             .as_ref()
             .map(|facts| facts.record.instance.clone())
             .unwrap_or_else(|| Some(name.as_str().to_string()));
-        let kept = match kept_instance.as_deref() {
-            Some(instance) => {
-                match self
-                    .store
-                    .snapshot(|store| store.breach_default_kept(instance))
-                {
-                    Ok(kept) => kept,
-                    // A failed kept-marker read keeps `pause` (fail closed):
-                    // the marker is the FR-21 promise's carrier.
-                    Err(err) => {
-                        return fail_closed_resolution(format!(
-                            "the kept-on-pause marker could not be read ({err}), so the breach \
-                             action fails closed to pause until the read succeeds"
-                        ))
-                    }
+        let mut kept = false;
+        if let Some(instance) = kept_instance.as_deref() {
+            match self
+                .store
+                .snapshot(|store| store.breach_default_kept(instance))
+            {
+                Ok(read) => kept = read,
+                // A failed kept-marker read keeps `pause` (fail closed):
+                // the marker is the FR-21 promise's carrier.
+                Err(err) => {
+                    fail_closed = Some(format!(
+                        "the kept-on-pause marker could not be read ({err}), so the breach \
+                         action fails closed to pause until the read succeeds"
+                    ))
                 }
             }
-            None => false,
+        }
+        let (inputs, config_labels) = match self.effective_config(name, ConfigLayer::empty()) {
+            Ok(effective) => {
+                let labels = crate::domain::runs::labels::bound_labels_from(&effective).0;
+                (config::explicit_limits(&effective), labels)
+            }
+            Err(_) => (
+                ResolveInputs {
+                    malformed_action: Some("the configuration could not be read".to_string()),
+                    ..ResolveInputs::default()
+                },
+                Vec::new(),
+            ),
         };
-        let inputs = self
-            .effective_config(name, ConfigLayer::empty())
-            .map(|effective| config::explicit_limits(&effective))
-            .unwrap_or_else(|_| ResolveInputs {
-                malformed_action: Some("the configuration could not be read".to_string()),
-                ..ResolveInputs::default()
-            });
         let (depth, wire_path, run_limits, bound_labels) = match &facts {
             Some(facts) => (
                 facts.record.control_depth,
@@ -293,30 +357,30 @@ impl Registry {
                 ControlDepth::Supervised,
                 true,
                 Default::default(),
-                Vec::new(),
+                config_labels
+                    .iter()
+                    .filter(|label| label.is_bound())
+                    .map(|label| (label.key.clone(), label.value.clone()))
+                    .collect(),
             ),
         };
-        let policies = match self.policies.current() {
-            Ok(policies) => policies,
-            Err(unavailable) => {
-                return fail_closed_resolution(format!(
-                    "the Policies could not be read into the cached set ({unavailable}), so the \
-                     limits fail closed to pause until a Policy change reloads them"
-                ))
-            }
-        };
-        if !policies.iter().any(|policy| policy.is_default()) {
+        let (policies, cache_note) = self.policies.current_or_last_good();
+        if let Some(reason) = cache_note {
+            fail_closed = Some(format!(
+                "the Policies could not be read into the cached set ({reason}), so the limits \
+                 fail closed to pause — the last good set still arms every ceiling it could — \
+                 until a Policy change reloads them"
+            ));
+        } else if !policies.iter().any(|policy| policy.is_default()) {
             // The `default` row is the fallback layer for every limit; a
-            // set without it (a corrupt row dropped in a wholesale-failure
-            // read is caught above, but a seeded-empty set is not) must not
-            // silently resolve the seeded `warn`.
-            return fail_closed_resolution(
+            // set without it must not silently resolve the seeded `warn`.
+            fail_closed = Some(
                 "the default Policy row is missing from the cached set, so the limits fail \
                  closed to pause until it is restored"
                     .to_string(),
             );
         }
-        policy::resolve(&policy::ResolutionInput {
+        let mut resolution = policy::resolve(&policy::ResolutionInput {
             depth,
             wire_path,
             bound_labels,
@@ -325,7 +389,18 @@ impl Registry {
             caller_limits: PolicyLimits::default(),
             kept_on_pause: kept,
             policies: policies.as_ref().clone(),
-        })
+        });
+        if let Some(note) = fail_closed {
+            // Fail closed WITHOUT disarming: every arm the reads could
+            // still resolve stays enforced; only the action degrades, to
+            // `pause`.
+            resolution.action = BreachAction::Pause;
+            resolution.effective_action = BreachAction::Pause;
+            resolution.fallback = None;
+            resolution.sources.breach_action = LimitSource::Instance;
+            resolution.fail_closed = Some(note);
+        }
+        resolution
     }
 
     /// Every Policy, ordered by name (the read-only connection).
@@ -336,6 +411,15 @@ impl Registry {
     /// One Policy by name.
     pub(crate) fn policy(&self, name: &str) -> Result<Option<PolicyRecord>, StoreError> {
         self.store.snapshot(move |store| store.policy(name))
+    }
+
+    /// The RAW stored Selector text of one Policy, undecoded (`None` when
+    /// no row has the name) — the corrupt-row delete path's read.
+    pub(crate) fn policy_selector_raw(
+        &self,
+        name: &str,
+    ) -> Result<Option<Option<String>>, StoreError> {
+        self.store.snapshot(move |store| store.policy_selector_raw(name))
     }
 
     /// Validate a create/change (the engine's refusals, before any write):
@@ -659,38 +743,82 @@ impl Registry {
     }
 
     /// Delete a Policy (one writer job; `default` is refused) and
-    /// re-resolve its matched Runs under the loosened set.
+    /// re-resolve its matched Runs under the loosened set. `prior` is the
+    /// decoded row when it could be read (its limits ride the event);
+    /// `raw_selector` is the RAW stored Selector text, so a CORRUPT row —
+    /// one whose Selector no longer parses, which fails every decoded
+    /// read — is still deletable by name (the remediation; money code
+    /// never wedges the operator out of the loop). When the raw Selector
+    /// cannot be parsed the matched set is EVERY non-ended Run (honest:
+    /// the row's scope is unknowable, so everything re-resolves) with a
+    /// note naming it.
     pub(crate) fn apply_policy_delete(
         &self,
-        existing: PolicyRecord,
+        name: &str,
+        prior: Option<PolicyRecord>,
+        raw_selector: Option<String>,
         contexts: HashMap<String, InstanceContext>,
     ) -> Result<PolicyApplied, RunError> {
-        if existing.is_default() {
+        if name == DEFAULT_POLICY_NAME {
             return Err(RunError::PolicyDefault {
                 what: "cannot be deleted — change it instead",
             });
         }
-        let matched_selector = existing.selector.clone();
+        // The matched set: the decoded prior's Selector when there is one,
+        // else the raw text; unparseable raw text re-resolves everything.
+        let matched_selector = prior
+            .as_ref()
+            .and_then(|prior| prior.selector.clone())
+            .or_else(|| {
+                raw_selector.as_deref().and_then(|raw| Selector::parse(raw).ok())
+            });
         let publisher = Arc::clone(&self.run_snapshot);
         let cache = Arc::clone(&self.policies);
-        let name = existing.name.clone();
-        let prior = existing.clone();
+        let name = name.to_string();
+        // The event's Selector: the decoded prior's when there is one; a
+        // corrupt row's raw text cannot become a Selector, so the event
+        // carries none and the note below names the scope honestly.
+        let event_selector = prior.as_ref().and_then(|prior| prior.selector.clone());
+        let raw_as_text = raw_selector
+            .as_deref()
+            .map(|raw| format!("`{raw}`"))
+            .unwrap_or_else(|| "NULL".to_string());
+        let unreadable_scope = prior.is_none() && matched_selector.is_none();
         let result = self.writer.call(move |ctx| {
             let store = ctx.store();
             let body = || -> Result<_, RunError> {
+                // Delete FIRST: a corrupt row must be gone before the
+                // policy-set read inside the re-resolution runs.
                 store.delete_policy(&name).map_err(RunError::Store)?;
-                // The matched set is the DELETED selector's (the Runs it
-                // selected now resolve looser).
-                let selectors: Vec<Selector> = matched_selector.into_iter().collect();
-                let (outcome, run_events, breaches) =
-                    re_resolve_matched(store, ctx, SelectorSet::Matching(&selectors), &contexts)?;
+                let (outcome, run_events, breaches) = match &matched_selector {
+                    // The matched set is the DELETED selector's (the Runs
+                    // it selected now resolve looser).
+                    Some(selector) => {
+                        let selectors = vec![selector.clone()];
+                        re_resolve_matched(
+                            store,
+                            ctx,
+                            SelectorSet::Matching(&selectors),
+                            &contexts,
+                        )?
+                    }
+                    None => re_resolve_matched(store, ctx, SelectorSet::EveryRun, &contexts)?,
+                };
+                let mut outcome = outcome;
+                if unreadable_scope {
+                    outcome.notes.push(format!(
+                        "the deleted Policy `{name}` had an unreadable Selector (stored as \
+                         {raw_as_text}), so EVERY non-ended Run re-resolved — its scope could \
+                         not be read",
+                    ));
+                }
                 let event = PolicyEvent {
                     schema_version: POLICY_EVENT_SCHEMA_VERSION,
                     kind: PolicyEventKind::Deleted,
                     name: name.clone(),
-                    selector: prior.selector.clone(),
+                    selector: event_selector,
                     limits: None,
-                    prior_limits: Some(prior.limits.clone()),
+                    prior_limits: prior.as_ref().map(|prior| prior.limits.clone()),
                     rates: BTreeMap::new(),
                     matched: outcome.matched,
                     fallbacks: outcome.fallbacks,
@@ -1357,38 +1485,6 @@ impl BreachDefaultSource for RegistryBreachDefault {
             .unwrap_or_else(ConfigLayer::empty);
         let effective = config::resolve([engine, kind_layer, instance, ConfigLayer::empty()]);
         config::explicit_limits(&effective)
-    }
-}
-
-/// The all-unset `LimitSources` (a fail-closed resolution's sources).
-fn unset_sources() -> LimitSources {
-    LimitSources {
-        tokens_per_run: LimitSource::Unset,
-        tokens_cumulative: LimitSource::Unset,
-        dollars_per_run: LimitSource::Unset,
-        dollars_cumulative: LimitSource::Unset,
-        breach_action: LimitSource::Unset,
-        scent_check: LimitSource::Unset,
-        rate: LimitSource::Unset,
-    }
-}
-
-/// A resolution that fails CLOSED (AD-7): no arms, `pause`, and the note
-/// that names why — what `Registry::resolved_limits` answers when a read
-/// the resolution depends on failed (money code never resolves the
-/// default by accident).
-fn fail_closed_resolution(note: String) -> PolicyResolution {
-    PolicyResolution {
-        tokens: TokenBudget::none(),
-        dollars: CostCap::none(),
-        action: BreachAction::Pause,
-        effective_action: BreachAction::Pause,
-        scent_check: ScentCheckMode::Off,
-        rate: None,
-        sources: unset_sources(),
-        fallback: None,
-        unpriced: None,
-        fail_closed: Some(note),
     }
 }
 

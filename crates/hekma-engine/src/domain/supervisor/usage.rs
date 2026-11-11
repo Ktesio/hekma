@@ -100,10 +100,27 @@ impl Supervisor {
     /// per-channel drains are independent cursors over independent files, so
     /// a line can never be ingested twice.
     pub(super) fn drain_usage_all(&mut self, registry: &Registry) {
-        // Story 21-3: the cross-process policy-cache staleness check rides
-        // the tick (one pragma read — never per event): a second engine's
-        // Policy change is picked up within a tick.
-        registry.refresh_policy_cache();
+        // Story 21-3 (review round 2): the cross-process policy-cache check
+        // rides the tick (one tiny aggregate read — never per event). A
+        // degraded reload is SURFACED here, once per continuous degraded
+        // state (the open notes are drained only at open and would grow
+        // unbounded); a healthy tick re-arms the notice.
+        match registry.refresh_policy_cache() {
+            Some(note) => {
+                if !self.policies_degraded_noted {
+                    self.policies_degraded_noted = true;
+                    self.emit_diagnostic(&format!(
+                        "the Policies could not be reloaded: {note} — enforcement continues \
+                         under the last good set with the breach action held at pause"
+                    ));
+                }
+            }
+            None => {
+                if self.policies_degraded_noted && !registry.policy_cache_degraded() {
+                    self.policies_degraded_noted = false;
+                }
+            }
+        }
         let names: Vec<InstanceName> = self.running.keys().cloned().collect();
         for name in names {
             self.drain_self_reported_for(registry, &name, DrainMode::MidRun);
@@ -976,10 +993,12 @@ impl Supervisor {
         // Run's own `run_limits` never leak into the instance arms (each
         // level's own ceilings ride its own level) and the instance's
         // explicit ceilings still apply however usage is attributed. The
-        // attributed `run_id` stays the evaluation's target.
+        // attributed `run_id` stays the evaluation's target. Passing no
+        // Run lets `resolved_limits` read the open process-owning Run
+        // itself — and a FAILED read fail-closes INSIDE it (pause, arms
+        // kept, note carried), never a silent label-less resolve.
         let _ = run_id;
-        let owner = registry.open_process_run(name).ok().flatten();
-        let resolution = registry.resolved_limits(name, owner.as_ref());
+        let resolution = registry.resolved_limits(name, None);
         let supervised = self.running.get(name);
         pipeline::EvalInput {
             name: name.clone(),

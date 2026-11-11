@@ -937,6 +937,11 @@ pub struct Supervisor {
     agent_log_truncate_deferred: bool,
     /// The stderr channel's twin of [`Self::agent_log_truncate_deferred`].
     agent_stderr_truncate_deferred: bool,
+    /// Story 21-3 (review round 2): the degraded-policy-cache notice latch
+    /// — a tick-time reload failure announces ONCE and re-arms when the
+    /// cache reads healthy again (enforcement continues under the last
+    /// good set with the action held at pause in the meantime).
+    policies_degraded_noted: bool,
     /// Review finding 16: whether [`Supervisor::set_serve_options`] has run
     /// on this supervisor — the OPEN-TIME-ONLY latch. The engine's open path
     /// applies once, on a fresh supervisor, before any lifecycle; any second
@@ -1162,6 +1167,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
@@ -1215,6 +1221,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,
@@ -1268,6 +1275,7 @@ impl Supervisor {
             #[cfg(test)]
             agent_log_cap_override: None,
             agent_log_truncate_deferred: false,
+            policies_degraded_noted: false,
             agent_stderr_truncate_deferred: false,
             poll_error_streaks: HashMap::new(),
             stable_run_window: STABLE_RUN_WINDOW,

@@ -203,38 +203,80 @@ impl Supervisor {
 
     /// Delete a Policy (story 21-3): its matched Runs re-resolve under the
     /// remaining set. The `default` Policy is refused. `dry_run` reports the
-    /// Runs the delete would re-resolve and writes nothing.
+    /// Runs the delete would re-resolve and writes nothing. A CORRUPT row —
+    /// one whose stored Selector no longer parses, which fails every
+    /// decoded read — is still deletable by name (the remediation; the job
+    /// re-resolves every non-ended Run because the corrupt scope is
+    /// unknowable) with a note saying so.
     pub(crate) fn delete_policy(
         &mut self,
         registry: &Registry,
         name: &str,
         dry_run: bool,
     ) -> Result<crate::domain::PolicyOutcome, RunError> {
-        let existing = registry
-            .policy(name)
-            .map_err(RunError::Store)?
-            .ok_or_else(|| RunError::PolicyNotFound {
-                name: name.to_string(),
-            })?;
-        if dry_run {
-            if existing.is_default() {
-                return Err(RunError::PolicyDefault {
-                    what: "cannot be deleted — change it instead",
-                });
-            }
-            let plan = registry.plan_policy_change(
-                Some(&existing),
-                &crate::domain::PolicyChange {
-                    name: existing.name.clone(),
-                    ..Default::default()
-                },
-            )?;
-            return Ok(crate::domain::PolicyOutcome {
-                record: None,
-                ..plan
+        if name == crate::domain::DEFAULT_POLICY_NAME {
+            return Err(RunError::PolicyDefault {
+                what: "cannot be deleted — change it instead",
             });
         }
-        let applied = registry.apply_policy_delete(existing, self.policy_contexts(registry))?;
+        let read = match registry.policy(name) {
+            Ok(Some(existing)) => Some(existing),
+            Ok(None) => {
+                return Err(RunError::PolicyNotFound {
+                    name: name.to_string(),
+                })
+            }
+            // The row exists but cannot be DECODED: fall through to the
+            // by-name delete — the row must stay removable (a corrupt
+            // Selector once wedged every surface out of the store).
+            Err(crate::ports::StoreError::CorruptRow { .. }) => None,
+            Err(other) => return Err(RunError::Store(other)),
+        };
+        if read.is_none() {
+            // The corrupt path: confirm the row is really there.
+            match registry.policy_selector_raw(name) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(RunError::PolicyNotFound {
+                        name: name.to_string(),
+                    })
+                }
+                Err(other) => return Err(RunError::Store(other)),
+            }
+        }
+        if dry_run {
+            if let Some(existing) = &read {
+                let plan = registry.plan_policy_change(
+                    Some(existing),
+                    &crate::domain::PolicyChange {
+                        name: existing.name.clone(),
+                        ..Default::default()
+                    },
+                )?;
+                return Ok(crate::domain::PolicyOutcome {
+                    record: None,
+                    ..plan
+                });
+            }
+            return Ok(crate::domain::PolicyOutcome {
+                record: None,
+                notes: vec![format!(
+                    "the Policy `{name}` is stored in an unreadable shape; deleting it \
+                     re-resolves every non-ended Run (its scope cannot be read)"
+                )],
+                ..Default::default()
+            });
+        }
+        let raw_selector = match registry.policy_selector_raw(name) {
+            Ok(raw) => raw.flatten(),
+            Err(other) => return Err(RunError::Store(other)),
+        };
+        let applied = registry.apply_policy_delete(
+            name,
+            read,
+            raw_selector,
+            self.policy_contexts(registry),
+        )?;
         Ok(self.finish_policy_applied(registry, applied))
     }
 

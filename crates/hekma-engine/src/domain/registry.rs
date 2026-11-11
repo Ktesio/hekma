@@ -343,7 +343,9 @@ impl Registry {
         // and every open Run resolves once so the stored resolutions and
         // the snapshot start true. All fail soft (open notes), and the
         // events ride `open_events` to the bus.
-        registry.load_policy_cache();
+        if let Some(note) = registry.load_policy_cache() {
+            registry.push_open_note(note);
+        }
         registry.finish_breach_default_upgrade();
         registry.initial_policy_sweep();
         Ok(registry)
@@ -536,7 +538,9 @@ impl Registry {
             policies: std::sync::Arc::new(crate::domain::runs::policy::PolicyCache::default()),
             open_events: std::sync::Mutex::new(Vec::new()),
         };
-        registry.load_policy_cache();
+        if let Some(note) = registry.load_policy_cache() {
+            registry.push_open_note(note);
+        }
         Ok(registry)
     }
 

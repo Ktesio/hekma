@@ -684,16 +684,24 @@ impl SqliteStore {
         result
     }
 
-    /// The connection's `PRAGMA data_version` (the cross-process change
-    /// detector, story 21-3): the value changes when ANOTHER connection or
-    /// process commits to the database — our own commits do not move it —
-    /// so a caller that stamps it after a load can cheaply tell (one
-    /// pragma read, no table scan) whether anything changed underneath it
-    /// since.
-    pub(crate) fn data_version(&self) -> Result<u64, StoreError> {
+    /// The policy table's change fingerprint (the cross-process staleness
+    /// check, story 21-3): every row's name and update time, concatenated
+    /// in name order. ANY committed change to the table — this engine's
+    /// own (the writer is a different connection, so its commits move the
+    /// read-only connection's change counters too) or another engine's —
+    /// changes the string; an unchanged table leaves it byte-identical, so
+    /// one tiny aggregate read per tick decides whether a reload is
+    /// needed. (A `PRAGMA data_version` check would fire on EVERY commit
+    /// by this engine's own writer — usage rows included — and reload the
+    /// set from SQL on almost every tick.)
+    pub(crate) fn policies_fingerprint(&self) -> Result<String, StoreError> {
         self.conn()
-            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
-            .map(|version| version.max(0) as u64)
+            .query_row(
+                "SELECT coalesce(group_concat(name || ':' || updated_at, '|'), '') \
+                 FROM (SELECT name, updated_at FROM policies ORDER BY name)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(backend)
     }
 

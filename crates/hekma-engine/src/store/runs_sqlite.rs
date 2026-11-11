@@ -916,6 +916,24 @@ impl PolicyRecords for SqliteStore {
         })
     }
 
+    /// The RAW stored Selector text of one Policy, undecoded:
+    /// `Ok(None)` = no row with the name; `Ok(Some(None))` = a row with a
+    /// NULL Selector (the `default` shape); `Ok(Some(Some(raw)))` = the
+    /// text as stored, PARSED BY NO ONE. The corrupt-row remediation path
+    /// (deleting a Policy whose Selector no longer parses) needs exactly
+    /// this — every decoded read of such a row fails, so the delete must
+    /// be drivable by name plus whatever raw text is there.
+    fn policy_selector_raw(&self, name: &str) -> Result<Option<Option<String>>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT selector FROM policies WHERE name = ?1",
+                [name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(backend)
+    }
+
     fn put_policy(&self, record: &PolicyRecord) -> Result<(), StoreError> {
         let now = crate::time::now_rfc3339();
         let selector = record.selector.as_ref().map(Selector::to_string);

@@ -578,7 +578,7 @@ fn deleting_the_policy_re_resolves_its_runs_under_what_remains() {
     assert_eq!(dry.matched, 1);
     let applied = seeded
         .registry
-        .apply_policy_delete(existing, contexts())
+        .apply_policy_delete("cap", Some(existing), None, contexts())
         .unwrap();
     assert_eq!(applied.outcome.matched, 1);
     assert!(seeded.registry.policy("cap").unwrap().is_none());
@@ -1054,7 +1054,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
     let existing = seeded.registry.policy("cap").unwrap().unwrap();
     seeded
         .registry
-        .apply_policy_delete(existing, contexts)
+        .apply_policy_delete("cap", Some(existing), None, contexts)
         .unwrap();
     assert!(
         seeded
@@ -1215,8 +1215,9 @@ fn a_named_policy_without_a_selector_and_rates_on_a_named_policy_are_refused() {
 #[test]
 fn a_store_set_without_its_default_row_degrades_the_cache_at_load() {
     // A `default`-less store (the row deleted out from under the engine)
-    // degrades the cache AT LOAD with an open note — the resolution then
-    // fails closed until a healthy set loads again.
+    // degrades the cache AT LOAD, answering the degradation note the OPEN
+    // path surfaces — the resolution then fails closed (pause, arms kept)
+    // until a healthy set loads again.
     let seeded = seed(1_000);
     seeded
         .registry
@@ -1227,11 +1228,11 @@ fn a_store_set_without_its_default_row_degrades_the_cache_at_load() {
             Ok(())
         })
         .unwrap();
-    seeded.registry.load_policy_cache();
-    assert!(
-        !seeded.registry.take_open_notes().is_empty(),
-        "the defaultless load is an open note"
-    );
+    let note = seeded
+        .registry
+        .load_policy_cache()
+        .expect("the defaultless load degrades with a note");
+    assert!(note.contains("default"), "{note}");
     let name = InstanceName::new("money").unwrap();
     assert_eq!(
         seeded
@@ -1252,7 +1253,7 @@ fn a_store_set_without_its_default_row_degrades_the_cache_at_load() {
             Ok(())
         })
         .unwrap();
-    seeded.registry.load_policy_cache();
+    assert!(seeded.registry.load_policy_cache().is_none());
     assert_eq!(
         seeded
             .registry
@@ -1354,6 +1355,104 @@ fn a_degraded_or_defaultless_policy_cache_fails_closed_to_pause() {
     let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
     assert!(resolution.fail_closed.is_none());
     assert_eq!(resolution.effective_action, BreachAction::Warn);
+}
+
+#[test]
+fn a_corrupt_policy_row_is_deletable_and_the_delete_heals_the_cache() {
+    // The N1 remediation path end to end at the registry level: a row whose
+    // Selector no longer parses fails every decoded read (the whole
+    // `policies()` read included, degrading the cache), yet the row is
+    // deletable BY NAME — the delete job removes it before the policy-set
+    // read runs, re-resolves everything (the corrupt scope is unknowable)
+    // with a note, and the post-commit publish heals the cache.
+    let seeded = seed(1_000);
+    seeded
+        .registry
+        .writer
+        .call(|ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO policies (name, selector, created_at, updated_at) \
+                 VALUES ('broken', 'team=', 't', 't')",
+            );
+            Ok(())
+        })
+        .unwrap();
+    // Every decoded read of the row fails, and the load degrades.
+    assert!(seeded.registry.policy("broken").is_err());
+    let note = seeded
+        .registry
+        .load_policy_cache()
+        .expect("the corrupt row degrades the load");
+    assert!(note.contains("could not be read"), "{note}");
+    // The delete goes through WITHOUT a decoded record.
+    let applied = seeded
+        .registry
+        .apply_policy_delete("broken", None, Some("team=".to_string()), contexts())
+        .unwrap();
+    assert!(
+        applied
+            .outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("unreadable Selector")),
+        "{:?}",
+        applied.outcome.notes
+    );
+    assert!(seeded.registry.policy("broken").unwrap().is_none());
+    assert!(
+        seeded.registry.load_policy_cache().is_none(),
+        "the delete healed the cache"
+    );
+    let name = InstanceName::new("money").unwrap();
+    let resolution = seeded.registry.resolved_limits(&name, Some(&seeded.run));
+    assert!(resolution.fail_closed.is_none());
+}
+
+#[test]
+fn a_fail_closed_resolution_keeps_the_arms_it_can_still_resolve() {
+    // The N1 core: a degraded cache must never disarm the fleet. With an
+    // explicit instance ceiling and an explicit Rate set, a degraded cache
+    // resolves them STILL ARMED with the action forced to `pause` and the
+    // note naming the degradation — never the armless resolution that once
+    // turned every budget off.
+    let state = tempfile::TempDir::new().unwrap();
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("keep").unwrap();
+    registry.register_with_adapter("keep", &crate::adapter::AdapterRef::Manifest(fake_manifest("keep"))).unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget.tokens]\nper_run = 1000\n[budget.dollars]\nper_run = \"1\"\n[cost.rate]\ninput = \"1\"\noutput = \"2\"\n",
+    )
+    .unwrap();
+    // Degrade the cache directly (any read failure lands here).
+    registry
+        .policies
+        .degrade("the Policies could not be read (test)".to_string());
+    let resolution = registry.resolved_limits(&name, None);
+    assert_eq!(resolution.tokens.per_run, Some(1_000));
+    assert_eq!(resolution.dollars.per_run.map(|m| m.get()), Some(1_000_000));
+    assert_eq!(
+        resolution.rate,
+        Some(Rate::new(1_000_000, 2_000_000)),
+        "the explicit instance Rate survives the degradation"
+    );
+    assert_eq!(resolution.action, BreachAction::Pause);
+    assert_eq!(resolution.effective_action, BreachAction::Pause);
+    let note = resolution.fail_closed.expect("the fail-closed note");
+    assert!(note.contains("fail closed to pause"), "{note}");
+    assert!(note.contains("last good set"), "{note}");
+    let _ = &mut registry;
+}
+
+/// A minimal `fake_agent` manifest dir for the registry-level fixtures.
+fn fake_manifest(name: &str) -> std::path::PathBuf {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.into_path();
+    hekma_conformance::test_support::ManifestFixture::new(name, &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("interaction")
+        .guaranteed_on_all_oses("pause")
+        .write(&path);
+    path
 }
 
 #[test]
