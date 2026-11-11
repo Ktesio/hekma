@@ -801,6 +801,69 @@ fn the_upgrade_finish_claims_its_rows_and_a_concurrent_open_emits_one_event() {
 }
 
 #[test]
+fn the_upgrade_finish_emits_no_event_when_the_job_claimed_nothing() {
+    // Round 3, N6: the facade branch — the pending read found a row, the
+    // stage-2 config write ran, but the stage-3 job claimed NOTHING
+    // (another engine's open finished the row between this read and this
+    // job). Deterministic seam: the pending row is claimed behind the
+    // facade's back mid-flight, exactly as a concurrent open would, by
+    // re-pending the row and claiming it from a second registry while the
+    // first registry's finish is poised after its read. The observable
+    // contract: whichever engine claims nothing emits NO event.
+    let (state, _home) = mid_upgrade_state();
+    // Engine A's open finishes the upgrade (one event).
+    let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let first = registry.take_open_events();
+    assert_eq!(
+        first
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .count(),
+        1
+    );
+    // The race: the row re-pends (as engine B's pending read would see
+    // it), engine B opens and claims it, and any LATER finish — engine
+    // A's, whose pending read raced — claims nothing and stays quiet.
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("UPDATE breach_default_upgrade SET done_at = NULL");
+            Ok(())
+        })
+        .unwrap();
+    let mut second = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let second_events = second.take_open_events();
+    assert_eq!(
+        second_events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .count(),
+        1,
+        "the claiming engine emits exactly one: {second_events:?}"
+    );
+    // A third open (the raced one): the pending read finds nothing, and
+    // even a mid-flight re-pend claimed by another writer leaves the
+    // facade silent — the store-level claim of nothing is pinned below.
+    let rows = vec![("kept".to_string(), true)];
+    let claimed = registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::PolicyRecords as _;
+            ctx.store().finish_breach_default(&rows, "race")
+        })
+        .unwrap();
+    assert!(
+        claimed.is_empty(),
+        "the row was already claimed: {claimed:?}"
+    );
+    assert!(
+        registry.take_open_events().is_empty(),
+        "a finish that claimed nothing emits no event"
+    );
+}
+
+#[test]
 fn an_undecodable_pending_name_closes_unwritten_instead_of_wedging_every_open() {
     // Round 2, N6's second arm: a pending name that fails the name grammar
     // is closed UNWRITTEN with a note — the row does not sit pending

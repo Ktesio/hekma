@@ -798,6 +798,10 @@ pub fn generate() -> VectorsDocument {
             .chain(block_fence_cases())
             .chain(chain_cases())
             .chain(policy_cases())
+            // The policy-change decide-level pins (round 3, N12): appended
+            // AFTER every shipped case, so the 1.2.0 sequence keeps its
+            // original indices byte-for-byte.
+            .chain(policy_decision_cases())
             .collect(),
     }
 }
@@ -1240,47 +1244,6 @@ fn block_fence_cases() -> Vec<Case> {
                 key(BreachDimension::Dollars, BreachScope::PerRun),
             ],
         ),
-        // ---- policy-resolution: a ceiling LOWERED below usage breaches at
-        // once even while ANOTHER scope's latch holds — the latch is per
-        // (dimension, scope), so the lowered scope fires now (the
-        // policy-change breach-at-once rule's decide-level pin) ----
-        decision_case(
-            "decision-policy-lowered-per-run-fires-while-cumulative-latched",
-            &[CoverTag::PolicyResolution, CoverTag::LatchPerScope],
-            GovernanceInput {
-                token: Some(TokenArm {
-                    run_total: 2_000,
-                    cumulative_total: 9_000,
-                    budget: TokenBudget {
-                        per_run: Some(1_000),
-                        cumulative: Some(5_000),
-                    },
-                    action: BreachAction::Pause,
-                }),
-                dollar: None,
-                latched: vec![key(BreachDimension::Tokens, BreachScope::Cumulative)],
-            },
-        ),
-        // ---- policy-resolution: a ceiling RAISED above usage re-arms —
-        // the cleared latch means the NEXT crossing fires again (the
-        // policy-change re-arm rule's decide-level pin) ----
-        decision_case(
-            "decision-policy-raised-then-recrossed-refires",
-            &[CoverTag::PolicyResolution, CoverTag::LatchReArm],
-            GovernanceInput {
-                token: Some(TokenArm {
-                    run_total: 4_000,
-                    cumulative_total: 0,
-                    budget: TokenBudget {
-                        per_run: Some(5_000),
-                        cumulative: None,
-                    },
-                    action: BreachAction::Pause,
-                }),
-                dollar: None,
-                latched: vec![],
-            },
-        ),
     ]
 }
 
@@ -1711,6 +1674,56 @@ fn policy_cases() -> Vec<Case> {
                 },
                 policies: vec![crate::domain::runs::PolicyRecord::default_policy()],
                 ..Default::default()
+            },
+        ),
+    ]
+}
+
+/// The two decide-level pins for the policy-change rules (round 3's
+/// N12): emitted AFTER every shipped case so the 1.2.0 sequence is
+/// order-identical.
+fn policy_decision_cases() -> Vec<Case> {
+    let key = LatchKey::new;
+    vec![
+        // ---- policy-resolution: a ceiling LOWERED below usage breaches at
+        // once even while ANOTHER scope's latch holds — the latch is per
+        // (dimension, scope), so the lowered scope fires now (the
+        // policy-change breach-at-once rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-lowered-per-run-fires-while-cumulative-latched",
+            &[CoverTag::PolicyResolution, CoverTag::LatchPerScope],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 2_000,
+                    cumulative_total: 9_000,
+                    budget: TokenBudget {
+                        per_run: Some(1_000),
+                        cumulative: Some(5_000),
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![key(BreachDimension::Tokens, BreachScope::Cumulative)],
+            },
+        ),
+        // ---- policy-resolution: a ceiling RAISED above usage re-arms —
+        // the cleared latch means the NEXT crossing fires again (the
+        // policy-change re-arm rule's decide-level pin) ----
+        decision_case(
+            "decision-policy-raised-then-recrossed-refires",
+            &[CoverTag::PolicyResolution, CoverTag::LatchReArm],
+            GovernanceInput {
+                token: Some(TokenArm {
+                    run_total: 4_000,
+                    cumulative_total: 0,
+                    budget: TokenBudget {
+                        per_run: Some(5_000),
+                        cumulative: None,
+                    },
+                    action: BreachAction::Pause,
+                }),
+                dollar: None,
+                latched: vec![],
             },
         ),
     ]
@@ -2617,31 +2630,106 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_1_2_0_sequence_keeps_its_original_indices() {
+        // Round 3, N12: every case the 1.2.0 artifact shipped sits at its
+        // original index, in the original order — new cases only append.
+        // (The exact shipped sequence, as committed at the 1.2.0 tag.)
+        const SHIPPED: &[&str] = &[
+            "decision-threshold-ge-exact-at-ceiling",
+            "decision-threshold-ge-one-below-ceiling",
+            "decision-threshold-ge-zero-ceiling-breaches-on-zero",
+            "decision-threshold-ge-dollar-exact-at-cap",
+            "decision-threshold-ge-zero-dollar-cap-breaches-on-zero",
+            "decision-threshold-ge-token-both-scopes-trip-per-run-reported",
+            "decision-threshold-ge-dollar-both-scopes-trip-per-run-reported",
+            "decision-latch-per-scope-holds-across-re-evaluation",
+            "decision-latch-per-scope-token-and-dollar-same-scope-fire",
+            "decision-latch-scope-and-dimension-independence",
+            "decision-latch-per-scope-dollar-hold-suppresses-the-dollar-dimension",
+            "decision-latch-per-scope-doubled-key-normalizes-to-one",
+            "decision-latch-re-arm-empty-latch-refires",
+            "decision-token-before-dollar-both-armed-both-tripping",
+            "decision-unarmed-token-dimension-skipped-dollar-only",
+            "derivation-integer-micros-split-per-direction-rates",
+            "derivation-integer-micros-single-token-sub-cent",
+            "derivation-integer-micros-cached-resplit",
+            "derivation-integer-micros-unset-cached-rate-conservative",
+            "derivation-round-half-up-tie-rounds-up",
+            "derivation-round-half-up-output-tie-rounds-up",
+            "derivation-round-half-up-below-tie-rounds-down",
+            "derivation-round-half-up-per-direction-independence",
+            "derivation-saturation-max-tokens-max-rate",
+            "derivation-saturation-cached-derivation-saturates",
+            "derivation-no-retro-repricing-rows-sum-at-their-own-rates",
+            "decision-block-fires-at-exact-ceiling",
+            "decision-block-both-dimensions-token-first",
+            "decision-block-latch-holds",
+            "fence-no-reason-passes",
+            "fence-single-dollar-cumulative",
+            "fence-reports-tokens-before-dollars",
+            "fence-reports-per-run-before-cumulative",
+            "fence-duplicate-reason-is-one-reason",
+            "chain-child-and-parent-both-breach-deepest-first",
+            "chain-latch-is-per-level",
+            "chain-parent-ceiling-binds-the-subtree",
+            "chain-three-levels-token-before-dollar-per-level",
+            "chain-one-level-is-decide",
+        ];
+        let document = generate();
+        assert_eq!(
+            document.cases.len(),
+            SHIPPED.len() + 14,
+            "39 shipped + the 14 cases 21-3 appends"
+        );
+        for (index, id) in SHIPPED.iter().enumerate() {
+            let actual = match &document.cases[index] {
+                Case::Decision(case) => &case.id,
+                Case::Derivation(case) => &case.id,
+                Case::Fence(case) => &case.id,
+                Case::Chain(case) => &case.id,
+                Case::Policy(case) => &case.id,
+            };
+            assert_eq!(actual, id, "index {index}: the shipped order is frozen");
+        }
+    }
+
+    #[test]
     fn the_1_2_0_chain_cases_follow_every_earlier_case() {
         // Story 21-2: additive — the 1.1.0 cases keep their positions and
         // the `chain` cases follow them. Story 21-3 (1.3.0) appends the
-        // `policy` cases after the chain era, so each era is one block.
+        // `policy` cases after the chain era; round 3 (N12) additionally
+        // moved the two policy-tagged DECISION cases to the very end (the
+        // 1.2.0 sequence keeps its original indices byte-for-byte), so
+        // the closing block is every 1.3.0 case in either kind.
         let document = generate();
         let first_chain = document
             .cases
             .iter()
             .position(|case| matches!(case, Case::Chain(_)))
             .expect("the 1.2.0 cases exist");
-        let first_policy = document
+        let first_appended = document
             .cases
             .iter()
-            .position(|case| matches!(case, Case::Policy(_)))
+            .position(|case| match case {
+                Case::Policy(_) => true,
+                Case::Decision(case) => case.covers.contains(&CoverTag::PolicyResolution),
+                _ => false,
+            })
             .expect("the 1.3.0 cases exist");
         assert!(document.cases[..first_chain]
             .iter()
             .all(|case| !matches!(case, Case::Chain(_) | Case::Policy(_))));
-        assert!(document.cases[first_chain..first_policy]
+        assert!(document.cases[first_chain..first_appended]
             .iter()
             .all(|case| matches!(case, Case::Chain(_))));
         assert!(
-            document.cases[first_policy..]
+            document.cases[first_appended..]
                 .iter()
-                .all(|case| matches!(case, Case::Policy(_))),
+                .all(|case| match case {
+                    Case::Policy(_) => true,
+                    Case::Decision(case) => case.covers.contains(&CoverTag::PolicyResolution),
+                    _ => false,
+                }),
             "the 1.3.0 cases close the artifact"
         );
     }

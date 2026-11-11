@@ -10,7 +10,10 @@
 //! Same posture as `tests/budget.rs`: the REAL `fake_agent` emits known
 //! usage (10 in / 20 out = 30 tokens per event) through the public
 //! [`Engine`]; every assertion is on committed state (the breach rows, the
-//! lifecycle state, the ledger's priced totals), never on timing.
+//! lifecycle state, the ledger's priced totals), never on timing. A Drop
+//! guard stops the agent even when an assertion fails first, so no live
+//! child outlives the test (a leaked process holds the temp dir and its
+//! handles on Windows — the hang class these suites guard against).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -33,6 +36,22 @@ fn write_fake_manifest(dir: &Path, kind: &str, args: &[&str]) {
 
 fn open(base: &TempDir) -> Engine {
     Engine::open(Some(base.path().to_path_buf())).expect("open engine")
+}
+
+/// Stops the agent on drop, however the test ends (an assertion panic
+/// unwinds through this): no live `fake_agent` child outlives the test.
+struct AgentGuard {
+    engine: Engine,
+    name: &'static str,
+}
+
+impl Drop for AgentGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .engine
+            .blocking()
+            .stop(self.name, Some(Duration::from_secs(5)));
+    }
 }
 
 /// Poll the committed lifecycle state for `name` until it equals `want`.
@@ -65,8 +84,8 @@ fn wait_for_state(state_dir: &Path, name: &str, want: LifecycleState, within: Du
 /// `cap` Policy over that label ALREADY in place — usage must flow UNDER
 /// the Policy (the ledger prices each row at its commit-time Rate; a Policy
 /// created after the events would face an unpriced ledger, honestly
-/// unbreachable).
-fn fleet_under(name: &str, events: u32, limits: PolicyLimits) -> (TempDir, Engine) {
+/// unbreachable). The returned guard stops the agent on drop.
+fn fleet_under(name: &'static str, events: u32, limits: PolicyLimits) -> (TempDir, AgentGuard) {
     let state = TempDir::new().unwrap();
     let manifest = TempDir::new().unwrap();
     write_fake_manifest(
@@ -93,7 +112,7 @@ fn fleet_under(name: &str, events: u32, limits: PolicyLimits) -> (TempDir, Engin
         )
         .expect("the Policy change applies");
     facade.start(name).unwrap();
-    (state, engine)
+    (state, AgentGuard { engine, name })
 }
 
 fn one_breach(engine: &Engine, name: &str) -> hekma_engine::BudgetBreachEvent {
@@ -128,21 +147,21 @@ fn usage_under_a_named_policy_enforces_the_token_scopes_and_pauses() {
             100,
         ),
     ] {
-        let (state, engine) = fleet_under("polcap", 5, limits.clone());
+        let (state, agent) = fleet_under("polcap", 5, limits.clone());
         wait_for_state(
             state.path(),
             "polcap",
             LifecycleState::Paused,
             Duration::from_secs(30),
         );
-        let breach = one_breach(&engine, "polcap");
+        let breach = one_breach(&agent.engine, "polcap");
         assert_eq!(breach.dimension, BreachDimension::Tokens);
         assert_eq!(breach.scope, scope);
         assert_eq!(breach.limit, ceiling);
         assert_eq!(breach.action.as_str(), "pause");
         assert!(breach.observed >= ceiling);
         // The Fleet view names the Policy's limit AND its source.
-        let fleet = engine.blocking().fleet().unwrap();
+        let fleet = agent.engine.blocking().fleet().unwrap();
         let entry = fleet.iter().find(|e| e.name.as_str() == "polcap").unwrap();
         let budget = entry.budget.as_ref().expect("the Policy budgets the Run");
         assert_eq!(
@@ -155,9 +174,7 @@ fn usage_under_a_named_policy_enforces_the_token_scopes_and_pauses() {
             BreachScope::Cumulative => assert_eq!(budget.cumulative_limit, Some(ceiling)),
         }
         assert_eq!(budget.breach_action.as_str(), "pause");
-        let _ = engine
-            .blocking()
-            .stop("polcap", Some(Duration::from_secs(5)));
+        // The guard's drop stops the agent.
     }
 }
 
@@ -188,21 +205,21 @@ fn usage_under_a_named_policy_enforces_the_dollar_scopes_with_its_flat_rate() {
             BreachScope::Cumulative,
         ),
     ] {
-        let (state, engine) = fleet_under("poldlr", 5, limits.clone());
+        let (state, agent) = fleet_under("poldlr", 5, limits.clone());
         wait_for_state(
             state.path(),
             "poldlr",
             LifecycleState::Paused,
             Duration::from_secs(30),
         );
-        let breach = one_breach(&engine, "poldlr");
+        let breach = one_breach(&agent.engine, "poldlr");
         assert_eq!(breach.dimension, BreachDimension::Dollars);
         assert_eq!(breach.scope, scope);
         assert_eq!(breach.limit, 100);
         assert_eq!(breach.action.as_str(), "pause");
         // The Policy's flat Rate priced the ledger (no instance Rate): the
         // derived cost equals the committed tokens × $1/$1 per 1M exactly.
-        let fleet = engine.blocking().fleet().unwrap();
+        let fleet = agent.engine.blocking().fleet().unwrap();
         let entry = fleet.iter().find(|e| e.name.as_str() == "poldlr").unwrap();
         let tokens = entry.usage.cumulative_total_tokens();
         assert!(
@@ -218,8 +235,6 @@ fn usage_under_a_named_policy_enforces_the_dollar_scopes_with_its_flat_rate() {
             hekma_engine::Micros(tokens as i64),
             "{tokens} tokens at $1/$1 per 1M = {tokens} micro-dollars"
         );
-        let _ = engine
-            .blocking()
-            .stop("poldlr", Some(Duration::from_secs(5)));
+        // The guard's drop stops the agent.
     }
 }
