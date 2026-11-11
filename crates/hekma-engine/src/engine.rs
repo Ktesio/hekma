@@ -2834,7 +2834,6 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.list_runs(query))
     }
 
-
     /// Blocking twin of [`Engine::policies`].
     pub fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
         self.engine.rt.block_on(self.engine.policies())

@@ -669,12 +669,9 @@ impl Registry {
         let instance = instance.to_string();
         let rows = rows.to_vec();
         self.writer
-            .call_weighted(
-                rows.len().max(1),
-                move |ctx| {
-                    crate::domain::runs::listing::seed_perf_rows(ctx.store(), &instance, &rows)
-                },
-            )
+            .call_weighted(rows.len().max(1), move |ctx| {
+                crate::domain::runs::listing::seed_perf_rows(ctx.store(), &instance, &rows)
+            })
             .map_err(crate::domain::RunError::Store)
     }
 

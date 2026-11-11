@@ -1839,12 +1839,6 @@ fn serve_shape_json(
 // absolute gates (a gate-platform run must pass both). Pure math + parsing
 // here, pinned by the #[cfg(test)] battery like the gate math above.
 // ---------------------------------------------------------------------------
-
-/// The harness's command-line surface: `--baseline <file>` and
-/// `--write-baseline <file>` (each also accepted as `--flag=<file>`), plus
-/// `--help`/`-h`, parsed in the example's plain std style — no dependencies,
-/// no clap. Invalid usage is a LOUD stderr error + exit 2 in `main`, never a
-/// silent ignore; diagnostics go to stderr (CLI-first).
 // ---------------------------------------------------------------------------
 // Story 21-5: the Run-scale listing scenario (--ps-seed <N>)
 // ---------------------------------------------------------------------------
@@ -1927,7 +1921,7 @@ fn ps_seed_rows(start: u64, count: usize, now_unix: u64) -> Vec<hekma_engine::Pe
             } else {
                 ("active", "", None)
             };
-            let resolution = (index % 10 == 0).then(|| PolicyResolution {
+            let resolution = index.is_multiple_of(10).then(|| PolicyResolution {
                 tokens: TokenBudget {
                     per_run: Some(200),
                     cumulative: None,
@@ -1958,15 +1952,29 @@ fn ps_seed_rows(start: u64, count: usize, now_unix: u64) -> Vec<hekma_engine::Pe
                 labels: vec![
                     (
                         "team".to_string(),
-                        if index % 2 == 0 { "core" } else { "edge" }.to_string(),
+                        if index.is_multiple_of(2) {
+                            "core"
+                        } else {
+                            "edge"
+                        }
+                        .to_string(),
                     ),
                     (
                         "env".to_string(),
-                        if index % 3 == 0 { "prod" } else { "dev" }.to_string(),
+                        if index.is_multiple_of(3) {
+                            "prod"
+                        } else {
+                            "dev"
+                        }
+                        .to_string(),
                     ),
                 ],
                 resolution,
-                subtree_tokens: (index % 10 == 0).then_some(300 + index % 1_000).unwrap_or(0),
+                subtree_tokens: if index.is_multiple_of(10) {
+                    300 + index % 1_000
+                } else {
+                    0
+                },
             }
         })
         .collect()
@@ -2014,7 +2022,9 @@ fn run_ps_scenario(
         let opened = Instant::now();
         let reader = Engine::open_read_only(Some(state_base.to_path_buf()))
             .map_err(|err| format!("the read-only open failed: {err}"))?;
-        outcome.open_ms.push(opened.elapsed().as_secs_f64() * 1000.0);
+        outcome
+            .open_ms
+            .push(opened.elapsed().as_secs_f64() * 1000.0);
         let page = Instant::now();
         let listing = reader
             .blocking()
@@ -2110,6 +2120,11 @@ fn ps_listing_json(outcome: &PsListingOutcome, gates: &GateReport) -> serde_json
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `--help`/`-h`, parsed in the example's plain std style — no dependencies,
+/// no clap. Invalid usage is a LOUD stderr error + exit 2 in `main`, never a
+/// silent ignore; diagnostics go to stderr (CLI-first).
+/// The harness's command-line surface: `--baseline <file>` and
+/// `--write-baseline <file>` (each also accepted as `--flag=<file>`), plus
 struct CliArgs {
     baseline: Option<String>,
     write_baseline: Option<String>,
@@ -3304,16 +3319,9 @@ fn main() {
     // exactly like the serve slot above. ----
     let mut ps_scenario_error: Option<String> = None;
     let ps = if let Some(seed) = cli.ps_seed {
-        let iterations = env_u64("PERF_BUDGETS_PS_ITERATIONS", PS_DEFAULT_ITERATIONS as u64)
-            as usize;
-        match run_ps_scenario(
-            &engine,
-            &names,
-            state.path(),
-            seed,
-            iterations,
-            config.ci,
-        ) {
+        let iterations =
+            env_u64("PERF_BUDGETS_PS_ITERATIONS", PS_DEFAULT_ITERATIONS as u64) as usize;
+        match run_ps_scenario(&engine, &names, state.path(), seed, iterations, config.ci) {
             Ok(outcome) => Some(outcome),
             Err(reason) => {
                 ps_scenario_error = Some(reason);
@@ -3606,7 +3614,12 @@ fn main() {
     // perf-budgets job (and any local gate runner) fails on the regression —
     // an absolute-budget failure, a ratchet failure, OR a serve-gate failure
     // (story 17-1). The fold itself is the pinned `run_exit_code`.
-    std::process::exit(run_exit_code(gates_passed, ratchet_failed, serve_failed, ps_failed));
+    std::process::exit(run_exit_code(
+        gates_passed,
+        ratchet_failed,
+        serve_failed,
+        ps_failed,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -5713,9 +5726,11 @@ mod tests {
         let gates_red =
             baseline_write_refusal(false, false, false, false).expect("a red absolute run refuses");
         assert!(gates_red.contains("absolute budgets FAILED"), "{gates_red}");
-        let serve_red = baseline_write_refusal(true, true, false, false).expect("a red serve run refuses");
+        let serve_red =
+            baseline_write_refusal(true, true, false, false).expect("a red serve run refuses");
         assert!(serve_red.contains("SERVE budgets FAILED"), "{serve_red}");
-        let ratchet_red = baseline_write_refusal(true, false, false, true).expect("a red ratchet refuses");
+        let ratchet_red =
+            baseline_write_refusal(true, false, false, true).expect("a red ratchet refuses");
         assert!(ratchet_red.contains("ratchet FAILED"), "{ratchet_red}");
         assert!(ratchet_red.contains("docs/testing.md"), "{ratchet_red}");
         // Both absolute families red at once names the default-budget
@@ -5737,7 +5752,9 @@ mod tests {
             seed: 10,
             iterations: 12,
             open_ms: vec![1.0; 12],
-            page_ms: vec![5.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            page_ms: vec![
+                5.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
             listed: 0,
             healthy_open: 0,
         };
@@ -5841,9 +5858,17 @@ mod tests {
         // is deleted: only a fully green run exits 0; ANY one of the three
         // red sources (absolute gates, ratchet, serve gates) reds the run.
         assert_eq!(run_exit_code(true, false, false, false), 0);
-        assert_eq!(run_exit_code(false, false, false, false), 1, "absolute gates red");
+        assert_eq!(
+            run_exit_code(false, false, false, false),
+            1,
+            "absolute gates red"
+        );
         assert_eq!(run_exit_code(true, true, false, false), 1, "ratchet red");
-        assert_eq!(run_exit_code(true, false, true, false), 1, "serve gates red");
+        assert_eq!(
+            run_exit_code(true, false, true, false),
+            1,
+            "serve gates red"
+        );
         assert_eq!(run_exit_code(true, false, false, true), 1, "ps gate red");
         assert_eq!(run_exit_code(false, true, true, true), 1, "all red");
     }

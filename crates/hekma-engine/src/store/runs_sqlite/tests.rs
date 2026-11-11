@@ -1123,7 +1123,6 @@ fn the_view_sql_matches_the_specification_predicates_row_by_row() {
     use crate::domain::runs::listing::{in_all_view, is_exception, is_healthy_open};
 
     let (_tmp, store) = store();
-    let mut index = 0;
     let mut expected_exceptions = Vec::new();
     let mut expected_all = Vec::new();
     let mut expected_healthy = 0u64;
@@ -1160,9 +1159,8 @@ fn the_view_sql_matches_the_specification_predicates_row_by_row() {
         ),
         ("ended-null-at", RunStatus::Ended, &[Anomaly::Failed], None),
     ];
-    for (label, status, anomalies, ended_at) in shapes {
+    for (index, (label, status, anomalies, ended_at)) in shapes.iter().enumerate() {
         let id = format!("run_P{index:03}{label}");
-        index += 1;
         insert(
             &store,
             shaped_owner(&id, "a", false, *status, anomalies, *ended_at),

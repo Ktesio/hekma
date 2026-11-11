@@ -69,8 +69,9 @@ pub(crate) struct EventsStreamQuery {
 
 /// One SSE frame decision the stream loop emits.
 enum Frame {
-    /// An event with its outbox seq (the `id:`).
-    Sequenced(u64, hekma_engine::EngineEvent),
+    /// An event with its outbox seq (the `id:`). Boxed: `EngineEvent` is
+    /// the large variant, and the stream yields one frame at a time.
+    Sequenced(u64, Box<hekma_engine::EngineEvent>),
     /// The lagged gap marker (no id).
     Lagged(u64),
     /// A Selector-filter read failed; the named event was dropped.
@@ -192,14 +193,21 @@ fn event_stream(
                 if let Some(entries) = replay.as_mut() {
                     if let Some(entry) = entries.next() {
                         match &selector {
-                            Some(selector) => match passes_selector(&state, selector, &entry.event)
-                                .await
-                            {
-                                Ok(true) => break Frame::Sequenced(entry.seq, entry.event.clone()),
-                                Ok(false) => continue,
-                                Err(detail) => break Frame::FilterError(detail),
-                            },
-                            None => break Frame::Sequenced(entry.seq, entry.event.clone()),
+                            Some(selector) => {
+                                match passes_selector(&state, selector, &entry.event).await {
+                                    Ok(true) => {
+                                        break Frame::Sequenced(
+                                            entry.seq,
+                                            Box::new(entry.event.clone()),
+                                        )
+                                    }
+                                    Ok(false) => continue,
+                                    Err(detail) => break Frame::FilterError(detail),
+                                }
+                            }
+                            None => {
+                                break Frame::Sequenced(entry.seq, Box::new(entry.event.clone()))
+                            }
                         }
                     }
                 }
@@ -221,11 +229,11 @@ fn event_stream(
                                 Some(selector) => match passes_selector(&state, selector, &event)
                                     .await
                                 {
-                                    Ok(true) => break Frame::Sequenced(seq, event),
+                                    Ok(true) => break Frame::Sequenced(seq, Box::new(event)),
                                     Ok(false) => continue,
                                     Err(detail) => break Frame::FilterError(detail),
                                 },
-                                None => break Frame::Sequenced(seq, event),
+                                None => break Frame::Sequenced(seq, Box::new(event)),
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {

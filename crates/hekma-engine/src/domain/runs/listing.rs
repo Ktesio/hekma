@@ -550,7 +550,7 @@ pub(crate) fn assemble<S: crate::ports::RunRecords + crate::ports::RunStore + ?S
                 })?;
                 let subtree = usage_of(store.run_rollup(&iname, &run_id)?);
                 let cumulative = process_owner
-                    .then(|| store.instance_rollup(&iname).map(&usage_of))
+                    .then(|| store.instance_rollup(&iname).map(usage_of))
                     .transpose()?;
                 (subtree, cumulative)
             }
@@ -617,12 +617,12 @@ pub(crate) fn seed_perf_rows(
                 run_id: crate::domain::usage::RunId::from_wire(row.run_id.clone()),
                 control_depth: crate::domain::ControlDepth::Announced,
                 wire_path: false,
-                status: crate::domain::RunStatus::from_wire(&row.status).ok_or_else(
-                    || crate::ports::StoreError::CorruptRow {
+                status: crate::domain::RunStatus::from_wire(&row.status).ok_or_else(|| {
+                    crate::ports::StoreError::CorruptRow {
                         name: row.run_id.clone(),
                         detail: format!("unknown bench status {}", row.status),
-                    },
-                )?,
+                    }
+                })?,
                 anomalies: crate::domain::Anomaly::decode(&row.anomalies),
                 parent_run_id: None,
                 instance: Some(instance.to_string()),

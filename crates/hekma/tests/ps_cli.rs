@@ -377,7 +377,7 @@ fn ps_pages_with_the_printed_cursor_disjointly() {
         .stderr
         .split("--cursor ")
         .nth(1)
-        .and_then(|rest| rest.trim().split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().next())
         .expect("the footer prints the next-page cursor")
         .to_string();
     let page_two = run_hekma_agent(
@@ -405,7 +405,7 @@ fn ps_pages_with_the_printed_cursor_disjointly() {
         .stderr
         .split("--cursor ")
         .nth(1)
-        .and_then(|rest| rest.trim().split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().next())
         .expect("page two's cursor")
         .to_string();
     let page_three = run_hekma_agent(

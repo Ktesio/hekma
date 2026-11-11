@@ -229,9 +229,11 @@ fn usage_cell(item: &hekma_engine::RunSummary) -> String {
         .usage
         .input_tokens
         .saturating_add(item.usage.output_tokens);
-    let dollars = (item.usage.cost_micros.0 > 0)
-        .then(|| format!(" · {}", render_dollars_bare(item.usage.cost_micros)))
-        .unwrap_or_default();
+    let dollars = if item.usage.cost_micros.0 > 0 {
+        format!(" · {}", render_dollars_bare(item.usage.cost_micros))
+    } else {
+        String::new()
+    };
     format!("{tokens} tok{dollars}")
 }
 
@@ -251,10 +253,7 @@ fn headroom_cell(item: &hekma_engine::RunSummary) -> String {
         parts.push(format!("{remaining} tok"));
     }
     if let Some(remaining) = budget.view.per_run_dollars_remaining {
-        parts.push(format!(
-            "{}",
-            render_dollars_bare(Micros(remaining.0.max(0)))
-        ));
+        parts.push(render_dollars_bare(Micros(remaining.0.max(0))).to_string());
     }
     if parts.is_empty() {
         // A resolved action with no ceiling: show the action honestly

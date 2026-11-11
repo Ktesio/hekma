@@ -4142,19 +4142,16 @@ fn the_sse_stream_carries_outbox_ids_and_resumes_from_last_event_id() {
 
     let mut reader = BufReader::new(response.body_mut().as_reader());
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut policy_id = 0u64;
-    loop {
+    let policy_id = loop {
         assert!(
             std::time::Instant::now() < deadline,
             "no policy frame in time"
         );
         let (id, event) = read_sse_frame(&mut reader);
         if event["kind"] == "policy" {
-            policy_id = id;
-            break;
+            break id;
         }
-    }
-    assert!(policy_id > 0, "the policy frame carried its id");
+    };
     // The id IS the outbox seq of that event: the export agrees.
     let mut response = get_ok(
         &client,
@@ -4182,16 +4179,13 @@ fn the_sse_stream_carries_outbox_ids_and_resumes_from_last_event_id() {
     assert_eq!(response.status(), StatusCode::OK);
     let mut reader = BufReader::new(response.body_mut().as_reader());
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no replayed frame in time"
-        );
-        let (id, event) = read_sse_frame(&mut reader);
-        assert_eq!(id, policy_id, "the replay starts past the id, at `later`");
-        assert_eq!(event["kind"], "policy");
-        break;
-    }
+    assert!(
+        std::time::Instant::now() < deadline,
+        "no replayed frame in time"
+    );
+    let (id, event) = read_sse_frame(&mut reader);
+    assert_eq!(id, policy_id, "the replay starts past the id, at `later`");
+    assert_eq!(event["kind"], "policy");
 
     // The typed 409s at connect — never a clamp.
     for (id, code) in [
@@ -4308,8 +4302,8 @@ fn read_sse_frame<R: std::io::BufRead>(reader: &mut R) -> (u64, serde_json::Valu
             Err(err) => panic!("the SSE read failed: {err}"),
         }
         let line = line.trim_end().to_string();
-        if line.starts_with("id: ") {
-            id = Some(line["id: ".len()..].parse().expect("the id is numeric"));
+        if let Some(raw) = line.strip_prefix("id: ") {
+            id = Some(raw.parse().expect("the id is numeric"));
         } else if let Some(payload) = line.strip_prefix("data: ") {
             let event: serde_json::Value = serde_json::from_str(payload.trim())
                 .expect("every data frame is the engine's JSON");
