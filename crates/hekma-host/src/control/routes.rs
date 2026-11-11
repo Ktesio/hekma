@@ -640,6 +640,71 @@ pub(crate) async fn export_ack(
     }))
 }
 
+/// The `?selector=&view=&limit=&cursor=` query of the Run listing (story
+/// 21-5). RAW strings parsed in [`runs_list`] (the export `limit`
+/// discipline): every malformed value stays inside the versioned envelope.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct RunsListQuery {
+    /// `key=value[,key=value…]` — bound and caller labels alike.
+    pub selector: Option<String>,
+    /// `exceptions` (the default) or `all`.
+    pub view: Option<String>,
+    /// The page size (raw — parsed in [`runs_list`]; `0` = the maximum).
+    pub limit: Option<String>,
+    /// The cursor the previous page printed.
+    pub cursor: Option<String>,
+}
+
+/// `GET /v0/runs?selector=&view=&limit=&cursor=` — the Run listing (story
+/// 21-5, PRD FR-50): the engine's own document, byte-shape-equal to
+/// `hekma ps --json`. Operator bearer (the auth layer); a malformed
+/// Selector, limit or view is a `400` with its own machine code, a cursor
+/// that is not the codec's form a `400 invalid-cursor` (the engine's typed
+/// refusal), everything else the engine's mapped error.
+pub(crate) async fn runs_list(
+    State(state): State<ApiState>,
+    Query(query): Query<RunsListQuery>,
+) -> ApiResult<Json<hekma_engine::RunListingDocument>> {
+    let view = match &query.view {
+        None => hekma_engine::ListingView::Exceptions,
+        Some(raw) => hekma_engine::ListingView::from_wire(raw).ok_or_else(|| {
+            ApiError::invalid_query_param(
+                "invalid-view",
+                format!("the view query parameter must be \"exceptions\" or \"all\": {raw}"),
+            )
+        })?,
+    };
+    let selector = match &query.selector {
+        None => None,
+        Some(raw) => Some(raw.parse::<hekma_engine::Selector>().map_err(|err| {
+            ApiError::invalid_query_param("invalid-selector", format!("selector: {err}"))
+        })?),
+    };
+    // The limit parses INSIDE the handler so every failure is a versioned
+    // envelope (never axum's plain-text extractor rejection). `0` takes the
+    // maximum; anything above the house page cap clamps to it (the CLI's
+    // `--limit` parity — its clamp notes on stderr, this clamps quietly).
+    let limit = match &query.limit {
+        None => 0usize,
+        Some(text) => text.parse::<usize>().map_err(|err| {
+            ApiError::invalid_query_param(
+                "invalid-limit",
+                format!("the limit query parameter must be a whole number ≥ 0: {err}"),
+            )
+        })?,
+    };
+    let listing = state
+        .engine
+        .list_runs(hekma_engine::ListRunsQuery {
+            view,
+            selector: selector.clone(),
+            after: query.cursor.clone(),
+            limit,
+        })
+        .await?;
+    Ok(Json(listing.into_document(view, selector)))
+}
+
 /// `POST /v0/runs` — open a child Run (story 21-2). `201` + `Location`
 /// with the new Run; a retried request carrying the same `external_id`
 /// answers `201` with the SAME Run (the open is idempotent by external id).

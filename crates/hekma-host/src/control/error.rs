@@ -151,6 +151,25 @@ impl ApiError {
         Self::new(ApiErrorKind::InvalidBody, message)
     }
 
+    /// A query-parameter rejection with its own machine `code` (story
+    /// 21-5: `invalid-selector`, `invalid-cursor`, `invalid-limit` on
+    /// `GET /v0/runs` and `/v0/events`) — the same 400 shape, a finer
+    /// code.
+    pub(crate) fn invalid_query_param(code: &'static str, message: impl Into<String>) -> Self {
+        let mut error = Self::new(ApiErrorKind::InvalidBody, message);
+        error.code = Some(code);
+        error
+    }
+
+    /// A conflict carrying its own machine `code` (story 21-5: the SSE
+    /// resume's typed `409 cursor-below-retention` / `cursor-past-tail` at
+    /// connect — never a clamp).
+    pub(crate) fn conflict_with_code(code: &'static str, message: impl Into<String>) -> Self {
+        let mut error = Self::new(ApiErrorKind::CursorInvalid, message);
+        error.code = Some(code);
+        error
+    }
+
     /// The auth layer's 401 (static message — it must never echo the
     /// presented token).
     pub(crate) fn unauthorized() -> Self {
@@ -329,6 +348,10 @@ impl From<RunError> for ApiError {
             // Story 21-3: a Scent-Check Mode before Scent-Check ships.
             | RunError::ScentUnavailable { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
+            // Story 21-5: a listing cursor that is not the codec's form is
+            // the caller's value being invalid → 400 `invalid-cursor`
+            // (the code rides from `RunError::code`).
+            RunError::InvalidCursor { .. } => ApiErrorKind::InvalidBody,
             RunError::Store(_) => ApiErrorKind::Internal,
         };
         let mut error = Self::new(kind, message);

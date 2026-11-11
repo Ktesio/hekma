@@ -243,8 +243,10 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // auth layer — no anonymous route.
         ("GET", format!("http://{addr}/v0/export")),
         ("POST", format!("http://{addr}/v0/export/ack")),
-        // Story 21-2: the Run routes.
+        // Story 21-2: the Run routes. Story 21-5 adds the listing (`GET
+        // /v0/runs`) beside the open.
         ("POST", format!("http://{addr}/v0/runs")),
+        ("GET", format!("http://{addr}/v0/runs")),
         ("GET", format!("http://{addr}/v0/runs/run_ghost")),
         ("POST", format!("http://{addr}/v0/runs/run_ghost/close")),
         // Story 21-9: the bound-label routes.
@@ -371,7 +373,13 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
             // The outbox pull (story 17-4) with a valid bearer answers 200 —
             // an empty/never-written journal is a valid EMPTY batch, not a
             // missing resource.
-            || url.ends_with("/v0/export");
+            // The Run listing (story 21-5) likewise: an empty state
+            // directory is a valid EMPTY listing.
+            || url.ends_with("/v0/export")
+        // The Run listing (story 21-5) is identity-shaped only on its GET —
+        // an empty state directory is a valid EMPTY listing. The POST
+        // (open) keeps its exactly-one-parent 400 below.
+        || (method == "GET" && url.ends_with("/v0/runs"));
         let register = method == "POST" && url.ends_with("/v0/instances");
         // The ack POST reached its handler but this loop's register-shaped
         // body carries no `seq` — the Json extractor's 422 is the
@@ -3898,4 +3906,419 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
     let response = get_ok(&client, &server.addr, "/v0/policies/nightly");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     server.stop().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The Run listing + the SSE ids / Selector / resume (story 21-5).
+// ---------------------------------------------------------------------------
+
+/// Seed `base` with the listing fixture BEFORE the serve opens (the same
+/// shape `ps_cli` seeds): one engine open migrates the store and creates
+/// the `tight` Policy (a Policy event lands in the outbox), SQL seeds the
+/// Run rows and labels, and a second open's initial sweep resolves the open
+/// Runs. `journal_seed` (optional) stages a pre-existing outbox floor: a
+/// legacy journal file whose single entry carries `seq`, imported by the
+/// v12 step of the FIRST open — so a below-floor resume is reachable.
+fn seed_listing_state(base: &Path, journal_seed: Option<u64>) {
+    if let Some(seq) = journal_seed {
+        std::fs::write(
+            base.join(hekma_engine::paths::OUTBOX_JOURNAL_FILE),
+            outbox_entry_line(seq),
+        )
+        .unwrap();
+    }
+    {
+        let engine = hekma_engine::Engine::open(Some(base.to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade
+            .create_policy(
+                hekma_engine::PolicyChange {
+                    name: "tight".to_string(),
+                    selector: Some("team=core".parse().unwrap()),
+                    set: hekma_engine::PolicyLimits {
+                        tokens_per_run: Some(1_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                    rates: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('demo', 'mock', 'running', '/h', 't', 't'); \
+             INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('calm', 'mock', 'running', '/h', 't', 't');",
+        )
+        .unwrap();
+        let demo: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let calm: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'calm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_J', 'supervised', 0, 'active', 'breach', {demo}, 1, 't', 't'); \
+             INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             parent_run_id, instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_H', 'supervised', 0, 'held', '', 'run_J', {demo}, 0, 't', 't'); \
+             INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at) \
+             VALUES ('run_K', 'supervised', 0, 'active', '', {calm}, 1, 't', 't'); \
+             INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+             ('run_J', 'team', 'core', 'bound', 'config'); \
+             INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+             ('run_H', 'flow', 'triage', 'caller', NULL); \
+             INSERT INTO run_latches (run_id, dimension, scope, action, latched_at) VALUES \
+             ('run_J', 'tokens', 'per-run', 'block', 't');"
+        ))
+        .unwrap();
+    }
+    {
+        let engine = hekma_engine::Engine::open(Some(base.to_path_buf())).unwrap();
+        let _ = engine.blocking().policies();
+    }
+}
+
+#[test]
+fn the_runs_route_serves_the_listing_and_refuses_bad_params() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+
+    let mut response = get_ok(&client, &server.addr, "/v0/runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["view"], "exceptions");
+    assert_eq!(json["counts"]["listed"], 2, "{json}");
+    assert_eq!(json["counts"]["healthy_open"], 1);
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items[0]["run_id"], "run_J");
+    assert_eq!(items[1]["run_id"], "run_H");
+    assert_eq!(items[0]["status"], "active");
+    assert_eq!(
+        items[0]["latched"],
+        serde_json::json!([{"dimension": "tokens", "scope": "per-run", "action": "block"}])
+    );
+    assert_eq!(items[0]["budget"]["per_run_remaining"], 1000);
+    assert_eq!(
+        items[0]["budget"]["sources"]["tokens_per_run"],
+        serde_json::json!({"policy": "tight"})
+    );
+
+    // Byte-shape parity with the engine's own document — the same struct
+    // `hekma ps --json` prints.
+    let engine = hekma_engine::Engine::open_read_only(Some(base.clone())).unwrap();
+    let listing = engine
+        .blocking()
+        .list_runs(hekma_engine::ListRunsQuery::exceptions())
+        .unwrap();
+    let reference =
+        serde_json::to_value(listing.into_document(hekma_engine::ListingView::Exceptions, None))
+            .unwrap();
+    assert_eq!(json, reference);
+
+    // The all view + a page + the cursor round-trip.
+    let mut response = get_ok(&client, &server.addr, "/v0/runs?view=all&limit=2");
+    assert_eq!(response.status(), StatusCode::OK);
+    let page_one = json_body(&mut response);
+    assert_eq!(page_one["items"].as_array().unwrap().len(), 2);
+    let cursor = page_one["next_cursor"].as_str().unwrap().to_string();
+    assert!(!cursor.is_empty());
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!(
+            "/v0/runs?view=all&limit=2&cursor={}",
+            percent_encode(&cursor)
+        ),
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let page_two = json_body(&mut response);
+    assert_eq!(page_two["items"][0]["run_id"], "run_H");
+    assert!(page_two["next_cursor"].is_null());
+
+    // A Selector composes with the view.
+    let mut response = get_ok(&client, &server.addr, "/v0/runs?selector=team=core");
+    let filtered = json_body(&mut response);
+    assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["items"][0]["run_id"], "run_J");
+    // A caller label selects too (bound and caller alike).
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        "/v0/runs?view=all&selector=flow=triage",
+    );
+    let filtered = json_body(&mut response);
+    assert_eq!(filtered["items"][0]["run_id"], "run_H");
+
+    // The typed refusals: 400 with the finer machine codes.
+    let auth = format!("Bearer {BEARER_VALUE}");
+    for (query, code) in [
+        ("selector=no-equals", "invalid-selector"),
+        ("cursor=!!!", "invalid-cursor"),
+        ("limit=abc", "invalid-limit"),
+        ("view=everything", "invalid-view"),
+    ] {
+        let mut response = client
+            .get(format!("http://{}/v0/runs?{query}", server.addr))
+            .header("Authorization", &auth)
+            .call()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["code"], code, "{query}: {json}");
+    }
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_sse_stream_carries_outbox_ids_and_resumes_from_last_event_id() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    // A pre-existing floor of 5 (the journal import): the below-floor 409
+    // is reachable and the replay set is small and known.
+    seed_listing_state(&base, Some(5));
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    // Where the outbox stands: the staged floor is 5 (the journal import);
+    // the tight Policy's create landed after it. A pull from the floor
+    // minus one is the lossless entry point (a cursor below the floor is
+    // the typed 409 — asserted further down).
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!("/v0/export?cursor={}", percent_encode("{\"seq\":4}")),
+    );
+    let export = json_body(&mut response);
+    let seqs: Vec<u64> = export["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["seq"].as_u64().unwrap())
+        .collect();
+    assert!(!seqs.is_empty(), "the seeded policy event exported");
+    assert_eq!(export["retained_from"].as_u64().unwrap(), 5);
+
+    // Live: every frame carries id: <seq>, monotone with the outbox.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Drive a NEW committed event on another connection.
+    let mut create = client
+        .post(format!("http://{}/v0/policies", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({
+            "name": "later",
+            "selector": "team=later",
+        }))
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let _ = create.body_mut().read_to_string();
+
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut policy_id = 0u64;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no policy frame in time"
+        );
+        let (id, event) = read_sse_frame(&mut reader);
+        if event["kind"] == "policy" {
+            policy_id = id;
+            break;
+        }
+    }
+    assert!(policy_id > 0, "the policy frame carried its id");
+    // The id IS the outbox seq of that event: the export agrees.
+    let mut response = get_ok(
+        &client,
+        &server.addr,
+        &format!("/v0/export?cursor={}", percent_encode("{\"seq\":4}")),
+    );
+    let export = json_body(&mut response);
+    let later = export["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["event"]["kind"] == "policy" && entry["event"]["name"] == "later")
+        .expect("the later policy exported");
+    assert_eq!(later["seq"].as_u64().unwrap(), policy_id);
+
+    // Resume: a reconnect from before the `later` event replays everything
+    // after the id through the same filter, then goes live — no duplicate,
+    // no gap. Reading one replayed frame (bounded) proves the seam.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .header("Last-Event-ID", (policy_id - 1).to_string())
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no replayed frame in time"
+        );
+        let (id, event) = read_sse_frame(&mut reader);
+        assert_eq!(id, policy_id, "the replay starts past the id, at `later`");
+        assert_eq!(event["kind"], "policy");
+        break;
+    }
+
+    // The typed 409s at connect — never a clamp.
+    for (id, code) in [
+        (3u64, "cursor-below-retention"),
+        (999_999, "cursor-past-tail"),
+    ] {
+        let mut response = client
+            .get(format!("http://{}/v0/events", server.addr))
+            .header("Authorization", &auth)
+            .header("Last-Event-ID", id.to_string())
+            .call()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "Last-Event-ID {id}"
+        );
+        let json = json_body(&mut response);
+        assert_eq!(json["error"]["code"], code, "Last-Event-ID {id}: {json}");
+    }
+    // A malformed Last-Event-ID is the 400 invalid-cursor refusal.
+    let mut response = client
+        .get(format!("http://{}/v0/events", server.addr))
+        .header("Authorization", &auth)
+        .header("Last-Event-ID", "not-a-number")
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&mut response)["error"]["code"], "invalid-cursor");
+    // A malformed Selector on the stream likewise.
+    let mut response = client
+        .get(format!("http://{}/v0/events?selector=bad", server.addr))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "invalid-selector"
+    );
+    server.stop().unwrap();
+}
+
+#[test]
+fn the_sse_selector_filters_by_the_subject_runs_current_labels() {
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base, sink_handle);
+    let client = client();
+    let auth = format!("Bearer {BEARER_VALUE}");
+
+    let mut response = client
+        .get(format!(
+            "http://{}/v0/events?selector=team%3Dcore",
+            server.addr
+        ))
+        .header("Authorization", &auth)
+        .call()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Two events while the stream is open: a label change on run_J (its
+    // subject Run carries team=core → delivered) and a Policy create (no
+    // subject Run → dropped under the Selector).
+    let mut label = client
+        .patch(format!("http://{}/v0/runs/run_J/labels", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"set": {"env": "prod"}}))
+        .unwrap();
+    assert_eq!(label.status(), StatusCode::OK);
+    let _ = label.body_mut().read_to_string();
+    let mut create = client
+        .post(format!("http://{}/v0/policies", server.addr))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({"name": "quiet", "selector": "team=quiet"}))
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let _ = create.body_mut().read_to_string();
+
+    let mut reader = BufReader::new(response.body_mut().as_reader());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "no run frame in time");
+        let (id, event) = read_sse_frame(&mut reader);
+        assert!(id > 0, "every event frame carries an id");
+        assert_ne!(
+            event["kind"], "policy",
+            "a no-Run event is dropped under a selector"
+        );
+        if event["kind"] == "run" && event["run_id"] == "run_J" {
+            assert_eq!(event["change"], "labels-changed");
+            break;
+        }
+    }
+    server.stop().unwrap();
+}
+
+/// Read ONE SSE event frame (an `id:` line then its `data:` line); any
+/// marker frame without an id panics naming it. Returns `(id, payload)`.
+fn read_sse_frame<R: std::io::BufRead>(reader: &mut R) -> (u64, serde_json::Value) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut id: Option<u64> = None;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no complete frame in time"
+        );
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("the stream ended mid-frame"),
+            Ok(_) => {}
+            Err(err) => panic!("the SSE read failed: {err}"),
+        }
+        let line = line.trim_end().to_string();
+        if line.starts_with("id: ") {
+            id = Some(line["id: ".len()..].parse().expect("the id is numeric"));
+        } else if let Some(payload) = line.strip_prefix("data: ") {
+            let event: serde_json::Value = serde_json::from_str(payload.trim())
+                .expect("every data frame is the engine's JSON");
+            let id = id.expect("every event frame carries an id");
+            return (id, event);
+        } else if line.starts_with(':') {
+            // A keep-alive comment.
+        } else if line.is_empty() {
+            // A frame terminator.
+        }
+    }
 }

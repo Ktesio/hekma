@@ -72,7 +72,7 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, ListRunsQuery, PolicyChange, PolicyOutcome,
+    ChildRunRequest, Label, LabelChange, LabelOutcome, ListRunsQuery, PolicyChange, PolicyOutcome,
     PolicyRecord, RunError, RunId, RunListing, RunRecord, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
@@ -1889,6 +1889,33 @@ impl Engine {
                 .lock()
                 .expect("registry mutex poisoned")
                 .list_runs(&query)
+        })
+        .await
+    }
+
+    /// The subject Run of `event` and the labels it carries NOW (story
+    /// 21-5): the SSE Selector filter's one read per filtered event —
+    /// snapshot first (no SQL), one read-only store read when the Run is
+    /// absent from it (ended Runs keep matching until compaction).
+    /// `Ok(None)` when the event names no Run (`policy`,
+    /// `breach_default_upgraded`) or the named Run has no row — both are
+    /// dropped under an active Selector and delivered without one.
+    /// Honest limitation, by design: the filter sees CURRENT labels, not
+    /// labels-at-event-time (nothing stores the latter).
+    pub async fn event_subject_labels(
+        &self,
+        event: &EngineEvent,
+    ) -> Result<Option<Vec<Label>>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let event = event.clone();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let Some(run_id) = registry.event_subject_run(&event) else {
+                return Ok(None);
+            };
+            registry
+                .run_current_labels(&run_id)
+                .map_err(RunError::Store)
         })
         .await
     }

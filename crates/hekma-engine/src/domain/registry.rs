@@ -36,6 +36,7 @@ use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::restart::RestartPolicy;
 use super::secret::SecretString;
+use super::usage::RunId;
 
 /// The engine-owned DEFAULTS layer (spine AD-9 layer 1), story 2-1.
 ///
@@ -405,6 +406,67 @@ impl Registry {
         &self,
     ) -> std::sync::Arc<crate::domain::runs::snapshot::RunSnapshot> {
         self.run_snapshot.current()
+    }
+
+    /// The subject Run of `event`, for the SSE Selector filter (story
+    /// 21-5): Run, Usage and Breach events name their Run directly; a
+    /// Transition belongs to its instance's open process-owning Run (the
+    /// snapshot's owners map, then the store); Policy and
+    /// breach-default-upgrade events name no Run (delivered only without a
+    /// Selector).
+    pub(crate) fn event_subject_run(&self, event: &crate::domain::EngineEvent) -> Option<RunId> {
+        use crate::domain::EngineEvent;
+        match event {
+            EngineEvent::Run(event) => Some(event.run_id.clone()),
+            EngineEvent::UsageUpdate(update) => Some(update.event.run_id.clone()),
+            EngineEvent::BudgetBreach(breach) => Some(RunId::from_wire(breach.run_id.clone())),
+            EngineEvent::Transition(transition) => {
+                let snapshot = self.run_snapshot();
+                snapshot
+                    .owner_of(&transition.instance)
+                    .map(|entry| entry.record.run_id.clone())
+                    .or_else(|| {
+                        // Not in the snapshot (a fresh engine, or the Run
+                        // just ended): the read-only store read.
+                        InstanceName::new(&transition.instance)
+                            .ok()
+                            .and_then(|name| {
+                                self.store
+                                    .snapshot(|store| {
+                                        use crate::ports::RunRecords as _;
+                                        store.open_process_run(&name)
+                                    })
+                                    .ok()
+                                    .flatten()
+                                    .map(|record| record.run_id)
+                            })
+                    })
+            }
+            EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => None,
+        }
+    }
+
+    /// The labels `run_id` carries NOW (story 21-5, the SSE Selector
+    /// filter's read): the published snapshot first (no SQL), one
+    /// read-only store read when the Run is absent from it — ended Runs
+    /// keep matching until compaction. `Ok(None)` when no row exists.
+    pub(crate) fn run_current_labels(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<Vec<crate::domain::Label>>, StoreError> {
+        let snapshot = self.run_snapshot();
+        if let Some(entry) = snapshot.run(run_id) {
+            return Ok(Some(entry.labels.clone()));
+        }
+        self.store.snapshot(
+            |store| -> Result<Option<Vec<crate::domain::Label>>, StoreError> {
+                use crate::ports::RunRecords as _;
+                if store.run_record(run_id)?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(store.run_labels(run_id)?))
+            },
+        )
     }
 
     /// Run a Run-registry operation as one writer job and commit its changes
