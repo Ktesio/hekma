@@ -120,6 +120,10 @@ pub(crate) trait RunStore {
     /// The rollup for one Run of an instance (zero when it has no rows).
     fn run_rollup(&self, name: &InstanceName, run_id: &RunId) -> Result<Rollup, StoreError>;
 
+    /// The rollup for one Run by id alone (story 23-1, schema v18: an
+    /// instance-less wire Run has a rollup too).
+    fn run_rollup_by_id(&self, run_id: &RunId) -> Result<Rollup, StoreError>;
+
     /// Bump the instance's launch generation and return the new value.
     fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError>;
 

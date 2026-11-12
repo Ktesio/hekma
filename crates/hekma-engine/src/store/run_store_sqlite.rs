@@ -335,7 +335,9 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
         )
         .map_err(backend)?;
     let mut by_instance: HashMap<i64, RollupRow> = HashMap::new();
-    let mut by_run: HashMap<(i64, String), RollupRow> = HashMap::new();
+    // Story 23-1 (schema v18): the Run rollup is keyed by the run id alone,
+    // so an instance-less Run (a wire Run of the shared proxy) folds too.
+    let mut by_run: HashMap<String, (Option<i64>, RollupRow)> = HashMap::new();
     let mut highest = watermark;
     {
         let mut stmt = conn
@@ -348,11 +350,7 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
         let mut rows = stmt.query([watermark]).map_err(backend)?;
         while let Some(row) = rows.next().map_err(backend)? {
             highest = highest.max(row.get::<_, i64>(0).map_err(backend)?);
-            // An instance-less row (none exist before story 21.2) has no
-            // per-instance rollup to fold into.
-            let Some(instance_id) = row.get::<_, Option<i64>>(1).map_err(backend)? else {
-                continue;
-            };
+            let instance_id = row.get::<_, Option<i64>>(1).map_err(backend)?;
             let run_id: String = row.get(2).map_err(backend)?;
             let stored = StoredUsage {
                 input: row.get::<_, i64>(3).map_err(backend)?.max(0) as u64,
@@ -368,11 +366,11 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
                     .map_err(backend)?
                     .map(|r| r.max(0) as u64),
             };
-            by_instance.entry(instance_id).or_default().add(&stored);
-            by_run
-                .entry((instance_id, run_id))
-                .or_default()
-                .add(&stored);
+            if let Some(instance_id) = instance_id {
+                by_instance.entry(instance_id).or_default().add(&stored);
+            }
+            let entry = by_run.entry(run_id).or_insert((instance_id, RollupRow::default()));
+            entry.1.add(&stored);
         }
     }
     for (instance_id, delta) in &by_instance {
@@ -380,33 +378,39 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
         rollup.merge(delta);
         write_instance_rollup(conn, *instance_id, &rollup)?;
     }
-    // Story 21-2: a Run's rollup is its subtree's — each row also folds into
-    // every ancestor through the parent chain (never by re-summing a
-    // subtree, AD-25). An instance-less ancestor has no rollup row yet.
-    let mut with_ancestors: HashMap<(i64, String), RollupRow> = HashMap::new();
-    for ((instance_id, run_id), delta) in by_run {
-        let chain = if ancestors {
-            super::runs_sqlite::ancestors_for_fold(conn, &run_id)?
-        } else {
-            Vec::new()
-        };
-        for (ancestor_instance, ancestor) in chain {
-            if let Some(ancestor_instance) = ancestor_instance {
-                with_ancestors
-                    .entry((ancestor_instance, ancestor))
-                    .or_default()
-                    .merge(&delta);
+    if !ancestors {
+        // The v12 backfill (before `runs` and before v18's re-key): the
+        // v12 shape, one row per (instance, run); instance-less rows did
+        // not exist then.
+        for (run_id, (instance_id, delta)) in &by_run {
+            if let Some(instance_id) = instance_id {
+                write_run_rollup_v12(conn, *instance_id, run_id, delta)?;
             }
         }
-        with_ancestors
-            .entry((instance_id, run_id))
-            .or_default()
-            .merge(&delta);
-    }
-    for ((instance_id, run_id), delta) in &with_ancestors {
-        let mut rollup = read_run_rollup(conn, *instance_id, run_id)?;
-        rollup.merge(delta);
-        write_run_rollup(conn, *instance_id, run_id, &rollup)?;
+    } else {
+        // Story 21-2: a Run's rollup is its subtree's — each row also folds
+        // into every ancestor through the parent chain (never by re-summing
+        // a subtree, AD-25); since v18 instance-less ancestors included.
+        let mut with_ancestors: HashMap<String, (Option<i64>, RollupRow)> = HashMap::new();
+        for (run_id, (instance_id, delta)) in by_run {
+            for (ancestor_instance, ancestor) in super::runs_sqlite::ancestors_for_fold(conn, &run_id)? {
+                with_ancestors
+                    .entry(ancestor)
+                    .or_insert((ancestor_instance, RollupRow::default()))
+                    .1
+                    .merge(&delta);
+            }
+            with_ancestors
+                .entry(run_id)
+                .or_insert((instance_id, RollupRow::default()))
+                .1
+                .merge(&delta);
+        }
+        for (run_id, (instance_id, delta)) in &with_ancestors {
+            let mut rollup = read_run_rollup(conn, run_id)?;
+            rollup.merge(delta);
+            write_run_rollup(conn, *instance_id, run_id, &rollup)?;
+        }
     }
     if highest > watermark {
         conn.execute(
@@ -533,6 +537,38 @@ fn write_instance_rollup(
 
 fn write_run_rollup(
     conn: &Connection,
+    instance_id: Option<i64>,
+    run_id: &str,
+    rollup: &RollupRow,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO usage_rollup_run \
+         (run_id, instance_id, events, input_tokens, output_tokens, cached_tokens, \
+          cached_unknown, cost_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(run_id) DO UPDATE SET events = excluded.events, \
+         input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens, \
+         cached_tokens = excluded.cached_tokens, cached_unknown = excluded.cached_unknown, \
+         cost_micros = excluded.cost_micros, \
+         instance_id = COALESCE(usage_rollup_run.instance_id, excluded.instance_id)",
+        rusqlite::params![
+            run_id,
+            instance_id,
+            rollup.events as i64,
+            rollup.input as i64,
+            rollup.output as i64,
+            rollup.cached as i64,
+            rollup.cached_unknown as i64,
+            rollup.cost.0,
+        ],
+    )
+    .map_err(backend)?;
+    Ok(())
+}
+
+/// The v12-shaped Run rollup write (the v12 backfill only, before v18
+/// re-keyed the table by run id).
+fn write_run_rollup_v12(
+    conn: &Connection,
     instance_id: i64,
     run_id: &str,
     rollup: &RollupRow,
@@ -574,16 +610,10 @@ fn read_instance_rollup(conn: &Connection, instance_id: i64) -> Result<RollupRow
     .map(Option::unwrap_or_default)
 }
 
-fn read_run_rollup(
-    conn: &Connection,
-    instance_id: i64,
-    run_id: &str,
-) -> Result<RollupRow, StoreError> {
+fn read_run_rollup(conn: &Connection, run_id: &str) -> Result<RollupRow, StoreError> {
     conn.query_row(
-        &format!(
-            "SELECT {ROLLUP_COLUMNS} FROM usage_rollup_run WHERE instance_id = ?1 AND run_id = ?2"
-        ),
-        rusqlite::params![instance_id, run_id],
+        &format!("SELECT {ROLLUP_COLUMNS} FROM usage_rollup_run WHERE run_id = ?1"),
+        rusqlite::params![run_id],
         RollupRow::read,
     )
     .optional()
@@ -843,11 +873,14 @@ impl RunStore for SqliteStore {
         Ok(read_instance_rollup(self.conn(), id)?.as_rollup())
     }
 
-    fn run_rollup(&self, name: &InstanceName, run_id: &RunId) -> Result<Rollup, StoreError> {
-        let Some(id) = self.instance_id(name)? else {
-            return Ok(Rollup::zero());
-        };
-        Ok(read_run_rollup(self.conn(), id, run_id.as_str())?.as_rollup())
+    fn run_rollup(&self, _name: &InstanceName, run_id: &RunId) -> Result<Rollup, StoreError> {
+        // Story 23-1 (v18): keyed by the run id alone; the instance name is
+        // kept in the signature for the callers that hold one.
+        self.run_rollup_by_id(run_id)
+    }
+
+    fn run_rollup_by_id(&self, run_id: &RunId) -> Result<Rollup, StoreError> {
+        Ok(read_run_rollup(self.conn(), run_id.as_str())?.as_rollup())
     }
 
     fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError> {
