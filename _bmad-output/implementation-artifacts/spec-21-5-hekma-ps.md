@@ -2,7 +2,7 @@
 title: 'hekma ps and Run listing'
 type: 'feature'
 created: '2026-11-09'
-status: 'in-progress'
+status: 'review'
 review_loop_iteration: 0
 baseline_commit: '4d1b85e7ae6cf142ac1b5cbf50785545279cb070'
 context:
