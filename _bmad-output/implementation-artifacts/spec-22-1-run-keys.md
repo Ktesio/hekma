@@ -2,7 +2,7 @@
 title: 'Run Keys: minting, hashing, refresh and revocation'
 type: 'feature'
 created: '2026-11-12'
-status: 'draft'
+status: 'ready-for-dev'
 review_loop_iteration: 0
 baseline_commit: '82b01fee7c398d13bc7481caf1810f599779a9f0'
 context:
@@ -198,3 +198,5 @@ Each is a public-contract choice; the recommendation is the spec's current text.
 ## Spec Change Log
 
 - 2026-11-12 — spec written from Story 22.1 and its Epic 22 seams, FR-53/FR-52/FR-14/FR-43/FR-60, AD-20/AD-22/AD-25/AD-26/AD-27, the key-custody security review (draft for ruling; §9's 22.1 criteria copied, proxy and Shim halves deferred), the 21-3/21-5 specs, 21-6's in-build spec (`LimitActor`, no schema step) and the deferred-work trigger naming this story. Status draft; awaiting the orchestrator's review and Islam's rulings on O1–O7.
+- 2026-11-12 — orchestrator review: approved for build. Ask First 1–14 accepted as recommended. O1–O7 are Islam's rulings (AI-58), still pending: the build proceeds on the security review's recommended options, and the PR stays unmerged until he rules; a different ruling changes the matching criterion. Basis: the review's own gate (§11) blocks 22-2's "supported" docs on P1/P4/P7, not 22-1's build. Build note: rebase onto the merged 21-6 first and wire its `LimitActor::Caller` and limits route in place.
+
