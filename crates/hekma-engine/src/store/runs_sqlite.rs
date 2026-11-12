@@ -585,6 +585,67 @@ const RUN_COLUMNS: &str = "r.run_id, r.control_depth, r.wire_path, r.status, r.a
 /// `FROM runs r LEFT JOIN agent_instances i` — the join every Run read uses.
 const RUN_FROM: &str = "FROM runs r LEFT JOIN agent_instances i ON i.id = r.instance_id";
 
+/// Decode one `run_labels` row (shared by the one-Run read and the Fleet's
+/// batched read, so both refuse a corrupt row with the same words).
+fn decode_label(
+    run_id: &str,
+    key: String,
+    value: String,
+    source: &str,
+    origin: Option<String>,
+) -> Result<Label, StoreError> {
+    let source = LabelSource::from_wire(source).ok_or_else(|| StoreError::CorruptRow {
+        name: "run_labels".to_string(),
+        detail: format!("Run `{run_id}` label `{key}` has an unknown source `{source}`"),
+    })?;
+    let origin =
+        match (source, origin) {
+            (LabelSource::Caller, _) => None,
+            // A bound row with no origin predates origins: configuration
+            // was the only bound source then.
+            (LabelSource::Bound, None) => Some(LabelOrigin::Config),
+            (LabelSource::Bound, Some(raw)) => Some(LabelOrigin::from_wire(&raw).ok_or_else(
+                || StoreError::CorruptRow {
+                    name: "run_labels".to_string(),
+                    detail: format!("Run `{run_id}` label `{key}` has an unknown origin `{raw}`"),
+                },
+            )?),
+        };
+    Ok(Label {
+        key,
+        value,
+        source,
+        origin,
+    })
+}
+
+/// Fold one per-run `run_limits` row into `limits` (shared by the one-Run
+/// read and the Fleet's batched read).
+fn apply_run_limit(
+    limits: &mut RunLimits,
+    run_id: &str,
+    dimension: &str,
+    limit: i64,
+    action: &str,
+) -> Result<(), StoreError> {
+    let action: BreachAction = action.parse().map_err(|_| StoreError::CorruptRow {
+        name: "run_limits".to_string(),
+        detail: format!("Run `{run_id}` has an unknown Breach Action `{action}`"),
+    })?;
+    limits.breach_action = Some(action);
+    match dimension {
+        "tokens" => limits.token_per_run = Some(limit.max(0) as u64),
+        "dollars" => limits.dollar_per_run_micros = Some(Micros(limit.max(0))),
+        other => {
+            return Err(StoreError::CorruptRow {
+                name: "run_limits".to_string(),
+                detail: format!("Run `{run_id}` has an unknown dimension `{other}`"),
+            })
+        }
+    }
+    Ok(())
+}
+
 fn read_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let run_id: String = row.get(0)?;
     let depth_raw: String = row.get(1)?;
@@ -827,30 +888,7 @@ impl RunRecords for SqliteStore {
         let mut labels = Vec::new();
         for row in rows {
             let (key, value, source, origin) = row.map_err(backend)?;
-            let source = LabelSource::from_wire(&source).ok_or_else(|| StoreError::CorruptRow {
-                name: "run_labels".to_string(),
-                detail: format!("Run `{run_id}` label `{key}` has an unknown source `{source}`"),
-            })?;
-            let origin = match (source, origin) {
-                (LabelSource::Caller, _) => None,
-                // A bound row with no origin predates origins: configuration
-                // was the only bound source then.
-                (LabelSource::Bound, None) => Some(LabelOrigin::Config),
-                (LabelSource::Bound, Some(raw)) => Some(LabelOrigin::from_wire(&raw).ok_or_else(
-                    || StoreError::CorruptRow {
-                        name: "run_labels".to_string(),
-                        detail: format!(
-                            "Run `{run_id}` label `{key}` has an unknown origin `{raw}`"
-                        ),
-                    },
-                )?),
-            };
-            labels.push(Label {
-                key,
-                value,
-                source,
-                origin,
-            });
+            labels.push(decode_label(run_id.as_str(), key, value, &source, origin)?);
         }
         Ok(labels)
     }
@@ -875,21 +913,7 @@ impl RunRecords for SqliteStore {
         let mut limits = RunLimits::default();
         for row in rows {
             let (dimension, limit, action) = row.map_err(backend)?;
-            let action: BreachAction = action.parse().map_err(|_| StoreError::CorruptRow {
-                name: "run_limits".to_string(),
-                detail: format!("Run `{run_id}` has an unknown Breach Action `{action}`"),
-            })?;
-            limits.breach_action = Some(action);
-            match dimension.as_str() {
-                "tokens" => limits.token_per_run = Some(limit.max(0) as u64),
-                "dollars" => limits.dollar_per_run_micros = Some(Micros(limit.max(0))),
-                other => {
-                    return Err(StoreError::CorruptRow {
-                        name: "run_limits".to_string(),
-                        detail: format!("Run `{run_id}` has an unknown dimension `{other}`"),
-                    })
-                }
-            }
+            apply_run_limit(&mut limits, run_id.as_str(), &dimension, limit, &action)?;
         }
         Ok(limits)
     }
@@ -1438,6 +1462,104 @@ impl PolicyRecords for SqliteStore {
             limits,
             kept_on_pause,
         }))
+    }
+
+    fn open_owner_resolution_facts(&self) -> Result<crate::ports::OpenOwnerFacts, StoreError> {
+        use std::collections::{HashMap, HashSet};
+        // Four reads for the whole Fleet, whatever its size: the open
+        // process-owning Runs, their labels, their per-run limits and the
+        // kept-on-pause markers. Each Run's entry decodes exactly as
+        // `run_resolution_facts` would (the same helpers, the same
+        // per-Run order: labels by key, limits by dimension — the
+        // primary-key order the one-Run read walks).
+        const OPEN_OWNER: &str = "r.process_owner = 1 AND r.status <> 'ended'";
+        let records = self.records(&format!("WHERE {OPEN_OWNER}"), [])?;
+        let mut labels: HashMap<String, Vec<Label>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn()
+                .prepare(&format!(
+                    "SELECT l.run_id, l.key, l.value, l.source, l.origin FROM run_labels l \
+                     JOIN runs r ON r.run_id = l.run_id WHERE {OPEN_OWNER} \
+                     ORDER BY l.run_id, l.key"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (run_id, key, value, source, origin) = row.map_err(backend)?;
+                let label = decode_label(&run_id, key, value, &source, origin)?;
+                labels.entry(run_id).or_default().push(label);
+            }
+        }
+        let mut limits: HashMap<String, RunLimits> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn()
+                .prepare(&format!(
+                    "SELECT l.run_id, l.dimension, l.limit_value, l.action FROM run_limits l \
+                     JOIN runs r ON r.run_id = l.run_id \
+                     WHERE {OPEN_OWNER} AND l.scope = 'per-run' \
+                     ORDER BY l.run_id, l.dimension"
+                ))
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(backend)?;
+            for row in rows {
+                let (run_id, dimension, limit, action) = row.map_err(backend)?;
+                let entry = limits.entry(run_id.clone()).or_default();
+                apply_run_limit(entry, &run_id, &dimension, limit, &action)?;
+            }
+        }
+        let kept: HashSet<String> = {
+            let mut stmt = self
+                .conn()
+                .prepare(
+                    "SELECT i.name FROM breach_default_upgrade b \
+                     JOIN agent_instances i ON i.id = b.instance_id",
+                )
+                .map_err(backend)?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(backend)?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(backend)?;
+            names
+        };
+        let runs = records
+            .into_iter()
+            .map(|record| {
+                let run_id = record.run_id.as_str();
+                let kept_on_pause = record
+                    .instance
+                    .as_deref()
+                    .is_some_and(|instance| kept.contains(instance));
+                crate::ports::ResolutionFacts {
+                    labels: labels.remove(run_id).unwrap_or_default(),
+                    limits: limits.remove(run_id).unwrap_or_default(),
+                    kept_on_pause,
+                    record,
+                }
+            })
+            .collect();
+        Ok(crate::ports::OpenOwnerFacts { runs, kept })
     }
 }
 

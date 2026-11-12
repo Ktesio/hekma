@@ -2486,3 +2486,81 @@ fn a_change_planned_on_a_stale_read_merges_over_the_fresh_row() {
         "the outcome names the row written"
     );
 }
+
+#[test]
+fn the_fleet_batch_resolves_every_row_exactly_as_the_per_row_read() {
+    // The Fleet's batched facts (one snapshot for every row) must produce
+    // the resolution each row's own read produces: the owner Run's labels
+    // (a Policy matches by them), its Run limits, the kept-on-pause
+    // markers, an instance with no open Run, and a named Run that is not
+    // the open owner (that row falls back to its own read).
+    let seeded = seed(10);
+    let registry = &seeded.registry;
+    let run = seeded.run.clone();
+    registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(&format!(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (2, 'idle', 'mock', 'stopped', '/i', 't', 't'); \
+                 INSERT INTO breach_default_upgrade (instance_id, listed_at, done_at) \
+                 VALUES (1, 't', 't'), (2, 't', 't'); \
+                 INSERT INTO run_limits (run_id, dimension, scope, limit_value, action, source, \
+                 set_at) VALUES ('{run}', 'tokens', 'per-run', 500, 'stop', 'caller', 't')"
+            ));
+            Ok(())
+        })
+        .unwrap();
+    change(
+        registry,
+        "core",
+        "team=core",
+        PolicyLimits {
+            tokens_cumulative: Some(9_000),
+            ..Default::default()
+        },
+    );
+    let batch = registry.fleet_resolution_facts().expect("the batch reads");
+    let money = InstanceName::new("money").unwrap();
+    let idle = InstanceName::new("idle").unwrap();
+    let stranger = RunId::mint();
+    for (name, run) in [
+        (&money, Some(&seeded.run)),
+        (&money, None),
+        (&money, Some(&stranger)),
+        (&idle, None),
+        (&idle, Some(&stranger)),
+    ] {
+        assert_eq!(
+            registry.resolved_limits_from_batch(name, run, None, Some(&batch)),
+            registry.resolved_limits_and_kept(name, run, None),
+            "{name} / {run:?}: the batch resolves as the per-row read does"
+        );
+    }
+    // The batch carried the facts, not just matching defaults.
+    let (owner, kept) =
+        registry.resolved_limits_from_batch(&money, Some(&seeded.run), None, Some(&batch));
+    assert!(kept, "the owner's kept-on-pause marker rides the batch");
+    assert_eq!(owner.tokens.per_run, Some(500), "the Run's own ceiling");
+    assert_eq!(
+        owner.sources.tokens_cumulative,
+        crate::domain::runs::LimitSource::Policy("core".to_string()),
+        "the Policy matched by the Run's bound label"
+    );
+    let (_, idle_kept) = registry.resolved_limits_from_batch(&idle, None, None, Some(&batch));
+    assert!(idle_kept, "an instance with no open Run reads its marker");
+
+    // A corrupt row fails the whole batch: every row then takes its own
+    // read (and fails closed there), exactly as before the batch existed.
+    registry
+        .writer
+        .call(|ctx| {
+            ctx.store()
+                .execute_batch_for_test("UPDATE run_labels SET source = 'bogus'");
+            Ok(())
+        })
+        .unwrap();
+    assert!(registry.fleet_resolution_facts().is_none());
+    let (degraded, _) = registry.resolved_limits_from_batch(&money, None, None, None);
+    assert!(degraded.fail_closed.is_some());
+}

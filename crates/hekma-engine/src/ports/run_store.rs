@@ -254,6 +254,23 @@ pub(crate) trait PolicyRecords {
     /// and whether its instance is kept on `pause` by the upgrade (the
     /// pipeline's live per-event resolution).
     fn run_resolution_facts(&self, run_id: &RunId) -> Result<Option<ResolutionFacts>, StoreError>;
+
+    /// Every open process-owning Run's resolution facts plus every
+    /// instance kept on `pause` by the upgrade, in a fixed handful of
+    /// queries (the Fleet read's batch: one pass for the whole Fleet, not
+    /// one per row). Each entry equals what [`Self::run_resolution_facts`]
+    /// reads for that Run.
+    fn open_owner_resolution_facts(&self) -> Result<OpenOwnerFacts, StoreError>;
+}
+
+/// The Fleet read's batched resolution facts (story 21-3's perf pass):
+/// what [`PolicyRecords::open_owner_resolution_facts`] reads.
+pub(crate) struct OpenOwnerFacts {
+    /// Every open process-owning Run's facts (at most one per instance,
+    /// the partial unique index), each as `run_resolution_facts` reads it.
+    pub runs: Vec<ResolutionFacts>,
+    /// The names of every instance kept on `pause` by the upgrade.
+    pub kept: std::collections::HashSet<String>,
 }
 
 /// One Run's resolution facts (story 21-3): everything the live per-event

@@ -180,7 +180,7 @@ fn the_subject_run_resolution_covers_every_event_family() {
 
     // Events naming no Run: delivered only without a Selector.
     for no_run in [
-        EngineEvent::Policy(hekma_engine::PolicyEvent {
+        EngineEvent::Policy(Box::new(hekma_engine::PolicyEvent {
             schema_version: hekma_engine::POLICY_EVENT_SCHEMA_VERSION,
             kind: hekma_engine::PolicyEventKind::Created,
             name: "p".to_string(),
@@ -191,7 +191,7 @@ fn the_subject_run_resolution_covers_every_event_family() {
             matched: 0,
             fallbacks: 0,
             at: "t".to_string(),
-        }),
+        })),
         EngineEvent::BreachDefaultUpgraded(hekma_engine::BreachDefaultUpgradedEvent {
             schema_version: hekma_engine::POLICY_EVENT_SCHEMA_VERSION,
             instances: Vec::new(),

@@ -976,6 +976,13 @@ impl Engine {
                 ),
                 Err(_) => None,
             };
+            // Story 21-3 (the perf-budgets ratchet): ONE batched read of
+            // every instance's Policy-resolution facts (the open
+            // process-owning Runs' rows, labels and limits, and the
+            // kept-on-pause markers), in the same AI-16 shape as the spawn
+            // records above. A failed batch (`None`) falls back to each
+            // row's own read, so it degrades one row at a time.
+            let resolution_facts = registry.fleet_resolution_facts();
             let entries = instances
                 .into_iter()
                 .map(|instance| {
@@ -983,6 +990,7 @@ impl Engine {
                         &registry,
                         &supervisor,
                         records.as_ref(),
+                        resolution_facts.as_ref(),
                         instance,
                         inner.read_only,
                     )
@@ -1026,6 +1034,7 @@ impl Engine {
                 &registry,
                 &supervisor,
                 Some(&records),
+                None,
                 instance,
                 inner.read_only,
             ))
@@ -1043,6 +1052,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         records: Option<&HashMap<InstanceName, SpawnRecord>>,
+        resolution_facts: Option<&crate::domain::registry_policy::FleetResolutionFacts>,
         instance: AgentInstance,
         read_only: bool,
     ) -> FleetEntry {
@@ -1167,7 +1177,12 @@ impl Engine {
         let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok();
-        let resolution = registry.resolved_limits(&instance.name, current_run_id.as_ref());
+        let (resolution, breach_default_upgraded) = registry.resolved_limits_from_batch(
+            &instance.name,
+            current_run_id.as_ref(),
+            effective_opt.as_ref(),
+            resolution_facts,
+        );
         let rate = resolution.rate;
         let cost_cap = resolution.dollars;
         let action = resolution.effective_action;
@@ -1273,10 +1288,8 @@ impl Engine {
             None
         };
         // Story 21-3: the FR-21 "kept on pause by upgrade" marker rides the
-        // row (rendered as the note; the explicit-key write clears it).
-        let breach_default_upgraded = registry
-            .breach_default_upgraded(&instance.name)
-            .unwrap_or(false);
+        // row (rendered as the note; the explicit-key write clears it). It
+        // was read with the resolution above, in the same snapshot.
         FleetEntry {
             name: instance.name,
             kind: instance.kind,
@@ -3061,7 +3074,7 @@ mod tests {
             assert!(labels.contains(&Label::bound("team", "core")), "{labels:?}");
         });
         // An event naming no Run answers None on the same fast path.
-        let policy = EngineEvent::Policy(crate::domain::runs::PolicyEvent {
+        let policy = EngineEvent::Policy(Box::new(crate::domain::runs::PolicyEvent {
             schema_version: crate::domain::runs::POLICY_EVENT_SCHEMA_VERSION,
             kind: crate::domain::runs::PolicyEventKind::Created,
             name: "p".to_string(),
@@ -3072,7 +3085,7 @@ mod tests {
             matched: 0,
             fallbacks: 0,
             at: "t".to_string(),
-        });
+        }));
         assert_eq!(
             engine.blocking().event_subject_labels(&policy).unwrap(),
             None
