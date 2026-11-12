@@ -2834,6 +2834,17 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.list_runs(query))
     }
 
+    /// Blocking twin of [`Engine::event_subject_labels`] — the SSE
+    /// Selector filter's read for sync consumers.
+    pub fn event_subject_labels(
+        &self,
+        event: &EngineEvent,
+    ) -> Result<Option<Vec<Label>>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.event_subject_labels(event))
+    }
+
     /// Blocking twin of [`Engine::policies`].
     pub fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
         self.engine.rt.block_on(self.engine.policies())
