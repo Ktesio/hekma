@@ -10650,14 +10650,18 @@ impl Drop for KillOnDrop {
         if self.0 == 0 {
             return;
         }
-        #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &self.0.to_string()])
-            .status();
-        #[cfg(windows)]
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &self.0.to_string()])
-            .status();
+        // A runtime OS branch, not `#[cfg]`: OS-conditional cfg is
+        // reserved to the backends (the boundary gate).
+        let pid = self.0.to_string();
+        let _ = if std::env::consts::OS == "windows" {
+            std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid])
+                .status()
+        } else {
+            std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status()
+        };
     }
 }
 
