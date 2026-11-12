@@ -82,8 +82,7 @@ const WORDS: VerbWords = VerbWords {
 };
 
 fn dollars(flag: &str, raw: &str) -> Result<Micros, Box<dyn std::error::Error>> {
-    let trimmed = raw.trim().trim_start_matches('$');
-    hekma_engine::parse_dollars_to_micros(trimmed)
+    hekma_engine::parse_dollars_to_micros(raw)
         .map_err(|reason| invalid(format!("--{flag}: {reason}")))
 }
 
@@ -635,7 +634,7 @@ mod tests {
     fn the_flags_build_one_change_and_bad_ones_are_usage_errors() {
         let change = change_from(&SetArgs {
             tokens_per_run: Some(500_000),
-            dollars_cumulative: Some("$3.000001".into()),
+            dollars_cumulative: Some("3.000001".into()),
             breach_action: Some("block".into()),
             clear: vec!["tokens-cumulative,dollars-per-run".into()],
             ..set_args()
