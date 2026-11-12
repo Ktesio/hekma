@@ -862,20 +862,37 @@ impl Registry {
         crate::domain::runs::bindings::BindingOutcome,
         crate::domain::runs::bindings::BindingError,
     > {
+        use crate::domain::runs::bindings::BindingError;
         let publisher = std::sync::Arc::clone(&self.run_snapshot);
-        self.writer
-            .call(move |ctx| {
-                let legacy_root = ctx.store().legacy_run()?;
-                let mut job = crate::domain::runs::bindings::BindingJob {
-                    ctx,
-                    publisher: &publisher,
-                };
-                op(&mut job, legacy_root).map_err(|err| match err {
-                    crate::domain::runs::bindings::BindingError::Store(store) => store,
-                    other => crate::ports::StoreError::Backend(other.to_string()),
-                })
+        // A refusal must ROLL BACK (an `update` can refuse after its first
+        // write), so the job always fails it as a store error; the typed
+        // refusal travels out beside it and replaces it here, so a caller
+        // sees `PrefixTaken`, never "backend error: …".
+        let refusal: std::sync::Arc<std::sync::Mutex<Option<BindingError>>> =
+            std::sync::Arc::default();
+        let slot = std::sync::Arc::clone(&refusal);
+        let result = self.writer.call(move |ctx| {
+            let legacy_root = ctx.store().legacy_run()?;
+            let mut job = crate::domain::runs::bindings::BindingJob {
+                ctx,
+                publisher: &publisher,
+            };
+            op(&mut job, legacy_root).map_err(|err| match err {
+                BindingError::Store(store) => store,
+                other => {
+                    let message = other.to_string();
+                    *slot.lock().expect("binding refusal slot") = Some(other);
+                    crate::ports::StoreError::Backend(message)
+                }
             })
-            .map_err(crate::domain::runs::bindings::BindingError::Store)
+        });
+        result.map_err(|err| {
+            refusal
+                .lock()
+                .expect("binding refusal slot")
+                .take()
+                .unwrap_or(BindingError::Store(err))
+        })
     }
 
     /// Story 23-1 (cross-process freshness): the reaper tick's foreign-commit

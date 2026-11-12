@@ -318,6 +318,13 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         }
         .into(),
         "policy-exists" => RunInvalid { message }.into(),
+        // Story 23-1: the endpoint bindings.
+        "binding-not-found" | "binding-route-not-found" => RunNotFound {
+            message: format!("{message}. List them with `hekma binding list`."),
+        }
+        .into(),
+        "binding-invalid" | "binding-exists" | "binding-prefix-taken" | "binding-limit"
+        | "binding-legacy-route" => RunInvalid { message }.into(),
         // Story 21-3: the default Policy's reserved shape is an Operator
         // refusal (2); a Scent-Check Mode before Scent-Check ships (2).
         "policy-default" | "scent-unavailable" => RunInvalid { message }.into(),

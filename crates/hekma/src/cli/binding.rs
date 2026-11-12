@@ -35,17 +35,10 @@ fn routed_error(err: RoutedError) -> Box<dyn std::error::Error> {
     }
 }
 
+/// A local read's refusal as the CLI's exit class: the same code table a
+/// routed write's `error.code` goes through, so the two never drift.
 fn engine_error(err: BindingError) -> Box<dyn std::error::Error> {
-    let message = err.to_string();
-    match err {
-        BindingError::NotFound { .. } | BindingError::RouteNotFound { .. } => {
-            crate::error::RunNotFound { message }.into()
-        }
-        other => RunInvalid {
-            message: other.to_string(),
-        }
-        .into(),
-    }
+    map_run_code(err.code(), err.to_string())
 }
 
 /// `--label k=v` values.

@@ -248,6 +248,24 @@ pub enum BindingError {
     Store(#[from] StoreError),
 }
 
+impl BindingError {
+    /// A stable machine code for wire surfaces (`error.code` on the
+    /// Control API; the CLI maps it onto its exit classes).
+    pub fn code(&self) -> &'static str {
+        match self {
+            BindingError::Invalid { .. } => "binding-invalid",
+            BindingError::NotFound { .. } => "binding-not-found",
+            BindingError::Exists { .. } => "binding-exists",
+            BindingError::PrefixTaken { .. } => "binding-prefix-taken",
+            BindingError::TooMany { .. } => "binding-limit",
+            BindingError::RouteNotFound { .. } => "binding-route-not-found",
+            BindingError::LegacyRoute { .. } => "binding-legacy-route",
+            BindingError::Credential(_) => "binding-credential",
+            BindingError::Store(_) => "binding-store",
+        }
+    }
+}
+
 /// Validate a binding name (the agent-name charset).
 pub(crate) fn validate_name(field: &str, name: &str) -> Result<(), BindingError> {
     crate::domain::InstanceName::new(name)

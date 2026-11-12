@@ -461,7 +461,9 @@ impl From<hekma_engine::BindingError> for ApiError {
             B::Invalid { .. } => ApiErrorKind::InvalidBody,
             B::Credential(_) | B::Store(_) => ApiErrorKind::Internal,
         };
-        Self::new(kind, message)
+        let mut error = Self::new(kind, message);
+        error.code = Some(err.code());
+        error
     }
 }
 
