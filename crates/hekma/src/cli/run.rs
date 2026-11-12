@@ -127,6 +127,15 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         }
         .into(),
         "instance-not-found" => instance_not_found(message),
+        // Story 21-3.
+        "policy-not-found" => RunNotFound {
+            message: format!("{message}. List them with `hekma policy list`."),
+        }
+        .into(),
+        "policy-exists" => RunInvalid { message }.into(),
+        // Story 21-3: the default Policy's reserved shape is an Operator
+        // refusal (2); a Scent-Check Mode before Scent-Check ships (2).
+        "policy-default" | "scent-unavailable" => RunInvalid { message }.into(),
         "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs" => {
             RunInvalid { message }.into()
         }
@@ -225,6 +234,19 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         }
         .into(),
         RunError::InstanceNotFound { .. } => instance_not_found(message),
+        // Story 21-3: an unknown Policy is not found (3); a taken name is a
+        // request that cannot be honored (2).
+        RunError::PolicyNotFound { .. } => RunNotFound {
+            message: format!("{message}. List them with `hekma policy list`."),
+        }
+        .into(),
+        RunError::PolicyExists { .. } => RunInvalid { message }.into(),
+        // Story 21-3: the default Policy's reserved shape is a refusal the
+        // Operator fixes on the command line (2), and a Scent-Check Mode
+        // before Scent-Check ships likewise (2).
+        RunError::PolicyDefault { .. } | RunError::ScentUnavailable { .. } => {
+            RunInvalid { message }.into()
+        }
         RunError::NestingTooDeep { .. }
         | RunError::ActionUnavailable { .. }
         | RunError::TooManyRuns { .. }

@@ -140,6 +140,13 @@ pub use domain::{
     RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
     MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
+// Story 21-3: Policies — the request and outcome of a Policy change, the
+// stored Policy, its limits and events, and the resolution a Run carries.
+pub use domain::{
+    BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyChange, PolicyEvent,
+    PolicyEventKind, PolicyLimits, PolicyOutcome, PolicyRecord, PolicyResolution, RunPolicy,
+    ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+};
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
