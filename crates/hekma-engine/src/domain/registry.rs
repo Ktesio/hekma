@@ -310,6 +310,43 @@ impl Registry {
             other => RegistryError::Store(other),
         })?;
         legacy.retire_outbox_files();
+        // Story 23-1: the per-call records store attaches to the writer's
+        // connection (one batch commits both files), and the calls a dead
+        // proxy owner left open close now — `recovered` when the ledger has
+        // their usage, else `crash` — before anything else runs. A live
+        // owner's rows (another engine on this state dir) are left alone.
+        let mut notes = notes;
+        match crate::store::calls_sqlite::segment_path(&paths.calls_dir())
+            .and_then(|segment| write_store.attach_calls(Some(&segment)))
+        {
+            Ok(()) => {
+                let backend = crate::backends::current();
+                let probe = |fingerprint: &crate::ports::ProcessFingerprint| {
+                    crate::ports::ProcessBackend::probe_alive(&backend, fingerprint)
+                };
+                match write_store.close_orphaned_calls(&probe) {
+                    Ok((0, 0)) => {}
+                    Ok((crashed, recovered)) => notes.push(format!(
+                        "{crashed} proxied call(s) in flight when the previous host stopped were \
+                         closed as crashed (their usage is unknown) and {recovered} as recovered"
+                    )),
+                    Err(err) => notes.push(format!(
+                        "the proxied calls left open by a stopped host could not be closed \
+                         ({err}); they stay open until the next start"
+                    )),
+                }
+            }
+            Err(err) => {
+                // Fall back to an in-memory segment so proxied calls still
+                // meter (their usage rows are in state.db); the records of
+                // this run are lost, and the note says so.
+                notes.push(format!(
+                    "the per-call records store could not be opened ({err}); calls are metered \
+                     but their records are not kept until it opens"
+                ));
+                let _ = write_store.attach_calls(None);
+            }
+        }
         let writer = StoreWriter::spawn(write_store)?;
         let store = SqliteStore::open_read_only(&paths.state_db())?;
         // Story 21-2: the writer publishes the initial Run snapshot (every
@@ -319,7 +356,6 @@ impl Registry {
         // An unreadable Run row degrades the snapshot to empty with a note
         // rather than refusing the open (graceful degradation).
         let publisher = std::sync::Arc::clone(&run_snapshot);
-        let mut notes = notes;
         if let Err(err) = writer.call(move |ctx| {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
             // Story 22-1: the key index loads with the Runs.

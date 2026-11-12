@@ -10,6 +10,7 @@
 //! backend. Budgets and config resolution arrive with their stories.
 
 mod budget;
+pub(crate) mod calls;
 mod bus;
 pub(crate) mod config;
 mod cost;
