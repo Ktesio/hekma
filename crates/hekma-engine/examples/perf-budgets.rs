@@ -2036,27 +2036,27 @@ fn run_ps_scenario(
         Ok(())
     };
 
-    let mut outcome = PsListingOutcome {
-        seed,
-        iterations,
-        open_ms: Vec::with_capacity(iterations),
-        page_ms: Vec::with_capacity(iterations),
-        listed: 0,
-        healthy_open: 0,
-    };
-    measure(&mut outcome)?;
-    // The CI once-retry (the read gate's policy): a first measurement past
-    // the strict budget cools down and re-measures from scratch; the gate
-    // applies to the SECOND run.
-    let first_p99 = outcome.page_p(0.99);
-    if ci && first_p99 >= PS_FIRST_PAGE_BUDGET_MS {
-        note(&format!(
-            "ps gate at-or-over budget on CI (p99 {first_p99:.3} ms; the gate is strict <) — \
-             cooling down {:?} and retrying ONCE (the gate applies to the second run)",
-            READ_RETRY_COOLDOWN
-        ));
-        std::thread::sleep(READ_RETRY_COOLDOWN);
-        outcome = PsListingOutcome {
+    let (outcome, _retried) =
+        measure_ps_with_once_retry(seed, iterations, ci, READ_RETRY_COOLDOWN, measure)?;
+    Ok(outcome)
+}
+
+/// Measure the WHOLE iteration set, and in CI mode re-measure it ONCE
+/// after `cooldown` when the set's p99 is at or over the strict budget (the
+/// read gate's once-retry policy: a co-tenant stall must not red an
+/// ordinary PR; the gate applies to the second set). The decision reads
+/// the full set — a slow tail anywhere in it counts, and one slow cold
+/// sample alone cannot trigger a re-measure before the set exists.
+/// Returns the gated outcome and whether the retry ran.
+fn measure_ps_with_once_retry(
+    seed: u64,
+    iterations: usize,
+    ci: bool,
+    cooldown: Duration,
+    mut measure: impl FnMut(&mut PsListingOutcome) -> Result<(), String>,
+) -> Result<(PsListingOutcome, bool), String> {
+    let mut measure_set = || -> Result<PsListingOutcome, String> {
+        let mut outcome = PsListingOutcome {
             seed,
             iterations,
             open_ms: Vec::with_capacity(iterations),
@@ -2064,12 +2064,23 @@ fn run_ps_scenario(
             listed: 0,
             healthy_open: 0,
         };
-        measure(&mut outcome)?;
+        for _ in 0..iterations.max(1) {
+            measure(&mut outcome)?;
+        }
+        Ok(outcome)
+    };
+    let outcome = measure_set()?;
+    let first_p99 = outcome.page_p(0.99);
+    if ci && first_p99 >= PS_FIRST_PAGE_BUDGET_MS {
+        note(&format!(
+            "ps gate at-or-over budget on CI (p99 {first_p99:.3} ms over {iterations} \
+             iterations; the gate is strict <) — cooling down {cooldown:?} and retrying \
+             the whole set ONCE (the gate applies to the second set)"
+        ));
+        std::thread::sleep(cooldown);
+        return Ok((measure_set()?, true));
     }
-    for _ in 1..iterations {
-        measure(&mut outcome)?;
-    }
-    Ok(outcome)
+    Ok((outcome, false))
 }
 
 /// The `ps_listing` report block (story 21-5) — present ONLY on `--ps-seed`
@@ -2098,6 +2109,7 @@ fn ps_listing_json(outcome: &PsListingOutcome, gates: &GateReport) -> serde_json
             "p95": outcome.open_p(0.95),
             "p99": outcome.open_p(0.99),
         },
+        "ps_first_page_p99_ms": outcome.page_p(0.99),
         "first_page_ms": {
             "note": "the first exceptions page (default limit 50) PLUS its counts — the \
                  exact read `hekma ps` runs, through the read-only engine",
@@ -5742,7 +5754,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn the_ps_percentiles_rank_over_varied_samples() {
         // Pinned after a real bug: the fraction-vs-percent convention
         // collapsed every rank to the minimum (p50 == p95 == p99 == min).
@@ -5847,12 +5858,65 @@ mod tests {
         assert_eq!(json["counts"]["listed"], 400);
         assert_eq!(json["counts"]["healthy_open"], 6_400);
         assert_eq!(json["first_page_ms"]["p99"], 2.0);
+        assert_eq!(
+            json["ps_first_page_p99_ms"], 2.0,
+            "the gated figure under the name the acceptance reads"
+        );
         assert_eq!(json["gates"][0]["name"], "ps_first_page_p99_lt_1s");
         assert_eq!(json["gates"][0]["hard"], true);
         assert_eq!(json["status"], "pass");
         assert_eq!(PS_GATED_METRICS, ["ps_first_page_p99_lt_1s"]);
     }
 
+    /// A scripted page sampler: each call pushes the next scripted page
+    /// figure (and a 1 ms open).
+    fn scripted(figures: Vec<f64>) -> impl FnMut(&mut PsListingOutcome) -> Result<(), String> {
+        let mut figures = figures.into_iter();
+        move |outcome: &mut PsListingOutcome| {
+            outcome.open_ms.push(1.0);
+            outcome
+                .page_ms
+                .push(figures.next().ok_or("the script ran out")?);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_ps_once_retry_reads_the_whole_iteration_set() {
+        // A slow tail at the END of the set (not the first sample) is what
+        // the CI once-retry must see: the whole set is re-measured once and
+        // the gate reads the second set.
+        let mut script = vec![2.0; 39];
+        script.push(5_000.0);
+        script.extend(vec![3.0; 40]);
+        let (outcome, retried) =
+            measure_ps_with_once_retry(10, 40, true, Duration::ZERO, scripted(script)).unwrap();
+        assert!(
+            retried,
+            "a slow tail anywhere in the set triggers the retry"
+        );
+        assert_eq!(
+            outcome.page_ms.len(),
+            40,
+            "the gated set is the full second set"
+        );
+        assert_eq!(outcome.page_p(0.99), 3.0);
+        // A set entirely under budget never retries.
+        let (outcome, retried) =
+            measure_ps_with_once_retry(10, 40, true, Duration::ZERO, scripted(vec![2.0; 40]))
+                .unwrap();
+        assert!(!retried);
+        assert_eq!(outcome.page_ms.len(), 40);
+        // Outside CI mode there is no retry: the slow set is the gated set.
+        let mut slow = vec![2.0; 39];
+        slow.push(5_000.0);
+        let (outcome, retried) =
+            measure_ps_with_once_retry(10, 40, false, Duration::ZERO, scripted(slow)).unwrap();
+        assert!(!retried);
+        assert_eq!(outcome.page_p(0.99), 5_000.0);
+    }
+
+    #[test]
     fn run_exit_code_folds_all_three_red_sources() {
         // Review round 3, pinned so each token has a test that fails if it
         // is deleted: only a fully green run exits 0; ANY one of the three

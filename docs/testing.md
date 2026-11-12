@@ -335,12 +335,18 @@ rest active healthy — each with two bound labels, a stored Policy
 resolution and a subtree rollup on every tenth row. The gate —
 `ps_first_page_p99_lt_1s`, strict `<` — binds only on `--ps-seed` runs
 (the default gated-metric set never carries ps names), with the same CI
-once-retry policy as the read gate. The CI seed is 10000. The
+once-retry policy as the read gate: when the whole iteration set's p99 is
+at or over the budget, the harness cools down and re-measures the whole
+set once, and the gate reads the second set. The report block names the
+gated figure `ps_first_page_p99_ms`. The CI seed is 10000: the
+`perf-budgets` job runs `perf-budgets --ps-seed 10000` as its own blocking
+step (without `--baseline`), and its report, `perf-budgets-ps-report.json`,
+rides the job's artifact beside the default and serve reports. The
 10k/100k/1M ladder belongs to the scale substrate story; the numbers
 below are this harness's own record.
 
-The measured record (local runs; the CI seed leg appends its own via the
-job):
+The measured record (local runs; each CI run's figures are in its job log
+and artifact):
 
 | Date | Platform | seed | open p99 (ms) | first page + counts p50/p95/p99 (ms) | listed / healthy | Verdict |
 |---|---|---|---|---|---|---|
