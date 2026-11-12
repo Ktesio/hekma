@@ -148,10 +148,13 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
-| `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action` and `external_id` | 201 + `Location: /v0/runs/{id}` + the Run |
+| `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action`, `external_id` and `issue_credentials` (default `true`: the response carries the child's Run Key and refresh credential once) | 201 + `Location: /v0/runs/{id}` + the Run |
 | `GET` | `/v0/runs` | The Run listing (below): `?selector=&view=exceptions\|all&limit=&cursor=` — the same document `hekma ps --json` prints | 200 |
 | `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
+| `POST` | `/v0/runs/refresh` | Trade a refresh credential (the bearer) once for a new Run Key and refresh credential (below) | 200 + the new pair |
+| `POST` | `/v0/runs/{id}/revoke-keys` | Revoke a Run's keys, and by default every key issued under them: `{"cascade": bool}` (Operator only, below) | 200 |
+| `GET` | `/v0/runs/{id}/keys` | A Run's credentials by token id, class, state and launch generation, never a value (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
 | `PATCH` | `/v0/runs/{id}/labels` | Bind and unbind labels as the Operator (below): `{"set": {…}, "remove": […], "dry_run": bool}` | 200 + the labels after |
 | `POST` | `/v0/runs/{id}/stop` · `/pause` · `/resume` · `/drain` | A lifecycle verb on one Run (below): the agent's own verb on the Run that owns its process (`stop` takes `{"window_secs"}`, `drain` `{"timeout_ms"}`, as on the instance routes); any other Run is a 409 naming its depth | 200 + `{"schema_version", "run_id", "instance"}` (drain adds `completed`, `waited_ms`) |

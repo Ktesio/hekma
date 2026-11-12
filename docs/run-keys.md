@@ -13,7 +13,7 @@ A **Run Key** is a [Run](runs.md)'s own credential. Whoever holds it can act on 
 
 A Run Key is not yet a replacement for your provider key: today the agent still holds the provider key you configured. Key custody, which puts the Run Key in the agent's API-key slot and keeps the real key inside Hekma, is planned (below).
 
-## What works today
+## What works on main
 
 | Area | What you get now |
 |---|---|
