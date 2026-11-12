@@ -439,10 +439,27 @@ async fn serve_admitted(
     };
     // Re-read after a creation (its publish preceded the ack).
     let snapshot = shared.snapshot.current();
-    let Some(entry) = snapshot.run(&run_id).cloned() else {
+    // A pending Run route (the launch job has not committed yet) has no
+    // entry: the Run is supervised and carries no label yet.
+    let entry = snapshot.run(&run_id).cloned();
+    if entry.is_none() && !snapshot.pending_routes.contains_key(&run_id) {
         drain_request_body(req.into_body()).await;
         return WireError::NoRoute.response();
-    };
+    }
+    let depth = entry
+        .as_ref()
+        .map(|entry| entry.record.control_depth.as_str())
+        .unwrap_or("supervised");
+    let labels: Vec<(String, String)> = entry
+        .as_ref()
+        .map(|entry| {
+            entry
+                .labels
+                .iter()
+                .map(|label| (label.key.clone(), label.value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // The permit: none within 1 s → refused before any dial.
     let Some(permit) = shared.pump.permit().await else {
@@ -459,7 +476,7 @@ async fn serve_admitted(
         call_id: new_call_id(),
         run_id: run_id.clone(),
         token_id: target.token_id.clone(),
-        depth: entry.record.control_depth.as_str(),
+        depth,
         binding: binding.clone(),
         started_at: crate::time::now_rfc3339_micros(),
         started,
@@ -606,11 +623,6 @@ async fn serve_admitted(
                 .headers
                 .insert(HeaderName::from_static(wire::RUN_ID_HEADER), value);
         }
-        let labels: Vec<(String, String)> = entry
-            .labels
-            .iter()
-            .map(|label| (label.key.clone(), label.value.clone()))
-            .collect();
         if let Some(value) = wire::labels_header_value(&labels) {
             parts
                 .headers

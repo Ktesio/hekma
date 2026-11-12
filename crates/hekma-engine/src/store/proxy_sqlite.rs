@@ -181,7 +181,7 @@ impl super::SqliteStore {
     }
 
     /// Record a process-owning Run's upstream (its launch job).
-    pub(crate) fn set_run_upstream(
+    pub(crate) fn record_run_upstream(
         &self,
         run_id: &crate::domain::RunId,
         upstream: Option<&str>,

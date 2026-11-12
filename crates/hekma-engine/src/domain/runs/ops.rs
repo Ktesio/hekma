@@ -430,6 +430,10 @@ pub(crate) struct SupervisedRun {
     /// Run); a fresh Run with `None` resolves with no explicit instance
     /// limits.
     pub inputs: Option<super::policy::ResolveInputs>,
+    /// Story 23-1: the instance's resolved upstream base URL, recorded on
+    /// the Run (the shared proxy's Run route forwards there); `None` keeps
+    /// what is recorded (an adoption) or records none (self-reported).
+    pub upstream: Option<String>,
 }
 
 /// A supervised launch's credentials (story 22-1), value-free: the Run Key
@@ -629,6 +633,14 @@ pub(crate) fn ensure_supervised<S: RunRecords + ?Sized>(
                 run.inputs.clone(),
                 at,
             )?);
+        }
+    }
+    // Story 23-1: the instance's upstream rides the Run (the shared proxy's
+    // Run route forwards there); the freshest entry publishes last.
+    if let Some(upstream) = &run.upstream {
+        store.set_run_upstream(&run.run_id, Some(upstream))?;
+        if let Some(entry) = refreshed_entry(store, &run.run_id)? {
+            changes.entries.push(entry);
         }
     }
     Ok(changes)

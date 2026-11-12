@@ -1431,6 +1431,10 @@ impl RunRecords for SqliteStore {
         super::tokens_sqlite::active_key_rows(self.conn())
     }
 
+    fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError> {
+        self.record_run_upstream(run_id, upstream)
+    }
+
     fn recently_revoked_keys(
         &self,
         since: &str,
