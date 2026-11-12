@@ -255,7 +255,7 @@ fn event_stream(
             };
             Some((
                 Ok(render(frame)),
-                (state, rx, shutdown, selector, None, next_tail),
+                (state, rx, shutdown, selector, replay, next_tail),
             ))
         },
     )
@@ -362,6 +362,61 @@ mod tests {
             rendered.replace("\\\"", "\"").contains(&payload),
             "the payload rides verbatim: {rendered}"
         );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_multi_entry_replay_delivers_every_entry_in_seq_order_before_live() {
+        // The seam's no-gap rule, pinned at the unit level: a resume with
+        // MORE than one replayed entry must deliver ALL of them (in seq
+        // order) before any live event — the replay queue is state, not a
+        // one-shot. (A previous version dropped the queue after the first
+        // frame; the integration test's single-entry replay hid it.)
+        use hekma_engine::{EngineEvent, LifecycleState, TransitionCause, TransitionEvent};
+        let (tx, rx) = broadcast::channel::<(u64, hekma_engine::EngineEvent)>(4);
+        let (state, _shutdown_tx) = quiet_state();
+        let replay: Vec<hekma_engine::OutboxEntry> = [10u64, 11, 12]
+            .into_iter()
+            .map(|seq| hekma_engine::OutboxEntry {
+                schema_version: 1,
+                seq,
+                event: EngineEvent::Transition(TransitionEvent::new(
+                    "probe",
+                    LifecycleState::Registered,
+                    LifecycleState::Starting,
+                    TransitionCause::Command {
+                        command: format!("start-{seq}"),
+                    },
+                    "2026-11-12T00:00:00Z",
+                )),
+            })
+            .collect();
+        let mut stream = event_stream(state, rx, None, Some(replay.into_iter())).boxed();
+        for expected in [10u64, 11, 12] {
+            let frame = StreamExt::next(&mut stream).await.unwrap().unwrap();
+            let rendered = format!("{frame:?}");
+            assert!(rendered.contains(&format!("id: {expected}")), "{rendered}");
+            assert!(
+                rendered.contains(&format!("start-{expected}")),
+                "the replayed payload rides verbatim: {rendered}"
+            );
+        }
+        // The replay exhausted: the live tail delivers next, deduped
+        // against nothing yet (the replayed tail was 12).
+        tx.send((
+            13,
+            EngineEvent::Transition(TransitionEvent::new(
+                "probe",
+                LifecycleState::Starting,
+                LifecycleState::Running,
+                TransitionCause::AdapterReady,
+                "2026-11-12T00:00:01Z",
+            )),
+        ))
+        .unwrap();
+        let frame = StreamExt::next(&mut stream).await.unwrap().unwrap();
+        let rendered = format!("{frame:?}");
+        assert!(rendered.contains("id: 13"), "{rendered}");
         drop(tx);
     }
 
