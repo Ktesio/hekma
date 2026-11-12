@@ -4312,6 +4312,45 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
     for row in results["results"].as_array().unwrap() {
         assert_eq!(row["limits"]["run_scoped"], true, "{row}");
     }
+    // A cumulative ceiling over the set: the owner takes it, the child is
+    // its own refusal.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/limits",
+        serde_json::json!({"set_token": token, "tokens_cumulative": 9_000_000}),
+    );
+    assert_eq!(status, 200, "{results}");
+    let rows = results["results"].as_array().unwrap();
+    let child_row = rows
+        .iter()
+        .find(|row| row["run_id"] == child.as_str())
+        .unwrap();
+    assert_eq!(child_row["error"]["code"], "scope-unavailable", "{results}");
+    // Close over a set: a closable child closes, the owner is refused.
+    let (status, extra) = json(
+        "POST",
+        "/v0/runs",
+        serde_json::json!({"parent_instance": "setter", "labels": {"task": "x"}}),
+    );
+    assert_eq!(status, 201, "{extra}");
+    let (status, document) = json(
+        "POST",
+        "/v0/runs/select",
+        serde_json::json!({"selector": "task=x"}),
+    );
+    assert_eq!(status, 200);
+    let token = document["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/close",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "close");
+    assert_eq!(results["results"][0]["outcome"], "closed");
+    assert_eq!(results["results"][0]["run"]["status"], "ended");
+
     // Labels over the set: one PATCH.
     let token = select()["token"].as_str().unwrap().to_string();
     let (status, results) = json(

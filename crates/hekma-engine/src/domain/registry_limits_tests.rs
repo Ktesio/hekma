@@ -1070,3 +1070,177 @@ fn a_corrupt_limit_row_is_a_typed_store_error() {
         .unwrap_err();
     assert!(err.to_string().contains("explode"), "{err}");
 }
+
+#[test]
+fn the_budget_jobs_edges_mixed_moves_stored_inputs_and_runs_without_an_agent() {
+    use crate::domain::runs::limits;
+    for direction in [
+        LimitsDirection::Raised,
+        LimitsDirection::Lowered,
+        LimitsDirection::Cleared,
+        LimitsDirection::Set,
+        LimitsDirection::Unchanged,
+    ] {
+        assert!(!direction.as_str().is_empty());
+    }
+    // Every field sets, clears and round-trips its wire form.
+    let full = RunLimits {
+        token_per_run: Some(1),
+        dollar_per_run_micros: Some(Micros(2)),
+        token_cumulative: Some(3),
+        dollar_cumulative_micros: Some(Micros(4)),
+        breach_action: Some(BreachAction::Stop),
+    };
+    for field in RunLimitField::ALL {
+        assert_eq!(RunLimitField::from_wire(field.as_str()), Some(field));
+        let change = RunLimitChange {
+            set: full,
+            clear: vec![field],
+        };
+        assert!(change.validate().is_err(), "{field:?} both set and cleared");
+        let cleared = RunLimitChange {
+            set: RunLimits::default(),
+            clear: vec![field],
+        }
+        .merged_over(&full);
+        assert_ne!(cleared, full, "{field:?}");
+    }
+    assert_eq!(RunLimitField::from_wire("rate"), None);
+    assert_eq!(
+        limits(RunLimits::default()).merged_over(&full),
+        full,
+        "an empty set keeps every field"
+    );
+
+    // A mixed move (one limit lowered, another cleared) is `set`.
+    let seeded = seed();
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(9_000_000),
+            dollar_per_run_micros: Some(Micros(9_000_000)),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        RunLimitChange {
+            set: RunLimits {
+                token_per_run: Some(8_000_000),
+                ..RunLimits::default()
+            },
+            clear: vec![RunLimitField::DollarsPerRun],
+        },
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(outcome.direction, LimitsDirection::Set);
+
+    // With no caller context the Run's stored inputs resolve it, and a
+    // `block` refusal names the Metering Source from the wire path.
+    let no_wire = seed_with(1, 1, false);
+    let planned = no_wire
+        .registry
+        .plan_run_limits(
+            &no_wire.run,
+            &limits(RunLimits {
+                token_per_run: Some(5),
+                ..RunLimits::default()
+            }),
+            LimitActor::Operator,
+            None,
+        )
+        .unwrap();
+    assert!(planned.dry_run);
+    let err = no_wire
+        .registry
+        .plan_run_limits(
+            &no_wire.run,
+            &limits(RunLimits {
+                breach_action: Some(BreachAction::Block),
+                ..RunLimits::default()
+            }),
+            LimitActor::Operator,
+            None,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("self-reported"), "{err}");
+    let wired = seed();
+    let child = add_child(&wired, true);
+    let err = wired
+        .registry
+        .plan_run_limits(
+            &child,
+            &limits(RunLimits {
+                token_per_run: Some(5),
+                breach_action: Some(BreachAction::Stop),
+                ..RunLimits::default()
+            }),
+            LimitActor::Operator,
+            None,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("engine-observed"), "{err}");
+
+    // The budget read with an unreadable configuration says so and falls
+    // back to the stored inputs.
+    let view = limits::limits_view(
+        wired.registry.reader(),
+        &wired.run,
+        Some(Err("bad toml".into())),
+    )
+    .unwrap();
+    assert!(view.notes.iter().any(|note| note.contains("bad toml")));
+    let view = limits::limits_view(wired.registry.reader(), &wired.run, None).unwrap();
+    assert!(view.cumulative_usage.is_some());
+
+    // A Run with no agent: nothing to re-arm, no cumulative usage.
+    let orphan = RunId::mint();
+    let mut row = record(&orphan, false, true, None);
+    row.instance = None;
+    wired
+        .registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().insert_run(&crate::ports::NewRun {
+                record: row,
+                labels: Vec::new(),
+                limits: Default::default(),
+                identity: None,
+            })
+        })
+        .unwrap();
+    let outcome = set(
+        &wired.registry,
+        &orphan,
+        limits(RunLimits {
+            token_per_run: Some(5),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        InstanceContext::default(),
+    )
+    .unwrap();
+    assert!(outcome.fired.is_empty() && outcome.re_armed.is_empty());
+    let planned = wired
+        .registry
+        .plan_run_limits(
+            &orphan,
+            &limits(RunLimits {
+                token_per_run: Some(1),
+                ..RunLimits::default()
+            }),
+            LimitActor::Operator,
+            None,
+        )
+        .unwrap();
+    assert!(planned.fired.is_empty());
+    let view = wired.registry.run_limits_view(&orphan).unwrap();
+    assert!(view.cumulative_usage.is_none());
+}

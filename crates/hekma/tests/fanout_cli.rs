@@ -316,3 +316,124 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
     assert_eq!(doc["results"][0]["outcome"], "drained");
     assert_eq!(doc["results"][0]["instance"]["state"], "stopped");
 }
+
+#[test]
+fn one_run_targets_plan_refuse_and_answer_as_json_unix() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        return;
+    }
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    let hekma = |args: &[&str]| run_hekma_agent(args, &ctx.project_dir, state_dir);
+    let _cleanup = Cleanup {
+        ctx: &ctx.project_dir,
+        state: state_dir,
+        agents: vec!["solo"],
+    };
+    let manifest = ctx.project_dir.join("solo");
+    std::fs::create_dir_all(&manifest).unwrap();
+    ManifestFixture::new("solo", &["--linger-ms", "600000"])
+        .guaranteed_on_all_oses("pause")
+        .guaranteed_on_all_oses("interaction")
+        .write(&manifest);
+    let run = hekma(&[
+        "agent",
+        "register",
+        "solo",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "config", "set", "solo", "labels.team", "solo"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&["agent", "start", "solo", "--detach"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&[
+        "run",
+        "open",
+        "--parent",
+        "solo",
+        "--label",
+        "team=solo",
+        "--json",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let opened = json(&run.stdout);
+    let child = opened["run"]["run_id"].as_str().unwrap().to_string();
+    let owner = opened["run"]["parent_run_id"].as_str().unwrap().to_string();
+
+    // One target's dry run: planned, nothing changed.
+    let run = hekma(&["agent", "stop", &owner, "--dry-run"]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("would stop (agent solo)"),
+        "{}",
+        run.stdout
+    );
+    let run = hekma(&["agent", "stop", &child, "--dry-run", "--json"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert_eq!(
+        json(&run.stdout)["results"][0]["error"]["code"],
+        "verb-unavailable"
+    );
+    // An agent name with --json acts through its Run.
+    let run = hekma(&["agent", "pause", "solo", "--json"]);
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(json(&run.stdout)["results"][0]["outcome"], "paused");
+    // The host's refusal of a child: as JSON and as a diagnostic.
+    let run = hekma(&["agent", "pause", &child, "--json"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert_eq!(json(&run.stdout)["results"][0]["outcome"], "refused");
+    let run = hekma(&["agent", "stop", &child]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    // The agent's own verb refusing (pause of a paused agent) as JSON.
+    let run = hekma(&["agent", "pause", &owner, "--json"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert_eq!(json(&run.stdout)["results"][0]["error"]["code"], "engine");
+    let run = hekma(&["agent", "resume", &owner]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(run.stdout.contains("Resumed Run"), "{}", run.stdout);
+
+    // The budget read renders a latched breach and pages a Selector.
+    let run = hekma(&["budget", "set", &owner, "--tokens-per-run", "0", "--yes"]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stdout.contains("breach: tokens per-run"),
+        "{}",
+        run.stdout
+    );
+    let run = hekma(&["budget", "show", "--selector", "team=solo", "--limit", "1"]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(run.stderr.contains("--cursor"), "{}", run.stderr);
+    let run = hekma(&["budget", "show", "--selector", "team=solo"]);
+    assert!(
+        run.stdout
+            .contains("latched            tokens per-run (warn)"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.stdout.matches("Run run_").count(), 2, "{}", run.stdout);
+
+    // Close: a dry run per target, and a Selector without --json prints
+    // the refusal it met.
+    let run = hekma(&["run", "close", &owner, "--dry-run", "--json"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert_eq!(
+        json(&run.stdout)["results"][0]["error"]["code"],
+        "owns-process"
+    );
+    let run = hekma(&["run", "close", &child, "--dry-run"]);
+    assert!(run.success, "{}", run.stderr);
+    assert!(run.stdout.contains("would close"), "{}", run.stdout);
+    let run = hekma(&["run", "close", "--selector", "team=solo", "--dry-run"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    let run = hekma(&["run", "close", "--selector", "team=solo", "--yes"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert!(run.stderr.contains("not closed"), "{}", run.stderr);
+    assert!(run.stdout.contains("closed"), "{}", run.stdout);
+    // A run id stop and drain answer as the agent's verbs do.
+    let run = hekma(&["agent", "stop", &owner, "--timeout", "2"]);
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(run.stdout.lines().last(), Some("stopped"), "{}", run.stdout);
+}
