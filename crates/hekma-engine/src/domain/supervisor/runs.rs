@@ -202,6 +202,33 @@ impl Supervisor {
         actor: crate::domain::LimitActor,
         dry_run: bool,
     ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        self.set_run_limits_guarded(registry, run_ids, change, actor, None, dry_run)
+    }
+
+    /// [`Self::set_run_limits`] as a [`crate::domain::RunActor`] (story
+    /// 22-1): a Caller's key is re-validated inside each Run's job.
+    pub(crate) fn set_run_limits_as(
+        &mut self,
+        registry: &Registry,
+        run_ids: &[RunId],
+        change: &crate::domain::RunLimitChange,
+        actor: crate::domain::RunActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        let limit_actor = actor.limit_actor();
+        let guard = matches!(actor, crate::domain::RunActor::Caller { .. }).then_some(actor);
+        self.set_run_limits_guarded(registry, run_ids, change, limit_actor, guard, dry_run)
+    }
+
+    fn set_run_limits_guarded(
+        &mut self,
+        registry: &Registry,
+        run_ids: &[RunId],
+        change: &crate::domain::RunLimitChange,
+        actor: crate::domain::LimitActor,
+        guard: Option<crate::domain::RunActor>,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
         change.validate()?;
         let mut results = Vec::with_capacity(run_ids.len());
         for run_id in run_ids {
@@ -218,11 +245,17 @@ impl Supervisor {
                 }
             };
             if dry_run {
-                let planned = registry.plan_run_limits(run_id, change, actor, context.as_ref());
+                let planned = registry.plan_run_limits_guarded(
+                    run_id,
+                    change,
+                    actor,
+                    context.as_ref(),
+                    guard.as_ref(),
+                );
                 results.push((run_id.clone(), planned));
                 continue;
             }
-            match registry.apply_run_limits(run_id, change, actor, context) {
+            match registry.apply_run_limits_guarded(run_id, change, actor, context, guard.clone()) {
                 Ok(applied) => {
                     self.publish_and_act(
                         registry,
@@ -581,6 +614,145 @@ impl Supervisor {
         })?;
         self.publish_run_events(events);
         registry.run_view(&opened)
+    }
+
+    /// Open a child Run as `actor` (story 22-1) and publish its events. The
+    /// credentials, when asked for, are minted HERE, before the job (an RNG
+    /// failure refuses with nothing written), and only their hashes enter it.
+    pub(crate) fn open_child_run_as(
+        &self,
+        registry: &Registry,
+        actor: crate::domain::RunActor,
+        request: ChildRunRequest,
+    ) -> Result<crate::domain::OpenedRun, RunError> {
+        use crate::domain::credential::{mint, IssuedCredentials, TokenClass};
+        let minted = if request.issue_credentials {
+            Some((mint(TokenClass::RunKey)?, mint(TokenClass::Refresh)?))
+        } else {
+            None
+        };
+        let stubs = minted
+            .as_ref()
+            .map(|(key, refresh)| (key.stub(), refresh.stub()));
+        let run_id = RunId::mint();
+        let parent_instance = match &request.parent {
+            crate::domain::RunParent::Instance(instance) => Some(instance.clone()),
+            crate::domain::RunParent::Run(id) => {
+                registry.run_record(id)?.and_then(|record| record.instance)
+            }
+        };
+        let inputs = parent_instance
+            .as_deref()
+            .and_then(|instance| InstanceName::new(instance).ok())
+            .map(|name| registry.resolve_inputs_fail_closed(&name));
+        let ((opened, issued), events) = registry.run_job(move |store| {
+            runs::keys::open_child_as(
+                store,
+                &actor,
+                &request,
+                run_id,
+                inputs,
+                stubs,
+                &crate::time::now_rfc3339(),
+            )
+        })?;
+        self.publish_run_events(events);
+        let view = registry.run_view(&opened)?;
+        let credentials = match (issued, minted) {
+            (true, Some((key, refresh))) => Some(IssuedCredentials::new(opened, key, refresh)),
+            _ => None,
+        };
+        Ok(crate::domain::OpenedRun { view, credentials })
+    }
+
+    /// Close a child Run as `actor` (story 22-1) and publish its events.
+    pub(crate) fn close_run_as(
+        &self,
+        registry: &Registry,
+        actor: crate::domain::RunActor,
+        run_id: &RunId,
+    ) -> Result<RunView, RunError> {
+        let id = run_id.clone();
+        let ((), events) = registry.run_job(move |store| {
+            let changes = runs::keys::close_as(store, &actor, &id, &crate::time::now_rfc3339())?;
+            Ok(((), changes))
+        })?;
+        self.publish_run_events(events);
+        registry.run_view(run_id)
+    }
+
+    /// The refresh job (story 22-1): trade an active refresh credential for
+    /// a new pair, once. The new pair is minted before the job. A reuse
+    /// commits its revocations and Anomaly and answers `credential-revoked`.
+    pub(crate) fn refresh_credentials(
+        &self,
+        registry: &Registry,
+        presented: &crate::domain::SecretString,
+    ) -> Result<crate::domain::IssuedCredentials, RunError> {
+        use crate::domain::credential::{hash_presented, mint, IssuedCredentials, TokenClass};
+        let key = mint(TokenClass::RunKey)?;
+        let refresh = mint(TokenClass::Refresh)?;
+        let pair = (key.stub(), refresh.stub());
+        let hash = hash_presented(presented);
+        let (result, events) = registry.run_job(move |store| {
+            runs::keys::refresh(store, &hash, pair, &crate::time::now_rfc3339())
+        })?;
+        self.publish_run_events(events);
+        let run_id = result?;
+        Ok(IssuedCredentials::new(run_id, key, refresh))
+    }
+
+    /// The Operator's `revoke-keys` job (story 22-1).
+    pub(crate) fn revoke_run_keys(
+        &self,
+        registry: &Registry,
+        run_id: &RunId,
+        cascade: bool,
+    ) -> Result<crate::domain::RevokeOutcome, RunError> {
+        let id = run_id.clone();
+        let (outcome, events) = registry.run_job(move |store| {
+            runs::keys::revoke_keys(store, &id, cascade, &crate::time::now_rfc3339())
+        })?;
+        self.publish_run_events(events);
+        Ok(outcome)
+    }
+
+    /// Revoke credentials seen in a URL (story 22-1). Returns how many were
+    /// revoked (a used refresh credential so seen is reuse, which revokes its
+    /// launch's live pair too). Only a value that resolves to an ACTIVE credential or a USED
+    /// refresh credential (one read on the registry's read-only connection)
+    /// reaches the store writer: unknown or already revoked values cost no
+    /// job.
+    pub(crate) fn revoke_exposed(
+        &self,
+        registry: &Registry,
+        presented: &[crate::domain::SecretString],
+    ) -> Result<usize, RunError> {
+        let mut hashes = Vec::new();
+        for secret in presented {
+            if matches!(
+                crate::domain::registry_keys::presented_state(&registry.store, secret)?,
+                crate::domain::PresentedState::Active(_) | crate::domain::PresentedState::Used(_)
+            ) {
+                hashes.push(crate::domain::credential::hash_presented(secret));
+            }
+        }
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        let (count, events) = registry.run_job(move |store| {
+            let changes = runs::keys::revoke_exposed(store, &hashes, &crate::time::now_rfc3339())?;
+            let revoked = changes
+                .credentials
+                .iter()
+                .filter(|event| {
+                    event.change == crate::domain::credential::CredentialChange::Revoked
+                })
+                .count();
+            Ok((revoked, changes))
+        })?;
+        self.publish_run_events(events);
+        Ok(count)
     }
 
     /// Close a child Run and publish its `ended` event.

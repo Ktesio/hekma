@@ -9,6 +9,7 @@ mod run_store_sqlite;
 mod runs_sqlite;
 pub(crate) use runs_sqlite::BreachDefaultSource;
 mod sqlite;
+mod tokens_sqlite;
 pub(crate) mod writer;
 
 pub(crate) use run_store_sqlite::{LegacyLogs, LegacyOutbox, LegacySource};

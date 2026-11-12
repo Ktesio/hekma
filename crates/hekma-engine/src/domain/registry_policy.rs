@@ -1379,7 +1379,7 @@ impl Registry {
         match result {
             Ok(committed) => {
                 for (event, append) in committed {
-                    self.note_open_event(append.seq, EngineEvent::Run(event));
+                    self.note_open_event(append.seq, event);
                 }
             }
             Err(err) => self.push_open_note(format!(

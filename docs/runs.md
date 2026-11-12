@@ -92,6 +92,8 @@ hekma budget set --selector team=core --clear tokens-per-run --yes
 
 A limit set on a Run outranks the agent's `budget.*` configuration and every Policy for that limit. It **belongs to the Run**, like a label set with `hekma label`: a crash relaunch keeps it, it ends with the Run, and a new `start` opens a new Run without it, so every result says it is Run-scoped (`run_scoped` and a note in `--json`). For limits every future Run should carry, set the agent's `budget.*` configuration or a [Policy](policies.md). Cumulative ceilings go on an agent's own Run only (they count the agent's lifetime usage); a child Run takes per-run ceilings. A raised ceiling above the usage re-arms its breach at once and lifts a matching `block` fence; one lowered to or below the usage breaches at once and applies the Breach Action, with no wait for the next model call. `--clear` hands a limit back to the next layer, which may raise or lower it. A limit a Caller sets is kept apart and applies only while it is tighter than the one the Operator, the Host or a Policy sets. Each change is one `limits-changed` Run event naming the Run's limits before and after. Over a Selector, `set` confirms like every set-taking verb; `show` with a Selector, or with no target, lists Runs as `hekma ps --all` does and pages with `--limit` and `--cursor`.
 
+<a id="run-keys"></a>**Every Run has a Run Key.** Each supervised launch gets its own [Run Key](run-keys.md) in `HEKMA_RUN_KEY`, and a child Run opened over the Control API gets its own Run Key and refresh credential once. A Run Key acts as its Run's Caller: it may open child Runs beneath its Run, close them and tighten their limits, and nothing else. Keys are stored as hashes, revoked when their process exits, when their Run ends, or with `hekma run revoke-keys`; `hekma run keys` lists them by token id. A used refresh credential presented again raises the `credential-reuse` Anomaly.
+
 ## What is coming
 
 A **Run** is one unit of agent work with a stable run id, a Control Depth, labels, budgets and a Run Status, whether or not Hekma started its process: a supervised agent, a child Run inside a Host or framework flow, or a client Hekma found.
@@ -100,6 +102,7 @@ A **Run** is one unit of agent work with a stable run id, a Control Depth, label
 |---|---|
 | Runs for supervised agents, run ids, labels from configuration, parent and child Runs, `hekma label` with `--selector`, `--dry-run` and `--yes` | On main |
 | `hekma ps`, Selectors on listings | On main |
+| Run Keys: a key per launch, child Run credentials, refresh, revocation | On main |
 | Selectors, `--dry-run` and `--yes` on `stop`, `pause`, `resume`, `drain` and `run close`; `hekma budget` | On main |
 | Hold, release, reroute and reject on a set | In development |
 | `hekma top` | Planned |

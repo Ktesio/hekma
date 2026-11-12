@@ -51,7 +51,7 @@ pub const USAGE_SCHEMA_VERSION: u32 = 1;
 pub struct RunId(String);
 
 /// The Crockford base32 alphabet a ULID renders in (no I, L, O, U).
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// Process-global counter mixed into a mint when the OS random source fails,
 /// so a degraded mint is still unique within the process (see [`RunId::mint`]).

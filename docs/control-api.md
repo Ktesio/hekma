@@ -93,19 +93,31 @@ Every route on every listener — `/v0/version` included — requires
 `Authorization: Bearer <token>`. Credentials go through one **credential
 resolver**: it holds the SHA-256 of each credential with its **class**, hashes
 the presented value and compares it in constant time against every entry, then
-checks the class against the authority matrix for the surface. Today one class
-is issued — the **operator/Host bearer** — and it carries two credentials: the
-local endpoint's token (from `control.json`) and the `--bearer-secret` value.
-Both work on both listeners and on every route. The other credential classes
-(announce-scoped credentials, Run Keys, refresh credentials, Node
-credentials) arrive with their stories; a credential whose class a surface
-does not allow will answer a typed `403 forbidden` (reserved — no issued
-class can reach it yet).
+checks the class against the authority matrix for the route's family. The
+**operator/Host bearer** class carries two credentials: the local endpoint's
+token (from `control.json`) and the `--bearer-secret` value. Both work on both
+listeners. [Run Keys](#run-keys) and refresh credentials are issued by the
+engine and resolved by their hash; a credential whose class a route does not
+allow answers a typed `403 forbidden`. Announce and Node credentials arrive
+later.
 
 A missing or wrong credential — including several `Authorization` fields, a
-scheme other than `Bearer`, or an empty value — answers `401` with a
-`WWW-Authenticate: Bearer` challenge and a static refusal body that never
-echoes the presented token. No handler runs for an unauthenticated request,
+scheme other than `Bearer`, or an empty value — answers `401 unauthorized` with
+a `WWW-Authenticate: Bearer` challenge and a static refusal body that never
+echoes the presented token; a revoked one answers `401 credential-revoked`.
+Unrecognised presentations are counted, never logged: the host writes at most
+one diagnostic line a minute with the counts by class prefix, and no value.
+An engine-issued credential is recognised from an in-memory index or one
+read-only database lookup before anything is locked or written, so a flood of
+made-up tokens costs reads only and never delays the engine's own writes. If
+that lookup itself fails, the request answers `500` with code `store` and a
+fixed message; the cause goes to the host's diagnostics, never to the client.
+The same is true one layer in: a store failure under an authenticated Run
+Key's or refresh credential's request answers the same fixed `store` 500 —
+the store's text is the Operator's, and the operator bearer's own requests
+keep the surfaced reason.
+A credential in a path or query is refused before authentication (see
+[Never in a URL](#never-in-a-url)). No handler runs for an unauthenticated request,
 and no secret VALUE ever enters a response, a log line, or an SSE frame — the
 API projects no secret reveal at all (a `secret:NAME` config value renders
 masked, exactly as the CLI displays it).
@@ -136,10 +148,13 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/events` | The live SSE stream (below) | 200, stays open |
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
-| `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action` and `external_id` | 201 + `Location: /v0/runs/{id}` + the Run |
+| `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action`, `external_id` and `issue_credentials` (default `true`: the response carries the child's Run Key and refresh credential once) | 201 + `Location: /v0/runs/{id}` + the Run |
 | `GET` | `/v0/runs` | The Run listing (below): `?selector=&view=exceptions\|all&limit=&cursor=` — the same document `hekma ps --json` prints | 200 |
 | `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
+| `POST` | `/v0/runs/refresh` | Trade a refresh credential (the bearer) once for a new Run Key and refresh credential (below) | 200 + the new pair |
+| `POST` | `/v0/runs/{id}/revoke-keys` | Revoke a Run's keys, and by default every key issued under them: `{"cascade": bool}` (Operator only, below) | 200 |
+| `GET` | `/v0/runs/{id}/keys` | A Run's credentials by token id, class, state and launch generation, never a value (Operator only, below) | 200 |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
 | `PATCH` | `/v0/runs/{id}/labels` | Bind and unbind labels as the Operator (below): `{"set": {…}, "remove": […], "dry_run": bool}` | 200 + the labels after |
 | `POST` | `/v0/runs/{id}/stop` · `/pause` · `/resume` · `/drain` | A lifecycle verb on one Run (below): the agent's own verb on the Run that owns its process (`stop` takes `{"window_secs"}`, `drain` `{"timeout_ms"}`, as on the instance routes); any other Run is a 409 naming its depth | 200 + `{"schema_version", "run_id", "instance"}` (drain adds `completed`, `waited_ms`) |
@@ -189,7 +204,9 @@ labels. `token_budget` and `dollar_cap` (a dollar string) are per-run ceilings
 over the child and its own children; they take `breach_action` `warn` (the
 default) — `pause`, `stop` and `block` are refused for a child Run today.
 A retried request with the same `external_id` answers `201` with the same
-Run. The response (and `GET /v0/runs/{id}`) is
+Run. External ids are scoped by who opens: the operator bearer and Hosts
+share one namespace, and each Run's keys have their own, so a Run Key can
+neither take over nor discover an id the Operator or a Host uses. The response (and `GET /v0/runs/{id}`) is
 `{"schema_version": 1, "run": {…}}`: the run id, `control_depth`,
 `wire_path`, `status`, `anomalies`, `parent_run_id`, `instance`,
 `process_owner`, `end_cause`, timestamps, `labels` (each with its `source`),
@@ -220,6 +237,115 @@ Run refusals carry a stable `error.code` beside the `kind`:
 | `label-not-bound` | 409 | `remove` names a label the Run set about itself (a caller label) |
 | `label-bound` | 409 | A caller label names a key already bound on the Run |
 | `instance-not-found` | 404 | No agent has the name given as a label target |
+| `run-out-of-scope` | 403 | A Run Key acting on a Run outside its own Run's subtree |
+| `forbidden` | 403 | A credential class the route's family does not allow |
+| `unauthorized` | 401 | An unknown credential |
+| `credential-revoked` | 401 | A revoked credential, a used refresh credential, or a key revoked while its request waited |
+| `too-many-children` | 409 | A Run Key opening a 1001st open child under one parent |
+| `credential-unavailable` | 503 | The operating system's random source failed, so no credential was issued and nothing changed |
+| `credential-in-url` | 400 | A credential in the path or query (it is revoked) |
+
+### Run Keys
+
+A **Run Key** (`hk_run_…`) is a Run's own credential (see
+[Run Keys](run-keys.md)). Every supervised launch gets one in
+`HEKMA_RUN_KEY`; `POST /v0/runs` returns one for the child it opens, with a
+refresh credential (`hk_ref_…`), unless the body sets
+`"issue_credentials": false`:
+
+```json
+{
+  "schema_version": 1,
+  "run": { "run_id": "run_…", "…": "…" },
+  "credentials": {
+    "run_key": "hk_run_…",
+    "refresh_credential": "hk_ref_…",
+    "token_id": "3f9a1c0b7d2e",
+    "refresh_token_id": "a81b44c90f13"
+  }
+}
+```
+
+The `credentials` object appears in that `201` only (and the refresh `200`,
+both with `Cache-Control: no-store`); no other route, event, SSE frame or
+export row ever carries a value. A retried `external_id` returns the existing
+Run with no `credentials`.
+
+**The authority matrix.** Every route belongs to one family, and every
+credential class is allowed on some families only:
+
+| Class | Operator routes | `POST /v0/runs` | `POST /v0/runs/{id}/close` | `PATCH /v0/runs/{id}/limits` | `POST /v0/runs/refresh` |
+|---|---|---|---|---|---|
+| Operator/Host bearer | yes | yes | yes | yes | `403 forbidden` |
+| Run Key | `403 forbidden` | within its subtree | within its subtree | tighten only, within its subtree | `403 forbidden` |
+| Refresh credential | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` | yes |
+| Announce credential | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` | `403 forbidden` |
+
+"Operator routes" is everything else: the fleet, instances, configuration,
+labels, Policies, the listing, `GET /v0/runs/{id}`, events, export, the
+lifecycle and Selector-set routes, `revoke-keys` and `keys`. A Run Key acts
+as its Run's **Caller**: it may open a child under its own Run or a
+descendant (the child's labels are caller labels, and its own pair comes back
+once), close a descendant, and tighten limits on its subtree — never raise
+one (`403 raise-forbidden`). Any other Run is `403 run-out-of-scope`. A Run
+Key may keep at most 1000 open children under one parent (`409
+too-many-children`); the operator bearer is not capped. A supervised agent's
+key, and its refresh credential, are refused (`401 unauthorized`) on a
+`--listen` listener that is not loopback; a listener bound to `0.0.0.0`
+counts as beyond loopback, whatever address a request arrives from. Every Run Key request re-checks the key inside its own write, so a
+request that arrives just after a revocation is refused and changes nothing,
+whatever it names: a child open whose parent does not resolve, or that
+retries an `external_id`, is refused too.
+
+```text
+POST /v0/runs/refresh                    Authorization: Bearer hk_ref_…
+POST /v0/runs/{id}/revoke-keys           {"cascade": true}   (operator bearer)
+GET  /v0/runs/{id}/keys                                      (operator bearer)
+```
+
+`POST /v0/runs/refresh` trades the presented refresh credential for a new
+pair once (`{"schema_version":1,"run_id":…,"credentials":{…}}`); the old Run
+Key is refused from the next request on. A used refresh credential presented
+again revokes the current pair of its own launch (for a Run opened over the
+Control API, the Run's current pair) and every used refresh credential of the
+Run, raises the `credential-reuse` Anomaly and answers `401
+credential-revoked`. A later launch's key is never revoked by an earlier
+launch's credential. A used refresh credential also leaves service wherever
+the credentials it belonged to do: at its launch's exit, at its Run's end,
+and under a `revoke-keys` cascade. Seen in a URL it is reuse evidence — only
+a holder of the value can put it there — and takes the same response as
+presenting it (see [Never in a URL](#never-in-a-url)). `revoke-keys` revokes the Run's active credentials and its
+used refresh credentials, so none of them can trigger a reuse later, and, unless `"cascade": false`, every credential issued under any
+credential the Run held; it answers `{"schema_version":1,"run_id":…,
+"cascade":true,"revoked":[{"run_id":…,"class":"run-key","token_id":…,
+"cascaded":false},…],"reuse_cleared":false}` once the revocation is committed,
+and clears `credential-reuse`. `keys` lists a Run's credentials — token id,
+class (`run-key`, `refresh`, `announce`), state (`active`, `retired`,
+`revoked`), launch generation, `issued_by` (a token id), times and the
+revocation cause — never a value or a hash.
+
+### Never in a URL
+
+A request whose path or query carries an `hk_run_`, `hk_ref_` or `hk_ann_`
+token, raw or percent-encoded, answers `400 credential-in-url` with a static
+body before it is authenticated, and a complete active token so exposed is
+revoked (cause `exposed-in-url`). A used refresh credential so exposed is
+reuse evidence — only a holder of the value can put it there — so it takes
+the same response as presenting it on the refresh route: the current pair of
+its own launch is revoked, every used refresh credential of the Run is
+revoked, a `reuse-detected` credential event is written and the
+`credential-reuse` Anomaly is raised while the Run is open; one unauthenticated
+request cannot quietly disarm the detection. A token-shaped value that was
+never issued, or is already revoked, is refused and changes nothing. The scan
+keeps at most 16 distinct tokens per URL; a request carrying more is refused
+all the same, and the host writes a rate-limited diagnostic saying how many
+it could not revoke. The per-agent metering listener applies the same rule: it
+answers a typed `hekma_credential_in_url` error, forwards nothing, and the
+engine revokes the exposed credential within a moment (on its next poll,
+about a quarter of a second). Between two polls the listener holds at most 64
+distinct exposed values (and 16 per URL, the scan's own cap); past that it
+still refuses the request, and the next poll writes a diagnostic saying how
+many it could not revoke.
 
 ### The Run listing
 
@@ -453,7 +579,8 @@ layer: without a valid bearer, any path answers `401` first.
 | `kind` | Status | When |
 |--------|--------|------|
 | `unauthorized` | 401 | Missing or wrong bearer (with the `WWW-Authenticate: Bearer` challenge) — including an ambiguous request carrying MULTIPLE `Authorization` headers (refused, never first-wins; the scheme itself is case-insensitive per RFC 9110) |
-| `forbidden` | 403 | Reserved: a valid credential whose class the surface does not allow (no issued class reaches it today) |
+| `forbidden` | 403 | A valid credential whose class the route's family does not allow (a Run Key or refresh credential on an Operator route, the operator bearer on `POST /v0/runs/refresh`), or a Run Key outside its subtree (`run-out-of-scope`) |
+| `unavailable` | 503 | No credential could be issued: the operating system's random source failed (`credential-unavailable`) |
 | `invalid_body` | 400 | A body/query failed validation: malformed JSON, `kind`+`manifest` together, `window_secs` out of bounds, malformed cursor, a RELATIVE `manifest` path, an unknown memory kind or restart policy, a `disposition`/`force` value outside its set |
 | `invalid_body` | 415 / 422 | A body the extractors reject: no usable content-type (415), or JSON that does not fit the route's type (422) |
 | `invalid_name` | 400 | The instance name is not a legal name |

@@ -188,7 +188,7 @@ fn outcome_row(outcome: &RunLimitsOutcome) -> ActResult {
 /// `hekma budget set <TARGET|--selector SEL> …`.
 pub fn set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
     let change = change_from(&args)?;
-    let target = Target::parse(args.target.as_deref(), args.selector.as_deref())?;
+    let target = Target::parse(args.target.as_deref(), args.selector.as_deref())?.prefer_agent();
     let flags = FanoutFlags {
         dry_run: args.dry_run,
         yes: args.yes,
@@ -402,7 +402,7 @@ struct ShowDocument<'a> {
 pub fn show(args: ShowArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target = match (args.target.as_deref(), args.selector.as_deref()) {
         (None, None) => None,
-        (target, selector) => Some(Target::parse(target, selector)?),
+        (target, selector) => Some(Target::parse(target, selector)?.prefer_agent()),
     };
     let limit = args.limit.unwrap_or(DEFAULT_PAGE);
     if limit == 0 || limit > MAX_SELECTED_RUNS {

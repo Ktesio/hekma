@@ -423,6 +423,21 @@ pub fn action_tightness(action: BreachAction) -> u8 {
     }
 }
 
+/// Whether a CALLER's Breach Action tightens `effective` (story 22-1, the
+/// 21-6 review's L2, decided conservatively until the owner rules): the
+/// tie order, except that `block` never replaces `pause` or `stop` for a
+/// Caller — `block` is cooperative (an agent that calls its provider
+/// directly is not fenced), so the workload must not trade a process
+/// action it cannot escape for a fence it can.
+pub(crate) fn caller_action_tightens(caller: BreachAction, effective: BreachAction) -> bool {
+    if caller == BreachAction::Block
+        && matches!(effective, BreachAction::Pause | BreachAction::Stop)
+    {
+        return false;
+    }
+    action_tightness(caller) > action_tightness(effective)
+}
+
 /// The Scent-Check Mode tightness order (FR-60's tie rule).
 fn scent_tightness(mode: ScentCheckMode) -> u8 {
     match mode {
@@ -550,6 +565,13 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             *source = LimitSource::Default;
         }
     }
+    // The dollar sources before the Caller layer (story 22-1, the 21-6
+    // review's N2): a Caller undercutting a Policy's unpriced cap must not
+    // silence the `unpriced-model` Anomaly — the Policy is still named.
+    let pre_caller_dollar_sources = [
+        sources.dollars_per_run.clone(),
+        sources.dollars_cumulative.clone(),
+    ];
     // ---- A Caller's ceilings (FR-53/FR-60): each applies only where it
     // is tighter than the value every other layer resolved — so a later
     // Operator, Host or Policy tightening below it wins again.
@@ -609,15 +631,6 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
             .limits
             .breach_action
             .unwrap_or(BreachAction::Warn)
-    };
-
-    // A Caller's Breach Action applies only where it is tighter.
-    let action = match input.caller_limits.breach_action {
-        Some(caller) if action_tightness(caller) > action_tightness(action) => {
-            sources.breach_action = LimitSource::Caller;
-            caller
-        }
-        _ => action,
     };
 
     // ---- The Scent-Check Mode: instance > the most specific matching
@@ -690,12 +703,35 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     } else {
         action
     };
+    // A Caller's Breach Action applies only where it is tighter than the
+    // EFFECTIVE action (story 22-1, the 21-6 review's N1: the authority
+    // check compares against the effective action, so the resolver must
+    // too — a Caller `pause` over a Policy `block` that fell back to `warn`
+    // is effective, never a silent no-op). A Caller's action is set
+    // directly (its depth was checked at write), so it carries no fallback.
+    let (action, effective_action, fallback) = match input.caller_limits.breach_action {
+        Some(caller) if caller_action_tightens(caller, effective_action) => {
+            sources.breach_action = LimitSource::Caller;
+            (caller, caller, None)
+        }
+        _ => (action, effective_action, fallback),
+    };
 
     // ---- The unpriced cap: a resolved Cost Cap with no Rate whose ceiling
     // source is a Policy fails loud; an explicit-instance cap keeps its
     // documented inert-with-notice (FR-20).
     let cap_policy = [&sources.dollars_per_run, &sources.dollars_cumulative]
         .into_iter()
+        .zip(pre_caller_dollar_sources.iter())
+        // A Caller source is transparent: the cap it undercut still names
+        // its Policy.
+        .map(|(source, before)| {
+            if *source == LimitSource::Caller {
+                before
+            } else {
+                source
+            }
+        })
         .find_map(|source| match source {
             LimitSource::Policy(name) => Some(name.clone()),
             LimitSource::Default if dollars.is_set() => Some(DEFAULT_POLICY_NAME.to_string()),

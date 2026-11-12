@@ -115,7 +115,7 @@ impl std::fmt::Display for LogCaptureMode {
 /// The resolved launch of an Agent Instance (built from a manifest `OpTemplate`
 /// or a native adapter). Everything the backend needs to spawn the process, in
 /// domain terms.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SpawnSpec {
     /// The executable to run (a program name resolved on `PATH`, or a path).
     pub exec: String,
@@ -264,6 +264,34 @@ pub struct SpawnSpec {
     /// backends stay capture-agnostic dumb executors, exactly like
     /// [`SpawnSpec::pipe_stdin`].
     pub capture_mode: LogCaptureMode,
+}
+
+/// A redacting `Debug` (story 22-1): the environment can carry resolved
+/// secrets and the launch's Run Key, so its values print as `[REDACTED]`
+/// (the names are kept); every other field prints as derived.
+impl std::fmt::Debug for SpawnSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|key| (key.as_str(), crate::domain::REDACTED))
+            .collect();
+        f.debug_struct("SpawnSpec")
+            .field("exec", &self.exec)
+            .field("args", &self.args)
+            .field("env", &env)
+            .field("working_dir", &self.working_dir)
+            .field("log_file", &self.log_file)
+            .field("attributed_log_path", &self.attributed_log_path)
+            .field("stderr_log_file", &self.stderr_log_file)
+            .field("instance_name", &self.instance_name)
+            .field("pipe_stdin", &self.pipe_stdin)
+            .field("detach", &self.detach)
+            .field("pipe_stdout", &self.pipe_stdout)
+            .field("inherit_env", &self.inherit_env)
+            .field("capture_mode", &self.capture_mode)
+            .finish()
+    }
 }
 
 /// The outcome of a [`ProcessBackend::stop`] call (AC3).

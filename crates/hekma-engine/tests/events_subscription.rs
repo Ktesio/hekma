@@ -143,6 +143,12 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::Policy(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
         }
+        EngineEvent::Credential(e) => {
+            assert_eq!(
+                e.schema_version,
+                hekma_engine::CREDENTIAL_EVENT_SCHEMA_VERSION
+            );
+        }
         EngineEvent::BreachDefaultUpgraded(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION);
         }
@@ -307,6 +313,9 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
             EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {
                 panic!("unexpected policy-family event in this flow: {event:?}")
             }
+            // Story 22-1: a launch's Run Key events name its Run, not the
+            // instance.
+            EngineEvent::Credential(_) => continue,
         };
         assert_eq!(
             instance,
@@ -389,9 +398,12 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     assert!(
         phase1[..first_breach].iter().all(|e| matches!(
             e,
-            EngineEvent::Transition(_) | EngineEvent::UsageUpdate(_) | EngineEvent::Run(_)
+            EngineEvent::Transition(_)
+                | EngineEvent::UsageUpdate(_)
+                | EngineEvent::Run(_)
+                | EngineEvent::Credential(_)
         )),
-        "only transitions, Run events and usage precede the breach"
+        "only transitions, Run events, the launch's Run Key and usage precede the breach"
     );
     match &phase1[first_breach] {
         EngineEvent::BudgetBreach(b) => {
@@ -591,7 +603,8 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
     let lagged = lagged.expect("a stalled receiver past the capacity observes Lagged");
     // Story 21-2: each start, pause and resume also commits one Run event
     // (created, held, active), published right after its transition.
-    let run_events = 1 + 2 * cycles as u64;
+    // Story 22-1: the start also commits the launch's Run Key (`issued`).
+    let run_events = 1 + 2 * cycles as u64 + 1;
     assert_eq!(
         lagged,
         total + run_events - EVENT_BUS_CAPACITY as u64,
@@ -607,7 +620,7 @@ fn stalled_subscriber_never_stalls_supervision_and_observes_lagged() {
         .iter()
         .filter_map(|event| match event {
             EngineEvent::Transition(t) => Some(t),
-            EngineEvent::Run(_) => None,
+            EngineEvent::Run(_) | EngineEvent::Credential(_) => None,
             other => panic!("only transitions and Run events publish here, got {other:?}"),
         })
         .collect();
@@ -816,7 +829,8 @@ fn interleaved_instances_keep_per_instance_fifo() {
                 got.push((t.instance.as_str(), t.prior_state, t.new_state))
             }
             // Story 21-2: each transition's Run projection follows it.
-            EngineEvent::Run(_) => {}
+            // Story 22-1: each launch's Run Key event rides with its Run.
+            EngineEvent::Run(_) | EngineEvent::Credential(_) => {}
             other => panic!("only transitions and Run events publish here, got {other:?}"),
         }
     }

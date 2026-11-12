@@ -163,6 +163,22 @@ pub use domain::{
     ScentCheckMode, UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use engine::{Blocking, DrainReport, Engine, EngineOptions, EventSubscription, InstanceStatus};
+// Story 22-1: Run Keys — the credential classes, the one-time issued pair,
+// the snapshot's match, the metadata listing and revocation report, the
+// credential event, and the actor a Caller acts as.
+/// Story 22-1: the URL scan the Control API and the metering listener use
+/// to refuse a credential in a path or query.
+pub use domain::credential::{percent_decode, scan_url, UrlScan, URL_SCAN_MAX_TOKENS};
+pub use domain::{
+    parse_presented, CredentialChange, CredentialError, CredentialEvent, CredentialMatch,
+    CredentialSummary, IssuedCredentials, MintedToken, OpenedRun, PresentedState, RevokeOutcome,
+    RevokedCredential, RunActor, SecretString, TokenClass, TokenHash, TokenState, ANNOUNCE_PREFIX,
+    CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, REFRESH_PREFIX, RUN_KEY_PREFIX,
+    TOKEN_BODY_LEN, TOKEN_ID_LEN,
+};
+/// Story 22-1: the reserved credential config keys and the variable every
+/// supervised agent receives its Run Key in.
+pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};
 // The shutdown drain's public surface (issue #328 item 3): the planner, the
 // per-instance outcome vocabulary, and (via `Engine::shutdown` / its
 // `blocking()` twin) the drain itself.

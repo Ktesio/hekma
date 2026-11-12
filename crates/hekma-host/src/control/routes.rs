@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -712,6 +712,7 @@ pub(crate) async fn runs_list(
 /// answers `201` with the SAME Run (the open is idempotent by external id).
 pub(crate) async fn run_open(
     State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
     ApiJson(request): ApiJson<dto::RunOpenRequest>,
 ) -> ApiResult<Response> {
     let parent = match (request.parent_run_id, request.parent_instance) {
@@ -736,30 +737,48 @@ pub(crate) async fn run_open(
         .map(hekma_engine::parse_dollars_to_micros)
         .transpose()
         .map_err(|reason| ApiError::invalid_body(format!("dollar_cap: {reason}")))?;
-    let view = state
+    let opened = state
         .engine
-        .open_child_run(ChildRunRequest {
-            parent,
-            labels: request.labels.into_iter().collect(),
-            limits: RunLimits {
-                token_per_run: request.token_budget,
-                dollar_per_run_micros,
-                breach_action,
-                ..RunLimits::default()
+        .open_child_run_as(
+            authority.actor()?,
+            ChildRunRequest {
+                parent,
+                labels: request.labels.into_iter().collect(),
+                limits: RunLimits {
+                    token_per_run: request.token_budget,
+                    dollar_per_run_micros,
+                    breach_action,
+                    ..RunLimits::default()
+                },
+                external_id: request.external_id,
+                issue_credentials: request.issue_credentials.unwrap_or(true),
             },
-            external_id: request.external_id,
-        })
-        .await?;
-    let location = format!("/v0/runs/{}", view.record.run_id);
-    Ok((
+        )
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
+    let location = format!("/v0/runs/{}", opened.view.record.run_id);
+    let credentials = opened
+        .credentials
+        .as_ref()
+        .map(dto::CredentialsDocument::from);
+    let mut response = (
         StatusCode::CREATED,
         [(header::LOCATION, location)],
-        Json(dto::RunDocument {
+        Json(dto::RunOpenedDocument {
             schema_version: dto::CONTROL_API_SCHEMA_VERSION,
-            run: view,
+            run: opened.view,
+            credentials,
         }),
     )
-        .into_response())
+        .into_response();
+    // A one-time credential must not sit in a cache.
+    if opened.credentials.is_some() {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    }
+    Ok(response)
 }
 
 /// `GET /v0/runs/{id}` — one Run: its row, labels, limits, subtree usage
@@ -779,12 +798,85 @@ pub(crate) async fn run_show(
 /// owns a process is a `409` naming the stop remediation).
 pub(crate) async fn run_close(
     State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Json<dto::RunDocument>> {
-    let view = state.engine.close_run(&run_id).await?;
+    let view = state
+        .engine
+        .close_run_as(authority.actor()?, &run_id)
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     Ok(Json(dto::RunDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
         run: view,
+    }))
+}
+
+/// `POST /v0/runs/refresh` (story 22-1) — trade the presented refresh
+/// credential for a new Run Key and refresh credential, once. Only a
+/// refresh credential reaches this handler (the matrix).
+pub(crate) async fn run_refresh(
+    State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
+) -> ApiResult<Response> {
+    let super::auth::Authority::Refresh(presented) = &authority else {
+        return Err(ApiError::forbidden());
+    };
+    // Never the Operator on this route (the matrix), so a store failure is
+    // always the fixed `store` body, never the backend's text.
+    let issued = state
+        .engine
+        .refresh_credentials(presented)
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
+    let mut response = Json(dto::RefreshDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: issued.run_id().clone(),
+        credentials: dto::CredentialsDocument::from(&issued),
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok(response)
+}
+
+/// `POST /v0/runs/{id}/revoke-keys` (story 22-1, Operator only) — revoke
+/// the Run's active credentials and, by default, every credential issued
+/// under them. Committed and published before this answers.
+pub(crate) async fn run_revoke_keys(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<dto::RevokeKeysDocument>> {
+    let request: dto::RevokeKeysRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        dto::RevokeKeysRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|err| ApiError::invalid_body(format!("invalid revoke-keys body: {err}")))?
+    };
+    let outcome = state
+        .engine
+        .revoke_run_keys(&run_id, request.cascade.unwrap_or(true))
+        .await?;
+    Ok(Json(dto::RevokeKeysDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        outcome,
+    }))
+}
+
+/// `GET /v0/runs/{id}/keys` (story 22-1, Operator only) — a Run's
+/// credential metadata: token ids, classes, states, never a value.
+pub(crate) async fn run_keys(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunKeysDocument>> {
+    let keys = state.engine.run_keys(&run_id).await?;
+    Ok(Json(dto::RunKeysDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: hekma_engine::RunId::from_wire(run_id),
+        keys,
     }))
 }
 
@@ -1234,19 +1326,19 @@ pub(crate) async fn run_limits_get(
 /// `invalid-request`.
 pub(crate) async fn run_limits_patch(
     State(state): State<ApiState>,
+    Extension(authority): Extension<super::auth::Authority>,
     Path(run_id): Path<String>,
     ApiJson(request): ApiJson<dto::RunLimitsPatch>,
 ) -> ApiResult<Json<dto::RunLimitsChangeDocument>> {
     let change = limit_change(&request)?;
+    // Story 22-1: the operator bearer acts as the Operator; a Run Key as
+    // its Run's Caller (tighten-only, within its subtree, re-validated in
+    // the job).
     let mut results = state
         .engine
-        .set_run_limits(
-            vec![run_id],
-            change,
-            hekma_engine::LimitActor::Operator,
-            request.dry_run,
-        )
-        .await?;
+        .set_run_limits_as(vec![run_id], change, authority.actor()?, request.dry_run)
+        .await
+        .map_err(|err| ApiError::for_authority(&authority, err))?;
     let (_, outcome) = results.pop().ok_or_else(|| {
         ApiError::new(
             super::error::ApiErrorKind::Internal,
@@ -1255,7 +1347,7 @@ pub(crate) async fn run_limits_patch(
     })?;
     Ok(Json(dto::RunLimitsChangeDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
-        outcome: outcome?,
+        outcome: outcome.map_err(|err| ApiError::for_authority(&authority, err))?,
     }))
 }
 

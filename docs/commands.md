@@ -507,6 +507,7 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 | `--dollar-cap <dollars>` | A per-run dollar cap over the child and its own children (needs the agent's Rate) |
 | `--breach-action warn` | The child's ceilings take `warn`; `pause`, `stop` and `block` are refused for a child Run |
 | `--external-id <id>` | A retried `open` with the same id returns the same Run |
+| `--print-key` | Issue the child's [Run Key](run-keys.md) and refresh credential and print them once (`run key: hk_run_…`, `refresh credential: hk_ref_…`; with `--json` a `credentials` object), with a stderr note that they are not shown again. Without it no credential is issued |
 | `--json` | Print the Run as `{"schema_version": 1, "run": {…}}` |
 
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
@@ -521,6 +522,33 @@ nesting, or a Breach Action the child cannot execute. `close` also takes
 `--selector`, `--dry-run`, `--yes` and `--json` like the
 [lifecycle verbs](#selectors-on-the-lifecycle-verbs); a Run that owns an
 agent's process is that Run's refusal.
+
+## Run Keys
+
+### `hekma run keys <run-id> [--json]` / `revoke-keys <run-id> [--no-cascade] [--json]`
+
+`keys` lists a Run's credentials (see [Run Keys](run-keys.md)): each one's
+token id, class (`run-key`, `refresh`), state (`active`, `retired`,
+`revoked`), launch generation, the token id it was issued under, the issue
+time and the revocation cause. Never a key. It reads `state.db` read-only and
+starts nothing; for a live supervised Run with no key it says "This Run
+started before Run Keys; it gets one at its next launch."
+
+`revoke-keys` revokes the Run's active credentials and, by default, every
+credential issued under any of them — the keys of child Runs opened with
+them, and their refresh chains. `--no-cascade` revokes the Run's own only.
+It goes through the local Service Host and returns once the revocation is
+committed, so the next request presenting a revoked key is refused:
+
+```text
+✓ Revoked 2 credential(s) for run_01JZ6Q9G3S8V2X7K4M1N5P0R2T and 1 under its child Runs; calls presenting them are refused from now on.
+  run_01JZ6Q9G3S8V2X7K4M1N5P0R2T  run-key  3f9a1c0b7d2e
+  …
+```
+
+It also clears the Run's `credential-reuse` Anomaly. Revocation never ends a
+Run. Exit codes: `3` when no Run has the id, `1` when the host cannot be
+reached.
 
 ## `hekma ps [--selector <sel>] [--all] [--limit <n>] [--cursor <c>] [--json]`
 
@@ -751,7 +779,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `agent.<key>` | any | Pass-through namespace delivered verbatim to the agent (bypasses known-key validation) |
 | `labels.<key>` | label value | A bound label on the agent's Runs (keys: a lowercase letter then up to 62 of `a-z 0-9 _ . -`; values: 1–128 of letters, digits, `_ . : / @ + -`, never `secret:`). Merged per key across layers; applied at start, and at once to a running agent's Run when set with `config set`. Never delivered to the agent |
 
-Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself.
+Two additional known keys are **engine-reserved and never operator-set**: `metering.base_url` (the loopback proxy endpoint the engine injects at start for an `engine-observed` instance) and `memory.dir` (the managed Memory Backing directory the engine injects at start for a `filesystem` backing). Hand-set values are stripped from the operator layers at resolve time, so these can only ever be delivered by the engine itself. Two more are reserved for the launch's [Run Key](run-keys.md): `run.key` and `run.refresh_key`. Setting either is refused (`config set` exits `2` without echoing the value), a hand-edited value is stripped at start, and they never appear in `effective-config.json`; every agent receives its Run Key in `HEKMA_RUN_KEY`.
 
 Both Rate directions are required for dollars to be derived; with no Rate, dollar features are inert (no fabricated `$0.00`). The cached price is OPTIONAL: when set, an event's cached tokens (the subset the provider served from its prompt cache) price at the cached rate and the remaining input at the input rate; when unset, cached tokens price AT the input rate — a deliberate conservative default that can only overstate the cost, never understate it. Cached tokens ride inside `input_tokens` (the input is inclusive), so token budgets count them once, through the ordinary totals, and surfaces show a `/ cached N` suffix only when a known non-zero subset exists. Dollars are integer micro-dollars internally and always labeled estimates. A config value of the form `secret:NAME` (on any key) is a secret reference — resolved at start, masked everywhere Hekma displays it.
 

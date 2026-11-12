@@ -62,6 +62,9 @@ pub(crate) enum ApiErrorKind {
     /// answers it yet — the classes that can be refused land with their
     /// stories (22-1, 22-3, 24-2, the Hub story).
     Forbidden,
+    /// Story 22-1: the engine could not issue a credential (the OS random
+    /// source failed) — `503`, retryable later, nothing changed.
+    Unavailable,
 }
 
 impl ApiErrorKind {
@@ -77,6 +80,7 @@ impl ApiErrorKind {
             ApiErrorKind::MethodNotAllowed => "method_not_allowed",
             ApiErrorKind::Unauthorized => "unauthorized",
             ApiErrorKind::Forbidden => "forbidden",
+            ApiErrorKind::Unavailable => "unavailable",
         }
     }
 
@@ -90,6 +94,7 @@ impl ApiErrorKind {
             ApiErrorKind::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiErrorKind::Forbidden => StatusCode::FORBIDDEN,
+            ApiErrorKind::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -130,6 +135,36 @@ impl ApiError {
         }
     }
 
+    /// Whether this is a 401 (story 22-1: an unresolved presentation is
+    /// counted for the rate-limited diagnostic).
+    pub(crate) fn is_unauthorized(&self) -> bool {
+        self.kind == ApiErrorKind::Unauthorized
+    }
+
+    /// Whether this is a store failure (the `store` code) — an error whose
+    /// message is the store backend's own text.
+    fn is_store(&self) -> bool {
+        self.code == Some("store")
+    }
+
+    /// A Caller-reachable surface's engine error, surfaced to `authority`
+    /// (story 22-1, review round 3, I-4): the Operator keeps the engine's
+    /// surfaced reason; any other authority's store failure becomes the
+    /// fixed [`Self::store_unreachable`] body, never the backend's text.
+    pub(crate) fn for_authority(authority: &super::auth::Authority, err: RunError) -> Self {
+        let error = Self::from(err);
+        if matches!(authority, super::auth::Authority::Operator) || !error.is_store() {
+            return error;
+        }
+        Self::store_unreachable()
+    }
+
+    /// Whether this is the credential-class refusal (`403 forbidden`).
+    #[cfg(test)]
+    pub(crate) fn is_forbidden(&self) -> bool {
+        self.code == Some("forbidden")
+    }
+
     /// Attach the encoded engine error (the `From` impls' builder).
     fn with_engine_error(mut self, encoded: serde_json::Value) -> Self {
         self.engine_error = Some(encoded);
@@ -139,10 +174,62 @@ impl ApiError {
     /// The credential-class refusal (story 21-4, reserved — see
     /// [`ApiErrorKind::Forbidden`]). Static: it never echoes the credential.
     pub(crate) fn forbidden() -> Self {
-        Self::new(
+        let mut error = Self::new(
             ApiErrorKind::Forbidden,
             "this credential's class is not allowed on this surface",
-        )
+        );
+        error.code = Some("forbidden");
+        error
+    }
+
+    /// Story 22-1: a revoked credential (static — never echoes it). Only a
+    /// holder of the token learns it was revoked, and it tells a legitimate
+    /// client to stop retrying.
+    pub(crate) fn credential_revoked() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Unauthorized,
+            "the presented credential has been revoked",
+        );
+        error.code = Some("credential-revoked");
+        error
+    }
+
+    /// Story 22-1: the engine could not check a presented credential (a
+    /// store failure before authentication). Static: an unauthenticated
+    /// client never sees the store's text, which goes to the Operator's
+    /// diagnostic instead.
+    pub(crate) fn credential_check_failed() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Internal,
+            "the presented credential could not be checked; try again later",
+        );
+        error.code = Some("store");
+        error
+    }
+
+    /// Story 22-1 (review round 3, I-4): the store failed under an
+    /// authenticated Caller. The same fixed treatment the unauthenticated
+    /// path gives a store failure — a static body with the `store` code —
+    /// because the store's own text (a table name, an instance name) is the
+    /// Operator's, never a Caller's.
+    pub(crate) fn store_unreachable() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Internal,
+            "the run store could not be reached; try again later",
+        );
+        error.code = Some("store");
+        error
+    }
+
+    /// Story 22-1: a credential in a URL (static — never echoes it).
+    pub(crate) fn credential_in_url() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::InvalidBody,
+            "Credentials never go in a URL; send them in the Authorization header. A credential \
+             seen in a URL is revoked.",
+        );
+        error.code = Some("credential-in-url");
+        error
     }
 
     /// A request-body rejection (bad JSON / violated exactly-one-of / an
@@ -173,10 +260,12 @@ impl ApiError {
     /// The auth layer's 401 (static message — it must never echo the
     /// presented token).
     pub(crate) fn unauthorized() -> Self {
-        Self::new(
+        let mut error = Self::new(
             ApiErrorKind::Unauthorized,
             "missing or invalid bearer token",
-        )
+        );
+        error.code = Some("unauthorized");
+        error
     }
 
     /// The stable truncation-guard sentence the engine's resync reader builds
@@ -366,6 +455,16 @@ impl From<RunError> for ApiError {
             | RunError::VerbUnavailable { .. } => ApiErrorKind::Conflict,
             // Story 21-6: a Caller may only tighten (an authority refusal).
             RunError::RaiseForbidden { .. } => ApiErrorKind::Forbidden,
+            // Story 22-1: a Run Key outside its own subtree (403
+            // `run-out-of-scope`); a credential revoked between
+            // authentication and its job, or not recognised (401); the
+            // Caller breadth cap (409); no credential could be issued (503).
+            RunError::RunOutOfScope { .. } => ApiErrorKind::Forbidden,
+            RunError::CredentialRevoked | RunError::CredentialUnknown => {
+                ApiErrorKind::Unauthorized
+            }
+            RunError::TooManyChildren { .. } => ApiErrorKind::Conflict,
+            RunError::CredentialUnavailable { .. } => ApiErrorKind::Unavailable,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
