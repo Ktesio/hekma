@@ -141,6 +141,13 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
 | `PATCH` | `/v0/runs/{id}/labels` | Bind and unbind labels as the Operator (below): `{"set": {…}, "remove": […], "dry_run": bool}` | 200 + the labels after |
+| `POST` | `/v0/runs/{id}/stop` · `/pause` · `/resume` · `/drain` | A lifecycle verb on one Run (below): the agent's own verb on the Run that owns its process (`stop` takes `{"window_secs"}`, `drain` `{"timeout_ms"}`, as on the instance routes); any other Run is a 409 naming its depth | 200 + `{"schema_version", "run_id", "instance"}` (drain adds `completed`, `waited_ms`) |
+| `GET` | `/v0/runs/{id}/limits` | One Run's budget read: the limits set on it, the resolved limits with their sources, usage, headroom and latches | 200 |
+| `PATCH` | `/v0/runs/{id}/limits` | Set or clear limits on one Run (below): `{"tokens_per_run"?, "tokens_cumulative"?, "dollars_per_run"?, "dollars_cumulative"?, "breach_action"?, "clear": […], "dry_run": bool}` | 200 + the outcome |
+| `POST` | `/v0/runs/select` | Resolve a Selector into a set to act on: `{"selector": "team=core"}` (below) | 200 + `{"schema_version", "token", "runs", "matched", "expires_at"}` |
+| `POST` | `/v0/runs/stop` · `/pause` · `/resume` · `/drain` · `/close` | Act on a selected set: `{"set_token": …}` (plus `window_secs` on `stop`, `timeout_ms` on `drain`) | 200 + one result per Run |
+| `PATCH` | `/v0/runs/labels` | Bind and unbind labels on a selected set: `{"set_token", "set", "remove"}` | 200 + one result per Run |
+| `POST` | `/v0/runs/limits` | Set or clear limits on a selected set: `{"set_token", …the limit fields}` | 200 + one result per Run |
 | `GET` | `/v0/policies` | Every Policy, `default` included, ordered by name | 200 |
 | `GET` | `/v0/policies/{name}` | One Policy: its Selector, limits and (on `default`) its model-keyed Rate table | 200 |
 | `POST` | `/v0/policies` | Create a Policy: `{"name", "selector", "tokens_per_run"?, "tokens_cumulative"?, "dollars_per_run_micros"?, "dollars_cumulative_micros"?, "breach_action"?, "rate"?}` — answers the matched and fallback counts | 201 + `Location: /v0/policies/{name}` |
@@ -199,7 +206,15 @@ Run refusals carry a stable `error.code` beside the `kind`:
 | `nesting-too-deep` | 400 | The child would nest more than 8 levels deep |
 | `action-unavailable` | 400 | The Breach Action cannot execute at the child's depth; the message names the depth and the Metering Source |
 | `invalid-request` | 400 | A malformed label or field |
-| `run-ended` | 409 | The Run has ended, so its labels cannot change |
+| `run-ended` | 409 | The Run has ended, so it cannot change |
+| `verb-unavailable` | 409 | A lifecycle verb the Run's depth does not serve yet (a child Run's verbs act on its calls); the message names the depth, or the parent that holds a held child |
+| `scope-unavailable` | 400 | A cumulative ceiling on a child Run (the cumulative scope is the agent's lifetime usage) |
+| `raise-forbidden` | 403 | A Caller loosening a limit (a Caller may only tighten) |
+| `too-many-runs` | 400 | A Selector matches more than 1000 Runs |
+| `set-token-not-found` | 404 | No pending set has the token (never issued, evicted, or issued before the host restarted — select again) |
+| `set-token-expired` | 409 | The set's 10 minutes have run out |
+| `set-token-used` | 409 | The set was already acted on (one act consumes it) |
+| `set-token-foreign` | 403 | The token was issued to another credential |
 | `label-from-config` | 409 | `remove` names a label the agent's `labels.<key>` configuration binds; the message names the key and how to change it |
 | `label-not-bound` | 409 | `remove` names a label the Run set about itself (a caller label) |
 | `label-bound` | 409 | A caller label names a key already bound on the Run |
@@ -230,6 +245,80 @@ refused (`422 invalid_body`), so a misspelled `dry_run` never becomes a real
 write. A change commits one `labels-changed` Run
 event; repeating it changes nothing and emits nothing.
 `GET /v0/runs/{id}/labels` answers `{"schema_version": 1, "run_id", "labels"}`.
+
+### Lifecycle verbs on a Run
+
+`POST /v0/runs/{id}/stop`, `/pause`, `/resume` and `/drain` act on the Run
+that owns an agent's supervised process exactly as the instance routes do —
+same ladder, same bounds, same refusals — and answer with the run id and the
+instance's read-back. A child Run's lifecycle verbs act on its model calls,
+which Hekma cannot hold or reject yet, so they are a `409 verb-unavailable`
+naming the Run's depth (a held child's `resume` names the parent that holds
+it). An ended Run is a `409 run-ended`.
+
+### Limits on a Run
+
+`PATCH /v0/runs/{id}/limits` sets limits on the Run itself (the same job as
+`hekma budget set`, see [Runs](runs.md#run-limits)); `GET` reads them back.
+
+```text
+PATCH /v0/runs/run_01JZ6Q9G3S8V2X7K4M1N5P0R2T/limits
+{"tokens_per_run": 500000, "dollars_per_run": "3.00", "breach_action": "pause"}
+```
+
+A limit set here outranks the agent's configuration and every Policy for
+that limit and belongs to the Run: it ends with the Run, and the agent's
+next start opens a new Run without it — the answer always carries
+`"run_scoped": true`. `clear` takes `tokens-per-run`, `tokens-cumulative`,
+`dollars-per-run`, `dollars-cumulative` and `breach-action`. The answer is
+the outcome: `direction` (`raised`, `lowered`, `cleared`, `set`,
+`unchanged`), `prior_limits` and `limits` (the Run's own), `resolution` (the
+resolved limits, each with its source), and what the change `fired`,
+`re_armed` and lifted from the fence (`fence_cleared`). A ceiling raised
+above the usage re-arms its latch and lifts the matching `block` fence
+reason on the live Run; one lowered to or below the usage breaches at once
+and applies the Breach Action before the answer. `dry_run` plans and writes
+nothing. An unknown field is refused (`422`), so a typo on a money field is
+never silently dropped. This bearer is the Operator's; a Caller — a later
+credential class — may only tighten (`403 raise-forbidden`).
+
+### Selector sets
+
+To act on a set, select it once, then act on exactly that set:
+
+```text
+POST /v0/runs/select
+{"selector": "team=core"}
+
+→ {"schema_version": 1, "token": "hkset_…", "runs": [{…}, {…}],
+   "matched": 2, "expires_at": "2026-11-12T10:20:00Z"}
+
+POST /v0/runs/stop
+{"set_token": "hkset_…", "window_secs": 30}
+
+→ {"schema_version": 1, "verb": "stop", "matched": 2,
+   "results": [{"run_id": "…", "outcome": "stopped", "instance": {…}},
+               {"run_id": "…", "outcome": "refused", "error": {"kind", "code", "message"}}]}
+```
+
+The selection matches every non-ended Run carrying all the Selector's terms,
+bound or caller, at most 1000 (`400 too-many-runs` beyond — never cut).
+Listing Runs is a different, paged read; a set to act on never pages. The
+token rides the request BODY, never a URL (URLs land in logs). It is 256
+random bits, stored by the host only as a hash, bound to the credential that
+selected it (another credential's use is `403 set-token-foreign`),
+single-use (`409 set-token-used` after one act — select again, since the set
+may have changed), and expires after 10 minutes (`409 set-token-expired`).
+The host keeps at most 64 pending sets in memory, the oldest evicted; a host
+restart forgets them (`404 set-token-not-found` — select again).
+
+Each Run of the set answers on its own, in set order: the verb's past tense
+(`stopped`, `paused`, `resumed`, `drained`, `closed`, `labeled`, a limits
+direction), `unchanged`, or `refused` with the error object a single-Run
+route would have answered (including `engine_error` when the agent's own
+verb refused). A Run that ended since the selection is its own `run-ended`
+refusal; the rest act. Stops and drains run their windows one after another,
+so a set's worst case is the sum of its windows.
 
 ## Documents and versions
 

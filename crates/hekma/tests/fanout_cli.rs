@@ -236,6 +236,8 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
     assert!(run.success, "{}", run.stderr);
     assert_eq!(run.stdout.lines().last(), Some("paused"), "{}", run.stdout);
     assert!(run.stdout.contains("Paused Run"), "{}", run.stdout);
+    let run = hekma(&["run", "show", &fan_b_owner, "--json"]);
+    assert_eq!(json(&run.stdout)["run"]["status"], "held", "the Run goes held");
     // A child held by its paused parent: resume names the parent.
     let run = hekma(&["agent", "resume", &fan_b_child]);
     assert_eq!(run.code, Some(4), "{}", run.stderr);
@@ -289,4 +291,24 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
         let run = hekma(&["agent", "show", name, "--json"]);
         assert_eq!(json(&run.stdout)["instance"]["state"], "stopped", "{name}");
     }
+
+    // A drain over a set drains each agent with its own bound.
+    let run = hekma(&["agent", "start", "fan-b", "--detach"]);
+    assert!(run.success, "{}", run.stderr);
+    let run = hekma(&[
+        "agent",
+        "drain",
+        "--selector",
+        "team=core",
+        "--timeout-ms",
+        "1000",
+        "--yes",
+        "--json",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let doc = json(&run.stdout);
+    assert_eq!(doc["verb"], "drain");
+    assert_eq!(doc["matched"], 1, "only the fresh Run is open: {doc}");
+    assert_eq!(doc["results"][0]["outcome"], "drained");
+    assert_eq!(doc["results"][0]["instance"]["state"], "stopped");
 }

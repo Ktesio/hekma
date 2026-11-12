@@ -23,11 +23,12 @@ against its implementation and assert byte-exact agreement.
 - Artifact id: `hekma-governance-vectors`
 - Canonical location: `crates/hekma-engine/governance/vectors-v1.json`
 - Checksum sidecar: `crates/hekma-engine/governance/vectors-v1.json.sha256`
-- Current version: **1.3.0** (schema version 1). 1.1.0 appended the `block`
+- Current version: **1.4.0** (schema version 1). 1.1.0 appended the `block`
   cases and the `fence` kind after the unchanged 1.0.0 set; 1.2.0 appended the
   `chain` kind for ancestor ceilings after the unchanged 1.1.0 set; 1.3.0
   appended the `policy` kind for Policy resolution after the unchanged 1.2.0
-  set.
+  set; 1.4.0 appended the `rearm` kind for the within-Run re-arm after the
+  unchanged 1.3.0 set.
 
 ## Getting the artifact
 
@@ -51,14 +52,14 @@ without running the CLI.
 
 ## The document, schema version 1
 
-An excerpt (the full artifact carries 39 cases; the shape is identical
+An excerpt (the full artifact carries 63 cases; the shape is identical
 throughout):
 
 ```json
 {
   "artifact": "hekma-governance-vectors",
   "schema_version": 1,
-  "vectors_version": "1.3.0",
+  "vectors_version": "1.4.0",
   "provenance": {
     "generated_from": [
       "BudgetEvaluator",
@@ -67,7 +68,9 @@ throughout):
       "cost_micros_with_cached",
       "governance::decide",
       "governance::fence_refusal",
-      "governance::decide_chain"
+      "governance::decide_chain",
+      "runs::policy::resolve",
+      "governance::rearm"
     ]
   },
   "cases": [
@@ -101,7 +104,7 @@ throughout):
 }
 ```
 
-Four case kinds exist:
+Six case kinds exist:
 
 - **`decision`** — a full governance evaluation: arms (the armed dimensions,
   with committed totals, ceilings, and the resolved breach action), the
@@ -132,8 +135,21 @@ Four case kinds exist:
   the exact resolution out — the effective ceilings and action with each
   limit's source, the depth fallback, and the unpriced-cap signal.
 
+- **`rearm`** (from 1.4.0) — the within-Run re-arm after a limit change: the
+  level's ceilings after the change (`arms`, with `arms_before` as context
+  only), its effective action, whether a Rate resolves, its committed totals
+  (the Run's own for the per-run scopes, the agent's lifetime totals for the
+  cumulative ones) and its latches before the change, in; out, the latches
+  released (`unlatched`), the `block` fence reasons lifted
+  (`fence_cleared`), the breaches the change fires at once (`fired`), the
+  latches and fence reasons after, and whether the Run's `breach` Anomaly
+  holds. `trigger` names what moved the ceiling — a Policy change
+  (`policy-change`), a limit set on the Run (`run-limits`) or an agent
+  configuration write (`config-write`); the expected outcome never depends on
+  it, and three cases pin the same input under all three.
+
 A later minor version may add a case kind, as 1.1.0 added `fence`, 1.2.0
-added `chain` and 1.3.0 added `policy`. See the
+added `chain`, 1.3.0 added `policy` and 1.4.0 added `rearm`. See the
 versioning policy for how a consumer pinned to an older version handles it.
 
 Every case carries `covers` — the rule set it pins:
@@ -150,6 +166,7 @@ Every case carries `covers` — the rule set it pins:
 | `no-retro-repricing` | Each ledger row prices at the rate persisted with it; repricing history at the latest rate produces a different (wrong) value. |
 | `block-fence` | A `block` decision fires under the same threshold, latch and order rules as any action. A fenced Run refuses with status 402 and the `hekma_budget_block` class, reporting the first raised reason: tokens before dollars, per-run before cumulative. |
 | `ancestor-ceilings` | Over a Run's ancestor chain every level decides on its own subtree totals and its own latches; outcomes come deepest level first, token before dollar within a level. |
+| `re-arm` | After a limit change, a latch whose ceiling is now above its total, or no longer set, re-arms, and its `block` fence reason lifts per reason — a fence holding another latched `block` reason stays up. A ceiling at or below its total keeps its latch, and one lowered to at or below the total fires at once. A latch is keyed by the action that recorded it, so a kept pair fires once more under a new action. The outcome is the same whatever moved the ceiling. |
 | `policy-resolution` | Each limit resolves on its own: explicit limits on the Run, then on the agent, outrank every Policy; per limit the most specific Selector (a strict term-set superset) wins, incomparable Selectors tie to the tightest value, and the default Policy fills what is unset. A malformed action fails closed to `pause`; an action the depth cannot execute acts as `warn`; a Cost Cap with no Rate is loud, never silently inert. |
 
 ## How a Host pins it
@@ -164,7 +181,10 @@ Every case carries `covers` — the rule set it pins:
    `expected_micros`. For each `chain` case, run every level through your
    guard and compare the outcomes level by level. For each `policy` case,
    resolve the input with your own resolution and compare every field of the
-   expected resolution.
+   expected resolution. For each `rearm` case, release the latches whose
+   ceiling is now above the total (or unset), lift their `block` reasons,
+   then run your guard over the new arms with the kept latches under the
+   current action, and compare every field of `expected`.
 3. **Fail on any difference.** A mismatch means your guard disagrees with the
    engine on a pinned rule — fix the guard (or file an issue if you believe
    the vector is wrong), never silently skip the case.
@@ -173,7 +193,7 @@ Every case carries `covers` — the rule set it pins:
    extend the proof. See the versioning policy below.
 
 A Rust Host can skip the re-implementation entirely: the engine exposes the
-same decision core (`governance::decide`, `decide_chain`, the derivations) through its public
+same decision core (`governance::decide`, `decide_chain`, `rearm`, the derivations) through its public
 API — see [Embedding the engine](embedding.md).
 
 ## Versioning policy
@@ -196,11 +216,13 @@ API — see [Embedding the engine](embedding.md).
   | 1.0.0 | 1-26 | the first 26 `decision` and `derivation` cases |
   | 1.1.0 | 27-34 | the `decision-block-*` cases and the `fence-*` cases |
   | 1.2.0 | 35-39 | the `chain-*` cases |
-  | 1.3.0 | 40-48 | the `policy-*` cases |
+  | 1.3.0 | 40-53 | the `policy-*` cases and two `decision-policy-*` cases |
+  | 1.4.0 | 54-63 | the `rearm-*` cases |
 
   The provenance list grows with the generator functions the new cases come
   from (1.1.0 added `governance::fence_refusal`, 1.2.0
-  `governance::decide_chain`, 1.3.0 `runs::policy::resolve`).
+  `governance::decide_chain`, 1.3.0 `runs::policy::resolve`, 1.4.0
+  `governance::rearm`).
 - **Any change to a shipped case** (its expected output or its input), or to
   the shape of the header or of an existing kind, is a **major** bump and is announced ahead of the release in the release
   notes. A major bump means a pinned verdict must be re-established — it does
