@@ -2,7 +2,7 @@
 title: 'Per-call records for Hosts'
 type: 'feature'
 created: '2026-11-12'
-status: 'draft'
+status: 'ready-for-dev'
 review_loop_iteration: 0
 baseline_commit: 'ab1cab22b27548a99293b4d50ec069f1625b317a'
 context:
@@ -164,3 +164,4 @@ Each is a public-contract or scope choice; the recommendation is the spec's curr
 ## Spec Change Log
 
 - 2026-11-12 — spec written from Story 19.4 (as amended 2026-10-30) and its readiness finding, Epic 19's context, AD-26/AD-27/AD-20/AD-22, FR-43/FR-49/FR-50, NFR-4/NFR-6, the security review's no-leak criteria, the 23-1 spec's calls-store design (approved, not built), the 22-1 spec's token ids and authority matrix, 21-5's listing pattern and `listing.rs`, today's `docs/control-api.md` and `docs/embedding.md`, and the deferred-work entries naming the calls store or 19.4. Status draft; awaiting the orchestrator's review and Islam's rulings on O1 and O2.
+- 2026-11-12 — orchestrator review: approved for build. Ask First 1–11 accepted as recommended (including shipping `hekma calls`, flat routes, `view=all` by default, the 100,000-row scan budget, this story owning the calls-store indexes, and nullable `token_id`). O1 (who may read records; a tenant-scoped read credential would be a new class) and O2 (12-hex token-id labels, tied to the security review's P12 and 22-1's O5) are Islam's, still pending; the build proceeds on the recommendations. Build after 23-1 lands; verify the ULID admission-time claim against 23-1's merged code.
