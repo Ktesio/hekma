@@ -593,6 +593,67 @@ fn unresolved_presentations_produce_one_diagnostic_and_no_token_in_any_log() {
 }
 
 #[test]
+fn credential_events_reach_sse_through_the_selector_and_carry_no_token() {
+    use std::io::BufRead;
+    let state = seeded_state();
+    let server = Server::start(state.path().to_path_buf());
+    // A child carrying a caller label the Selector matches.
+    let opened = call(
+        "POST",
+        &server.url("/v0/runs"),
+        BEARER_VALUE,
+        Some(serde_json::json!({ "parent_run_id": "run_ROOT", "labels": {"flow": "sse"} })),
+    );
+    assert_eq!(opened.status, StatusCode::CREATED, "{}", opened.body);
+    let child = opened.json()["run"]["run_id"].as_str().unwrap().to_string();
+    let refresh = opened.json()["credentials"]["refresh_credential"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let agent = client();
+    let mut stream = agent
+        .get(server.url("/v0/events?selector=flow=sse"))
+        .header("Authorization", format!("Bearer {BEARER_VALUE}"))
+        .call()
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    // Rotate: four credential events on the child's Run.
+    let rotated = call("POST", &server.url("/v0/runs/refresh"), &refresh, None);
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let new_key = rotated.json()["credentials"]["run_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut reader = std::io::BufReader::new(stream.body_mut().as_reader());
+    let mut changes = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while changes.len() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "credential frames never arrived"
+        );
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        assert!(
+            !line.contains(&refresh) && !line.contains(&new_key),
+            "{line}"
+        );
+        if let Some(payload) = line.trim_end().strip_prefix("data: ") {
+            let event: serde_json::Value = serde_json::from_str(payload).unwrap();
+            if event["kind"] == "credential" {
+                assert_eq!(event["run_id"], child.as_str());
+                assert!(event.get("token_hash").is_none());
+                changes.push(event["change"].as_str().unwrap().to_string());
+            }
+        }
+    }
+    changes.sort();
+    assert_eq!(changes, vec!["issued", "issued", "rotated", "rotated"]);
+}
+
+#[test]
 fn the_caller_breadth_cap_answers_409_over_http() {
     let state = seeded_state();
     let server = Server::start(state.path().to_path_buf());

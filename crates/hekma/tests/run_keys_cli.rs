@@ -78,6 +78,32 @@ fn api(state_dir: &Path, method: &str, path: &str, bearer: &str, parent: &str) -
     )
 }
 
+/// Trade a refresh credential on the state root's host: (run key, refresh).
+fn refresh_pair(state_dir: &Path, refresh: &str) -> (String, String) {
+    let discovery = hekma_host::read_discovery(state_dir).expect("a host is recorded");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build(),
+    );
+    let mut response = agent
+        .post(format!("http://{}/v0/runs/refresh", discovery.addr))
+        .header("Authorization", format!("Bearer {refresh}"))
+        .send("")
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value =
+        serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap();
+    (
+        body["credentials"]["run_key"].as_str().unwrap().to_string(),
+        body["credentials"]["refresh_credential"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    )
+}
+
 /// Every file under `root` (the db, its -wal and -shm, the logs, every
 /// Agent Home, control.json, serve.log) scanned for `sentinel`.
 fn assert_no_sentinel(root: &Path, sentinel: &str) {
@@ -241,7 +267,14 @@ fn open_prints_the_pair_once_only_with_print_key_and_revoke_keys_refuses_them_at
         assert!(!run.stdout.contains(&key) && !run.stdout.contains(&refresh));
         assert!(!run.stderr.contains(&key));
     }
-    // The key works on the Control API, until it is revoked.
+    // The key works on the Control API; a refresh replaces it.
+    assert_eq!(api(state_dir, "POST", "/v0/runs", &key, &child).0, 201);
+    let (old_key, old_refresh) = (key.clone(), refresh.clone());
+    let (key, refresh) = refresh_pair(state_dir, &old_refresh);
+    assert_eq!(
+        api(state_dir, "POST", "/v0/runs", &old_key, &child),
+        (401, "credential-revoked".to_string())
+    );
     assert_eq!(api(state_dir, "POST", "/v0/runs", &key, &child).0, 201);
     let run = run_hekma_agent(
         &["run", "revoke-keys", &child, "--no-cascade"],
@@ -293,7 +326,7 @@ fn open_prints_the_pair_once_only_with_print_key_and_revoke_keys_refuses_them_at
     );
     stop_host(state_dir);
     // No token on disk, before and after a WAL checkpoint.
-    for secret in [&key, &refresh] {
+    for secret in [&key, &refresh, &old_key, &old_refresh] {
         assert_no_sentinel(state_dir, secret);
     }
     {
@@ -301,7 +334,7 @@ fn open_prints_the_pair_once_only_with_print_key_and_revoke_keys_refuses_them_at
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
     }
-    for secret in [&key, &refresh] {
+    for secret in [&key, &refresh, &old_key, &old_refresh] {
         assert_no_sentinel(state_dir, secret);
     }
 }

@@ -1876,3 +1876,42 @@ fn an_operator_clear_lifts_a_callers_row_too_the_operator_outranks() {
         Some(800)
     );
 }
+
+#[test]
+fn l2_a_caller_may_not_trade_pause_or_stop_for_the_cooperative_block() {
+    let seeded = seed_with(50, 50, true);
+    let ctx = || context(Some(WireFence::default()), PolicyLimits::default());
+    cap_policy(
+        &seeded,
+        PolicyLimits {
+            tokens_per_run: Some(1_000),
+            breach_action: Some(BreachAction::Stop),
+            ..PolicyLimits::default()
+        },
+        ctx(),
+    );
+    let block = limits(RunLimits {
+        breach_action: Some(BreachAction::Block),
+        ..RunLimits::default()
+    });
+    let refused = set(
+        &seeded.registry,
+        &seeded.run,
+        block.clone(),
+        LimitActor::Caller,
+        ctx(),
+    )
+    .unwrap_err();
+    assert_eq!(refused.code(), "raise-forbidden");
+    assert!(refused.to_string().contains("breach-action"), "{refused}");
+    // The Operator may set it.
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        block,
+        LimitActor::Operator,
+        ctx(),
+    )
+    .unwrap();
+    assert_eq!(outcome.resolution.effective_action, BreachAction::Block);
+}
