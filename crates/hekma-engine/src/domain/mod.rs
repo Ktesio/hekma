@@ -79,9 +79,9 @@ pub use governance::{
     generate, governance_vectors_checksum, re_armed_keys, rearm, run_derivation, Case, ChainCase,
     CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal,
     GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, LatchedReason, LevelArms,
-    LevelTotals, Provenance, RearmInput, RearmOutcome, RowPricing, TokenArm, VectorsDocument,
-    ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
-    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    LevelTotals, Provenance, RearmCase, RearmInput, RearmOutcome, RearmTrigger, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER,
+    FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
     GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 pub use instance::AgentInstance;
