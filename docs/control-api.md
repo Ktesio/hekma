@@ -208,8 +208,8 @@ Run refusals carry a stable `error.code` beside the `kind`:
 
 ### The Run listing
 
-`GET /v0/runs` is `hekma ps`'s read (FR-50 parity: every filter, Selector
-and page parameter of the CLI has its equivalent here). Query parameters:
+`GET /v0/runs` is `hekma ps`'s read — every filter, Selector and page
+parameter of the CLI has its equivalent here. Query parameters:
 
 | Parameter | Meaning |
 |---|---|

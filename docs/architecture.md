@@ -76,8 +76,8 @@ the primary key is the index; stable under row updates, immune to
 duplicates when Runs are created mid-pagination). The cursor is opaque —
 `base64url("v1:" + last run id)` — versioned so a future key shape
 refuses as `invalid-cursor` instead of mispaging. Listing Selectors
-compose the 21-9 label arms beside the view predicate and **page past**
-the 1000-Run verb cap (a listing never loads the whole Run set). Each
+compose the label-selector arms beside the view predicate and **page
+past** the 1000-Run verb cap (a listing never loads the whole Run set). Each
 row's detail (labels, stored Policy resolution, subtree rollup, latches,
 and the instance cumulative rollup on process-owning rows only) is
 assembled as bounded primary-key point reads over the page, and the

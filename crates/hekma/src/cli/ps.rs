@@ -1,5 +1,5 @@
-//! `hekma ps` — the exception-first Run listing (story 21-5, PRD FR-50):
-//! the Runs that need you, newest first.
+//! `hekma ps` — the exception-first Run listing: the Runs that need you,
+//! newest first.
 //!
 //! The default view lists a Run iff it carries an Anomaly (an ended Run
 //! only inside the 7-day ended-Run window) or a `held`/`silent`/`stale`
@@ -7,7 +7,7 @@
 //! Run inside the window. `--selector` filters by label (bound or caller);
 //! `--limit` with the printed `--cursor` value pages. Results go to stdout
 //! (a table, or the `--json` document), the counts footer and the
-//! next-page hint to stderr (AD-12). A read-only open: no host is started,
+//! next-page hint to stderr. A read-only open: no host is started,
 //! nothing is created, nothing is written.
 //!
 //! Exit classes: `2` an invalid Selector/cursor/limit, `1` a store
@@ -41,8 +41,8 @@ pub struct PsArgs {
 
 /// `hekma ps [--selector SEL] [--all] [--limit N] [--cursor C] [--json]`.
 pub fn run(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // The Selector parses BEFORE the state directory is opened (a bad flag
-    // is refused first, the 21-4 read discipline).
+    // The Selector parses BEFORE the state directory is opened (a bad
+    // flag is refused first — the read discipline).
     let selector = args
         .selector
         .as_deref()
