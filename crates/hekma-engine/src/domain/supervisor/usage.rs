@@ -679,9 +679,11 @@ impl Supervisor {
         if dropped > 0 {
             self.emit_diagnostic(&format!(
                 "{}: the metering listener refused {dropped} more credential(s) in URLs than it \
-                 can hold for revocation (at most {} between two reaper passes); those were not \
-                 revoked — if one may be the Run's, revoke its keys with `hekma run revoke-keys`",
+                 can hold for revocation (at most {} per URL and {} between two reaper passes); \
+                 those were not revoked — if one may be the Run's, revoke its keys with `hekma \
+                 run revoke-keys`",
                 name.as_str(),
+                crate::domain::credential::URL_SCAN_MAX_TOKENS,
                 crate::metering::listener::EXPOSED_QUEUE_MAX,
             ));
         }
