@@ -304,6 +304,32 @@ pub(crate) mod test_support {
         });
         rx.recv().expect("the quiet state")
     }
+
+    /// Like [`quiet_api_state`] over a WRITABLE engine (story 21-5's SSE
+    /// seam tests commit events through it). Leaked the same way.
+    pub(crate) fn writable_api_state() -> (ApiState, watch::Sender<bool>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::TempDir::new().expect("a temp state root");
+            let engine = hekma_engine::Engine::open(Some(root.path().to_path_buf()))
+                .expect("a writable engine");
+            let engine = std::sync::Arc::new(engine);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let state = ApiState {
+                engine: std::sync::Arc::clone(&engine),
+                resolver: CredentialResolver::new([("quiet", CredentialClass::OperatorBearer)]),
+                config_write: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                shutdown: shutdown_rx,
+                activity: Activity::new(),
+                notes: NoteTap::keeping_startup_notes(),
+                log_capture: hekma_engine::LogCaptureMode::Full,
+            };
+            std::mem::forget(engine);
+            std::mem::forget(root);
+            let _ = tx.send((state, shutdown_tx));
+        });
+        rx.recv().expect("the writable state")
+    }
 }
 
 /// One listener the API serves on (story 21-4).

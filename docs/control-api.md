@@ -385,10 +385,16 @@ left hanging.)
 it saw is validated BEFORE streaming: a seq below the outbox's retained
 floor answers `409 cursor-below-retention`, one past the committed tail
 `409 cursor-past-tail` (typed, never clamped — the export contract's
-rule). The server then subscribes first, replays the outbox rows with
-`seq > N` through the active Selector filter, and hands over to live
-delivery dropping live seqs the replay already delivered — no duplicate,
-no gap at the seam.
+rule). The server subscribes to the live bus first, then replays the
+outbox rows with `seq > N` through the active Selector filter, reading
+them in bounded batches as the client drains them (a long backlog is never
+held in memory at once), and hands over to live delivery dropping live
+seqs the replay already read — no duplicate, no gap at the seam. If a
+later replay batch can no longer be read (the outbox's floor moved past it
+mid-replay), the stream sends one `{"kind":"replay-error",…}` frame (no
+`id`) and closes; reconnecting with the last id received then gets the
+typed `409`. Without `Last-Event-ID` nothing is replayed or deduplicated:
+every live event is delivered as published.
 
 **Filter — `?selector=key=value[,…]`.** With a Selector only events whose
 subject Run currently carries every term (bound or caller labels alike)

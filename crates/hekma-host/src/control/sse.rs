@@ -13,10 +13,16 @@
 //!   seq below the outbox's retained floor answers `409
 //!   cursor-below-retention`, one past the committed tail `409
 //!   cursor-past-tail` — typed, never a clamp (the export contract's
-//!   rule). Then the handler SUBSCRIBES FIRST, replays the outbox rows
-//!   with `seq > N` through the active Selector filter, and hands over to
-//!   live delivery dropping live seqs at or below the replayed tail — no
-//!   duplicate, no gap at the seam.
+//!   rule). The handler SUBSCRIBES FIRST, then reads the outbox rows with
+//!   `seq > N` (one bounded batch at a time, as the client drains them —
+//!   never the whole backlog in memory) through the active Selector
+//!   filter, and hands over to live delivery dropping live seqs at or
+//!   below the last seq the replay READ — no duplicate, no gap at the
+//!   seam. A later replay batch that fails (the floor moved past it)
+//!   surfaces a `{"kind":"replay-error",…}` frame and ENDS the stream: a
+//!   reconnect then gets the typed `409`, never a silent gap.
+//! * Without `Last-Event-ID` nothing is replayed and nothing is deduped:
+//!   every live event is delivered as published.
 //! * `?selector=key=value[,…]` evaluates each event's subject Run against
 //!   its CURRENT labels (snapshot first, one read-only store read when the
 //!   Run is absent from it — ended Runs keep matching until compaction).
@@ -67,6 +73,10 @@ pub(crate) struct EventsStreamQuery {
     pub selector: Option<String>,
 }
 
+/// The replay-failure marker's `kind` token: a later replay batch could
+/// not be read (the outbox floor moved past it); the stream ends after it.
+const REPLAY_ERROR_KIND: &str = "replay-error";
+
 /// One SSE frame decision the stream loop emits.
 enum Frame {
     /// An event with its outbox seq (the `id:`). Boxed: `EngineEvent` is
@@ -76,6 +86,113 @@ enum Frame {
     Lagged(u64),
     /// A Selector-filter read failed; the named event was dropped.
     FilterError(String),
+    /// A later replay batch failed; the stream ends after this frame.
+    ReplayError(String),
+}
+
+/// The lazy outbox replay of a `Last-Event-ID` resume (story 21-5): one
+/// bounded export batch buffered at a time, the next read only when the
+/// client has drained the last — never the whole backlog in memory.
+struct Replay {
+    /// The current batch's undelivered entries.
+    buffered: std::vec::IntoIter<hekma_engine::OutboxEntry>,
+    /// The last seq the replay has READ (the next batch reads after it;
+    /// once the replay ends, live seqs at or below it are already
+    /// delivered).
+    after: u64,
+    /// Whether the last batch came back full (another may follow).
+    more: bool,
+    /// The batch size.
+    batch: u32,
+}
+
+impl Replay {
+    /// Read the FIRST batch after `after` — the connect-time validation:
+    /// below the retained floor or past the committed tail is the typed
+    /// `409` (the never-clamp rule).
+    async fn start(state: &ApiState, after: u64, batch: u32) -> Result<Self, ApiError> {
+        let mut replay = Self {
+            buffered: Vec::new().into_iter(),
+            after,
+            more: true,
+            batch,
+        };
+        replay.fill(state).await.map_err(|err| match err {
+            hekma_engine::EngineError::Log { detail, .. }
+                if detail.contains(hekma_engine::BELOW_FLOOR_SENTENCE) =>
+            {
+                ApiError::conflict_with_code("cursor-below-retention", detail)
+            }
+            hekma_engine::EngineError::Log { detail, .. }
+                if detail.contains(hekma_engine::PAST_TAIL_SENTENCE) =>
+            {
+                ApiError::conflict_with_code("cursor-past-tail", detail)
+            }
+            other => other.into(),
+        })?;
+        Ok(replay)
+    }
+
+    /// Read the next batch into the buffer.
+    async fn fill(&mut self, state: &ApiState) -> Result<(), hekma_engine::EngineError> {
+        let batch = state
+            .engine
+            .export_events(
+                Some(hekma_engine::OutboxCursor { seq: self.after }),
+                self.batch,
+            )
+            .await?;
+        self.more = batch.events.len() >= self.batch as usize;
+        self.after = self.after.max(batch.cursor.seq);
+        self.buffered = batch.events.into_iter();
+        Ok(())
+    }
+
+    /// The next replayed entry: `Ok(None)` once the outbox is drained,
+    /// `Err` naming a later batch that could not be read.
+    async fn next(
+        &mut self,
+        state: &ApiState,
+    ) -> Result<Option<hekma_engine::OutboxEntry>, String> {
+        loop {
+            if let Some(entry) = self.buffered.next() {
+                return Ok(Some(entry));
+            }
+            if !self.more {
+                return Ok(None);
+            }
+            self.fill(state).await.map_err(|err| err.to_string())?;
+        }
+    }
+}
+
+/// Subscribe to the sequenced bus, THEN read the replay's first batch — in
+/// this order, so every event committed after the subscribe is on the
+/// receiver and every event committed before the read is in the replay
+/// (the seam dedups the overlap by seq). `seam` runs between the two steps:
+/// production passes a no-op; the tests commit an event there.
+async fn subscribe_then_replay<F>(
+    state: &ApiState,
+    last_event_id: Option<u64>,
+    batch: u32,
+    seam: F,
+) -> Result<
+    (
+        broadcast::Receiver<(u64, hekma_engine::EngineEvent)>,
+        Option<Replay>,
+    ),
+    ApiError,
+>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let rx = state.engine.subscribe_sequenced();
+    seam.await;
+    let replay = match last_event_id {
+        None => None,
+        Some(after) => Some(Replay::start(state, after, batch).await?),
+    };
+    Ok((rx, replay))
 }
 
 /// The `GET /v0/events` handler — the SSE response (ids, Selector filter,
@@ -92,64 +209,29 @@ pub(crate) async fn live_events(
             ApiError::invalid_query_param("invalid-selector", format!("selector: {err}"))
         })?),
     };
-    // Validate the resume cursor BEFORE streaming (the never-clamp rule):
-    // below the retained floor or past the committed tail is a typed 409.
-    let replay = match headers
+    let last_event_id = match headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
     {
         None => None,
-        Some(raw) => {
-            let seq = raw.parse::<u64>().map_err(|err| {
-                ApiError::invalid_query_param(
-                    "invalid-cursor",
-                    format!("Last-Event-ID must be an event id (a whole number): {err}"),
-                )
-            })?;
-            let mut entries = Vec::new();
-            let mut after = seq;
-            loop {
-                let batch = state
-                    .engine
-                    .export_events(
-                        Some(hekma_engine::OutboxCursor { seq: after }),
-                        hekma_engine::EXPORT_BATCH_MAX_CAP,
-                    )
-                    .await
-                    .map_err(|err| match err {
-                        hekma_engine::EngineError::Log { detail, .. }
-                            if detail.contains(hekma_engine::BELOW_FLOOR_SENTENCE) =>
-                        {
-                            ApiError::conflict_with_code("cursor-below-retention", detail)
-                        }
-                        hekma_engine::EngineError::Log { detail, .. }
-                            if detail.contains(hekma_engine::PAST_TAIL_SENTENCE) =>
-                        {
-                            ApiError::conflict_with_code("cursor-past-tail", detail)
-                        }
-                        other => other.into(),
-                    })?;
-                let count = batch.events.len();
-                after = batch.cursor.seq;
-                entries.extend(batch.events);
-                if count < hekma_engine::EXPORT_BATCH_MAX_CAP as usize {
-                    break;
-                }
-            }
-            Some(entries)
-        }
+        Some(raw) => Some(raw.parse::<u64>().map_err(|err| {
+            ApiError::invalid_query_param(
+                "invalid-cursor",
+                format!("Last-Event-ID must be an event id (a whole number): {err}"),
+            )
+        })?),
     };
-    // Subscribe FIRST (before replaying) so the seam has no gap: everything
-    // committed after this point buffers on the receiver while the replay
-    // drains; the handover drops live seqs at or below the replayed tail.
-    let rx = state.engine.subscribe_sequenced();
-    Ok(Sse::new(event_stream(
-        state,
-        rx,
-        selector,
-        replay.map(Vec::into_iter),
-    ))
-    .keep_alive(KeepAlive::default()))
+    // Subscribe FIRST, then validate and read the resume cursor's first
+    // batch (below the retained floor or past the committed tail is a
+    // typed 409 BEFORE streaming — the never-clamp rule).
+    let (rx, replay) = subscribe_then_replay(
+        &state,
+        last_event_id,
+        hekma_engine::EXPORT_BATCH_MAX_CAP,
+        std::future::ready(()),
+    )
+    .await?;
+    Ok(Sse::new(event_stream(state, rx, selector, replay)).keep_alive(KeepAlive::default()))
 }
 
 /// Whether `event` passes `selector` — the subject Run's CURRENT labels
@@ -170,70 +252,104 @@ async fn passes_selector(
         .unwrap_or(false))
 }
 
+/// The stream's state between polls.
+struct StreamState {
+    state: ApiState,
+    rx: broadcast::Receiver<(u64, hekma_engine::EngineEvent)>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    selector: Option<hekma_engine::Selector>,
+    /// The replay still draining (a resume only).
+    replay: Option<Replay>,
+    /// Set once a resume's replay has drained: the last seq it READ. Live
+    /// seqs at or below it were already replayed and are dropped. `None`
+    /// on a plain stream — nothing is deduped there.
+    live_floor: Option<u64>,
+    /// The stream ends at the next poll (after a replay-error frame).
+    ended: bool,
+}
+
+/// Whether `event` passes the stream's Selector (always, without one).
+async fn admit(
+    state: &ApiState,
+    selector: &Option<hekma_engine::Selector>,
+    seq: u64,
+    event: hekma_engine::EngineEvent,
+) -> Option<Frame> {
+    match selector {
+        Some(selector) => match passes_selector(state, selector, &event).await {
+            Ok(true) => Some(Frame::Sequenced(seq, Box::new(event))),
+            Ok(false) => None,
+            Err(detail) => Some(Frame::FilterError(detail)),
+        },
+        None => Some(Frame::Sequenced(seq, Box::new(event))),
+    }
+}
+
 /// The stream: replay (when resuming), then live. The unfold state carries
 /// the phase; each poll produces at most one frame (skipped events —
 /// seq-dedup at the seam, non-matching Selectors — simply loop).
-#[allow(clippy::type_complexity)]
 fn event_stream(
     state: ApiState,
     rx: broadcast::Receiver<(u64, hekma_engine::EngineEvent)>,
     selector: Option<hekma_engine::Selector>,
-    replay: Option<std::vec::IntoIter<hekma_engine::OutboxEntry>>,
+    replay: Option<Replay>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let shutdown = state.shutdown.clone();
     futures_util::stream::unfold(
-        (state, rx, shutdown, selector, replay, 0u64),
-        |(state, mut rx, mut shutdown, selector, mut replay, replay_tail)| async move {
+        StreamState {
+            state,
+            rx,
+            shutdown,
+            selector,
+            replay,
+            live_floor: None,
+            ended: false,
+        },
+        |mut stream| async move {
             // `wait_for` semantics: the CURRENT shutdown value answers
             // immediately, `changed()` only future edges.
-            if *shutdown.borrow_and_update() {
+            if stream.ended || *stream.shutdown.borrow_and_update() {
                 return None;
             }
             let frame = loop {
-                if let Some(entries) = replay.as_mut() {
-                    if let Some(entry) = entries.next() {
-                        match &selector {
-                            Some(selector) => {
-                                match passes_selector(&state, selector, &entry.event).await {
-                                    Ok(true) => {
-                                        break Frame::Sequenced(
-                                            entry.seq,
-                                            Box::new(entry.event.clone()),
-                                        )
-                                    }
-                                    Ok(false) => continue,
-                                    Err(detail) => break Frame::FilterError(detail),
-                                }
+                if let Some(replay) = stream.replay.as_mut() {
+                    match replay.next(&stream.state).await {
+                        Ok(Some(entry)) => {
+                            match admit(&stream.state, &stream.selector, entry.seq, entry.event)
+                                .await
+                            {
+                                Some(frame) => break frame,
+                                None => continue,
                             }
-                            None => {
-                                break Frame::Sequenced(entry.seq, Box::new(entry.event.clone()))
-                            }
+                        }
+                        Ok(None) => {
+                            stream.live_floor = Some(replay.after);
+                            stream.replay = None;
+                        }
+                        Err(detail) => {
+                            stream.replay = None;
+                            stream.ended = true;
+                            break Frame::ReplayError(detail);
                         }
                     }
                 }
-                replay = None;
                 tokio::select! {
-                    _ = shutdown.changed() => {
+                    _ = stream.shutdown.changed() => {
                         // The API is going down: end the stream inside the
                         // graceful window; the engine is untouched.
                         return None;
                     }
-                    received = rx.recv() => match received {
+                    received = stream.rx.recv() => match received {
                         Ok((seq, event)) => {
-                            // Seq-dedup at the seam: everything the replay
-                            // already delivered is dropped, never re-sent.
-                            if seq <= replay_tail {
+                            // Seq-dedup at the seam (a resume only):
+                            // everything the replay read is dropped, never
+                            // re-sent.
+                            if stream.live_floor.is_some_and(|floor| seq <= floor) {
                                 continue;
                             }
-                            match &selector {
-                                Some(selector) => match passes_selector(&state, selector, &event)
-                                    .await
-                                {
-                                    Ok(true) => break Frame::Sequenced(seq, Box::new(event)),
-                                    Ok(false) => continue,
-                                    Err(detail) => break Frame::FilterError(detail),
-                                },
-                                None => break Frame::Sequenced(seq, Box::new(event)),
+                            match admit(&stream.state, &stream.selector, seq, event).await {
+                                Some(frame) => break frame,
+                                None => continue,
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -247,16 +363,7 @@ fn event_stream(
                     }
                 }
             };
-            // The tail advances only over DELIVERED (or replayed) frames —
-            // a lag burst re-syncs at the current tail either way.
-            let next_tail = match &frame {
-                Frame::Sequenced(seq, _) => (*seq).max(replay_tail),
-                _ => replay_tail,
-            };
-            Some((
-                Ok(render(frame)),
-                (state, rx, shutdown, selector, replay, next_tail),
-            ))
+            Some((Ok(render(frame)), stream))
         },
     )
 }
@@ -279,6 +386,11 @@ fn render(frame: Frame) -> Event {
             let frame = serde_json::json!({ "kind": FILTER_ERROR_KIND, "detail": detail });
             // The dropped event's seq must not become a resume point that
             // claims delivery — no id on the marker.
+            Event::default().data(frame.to_string())
+        }
+        Frame::ReplayError(detail) => {
+            let frame = serde_json::json!({ "kind": REPLAY_ERROR_KIND, "detail": detail });
+            // No id: nothing past the client's last delivered id was sent.
             Event::default().data(frame.to_string())
         }
     }
@@ -391,7 +503,13 @@ mod tests {
                 )),
             })
             .collect();
-        let mut stream = event_stream(state, rx, None, Some(replay.into_iter())).boxed();
+        let replay = Replay {
+            buffered: replay.into_iter(),
+            after: 12,
+            more: false,
+            batch: 10,
+        };
+        let mut stream = event_stream(state, rx, None, Some(replay)).boxed();
         for expected in [10u64, 11, 12] {
             let frame = StreamExt::next(&mut stream).await.unwrap().unwrap();
             let rendered = format!("{frame:?}");
@@ -417,6 +535,221 @@ mod tests {
         let frame = StreamExt::next(&mut stream).await.unwrap().unwrap();
         let rendered = format!("{frame:?}");
         assert!(rendered.contains("id: 13"), "{rendered}");
+        drop(tx);
+    }
+
+    /// A `{"kind":"…"}` probe transition (`n` rides the command name, so a
+    /// frame names which event it carries).
+    fn probe(n: u64) -> hekma_engine::EngineEvent {
+        use hekma_engine::{EngineEvent, LifecycleState, TransitionCause, TransitionEvent};
+        EngineEvent::Transition(TransitionEvent::new(
+            "probe",
+            LifecycleState::Registered,
+            LifecycleState::Starting,
+            TransitionCause::Command {
+                command: format!("start-{n}"),
+            },
+            "2026-11-12T00:00:00Z",
+        ))
+    }
+
+    /// The next frame's debug rendering, bounded (never a hung test).
+    async fn next_frame<S>(stream: &mut S) -> String
+    where
+        S: Stream<Item = Result<Event, Infallible>> + Unpin,
+    {
+        let frame =
+            tokio::time::timeout(std::time::Duration::from_secs(10), StreamExt::next(stream))
+                .await
+                .expect("a frame within the bound")
+                .expect("the stream is open")
+                .unwrap();
+        format!("{frame:?}")
+    }
+
+    /// The `id:` a rendered frame carries, if any.
+    fn frame_id(rendered: &str) -> Option<u64> {
+        let start = rendered.find("id: ")? + 4;
+        let digits: String = rendered[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// Commit one Policy (one committed, published event) through `state`'s
+    /// writable engine.
+    async fn commit_policy(state: &ApiState, name: &str) {
+        state
+            .engine
+            .create_policy(
+                hekma_engine::PolicyChange {
+                    name: name.to_string(),
+                    selector: Some("team=core".parse().unwrap()),
+                    set: Default::default(),
+                    clear: Vec::new(),
+                    rates: Default::default(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Every committed outbox seq after `after`.
+    async fn outbox_seqs(state: &ApiState, after: u64) -> Vec<u64> {
+        state
+            .engine
+            .export_events(Some(hekma_engine::OutboxCursor { seq: after }), 10_000)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .map(|entry| entry.seq)
+            .collect()
+    }
+
+    /// Resume from 0 with `batch`-sized replay reads while an event commits
+    /// between the subscribe and the first replay read: every committed
+    /// event arrives exactly once, in order, then live continues.
+    async fn resume_across_the_seam(batch: u32) {
+        let (state, _shutdown_tx) = super::super::test_support::writable_api_state();
+        commit_policy(&state, "before-one").await;
+        commit_policy(&state, "before-two").await;
+        let (rx, replay) =
+            subscribe_then_replay(&state, Some(0), batch, commit_policy(&state, "at-the-seam"))
+                .await
+                .unwrap();
+        let expected = outbox_seqs(&state, 0).await;
+        assert!(expected.len() >= 3, "{expected:?}");
+        let mut stream = event_stream(state.clone(), rx, None, replay).boxed();
+        let mut delivered = Vec::new();
+        let mut seam_seen = false;
+        for _ in 0..expected.len() {
+            let rendered = next_frame(&mut stream).await;
+            seam_seen |= rendered.contains("at-the-seam");
+            delivered.push(frame_id(&rendered).expect("an event frame carries its id"));
+        }
+        assert_eq!(
+            delivered, expected,
+            "batch {batch}: every committed event, once, in order"
+        );
+        assert!(seam_seen, "batch {batch}: the seam's event was delivered");
+        // Nothing else is pending: the live copy of the seam's event (and
+        // of every replayed event) was deduped.
+        commit_policy(&state, "after").await;
+        let rendered = next_frame(&mut stream).await;
+        assert!(rendered.contains("after"), "{rendered}");
+        assert_eq!(
+            frame_id(&rendered),
+            outbox_seqs(&state, 0).await.last().copied()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_committed_between_subscribe_and_replay_is_delivered_once() {
+        // The seam: the resume subscribes FIRST and reads the replay
+        // second, so an event committed between the two is on the receiver
+        // AND in the replay — delivered exactly once, never lost. (Reading
+        // the replay before subscribing loses it: in neither.) One batch
+        // holds the whole replay here, so the seam is the only path.
+        resume_across_the_seam(hekma_engine::EXPORT_BATCH_MAX_CAP).await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_reads_the_replay_lazily_in_bounded_batches() {
+        // Two-entry batches: the replay drains across several reads (each
+        // read only once the client has drained the last), with the same
+        // exactly-once seam.
+        resume_across_the_seam(2).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_later_replay_batch_is_named_and_ends_the_stream() {
+        // The replay reads lazily; a batch that cannot be read after the
+        // stream started (here: past the tail) surfaces a replay-error
+        // frame with no id and ENDS the stream — never a silent gap.
+        let (state, _shutdown_tx) = super::super::test_support::writable_api_state();
+        let (_tx, rx) = broadcast::channel::<(u64, hekma_engine::EngineEvent)>(4);
+        let replay = Replay {
+            buffered: Vec::new().into_iter(),
+            after: 1_000_000,
+            more: true,
+            batch: 2,
+        };
+        let mut stream = event_stream(state, rx, None, Some(replay)).boxed();
+        let rendered = next_frame(&mut stream).await;
+        assert!(rendered.contains("replay-error"), "{rendered}");
+        assert_eq!(frame_id(&rendered), None, "the marker carries no id");
+        let end = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("the stream ends, it does not hang");
+        assert!(end.is_none(), "the stream ended after the marker");
+    }
+
+    #[tokio::test]
+    async fn the_lagged_frame_carries_no_id() {
+        // A receiver that falls behind the ring sees the gap marker — with
+        // NO id (it is a gap, not an event) — then the stream continues.
+        let (tx, rx) = broadcast::channel::<(u64, hekma_engine::EngineEvent)>(1);
+        let (state, _shutdown_tx) = quiet_state();
+        let mut stream = event_stream(state, rx, None, None).boxed();
+        for seq in [1u64, 2, 3] {
+            tx.send((seq, probe(seq))).unwrap();
+        }
+        let rendered = next_frame(&mut stream).await;
+        assert!(rendered.contains("lagged"), "{rendered}");
+        assert_eq!(frame_id(&rendered), None, "{rendered}");
+        let rendered = next_frame(&mut stream).await;
+        assert_eq!(
+            frame_id(&rendered),
+            Some(3),
+            "the stream continues: {rendered}"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_plain_stream_delivers_every_live_event_even_out_of_seq_order() {
+        // No Last-Event-ID: nothing was replayed, so nothing is deduped — a
+        // live event whose seq is below one already delivered is still
+        // delivered (only a resume's replayed range is dropped).
+        let (tx, rx) = broadcast::channel::<(u64, hekma_engine::EngineEvent)>(4);
+        let (state, _shutdown_tx) = quiet_state();
+        let mut stream = event_stream(state, rx, None, None).boxed();
+        tx.send((5, probe(5))).unwrap();
+        tx.send((3, probe(3))).unwrap();
+        assert_eq!(frame_id(&next_frame(&mut stream).await), Some(5));
+        assert_eq!(frame_id(&next_frame(&mut stream).await), Some(3));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_resume_drops_live_copies_of_replayed_seqs_only() {
+        // The resume's dedup floor is the last seq the replay READ: a live
+        // copy at or below it is dropped, everything above it delivered.
+        let (tx, rx) = broadcast::channel::<(u64, hekma_engine::EngineEvent)>(8);
+        let (state, _shutdown_tx) = quiet_state();
+        let replay = Replay {
+            buffered: vec![hekma_engine::OutboxEntry {
+                schema_version: 1,
+                seq: 7,
+                event: probe(7),
+            }]
+            .into_iter(),
+            after: 7,
+            more: false,
+            batch: 10,
+        };
+        let mut stream = event_stream(state, rx, None, Some(replay)).boxed();
+        for seq in [6u64, 7, 8] {
+            tx.send((seq, probe(seq))).unwrap();
+        }
+        assert_eq!(frame_id(&next_frame(&mut stream).await), Some(7));
+        assert_eq!(frame_id(&next_frame(&mut stream).await), Some(8));
         drop(tx);
     }
 
