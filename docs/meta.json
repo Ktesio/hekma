@@ -11,6 +11,7 @@
     "runs",
     "policies",
     "run-keys",
+    "metering-proxy",
     "attach",
     "---Reference---",
     "commands",
