@@ -192,6 +192,7 @@ fn open_request(args: &OpenArgs) -> Result<ChildRunRequest, Box<dyn std::error::
             token_per_run: args.token_budget,
             dollar_per_run_micros,
             breach_action,
+            ..RunLimits::default()
         },
         external_id: args.external_id.clone(),
     })

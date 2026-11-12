@@ -305,6 +305,19 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// The limits set directly on a Run.
     fn run_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError>;
 
+    /// Replace a Run's whole `run_limits` set (story 21-6, the budget job):
+    /// every ceiling `limits` carries is written with `source` (the actor:
+    /// `operator`, `host`, `caller`) and `at`, plus the action row that
+    /// decides the Run's Breach Action (set or explicitly unset). An empty
+    /// `limits` deletes every row.
+    fn replace_run_limits(
+        &self,
+        run_id: &RunId,
+        limits: &RunLimits,
+        source: &str,
+        at: &str,
+    ) -> Result<(), StoreError>;
+
     /// The Run and its ancestors, the Run first.
     fn run_chain(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;
 

@@ -114,6 +114,8 @@ fn note<S: RunRecords + ?Sized>(
         anomalies: record.anomalies.clone(),
         labels: bound_only(&labels),
         prior_labels: prior.labels,
+        limits: prior.limits.map(|_| limits),
+        prior_limits: prior.limits,
         cause,
         policies: resolution
             .as_ref()
@@ -136,6 +138,9 @@ struct Prior {
     depth: Option<ControlDepth>,
     wire_path: Option<bool>,
     labels: Option<Vec<Label>>,
+    /// The Run's own limits before, on `limits-changed` (the event then
+    /// carries the limits after too).
+    limits: Option<super::RunLimits>,
 }
 
 /// The bound subset of `labels` (what a Run event carries).
@@ -577,6 +582,30 @@ fn write_labels<S: RunRecords + ?Sized>(
 /// Note an `anomalies-changed` event for `record` (already saved with its
 /// new Anomalies) plus its snapshot entry. Story 21-3's public entry point
 /// for the resolution-owned Anomalies (`depth-fallback`, `unpriced-model`).
+/// Note a `limits-changed` event for `record` (story 21-6): the Run's own
+/// limits before (`prior`) and after (read back), with the actor as the
+/// cause. The record is saved by the caller (or unchanged).
+pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    prior: super::RunLimits,
+    actor: &str,
+    _at: &str,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::LimitsChanged,
+        Prior {
+            limits: Some(prior),
+            ..Prior::default()
+        },
+        Some(actor.to_string()),
+    )
+}
+
 pub(crate) fn note_anomalies_changed<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,

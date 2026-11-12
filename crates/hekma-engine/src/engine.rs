@@ -72,8 +72,9 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, PolicyChange, PolicyOutcome, PolicyRecord,
-    RunError, RunId, RunRecord, RunView, Selector,
+    ChildRunRequest, LabelChange, LabelOutcome, LimitActor, PolicyChange, PolicyOutcome,
+    PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsOutcome,
+    RunLimitsView, RunRecord, RunVerbError, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -1872,6 +1873,172 @@ impl Engine {
         .await
     }
 
+    /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
+    /// row when the verb maps to its instance's verb, else the per-Run
+    /// refusal ([`RunError::RunEnded`], [`RunError::VerbUnavailable`]) the
+    /// act would answer. Reads only — the `--dry-run` planner; an act can
+    /// still meet the instance verb's own refusals (capability, state).
+    pub async fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            Ok(record)
+        })
+        .await
+    }
+
+    /// The instance a Run-grain verb acts on, checked and acted under the
+    /// SAME locks (so a Run that ends — and a fresh start that replaces it
+    /// — between the check and the act cannot redirect the verb onto
+    /// another Run).
+    async fn act_on_run<T: Send + 'static>(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+        act: impl FnOnce(&Registry, &mut Supervisor, &str) -> Result<T, EngineError> + Send + 'static,
+    ) -> Result<T, RunVerbError> {
+        self.refuse_if_read_only()
+            .map_err(|err| RunVerbError::Run(RunError::Store(err)))?;
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let record = registry
+                .run_record(&run_id)?
+                .ok_or_else(|| RunError::NotFound {
+                    run_id: run_id.as_str().to_string(),
+                })?;
+            let instance = crate::domain::runs::verbs::run_verb_target(verb, &record)?;
+            act(&registry, &mut supervisor, &instance).map_err(RunVerbError::Engine)
+        })
+        .await
+    }
+
+    /// Stop the instance whose supervised process Run `run_id` owns (story
+    /// 21-6, PRD FR-50): exactly [`Engine::stop`] on that instance. A child
+    /// Run, an ended Run, and any depth the verb × depth table does not
+    /// serve yet are refused per Run ([`RunVerbError::Run`]).
+    pub async fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Stop,
+            move |registry, supervisor, name| supervisor.stop(registry, name, window),
+        )
+        .await
+    }
+
+    /// Pause the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::pause`] on it (the Run goes `held`). Other Runs
+    /// are refused per Run.
+    pub async fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Pause,
+            |registry, supervisor, name| supervisor.pause(registry, name),
+        )
+        .await
+    }
+
+    /// Resume the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::resume`] on it. A child held because its parent is
+    /// paused is refused, naming the parent.
+    pub async fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Resume,
+            |registry, supervisor, name| supervisor.resume(registry, name),
+        )
+        .await
+    }
+
+    /// Drain the instance whose process Run `run_id` owns (story 21-6):
+    /// exactly [`Engine::drain`] on it, with its own bound. Other Runs are
+    /// refused per Run.
+    pub async fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.act_on_run(
+            run_id,
+            RunLifecycleVerb::Drain,
+            move |registry, supervisor, name| {
+                supervisor
+                    .drain(registry, name, timeout_override)
+                    .map(|(instance, outcome)| DrainReport { instance, outcome })
+            },
+        )
+        .await
+    }
+
+    /// Set limits on Runs as `actor` (story 21-6, PRD FR-50 / FR-60): the
+    /// budget job behind `hekma budget set` and `PATCH /v0/runs/{id}/limits`.
+    /// Each Run is one writer job and answers on its own (a refusal on one
+    /// never stops the others): `scope-unavailable` (a cumulative ceiling on
+    /// a child Run), `action-unavailable` (an action its depth cannot
+    /// execute, naming the Metering Source), `raise-forbidden` (a Caller
+    /// loosening a limit), `run-ended`, `run-not-found`. A committed change
+    /// writes the Run's `run_limits`, re-resolves it, commits one
+    /// `limits-changed` event and runs the shared re-arm pass: a ceiling
+    /// raised above the totals re-arms its latch and lifts the matching
+    /// `block` fence reason per reason; one lowered to at or below the usage
+    /// breaches at once, its Breach Action applied before this returns. A
+    /// limit set here belongs to the Run — it ends with the Run. `dry_run`
+    /// plans each Run and writes nothing. A malformed change is refused
+    /// whole.
+    pub async fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<Vec<(RunId, Result<RunLimitsOutcome, RunError>)>, RunError> {
+        if !dry_run {
+            self.refuse_if_read_only().map_err(RunError::Store)?;
+        }
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let mut supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
+            let ids: Vec<RunId> = run_ids.into_iter().map(RunId::from_wire).collect();
+            supervisor.set_run_limits(&registry, &ids, &change, actor, dry_run)
+        })
+        .await
+    }
+
+    /// The budget read of one Run (story 21-6, `hekma budget show`): the
+    /// limits set on the Run, the resolved limits with each source, its
+    /// subtree and cumulative usage, the headroom and the latches. Reads
+    /// only.
+    pub async fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let run_id = RunId::from_wire(run_id);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .run_limits_view(&run_id)
+        })
+        .await
+    }
+
     /// Every stored Policy (story 21-3, PRD FR-60), the `default` Policy
     /// included, ordered by name. Reads only.
     pub async fn policies(&self) -> Result<Vec<PolicyRecord>, RunError> {
@@ -2744,6 +2911,67 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::select_runs`].
     pub fn select_runs(&self, selector: &Selector) -> Result<Vec<RunRecord>, RunError> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
+    }
+
+    /// Blocking twin of [`Engine::plan_run_verb`].
+    pub fn plan_run_verb(
+        &self,
+        run_id: &str,
+        verb: RunLifecycleVerb,
+    ) -> Result<RunRecord, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.plan_run_verb(run_id, verb))
+    }
+
+    /// Blocking twin of [`Engine::stop_run`].
+    pub fn stop_run(
+        &self,
+        run_id: &str,
+        window: Option<Duration>,
+    ) -> Result<AgentInstance, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.stop_run(run_id, window))
+    }
+
+    /// Blocking twin of [`Engine::pause_run`].
+    pub fn pause_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.pause_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::resume_run`].
+    pub fn resume_run(&self, run_id: &str) -> Result<AgentInstance, RunVerbError> {
+        self.engine.rt.block_on(self.engine.resume_run(run_id))
+    }
+
+    /// Blocking twin of [`Engine::drain_run`].
+    pub fn drain_run(
+        &self,
+        run_id: &str,
+        timeout_override: Option<Duration>,
+    ) -> Result<DrainReport, RunVerbError> {
+        self.engine
+            .rt
+            .block_on(self.engine.drain_run(run_id, timeout_override))
+    }
+
+    /// Blocking twin of [`Engine::set_run_limits`].
+    pub fn set_run_limits(
+        &self,
+        run_ids: Vec<String>,
+        change: RunLimitChange,
+        actor: LimitActor,
+        dry_run: bool,
+    ) -> Result<Vec<(RunId, Result<RunLimitsOutcome, RunError>)>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.set_run_limits(run_ids, change, actor, dry_run))
+    }
+
+    /// Blocking twin of [`Engine::run_limits_view`].
+    pub fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
+        self.engine.rt.block_on(self.engine.run_limits_view(run_id))
     }
 
     /// Blocking twin of [`Engine::policies`].

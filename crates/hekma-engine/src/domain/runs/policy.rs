@@ -689,15 +689,19 @@ pub fn resolve(input: &ResolutionInput) -> PolicyResolution {
     }
 }
 
-/// The Run-level ceiling for `kind` (`run_limits`), if set. Only per-run
-/// scopes exist at the Run level today (21-2).
+/// The Run-level ceiling for `kind` (`run_limits`), if set. Story 21-6
+/// adds the cumulative scopes (set through `hekma budget` on a
+/// process-owning Run; a child Run never carries one).
 fn run_ceiling(limits: &RunLimits, kind: LimitKind) -> Option<u64> {
     match kind {
         LimitKind::TokensPerRun => limits.token_per_run,
         LimitKind::DollarsPerRun => limits
             .dollar_per_run_micros
-            .map(|micros| micros.get() as u64),
-        LimitKind::TokensCumulative | LimitKind::DollarsCumulative => None,
+            .map(|micros| micros.get().max(0) as u64),
+        LimitKind::TokensCumulative => limits.token_cumulative,
+        LimitKind::DollarsCumulative => limits
+            .dollar_cumulative_micros
+            .map(|micros| micros.get().max(0) as u64),
     }
 }
 
@@ -1243,6 +1247,7 @@ mod tests {
             token_per_run: Some(100),
             dollar_per_run_micros: None,
             breach_action: Some(BreachAction::Warn),
+            ..RunLimits::default()
         };
         let resolution = resolve(&with_run);
         assert_eq!(limits_of(&resolution), Some(100));

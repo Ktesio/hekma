@@ -678,6 +678,7 @@ pub(crate) async fn run_open(
                 token_per_run: request.token_budget,
                 dollar_per_run_micros,
                 breach_action,
+                ..RunLimits::default()
             },
             external_id: request.external_id,
         })

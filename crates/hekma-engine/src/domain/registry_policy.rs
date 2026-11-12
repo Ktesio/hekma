@@ -26,7 +26,7 @@ use crate::domain::config::{self, ConfigLayer, SourceLayer};
 use crate::domain::cost::Rate;
 use crate::domain::name::InstanceName;
 use crate::domain::outbox::OUTBOX_MAX_BYTES;
-use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
+use crate::domain::pipeline::CommittedBreach;
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
     self, BreachDefaultUpgradedEvent, PolicyEvent, PolicyEventKind, PolicyLimits, PolicyRecord,
@@ -35,7 +35,6 @@ use crate::domain::runs::policy::{
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
 use crate::domain::Registry;
-use crate::metering::WireFence;
 use crate::ports::{PolicyRecords, RunRecords, RunStore, StoreError};
 use crate::store::BreachDefaultSource;
 use crate::time::now_rfc3339;
@@ -75,30 +74,7 @@ pub struct PolicyOutcome {
     pub notes: Vec<String>,
 }
 
-/// The live per-instance context the policy-change job's money half needs
-/// (built by the caller — engine or supervisor — which holds the locks):
-/// the instance's metering wire fence, its metering source for the breach
-/// records, and its fresh explicit inputs. Whether the engine supervises
-/// the instance is the CALLER's own fact when it applies the returned
-/// process actions (D2) — an unsupervised instance's breaches still
-/// record and latch here.
-#[derive(Clone, Default)]
-pub(crate) struct InstanceContext {
-    /// The instance's live wire fence (an engine-observed instance's
-    /// listener fence; `None` when it has no listener).
-    pub fence: Option<WireFence>,
-    /// The instance's metering source (the breach records name it).
-    pub metering_source: String,
-    /// Whether THIS engine supervises the instance right now: only a
-    /// supervised instance's money half runs (the breach-at-once latch
-    /// must be executable by the engine that records it); an unsupervised
-    /// instance still gets FRESH inputs for its stored resolution.
-    pub supervised: bool,
-    /// The instance's explicit limits and model, read fresh from its
-    /// configuration by the caller; `Err` names why they could not be read
-    /// (the Run is then skipped, never resolved as if nothing were set).
-    pub inputs: Option<Result<ResolveInputs, String>>,
-}
+pub(crate) use crate::domain::runs::limits::InstanceContext;
 
 /// The Fleet read's resolution facts for every instance at once
 /// ([`Registry::fleet_resolution_facts`]): the open process-owning Runs'
@@ -1568,7 +1544,7 @@ fn re_resolve_matched(
                 }
                 let context = contexts.get(instance).cloned().unwrap_or_default();
                 if let Ok(name) = InstanceName::new(instance) {
-                    re_arm(
+                    crate::domain::runs::limits::re_arm(
                         store,
                         &name,
                         run,
@@ -1594,236 +1570,6 @@ fn re_resolve_matched(
         changes,
         breaches,
     ))
-}
-
-/// The re-arm pass over one matched Run.
-///
-/// * RAISED above the totals (or UNSET — a cleared or deleted ceiling is
-///   limit-free, so its latch always re-arms): the latch rows for the
-///   re-armed `(dimension, scope)` clear, the `breach` Anomaly clears when
-///   no latch remains (with its `anomalies-changed` event and snapshot
-///   entry), and the matching `block` fence reason clears PER REASON
-///   (amendment 2: only the reasons whose new ceiling now sits above the
-///   totals; a fence holding any other latched `block` reason stays up).
-///   Per-run ceilings compare against the RUN's totals; cumulative
-///   ceilings against the INSTANCE's lifetime totals (a multi-Run instance
-///   over its cumulative cap must not unlatch on a per-Run comparison).
-/// * THEN lowered-to-at-or-below: `pipeline::evaluate` commits the breach
-///   NOW (breach row, latch, outbox, `breach` Anomaly; the decision's
-///   process action returns to the caller to apply).
-///
-/// The evaluation's Run changes fold into `changes` (the caller's ONE
-/// commit publishes the post-breach entries last — the pre-breach entry
-/// must not overwrite them), and its degraded reads surface as notes.
-#[allow(clippy::too_many_arguments)]
-fn re_arm(
-    store: &crate::store::SqliteStore,
-    instance: &InstanceName,
-    run: &RunRecord,
-    resolution: &PolicyResolution,
-    context: &InstanceContext,
-    supervised: bool,
-    ctx: &mut crate::store::WriterCtx<'_>,
-    breaches: &mut Vec<CommittedBreach>,
-    changes: &mut RunChanges,
-    notes: &mut Vec<String>,
-) -> Result<(), RunError> {
-    let usage = store
-        .run_rollup(instance, &run.run_id)
-        .map_err(RunError::Store)?;
-    let tokens_now = usage.totals.total_tokens();
-    let dollars_now = usage.cost.get() as u64;
-    // The CUMULATIVE scope compares against the instance's LIFETIME totals
-    // (every Run), not this Run's — the same read the pipeline's cumulative
-    // arm uses (`instance_rollup`).
-    let instance_usage = store.instance_rollup(instance).map_err(RunError::Store)?;
-    let instance_tokens = instance_usage.totals.total_tokens();
-    let instance_dollars = instance_usage.cost.get() as u64;
-
-    // ---- the re-arm half (raise above the totals, or unset).
-    // A CHILD level enforces only its Run- and Policy-sourced PER-RUN arms
-    // (the instance's ceilings arm the process level alone — see
-    // `pipeline::levels_for`), so a child's latch compares against the
-    // ceiling its OWN level would enforce today. An instance-sourced
-    // ceiling that the child level never arms must re-arm the latch it
-    // once held (a Policy armed the child at 50, latched at 60, and the
-    // Policy's deletion left an instance-sourced 40: the latch once stuck
-    // forever, because `40 > 60` is false — the 21-3 review round 2
-    // finding N14).
-    let level_sourced = |source: &crate::domain::runs::LimitSource| {
-        !matches!(source, crate::domain::runs::LimitSource::Instance)
-    };
-    let token_per_run = if run.process_owner {
-        resolution.tokens.per_run
-    } else {
-        level_sourced(&resolution.sources.tokens_per_run)
-            .then_some(resolution.tokens.per_run)
-            .flatten()
-    };
-    let dollar_per_run = if run.process_owner {
-        resolution.dollars.per_run.map(|micros| micros.get() as u64)
-    } else {
-        level_sourced(&resolution.sources.dollars_per_run)
-            .then(|| resolution.dollars.per_run.map(|micros| micros.get() as u64))
-            .flatten()
-    };
-    let mut re_armed: Vec<crate::domain::LatchKey> = Vec::new();
-    for (key, ceiling, total_now) in [
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Tokens,
-                crate::domain::BreachScope::PerRun,
-            ),
-            token_per_run,
-            tokens_now,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Tokens,
-                crate::domain::BreachScope::Cumulative,
-            ),
-            if run.process_owner {
-                resolution.tokens.cumulative
-            } else {
-                None
-            },
-            instance_tokens,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Dollars,
-                crate::domain::BreachScope::PerRun,
-            ),
-            dollar_per_run,
-            dollars_now,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Dollars,
-                crate::domain::BreachScope::Cumulative,
-            ),
-            if run.process_owner {
-                resolution
-                    .dollars
-                    .cumulative
-                    .map(|micros| micros.get() as u64)
-            } else {
-                None
-            },
-            instance_dollars,
-        ),
-    ] {
-        // A ceiling that became UNSET (or one this level no longer
-        // enforces) re-arms too: `--clear` and delete loosen, and a
-        // latched breach under a ceiling that no longer exists would hold
-        // the Run (and a `block` fence) forever.
-        if ceiling.is_none_or(|ceiling| ceiling > total_now) {
-            re_armed.push(key);
-        }
-    }
-    let mut any_latch_left = false;
-    if !re_armed.is_empty() {
-        for (key, action) in store.latches(&run.run_id).map_err(RunError::Store)? {
-            if re_armed.contains(&key) {
-                store
-                    .unlatch(&run.run_id, key, action)
-                    .map_err(RunError::Store)?;
-                // Per-reason fence clear: only the raised reasons clear; the
-                // fence stays up while any other latched `block` reason
-                // holds (amendment 2).
-                if action == BreachAction::Block {
-                    if let Some(fence) = &context.fence {
-                        let fence = fence.clone();
-                        ctx.after_commit(move || fence.clear(key));
-                    }
-                }
-            } else {
-                any_latch_left = true;
-            }
-        }
-        if !any_latch_left {
-            changes.extend(
-                ops::clear_breach_anomaly(store, &run.run_id, &now_rfc3339())
-                    .map_err(RunError::Store)?,
-            );
-        }
-    }
-
-    // ---- the breach-at-once half (lowered to at-or-below the usage),
-    // ONLY on an instance this engine supervises (the latch must be
-    // executable by the engine that records it):
-    // the same pipeline evaluation a usage commit runs, over the NEW arms.
-    // The process level's arms are the instance's (the process-owning
-    // Run's resolution — the matched Run's own when it IS the owner; the
-    // owner's STORED resolution when the match is a child, whose own arms
-    // ride its own level inside the evaluation).
-    if !supervised {
-        return Ok(());
-    }
-    let owner_arms = if run.process_owner {
-        resolution.clone()
-    } else {
-        let owner_row = match store.open_process_run(instance).map_err(RunError::Store)? {
-            Some(owner) => owner,
-            None => {
-                notes.push(format!(
-                    "Run `{}` (agent `{}`) was not breach-checked: its agent has no open \
-                     process-owning Run to arm the process level",
-                    run.run_id.as_str(),
-                    instance.as_str(),
-                ));
-                return Ok(());
-            }
-        };
-        match store
-            .run_policy(&owner_row.run_id)
-            .map_err(RunError::Store)?
-        {
-            Some(row) => row.resolution,
-            None => {
-                notes.push(format!(
-                    "Run `{}` (agent `{}`) was not breach-checked: its agent's process-owning \
-                     Run has no stored resolution to arm the process level",
-                    run.run_id.as_str(),
-                    instance.as_str(),
-                ));
-                return Ok(());
-            }
-        }
-    };
-    let armed = supervised
-        && (owner_arms.tokens.is_set()
-            || (owner_arms.rate.is_some() && owner_arms.dollars.is_set())
-            || resolution.tokens.per_run.is_some()
-            || (resolution.rate.is_some() && resolution.dollars.per_run.is_some()));
-    if armed {
-        let input = EvalInput {
-            name: instance.clone(),
-            run_id: run.run_id.clone(),
-            // A missing context (the instance not supervised here) is the
-            // honest `unknown`, never a fabricated empty source.
-            metering_source: if context.metering_source.is_empty() {
-                "unknown".to_string()
-            } else {
-                context.metering_source.clone()
-            },
-            token_budget: owner_arms.tokens,
-            token_action: owner_arms.effective_action,
-            rate: owner_arms.rate,
-            cost_cap: owner_arms.dollars,
-            cost_action: owner_arms.effective_action,
-            supervised: true,
-            fence: context.fence.clone(),
-            runs: None,
-            #[cfg(test)]
-            totals_fault: false,
-        };
-        let mut evaluation = pipeline::evaluate(ctx, &input).map_err(RunError::Store)?;
-        breaches.extend(std::mem::take(&mut evaluation.breaches));
-        notes.extend(std::mem::take(&mut evaluation.degraded_reads));
-        changes.extend(evaluation.take_run_changes());
-    }
-    Ok(())
 }
 
 /// Merge a change over an existing row (the change's `set` fields win;

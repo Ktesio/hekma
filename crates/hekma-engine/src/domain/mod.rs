@@ -35,6 +35,7 @@ pub(crate) mod probe_kinds;
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
 mod registry;
+pub(crate) mod registry_limits;
 pub(crate) mod registry_policy;
 #[cfg(test)]
 mod registry_policy_tests;
@@ -75,10 +76,11 @@ pub use fleet::{
 };
 pub use governance::{
     canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
-    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
-    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
-    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
-    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
+    generate, governance_vectors_checksum, re_armed_keys, rearm, run_derivation, Case, ChainCase,
+    CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, LatchedReason, LevelArms,
+    LevelTotals, Provenance, RearmInput, RearmOutcome, RowPricing, TokenArm, VectorsDocument,
+    ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
     GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
     GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
@@ -104,6 +106,10 @@ pub use runs::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
     PolicyLimits, PolicyRecord, PolicyResolution, RunPolicy, ScentCheckMode, UpgradedInstance,
     DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
+};
+pub use runs::{
+    LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
+    RunLimitsView, RunVerbError,
 };
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.

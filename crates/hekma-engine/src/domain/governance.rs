@@ -424,6 +424,224 @@ pub fn fence_refusal(reasons: &[LatchKey]) -> Option<FenceRefusal> {
 }
 
 // ---------------------------------------------------------------------------
+// The within-Run re-arm (story 21-6, vectors 1.4.0)
+// ---------------------------------------------------------------------------
+
+/// The ceilings ONE level enforces after a limit change, per
+/// `(dimension, scope)`, in the evaluators' units (tokens; integer
+/// micro-dollars). `None` = the level enforces no ceiling there (unset, or
+/// one this level never arms — a child level carries no cumulative scope).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelArms {
+    /// The per-run token ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_run: Option<u64>,
+    /// The cumulative token ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_cumulative: Option<u64>,
+    /// The per-run dollar cap, micro-dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollars_per_run_micros: Option<u64>,
+    /// The cumulative dollar cap, micro-dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollars_cumulative_micros: Option<u64>,
+}
+
+impl LevelArms {
+    /// The ceiling for one `(dimension, scope)`.
+    pub fn ceiling(&self, key: LatchKey) -> Option<u64> {
+        match (key.dimension, key.scope) {
+            (BreachDimension::Tokens, BreachScope::PerRun) => self.tokens_per_run,
+            (BreachDimension::Tokens, BreachScope::Cumulative) => self.tokens_cumulative,
+            (BreachDimension::Dollars, BreachScope::PerRun) => self.dollars_per_run_micros,
+            (BreachDimension::Dollars, BreachScope::Cumulative) => self.dollars_cumulative_micros,
+        }
+    }
+}
+
+/// The committed totals a re-arm compares against: per-run scopes against
+/// the RUN's subtree totals, cumulative scopes against the hosting
+/// instance's lifetime totals (every Run).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LevelTotals {
+    /// The Run's subtree token total.
+    pub run_tokens: u64,
+    /// The instance's lifetime token total.
+    pub cumulative_tokens: u64,
+    /// The Run's subtree cost, micro-dollars.
+    pub run_cost_micros: u64,
+    /// The instance's lifetime cost, micro-dollars.
+    pub cumulative_cost_micros: u64,
+}
+
+impl LevelTotals {
+    /// The total one `(dimension, scope)` compares against.
+    pub fn total(&self, key: LatchKey) -> u64 {
+        match (key.dimension, key.scope) {
+            (BreachDimension::Tokens, BreachScope::PerRun) => self.run_tokens,
+            (BreachDimension::Tokens, BreachScope::Cumulative) => self.cumulative_tokens,
+            (BreachDimension::Dollars, BreachScope::PerRun) => self.run_cost_micros,
+            (BreachDimension::Dollars, BreachScope::Cumulative) => self.cumulative_cost_micros,
+        }
+    }
+}
+
+/// The RE-ARM rule (story 21-3's raise half, promoted and shared by every
+/// raise trigger in story 21-6): the `(dimension, scope)` pairs whose latch
+/// re-arms after a limit change — every pair whose ceiling is now ABOVE its
+/// total, or no longer set at this level (a cleared or deleted ceiling is
+/// limit-free, so a latch under it would otherwise hold forever). In
+/// [`FENCE_REASON_ORDER`]. A ceiling AT or below the total keeps its latch
+/// (the `>=` threshold: it would fire again at once).
+pub fn re_armed_keys(arms: &LevelArms, totals: &LevelTotals) -> Vec<LatchKey> {
+    FENCE_REASON_ORDER
+        .into_iter()
+        .filter(|key| {
+            arms.ceiling(*key)
+                .is_none_or(|ceiling| ceiling > totals.total(*key))
+        })
+        .collect()
+}
+
+/// One latched pair with the Breach Action that recorded it (the latch is
+/// keyed by action: a pair spent under `warn` re-fires once under `pause`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatchedReason {
+    /// The `(dimension, scope)`.
+    pub reason: LatchKey,
+    /// The action it latched under.
+    pub action: BreachAction,
+}
+
+/// A `rearm` input (vectors 1.4.0): one level's ceilings and action after
+/// a limit change, its totals, and its latches before the change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RearmInput {
+    /// The level's ceilings AFTER the change.
+    pub arms: LevelArms,
+    /// The level's effective Breach Action after the change.
+    pub action: BreachAction,
+    /// Whether a Rate resolves (an unpriced dollar cap re-arms like any
+    /// ceiling but cannot fire).
+    pub priced: bool,
+    /// The committed totals.
+    pub totals: LevelTotals,
+    /// The latches before the change, in latch order.
+    #[serde(default)]
+    pub latched: Vec<LatchedReason>,
+}
+
+/// What a `rearm` does (vectors 1.4.0).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RearmOutcome {
+    /// The latches the change released (re-armed), in latch order.
+    pub unlatched: Vec<LatchedReason>,
+    /// The `block` fence reasons that lift — PER REASON: only the released
+    /// `block` latches; any other latched `block` reason keeps the fence up.
+    pub fence_cleared: Vec<LatchKey>,
+    /// The breaches the change fires AT ONCE (a ceiling now at or below
+    /// its total), token before dollar — [`decide`] over the new arms.
+    pub fired: Vec<GovernanceDecision>,
+    /// The latches after: the kept ones, then the newly fired.
+    pub latched_after: Vec<LatchedReason>,
+    /// The fence reasons raised after, in [`FENCE_REASON_ORDER`] (every
+    /// `block` latch left or fired).
+    pub fence_after: Vec<LatchKey>,
+    /// Whether the Run's `breach` Anomaly holds after (it mirrors the
+    /// latches: cleared once every latch re-armed, raised by a firing).
+    pub breach_anomaly: bool,
+}
+
+/// The within-Run re-arm, whole (story 21-6, vectors 1.4.0): release the
+/// latches [`re_armed_keys`] names, lift their `block` fence reasons per
+/// reason, then [`decide`] over the new arms with the kept latches (only
+/// those under the current action count — the action-keyed latch) so a
+/// ceiling lowered to at-or-below its total fires now. The outcome is the
+/// same whatever raised or lowered the ceiling — a Policy change, a
+/// Run-level limit, or an instance configuration write. This is exactly
+/// the composition the store-side pass runs (`runs::limits::re_arm`, then
+/// the pipeline's evaluation), for one level.
+pub fn rearm(input: &RearmInput) -> RearmOutcome {
+    let keys = re_armed_keys(&input.arms, &input.totals);
+    let mut outcome = RearmOutcome::default();
+    let mut kept: Vec<LatchedReason> = Vec::new();
+    for latched in &input.latched {
+        if kept
+            .iter()
+            .chain(outcome.unlatched.iter())
+            .any(|seen| seen == latched)
+        {
+            continue;
+        }
+        if keys.contains(&latched.reason) {
+            outcome.unlatched.push(*latched);
+            if latched.action == BreachAction::Block
+                && !outcome.fence_cleared.contains(&latched.reason)
+            {
+                outcome.fence_cleared.push(latched.reason);
+            }
+        } else {
+            kept.push(*latched);
+        }
+    }
+    let token_budget = TokenBudget {
+        per_run: input.arms.tokens_per_run,
+        cumulative: input.arms.tokens_cumulative,
+    };
+    let cost_cap = CostCap {
+        per_run: input
+            .arms
+            .dollars_per_run_micros
+            .map(|v| Micros(v.min(i64::MAX as u64) as i64)),
+        cumulative: input
+            .arms
+            .dollars_cumulative_micros
+            .map(|v| Micros(v.min(i64::MAX as u64) as i64)),
+    };
+    let decision = decide(&GovernanceInput {
+        token: token_budget.is_set().then_some(TokenArm {
+            run_total: input.totals.run_tokens,
+            cumulative_total: input.totals.cumulative_tokens,
+            budget: token_budget,
+            action: input.action,
+        }),
+        dollar:
+            (input.priced && cost_cap.is_set()).then_some(DollarArm {
+                run_cost: Micros(input.totals.run_cost_micros.min(i64::MAX as u64) as i64),
+                cumulative_cost: Micros(
+                    input.totals.cumulative_cost_micros.min(i64::MAX as u64) as i64
+                ),
+                cap: cost_cap,
+                action: input.action,
+            }),
+        latched: kept
+            .iter()
+            .filter(|latched| latched.action == input.action)
+            .map(|latched| latched.reason)
+            .collect(),
+    });
+    outcome.latched_after = kept;
+    for fired in &decision.decisions {
+        outcome.latched_after.push(LatchedReason {
+            reason: LatchKey::new(fired.dimension, fired.scope),
+            action: fired.action,
+        });
+    }
+    outcome.fired = decision.decisions;
+    outcome.fence_after = FENCE_REASON_ORDER
+        .into_iter()
+        .filter(|key| {
+            outcome
+                .latched_after
+                .iter()
+                .any(|latched| latched.reason == *key && latched.action == BreachAction::Block)
+        })
+        .collect();
+    outcome.breach_anomaly = !outcome.latched_after.is_empty();
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // The vectors artifact (schema + generator)
 // ---------------------------------------------------------------------------
 

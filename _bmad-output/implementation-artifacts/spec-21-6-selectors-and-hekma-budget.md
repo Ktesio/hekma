@@ -2,7 +2,7 @@
 title: 'Selectors on every verb and hekma budget'
 type: 'feature'
 created: '2026-11-09'
-status: 'ready-for-dev'
+status: 'in-progress'
 review_loop_iteration: 0
 baseline_commit: 'cf4ec27d552587d2fad968800ecac5595309b84e'
 context:

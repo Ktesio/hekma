@@ -31,6 +31,7 @@ use super::usage::RunId;
 use crate::ports::StoreError;
 
 pub(crate) mod labels;
+pub(crate) mod limits;
 pub(crate) mod ops;
 pub(crate) mod policy;
 pub mod selector;
@@ -38,13 +39,16 @@ pub(crate) mod snapshot;
 pub mod verbs;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
+pub use limits::{
+    LimitActor, LimitsDirection, RunLimitChange, RunLimitField, RunLimitsOutcome, RunLimitsView,
+};
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
     PolicyLimits, PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy, ScentCheckMode,
     UpgradedInstance, DEFAULT_POLICY_NAME, POLICY_EVENT_SCHEMA_VERSION,
 };
 pub use selector::{Selector, SelectorScope, MAX_SELECTED_RUNS};
-pub use verbs::{verb_cell, CellBehavior, RunVerb, VerbCell, RUN_VERBS};
+pub use verbs::{verb_cell, CellBehavior, RunLifecycleVerb, RunVerb, VerbCell, RUN_VERBS};
 
 /// The schema version stamped on every [`RunEvent`] (AD-14). Independent of
 /// the transition, breach and usage event schemas; bumped only on an
@@ -367,9 +371,11 @@ impl Label {
     }
 }
 
-/// The limits set directly on a Run (story 21-2: on a child Run at open).
-/// A supervised Run's ceilings come from its instance configuration, which
-/// the pipeline resolves; these are the Run-level ones (`run_limits`).
+/// The limits set directly on a Run (`run_limits`): on a child Run at open
+/// (story 21-2), or through `hekma budget` on any non-ended Run (story
+/// 21-6). A limit set here BELONGS TO THE RUN — it ends with the Run, and a
+/// fresh start mints a new Run without it. It outranks the instance
+/// configuration and every Policy for that limit (FR-60).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunLimits {
     /// A per-run token ceiling over the Run's subtree usage.
@@ -378,15 +384,36 @@ pub struct RunLimits {
     /// A per-run dollar cap over the Run's subtree cost, in micro-dollars.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dollar_per_run_micros: Option<Micros>,
+    /// A cumulative token ceiling, enforced against the hosting instance's
+    /// lifetime ledger while this Run is open (story 21-6; process-owning
+    /// Runs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cumulative: Option<u64>,
+    /// A cumulative dollar cap in micro-dollars, enforced against the
+    /// hosting instance's lifetime ledger while this Run is open (story
+    /// 21-6; process-owning Runs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dollar_cumulative_micros: Option<Micros>,
     /// The Breach Action for these ceilings (`warn` when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breach_action: Option<BreachAction>,
 }
 
 impl RunLimits {
-    /// Whether any ceiling is set.
+    /// Whether any per-run ceiling is set (a child level's arms: a child
+    /// carries no cumulative scope).
     pub fn is_armed(&self) -> bool {
         self.token_per_run.is_some() || self.dollar_per_run_micros.is_some()
+    }
+
+    /// Whether any field at all is set (a ceiling of either scope, or the
+    /// Breach Action).
+    pub fn is_set(&self) -> bool {
+        self.token_per_run.is_some()
+            || self.dollar_per_run_micros.is_some()
+            || self.token_cumulative.is_some()
+            || self.dollar_cumulative_micros.is_some()
+            || self.breach_action.is_some()
     }
 
     /// The Breach Action these ceilings execute (`warn` when unset).
@@ -520,6 +547,8 @@ pub enum RunEventKind {
     AnomaliesChanged,
     /// Its bound labels changed.
     LabelsChanged,
+    /// Its own limits changed (story 21-6: `hekma budget set`).
+    LimitsChanged,
     /// It ended.
     Ended,
 }
@@ -533,6 +562,7 @@ impl RunEventKind {
             RunEventKind::StatusChanged => "status-changed",
             RunEventKind::AnomaliesChanged => "anomalies-changed",
             RunEventKind::LabelsChanged => "labels-changed",
+            RunEventKind::LimitsChanged => "limits-changed",
             RunEventKind::Ended => "ended",
         }
     }
@@ -577,6 +607,12 @@ pub struct RunEvent {
     /// Its bound labels before the change, on `labels-changed` (story 21-9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_labels: Option<Vec<Label>>,
+    /// Its own limits after the change, on `limits-changed` (story 21-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RunLimits>,
+    /// Its own limits before the change, on `limits-changed` (story 21-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_limits: Option<RunLimits>,
     /// Why (a transition cause, `parent-paused`, `closed`, `label-verb`,
     /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -653,11 +689,50 @@ pub enum RunError {
         /// Its instance.
         instance: String,
     },
-    /// The Run has ended, so its labels cannot change (story 21-9).
-    #[error("Run `{run_id}` has ended, so its labels cannot change")]
+    /// The Run has ended, so it cannot change (story 21-9: its labels;
+    /// story 21-6: its limits and lifecycle verbs too).
+    #[error("Run `{run_id}` has ended, so it cannot change")]
     RunEnded {
         /// The Run.
         run_id: String,
+    },
+    /// A limit scope the Run cannot carry (story 21-6): a cumulative
+    /// ceiling belongs to the hosting agent's lifetime ledger, so only its
+    /// process-owning Run carries one.
+    #[error(
+        "`{limit}` cannot be set on Run `{run_id}`: it is a child Run, and a cumulative \
+         ceiling counts the hosting agent's lifetime usage — set it on the agent's own Run, \
+         or in the agent's `budget.*` configuration"
+    )]
+    ScopeUnavailable {
+        /// The Run.
+        run_id: String,
+        /// The refused limit (`tokens-cumulative`, …).
+        limit: String,
+    },
+    /// A Caller may only tighten a Run's limits (story 21-6, PRD FR-60).
+    #[error(
+        "Run `{run_id}`'s limits can only be tightened by its Caller, and this change loosens \
+         `{limit}` — an Operator or Host raises a ceiling"
+    )]
+    RaiseForbidden {
+        /// The Run.
+        run_id: String,
+        /// The first limit the change loosens.
+        limit: String,
+    },
+    /// A lifecycle verb the Run's Control Depth does not serve yet (story
+    /// 21-6: the verb × depth table's cell, answered per Run).
+    #[error("`{verb}` on Run `{run_id}` is refused: {reason}")]
+    VerbUnavailable {
+        /// The Run.
+        run_id: String,
+        /// The verb (`stop`, `pause`, `resume`, `drain`).
+        verb: String,
+        /// The Run's depth, rendered (`announced`, `supervised (no wire)`).
+        depth: String,
+        /// Why, naming the depth (or the Metering Source) and the way out.
+        reason: String,
     },
     /// The label verb cannot remove a label the instance configuration binds
     /// (story 21-9).
@@ -764,6 +839,9 @@ impl RunError {
             RunError::ActionUnavailable { .. } => "action-unavailable",
             RunError::OwnsProcess { .. } => "owns-process",
             RunError::RunEnded { .. } => "run-ended",
+            RunError::ScopeUnavailable { .. } => "scope-unavailable",
+            RunError::RaiseForbidden { .. } => "raise-forbidden",
+            RunError::VerbUnavailable { .. } => "verb-unavailable",
             RunError::LabelFromConfig { .. } => "label-from-config",
             RunError::LabelNotBound { .. } => "label-not-bound",
             RunError::LabelBound { .. } => "label-bound",
@@ -776,6 +854,19 @@ impl RunError {
             RunError::Store(_) => "store",
         }
     }
+}
+
+/// Why a lifecycle verb addressed to a Run failed (story 21-6): the
+/// Run-level refusal (not found, ended, the depth's cell), or the instance
+/// verb's own error once the Run mapped to its instance.
+#[derive(Debug, thiserror::Error)]
+pub enum RunVerbError {
+    /// The Run refused the verb.
+    #[error(transparent)]
+    Run(#[from] RunError),
+    /// The instance verb failed.
+    #[error(transparent)]
+    Engine(#[from] crate::domain::EngineError),
 }
 
 #[cfg(test)]
