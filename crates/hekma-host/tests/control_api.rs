@@ -1007,7 +1007,9 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
     // exit keeps the Windows stop that follows this drain (~3s — the
     // graceful step there only waits, no signal to lean on) far inside
     // the suite client's 10s response timeout, the sibling pattern the
-    // 1200ms-exit fixtures below use for the same reason.
+    // 1200ms-exit fixture above (in
+    // `the_drain_route_serves_both_outcomes_and_rejects_an_out_of_range_bound`)
+    // uses for the same reason.
     let _stalled_fixture = registered_drain_fake_agent(
         &base,
         "stalleddrain",
