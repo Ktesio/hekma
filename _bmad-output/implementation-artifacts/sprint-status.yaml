@@ -219,7 +219,7 @@ development_status:
   21-9-bound-labels-hekma-label: done  # 2026-11-11 MERGED as 0ba9d4b (PR #391). added 2026-10-30 by the readiness gate (D3); runs after 21-2, before 21-3. 2026-11-03 built on ktesio/determined-antonelli-d69505 (spec-21-9-bound-labels.md): `hekma label set|remove` + `--selector/--dry-run/--yes/--json` (writes routed through the local Service Host, reads and dry runs read-only), `GET/PATCH /v0/runs/{id}/labels`, label origins (schema v14), the Caller guard, the no-op Policy hook for 21-3; hekma-engine stays 0.12.0. One independent review pass done; one PR; merged origin/main 78a6534; all gates green; changed-line coverage 95.91%
   epic-21-retrospective: optional
   epic-22: backlog  # Run Identity and Key Custody (FR-53, FR-54; AD-22)
-  22-1-run-keys-minting-hashing-refresh-and-revocation: backlog
+  22-1-run-keys-minting-hashing-refresh-and-revocation: in-progress  # 2026-11-12 spec drafted on ktesio/22-1-run-keys (spec-22-1-run-keys.md, status draft, base 82b01fe = 21-5): Run Key per launch, hash-only `tokens` (schema v17), refresh with reuse detection, cascade revocation, route-family authority matrix; awaiting orchestrator review + Islam rulings O1-O7 (security review P1-P5/P8/P12); builds after 21-6 merges; hekma-engine stays 0.12.0
   22-2-the-run-key-in-the-api-key-slot-key-custody-by-default: backlog  # security review before docs say supported
   22-3-scent-check-modes: backlog  # decides PRD Q9
   22-4-bypass-detection-in-the-shim: backlog  # after 24-1
