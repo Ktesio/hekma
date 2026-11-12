@@ -229,7 +229,7 @@ development_status:
   23-1-the-shared-metering-proxy: in-progress  # 2026-11-12 spec drafted on ktesio/23-1-shared-proxy (spec-23-1-shared-metering-proxy.md, status draft, base 2d96652 = 22-1 approved spec): one sticky-port loopback proxy per data-path owner; Run Key → Run route (/_hekma/runs/<id>) → binding → unattributed; hints make children/splits; block from the snapshot over the ancestor chain; unacked per-call records under permits; calls store; hekma binding + /v0/bindings; schema v18; awaiting orchestrator review + Islam rulings O1-O6; builds after 22-1 merges; hekma-engine stays 0.12.0
   23-2-self-announce-run-identities-and-leases: ready-for-dev
   23-3-inbound-otlp-and-observed-runs: ready-for-dev
-  23-4-wire-hold-release-reroute-and-reject: backlog  # reject reuses 19-2's block response
+  23-4-wire-hold-release-reroute-and-reject: ready-for-dev  # reject reuses 19-2's block response
   epic-23-retrospective: optional
   epic-24: backlog  # Operability at Scale (FR-55, FR-59, NFR-4, NFR-9; AD-18, AD-21, AD-23)
   24-1-one-shim-per-supervised-process: backlog
