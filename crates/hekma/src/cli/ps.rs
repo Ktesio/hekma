@@ -227,12 +227,18 @@ fn footer_text(listing: &RunListing, all: bool, next_page: &NextPage) -> String 
 /// `binding <name>`, the external id — story 23-1), else the run id (a
 /// child Run inside a process).
 fn run_cell(item: &hekma_engine::RunSummary) -> String {
-    if let Some(identity) = identity_cell(item) {
-        return identity;
-    }
-    match (&item.record.instance, item.record.process_owner) {
-        (Some(instance), true) => instance.clone(),
-        _ => item.record.run_id.as_str().to_string(),
+    let cell = identity_cell(item).unwrap_or_else(|| {
+        match (&item.record.instance, item.record.process_owner) {
+            (Some(instance), true) => instance.clone(),
+            _ => item.record.run_id.as_str().to_string(),
+        }
+    });
+    // The legacy root route's Run is an adopted agent's (it has an
+    // instance), so the note rides whatever the cell names.
+    if item.before_shared_proxy {
+        format!("{cell} (started before the shared proxy)")
+    } else {
+        cell
     }
 }
 
@@ -253,11 +259,7 @@ fn identity_cell(item: &hekma_engine::RunSummary) -> Option<String> {
         // (run:<parent>/<external>): the external id names the grain.
         _ => external.clone(),
     };
-    if item.before_shared_proxy {
-        Some(format!("{rendered} (started before the shared proxy)"))
-    } else {
-        Some(rendered)
-    }
+    Some(rendered)
 }
 
 /// The ANOMALIES cell: `breach[block]` — the breach Anomaly with each
@@ -416,6 +418,29 @@ mod tests {
         assert_eq!(run_cell(&owner), "demo");
         let child = summary("run_CHILD", false);
         assert_eq!(run_cell(&child), "run_CHILD");
+    }
+
+    #[test]
+    fn the_run_cell_renders_wire_identities_and_the_legacy_route_note() {
+        let wire = |namespace: &str, external: &str| {
+            let mut item = summary("run_W", false);
+            item.record.instance = None;
+            item.identity = Some((namespace.to_string(), external.to_string()));
+            item
+        };
+        assert_eq!(run_cell(&wire("proxy", "unattributed")), "unattributed");
+        assert_eq!(run_cell(&wire("binding", "openai")), "binding openai");
+        assert_eq!(run_cell(&wire("binding:openai", "team-a")), "team-a");
+        // An instance's own Run keeps its name even when it has an identity.
+        let mut owned = wire("binding", "openai");
+        owned.record.instance = Some("demo".to_string());
+        owned.record.process_owner = true;
+        assert_eq!(run_cell(&owned), "demo");
+        // The legacy root route's Run is an adopted agent's (it has an
+        // instance), and the note still shows.
+        let mut legacy = summary("run_L", true);
+        legacy.before_shared_proxy = true;
+        assert_eq!(run_cell(&legacy), "demo (started before the shared proxy)");
     }
 
     #[test]
