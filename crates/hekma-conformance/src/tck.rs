@@ -5598,17 +5598,22 @@ impl UpstreamStub {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut buf = Vec::with_capacity(8 * 1024);
         let mut chunk = [0u8; 4096];
-        // Read until the header terminator (or the 64KB cap — matching the
-        // engine tests' bounded reader).
+        // Read the WHOLE request — the header block, then the body its
+        // Content-Length announces (bounded by the 64KB cap, matching the
+        // engine tests' bounded reader). Answering and closing with request
+        // bytes still unread makes the close abortive (an RST) on Windows,
+        // and a peer that receives the RST may lose the already-sent
+        // response: the engine's forward then fails as a 502 and the row
+        // never commits (the `have N-1` flake).
         loop {
+            let complete = find_subsequence(&buf, b"\r\n\r\n")
+                .is_some_and(|end| buf.len() >= end + 4 + content_length(&buf[..end]));
+            if complete || buf.len() > 64 * 1024 {
+                break;
+            }
             match stream.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => {
-                    buf.extend_from_slice(&chunk[..n]);
-                    if find_subsequence(&buf, b"\r\n\r\n").is_some() || buf.len() > 64 * 1024 {
-                        break;
-                    }
-                }
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 Err(_) => break,
             }
         }
@@ -5642,6 +5647,21 @@ impl Drop for UpstreamStub {
             let _ = handle.join();
         }
     }
+}
+
+/// The `Content-Length` a request's header block announces (0 when absent
+/// or unparseable — the stub then answers after the headers, as before).
+fn content_length(head: &[u8]) -> usize {
+    String::from_utf8_lossy(head)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
 }
 
 /// The `needle`-in-`haystack` helper (the engine tests' shape).
@@ -6498,6 +6518,16 @@ source = "self-reported"
     /// path commit exactly 3 × 30/70), the self-reported half reads
     /// not_applicable — the mirror image of the self-reported pass above. This
     /// is the proof that the TCK covers BOTH Metering Sources.
+    #[test]
+    fn the_upstream_stub_reads_the_announced_body_length() {
+        assert_eq!(
+            content_length(b"POST /v1/chat/completions HTTP/1.1\r\ncontent-LENGTH:  71"),
+            71
+        );
+        assert_eq!(content_length(b"GET / HTTP/1.1\r\nHost: x"), 0);
+        assert_eq!(content_length(b"POST / HTTP/1.1\r\nContent-Length: nope"), 0);
+    }
+
     #[test]
     fn engine_observed_manifest_adapter_passes_the_observed_section() {
         let dir = tempfile::Builder::new()
