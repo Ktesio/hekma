@@ -364,14 +364,6 @@ impl Registry {
         Ok(registry)
     }
 
-    /// Whether the instance carries the FR-21 "kept on pause by upgrade"
-    /// marker (story 21-3): the Fleet and Run surfaces render the note from
-    /// this read.
-    pub(crate) fn breach_default_upgraded(&self, name: &InstanceName) -> Result<bool, StoreError> {
-        self.store
-            .snapshot(|store| store.breach_default_kept(name.as_str()))
-    }
-
     /// Clear an instance's FR-21 upgrade marker (story 21-3): an explicit
     /// `budget.breach_action` write ends the "kept on pause by upgrade"
     /// note. Best-effort — a failure returns a warning note (the marker
@@ -625,6 +617,23 @@ impl Registry {
     ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
         self.store
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
+    /// [`Self::select_runs`] with each Run assembled as its listing row
+    /// (story 21-6's `POST /v0/runs/select` answer): the same capped act
+    /// set, read in ONE snapshot so the rows and the set agree.
+    pub(crate) fn select_run_summaries(
+        &self,
+        selector: &crate::domain::Selector,
+    ) -> Result<Vec<crate::domain::runs::RunSummary>, crate::domain::RunError> {
+        self.store.snapshot(|store| {
+            let records = match crate::domain::runs::ops::select(store, selector) {
+                Ok(records) => records,
+                Err(err) => return Ok(Err(err)),
+            };
+            Ok(crate::domain::runs::listing::assemble(store, records)
+                .map_err(crate::domain::RunError::Store))
+        })?
     }
 
     /// The Run listing (story 21-5): one exception-first (or all-inside-the-

@@ -7,31 +7,27 @@
 //! labels select Policies.
 //!
 //! Results go to stdout (one line per Run, or the `--json` document),
-//! diagnostics and refusals to stderr (AD-12). A Selector is resolved here,
-//! then the verb acts on exactly the listed Runs (FR-50).
+//! diagnostics and refusals to stderr (AD-12). A Selector rides the shared
+//! fan-out ([`super::fanout`]): resolved once, confirmed, then the verb acts
+//! on exactly the listed Runs (FR-50) with ONE set-form call.
 //!
 //! One data-path owner (AD-20): the target and the Selector are read from
 //! `state.db` read-only, and so is a `--dry-run` (it writes nothing, so it
-//! starts no Service Host); each write is one `PATCH /v0/runs/{id}/labels`
-//! routed to the state root's local Service Host, found or started as every
-//! `hekma agent` write is.
+//! starts no Service Host). A single target's write is one
+//! `PATCH /v0/runs/{id}/labels`; a Selector's is one `PATCH /v0/runs/labels`
+//! carrying the set token `POST /v0/runs/select` minted — both routed to the
+//! state root's local Service Host, found or started as every `hekma agent`
+//! write is.
 
-use std::io::{BufRead, IsTerminal, Write};
+use hekma_engine::{Engine, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, Selector};
+use serde_json::{json, Value};
 
-use hekma_engine::{
-    Engine, Label, LabelChange, LabelOrigin, LabelOutcome, LabelSource, RunError, Selector,
-};
-use serde::Serialize;
-use serde_json::json;
-
-use super::agent::{open_read_only_engine, route, RoutedError};
-use super::host_client::{segment, CallError};
-use crate::cli::run::{looks_like_run_id, map_run_code, run_error_class};
+use super::agent::{open_read_only_engine, route};
+use super::fanout::{self, ActResult, FanoutFlags, Refusal, SetAct, Target, VerbWords};
+use super::host_client::segment;
+use crate::cli::run::{looks_like_run_id, run_error_class};
 use crate::error::{AgentIo, RunInvalid};
 use crate::ui;
-
-/// The `--json` document's schema version (the label-results family).
-const LABEL_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
 /// Which label verb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,175 +51,90 @@ pub struct LabelArgs {
     pub json: bool,
 }
 
-/// What the verb acts on.
-#[derive(Debug, PartialEq, Eq)]
-enum Target {
-    /// One Run by id.
-    Run(String),
-    /// An agent's open Run.
-    Instance(String),
-    /// Every open Run a Selector matches.
-    Selector(Selector),
-}
-
-/// One Run's result.
-#[derive(Serialize)]
-struct RunResult {
-    run_id: String,
-    outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    labels: Option<Vec<Label>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prior_labels: Option<Vec<Label>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<ResultError>,
-}
-
-#[derive(Serialize)]
-struct ResultError {
-    code: String,
-    message: String,
-}
-
-/// Why one Run's write failed: the engine's refusal (planned locally, or
-/// decoded from the host's `error.code`), or a host-level failure.
-struct Refusal {
-    code: String,
-    message: String,
-    diagnostic: Box<dyn std::error::Error>,
-}
-
-impl Refusal {
-    fn from_run_error(err: RunError) -> Self {
-        let message = err.to_string();
-        Self {
-            code: err.code().to_string(),
-            diagnostic: run_error_class(&err, message.clone()),
-            message,
-        }
+/// The fan-out's words for each label verb.
+fn words(verb: LabelVerb) -> VerbWords {
+    match verb {
+        LabelVerb::Set => VerbWords {
+            verb: "label",
+            past: "labeled",
+            question: "Label",
+            imperative: "label",
+        },
+        LabelVerb::Remove => VerbWords {
+            verb: "label",
+            past: "labeled",
+            question: "Unlabel",
+            imperative: "unlabel",
+        },
     }
-
-    fn from_routed(err: RoutedError) -> Self {
-        match err {
-            RoutedError::Call(CallError::Coded { code, message }) => Self {
-                diagnostic: map_run_code(&code, message.clone()),
-                code,
-                message,
-            },
-            other => {
-                let diagnostic = other.into_diagnostic();
-                Self {
-                    code: "service-host".to_string(),
-                    message: diagnostic.to_string(),
-                    diagnostic,
-                }
-            }
-        }
-    }
-}
-
-/// The `--json` document.
-#[derive(Serialize)]
-struct LabelDocument {
-    schema_version: u32,
-    dry_run: bool,
-    matched: usize,
-    results: Vec<RunResult>,
 }
 
 /// `hekma label set|remove …`.
 pub fn run(args: LabelArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (target, change) = parse(&args)?;
+    let words = words(args.verb);
+    let flags = FanoutFlags {
+        dry_run: args.dry_run,
+        yes: args.yes,
+        json: args.json,
+    };
+    if let Target::Selector(selector) = &target {
+        let plan_change = change.clone();
+        let plan = move |engine: &Engine, run: &hekma_engine::RunRecord| {
+            engine
+                .blocking()
+                .label_run(run.run_id.as_str(), plan_change.clone(), true)
+                .map(|outcome| success(&outcome))
+                .map_err(Refusal::from_run_error)
+        };
+        return fanout::run_selector(
+            selector,
+            &words,
+            flags,
+            &plan,
+            SetAct {
+                method: "PATCH",
+                path: "/v0/runs/labels",
+                body: json!({ "set": change.set, "remove": change.remove }),
+                per_run: std::time::Duration::from_secs(5),
+                render: &render_result,
+                decorate: &fanout::as_answered,
+            },
+        );
+    }
     let engine = open_read_only_engine()?;
     let facade = engine.blocking();
-    let run_ids = match &target {
-        // Read first, so an unknown id is refused without starting a host.
-        Target::Run(id) => vec![facade
-            .run(id)
-            .map_err(|err| run_error_class(&err, err.to_string()))?
-            .record
-            .run_id
-            .to_string()],
-        Target::Instance(name) => vec![facade
-            .instance_run(name)
-            .map_err(|err| run_error_class(&err, err.to_string()))?
-            .record
-            .run_id
-            .to_string()],
-        Target::Selector(selector) => facade
-            .select_runs(selector)
-            .map_err(|err| run_error_class(&err, err.to_string()))?
-            .into_iter()
-            .map(|record| record.run_id.to_string())
-            .collect(),
-    };
-    if run_ids.is_empty() {
-        if let Target::Selector(selector) = &target {
-            ui::note(format!(
-                "No open Run matches `{selector}`; nothing was labeled."
-            ));
-        }
-        return finish(&args, 0, Vec::new(), None);
+    // Read first, so an unknown id is refused without starting a host.
+    let run_id = match &target {
+        Target::Run(id) => facade.run(id),
+        Target::Instance(name) => facade.instance_run(name),
+        Target::Selector(_) => unreachable!("handled above"),
     }
-    let selecting = matches!(target, Target::Selector(_));
-    if selecting && run_ids.len() > 1 && !args.dry_run && !args.yes {
-        let stdin = std::io::stdin();
-        let confirmed = confirm(
-            &run_ids,
-            args.verb,
-            stdin.is_terminal(),
-            &mut stdin.lock(),
-            &mut std::io::stderr(),
-        )?;
-        if !confirmed {
-            ui::note("Nothing was labeled.");
-            return finish(&args, run_ids.len(), Vec::new(), None);
-        }
-    }
-    let mut results = Vec::with_capacity(run_ids.len());
-    let mut first_failure: Option<Refusal> = None;
-    let mut failures = 0usize;
-    for run_id in &run_ids {
-        match apply(&engine, run_id, &change, args.dry_run) {
-            Ok(outcome) => results.push(success(&outcome)),
-            Err(refusal) => {
-                failures += 1;
-                if selecting && !args.json {
-                    eprintln!(
-                        "{}",
-                        ui::error_text(format!("Run {run_id} not labeled: {}", refusal.message))
-                    );
-                }
-                results.push(RunResult {
-                    run_id: run_id.clone(),
-                    outcome: "refused",
-                    labels: None,
-                    prior_labels: None,
-                    error: Some(ResultError {
-                        code: refusal.code.clone(),
-                        message: refusal.message.clone(),
-                    }),
-                });
-                first_failure.get_or_insert(refusal);
-            }
-        }
-    }
-    let matched = run_ids.len();
-    let failure = first_failure.map(|refusal| {
-        if selecting {
-            // Keep the first refusal's exit class, with the count.
-            reclassed(
-                refusal.diagnostic,
-                format!(
-                    "{failures} of {matched} Runs were not labeled; the first refusal: {}",
-                    refusal.message
-                ),
+    .map_err(|err| run_error_class(&err, err.to_string()))?
+    .record
+    .run_id
+    .to_string();
+    match apply(&engine, &run_id, &change, args.dry_run) {
+        Ok(outcome) => fanout::finish(
+            &words,
+            flags,
+            1,
+            vec![success(&outcome)],
+            None,
+            &render_result,
+        ),
+        Err(refusal) => {
+            let row = ActResult::refused(run_id, &refusal);
+            fanout::finish(
+                &words,
+                flags,
+                1,
+                vec![row],
+                Some(refusal.diagnostic),
+                &render_result,
             )
-        } else {
-            refusal.diagnostic
         }
-    });
-    finish(&args, matched, results, failure)
+    }
 }
 
 /// Label one Run: a dry run plans on the read-only engine (nothing is
@@ -268,89 +179,34 @@ fn apply(
         })
 }
 
-/// `diagnostic`'s exit class carrying `message` instead (a partial
-/// failure's summary under its first refusal's class).
-fn reclassed(
-    diagnostic: Box<dyn std::error::Error>,
-    message: String,
-) -> Box<dyn std::error::Error> {
-    use crate::error::{
-        AgentNotFound, AgentStore, RunInvalidState, RunNotFound, ServiceHostRefused,
-        ServiceHostUnavailable,
-    };
-    if diagnostic.is::<RunNotFound>() {
-        RunNotFound { message }.into()
-    } else if diagnostic.is::<RunInvalid>() {
-        RunInvalid { message }.into()
-    } else if diagnostic.is::<AgentNotFound>() {
-        AgentNotFound { message }.into()
-    } else if diagnostic.is::<RunInvalidState>() {
-        RunInvalidState { message }.into()
-    } else if diagnostic.is::<ServiceHostRefused>() {
-        ServiceHostRefused { message }.into()
-    } else if diagnostic.is::<ServiceHostUnavailable>() {
-        ServiceHostUnavailable { message }.into()
-    } else {
-        AgentStore { message }.into()
-    }
-}
-
-/// Print the results (human lines or the `--json` document) and return the
-/// first failure's class, if any.
-fn finish(
-    args: &LabelArgs,
-    matched: usize,
-    results: Vec<RunResult>,
-    failure: Option<Box<dyn std::error::Error>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if args.json {
-        let document = LabelDocument {
-            schema_version: LABEL_DOCUMENT_SCHEMA_VERSION,
-            dry_run: args.dry_run,
-            matched,
-            results,
-        };
-        println!("{}", serde_json::to_string_pretty(&document)?);
-    } else {
-        for result in &results {
-            if let Some(line) = render_result(result) {
-                println!("{line}");
-            }
-        }
-    }
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
-}
-
 /// A successful outcome as a result row.
-fn success(outcome: &LabelOutcome) -> RunResult {
+fn success(outcome: &LabelOutcome) -> ActResult {
     let verb = match (outcome.changed, outcome.dry_run) {
         (false, _) => "unchanged",
         (true, false) => "labeled",
         (true, true) => "would-label",
     };
-    RunResult {
-        run_id: outcome.run_id.to_string(),
-        outcome: verb,
-        labels: Some(outcome.labels.clone()),
-        prior_labels: Some(outcome.prior_labels.clone()),
-        error: None,
-    }
+    ActResult::ok(outcome.run_id.to_string(), verb)
+        .with("labels", json!(outcome.labels))
+        .with("prior_labels", json!(outcome.prior_labels))
 }
 
 /// One human line per Run; a refusal renders nothing here (it went to
 /// stderr, or is the returned error).
-fn render_result(result: &RunResult) -> Option<String> {
-    let labels = result.labels.as_deref()?;
-    let rendered = render_labels(labels);
-    Some(match result.outcome {
+fn render_result(result: &ActResult) -> Option<String> {
+    let labels: Vec<Label> = serde_json::from_value(result.field("labels")?.clone()).ok()?;
+    let prior: Vec<Label> = result
+        .field("prior_labels")
+        .cloned()
+        .and_then(|value: Value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let rendered = render_labels(&labels);
+    Some(match result.outcome.as_str() {
         "labeled" => ui::success_text(format!("Run {} labeled: {rendered}", result.run_id)),
         "would-label" => format!(
             "Run {} would label: {rendered} (now: {})",
             result.run_id,
-            render_labels(result.prior_labels.as_deref().unwrap_or_default())
+            render_labels(&prior)
         ),
         _ => format!("Run {} unchanged: {rendered}", result.run_id),
     })
@@ -375,43 +231,6 @@ pub(crate) fn render_labels(labels: &[Label]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Ask before acting on several Runs. Only a terminal stdin is asked (a
-/// pipe is never read, so a script or test cannot hang): otherwise the
-/// request is refused, naming `--yes` and `--dry-run`.
-fn confirm(
-    run_ids: &[String],
-    verb: LabelVerb,
-    is_terminal: bool,
-    input: &mut dyn BufRead,
-    out: &mut dyn Write,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let (action, question) = match verb {
-        LabelVerb::Set => ("label", "Label"),
-        LabelVerb::Remove => ("unlabel", "Unlabel"),
-    };
-    let mut listing = format!("The Selector matches {} Runs:\n", run_ids.len());
-    for id in run_ids {
-        listing.push_str(&format!("  {id}\n"));
-    }
-    write!(out, "{listing}")?;
-    if !is_terminal {
-        return Err(invalid(format!(
-            "the Selector matches {} Runs and there is no terminal to confirm on — pass --yes \
-             to {action} them all, or --dry-run to see each Run's change first",
-            run_ids.len()
-        )));
-    }
-    let count = run_ids.len();
-    write!(out, "{question} these {count} Runs? [y/N] ")?;
-    out.flush()?;
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 /// Parse the target and the change (no engine needed, so a malformed
@@ -484,6 +303,7 @@ fn invalid(message: String) -> Box<dyn std::error::Error> {
 mod tests {
     use super::*;
     use crate::error::{RunInvalidState, RunNotFound};
+    use hekma_engine::RunError;
 
     fn args(verb: LabelVerb, selector: Option<&str>, positionals: &[&str]) -> LabelArgs {
         LabelArgs {
@@ -538,37 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn several_runs_are_confirmed_only_on_a_terminal() {
-        let ids = vec!["run_A".to_string(), "run_B".to_string()];
-        let mut out = Vec::new();
-        // Not a terminal: refused, and stdin is never read.
-        let mut never = std::io::Cursor::new(b"y\n".to_vec());
-        let refused = confirm(&ids, LabelVerb::Set, false, &mut never, &mut out).unwrap_err();
-        assert!(refused.is::<RunInvalid>());
-        assert!(refused.to_string().contains("--yes"), "{refused}");
-        assert_eq!(never.position(), 0, "a non-terminal stdin is never read");
-        let listing = String::from_utf8(out).unwrap();
-        assert!(listing.contains("run_A") && listing.contains("run_B"));
-        for (answer, expected) in [
-            ("y\n", true),
-            ("YES\n", true),
-            ("n\n", false),
-            ("\n", false),
-        ] {
-            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
-            let mut out = Vec::new();
-            assert_eq!(
-                confirm(&ids, LabelVerb::Remove, true, &mut input, &mut out).unwrap(),
-                expected,
-                "{answer:?}"
-            );
-            assert!(String::from_utf8(out)
-                .unwrap()
-                .contains("Unlabel these 2 Runs?"));
-        }
-    }
-
-    #[test]
     fn results_render_one_line_per_run() {
         let outcome = LabelOutcome {
             run_id: hekma_engine::RunId::from_wire("run_A"),
@@ -599,14 +388,15 @@ mod tests {
             .unwrap()
             .contains("unchanged"));
         assert_eq!(render_labels(&[]), "—");
-        let refused = RunResult {
-            run_id: "run_B".to_string(),
-            outcome: "refused",
-            labels: None,
-            prior_labels: None,
-            error: None,
-        };
+        let refused = ActResult::refused(
+            "run_B",
+            &Refusal::from_run_error(RunError::RunEnded {
+                run_id: "run_B".into(),
+            }),
+        );
         assert!(render_result(&refused).is_none());
+        assert_eq!(words(LabelVerb::Remove).question, "Unlabel");
+        assert_eq!(words(LabelVerb::Set).verb, "label");
     }
 
     #[test]

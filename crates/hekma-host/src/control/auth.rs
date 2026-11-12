@@ -162,19 +162,29 @@ fn presented_bearer(headers: &axum::http::HeaderMap) -> Option<&str> {
 /// story 21-4).
 pub(crate) async fn require_bearer(
     State(state): State<ApiState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    match state.resolver.resolve(presented_bearer(request.headers())) {
+    let presented = presented_bearer(request.headers());
+    match state.resolver.resolve(presented) {
         None => return ApiError::unauthorized().into_response(),
         Some(class) if !class.allows(Surface::ControlApi) => {
             return ApiError::forbidden().into_response();
         }
         Some(_) => {}
     }
+    // Story 21-6: the presented credential's HASH rides the request (never
+    // the value) — a set token is bound to the credential that minted it.
+    let credential = Credential(sha256(presented.unwrap_or_default().as_bytes()));
+    request.extensions_mut().insert(credential);
     let _active = state.activity.enter();
     next.run(request).await
 }
+
+/// The SHA-256 of the credential that authenticated a request (story 21-6:
+/// the set-token binding). Inserted by [`require_bearer`]; never a value.
+#[derive(Clone, Copy)]
+pub(crate) struct Credential(pub(crate) [u8; 32]);
 
 #[cfg(test)]
 mod tests {

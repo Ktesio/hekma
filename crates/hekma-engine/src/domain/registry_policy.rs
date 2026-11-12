@@ -26,7 +26,7 @@ use crate::domain::config::{self, ConfigLayer, SourceLayer};
 use crate::domain::cost::Rate;
 use crate::domain::name::InstanceName;
 use crate::domain::outbox::OUTBOX_MAX_BYTES;
-use crate::domain::pipeline::{self, CommittedBreach, EvalInput};
+use crate::domain::pipeline::CommittedBreach;
 use crate::domain::runs::ops::{self, CommittedRunEvent, RunChanges};
 use crate::domain::runs::policy::{
     self, BreachDefaultUpgradedEvent, PolicyEvent, PolicyEventKind, PolicyLimits, PolicyRecord,
@@ -35,7 +35,6 @@ use crate::domain::runs::policy::{
 use crate::domain::runs::{ControlDepth, PolicyResolution, RunError, RunRecord, Selector};
 use crate::domain::usage::RunId;
 use crate::domain::Registry;
-use crate::metering::WireFence;
 use crate::ports::{PolicyRecords, RunRecords, RunStore, StoreError};
 use crate::store::BreachDefaultSource;
 use crate::time::now_rfc3339;
@@ -75,29 +74,14 @@ pub struct PolicyOutcome {
     pub notes: Vec<String>,
 }
 
-/// The live per-instance context the policy-change job's money half needs
-/// (built by the caller — engine or supervisor — which holds the locks):
-/// the instance's metering wire fence, its metering source for the breach
-/// records, and its fresh explicit inputs. Whether the engine supervises
-/// the instance is the CALLER's own fact when it applies the returned
-/// process actions (D2) — an unsupervised instance's breaches still
-/// record and latch here.
-#[derive(Clone, Default)]
-pub(crate) struct InstanceContext {
-    /// The instance's live wire fence (an engine-observed instance's
-    /// listener fence; `None` when it has no listener).
-    pub fence: Option<WireFence>,
-    /// The instance's metering source (the breach records name it).
-    pub metering_source: String,
-    /// Whether THIS engine supervises the instance right now: only a
-    /// supervised instance's money half runs (the breach-at-once latch
-    /// must be executable by the engine that records it); an unsupervised
-    /// instance still gets FRESH inputs for its stored resolution.
-    pub supervised: bool,
-    /// The instance's explicit limits and model, read fresh from its
-    /// configuration by the caller; `Err` names why they could not be read
-    /// (the Run is then skipped, never resolved as if nothing were set).
-    pub inputs: Option<Result<ResolveInputs, String>>,
+pub(crate) use crate::domain::runs::limits::InstanceContext;
+
+/// The Fleet read's resolution facts for every instance at once
+/// ([`Registry::fleet_resolution_facts`]): the open process-owning Runs'
+/// facts keyed by instance name, and the kept-on-pause markers.
+pub(crate) struct FleetResolutionFacts {
+    open: HashMap<String, crate::ports::ResolutionFacts>,
+    kept: std::collections::HashSet<String>,
 }
 
 impl Registry {
@@ -295,32 +279,110 @@ impl Registry {
         name: &InstanceName,
         run: Option<&RunId>,
     ) -> PolicyResolution {
-        let mut fail_closed = None;
-        // The Run facts: the named Run's, else the instance's open
-        // process-owning Run's, else none (a fresh start before its Run
-        // row exists).
-        let mut facts = None;
-        if let Some(run_id) = run {
-            match self
-                .store
-                .snapshot(|store| store.run_resolution_facts(run_id))
-            {
-                Ok(Some(read)) => facts = Some(read),
-                Ok(None) => {}
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "this Run's resolution facts could not be read ({err}), so its limits \
-                         fail closed to pause until the read succeeds"
-                    ))
-                }
-            }
-        }
-        if facts.is_none() && fail_closed.is_none() {
-            match self.store.snapshot(|store| store.open_process_run(name)) {
-                Ok(Some(owner)) => match self
-                    .store
-                    .snapshot(|store| store.run_resolution_facts(&owner.run_id))
-                {
+        let effective = self.effective_config(name, ConfigLayer::empty()).ok();
+        self.resolved_limits_with(name, run, effective.as_ref())
+    }
+
+    /// [`Self::resolved_limits`] over an effective configuration the caller
+    /// already read (`None` when that read failed — the same fail-closed
+    /// `pause` as an unreadable configuration). The Fleet read resolves
+    /// every instance this way so its configuration is read once, not
+    /// twice (the perf-budgets ratchet caught the double read).
+    pub(crate) fn resolved_limits_with(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+    ) -> PolicyResolution {
+        self.resolved_limits_and_kept(name, run, effective).0
+    }
+
+    /// [`Self::resolved_limits_with`] plus the instance's kept-on-pause
+    /// marker as read in the same snapshot (`false` when that read failed;
+    /// the resolution then fails closed). The Fleet row renders the marker
+    /// as its note, so it reads it here rather than in another snapshot.
+    pub(crate) fn resolved_limits_and_kept(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+    ) -> (PolicyResolution, bool) {
+        let (facts, kept, fail_closed) = self.read_resolution_facts(name, run);
+        self.finish_resolution(facts.as_ref(), kept, fail_closed, effective)
+    }
+
+    /// The Fleet read's batched resolution facts: every open
+    /// process-owning Run's facts and every kept-on-pause marker, read in
+    /// ONE snapshot for the whole Fleet (the AI-16 batched-read pattern;
+    /// the perf-budgets ratchet caught the per-row snapshots). `None` when
+    /// the batch read fails — each row then reads its own facts, so a
+    /// transient failure degrades (fails closed on) one row at a time,
+    /// exactly as before the batch.
+    pub(crate) fn fleet_resolution_facts(&self) -> Option<FleetResolutionFacts> {
+        let read = self
+            .store
+            .snapshot(|store| store.open_owner_resolution_facts())
+            .ok()?;
+        let open = read
+            .runs
+            .into_iter()
+            .filter_map(|facts| {
+                let instance = facts.record.instance.clone()?;
+                Some((instance, facts))
+            })
+            .collect();
+        Some(FleetResolutionFacts {
+            open,
+            kept: read.kept,
+        })
+    }
+
+    /// [`Self::resolved_limits_and_kept`] over the Fleet's batched facts:
+    /// the SAME resolution the per-row read produces, without a store read
+    /// per row. The batch answers a row when it holds the facts that read
+    /// would have found — the instance's open process-owning Run (when
+    /// `run` names it, or no Run is named), or the authoritative absence
+    /// of one (no Run named) — and every other row (a named Run that is
+    /// not the open owner, or no batch at all) takes the per-row read.
+    pub(crate) fn resolved_limits_from_batch(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+        batch: Option<&FleetResolutionFacts>,
+    ) -> (PolicyResolution, bool) {
+        let Some(batch) = batch else {
+            return self.resolved_limits_and_kept(name, run, effective);
+        };
+        let owner = batch.open.get(name.as_str());
+        let facts = match (run, owner) {
+            (Some(run_id), Some(owner)) if owner.record.run_id == *run_id => Some(owner),
+            (Some(_), _) => return self.resolved_limits_and_kept(name, run, effective),
+            (None, owner) => owner,
+        };
+        let kept = match facts {
+            Some(facts) => facts.kept_on_pause,
+            None => batch.kept.contains(name.as_str()),
+        };
+        self.finish_resolution(facts, kept, None, effective)
+    }
+
+    /// The store facts one resolution reads — the Run's resolution facts
+    /// (the named Run's, else the instance's open process-owning Run's,
+    /// else none: a fresh start before its Run row exists) and the
+    /// kept-on-pause marker — in ONE snapshot (one read transaction per
+    /// resolution, not one per fact: this runs per usage event). A failed
+    /// fact read keeps its own fail-closed note.
+    fn read_resolution_facts(
+        &self,
+        name: &InstanceName,
+        run: Option<&RunId>,
+    ) -> (Option<crate::ports::ResolutionFacts>, bool, Option<String>) {
+        let reads = self.store.snapshot(|store| {
+            let mut fail_closed = None;
+            let mut facts = None;
+            if let Some(run_id) = run {
+                match store.run_resolution_facts(run_id) {
                     Ok(Some(read)) => facts = Some(read),
                     Ok(None) => {}
                     Err(err) => {
@@ -329,43 +391,78 @@ impl Registry {
                              limits fail closed to pause until the read succeeds"
                         ))
                     }
+                }
+            }
+            if facts.is_none() && fail_closed.is_none() {
+                match store.open_process_run(name) {
+                    Ok(Some(owner)) => match store.run_resolution_facts(&owner.run_id) {
+                        Ok(Some(read)) => facts = Some(read),
+                        Ok(None) => {}
+                        Err(err) => {
+                            fail_closed = Some(format!(
+                                "this Run's resolution facts could not be read ({err}), so \
+                                 its limits fail closed to pause until the read succeeds"
+                            ))
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(err) => {
+                        fail_closed = Some(format!(
+                            "the open Run could not be read ({err}), so the limits fail \
+                             closed to pause until the read succeeds"
+                        ))
+                    }
+                }
+            }
+            // The Run's facts already carry its instance's marker, read in
+            // this same snapshot by `run_resolution_facts`; only a read
+            // with no Run facts reads the marker by the instance's name.
+            let mut kept = false;
+            match facts.as_ref() {
+                Some(facts) => kept = facts.kept_on_pause,
+                None => match store.breach_default_kept(name.as_str()) {
+                    Ok(read) => kept = read,
+                    // A failed kept-marker read keeps `pause` (fail
+                    // closed): the marker is the FR-21 promise's carrier.
+                    Err(err) => {
+                        fail_closed = Some(format!(
+                            "the kept-on-pause marker could not be read ({err}), so the \
+                             breach action fails closed to pause until the read succeeds"
+                        ))
+                    }
                 },
-                Ok(None) => {}
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "the open Run could not be read ({err}), so the limits fail closed to \
-                         pause until the read succeeds"
-                    ))
-                }
             }
+            Ok((facts, kept, fail_closed))
+        });
+        match reads {
+            Ok(reads) => reads,
+            Err(err) => (
+                None,
+                false,
+                Some(format!(
+                    "the Run's resolution facts could not be read ({err}), so its limits \
+                     fail closed to pause until the read succeeds"
+                )),
+            ),
         }
-        let kept_instance = facts
-            .as_ref()
-            .map(|facts| facts.record.instance.clone())
-            .unwrap_or_else(|| Some(name.as_str().to_string()));
-        let mut kept = false;
-        if let Some(instance) = kept_instance.as_deref() {
-            match self
-                .store
-                .snapshot(|store| store.breach_default_kept(instance))
-            {
-                Ok(read) => kept = read,
-                // A failed kept-marker read keeps `pause` (fail closed):
-                // the marker is the FR-21 promise's carrier.
-                Err(err) => {
-                    fail_closed = Some(format!(
-                        "the kept-on-pause marker could not be read ({err}), so the breach \
-                         action fails closed to pause until the read succeeds"
-                    ))
-                }
+    }
+
+    /// The pure tail of one resolution: the instance's explicit config,
+    /// the facts read for it and the cached policy set through
+    /// `policy::resolve`, then the fail-closed tightening.
+    fn finish_resolution(
+        &self,
+        facts: Option<&crate::ports::ResolutionFacts>,
+        kept: bool,
+        mut fail_closed: Option<String>,
+        effective: Option<&crate::domain::EffectiveConfig>,
+    ) -> (PolicyResolution, bool) {
+        let (inputs, config_labels) = match effective {
+            Some(effective) => {
+                let labels = crate::domain::runs::labels::bound_labels_from(effective).0;
+                (config::explicit_limits(effective), labels)
             }
-        }
-        let (inputs, config_labels) = match self.effective_config(name, ConfigLayer::empty()) {
-            Ok(effective) => {
-                let labels = crate::domain::runs::labels::bound_labels_from(&effective).0;
-                (config::explicit_limits(&effective), labels)
-            }
-            Err(_) => (
+            None => (
                 ResolveInputs {
                     malformed_action: Some("the configuration could not be read".to_string()),
                     ..ResolveInputs::default()
@@ -373,11 +470,12 @@ impl Registry {
                 Vec::new(),
             ),
         };
-        let (depth, wire_path, run_limits, bound_labels) = match &facts {
+        let (depth, wire_path, run_limits, caller, bound_labels) = match facts {
             Some(facts) => (
                 facts.record.control_depth,
                 facts.record.wire_path,
                 facts.limits,
+                facts.caller_limits,
                 facts
                     .labels
                     .iter()
@@ -388,6 +486,7 @@ impl Registry {
             None => (
                 ControlDepth::Supervised,
                 true,
+                Default::default(),
                 Default::default(),
                 config_labels
                     .iter()
@@ -418,7 +517,7 @@ impl Registry {
             bound_labels,
             run_limits,
             inputs,
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.as_ref().clone(),
         });
@@ -443,7 +542,7 @@ impl Registry {
             resolution.effective_action = tighten(resolution.effective_action);
             resolution.fail_closed = Some(note);
         }
-        resolution
+        (resolution, kept)
     }
 
     /// Every Policy, ordered by name (the read-only connection).
@@ -739,9 +838,10 @@ impl Registry {
             Ok((
                 store.run_labels(&record.run_id)?,
                 store.run_limits(&record.run_id)?,
+                store.run_caller_limits(&record.run_id)?,
             ))
         });
-        let (labels, run_limits) = facts.unwrap_or_default();
+        let (labels, run_limits, caller) = facts.unwrap_or_default();
         let inputs = record
             .instance
             .as_deref()
@@ -766,7 +866,7 @@ impl Registry {
                 .collect(),
             run_limits,
             inputs,
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.to_vec(),
         })
@@ -869,7 +969,10 @@ impl Registry {
                     at,
                 };
                 let append = store
-                    .append_outbox(&EngineEvent::Policy(event.clone()), OUTBOX_MAX_BYTES)
+                    .append_outbox(
+                        &EngineEvent::Policy(Box::new(event.clone())),
+                        OUTBOX_MAX_BYTES,
+                    )
                     .map_err(RunError::Store)?;
                 let _ = append;
                 Ok((
@@ -1012,7 +1115,10 @@ impl Registry {
                     at: now_rfc3339(),
                 };
                 let append = store
-                    .append_outbox(&EngineEvent::Policy(event.clone()), OUTBOX_MAX_BYTES)
+                    .append_outbox(
+                        &EngineEvent::Policy(Box::new(event.clone())),
+                        OUTBOX_MAX_BYTES,
+                    )
                     .map_err(RunError::Store)?;
                 Ok((
                     PolicyApplied {
@@ -1394,6 +1500,9 @@ fn re_resolve_matched(
             .unwrap_or(false);
         let labels = store.run_labels(&run.run_id).map_err(RunError::Store)?;
         let run_limits = store.run_limits(&run.run_id).map_err(RunError::Store)?;
+        let caller = store
+            .run_caller_limits(&run.run_id)
+            .map_err(RunError::Store)?;
         let resolution = policy::resolve(&policy::ResolutionInput {
             depth: run.control_depth,
             wire_path: run.wire_path,
@@ -1404,7 +1513,7 @@ fn re_resolve_matched(
                 .collect(),
             run_limits,
             inputs: inputs.clone(),
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.clone(),
         });
@@ -1441,7 +1550,7 @@ fn re_resolve_matched(
                 }
                 let context = contexts.get(instance).cloned().unwrap_or_default();
                 if let Ok(name) = InstanceName::new(instance) {
-                    re_arm(
+                    crate::domain::runs::limits::re_arm(
                         store,
                         &name,
                         run,
@@ -1467,236 +1576,6 @@ fn re_resolve_matched(
         changes,
         breaches,
     ))
-}
-
-/// The re-arm pass over one matched Run.
-///
-/// * RAISED above the totals (or UNSET — a cleared or deleted ceiling is
-///   limit-free, so its latch always re-arms): the latch rows for the
-///   re-armed `(dimension, scope)` clear, the `breach` Anomaly clears when
-///   no latch remains (with its `anomalies-changed` event and snapshot
-///   entry), and the matching `block` fence reason clears PER REASON
-///   (amendment 2: only the reasons whose new ceiling now sits above the
-///   totals; a fence holding any other latched `block` reason stays up).
-///   Per-run ceilings compare against the RUN's totals; cumulative
-///   ceilings against the INSTANCE's lifetime totals (a multi-Run instance
-///   over its cumulative cap must not unlatch on a per-Run comparison).
-/// * THEN lowered-to-at-or-below: `pipeline::evaluate` commits the breach
-///   NOW (breach row, latch, outbox, `breach` Anomaly; the decision's
-///   process action returns to the caller to apply).
-///
-/// The evaluation's Run changes fold into `changes` (the caller's ONE
-/// commit publishes the post-breach entries last — the pre-breach entry
-/// must not overwrite them), and its degraded reads surface as notes.
-#[allow(clippy::too_many_arguments)]
-fn re_arm(
-    store: &crate::store::SqliteStore,
-    instance: &InstanceName,
-    run: &RunRecord,
-    resolution: &PolicyResolution,
-    context: &InstanceContext,
-    supervised: bool,
-    ctx: &mut crate::store::WriterCtx<'_>,
-    breaches: &mut Vec<CommittedBreach>,
-    changes: &mut RunChanges,
-    notes: &mut Vec<String>,
-) -> Result<(), RunError> {
-    let usage = store
-        .run_rollup(instance, &run.run_id)
-        .map_err(RunError::Store)?;
-    let tokens_now = usage.totals.total_tokens();
-    let dollars_now = usage.cost.get() as u64;
-    // The CUMULATIVE scope compares against the instance's LIFETIME totals
-    // (every Run), not this Run's — the same read the pipeline's cumulative
-    // arm uses (`instance_rollup`).
-    let instance_usage = store.instance_rollup(instance).map_err(RunError::Store)?;
-    let instance_tokens = instance_usage.totals.total_tokens();
-    let instance_dollars = instance_usage.cost.get() as u64;
-
-    // ---- the re-arm half (raise above the totals, or unset).
-    // A CHILD level enforces only its Run- and Policy-sourced PER-RUN arms
-    // (the instance's ceilings arm the process level alone — see
-    // `pipeline::levels_for`), so a child's latch compares against the
-    // ceiling its OWN level would enforce today. An instance-sourced
-    // ceiling that the child level never arms must re-arm the latch it
-    // once held (a Policy armed the child at 50, latched at 60, and the
-    // Policy's deletion left an instance-sourced 40: the latch once stuck
-    // forever, because `40 > 60` is false — the 21-3 review round 2
-    // finding N14).
-    let level_sourced = |source: &crate::domain::runs::LimitSource| {
-        !matches!(source, crate::domain::runs::LimitSource::Instance)
-    };
-    let token_per_run = if run.process_owner {
-        resolution.tokens.per_run
-    } else {
-        level_sourced(&resolution.sources.tokens_per_run)
-            .then_some(resolution.tokens.per_run)
-            .flatten()
-    };
-    let dollar_per_run = if run.process_owner {
-        resolution.dollars.per_run.map(|micros| micros.get() as u64)
-    } else {
-        level_sourced(&resolution.sources.dollars_per_run)
-            .then(|| resolution.dollars.per_run.map(|micros| micros.get() as u64))
-            .flatten()
-    };
-    let mut re_armed: Vec<crate::domain::LatchKey> = Vec::new();
-    for (key, ceiling, total_now) in [
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Tokens,
-                crate::domain::BreachScope::PerRun,
-            ),
-            token_per_run,
-            tokens_now,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Tokens,
-                crate::domain::BreachScope::Cumulative,
-            ),
-            if run.process_owner {
-                resolution.tokens.cumulative
-            } else {
-                None
-            },
-            instance_tokens,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Dollars,
-                crate::domain::BreachScope::PerRun,
-            ),
-            dollar_per_run,
-            dollars_now,
-        ),
-        (
-            crate::domain::LatchKey::new(
-                crate::domain::BreachDimension::Dollars,
-                crate::domain::BreachScope::Cumulative,
-            ),
-            if run.process_owner {
-                resolution
-                    .dollars
-                    .cumulative
-                    .map(|micros| micros.get() as u64)
-            } else {
-                None
-            },
-            instance_dollars,
-        ),
-    ] {
-        // A ceiling that became UNSET (or one this level no longer
-        // enforces) re-arms too: `--clear` and delete loosen, and a
-        // latched breach under a ceiling that no longer exists would hold
-        // the Run (and a `block` fence) forever.
-        if ceiling.is_none_or(|ceiling| ceiling > total_now) {
-            re_armed.push(key);
-        }
-    }
-    let mut any_latch_left = false;
-    if !re_armed.is_empty() {
-        for (key, action) in store.latches(&run.run_id).map_err(RunError::Store)? {
-            if re_armed.contains(&key) {
-                store
-                    .unlatch(&run.run_id, key, action)
-                    .map_err(RunError::Store)?;
-                // Per-reason fence clear: only the raised reasons clear; the
-                // fence stays up while any other latched `block` reason
-                // holds (amendment 2).
-                if action == BreachAction::Block {
-                    if let Some(fence) = &context.fence {
-                        let fence = fence.clone();
-                        ctx.after_commit(move || fence.clear(key));
-                    }
-                }
-            } else {
-                any_latch_left = true;
-            }
-        }
-        if !any_latch_left {
-            changes.extend(
-                ops::clear_breach_anomaly(store, &run.run_id, &now_rfc3339())
-                    .map_err(RunError::Store)?,
-            );
-        }
-    }
-
-    // ---- the breach-at-once half (lowered to at-or-below the usage),
-    // ONLY on an instance this engine supervises (the latch must be
-    // executable by the engine that records it):
-    // the same pipeline evaluation a usage commit runs, over the NEW arms.
-    // The process level's arms are the instance's (the process-owning
-    // Run's resolution — the matched Run's own when it IS the owner; the
-    // owner's STORED resolution when the match is a child, whose own arms
-    // ride its own level inside the evaluation).
-    if !supervised {
-        return Ok(());
-    }
-    let owner_arms = if run.process_owner {
-        resolution.clone()
-    } else {
-        let owner_row = match store.open_process_run(instance).map_err(RunError::Store)? {
-            Some(owner) => owner,
-            None => {
-                notes.push(format!(
-                    "Run `{}` (agent `{}`) was not breach-checked: its agent has no open \
-                     process-owning Run to arm the process level",
-                    run.run_id.as_str(),
-                    instance.as_str(),
-                ));
-                return Ok(());
-            }
-        };
-        match store
-            .run_policy(&owner_row.run_id)
-            .map_err(RunError::Store)?
-        {
-            Some(row) => row.resolution,
-            None => {
-                notes.push(format!(
-                    "Run `{}` (agent `{}`) was not breach-checked: its agent's process-owning \
-                     Run has no stored resolution to arm the process level",
-                    run.run_id.as_str(),
-                    instance.as_str(),
-                ));
-                return Ok(());
-            }
-        }
-    };
-    let armed = supervised
-        && (owner_arms.tokens.is_set()
-            || (owner_arms.rate.is_some() && owner_arms.dollars.is_set())
-            || resolution.tokens.per_run.is_some()
-            || (resolution.rate.is_some() && resolution.dollars.per_run.is_some()));
-    if armed {
-        let input = EvalInput {
-            name: instance.clone(),
-            run_id: run.run_id.clone(),
-            // A missing context (the instance not supervised here) is the
-            // honest `unknown`, never a fabricated empty source.
-            metering_source: if context.metering_source.is_empty() {
-                "unknown".to_string()
-            } else {
-                context.metering_source.clone()
-            },
-            token_budget: owner_arms.tokens,
-            token_action: owner_arms.effective_action,
-            rate: owner_arms.rate,
-            cost_cap: owner_arms.dollars,
-            cost_action: owner_arms.effective_action,
-            supervised: true,
-            fence: context.fence.clone(),
-            runs: None,
-            #[cfg(test)]
-            totals_fault: false,
-        };
-        let mut evaluation = pipeline::evaluate(ctx, &input).map_err(RunError::Store)?;
-        breaches.extend(std::mem::take(&mut evaluation.breaches));
-        notes.extend(std::mem::take(&mut evaluation.degraded_reads));
-        changes.extend(evaluation.take_run_changes());
-    }
-    Ok(())
 }
 
 /// Merge a change over an existing row (the change's `set` fields win;

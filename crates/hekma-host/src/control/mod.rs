@@ -25,6 +25,7 @@ mod dto;
 mod error;
 pub(crate) mod notes;
 mod routes;
+pub(crate) mod sets;
 mod sse;
 pub(crate) mod tls;
 
@@ -37,7 +38,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::middleware;
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::Router;
 use hekma_engine::DiagnosticSink;
 use tokio::sync::watch;
@@ -77,6 +78,9 @@ pub(crate) struct ApiState {
     /// only): `/v0/version` — the CLI's discovery probe — must never wait
     /// on an engine lock that a long `stop` holds (story 21-4 review).
     log_capture: hekma_engine::LogCaptureMode,
+    /// The pending Run sets `POST /v0/runs/select` minted (story 21-6):
+    /// host memory only, shared by every listener.
+    sets: sets::SetStore,
 }
 
 /// The API's request activity (story 21-4): how many authenticated requests
@@ -213,6 +217,25 @@ fn router(state: ApiState) -> Router {
         .route("/v0/runs", get(routes::runs_list).post(routes::run_open))
         .route("/v0/runs/{id}", get(routes::run_show))
         .route("/v0/runs/{id}/close", post(routes::run_close))
+        // Story 21-6: the Run-grain lifecycle verbs, Run-level limits, and
+        // Selector sets (select once, act on exactly that set — the token
+        // rides the body, never a URL).
+        .route("/v0/runs/{id}/stop", post(routes::run_stop))
+        .route("/v0/runs/{id}/pause", post(routes::run_pause))
+        .route("/v0/runs/{id}/resume", post(routes::run_resume))
+        .route("/v0/runs/{id}/drain", post(routes::run_drain))
+        .route(
+            "/v0/runs/{id}/limits",
+            get(routes::run_limits_get).patch(routes::run_limits_patch),
+        )
+        .route("/v0/runs/select", post(routes::runs_select))
+        .route("/v0/runs/stop", post(routes::runs_stop))
+        .route("/v0/runs/pause", post(routes::runs_pause))
+        .route("/v0/runs/resume", post(routes::runs_resume))
+        .route("/v0/runs/drain", post(routes::runs_drain))
+        .route("/v0/runs/close", post(routes::runs_close))
+        .route("/v0/runs/labels", patch(routes::runs_labels_patch))
+        .route("/v0/runs/limits", post(routes::runs_limits))
         // Bound labels (story 21-9): read a Run's labels, bind and unbind
         // them as the Operator (this bearer is the Operator's; the Run Key
         // and announce credential classes never reach these routes).
@@ -296,6 +319,7 @@ pub(crate) mod test_support {
                 activity: Activity::new(),
                 notes: NoteTap::keeping_startup_notes(),
                 log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
             };
             // Leak the engine (never dropped) and the temp root.
             std::mem::forget(engine);
@@ -323,6 +347,7 @@ pub(crate) mod test_support {
                 activity: Activity::new(),
                 notes: NoteTap::keeping_startup_notes(),
                 log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
             };
             std::mem::forget(engine);
             std::mem::forget(root);
@@ -405,6 +430,7 @@ impl BoundListeners {
         resolver: CredentialResolver,
         notes: NoteTap,
         sink: DiagnosticSink,
+        set_token_ttl: Option<Duration>,
     ) -> Result<ControlApi, String> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let activity = Activity::new();
@@ -417,6 +443,7 @@ impl BoundListeners {
             activity: activity.clone(),
             notes,
             log_capture,
+            sets: sets::SetStore::new(set_token_ttl),
         });
         let mut tasks = Vec::with_capacity(self.bound.len());
         let mut accept_tasks = Vec::new();

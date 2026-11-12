@@ -10635,3 +10635,170 @@ fn engine_open_ends_a_run_whose_relaunch_never_ran() {
     // The relaunch running after all reopens the same Run.
     let _ = name;
 }
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Run-level limits through the Supervisor (the budget job's
+// process actions, the config-write re-arm) and the Run-grain verbs.
+// ---------------------------------------------------------------------------
+
+/// Kills a spawned agent by pid when dropped, so a failed assertion never
+/// leaves a long-lingering `fake_agent` behind.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &self.0.to_string()])
+            .status();
+        #[cfg(windows)]
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &self.0.to_string()])
+            .status();
+    }
+}
+
+fn kill_guard(registry: &Registry, name: &str) -> KillOnDrop {
+    let name = InstanceName::new(name).unwrap();
+    KillOnDrop(
+        registry
+            .spawn_record(&name)
+            .ok()
+            .flatten()
+            .map(|record| record.fingerprint.pid)
+            .unwrap_or(0),
+    )
+}
+
+#[test]
+fn a_run_limit_lowered_below_usage_executes_its_breach_action_on_the_live_agent() {
+    let (_state, _manifest, registry) = setup_fake("rlimit", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("rlimit").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "rlimit").unwrap();
+    let _guard = kill_guard(&registry, "rlimit");
+    let owner = open_run(&registry, "rlimit").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &owner,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 400,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // A dry run plans the breach and changes nothing.
+    let change = crate::domain::RunLimitChange {
+        set: crate::domain::RunLimits {
+            token_per_run: Some(500),
+            breach_action: Some(BreachAction::Stop),
+            ..Default::default()
+        },
+        clear: Vec::new(),
+    };
+    let planned = sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &change,
+            crate::domain::LimitActor::Operator,
+            true,
+        )
+        .unwrap();
+    assert_eq!(planned[0].1.as_ref().unwrap().fired.len(), 1);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Running
+    );
+    // The write fires AT ONCE and the Supervisor executes `stop` (D2).
+    let results = sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &change,
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .unwrap();
+    let outcome = results[0].1.as_ref().unwrap();
+    assert_eq!(outcome.direction, crate::domain::LimitsDirection::Lowered);
+    assert_eq!(outcome.fired.len(), 1);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Stopped
+    );
+    // A malformed change is refused whole; an unknown Run is that Run's
+    // refusal, the rest answered.
+    assert!(sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &crate::domain::RunLimitChange::default(),
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .is_err());
+    let results = sup
+        .set_run_limits(
+            &registry,
+            &[RunId::mint(), owner.clone()],
+            &change,
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .unwrap();
+    assert_eq!(results[0].1.as_ref().unwrap_err().code(), "run-not-found");
+    assert_eq!(results[1].1.as_ref().unwrap_err().code(), "run-ended");
+}
+
+#[test]
+fn a_config_write_raise_re_arms_a_live_runs_latch_and_a_lowering_fires_at_once() {
+    let (_state, _manifest, registry) = setup_fake("cfgrearm", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("cfgrearm").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "cfgrearm").unwrap();
+    let _guard = kill_guard(&registry, "cfgrearm");
+    let owner = open_run(&registry, "cfgrearm").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &owner,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 500,
+            output_tokens: 500,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // A `warn` ceiling written BELOW the usage breaches at the write itself
+    // (no further usage event).
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.tokens.per_run", "800")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    let latched = registry.latches(&owner).unwrap();
+    assert_eq!(latched.len(), 1, "fired at the write: {latched:?}");
+    // Raised above the usage: the latch re-arms at the write.
+    registry
+        .set_config(&name, "budget.tokens.per_run", "5000")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    assert!(registry.latches(&owner).unwrap().is_empty(), "re-armed");
+    assert!(!registry
+        .run_view(&owner)
+        .unwrap()
+        .record
+        .anomalies
+        .contains(&crate::domain::runs::Anomaly::Breach));
+    let _ = sup.stop(&registry, "cfgrearm", Some(Duration::from_secs(5)));
+}

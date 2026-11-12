@@ -109,6 +109,7 @@ pub fn run(flags: ServeFlags) -> Result<(), Box<dyn std::error::Error>> {
         // build notes the skew.
         build_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         autostart_idle_override: flags.idle_window.map(std::time::Duration::from_secs),
+        set_token_ttl_override: None,
     };
     hekma_host::serve(options).map_err(|err| {
         // The typed refusal carries its full holder-naming/remediation text

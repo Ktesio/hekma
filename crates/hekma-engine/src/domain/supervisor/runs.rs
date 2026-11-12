@@ -125,33 +125,32 @@ impl Supervisor {
     }
 
     /// Re-resolve the open process-owning Run's Policies after a
-    /// `budget.*` or `cost.rate.*` config write (story 21-3): one writer
-    /// job with FRESH caller-side inputs (the write just changed them), so
-    /// the stored resolution, its Anomalies and the published snapshot
-    /// match the config the operator sees. An instance with no open Run
-    /// resolves nothing (the next start resolves at creation).
-    pub(crate) fn sync_run_policy(&self, registry: &Registry, name: &InstanceName) {
+    /// `budget.*` or `cost.rate.*` config write (story 21-3), then run the
+    /// SAME re-arm pass a Policy change and `hekma budget` run (story 21-6,
+    /// the live un-fence's config-write trigger): one writer job with FRESH
+    /// caller-side inputs (the write just changed them), so the stored
+    /// resolution, its Anomalies and the published snapshot match the
+    /// config the operator sees; a ceiling raised above the totals re-arms
+    /// its latch and lifts the matching `block` fence reasons per reason,
+    /// and one lowered to at or below the usage breaches at once (its
+    /// process action applied here). An instance with no open Run resolves
+    /// nothing (the next start resolves at creation).
+    pub(crate) fn sync_run_policy(&mut self, registry: &Registry, name: &InstanceName) {
         // The fail-closed read (round 3, L6): an unreadable configuration
         // is carried as the malformed note (action pause), never resolved
         // as if the instance had set nothing.
         let inputs = registry.resolve_inputs_fail_closed(name);
-        let instance = name.clone();
-        let result = registry.run_job(move |store| {
-            use crate::ports::RunRecords;
-            let Some(open) = store.open_process_run(&instance)? else {
-                return Ok(((), crate::domain::runs::ops::RunChanges::default()));
-            };
-            let changes = crate::domain::runs::policy::resolve_run(
-                store,
-                &open.run_id,
-                Some(inputs),
-                &crate::time::now_rfc3339(),
-            )?;
-            Ok(((), changes))
-        });
-        match result {
-            Ok(((), events)) => {
-                self.publish_run_events(events);
+        let context = self.instance_context(registry, name);
+        match registry.rearm_after_config_write(name, inputs, context) {
+            Ok(applied) => {
+                self.publish_and_act(
+                    registry,
+                    applied.breaches,
+                    Vec::new(),
+                    applied.run_events,
+                    &applied.notes,
+                    "a configuration write",
+                );
             }
             Err(err) => self.emit_diagnostic(&format!(
                 "{}: the configuration was written, but the open Run's Policies could not be \
@@ -159,6 +158,87 @@ impl Supervisor {
                 name.as_str(),
             )),
         }
+    }
+
+    /// One instance's live context for the re-arm pass (story 21-6): its
+    /// wire fence and metering source when this engine supervises it, and
+    /// its fresh explicit inputs.
+    pub(crate) fn instance_context(
+        &self,
+        registry: &Registry,
+        name: &InstanceName,
+    ) -> crate::domain::registry_policy::InstanceContext {
+        match self.running.get(name) {
+            Some(supervised) => crate::domain::registry_policy::InstanceContext {
+                fence: supervised
+                    .observed_listener
+                    .as_ref()
+                    .map(crate::metering::ObservedListener::fence),
+                metering_source: supervised.metering_source.clone(),
+                supervised: true,
+                inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
+            },
+            None => crate::domain::registry_policy::InstanceContext {
+                fence: None,
+                metering_source: String::new(),
+                supervised: false,
+                inputs: Some(registry.try_resolve_inputs_for(name.as_str())),
+            },
+        }
+    }
+
+    /// Set Run-level limits as `actor` (story 21-6, the budget job behind
+    /// `hekma budget set` and `PATCH /v0/runs/{id}/limits`): one writer job
+    /// per Run, each answered on its own — a refusal on one Run never stops
+    /// the others. A committed change re-arms (raise) or breaches at once
+    /// (lower) through the shared re-arm pass; the breaches' process
+    /// actions are executed here (D2). `dry_run` plans each Run and writes
+    /// nothing. A malformed change is refused before any Run is read.
+    pub(crate) fn set_run_limits(
+        &mut self,
+        registry: &Registry,
+        run_ids: &[RunId],
+        change: &crate::domain::RunLimitChange,
+        actor: crate::domain::LimitActor,
+        dry_run: bool,
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
+        change.validate()?;
+        let mut results = Vec::with_capacity(run_ids.len());
+        for run_id in run_ids {
+            let context = match registry.run_record(run_id) {
+                Ok(Some(record)) => record
+                    .instance
+                    .as_deref()
+                    .and_then(|instance| InstanceName::new(instance).ok())
+                    .map(|name| self.instance_context(registry, &name)),
+                Ok(None) => None,
+                Err(err) => {
+                    results.push((run_id.clone(), Err(err)));
+                    continue;
+                }
+            };
+            if dry_run {
+                let planned = registry.plan_run_limits(run_id, change, actor, context.as_ref());
+                results.push((run_id.clone(), planned));
+                continue;
+            }
+            match registry.apply_run_limits(run_id, change, actor, context) {
+                Ok(applied) => {
+                    self.publish_and_act(
+                        registry,
+                        applied.breaches,
+                        Vec::new(),
+                        applied.run_events,
+                        &applied.notes,
+                        "a Run limit change",
+                    );
+                    let outcome = applied.outcome.expect("the budget job reports its Run");
+                    results.push((run_id.clone(), Ok(outcome)));
+                }
+                Err(err) => results.push((run_id.clone(), Err(err))),
+            }
+        }
+        Ok(results)
     }
 
     /// The live per-instance context a Policy change's money half needs
@@ -324,23 +404,45 @@ impl Supervisor {
         Ok(self.finish_policy_applied(registry, applied))
     }
 
-    /// Publish what a committed Policy write produced, in COMMIT order
-    /// (the breaches the change fired — their outbox rows were appended
-    /// first, inside the re-resolution — then the Policy event, then the
-    /// Run events the re-resolutions caused; the bus invariant is bus
-    /// order == outbox order), and execute each breach's process action
-    /// through the lifecycle AFTER the publishes (the breaches are
-    /// durable; a failing pause never loses the record, and the
-    /// lifecycle's own transition events then land last, as they do on
-    /// the outbox).
+    /// Publish what a committed Policy write produced, in COMMIT order,
+    /// and execute its breaches' process actions ([`Self::publish_and_act`]).
     fn finish_policy_applied(
         &mut self,
         registry: &Registry,
         applied: crate::domain::registry_policy::PolicyApplied,
     ) -> crate::domain::PolicyOutcome {
+        self.publish_and_act(
+            registry,
+            applied.breaches,
+            applied.events,
+            applied.run_events,
+            &applied.outcome.notes,
+            "a Policy change",
+        );
+        applied.outcome
+    }
+
+    /// Publish what a committed money job produced (a Policy write, a
+    /// Run-level limit change, a config-write re-arm) in COMMIT order —
+    /// the breaches the job fired (their outbox rows were appended first,
+    /// inside the re-arm pass), then its Policy events, then the Run events
+    /// (the bus invariant is bus order == outbox order) — and execute each
+    /// breach's process action through the lifecycle AFTER the publishes
+    /// (the breaches are durable; a failing pause never loses the record,
+    /// and the lifecycle's own transition events then land last, as they
+    /// do on the outbox). `what` names the cause in the diagnostics.
+    pub(crate) fn publish_and_act(
+        &mut self,
+        registry: &Registry,
+        breaches: Vec<crate::domain::pipeline::CommittedBreach>,
+        policy_events: Vec<(crate::domain::PolicyEvent, crate::ports::OutboxAppend)>,
+        run_events: Vec<ops::CommittedRunEvent>,
+        notes: &[String],
+        what: &str,
+    ) {
         let mut actions: Vec<(InstanceName, Vec<crate::domain::pipeline::CommittedBreach>)> =
             Vec::new();
-        for breach in applied.breaches {
+        for breach in breaches {
             let instance = breach.event.instance.clone();
             let name = match InstanceName::new(&instance) {
                 Ok(name) => name,
@@ -354,9 +456,8 @@ impl Supervisor {
                         crate::domain::EngineEvent::BudgetBreach(breach.event.clone()),
                     );
                     self.emit_diagnostic(&format!(
-                        "a Policy change fired a breach on `{instance}`, which is not a valid \
-                         agent name ({err}); the breach is recorded but its action was not \
-                         executed"
+                        "{what} fired a breach on `{instance}`, which is not a valid agent name \
+                         ({err}); the breach is recorded but its action was not executed"
                     ));
                     continue;
                 }
@@ -372,11 +473,14 @@ impl Supervisor {
                 None => actions.push((name, vec![breach])),
             }
         }
-        for (event, outbox) in applied.events {
+        for (event, outbox) in policy_events {
             self.note_outbox_append(&outbox);
-            self.publish(outbox.seq, crate::domain::EngineEvent::Policy(event));
+            self.publish(
+                outbox.seq,
+                crate::domain::EngineEvent::Policy(Box::new(event)),
+            );
         }
-        self.publish_run_events(applied.run_events);
+        self.publish_run_events(run_events);
         // Then the process actions (only for instances this engine
         // supervises; D2: the caller applies them).
         for (name, breaches) in actions {
@@ -386,9 +490,9 @@ impl Supervisor {
                 // recorded and published, and ONE diagnostic says so —
                 // never a failed pause per breach.
                 self.emit_diagnostic(&format!(
-                    "{}: a Policy change fired {} breach(es) on a Run of an agent this engine \
-                     does not supervise; the breaches are recorded, and the supervising engine \
-                     applies the action",
+                    "{}: {what} fired {} breach(es) on a Run of an agent this engine does not \
+                     supervise; the breaches are recorded, and the supervising engine applies \
+                     the action",
                     name.as_str(),
                     breaches.len(),
                 ));
@@ -396,10 +500,9 @@ impl Supervisor {
             }
             self.execute_breach_actions(registry, &name, breaches);
         }
-        for note in &applied.outcome.notes {
+        for note in notes {
             self.emit_diagnostic(note);
         }
-        applied.outcome
     }
 
     /// Execute already-published breaches' process actions (the action

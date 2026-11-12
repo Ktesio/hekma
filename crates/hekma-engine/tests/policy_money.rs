@@ -222,9 +222,12 @@ fn usage_under_a_named_policy_enforces_the_dollar_scopes_with_its_flat_rate() {
         let fleet = agent.engine.blocking().fleet().unwrap();
         let entry = fleet.iter().find(|e| e.name.as_str() == "poldlr").unwrap();
         let tokens = entry.usage.cumulative_total_tokens();
+        // The cap is crossed on the 4th event (120 micro-dollars > 100);
+        // whether the 5th commits before the pause lands is the platform's
+        // timing (macOS pauses first), so only the crossing is asserted.
         assert!(
-            tokens >= TOKENS_PER_EVENT * 5,
-            "the events committed: {tokens}"
+            tokens >= TOKENS_PER_EVENT * 4,
+            "the crossing event committed: {tokens}"
         );
         let cost = entry
             .usage
