@@ -271,6 +271,11 @@ struct EngineInner {
     /// [`Engine::subscribe`] hands out receivers without ever contending on
     /// the supervisor lock. Both clones share one broadcast channel.
     events: EventBus,
+    /// The registry's published Run snapshot, held OUTSIDE the registry
+    /// mutex (story 21-5): the SSE Selector filter resolves a snapshot-
+    /// resident subject Run's labels lock-free, so a filtered stream never
+    /// contends with supervision on the registry lock per event.
+    run_snapshot: Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -538,11 +543,13 @@ impl Engine {
             supervisor.emit_open_note(&note);
         }
         let events = supervisor.event_bus();
+        let run_snapshot = Arc::clone(registry.run_publisher());
         let inner = Arc::new(EngineInner {
             read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
+            run_snapshot,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -596,11 +603,13 @@ impl Engine {
         let rt = Self::build_runtime()?;
         let supervisor = Supervisor::with_runtime(rt.handle().clone());
         let events = supervisor.event_bus();
+        let run_snapshot = Arc::clone(registry.run_publisher());
         let inner = Arc::new(EngineInner {
             read_only: true,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
+            run_snapshot,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -1928,6 +1937,17 @@ impl Engine {
         &self,
         event: &EngineEvent,
     ) -> Result<Option<Vec<Label>>, RunError> {
+        // The fast path: the published snapshot, read lock-free and without
+        // a blocking-pool hop — an open subject Run (the common case) never
+        // touches the registry mutex the supervisor's poll needs.
+        match crate::domain::runs::snapshot::subject_labels(
+            &self.inner.run_snapshot.current(),
+            event,
+        ) {
+            crate::domain::runs::snapshot::SubjectLabels::Found(labels) => return Ok(Some(labels)),
+            crate::domain::runs::snapshot::SubjectLabels::NoSubject => return Ok(None),
+            crate::domain::runs::snapshot::SubjectLabels::NotInSnapshot => {}
+        }
         let inner = Arc::clone(&self.inner);
         let event = event.clone();
         self.run_blocking(move || {
@@ -2991,6 +3011,73 @@ mod tests {
     use super::*;
     use crate::domain::NameError;
     use crate::ports::StoreError;
+
+    #[test]
+    fn the_sse_filter_resolves_an_open_run_without_the_registry_lock() {
+        // An open Run lives in the published snapshot: the Selector filter's
+        // label read answers from it lock-free — even while the registry
+        // mutex (the one the supervisor's poll needs) is held elsewhere.
+        let tmp = tempfile::TempDir::new().unwrap();
+        drop(Engine::open(Some(tmp.path().to_path_buf())).unwrap());
+        {
+            let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
+            conn.execute_batch(
+                "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('demo', 'mock', 'running', '/h', 't', 't'); \
+                 INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 instance_id, process_owner, created_at, updated_at) SELECT 'run_S', \
+                 'supervised', 0, 'active', '', id, 0, 't', 't' FROM agent_instances \
+                 WHERE name = 'demo'; \
+                 INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+                 ('run_S', 'team', 'core', 'bound', 'config');",
+            )
+            .unwrap();
+        }
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let event = EngineEvent::BudgetBreach(crate::domain::BudgetBreachEvent::new(
+            "demo",
+            "run_S",
+            crate::domain::BreachScope::PerRun,
+            1,
+            1,
+            crate::domain::BreachAction::Warn,
+            "self-reported",
+            "t",
+        ));
+        let guard = engine.inner.registry.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            let event = &event;
+            scope.spawn(move || {
+                let _ = tx.send(engine.blocking().event_subject_labels(event));
+            });
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(guard);
+            let labels = answer
+                .expect("answered while the registry lock was held")
+                .unwrap()
+                .expect("the open Run's labels");
+            assert!(labels.contains(&Label::bound("team", "core")), "{labels:?}");
+        });
+        // An event naming no Run answers None on the same fast path.
+        let policy = EngineEvent::Policy(crate::domain::runs::PolicyEvent {
+            schema_version: crate::domain::runs::POLICY_EVENT_SCHEMA_VERSION,
+            kind: crate::domain::runs::PolicyEventKind::Created,
+            name: "p".to_string(),
+            selector: None,
+            limits: None,
+            prior_limits: None,
+            rates: Default::default(),
+            matched: 0,
+            fallbacks: 0,
+            at: "t".to_string(),
+        });
+        assert_eq!(
+            engine.blocking().event_subject_labels(&policy).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn config_facade_round_trip_and_invalid_name_arms() {
