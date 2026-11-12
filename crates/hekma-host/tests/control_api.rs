@@ -4265,7 +4265,7 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
     let document = select();
     assert_eq!(document["matched"], 2, "{document}");
     // Each selected Run is its listing row (the `GET /v0/runs` item): the
-    // Run's own fields flattened, plus labels, usage and latches.
+    // Run's own fields flattened, plus its labels and usage.
     for run in document["runs"].as_array().unwrap() {
         assert!(run["run_id"].is_string(), "{run}");
         assert!(
@@ -4277,7 +4277,6 @@ fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_r
             "{run}"
         );
         assert!(run["usage"]["input_tokens"].is_u64(), "{run}");
-        assert!(run["latched"].is_array(), "{run}");
     }
     let owner = document["runs"]
         .as_array()

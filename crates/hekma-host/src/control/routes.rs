@@ -1029,7 +1029,9 @@ pub(crate) async fn runs_select(
         .sets
         .mint(
             credential.0,
-            runs.iter().map(|run| run.record.run_id.to_string()).collect(),
+            runs.iter()
+                .map(|run| run.record.run_id.to_string())
+                .collect(),
         )
         .map_err(|reason| {
             ApiError::new(
