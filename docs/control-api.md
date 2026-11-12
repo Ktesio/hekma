@@ -232,7 +232,9 @@ figures only where a Rate prices them — an unpriced cap shows the
 `unpriced-model` Anomaly instead), and `kept_on_pause` where the
 breach-default upgrade holds the agent on `pause`. `counts` carries
 `listed` (what the active view matches) and `healthy_open`. `next_cursor`
-is `null` exactly when the read is exhausted.
+is `null` exactly when the read is exhausted — a final page that is exactly
+full carries none. The cursor names only the last Run read, so send the next
+page's request with the same `view`, `selector` and `limit`.
 
 Malformed parameters are typed `400`s with their own `error.code`:
 `invalid-selector`, `invalid-cursor` (a cursor this listing never minted —

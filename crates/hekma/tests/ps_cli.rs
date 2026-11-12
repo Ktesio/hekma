@@ -240,6 +240,17 @@ fn ps_lists_the_exceptions_and_counts_the_healthy() {
     let _ = held_at;
     // The latched action rides the Anomaly cell.
     assert!(ps.stdout.contains("breach[block]"), "{}", ps.stdout);
+    // A supervised Run whose model calls skip the listener (wire_path 0):
+    // the CONTROL cell renders whole, never `supervised (no wi…`.
+    let demo_row = ps
+        .stdout
+        .lines()
+        .find(|line| line.contains("demo"))
+        .unwrap();
+    assert!(
+        demo_row.contains("supervised (no wire)"),
+        "the whole CONTROL cell: {demo_row}"
+    );
     // The footer names the counts.
     assert!(
         ps.stderr
@@ -380,6 +391,15 @@ fn ps_pages_with_the_printed_cursor_disjointly() {
         .and_then(|rest| rest.split_whitespace().next())
         .expect("the footer prints the next-page cursor")
         .to_string();
+    // The hint is the exact continuation: the same view and page size (the
+    // cursor alone would page the default exceptions view at 50).
+    assert!(
+        page_one.stderr.contains(&format!(
+            "next page: hekma ps --all --limit 2 --cursor {cursor}"
+        )),
+        "{}",
+        page_one.stderr
+    );
     let page_two = run_hekma_agent(
         &["ps", "--all", "--limit", "2", "--cursor", &cursor],
         &ctx.project_dir,
@@ -481,6 +501,48 @@ fn ps_selector_filters_bound_and_caller_labels_in_either_view() {
 }
 
 #[test]
+fn an_empty_page_still_prints_its_note_and_the_counts() {
+    // A Selector nothing carries: the note names the Selector, and the
+    // counts footer still prints (an empty page never hides the counts).
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    seed(state_dir);
+    let ps = run_hekma_agent(
+        &["ps", "--selector", "team=nobody"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(ps.code, Some(0), "stderr: {}", ps.stderr);
+    assert!(ps.stdout.is_empty(), "{}", ps.stdout);
+    assert!(
+        ps.stderr
+            .contains("no Runs carrying team=nobody need attention"),
+        "{}",
+        ps.stderr
+    );
+    assert!(
+        ps.stderr
+            .contains("0 listed · 0 healthy open Runs not shown (--all lists them)"),
+        "{}",
+        ps.stderr
+    );
+    // The --all view's wording on no match.
+    let ps = run_hekma_agent(
+        &["ps", "--all", "--selector", "team=nobody"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert_eq!(ps.code, Some(0), "stderr: {}", ps.stderr);
+    assert!(
+        ps.stderr.contains("no Runs carry team=nobody"),
+        "{}",
+        ps.stderr
+    );
+    assert!(ps.stderr.contains("0 listed"), "{}", ps.stderr);
+}
+
+#[test]
 fn ps_on_an_empty_state_dir_prints_the_note_and_creates_nothing() {
     let ctx = TestContext::new();
     let state = TestContext::new();
@@ -550,11 +612,12 @@ fn a_lowered_policy_re_resolves_and_ps_shows_the_new_headroom() {
     let state_dir = state.project_dir.as_path();
     seed(state_dir);
 
-    // The 21-3 change job: raise the ceiling (still above the seeded
-    // usage, so the re-arm pass clears the synthetic latch and the breach
-    // Anomaly — the honest change semantics; the FRESH headroom is the
-    // point here).
-    {
+    // The 21-3 change job, twice: first set the ceiling well above the
+    // seeded usage (300) — the re-arm pass clears the synthetic latch and
+    // the breach Anomaly, the honest change semantics — then LOWER it.
+    // Each `hekma ps` shows the resolution the change just stored, never a
+    // stale or configured-only figure.
+    let change = |tokens_per_run: u64| {
         let engine = Engine::open(Some(state_dir.to_path_buf())).unwrap();
         engine
             .blocking()
@@ -563,7 +626,7 @@ fn a_lowered_policy_re_resolves_and_ps_shows_the_new_headroom() {
                     name: "tight".to_string(),
                     selector: None,
                     set: PolicyLimits {
-                        tokens_per_run: Some(500),
+                        tokens_per_run: Some(tokens_per_run),
                         ..PolicyLimits::default()
                     },
                     clear: Vec::new(),
@@ -572,35 +635,35 @@ fn a_lowered_policy_re_resolves_and_ps_shows_the_new_headroom() {
                 false,
             )
             .unwrap();
-    }
-    let ps = run_hekma_agent(
-        &["ps", "--json", "--all", "--selector", "team=core"],
-        &ctx.project_dir,
-        state_dir,
-    );
-    assert!(ps.success, "stderr: {}", ps.stderr);
-    let document: serde_json::Value = serde_json::from_str(&ps.stdout).unwrap();
-    let item = &document["items"][0];
-    assert_eq!(item["run_id"], "run_J", "items: {}", document["items"]);
-    // Never a stale or configured-only figure: the new resolution (500)
-    // minus the same subtree usage.
+    };
+    let headroom = || {
+        let ps = run_hekma_agent(
+            &["ps", "--json", "--all", "--selector", "team=core"],
+            &ctx.project_dir,
+            state_dir,
+        );
+        assert!(ps.success, "stderr: {}", ps.stderr);
+        let document: serde_json::Value = serde_json::from_str(&ps.stdout).unwrap();
+        let item = document["items"][0].clone();
+        assert_eq!(item["run_id"], "run_J", "items: {}", document["items"]);
+        item
+    };
+    change(1_000);
+    let item = headroom();
+    assert_eq!(item["budget"]["per_run_limit"], 1_000, "{item}");
+    assert_eq!(item["budget"]["per_run_remaining"], 700, "{item}");
+    // The re-arm cleared the synthetic breach (the ceiling no longer holds
+    // a latch) — an honest row, never a stale Anomaly.
+    assert_eq!(item["anomalies"], serde_json::json!([]), "{item}");
+    // Lowered: 1000 → 500, still above the usage — the new headroom.
+    change(500);
+    let item = headroom();
+    assert_eq!(item["budget"]["per_run_limit"], 500, "{item}");
+    assert_eq!(item["budget"]["per_run_remaining"], 200, "{item}");
     assert_eq!(
-        item["budget"]["per_run_limit"], 500,
-        "items: {}",
-        document["items"]
-    );
-    assert_eq!(
-        item["budget"]["per_run_remaining"], 200,
-        "items: {}",
-        document["items"]
-    );
-    // The re-arm cleared the synthetic breach (the raised ceiling no longer
-    // holds a latch) — an honest row, never a stale Anomaly.
-    assert_eq!(
-        item["anomalies"],
-        serde_json::json!([]),
-        "items: {}",
-        document["items"]
+        item["budget"]["sources"]["tokens_per_run"],
+        serde_json::json!({"policy": "tight"}),
+        "{item}"
     );
 }
 

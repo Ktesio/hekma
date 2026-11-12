@@ -517,7 +517,7 @@ hekma ps --all --limit 100 --json
 | `--selector key=value[,key=value...]` | Only Runs carrying all these labels, bound or caller |
 | `--all` | List every Run inside the ended-Run window, not just the exceptions |
 | `--limit <n>` | Page size: default 50, at most 1000; `0` means the maximum; above the cap it clamps with a note |
-| `--cursor <c>` | Continue after a previous page (the footer prints the exact value) |
+| `--cursor <c>` | Continue after a previous page (the footer prints the exact command: the same `--all`, `--selector` and `--limit`, plus the cursor) |
 | `--json` | Print `{"schema_version": 1, "view", "selector", "items", "next_cursor", "counts"}` — one document |
 
 The default view is **exception-first**: a Run is listed when it carries an
@@ -538,6 +538,9 @@ figure whole, each row's labels with source and origin, its latches as
 `latched: [{dimension, scope, action}]`, its resolved limits' sources and
 the effective Breach Action, and the `kept_on_pause` marker where the
 breach-default upgrade holds an agent on `pause`.
+
+An empty page prints a note naming what was asked (the view, the Selector,
+or a cursor past the last Run) and still prints the counts footer.
 
 Exit codes: `2` an invalid selector, cursor or limit; `1` a store failure;
 `0` otherwise — an empty listing included.

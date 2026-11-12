@@ -681,11 +681,13 @@ pub(crate) async fn runs_list(
         })?),
     };
     // The limit parses INSIDE the handler so every failure is a versioned
-    // envelope (never axum's plain-text extractor rejection). `0` takes the
-    // maximum; anything above the house page cap clamps to it (the CLI's
-    // `--limit` parity — its clamp notes on stderr, this clamps quietly).
+    // envelope (never axum's plain-text extractor rejection). Absent, it is
+    // the documented default page (50 — `hekma ps`'s default, so the two
+    // first pages and cursors agree); `0` takes the maximum; anything above
+    // the house page cap clamps to it (the CLI's `--limit` parity — its
+    // clamp notes on stderr, this clamps quietly).
     let limit = match &query.limit {
-        None => 0usize,
+        None => hekma_engine::LISTING_DEFAULT_LIMIT,
         Some(text) => text.parse::<usize>().map_err(|err| {
             ApiError::invalid_query_param(
                 "invalid-limit",

@@ -3995,6 +3995,57 @@ fn seed_listing_state(base: &Path, journal_seed: Option<u64>) {
 }
 
 #[test]
+fn the_runs_route_defaults_to_the_documented_page_of_fifty() {
+    // No `limit`: the documented default page (50), the same first page and
+    // cursor `hekma ps` prints — not the 1000-row maximum.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    seed_listing_state(&base, None);
+    {
+        let conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        let demo: i64 = conn
+            .query_row(
+                "SELECT id FROM agent_instances WHERE name = 'demo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for index in 0..60 {
+            conn.execute(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 parent_run_id, instance_id, process_owner, created_at, updated_at) \
+                 VALUES (?1, 'supervised', 0, 'active', 'failed', 'run_J', ?2, 0, 't', 't')",
+                rusqlite::params![format!("run_Z{index:03}"), demo],
+            )
+            .unwrap();
+        }
+    }
+    let (sink_handle, _diagnostics) = SharedSink::new();
+    let server = spawn_serve_with_api(base.clone(), sink_handle);
+    let client = client();
+    let mut response = get_ok(&client, &server.addr, "/v0/runs");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(&mut response);
+    assert_eq!(json["counts"]["listed"], 62, "{}", json["counts"]);
+    assert_eq!(
+        json["items"].as_array().unwrap().len(),
+        hekma_engine::LISTING_DEFAULT_LIMIT,
+        "the default page is the documented 50"
+    );
+    assert!(json["next_cursor"].is_string(), "a further page exists");
+    // Parity with the CLI's default read (ListRunsQuery::exceptions()).
+    let engine = hekma_engine::Engine::open_read_only(Some(base.clone())).unwrap();
+    let listing = engine
+        .blocking()
+        .list_runs(hekma_engine::ListRunsQuery::exceptions())
+        .unwrap();
+    let reference =
+        serde_json::to_value(listing.into_document(hekma_engine::ListingView::Exceptions, None))
+            .unwrap();
+    assert_eq!(json, reference);
+}
+
+#[test]
 fn the_runs_route_serves_the_listing_and_refuses_bad_params() {
     let state = tempfile::tempdir().unwrap();
     let base = state.path().to_path_buf();

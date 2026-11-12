@@ -73,7 +73,43 @@ pub fn run(args: PsArgs) -> Result<(), Box<dyn std::error::Error>> {
             limit: limit.min(LISTING_MAX_LIMIT as u64) as usize,
         })
         .map_err(|err| run_error_class(&err, err.to_string()))?;
-    render(&listing, args.json, view, selector)
+    let next_page = NextPage {
+        all: args.all,
+        selector: selector.as_ref().map(ToString::to_string),
+        limit: args.limit.map(|limit| limit.min(LISTING_MAX_LIMIT as u64)),
+        cursor_given: args.cursor.is_some(),
+    };
+    render(&listing, args.json, view, selector, &next_page)
+}
+
+/// What the footer's next-page hint must repeat so the next page is the
+/// SAME listing: the view, the Selector and the page size (the cursor
+/// encodes only the last run id). `cursor_given` marks a later page (the
+/// empty note's wording).
+#[derive(Clone)]
+struct NextPage {
+    all: bool,
+    selector: Option<String>,
+    limit: Option<u64>,
+    cursor_given: bool,
+}
+
+impl NextPage {
+    /// The exact command that continues after `cursor`.
+    fn command(&self, cursor: &str) -> String {
+        let mut command = "hekma ps".to_string();
+        if self.all {
+            command.push_str(" --all");
+        }
+        if let Some(selector) = &self.selector {
+            command.push_str(&format!(" --selector {selector}"));
+        }
+        if let Some(limit) = self.limit {
+            command.push_str(&format!(" --limit {limit}"));
+        }
+        command.push_str(&format!(" --cursor {cursor}"));
+        command
+    }
 }
 
 /// Render one page: the `--json` document on stdout, or the human table on
@@ -83,27 +119,26 @@ fn render(
     json: bool,
     view: ListingView,
     selector: Option<hekma_engine::Selector>,
+    next_page: &NextPage,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all = view == ListingView::All;
     if json {
         let document = listing.clone().into_document(view, selector);
         println!("{}", serde_json::to_string_pretty(&document)?);
-        footer(listing, all);
+        footer(listing, all, next_page);
         return Ok(());
     }
     if listing.items.is_empty() {
-        ui::note(if all {
-            "no Runs to list — nothing is inside the ended-Run window".to_string()
-        } else {
-            "no Runs need attention — no Anomalies and no held, silent or stale \
-             statuses (nothing was listed; healthy open Runs are counted with --all)"
-                .to_string()
-        });
+        // The note, then the footer: the counts (the healthy open Runs
+        // above all) still show on an empty page.
+        ui::note(empty_note(all, next_page));
+        footer(listing, all, next_page);
         return Ok(());
     }
     let columns = [
         ui::TableColumn::new("RUN", 10, 32),
-        ui::TableColumn::new("CONTROL", 8, 19),
+        // 20: `supervised (no wire)` renders whole.
+        ui::TableColumn::new("CONTROL", 8, 20),
         ui::TableColumn::new("STATUS", 6, 6),
         ui::TableColumn::new("ANOMALIES", 9, 24),
         ui::TableColumn::new("LABELS", 6, 24),
@@ -132,18 +167,41 @@ fn render(
         })
         .collect::<Vec<_>>();
     ui::print_table("Runs", &columns, &rows);
-    footer(listing, all);
+    footer(listing, all, next_page);
     Ok(())
+}
+
+/// The empty page's note, worded for what was asked: a later page, a
+/// Selector, the `--all` view or the exceptions view.
+fn empty_note(all: bool, next_page: &NextPage) -> String {
+    if next_page.cursor_given {
+        return "no more Runs after this cursor".to_string();
+    }
+    if let Some(selector) = &next_page.selector {
+        return if all {
+            format!(
+                "no Runs carry {selector} — none open and none ended inside the 7-day \
+                 ended-Run window"
+            )
+        } else {
+            format!("no Runs carrying {selector} need attention")
+        };
+    }
+    if all {
+        "no Runs to list — none open and none ended inside the 7-day ended-Run window".to_string()
+    } else {
+        "no Runs need attention — no Anomalies and no held, silent or stale statuses".to_string()
+    }
 }
 
 /// The counts footer and the exact next-page hint (stderr; stdout stays
 /// parseable).
-fn footer(listing: &RunListing, all: bool) {
-    ui::note(footer_text(listing, all));
+fn footer(listing: &RunListing, all: bool, next_page: &NextPage) {
+    ui::note(footer_text(listing, all, next_page));
 }
 
 /// The footer's text (one construction site, unit-testable).
-fn footer_text(listing: &RunListing, all: bool) -> String {
+fn footer_text(listing: &RunListing, all: bool, next_page: &NextPage) -> String {
     let RunListing {
         counts,
         next_cursor,
@@ -159,7 +217,7 @@ fn footer_text(listing: &RunListing, all: bool) -> String {
         note.push_str(" not shown (--all lists them)");
     }
     if let Some(cursor) = next_cursor {
-        note.push_str(&format!(" · next page: hekma ps --cursor {cursor}"));
+        note.push_str(&format!(" · next page: {}", next_page.command(cursor)));
     }
     note
 }
@@ -466,21 +524,87 @@ mod tests {
                 healthy_open: 212,
             },
         };
+        let plain = NextPage {
+            all: false,
+            selector: None,
+            limit: None,
+            cursor_given: false,
+        };
         assert_eq!(
-            footer_text(&listing, false),
+            footer_text(&listing, false, &plain),
             "3 listed · 212 healthy open Runs not shown (--all lists them)"
         );
         listing.next_cursor = Some("dnVuXzE".to_string());
         assert_eq!(
-            footer_text(&listing, false),
+            footer_text(&listing, false, &plain),
             "3 listed · 212 healthy open Runs not shown (--all lists them) · next page: \
              hekma ps --cursor dnVuXzE"
         );
         listing.counts.healthy_open = 1;
+        let all = NextPage { all: true, ..plain };
         assert_eq!(
-            footer_text(&listing, true),
-            "3 listed · 1 healthy open Run · next page: hekma ps --cursor dnVuXzE"
+            footer_text(&listing, true, &all),
+            "3 listed · 1 healthy open Run · next page: hekma ps --all --cursor dnVuXzE"
         );
+    }
+
+    #[test]
+    fn the_next_page_hint_repeats_the_view_the_selector_and_the_limit() {
+        // The cursor encodes only the last run id: the hint must carry the
+        // rest, or the copied command pages a DIFFERENT listing.
+        let next = NextPage {
+            all: true,
+            selector: Some("team=core,env=prod".to_string()),
+            limit: Some(100),
+            cursor_given: true,
+        };
+        assert_eq!(
+            next.command("dnVuXzE"),
+            "hekma ps --all --selector team=core,env=prod --limit 100 --cursor dnVuXzE"
+        );
+        let next = NextPage {
+            all: false,
+            selector: None,
+            limit: Some(0),
+            cursor_given: false,
+        };
+        assert_eq!(next.command("c"), "hekma ps --limit 0 --cursor c");
+    }
+
+    #[test]
+    fn the_empty_note_names_what_was_asked() {
+        let base = NextPage {
+            all: false,
+            selector: None,
+            limit: None,
+            cursor_given: false,
+        };
+        assert_eq!(
+            empty_note(false, &base),
+            "no Runs need attention — no Anomalies and no held, silent or stale statuses"
+        );
+        assert!(empty_note(
+            true,
+            &NextPage {
+                all: true,
+                ..base.clone()
+            }
+        )
+        .contains("none open and none ended inside the 7-day ended-Run window"));
+        let selected = NextPage {
+            selector: Some("team=core".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(
+            empty_note(false, &selected),
+            "no Runs carrying team=core need attention"
+        );
+        assert!(empty_note(true, &selected).starts_with("no Runs carry team=core"));
+        let later = NextPage {
+            cursor_given: true,
+            ..base
+        };
+        assert_eq!(empty_note(false, &later), "no more Runs after this cursor");
     }
 
     #[test]
