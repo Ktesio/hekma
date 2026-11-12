@@ -194,3 +194,38 @@ fn a_url_scan_finds_tokens_raw_encoded_and_in_any_case() {
     assert_eq!(percent_decode("a%2"), "a%2");
     assert_eq!(percent_decode("%zz%41"), "%zzA");
 }
+
+#[test]
+fn a_token_packed_url_keeps_at_most_the_cap_without_duplicates() {
+    // Many distinct tokens, each repeated, packed end to end (the pre-auth
+    // amplifier shape): the scan keeps the FIRST distinct tokens, in order,
+    // up to the cap, with no duplicates, and still reports `found`.
+    let distinct: Vec<MintedToken> = (0..URL_SCAN_MAX_TOKENS * 3)
+        .map(|_| mint(TokenClass::RunKey).unwrap())
+        .collect();
+    let mut url = String::from("/v0/");
+    for token in &distinct {
+        for _ in 0..4 {
+            url.push_str(token.secret().expose_secret());
+        }
+    }
+    let scan = scan_url(&url);
+    assert!(scan.found);
+    assert_eq!(scan.tokens.len(), URL_SCAN_MAX_TOKENS);
+    let hashes: Vec<TokenHash> = scan.tokens.iter().map(hash_presented).collect();
+    for (index, hash) in hashes.iter().enumerate() {
+        assert!(
+            !hashes[..index].iter().any(|seen| seen.ct_eq(hash)),
+            "token {index} is a duplicate"
+        );
+        assert!(
+            hash.ct_eq(&distinct[index].hash()),
+            "token {index} is not the {index}th distinct"
+        );
+    }
+    // A URL with one token, repeated, still yields exactly that one.
+    let one = distinct[0].secret().expose_secret().repeat(50);
+    let scan = scan_url(&format!("/v0/{one}"));
+    assert!(scan.found);
+    assert_eq!(scan.tokens.len(), 1);
+}

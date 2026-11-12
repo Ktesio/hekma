@@ -428,23 +428,34 @@ pub fn percent_decode(text: &str) -> String {
 
 /// Scan a URL's path and query, raw and percent-decoded (decoded twice, so
 /// a double-encoded token is caught too).
+///
+/// It runs before authentication, so its work is bounded: each token is
+/// hashed once into a set (the server's own copies, so timing does not
+/// matter), and at most [`URL_SCAN_MAX_TOKENS`] distinct tokens are kept —
+/// the first ones, in order. `found` stays true whatever the count.
 pub fn scan_url(path_and_query: &str) -> UrlScan {
     let once = percent_decode(path_and_query);
     let twice = percent_decode(&once);
     let mut scan = UrlScan::default();
+    let mut seen = std::collections::HashSet::new();
     for text in [path_and_query, once.as_str(), twice.as_str()] {
         let part = scan_url_text(text);
         scan.found |= part.found;
         for token in part.tokens {
-            if !scan.tokens.iter().any(|seen| {
-                TokenHash::of(seen.expose_secret()).ct_eq(&TokenHash::of(token.expose_secret()))
-            }) {
+            if scan.tokens.len() >= URL_SCAN_MAX_TOKENS {
+                break;
+            }
+            if seen.insert(TokenHash::of(token.expose_secret())) {
                 scan.tokens.push(token);
             }
         }
     }
     scan
 }
+
+/// The most distinct tokens one URL scan keeps (and so revokes). The
+/// request is refused anyway; a real accidental exposure carries one or two.
+pub const URL_SCAN_MAX_TOKENS: usize = 16;
 
 /// A Run Key and its paired refresh credential, issued once (a Control API
 /// child open, a refresh). `Debug` shows the token ids only; there is no
