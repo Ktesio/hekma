@@ -348,7 +348,6 @@ mod bench {
                 cost_cap: CostCap::default(),
                 cost_action: BreachAction::Pause,
                 supervised: true,
-                fence: None,
                 runs: None,
                 totals_fault: false,
             },

@@ -257,6 +257,12 @@ impl MintedToken {
             hash: self.hash,
         }
     }
+
+    /// Consume the token for its one delivery (the cleartext moves to the
+    /// caller that shows it once; nothing further can read it here).
+    pub(crate) fn into_secret(self) -> SecretString {
+        self.secret
+    }
 }
 
 /// A minted token without its value: what a writer job records.

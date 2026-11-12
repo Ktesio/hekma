@@ -466,6 +466,9 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// snapshot's key index at open).
     fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;
 
+    /// Record a process-owning Run's upstream base URL (story 23-1).
+    fn set_run_upstream(&self, run_id: &RunId, upstream: Option<&str>) -> Result<(), StoreError>;
+
     /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
     /// at most `limit` (story 23-1: the recently-revoked set at open).
     fn recently_revoked_keys(
