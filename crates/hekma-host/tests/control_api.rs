@@ -1949,42 +1949,47 @@ fn the_api_is_off_by_default_and_the_flag_pair_is_validated() {
         "no operator listener exists by default:\n{text}"
     );
     // The notice SEQUENCE, pinned exactly (review item 27's discipline):
-    // started, the local endpoint, signal, the API stop, the drain's
-    // zero-agent outcome, complete — in order, and NOTHING else.
+    // started, the shared metering proxy's address, the local endpoint,
+    // signal, the API stop, the drain's zero-agent outcome, complete — in
+    // order, and NOTHING else.
     let notices: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         notices.len(),
-        6,
-        "a listener-less serve emits exactly six notices:\n{text}"
+        7,
+        "a listener-less serve emits exactly seven notices:\n{text}"
     );
     assert!(
         notices[0].starts_with("[hekma] host started; state root "),
         "the first notice is the started notice:\n{text}"
     );
     assert!(
-        notices[1].starts_with(&format!(
+        notices[1].starts_with("[hekma] the metering proxy is listening on http://127.0.0.1:"),
+        "the second notice names the shared metering proxy on loopback:\n{text}"
+    );
+    assert!(
+        notices[2].starts_with(&format!(
             "[hekma] local control endpoint on {} (loopback, for the hekma CLI;",
             discovery.addr
         )),
-        "the second notice names the local endpoint:\n{text}"
-    );
-    assert_eq!(
-        notices[2],
-        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
-        "the third notice is the signal notice, verbatim:\n{text}"
+        "the third notice names the local endpoint:\n{text}"
     );
     assert_eq!(
         notices[3],
+        "[hekma] SIGTEST received; stopping running and paused agents (graceful window 1s) ...",
+        "the fourth notice is the signal notice, verbatim:\n{text}"
+    );
+    assert_eq!(
+        notices[4],
         "[hekma] control api stopped; no requests are accepted for the rest of the shutdown",
-        "the fourth notice is the API stop:\n{text}"
+        "the fifth notice is the API stop:\n{text}"
     );
     assert_eq!(
-        notices[4], "[hekma] no running or paused agents; nothing to stop",
-        "the fifth notice is the drain's zero-agent outcome:\n{text}"
+        notices[5], "[hekma] no running or paused agents; nothing to stop",
+        "the sixth notice is the drain's zero-agent outcome:\n{text}"
     );
     assert_eq!(
-        notices[5], "[hekma] shutdown complete (SIGTEST)",
-        "the sixth notice is the completion notice, verbatim:\n{text}"
+        notices[6], "[hekma] shutdown complete (SIGTEST)",
+        "the seventh notice is the completion notice, verbatim:\n{text}"
     );
 
     // --listen without --bearer-secret: a typed InvalidOptions (usage class).

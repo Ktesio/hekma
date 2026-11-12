@@ -1305,16 +1305,7 @@ impl Supervisor {
     /// [`Self::emit_diagnostic`], callable without the supervisor lock.
     pub(crate) fn diagnostic_fn(&self) -> Arc<dyn Fn(String) + Send + Sync> {
         let sink = self.diagnostics.clone();
-        Arc::new(move |line: String| match &sink {
-            Some(sink) => {
-                let mut writer = sink
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = writeln!(writer, "[hekma] {line}");
-                let _ = writer.flush();
-            }
-            None => eprintln!("[hekma] {line}"),
-        })
+        Arc::new(move |line: String| write_diagnostic(sink.as_ref(), &line))
     }
 
     pub(crate) fn set_serve_options(
@@ -1487,28 +1478,7 @@ impl Supervisor {
     /// The sink's `Write` impl must not re-enter the engine — a call that
     /// took the supervisor lock would deadlock.
     fn emit_diagnostic(&self, message: &str) {
-        let mut line = String::with_capacity(message.len() + 10);
-        line.push_str("[hekma] ");
-        line.push_str(message);
-        line.push('\n');
-        match &self.diagnostics {
-            Some(sink) => {
-                let mut writer = sink
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let bytes = line.as_bytes();
-                // Swallow BOTH failure modes (io error, panic) and FLUSH:
-                // a buffering host writer must not silently lose the line
-                // inside its own buffer after a successful `write_all`.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _ = writer.write_all(bytes);
-                    let _ = writer.flush();
-                }));
-            }
-            None => {
-                let _ = std::io::stderr().write_all(line.as_bytes());
-            }
-        }
+        write_diagnostic(self.diagnostics.as_ref(), message);
     }
 
     // ---- ACP transport support (story 14-1, spine AD-19) ----
@@ -2437,3 +2407,32 @@ mod reaper;
 mod runs;
 mod spawn;
 mod usage;
+
+/// Write one diagnostic line to the installed sink, else stderr: the body of
+/// [`Supervisor::emit_diagnostic`], shared with the proxy's lock-free
+/// [`Supervisor::diagnostic_fn`] so the engine still reaches stdio in exactly
+/// one place. The `[hekma] ` prefix and the terminating newline live here.
+fn write_diagnostic(sink: Option<&DiagnosticSink>, message: &str) {
+    let mut line = String::with_capacity(message.len() + 10);
+    line.push_str("[hekma] ");
+    line.push_str(message);
+    line.push('\n');
+    match sink {
+        Some(sink) => {
+            let mut writer = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bytes = line.as_bytes();
+            // Swallow BOTH failure modes (io error, panic) and FLUSH:
+            // a buffering host writer must not silently lose the line
+            // inside its own buffer after a successful `write_all`.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = writer.write_all(bytes);
+                let _ = writer.flush();
+            }));
+        }
+        None => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+    }
+}

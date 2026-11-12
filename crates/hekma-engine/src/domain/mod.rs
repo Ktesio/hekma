@@ -51,6 +51,7 @@ mod secret;
 mod supervisor;
 mod transition;
 mod usage;
+pub(crate) use usage::mint_ulid;
 
 pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,

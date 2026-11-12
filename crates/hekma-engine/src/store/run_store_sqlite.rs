@@ -900,6 +900,10 @@ impl RunStore for SqliteStore {
         Ok(read_run_rollup(self.conn(), run_id.as_str())?.as_rollup())
     }
 
+    fn run_identity(&self, run_id: &RunId) -> Result<Option<(String, String)>, StoreError> {
+        self.run_identity(run_id)
+    }
+
     fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError> {
         let generation: Option<i64> = self
             .conn()

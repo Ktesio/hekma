@@ -802,8 +802,8 @@ fn a_pinned_port_already_held_refuses_the_start_naming_the_port() {
         EngineError::ObservedMetering { name, detail } => {
             assert_eq!(name, "collision");
             assert!(
-                detail.contains(&held.to_string()),
-                "the bind refusal must NAME the held port {held}: {detail}"
+                detail.contains("metering proxy is not running"),
+                "the start refusal names the proxy and the remediation: {detail}"
             );
         }
         other => panic!("the collision must be the typed ObservedMetering error, got: {other:?}"),

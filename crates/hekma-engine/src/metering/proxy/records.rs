@@ -35,35 +35,10 @@ pub(crate) const PERMIT_WAIT: Duration = Duration::from_secs(1);
 /// The most consecutive failures of one record before it is skipped.
 pub(crate) const MAX_RECORD_ATTEMPTS: u32 = 10;
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-/// A new call id: `call_` + a ULID (48-bit millisecond time, 80 random bits,
-/// Crockford base32). A failing random source falls back to a process
-/// counter mixed into the random half — a call id is a dedup key, never a
-/// secret.
+/// A new call id: `call_` + a ULID ([`mint_ulid`](crate::domain::mint_ulid),
+/// the same mint as Run ids). A call id is a dedup key, never a secret.
 pub(crate) fn new_call_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        & 0xFFFF_FFFF_FFFF;
-    let mut random = [0u8; 10];
-    if getrandom::getrandom(&mut random).is_err() {
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-        random[..8].copy_from_slice(&count.to_be_bytes());
-        random[8..].copy_from_slice(&(std::process::id() as u16).to_be_bytes());
-    }
-    let mut value: u128 = u128::from(millis) << 80;
-    for (index, byte) in random.iter().enumerate() {
-        value |= u128::from(*byte) << (8 * (9 - index));
-    }
-    let mut out = String::with_capacity(31);
-    out.push_str("call_");
-    for shift in (0..26).rev() {
-        out.push(CROCKFORD[((value >> (shift * 5)) & 0x1F) as usize] as char);
-    }
-    out
+    format!("call_{}", crate::domain::mint_ulid())
 }
 
 /// Counters the proxy keeps (read by the info surface and the tests).

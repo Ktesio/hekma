@@ -223,11 +223,40 @@ fn footer_text(listing: &RunListing, all: bool, next_page: &NextPage) -> String 
 }
 
 /// The RUN cell: the instance name on process-owning rows (the grain an
-/// operator acts on), else the run id (a child Run inside a process).
+/// operator acts on), a wire Run's identity (`unattributed`,
+/// `binding <name>`, the external id — story 23-1), else the run id (a
+/// child Run inside a process).
 fn run_cell(item: &hekma_engine::RunSummary) -> String {
+    if let Some(identity) = identity_cell(item) {
+        return identity;
+    }
     match (&item.record.instance, item.record.process_owner) {
         (Some(instance), true) => instance.clone(),
         _ => item.record.run_id.as_str().to_string(),
+    }
+}
+
+/// A wire Run's rendered identity, when it has one: the unattributed Run,
+/// a binding's Run, a split Run or a hint child (story 23-1). Instanceless
+/// Runs without an identity fall back to their id.
+fn identity_cell(item: &hekma_engine::RunSummary) -> Option<String> {
+    if item.record.instance.is_some() {
+        return None;
+    }
+    let (namespace, external) = item.identity.as_ref()?;
+    let rendered = match namespace.as_str() {
+        // The unattributed Run (proxy/unattributed).
+        "proxy" => "unattributed".to_string(),
+        // A binding's own Run (binding/<name>).
+        "binding" => format!("binding {external}"),
+        // A split Run (binding:<name>/<external>) or a hint child
+        // (run:<parent>/<external>): the external id names the grain.
+        _ => external.clone(),
+    };
+    if item.before_shared_proxy {
+        Some(format!("{rendered} (started before the shared proxy)"))
+    } else {
+        Some(rendered)
     }
 }
 
@@ -370,6 +399,8 @@ mod tests {
             latched: Vec::new(),
             budget: None,
             kept_on_pause: false,
+            identity: None,
+            before_shared_proxy: false,
         }
     }
 

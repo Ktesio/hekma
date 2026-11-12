@@ -124,6 +124,10 @@ pub(crate) trait RunStore {
     /// instance-less wire Run has a rollup too).
     fn run_rollup_by_id(&self, run_id: &RunId) -> Result<Rollup, StoreError>;
 
+    /// A Run's `(namespace, external id)` identity, when it has one (story
+    /// 23-1: the wire Runs).
+    fn run_identity(&self, run_id: &RunId) -> Result<Option<(String, String)>, StoreError>;
+
     /// Bump the instance's launch generation and return the new value.
     fn bump_launch_generation(&self, name: &InstanceName) -> Result<u64, StoreError>;
 

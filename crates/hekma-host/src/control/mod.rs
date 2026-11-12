@@ -268,6 +268,35 @@ fn router(state: ApiState) -> Router {
                 .patch(routes::policy_change)
                 .delete(routes::policy_delete),
         )
+        // Endpoint bindings (story 23-1, Operator bearer only — the other
+        // credential classes are refused on this family): the Operator
+        // surface the shared Metering Proxy routes on, with per-binding
+        // reroute routes and announce / proxy-access credentials.
+        .route(
+            "/v0/bindings",
+            get(routes::bindings_list).post(routes::binding_create),
+        )
+        .route(
+            "/v0/bindings/{name}",
+            get(routes::binding_show)
+                .patch(routes::binding_patch)
+                .delete(routes::binding_delete),
+        )
+        .route(
+            "/v0/bindings/{name}/routes/{route}",
+            put(routes::binding_route_put).delete(routes::binding_route_delete),
+        )
+        .route(
+            "/v0/bindings/{name}/credentials",
+            get(routes::binding_credentials),
+        )
+        .route(
+            "/v0/bindings/{name}/credentials/revoke",
+            post(routes::binding_credential_revoke),
+        )
+        // Story 23-1: where the shared Metering Proxy listens (or why it is
+        // not running).
+        .route("/v0/proxy", get(routes::proxy_show))
         // Live events (SSE).
         .route("/v0/events", get(sse::live_events))
         // The ephemeral-host export surface (story 17-4): the global outbox

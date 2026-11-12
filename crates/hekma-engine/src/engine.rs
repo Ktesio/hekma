@@ -760,6 +760,21 @@ impl Engine {
             .map(|proxy| proxy.info().clone())
     }
 
+    /// The metering proxy port RECORDED for this state directory (story
+    /// 23-1) — the sticky address a client points at even when this engine
+    /// (a read-only CLI, say) runs no proxy itself. `None` before any host
+    /// recorded one.
+    pub fn recorded_metering_port(&self) -> Option<u16> {
+        self.inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .reader()
+            .proxy_port()
+            .ok()
+            .flatten()
+    }
+
     /// Why the shared Metering Proxy is not running, when it was enabled
     /// and could not start (story 23-1).
     pub fn metering_proxy_error(&self) -> Option<String> {
@@ -3378,6 +3393,27 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.list())
     }
 
+    /// Blocking [`Engine::binding`] (story 23-1).
+    pub fn binding(&self, name: &str) -> Result<Option<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.binding(name))
+    }
+
+    /// Blocking [`Engine::bindings`] (story 23-1).
+    pub fn bindings(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.bindings(after, limit))
+    }
+
+    /// Blocking [`Engine::binding_credentials`] (story 23-1).
+    pub fn binding_credentials(&self, name: &str) -> Result<Vec<BindingCredential>, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.binding_credentials(name))
+    }
+
     /// Blocking [`Engine::fleet`] (story 1-7, FR-4). The Fleet as serializable
     /// [`FleetEntry`] rows — what `hekma agent list [--json]` renders.
     pub fn fleet(&self) -> Result<Vec<FleetEntry>, RegistryError> {
@@ -3908,6 +3944,66 @@ impl Blocking<'_> {
         name: &str,
     ) -> Result<Option<crate::ports::MemoryBackingStatus>, RegistryError> {
         self.engine.rt.block_on(self.engine.memory_status(name))
+    }
+
+    /// Blocking twin of [`Engine::stop_metering_proxy`].
+    pub fn stop_metering_proxy(&self, grace: Duration) {
+        self.engine
+            .rt
+            .block_on(self.engine.stop_metering_proxy(grace))
+    }
+
+    /// Blocking twin of [`Engine::create_binding`].
+    pub fn create_binding(&self, spec: BindingSpec) -> Result<Binding, BindingError> {
+        self.engine.rt.block_on(self.engine.create_binding(spec))
+    }
+
+    /// Blocking twin of [`Engine::update_binding`].
+    pub fn update_binding(&self, name: &str, patch: BindingPatch) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.update_binding(name, patch))
+    }
+
+    /// Blocking twin of [`Engine::delete_binding`].
+    pub fn delete_binding(&self, name: &str) -> Result<(), BindingError> {
+        self.engine.rt.block_on(self.engine.delete_binding(name))
+    }
+
+    /// Blocking twin of [`Engine::put_binding_route`].
+    pub fn put_binding_route(&self, name: &str, route: RouteSpec) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.put_binding_route(name, route))
+    }
+
+    /// Blocking twin of [`Engine::remove_binding_route`].
+    pub fn remove_binding_route(&self, name: &str, route: &str) -> Result<Binding, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.remove_binding_route(name, route))
+    }
+
+    /// Blocking twin of [`Engine::issue_binding_credential`].
+    pub fn issue_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<IssuedBindingCredential, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.issue_binding_credential(name, class))
+    }
+
+    /// Blocking twin of [`Engine::revoke_binding_credential`].
+    pub fn revoke_binding_credential(
+        &self,
+        name: &str,
+        class: BindingCredentialClass,
+    ) -> Result<(), BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.revoke_binding_credential(name, class))
     }
 }
 

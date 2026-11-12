@@ -560,6 +560,14 @@ mod tests {
             (C::Announce, F::Proxy, false),
             (C::Announce, F::Heartbeat, true),
             (C::Announce, F::OtlpIntake, true),
+            (C::ProxyAccess, F::Operator, false),
+            (C::ProxyAccess, F::RunOpen, false),
+            (C::ProxyAccess, F::RunClose, false),
+            (C::ProxyAccess, F::RunLimits, false),
+            (C::ProxyAccess, F::RunRefresh, false),
+            (C::ProxyAccess, F::Proxy, false),
+            (C::ProxyAccess, F::Heartbeat, false),
+            (C::ProxyAccess, F::OtlpIntake, false),
         ];
         assert_eq!(table.len(), C::ALL.len() * F::ALL.len());
         for (class, family, allowed) in table {
