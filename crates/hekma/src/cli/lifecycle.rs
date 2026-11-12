@@ -150,6 +150,7 @@ pub fn run(verb: RunLifecycleVerb, args: LifecycleArgs) -> Result<(), Box<dyn st
                     body,
                     per_run,
                     render: &render,
+                    decorate: &fanout::as_answered,
                 },
             )
         }
@@ -361,6 +362,7 @@ pub fn close(args: LifecycleArgs) -> Result<(), Box<dyn std::error::Error>> {
                 body: json!({}),
                 per_run: Duration::from_secs(5),
                 render: &render_close,
+                decorate: &fanout::as_answered,
             },
         ),
         Target::Run(run_id) | Target::Instance(run_id) if !flags.dry_run => {

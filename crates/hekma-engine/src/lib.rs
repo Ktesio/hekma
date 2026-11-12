@@ -144,7 +144,7 @@ pub use domain::{
 // lifecycle verbs, Run-level limits as one actor, and the budget read.
 pub use domain::{
     LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
-    RunLimitsView, RunVerbError,
+    RunLimitsResults, RunLimitsView, RunVerbError,
 };
 // Story 21-3: Policies — the request and outcome of a Policy change, the
 // stored Policy, its limits and events, and the resolution a Run carries.

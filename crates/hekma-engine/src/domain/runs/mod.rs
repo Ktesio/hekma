@@ -40,7 +40,8 @@ pub mod verbs;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use limits::{
-    LimitActor, LimitsDirection, RunLimitChange, RunLimitField, RunLimitsOutcome, RunLimitsView,
+    LimitActor, LimitsDirection, RunLimitChange, RunLimitField, RunLimitsOutcome, RunLimitsResults,
+    RunLimitsView,
 };
 pub use policy::{
     BreachDefaultUpgradedEvent, LimitKind, LimitSource, LimitSources, PolicyEvent, PolicyEventKind,
@@ -607,12 +608,14 @@ pub struct RunEvent {
     /// Its bound labels before the change, on `labels-changed` (story 21-9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_labels: Option<Vec<Label>>,
-    /// Its own limits after the change, on `limits-changed` (story 21-6).
+    /// Its own limits after the change, on `limits-changed` (story 21-6;
+    /// boxed to keep the event small on the bus — the wire form is the
+    /// plain object).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limits: Option<RunLimits>,
+    pub limits: Option<Box<RunLimits>>,
     /// Its own limits before the change, on `limits-changed` (story 21-6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prior_limits: Option<RunLimits>,
+    pub prior_limits: Option<Box<RunLimits>>,
     /// Why (a transition cause, `parent-paused`, `closed`, `label-verb`,
     /// `config`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]

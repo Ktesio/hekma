@@ -203,6 +203,11 @@ pub fn set(args: SetArgs) -> Result<(), Box<dyn std::error::Error>> {
                 body: change_body(&change),
                 per_run: std::time::Duration::from_secs(10),
                 render: &render_set,
+                decorate: &|row: &mut ActResult| {
+                    row.fields.insert("run_scoped".to_string(), json!(true));
+                    row.fields
+                        .insert("note".to_string(), json!(RUN_SCOPED_NOTE));
+                },
             },
         );
     }
@@ -458,6 +463,15 @@ fn source_text(source: &LimitSource) -> String {
     }
 }
 
+/// One rendered limit row: its label, ceiling, source, usage and headroom.
+type Row<'a> = (
+    &'a str,
+    Option<String>,
+    &'a LimitSource,
+    String,
+    Option<String>,
+);
+
 /// One Run's budget block.
 fn render_view(view: &RunLimitsView) -> String {
     let run = &view.run;
@@ -477,7 +491,7 @@ fn render_view(view: &RunLimitsView) -> String {
     let cumulative_used = view
         .cumulative_usage
         .map(|usage| usage.input_tokens.saturating_add(usage.output_tokens));
-    let rows: [(&str, Option<String>, &LimitSource, String, Option<String>); 4] = [
+    let rows: [Row<'_>; 4] = [
         (
             "tokens per-run",
             resolution.tokens.per_run.map(|v| v.to_string()),

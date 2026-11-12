@@ -98,6 +98,7 @@ pub fn run(args: LabelArgs) -> Result<(), Box<dyn std::error::Error>> {
                 body: json!({ "set": change.set, "remove": change.remove }),
                 per_run: std::time::Duration::from_secs(5),
                 render: &render_result,
+                decorate: &fanout::as_answered,
             },
         );
     }

@@ -178,7 +178,11 @@ fn anomalies(registry: &Registry, run: &RunId) -> Vec<Anomaly> {
 /// The four (dimension, scope) cells: a setter for the Run's own limits,
 /// the latch key, and the ceiling BELOW and ABOVE the seeded usage (1M
 /// tokens; $1.00 of cost; the instance's lifetime = the one Run here).
-fn cells() -> Vec<(&'static str, fn(u64) -> RunLimits, LatchKey, u64, u64)> {
+/// One cell: its label, the Run-limit setter, the latch key, and the
+/// ceilings below and above the usage.
+type Cell = (&'static str, fn(u64) -> RunLimits, LatchKey, u64, u64);
+
+fn cells() -> Vec<Cell> {
     use crate::domain::BreachScope;
     vec![
         (
@@ -388,11 +392,14 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
         })
         .collect();
     assert_eq!(changed.len(), 3, "{changed:?}");
-    assert_eq!(changed[0].prior_limits, Some(RunLimits::default()));
-    assert_eq!(changed[0].limits, Some(both));
+    assert_eq!(
+        changed[0].prior_limits.as_deref(),
+        Some(&RunLimits::default())
+    );
+    assert_eq!(changed[0].limits.as_deref(), Some(&both));
     assert_eq!(changed[0].cause.as_deref(), Some("operator"));
     assert_eq!(
-        changed[2].limits.unwrap().dollar_cumulative_micros,
+        changed[2].limits.as_ref().unwrap().dollar_cumulative_micros,
         Some(Micros(9_000_000))
     );
 }

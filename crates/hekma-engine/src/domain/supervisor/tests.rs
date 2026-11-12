@@ -10738,7 +10738,7 @@ fn a_run_limit_lowered_below_usage_executes_its_breach_action_on_the_live_agent(
     assert!(sup
         .set_run_limits(
             &registry,
-            &[owner.clone()],
+            std::slice::from_ref(&owner),
             &crate::domain::RunLimitChange::default(),
             crate::domain::LimitActor::Operator,
             false,

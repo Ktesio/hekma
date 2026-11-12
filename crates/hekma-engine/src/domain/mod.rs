@@ -111,7 +111,7 @@ pub use runs::{
 };
 pub use runs::{
     LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
-    RunLimitsView, RunVerbError,
+    RunLimitsResults, RunLimitsView, RunVerbError,
 };
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.

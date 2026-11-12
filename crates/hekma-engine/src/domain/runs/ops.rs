@@ -114,8 +114,8 @@ fn note<S: RunRecords + ?Sized>(
         anomalies: record.anomalies.clone(),
         labels: bound_only(&labels),
         prior_labels: prior.labels,
-        limits: prior.limits.map(|_| limits),
-        prior_limits: prior.limits,
+        limits: prior.limits.map(|_| Box::new(limits)),
+        prior_limits: prior.limits.map(Box::new),
         cause,
         policies: resolution
             .as_ref()

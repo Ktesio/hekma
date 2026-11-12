@@ -521,6 +521,13 @@ pub struct RunLimitsOutcome {
     pub run_scoped: bool,
 }
 
+/// The budget job's answer per Run, in request order: each Run's outcome or
+/// its own refusal.
+pub type RunLimitsResults = Vec<(
+    crate::domain::usage::RunId,
+    Result<RunLimitsOutcome, RunError>,
+)>;
+
 /// The budget-show read of one Run (`hekma budget show`,
 /// `GET /v0/runs/{id}/limits`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

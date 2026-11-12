@@ -201,7 +201,7 @@ impl Supervisor {
         change: &crate::domain::RunLimitChange,
         actor: crate::domain::LimitActor,
         dry_run: bool,
-    ) -> Result<Vec<(RunId, Result<crate::domain::RunLimitsOutcome, RunError>)>, RunError> {
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
         change.validate()?;
         let mut results = Vec::with_capacity(run_ids.len());
         for run_id in run_ids {

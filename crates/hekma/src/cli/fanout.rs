@@ -248,7 +248,13 @@ pub(crate) struct SetAct<'a> {
     pub per_run: Duration,
     /// A successful answer's row → its human line.
     pub render: &'a dyn Fn(&ActResult) -> Option<String>,
+    /// Completes a successful answer's row with the verb's own fields
+    /// (the budget verb's Run-scoped note).
+    pub decorate: &'a dyn Fn(&mut ActResult),
 }
+
+/// The no-op [`SetAct::decorate`].
+pub(crate) fn as_answered(_: &mut ActResult) {}
 
 /// The listing shown before acting on a set (stderr).
 pub(crate) fn listing(runs: &[RunRecord]) -> String {
@@ -422,6 +428,7 @@ pub(crate) fn run_selector(
                 }
             }
         }
+        (act.decorate)(&mut result);
         results.push(result);
     }
     let matched = results.len();

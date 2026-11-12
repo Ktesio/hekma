@@ -73,8 +73,8 @@ use crate::domain::{
 };
 use crate::domain::{
     ChildRunRequest, LabelChange, LabelOutcome, LimitActor, PolicyChange, PolicyOutcome,
-    PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsOutcome,
-    RunLimitsView, RunRecord, RunVerbError, RunView, Selector,
+    PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsView, RunRecord,
+    RunVerbError, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -2008,7 +2008,7 @@ impl Engine {
         change: RunLimitChange,
         actor: LimitActor,
         dry_run: bool,
-    ) -> Result<Vec<(RunId, Result<RunLimitsOutcome, RunError>)>, RunError> {
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
         if !dry_run {
             self.refuse_if_read_only().map_err(RunError::Store)?;
         }
@@ -2963,7 +2963,7 @@ impl Blocking<'_> {
         change: RunLimitChange,
         actor: LimitActor,
         dry_run: bool,
-    ) -> Result<Vec<(RunId, Result<RunLimitsOutcome, RunError>)>, RunError> {
+    ) -> Result<crate::domain::RunLimitsResults, RunError> {
         self.engine
             .rt
             .block_on(self.engine.set_run_limits(run_ids, change, actor, dry_run))
@@ -3492,7 +3492,6 @@ mod tests {
             )
             .is_err());
         // A read-only engine plans but refuses every write.
-        drop(facade);
         drop(engine);
         let read_only = Engine::open_read_only(Some(tmp.path().to_path_buf())).unwrap();
         let ro = read_only.blocking();
