@@ -611,7 +611,7 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: the snapshot index)
   summary: Cross-engine revocation propagation: a second engine on the same state dir (an embedder beside `hekma serve`) publishes its own snapshot, so a revocation it commits reaches the host's snapshot only on the host's next open. Harmless for the Control API — every Run Key action is a write that re-validates the key's row inside its job, and a snapshot miss falls back to one store read (`Engine::credential_state`) — but a proxy that reads only the snapshot would honour a key another engine revoked.
-  evidence: `domain/runs/keys.rs` (`caller_check`), `crates/hekma-host/src/control/auth.rs` (`authorize`'s store fallback). Trigger: story 23.1 (the proxy reads only the snapshot) and story 24.4 (snapshot scale and cross-process publication).
+  evidence: `domain/runs/keys.rs` (`caller_check`), `crates/hekma-host/src/control/auth.rs` (`authorize`'s store fallback, now on the engine's lock-free credential reader). Trigger: story 23.1 (the proxy reads only the snapshot) and story 24.4 (snapshot scale and cross-process publication).
 
 - source_spec: `spec-22-1-run-keys.md` (Deferrals: one shared token generator)
   summary: 21-6's `hkset_` set tokens are minted and hashed by the host (`ring`), while Run Keys use the engine's `credential::mint` and std-only SHA-256. Two generators for two token families; folding the set token onto the engine's generator (and its no-fallback rule) is a host-auth change.
@@ -620,6 +620,14 @@ When a deferred entry is fixed, its bullet gains a trailing marker line — `res
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: Breadth)
   summary: The Caller breadth cap counts ALL open children of the parent (`open_children`), not only those a Caller opened, so an Operator-opened child counts against a Caller's 1000; and an announce-created Run has no cap yet. Simpler and stricter; revisit with announce.
   evidence: `domain/runs/keys.rs` (`open_child_as`). Trigger: story 23.2 (announce creates Runs).
+
+- source_spec: `spec-22-1-run-keys.md` (security review pass 1, L8)
+  summary: The Caller breadth cap bounds one PARENT, not one key: nesting is 8 deep, so a single Run Key can create about 1000^7 Runs, each its own writer job, and every `publish_changes` clones the whole snapshot (Runs and key maps), so the cost per write grows with N. Accepted for this story (the spec's breadth rule); the fix is a per-root-key (or per-subtree) cap counted inside the open job.
+  evidence: `domain/runs/keys.rs` (`open_child_as`, `MAX_CALLER_OPEN_CHILDREN`), `domain/runs/snapshot.rs` (`RunSnapshot::with` clones). Trigger: story 23.2 (announce creates Runs and revisits the breadth rule) or story 24.4 (snapshot scale), whichever lands first.
+
+- source_spec: `spec-22-1-run-keys.md` (security review pass 1, L9 remainder)
+  summary: `hekma rm --force` now drops the removed instance's Runs' keys from the published key index in the same commit (fixed in the review's fix round), but the `tokens` rows themselves still go with the instance through `ON DELETE CASCADE`, so `hekma run keys` can no longer list them; the credential events in the outbox keep the history. Decide whether a removed instance's credential rows should be kept as an audit trail (and the foreign key relaxed).
+  evidence: `store/tokens_sqlite.rs` (`tokens.run_id … ON DELETE CASCADE`), `domain/registry.rs` (`remove`). Trigger: story 23.1 (the proxy and its audit surface) or the first audit-export story, whichever lands first.
 
 - source_spec: `spec-22-1-run-keys.md` (Design Notes: Display once; secret scanning)
   summary: The `hk_run_`/`hk_ref_`/`hk_ann_` prefixes are distinctive enough for secret scanners, but they are not registered with GitHub secret scanning (a follow-up outside the code).

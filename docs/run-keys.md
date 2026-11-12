@@ -52,8 +52,8 @@ These credentials are shown once and are not stored. Keep them somewhere safe; `
 
 Every supervised agent gets its launch's Run Key in the `HEKMA_RUN_KEY` environment variable, so the agent and any in-process helper can open and close child Runs under it and tighten their limits through the [Control API](control-api.md#run-keys) on loopback. An Adapter may also deliver it to its own environment variable by mapping the reserved `run.key` key with an `env` target; a `flag` or `file` target is refused at registration. See [the manifest's reserved keys](manifest.md#reserved-credential-keys).
 
-- **A key per launch.** A Restart Policy relaunch keeps the Run, its id, budgets and labels, and gets a new key. The previous launch's key is revoked when its process is confirmed exited, before the relaunch starts. An engine restart that adopts a live agent changes nothing: the agent keeps its key.
-- **Loopback only.** A supervised agent's key has no network use, so it is refused on a `--listen` listener that is not loopback. Keys of Runs opened over the Control API are accepted there.
+- **A key per launch.** A Restart Policy relaunch keeps the Run, its id, budgets and labels, and gets a new key. The previous launch's key is revoked when its process is confirmed exited, before the relaunch starts. Recording the exit and revoking the key are one write: if the revocation cannot be written, the exit is not recorded either. Issuing a launch's key also revokes anything an earlier launch of the Run still holds, so only one launch's key is ever live. An engine restart that adopts a live agent changes nothing: the agent keeps its key.
+- **Loopback only.** A supervised agent's key, and its refresh credential if it has one, have no network use, so they are refused on a `--listen` listener that is not loopback. A listener bound to `0.0.0.0` counts as beyond loopback. Keys of Runs opened over the Control API are accepted there.
 - **Never in a file or an argument.** The key reaches only the agent's environment. `effective-config.json` and `hekma agent config get` never show it, and setting `run.key` or `run.refresh_key` in configuration is refused.
 - **Children inherit it.** Processes the agent starts inherit its environment, `HEKMA_RUN_KEY` included. That is expected: they act within the same Run.
 - **A short window at start.** The key is recognised once the launch has been recorded, a few hundred milliseconds after spawn. A request in that window is refused as unknown; retry it.
@@ -70,7 +70,7 @@ A Run Key does not expire on a timer: agents do not refresh an API key mid-run, 
 curl -s -X POST -H "Authorization: Bearer $REFRESH_CREDENTIAL" http://127.0.0.1:<port>/v0/runs/refresh
 ```
 
-A refresh retires the presented credential, revokes its Run Key at once, and returns a new Run Key and refresh credential for the same Run. Possession is the binding: Hekma does not check which process presents it. A used refresh credential presented again revokes the Run's current pair, raises the `credential-reuse` Anomaly (listed by `hekma ps`), and answers `401 credential-revoked`, so a silent takeover becomes a visible one. `hekma run revoke-keys` on the Run acknowledges and clears the Anomaly.
+A refresh retires the presented credential, revokes its Run Key at once, and returns a new Run Key and refresh credential for the same Run. Possession is the binding: Hekma does not check which process presents it. A used refresh credential presented again revokes the Run's current pair, raises the `credential-reuse` Anomaly (listed by `hekma ps`), and answers `401 credential-revoked`, so a silent takeover becomes a visible one. It also revokes every used refresh credential of the Run. `hekma run revoke-keys` on the Run acknowledges and clears the Anomaly, and revokes the Run's used refresh credentials too, so an old one found later in a log is a plain `401 credential-revoked` that changes nothing.
 
 ### Revocation
 
@@ -80,13 +80,17 @@ hekma run revoke-keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T   # and every key issued un
 hekma run revoke-keys run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --no-cascade
 ```
 
-A revocation is committed and published before the command returns, so the very next request presenting the key is refused, and a hard kill of the Service Host cannot undo it. By default it cascades: keys of child Runs opened with the revoked keys, and their refresh chains, are revoked too. Revocation never ends a Run; children opened under a revoked key stay open.
+A revocation is committed and published before the command returns, so the very next request presenting the key is refused, and a hard kill of the Service Host cannot undo it. Like every write to `state.db`, it is not forced to disk on each commit: an operating-system crash or a power loss can lose the last moment of writes, a revocation included. After one, check with `hekma run keys` and revoke again if needed. By default it cascades: keys of child Runs opened with the revoked keys, and their refresh chains, are revoked too. Revocation never ends a Run; children opened under a revoked key stay open.
 
-A Run that ends revokes its own keys; its child Runs that outlive it keep theirs.
+A Run that ends revokes its own keys; its child Runs that outlive it keep theirs. Removing an instance (`hekma rm --force`) removes its Runs and their keys with it.
 
 ### Never in a URL
 
-Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. The per-agent metering listener applies the same rule (a typed `hekma_credential_in_url` error, nothing forwarded upstream), and strips any `x-hekma-run-key` header before forwarding a call to the provider.
+Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. The per-agent metering listener applies the same rule: it answers a typed `hekma_credential_in_url` error, forwards nothing upstream, and the exposed credential is revoked a moment later. Only a credential Hekma issued and still honours is revoked; anything else in the URL is just refused. The listener also strips any `x-hekma-run-key` header before forwarding a call to the provider.
+
+### External ids
+
+A child open's `external_id` makes a retry safe: the same id returns the same Run. Ids are scoped by who opens. The Operator and Hosts share one namespace; each Run's keys have their own, so a Run Key can neither take over nor discover an id the Operator or a Host uses.
 
 ## What is coming
 
