@@ -2,7 +2,7 @@
 title: 'The shared Metering Proxy'
 type: 'feature'
 created: '2026-11-12'
-status: 'draft'
+status: 'ready-for-dev'
 review_loop_iteration: 0
 baseline_commit: '2d96652d6be1e9d44b9889005ef5c2d0981a388f'
 context:
@@ -233,3 +233,5 @@ Each is a public-contract or scope choice; the recommendation is the spec's curr
 ## Spec Change Log
 
 - 2026-11-12 — spec written from Story 23.1 and its readiness bullets, the Epic 23 seams (23.2–23.4), 19.4, 22.2, 22.5 and 24.1–24.4, AD-26/AD-7/AD-25/AD-27/AD-20/AD-22/AD-21, FR-51/FR-43/FR-49/FR-53/FR-21/FR-60, NFR-4/NFR-6/NFR-9 and PRD §6/§7, the key-custody security review (draft for ruling; R1.6/R1.8/R1.12 proxy halves, R2.5/R2.6/R2.10 per its 23.1 note), the 22-1 spec (approved, not built), the 19-2/21-3/21-5 specs, 21-6's in-build spec (no schema step, vectors 1.4.0), and the deferred-work entries naming this story. Status draft; awaiting the orchestrator's review and Islam's rulings on O1–O6.
+- 2026-11-12 — orchestrator review: approved for build. The orchestrator-level Ask First items are accepted as recommended. O1–O6 are Islam's rulings, still pending: the build proceeds on the recommended options (O1 `hk_pxy_` yes; O2 issue per-binding credentials now per D3; O3 outbound identity headers on by default, with a release-note line naming the change; O4 per-call records stay unacknowledged per AD-26; O5 the Run route path as unauthenticated attribution until custody; O6 refuse unknown and revoked Run Keys now), and the PR stays unmerged until he rules. Build after 22-1 lands on its branch; ride 22-1's code for the launch generation.
+
