@@ -626,8 +626,17 @@ pub(crate) struct ProxiedCommit {
 /// its locks.
 #[derive(Debug)]
 pub(crate) struct EvaluationInbox {
-    tx: std::sync::Mutex<std::sync::mpsc::Sender<ProxiedCommit>>,
-    rx: std::sync::Mutex<std::sync::mpsc::Receiver<ProxiedCommit>>,
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<InboxItem>>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<InboxItem>>,
+}
+
+/// One inbox item, in commit order.
+#[derive(Debug)]
+pub(crate) enum InboxItem {
+    /// A committed proxied close's usage and evaluation.
+    Proxied(ProxiedCommit),
+    /// Run events a proxy job committed (a wire Run's `created`).
+    RunEvents(Vec<runs::ops::CommittedRunEvent>),
 }
 
 impl Default for EvaluationInbox {
@@ -644,11 +653,20 @@ impl EvaluationInbox {
     /// Push one committed evaluation (a post-commit hook).
     pub(crate) fn push(&self, commit: ProxiedCommit) {
         let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = tx.send(commit);
+        let _ = tx.send(InboxItem::Proxied(commit));
+    }
+
+    /// Push the Run events a proxy job committed.
+    pub(crate) fn push_run_events(&self, events: Vec<runs::ops::CommittedRunEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = tx.send(InboxItem::RunEvents(events));
     }
 
     /// Take everything queued, in push (commit) order.
-    pub(crate) fn drain(&self) -> Vec<ProxiedCommit> {
+    pub(crate) fn drain(&self) -> Vec<InboxItem> {
         let rx = self.rx.lock().unwrap_or_else(|p| p.into_inner());
         rx.try_iter().collect()
     }

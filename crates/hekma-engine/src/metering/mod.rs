@@ -30,7 +30,9 @@
 
 mod fence;
 pub(crate) mod listener;
-mod parse;
+pub(crate) mod parse;
+pub(crate) mod proxy;
+pub(crate) mod relay;
 
 pub(crate) use fence::WireFence;
 pub(crate) use listener::{ListenerError, ObservedListener};
