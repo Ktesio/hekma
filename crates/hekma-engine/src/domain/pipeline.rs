@@ -553,7 +553,7 @@ pub(crate) fn record_breach(
 ) -> Result<OutboxAppend, StoreError> {
     let store = ctx.store();
     store.append_breach(event)?;
-    if let Ok(instance) = InstanceName::new(&event.instance) {
+    if let Some(Ok(instance)) = event.instance.as_deref().map(InstanceName::new) {
         store.ensure_run_row(&RunId::from_wire(event.run_id.clone()), &instance)?;
     }
     store.latch(

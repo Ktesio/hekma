@@ -59,7 +59,8 @@ fn seed_at(input: u64, output: u64) -> Seeded {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: "money".to_string(),
+                    instance: Some("money".to_string()),
+                    call_id: None,
                     run_id: run_for_job,
                     input_tokens: input,
                     output_tokens: output,
@@ -138,7 +139,8 @@ fn seed_multi_run(open_tokens: u64, instance_tokens: u64) -> Seeded {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: "money".to_string(),
+                    instance: Some("money".to_string()),
+                    call_id: None,
                     run_id: run_for_job,
                     input_tokens: earlier,
                     output_tokens: earlier,
@@ -1946,7 +1948,8 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: "money".to_string(),
+                    instance: Some("money".to_string()),
+                    call_id: None,
                     run_id: usage_child,
                     input_tokens: 30,
                     output_tokens: 30,

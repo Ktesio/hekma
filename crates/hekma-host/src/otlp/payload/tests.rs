@@ -34,7 +34,8 @@ fn usage_in_run(
     cached: Option<u64>,
 ) -> EngineEvent {
     EngineEvent::UsageUpdate(UsageUpdateEvent::new(UsageEvent {
-        instance: instance.to_string(),
+        instance: Some(instance.to_string()),
+        call_id: None,
         run_id: RunId::from_wire(run),
         input_tokens: input,
         output_tokens: output,

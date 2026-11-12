@@ -146,9 +146,17 @@ impl std::fmt::Display for RunId {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvent {
     /// The Agent Instance this measurement belongs to (its unique name).
-    pub instance: String,
+    /// `None` for usage on a Run with no Agent Instance (a wire Run of the
+    /// shared Metering Proxy, story 23-1) — omitted on the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
     /// The Run (spine AD-7) this measurement was reported during.
     pub run_id: RunId,
+    /// The proxied call this measurement was metered from (`call_` + ULID,
+    /// story 23-1): the ledger's dedup key for proxied rows. `None` for a
+    /// self-reported row — omitted on the wire then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Input (prompt) tokens the agent reported for this event — INCLUSIVE of
     /// the cached subset (`0 <= cached_tokens <= input_tokens`, the 14-6
     /// invariant).
@@ -289,7 +297,8 @@ mod tests {
 
     fn sample_event(seq: u64) -> UsageEvent {
         UsageEvent {
-            instance: "demo".to_string(),
+            instance: Some("demo".to_string()),
+            call_id: None,
             run_id: RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,

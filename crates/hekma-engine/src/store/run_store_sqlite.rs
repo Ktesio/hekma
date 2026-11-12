@@ -255,7 +255,7 @@ fn migrate_v12_body(
         let breaches = legacy.breaches(name);
         notes.extend(breaches.notes);
         for event in &breaches.records {
-            insert_breach_row(conn, *id, event)?;
+            insert_breach_row(conn, Some(*id), event)?;
         }
     }
     // Latches: the breaches already recorded for each live instance's current
@@ -638,7 +638,7 @@ fn insert_transition_row(
 
 fn insert_breach_row(
     conn: &Connection,
-    instance_id: i64,
+    instance_id: Option<i64>,
     event: &BudgetBreachEvent,
 ) -> Result<(), StoreError> {
     let json = serde_json::to_string(event)
@@ -820,7 +820,19 @@ impl RunStore for SqliteStore {
         rate: Option<Rate>,
         generation: u64,
     ) -> Result<RecordOutcome, StoreError> {
-        let id = self.require_instance_id(&event.instance)?;
+        // Story 23-1: a row on a Run with no Agent Instance (a wire Run of
+        // the shared proxy) must carry a call id — the (run, call id) index
+        // is its only dedup key (the sequence key's NULL instance would be
+        // distinct on every replay).
+        let id = match &event.instance {
+            Some(instance) => Some(self.require_instance_id(instance)?),
+            None if event.call_id.is_none() => {
+                return Err(StoreError::Backend(
+                    "a usage row on a Run with no agent instance must carry a call id".to_string(),
+                ))
+            }
+            None => None,
+        };
         // The per-event effective Rate (3-3) and cached Rate (14-6), clamped
         // into their signed columns exactly as before.
         let rate_input = rate.map(|r| clamp_tokens(r.input_micros_per_1m));
@@ -831,8 +843,8 @@ impl RunStore for SqliteStore {
             "INSERT INTO usage_events \
              (instance_id, run_id, input_tokens, output_tokens, metering_source, occurred_at, \
               sequence, input_micros_per_1m, output_micros_per_1m, cached_tokens, \
-              cached_micros_per_1m, launch_generation) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              cached_micros_per_1m, launch_generation, call_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 id,
                 event.run_id.as_str(),
@@ -846,6 +858,7 @@ impl RunStore for SqliteStore {
                 cached,
                 rate_cached,
                 clamp_tokens(generation),
+                event.call_id,
             ],
         );
         match result {
@@ -907,7 +920,11 @@ impl RunStore for SqliteStore {
     }
 
     fn append_breach(&self, event: &BudgetBreachEvent) -> Result<(), StoreError> {
-        let id = self.require_instance_id(&event.instance)?;
+        // Story 23-1 (v18): a wire Run's breach names no instance.
+        let id = match &event.instance {
+            Some(instance) => Some(self.require_instance_id(instance)?),
+            None => None,
+        };
         insert_breach_row(self.conn(), id, event)
     }
 

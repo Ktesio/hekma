@@ -72,7 +72,8 @@ fn seed_with(input: u64, output: u64, wire_path: bool) -> Seeded {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: INSTANCE.to_string(),
+                    instance: Some(INSTANCE.to_string()),
+                    call_id: None,
                     run_id: usage_run,
                     input_tokens: input,
                     output_tokens: output,
@@ -742,7 +743,8 @@ fn a_caller_limit_on_a_child_run_arms_the_childs_own_level() {
         .call(move |ctx| {
             ctx.store().insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: INSTANCE.to_string(),
+                    instance: Some(INSTANCE.to_string()),
+                    call_id: None,
                     run_id: usage_child,
                     input_tokens: 30,
                     output_tokens: 30,

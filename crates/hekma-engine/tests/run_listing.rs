@@ -207,7 +207,8 @@ fn the_subject_run_resolution_covers_every_event_family() {
     // A usage / breach event resolves by its run id, ended or not.
     let usage = EngineEvent::UsageUpdate(hekma_engine::UsageUpdateEvent::new(
         hekma_engine::UsageEvent {
-            instance: "demo".to_string(),
+            instance: Some("demo".to_string()),
+            call_id: None,
             run_id: RunId::from_wire("run_subE"),
             input_tokens: 1,
             output_tokens: 1,

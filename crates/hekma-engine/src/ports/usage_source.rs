@@ -313,7 +313,8 @@ pub fn assemble_usage_event(
     occurred_at: String,
 ) -> UsageEvent {
     UsageEvent {
-        instance: instance.to_string(),
+        instance: Some(instance.to_string()),
+        call_id: None,
         run_id,
         input_tokens: parsed.input_tokens,
         output_tokens: parsed.output_tokens,
@@ -532,7 +533,7 @@ mod tests {
             "self-reported",
             "2026-07-06T00:00:00Z".to_string(),
         );
-        assert_eq!(event.instance, "svc");
+        assert_eq!(event.instance.as_deref(), Some("svc"));
         assert_eq!(event.run_id.as_str(), "run-xyz");
         assert_eq!(event.input_tokens, 8);
         assert_eq!(event.output_tokens, 16);

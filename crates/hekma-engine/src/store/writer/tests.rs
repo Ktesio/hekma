@@ -324,7 +324,8 @@ mod bench {
         UsageJob {
             row_rate: None,
             event: UsageEvent {
-                instance: instance.to_string(),
+                instance: Some(instance.to_string()),
+                call_id: None,
                 run_id: RunId::from_wire(run),
                 input_tokens: 10,
                 output_tokens: 5,

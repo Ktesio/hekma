@@ -305,8 +305,8 @@ fn subscriber_sees_the_uj3_flow_in_commit_order_with_schema_valid_payloads() {
     for event in &events {
         let instance = match event {
             EngineEvent::Transition(e) => e.instance.as_str(),
-            EngineEvent::BudgetBreach(e) => e.instance.as_str(),
-            EngineEvent::UsageUpdate(e) => e.event.instance.as_str(),
+            EngineEvent::BudgetBreach(e) => e.instance.as_deref().unwrap_or_default(),
+            EngineEvent::UsageUpdate(e) => e.event.instance.as_deref().unwrap_or_default(),
             EngineEvent::Run(e) => e.instance.as_deref().unwrap_or_default(),
             // This flow changes no Policy and its fresh state dir has nothing
             // to upgrade, so neither family can appear.
@@ -894,7 +894,7 @@ fn interleaved_instances_keep_per_instance_fifo() {
         let mine: Vec<EngineEvent> = events
             .iter()
             .filter_map(|e| match e {
-                EngineEvent::UsageUpdate(u) if u.event.instance.as_str() == name => Some(e.clone()),
+                EngineEvent::UsageUpdate(u) if u.event.instance.as_deref() == Some(name) => Some(e.clone()),
                 _ => None,
             })
             .collect();

@@ -1202,7 +1202,8 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
     // Usage on the owner's Run folds into its subtree rollup AND the
     // instance's cumulative rollup (10k in / 20k out at $1/$2 per 1M).
     let event = UsageEvent {
-        instance: "a".to_string(),
+        instance: Some("a".to_string()),
+        call_id: None,
         run_id: owner.clone(),
         input_tokens: 10_000,
         output_tokens: 20_000,

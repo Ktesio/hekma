@@ -441,8 +441,8 @@ fn assert_subscriber_isolation(result: &FlowResult) {
 fn event_instance(event: &EngineEvent) -> &str {
     match event {
         EngineEvent::Transition(t) => &t.instance,
-        EngineEvent::BudgetBreach(b) => &b.instance,
-        EngineEvent::UsageUpdate(u) => &u.event.instance,
+        EngineEvent::BudgetBreach(b) => b.instance.as_deref().unwrap_or_default(),
+        EngineEvent::UsageUpdate(u) => u.event.instance.as_deref().unwrap_or_default(),
         EngineEvent::Run(r) => r.instance.as_deref().unwrap_or_default(),
         // Policy-family events are fleet-wide: they name no instance.
         EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => "",

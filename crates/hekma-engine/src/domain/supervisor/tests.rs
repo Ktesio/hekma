@@ -8468,7 +8468,8 @@ fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: "fencepolicy".to_string(),
+                    instance: Some("fencepolicy".to_string()),
+                    call_id: None,
                     run_id: seed_usage,
                     input_tokens: 1_500_000,
                     output_tokens: 0,

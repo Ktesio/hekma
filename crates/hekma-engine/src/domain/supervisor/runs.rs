@@ -476,7 +476,17 @@ impl Supervisor {
         let mut actions: Vec<(InstanceName, Vec<crate::domain::pipeline::CommittedBreach>)> =
             Vec::new();
         for breach in breaches {
-            let instance = breach.event.instance.clone();
+            let Some(instance) = breach.event.instance.clone() else {
+                // Story 23-1: a breach on a Run with no Agent Instance (a
+                // wire Run) has no process to act on — it is recorded and
+                // published; `block` already rode the snapshot.
+                self.note_outbox_append(&breach.outbox);
+                self.publish(
+                    breach.outbox.seq,
+                    crate::domain::EngineEvent::BudgetBreach(breach.event.clone()),
+                );
+                continue;
+            };
             let name = match InstanceName::new(&instance) {
                 Ok(name) => name,
                 Err(err) => {

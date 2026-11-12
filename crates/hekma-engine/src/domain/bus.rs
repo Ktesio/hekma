@@ -421,7 +421,8 @@ mod tests {
             "2026-09-09T00:00:00Z",
         );
         let usage = UsageUpdateEvent::new(super::super::UsageEvent {
-            instance: "probe".to_string(),
+            instance: Some("probe".to_string()),
+            call_id: None,
             run_id: super::super::RunId::from_wire("run-1"),
             input_tokens: 10,
             output_tokens: 20,
