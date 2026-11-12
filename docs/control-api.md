@@ -112,6 +112,10 @@ read-only database lookup before anything is locked or written, so a flood of
 made-up tokens costs reads only and never delays the engine's own writes. If
 that lookup itself fails, the request answers `500` with code `store` and a
 fixed message; the cause goes to the host's diagnostics, never to the client.
+The same is true one layer in: a store failure under an authenticated Run
+Key's or refresh credential's request answers the same fixed `store` 500 —
+the store's text is the Operator's, and the operator bearer's own requests
+keep the surfaced reason.
 A credential in a path or query is refused before authentication (see
 [Never in a URL](#never-in-a-url)). No handler runs for an unauthenticated request,
 and no secret VALUE ever enters a response, a log line, or an SSE frame — the
@@ -305,7 +309,9 @@ Run, raises the `credential-reuse` Anomaly and answers `401
 credential-revoked`. A later launch's key is never revoked by an earlier
 launch's credential. A used refresh credential also leaves service wherever
 the credentials it belonged to do: at its launch's exit, at its Run's end,
-under a `revoke-keys` cascade, and when it is seen in a URL. `revoke-keys` revokes the Run's active credentials and its
+and under a `revoke-keys` cascade. Seen in a URL it is reuse evidence — only
+a holder of the value can put it there — and takes the same response as
+presenting it (see [Never in a URL](#never-in-a-url)). `revoke-keys` revokes the Run's active credentials and its
 used refresh credentials, so none of them can trigger a reuse later, and, unless `"cascade": false`, every credential issued under any
 credential the Run held; it answers `{"schema_version":1,"run_id":…,
 "cascade":true,"revoked":[{"run_id":…,"class":"run-key","token_id":…,
@@ -319,15 +325,24 @@ revocation cause — never a value or a hash.
 
 A request whose path or query carries an `hk_run_`, `hk_ref_` or `hk_ann_`
 token, raw or percent-encoded, answers `400 credential-in-url` with a static
-body before it is authenticated, and a complete active token, or a used
-refresh credential, so exposed is revoked (cause `exposed-in-url`). A
-token-shaped value that was never issued, or is already revoked, is refused
-and changes nothing. The per-agent metering listener applies the same rule: it
+body before it is authenticated, and a complete active token so exposed is
+revoked (cause `exposed-in-url`). A used refresh credential so exposed is
+reuse evidence — only a holder of the value can put it there — so it takes
+the same response as presenting it on the refresh route: the current pair of
+its own launch is revoked, every used refresh credential of the Run is
+revoked, a `reuse-detected` credential event is written and the
+`credential-reuse` Anomaly is raised while the Run is open; one unauthenticated
+request cannot quietly disarm the detection. A token-shaped value that was
+never issued, or is already revoked, is refused and changes nothing. The scan
+keeps at most 16 distinct tokens per URL; a request carrying more is refused
+all the same, and the host writes a rate-limited diagnostic saying how many
+it could not revoke. The per-agent metering listener applies the same rule: it
 answers a typed `hekma_credential_in_url` error, forwards nothing, and the
 engine revokes the exposed credential within a moment (on its next poll,
 about a quarter of a second). Between two polls the listener holds at most 64
-distinct exposed values; past that it still refuses the request, and the next
-poll writes a diagnostic saying how many it could not revoke.
+distinct exposed values (and 16 per URL, the scan's own cap); past that it
+still refuses the request, and the next poll writes a diagnostic saying how
+many it could not revoke.
 
 ### The Run listing
 
