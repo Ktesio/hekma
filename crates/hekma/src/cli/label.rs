@@ -225,6 +225,7 @@ pub(crate) fn render_labels(labels: &[Label]) -> String {
                 (LabelSource::Bound, Some(LabelOrigin::LabelVerb)) => {
                     "bound, label-verb".to_string()
                 }
+                (LabelSource::Bound, Some(LabelOrigin::Binding)) => "bound, binding".to_string(),
                 (LabelSource::Bound, _) => "bound, config".to_string(),
             };
             format!("{}={} ({source})", label.key, label.value)

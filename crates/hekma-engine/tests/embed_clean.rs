@@ -449,6 +449,8 @@ fn event_instance(event: &EngineEvent) -> &str {
         // Story 22-1: a credential event names its Run, not an instance —
         // checked by run id in the isolation assertion.
         EngineEvent::Credential(_) => "",
+        // Story 23-1: binding events are fleet-wide.
+        EngineEvent::Binding(_) => "",
     }
 }
 

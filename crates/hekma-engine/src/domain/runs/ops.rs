@@ -697,6 +697,36 @@ pub(crate) fn sync_bound_labels<S: RunRecords + ?Sized>(
     Ok(changes)
 }
 
+/// Re-sync a binding Run's `binding`-origin labels to `binding` (story
+/// 23-1: a binding label change re-resolves its Runs in the same job).
+pub(crate) fn sync_binding_labels<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    binding: &[(String, String)],
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    let current = store.run_labels(run_id)?;
+    let next = labels::plan_binding_sync(&current, binding);
+    if next == current {
+        return Ok(changes);
+    }
+    write_labels(
+        store,
+        &mut changes,
+        record,
+        &current,
+        &next,
+        "binding",
+        None,
+        at,
+    )?;
+    Ok(changes)
+}
+
 /// Write a Run's next label set (`next`, from a planner), then run the
 /// Policy hook inside the same job, then note the `labels-changed` event
 /// (bound labels before and after) and the snapshot entry — so a Policy

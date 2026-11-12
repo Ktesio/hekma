@@ -277,7 +277,8 @@ impl MetricState {
                 // its run regardless of which token types it carries.
                 let seq = self.next_run_seq;
                 self.next_run_seq = self.next_run_seq.saturating_add(1);
-                self.run_last_seen.insert((instance.clone(), run.clone()), seq);
+                self.run_last_seen
+                    .insert((instance.clone(), run.clone()), seq);
                 for (token_type, value) in [
                     (TokenType::Input, Some(event.input_tokens)),
                     (TokenType::Output, Some(event.output_tokens)),
@@ -308,6 +309,9 @@ impl MetricState {
             // Story 22-1: credential events carry no counter before
             // `otlp-metrics v2` (and never a token) — ignored.
             EngineEvent::Credential(_) => {}
+            // Story 23-1: binding events carry no counter before
+            // `otlp-metrics v2` (the AD-21 interim) — ignored.
+            EngineEvent::Binding(_) => {}
         }
     }
 

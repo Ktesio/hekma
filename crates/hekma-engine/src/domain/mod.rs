@@ -10,8 +10,8 @@
 //! backend. Budgets and config resolution arrive with their stories.
 
 mod budget;
-pub(crate) mod calls;
 mod bus;
+pub(crate) mod calls;
 pub(crate) mod config;
 mod cost;
 pub(crate) mod credential;
@@ -129,6 +129,12 @@ pub use runs::{
     RunLimitsResults, RunLimitsView, RunVerbError,
 };
 pub use runs::{OpenedRun, RunActor, MAX_CALLER_OPEN_CHILDREN};
+// Story 23-1: Operator endpoint bindings.
+pub use runs::bindings::{
+    Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
+    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+};
 // The resync core is engine-internal glue the facade calls (the story-10-3
 // helper); only the cursor/batch TYPES are public surface.
 pub use restart::{is_crash_loop, BackoffSchedule, RestartPolicy, MAX_CONSECUTIVE_FAILURES};

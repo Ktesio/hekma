@@ -546,7 +546,11 @@ fn the_wire_vocabulary_is_stable() {
     assert_eq!(LabelSource::from_wire("caller"), Some(LabelSource::Caller));
     assert_eq!(LabelSource::from_wire("x"), None);
     assert_eq!(LabelSource::Caller.as_str(), "caller");
-    for origin in [LabelOrigin::Config, LabelOrigin::LabelVerb] {
+    for origin in [
+        LabelOrigin::Config,
+        LabelOrigin::LabelVerb,
+        LabelOrigin::Binding,
+    ] {
         assert_eq!(LabelOrigin::from_wire(origin.as_str()), Some(origin));
         assert_eq!(
             serde_json::to_string(&origin).unwrap(),

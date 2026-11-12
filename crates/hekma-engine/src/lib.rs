@@ -176,6 +176,12 @@ pub use domain::{
     CREDENTIAL_EVENT_SCHEMA_VERSION, MAX_CALLER_OPEN_CHILDREN, REFRESH_PREFIX, RUN_KEY_PREFIX,
     TOKEN_BODY_LEN, TOKEN_ID_LEN,
 };
+// Story 23-1: the shared Metering Proxy's endpoint bindings.
+pub use domain::{
+    Binding, BindingChange, BindingCredential, BindingCredentialClass, BindingError, BindingEvent,
+    BindingOutcome, BindingPatch, BindingRoute, BindingSpec, IssuedBindingCredential, RouteSpec,
+    BINDING_EVENT_SCHEMA_VERSION, MAX_BINDINGS, MAX_BINDING_ROUTES,
+};
 /// Story 22-1: the reserved credential config keys and the variable every
 /// supervised agent receives its Run Key in.
 pub use domain::{RUN_KEY_ENV, RUN_KEY_KEY, RUN_KEY_MARKER_PREFIX, RUN_REFRESH_KEY_KEY};

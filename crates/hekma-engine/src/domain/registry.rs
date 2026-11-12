@@ -360,7 +360,12 @@ impl Registry {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
             // Story 22-1: the key index loads with the Runs.
             let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
-            ctx.after_commit(move || publisher.publish_changes(entries, keys));
+            // Story 23-1: the endpoint bindings load with them.
+            let bindings = crate::domain::runs::bindings::table_of(&ctx.store().bindings()?);
+            ctx.after_commit(move || {
+                publisher.publish_changes(entries, keys);
+                publisher.publish_bindings(bindings);
+            });
             Ok(())
         }) {
             notes.push(format!(
@@ -478,6 +483,8 @@ impl Registry {
             EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => None,
             // Story 22-1: a credential event's subject is its Run.
             EngineEvent::Credential(event) => Some(event.run_id.clone()),
+            // Story 23-1: a binding event names no Run.
+            EngineEvent::Binding(_) => None,
         }
     }
 

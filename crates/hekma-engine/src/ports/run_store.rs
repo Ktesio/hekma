@@ -468,8 +468,11 @@ pub(crate) trait RunRecords: PolicyRecords {
 
     /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
     /// at most `limit` (story 23-1: the recently-revoked set at open).
-    fn recently_revoked_keys(&self, since: &str, limit: usize)
-        -> Result<Vec<TokenHash>, StoreError>;
+    fn recently_revoked_keys(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<TokenHash>, StoreError>;
 
     /// What a Run's snapshot entry carries beyond its row (story 23-1):
     /// the disposition from its latch rows, its recorded upstream and its

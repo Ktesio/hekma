@@ -153,7 +153,9 @@ impl super::SqliteStore {
                     start.binding,
                     start.started_at,
                     start.owner.map(|f| i64::from(f.pid)),
-                    start.owner.map(|f| f.start_time.min(i64::MAX as u64) as i64),
+                    start
+                        .owner
+                        .map(|f| f.start_time.min(i64::MAX as u64) as i64),
                 ],
             )
             .map_err(backend)?;
@@ -211,7 +213,16 @@ impl super::SqliteStore {
         &self,
         alive: &dyn Fn(&ProcessFingerprint) -> Option<bool>,
     ) -> Result<(u64, u64), StoreError> {
-        type Row = (String, String, Option<String>, String, Option<String>, String, Option<i64>, Option<i64>);
+        type Row = (
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+        );
         let rows: Vec<Row> = {
             let mut stmt = self
                 .conn()
@@ -412,13 +423,21 @@ mod tests {
         let dead = ProcessFingerprint::new(1, 1);
         let live = ProcessFingerprint::new(2, 2);
         let unknown = ProcessFingerprint::new(3, 3);
-        store.insert_open_call(&start("call_crash", Some(dead))).unwrap();
-        store.insert_open_call(&start("call_rec", Some(dead))).unwrap();
-        store.insert_open_call(&start("call_live", Some(live))).unwrap();
+        store
+            .insert_open_call(&start("call_crash", Some(dead)))
+            .unwrap();
+        store
+            .insert_open_call(&start("call_rec", Some(dead)))
+            .unwrap();
+        store
+            .insert_open_call(&start("call_live", Some(live)))
+            .unwrap();
         store
             .insert_open_call(&start("call_unknown", Some(unknown)))
             .unwrap();
-        store.insert_open_call(&start("call_noowner", None)).unwrap();
+        store
+            .insert_open_call(&start("call_noowner", None))
+            .unwrap();
         store
             .conn()
             .execute_batch(
@@ -434,10 +453,7 @@ mod tests {
         };
         assert_eq!(store.close_orphaned_calls(&probe).unwrap(), (1, 1));
         assert_eq!(store.calls_counts_for_test(), (2, 3));
-        assert_eq!(
-            store.call_record_for_test("call_crash").unwrap().0,
-            "crash"
-        );
+        assert_eq!(store.call_record_for_test("call_crash").unwrap().0, "crash");
         assert_eq!(
             store.call_record_for_test("call_rec"),
             Some((
@@ -470,7 +486,10 @@ mod tests {
         let again = Connection::open_in_memory().unwrap();
         assert!(matches!(
             attach(&again, Some(&first)),
-            Err(StoreError::SchemaTooNew { found: 2, supported: 1 })
+            Err(StoreError::SchemaTooNew {
+                found: 2,
+                supported: 1
+            })
         ));
         // An in-memory segment works for stores without a state directory.
         let memory = Connection::open_in_memory().unwrap();

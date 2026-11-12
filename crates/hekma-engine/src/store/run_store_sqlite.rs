@@ -369,7 +369,9 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
             if let Some(instance_id) = instance_id {
                 by_instance.entry(instance_id).or_default().add(&stored);
             }
-            let entry = by_run.entry(run_id).or_insert((instance_id, RollupRow::default()));
+            let entry = by_run
+                .entry(run_id)
+                .or_insert((instance_id, RollupRow::default()));
             entry.1.add(&stored);
         }
     }
@@ -393,7 +395,9 @@ fn fold_rows(conn: &Connection, ancestors: bool) -> Result<(), StoreError> {
         // a subtree, AD-25); since v18 instance-less ancestors included.
         let mut with_ancestors: HashMap<String, (Option<i64>, RollupRow)> = HashMap::new();
         for (run_id, (instance_id, delta)) in by_run {
-            for (ancestor_instance, ancestor) in super::runs_sqlite::ancestors_for_fold(conn, &run_id)? {
+            for (ancestor_instance, ancestor) in
+                super::runs_sqlite::ancestors_for_fold(conn, &run_id)?
+            {
                 with_ancestors
                     .entry(ancestor)
                     .or_insert((ancestor_instance, RollupRow::default()))

@@ -140,6 +140,12 @@ pub enum EngineEvent {
     /// the change. Carries a token id, never a token or a hash. Boxed for the
     /// same ring-size reason as `Policy`.
     Credential(Box<super::credential::CredentialEvent>),
+    /// An endpoint-binding change (story 23-1): created, changed, deleted,
+    /// a route added or removed, a per-binding credential issued or revoked
+    /// — committed with its outbox row in the job that made the change.
+    /// Carries a token id on a credential change, never a token or a hash.
+    /// Boxed for the same ring-size reason as `Policy`.
+    Binding(Box<super::runs::bindings::BindingEvent>),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of

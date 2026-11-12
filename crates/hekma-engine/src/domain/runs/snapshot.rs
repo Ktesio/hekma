@@ -444,9 +444,9 @@ pub(crate) fn subject_labels(
         EngineEvent::Transition(transition) => snapshot.owner_of(&transition.instance),
         // Story 22-1: a credential event's subject is its Run.
         EngineEvent::Credential(event) => snapshot.run(&event.run_id),
-        EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => {
-            return SubjectLabels::NoSubject
-        }
+        EngineEvent::Policy(_)
+        | EngineEvent::BreachDefaultUpgraded(_)
+        | EngineEvent::Binding(_) => return SubjectLabels::NoSubject,
     };
     match entry {
         Some(entry) => SubjectLabels::Found(entry.labels.clone()),
