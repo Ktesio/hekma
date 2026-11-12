@@ -743,6 +743,103 @@ fn a_store_failure_on_the_unauthenticated_path_answers_a_static_500() {
     assert!(!text.contains(&unknown), "{text}");
 }
 
+/// Review 3, L-new-1: a URL carrying more distinct tokens than the scan's
+/// cap is refused all the same; the tokens past the cap are NOT revoked
+/// (the real key behind the junk still works), and the host writes a
+/// diagnostic naming how many it could not revoke, with the remedy and no
+/// value.
+#[test]
+fn tokens_past_the_url_scan_cap_are_refused_and_reported_not_revoked() {
+    let state = seeded_state();
+    let server = Server::start(state.path().to_path_buf());
+    let (child, key, _) = operator_open(&server, "run_ROOT");
+    // Enough never-issued values to fill the scan's cap, with the real key
+    // behind them.
+    let filler = "J".repeat(50);
+    let mut url = String::from("/v0/x?a=");
+    for index in 0..hekma_engine::URL_SCAN_MAX_TOKENS {
+        url.push_str(&format!("hk_run_{index:02}{filler}"));
+    }
+    url.push_str("&b=");
+    url.push_str(&key);
+    let answer = call("GET", &server.url(&url), BEARER_VALUE, None);
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    assert_eq!(answer.code(), "credential-in-url", "{}", answer.body);
+    assert!(!answer.body.contains(&key), "{}", answer.body);
+    // The one value past the cap was not revoked: it still authenticates.
+    let still = call(
+        "POST",
+        &server.url("/v0/runs"),
+        &key,
+        Some(serde_json::json!({ "parent_run_id": child, "issue_credentials": false })),
+    );
+    assert_eq!(still.status, StatusCode::CREATED, "{}", still.body);
+    let text = server.sink.text();
+    assert!(
+        text.lines().any(|line| line
+            .contains("refused 1 credential(s) in URLs past the scan cap of")
+            && line.contains("hekma run revoke-keys")),
+        "{text}"
+    );
+    assert!(!text.contains(&key), "{text}");
+}
+
+/// Review 3, I-4: a store failure under an authenticated Caller never
+/// hands the store's own text (a table name) to the Caller — it answers
+/// the fixed `store` 500 the unauthenticated path uses — while the
+/// Operator's own request keeps the surfaced reason.
+#[test]
+fn a_store_failure_on_a_callers_request_answers_the_fixed_store_body() {
+    let state = seeded_state();
+    let server = Server::start(state.path().to_path_buf());
+    let (child, key, _) = operator_open(&server, "run_ROOT");
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    conn.execute_batch("ALTER TABLE tokens RENAME TO tokens_away")
+        .unwrap();
+    // The Caller's key resolves from the in-memory index; its job's first
+    // read (the in-job key check) hits the missing table.
+    let caller = call(
+        "POST",
+        &server.url("/v0/runs"),
+        &key,
+        Some(serde_json::json!({ "parent_run_id": child })),
+    );
+    // The Operator's open mints into the missing table.
+    let operator = call(
+        "POST",
+        &server.url("/v0/runs"),
+        BEARER_VALUE,
+        Some(serde_json::json!({ "parent_run_id": "run_ROOT" })),
+    );
+    conn.execute_batch("ALTER TABLE tokens_away RENAME TO tokens")
+        .unwrap();
+    assert_eq!(
+        caller.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        caller.body
+    );
+    assert_eq!(caller.code(), "store", "{}", caller.body);
+    assert_eq!(
+        caller.json()["error"]["message"],
+        "the run store could not be reached; try again later",
+        "{}",
+        caller.body
+    );
+    for leak in ["tokens", "no such table", "state.db", &key] {
+        assert!(!caller.body.contains(leak), "{leak}: {}", caller.body);
+    }
+    assert_eq!(
+        operator.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{}",
+        operator.body
+    );
+    assert_eq!(operator.code(), "store", "{}", operator.body);
+    assert!(operator.body.contains("no such table"), "{}", operator.body);
+}
+
 #[test]
 fn credential_events_reach_sse_through_the_selector_and_carry_no_token() {
     use std::io::BufRead;

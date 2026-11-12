@@ -187,6 +187,10 @@ struct DiagnosticsInner {
     /// that was last reported.
     check_failures: u64,
     last_check_failure: Option<Instant>,
+    /// Tokens the URL scan left past its cap (refused with the request, not
+    /// revoked), and when that was last reported.
+    url_overflow: u64,
+    last_url_overflow: Option<Instant>,
 }
 
 impl AuthDiagnostics {
@@ -201,6 +205,8 @@ impl AuthDiagnostics {
                 last: None,
                 check_failures: 0,
                 last_check_failure: None,
+                url_overflow: 0,
+                last_url_overflow: None,
             })),
             notifier: notifier.map(Arc::new),
             interval,
@@ -269,6 +275,37 @@ impl AuthDiagnostics {
         );
         inner.check_failures = 0;
         inner.last_check_failure = Some(Instant::now());
+        drop(inner);
+        if let Some(notifier) = &self.notifier {
+            notifier.note(&line);
+        }
+        Some(line)
+    }
+
+    /// Count the tokens refused URLs carried past the URL scan's cap (an
+    /// upper bound on the distinct values: repeats past the cap are not
+    /// hashed, so each is counted). The request is refused whatever the
+    /// count, but those values are NOT revoked — the Operator learns how
+    /// many, at most one line per interval, with the remedy; never a value.
+    /// Returns the line emitted, if any (for tests).
+    pub(crate) fn url_scan_overflow(&self, overflow: usize) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.url_overflow += overflow as u64;
+        let due = inner
+            .last_url_overflow
+            .is_none_or(|last| last.elapsed() >= self.interval);
+        if !due {
+            return None;
+        }
+        let count = inner.url_overflow;
+        let line = format!(
+            "the Control API refused {count} credential(s) in URLs past the scan cap of {} and \
+             could not revoke them; if one may be the Run's, revoke its keys with `hekma run \
+             revoke-keys`",
+            hekma_engine::URL_SCAN_MAX_TOKENS,
+        );
+        inner.url_overflow = 0;
+        inner.last_url_overflow = Some(Instant::now());
         drop(inner);
         if let Some(notifier) = &self.notifier {
             notifier.note(&line);
@@ -514,6 +551,12 @@ pub(crate) async fn refuse_credential_in_url(
     if !scan.found {
         return next.run(request).await;
     }
+    // Past the scan's cap the tokens are refused with the request but not
+    // revoked: that is the Operator's to know (rate-limited), never the
+    // client's — the refusal body stays static.
+    if scan.overflow > 0 {
+        state.auth_diagnostics.url_scan_overflow(scan.overflow);
+    }
     drop(request);
     if !scan.tokens.is_empty() {
         // Best-effort: the refusal stands whatever the revocation's fate
@@ -734,6 +777,25 @@ mod tests {
         );
         let line = quick.unresolved(None).unwrap();
         assert!(line.contains("none 1"), "{line}");
+    }
+
+    #[test]
+    fn url_scan_overflow_is_counted_and_reported_at_most_once_per_interval() {
+        let diagnostics = AuthDiagnostics::new(None, Duration::from_secs(3600));
+        let first = diagnostics.url_scan_overflow(1).expect("the first reports");
+        assert!(
+            first.contains("refused 1 credential(s) in URLs past the scan cap of")
+                && first.contains("hekma run revoke-keys"),
+            "{first}"
+        );
+        // Within the interval nothing more is written, but the count grows.
+        for _ in 0..100 {
+            assert!(diagnostics.url_scan_overflow(2).is_none());
+        }
+        // A zero interval reports again, carrying the count since.
+        let quick = AuthDiagnostics::new(None, Duration::ZERO);
+        let line = quick.url_scan_overflow(3).unwrap();
+        assert!(line.contains("refused 3 credential(s)"), "{line}");
     }
 
     #[test]

@@ -1407,8 +1407,9 @@ fn a_stale_refresh_credential_of_an_exited_launch_never_revokes_the_live_launch(
 /// Review 1, L4 (the remainder): a used refresh credential leaves service
 /// with the credentials it belonged to — at its launch's exit, at a
 /// relaunch whose exit was never recorded, at its Run's end, under the
-/// Operator's cascade, and when it is seen in a URL. Presented afterwards
-/// it is a plain refusal, never a reuse that revokes a live pair.
+/// Operator's cascade, and when it is seen in a URL (which is reuse, so the
+/// rotated pair goes too and the Anomaly is raised). Presented afterwards it
+/// is a plain refusal, never a reuse that revokes a live pair.
 #[test]
 fn a_used_refresh_credential_leaves_service_wherever_its_credentials_do() {
     use crate::domain::LifecycleState;
@@ -1478,12 +1479,28 @@ fn a_used_refresh_credential_leaves_service_wherever_its_credentials_do() {
             )],
         )
         .unwrap();
-    assert_eq!(count, 1);
+    // Review 3, N3: a used refresh credential in a URL is reuse evidence,
+    // not a quiet revocation (which would let a thief who already rotated
+    // it disarm the detection with one unauthenticated request). Its
+    // launch's live pair goes, the reuse is recorded and the Anomaly raised.
+    assert_eq!(count, 3, "the used credential and the rotated pair");
     used(&w, first.refresh_credential(), "exposed-in-url");
+    assert!(w.authenticate(rotated.run_key()).is_none());
+    assert_eq!(
+        w.token_state(rotated.refresh_credential()),
+        TokenState::Revoked
+    );
+    assert!(w.run(&child).anomalies.contains(&Anomaly::CredentialReuse));
+    let reuse: Vec<_> = w
+        .credential_events()
+        .into_iter()
+        .filter(|e| e.change == CredentialChange::ReuseDetected)
+        .collect();
+    assert_eq!(reuse.len(), 1);
+    assert_eq!(reuse[0].cause.as_deref(), Some("exposed-in-url"));
+    // Afterwards the value is out of service: presenting it changes nothing.
     assert_eq!(
         w.refresh(first.refresh_credential()).unwrap_err().code(),
         "credential-revoked"
     );
-    assert!(w.authenticate(rotated.run_key()).is_some());
-    assert!(!w.run(&child).anomalies.contains(&Anomaly::CredentialReuse));
 }

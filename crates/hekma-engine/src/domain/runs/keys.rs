@@ -383,6 +383,57 @@ pub(crate) fn on_process_exited<S: RunRecords + ?Sized>(
     revoke_used_where(store, changes, run_id, launched, cause::PROCESS_EXITED, at)
 }
 
+/// The response to a used (`retired`) refresh credential presented again,
+/// whether on the refresh route or seen in a URL: one `reuse-detected`
+/// event names it, the Run's current credentials of the credential's own
+/// launch generation are revoked (its refresh chain; a later launch's key
+/// was issued by the engine, never through this chain, so a stale
+/// credential of an exited launch is no kill switch for the live one), the
+/// Run's used credentials leave for good (presenting this one or an older
+/// one again is a plain refusal, not a second reuse), and a non-ended Run
+/// gains the `credential-reuse` Anomaly. A silent takeover becomes a
+/// visible one.
+fn respond_to_reuse<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    row: &TokenRow,
+    record: RunRecord,
+    cause: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    changes.credentials.push(CredentialEvent {
+        schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
+        change: CredentialChange::ReuseDetected,
+        class: row.class,
+        token_id: row.token_id.clone(),
+        run_id: row.run_id.clone(),
+        launch_generation: row.launch_generation,
+        issued_by: None,
+        prior_token_id: None,
+        cause: Some(cause.to_string()),
+        at: at.to_string(),
+    });
+    revoke_run_tokens(
+        store,
+        changes,
+        &row.run_id,
+        |active| {
+            active.class != TokenClass::Announce
+                && active.launch_generation == row.launch_generation
+        },
+        cause,
+        at,
+    )?;
+    revoke_used(store, changes, &row.run_id, cause, at)?;
+    if !record.is_ended() && !record.anomalies.contains(&Anomaly::CredentialReuse) {
+        let mut anomalies = record.anomalies.clone();
+        anomalies.push(Anomaly::CredentialReuse);
+        let status = record.status;
+        super::ops::move_to(store, changes, record, status, anomalies, None, at)?;
+    }
+    Ok(())
+}
+
 /// The refresh job (story 22-1, P3): a Run's active refresh credential
 /// buys a new Run Key and refresh pair once.
 ///
@@ -412,46 +463,10 @@ pub(crate) fn refresh<S: RunRecords + ?Sized>(
     match row.state {
         TokenState::Revoked => return Err(RunError::CredentialRevoked),
         TokenState::Retired => {
-            // Reuse: revoke what the Run holds now in the credential's own
-            // generation (its refresh chain), raise the Anomaly. A later
-            // launch's key was issued by the engine, never through this
-            // chain, so a stale credential of an exited launch is no kill
-            // switch for the live one.
             let record = store
                 .run_record(&row.run_id)?
                 .ok_or(RunError::CredentialRevoked)?;
-            changes.credentials.push(CredentialEvent {
-                schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
-                change: CredentialChange::ReuseDetected,
-                class: row.class,
-                token_id: row.token_id.clone(),
-                run_id: row.run_id.clone(),
-                launch_generation: row.launch_generation,
-                issued_by: None,
-                prior_token_id: None,
-                cause: Some(cause::REFRESH_REUSE.to_string()),
-                at: at.to_string(),
-            });
-            revoke_run_tokens(
-                store,
-                &mut changes,
-                &row.run_id,
-                |active| {
-                    active.class != TokenClass::Announce
-                        && active.launch_generation == row.launch_generation
-                },
-                cause::REFRESH_REUSE,
-                at,
-            )?;
-            // The used credentials leave for good: presenting this one (or an
-            // older one) again is a plain refusal, not a second reuse.
-            revoke_used(store, &mut changes, &row.run_id, cause::REFRESH_REUSE, at)?;
-            if !record.is_ended() && !record.anomalies.contains(&Anomaly::CredentialReuse) {
-                let mut anomalies = record.anomalies.clone();
-                anomalies.push(Anomaly::CredentialReuse);
-                let status = record.status;
-                super::ops::move_to(store, &mut changes, record, status, anomalies, None, at)?;
-            }
+            respond_to_reuse(store, &mut changes, &row, record, cause::REFRESH_REUSE, at)?;
             return Ok((Err(RunError::CredentialRevoked), changes));
         }
         TokenState::Active => {}
@@ -577,9 +592,12 @@ pub(crate) fn revoke_keys<S: RunRecords + ?Sized>(
 }
 
 /// Revoke credentials seen in a URL (story 22-1, Ask First 6): they have
-/// reached someone's access log. Only active tokens and used refresh
-/// credentials change (a used one so seen would otherwise stay a reuse
-/// trigger in that log's readers' hands); an unknown value changes nothing.
+/// reached someone's access log. An active token is revoked. A used refresh
+/// credential so seen is reuse evidence (only a holder of the value can put
+/// it there, and the value has been traded already): it takes
+/// [`respond_to_reuse`], exactly as the refresh route would, so the
+/// exposure cannot be used to disarm the detection quietly. A revoked or
+/// unknown value changes nothing.
 pub(crate) fn revoke_exposed<S: RunRecords + ?Sized>(
     store: &S,
     hashes: &[TokenHash],
@@ -595,9 +613,19 @@ pub(crate) fn revoke_exposed<S: RunRecords + ?Sized>(
                 TokenState::Active => {
                     revoke(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
                 }
-                TokenState::Retired => {
-                    revoke_retired_row(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
-                }
+                TokenState::Retired => match (row.class, store.run_record(&row.run_id)?) {
+                    (TokenClass::Refresh, Some(record)) => respond_to_reuse(
+                        store,
+                        &mut changes,
+                        &row,
+                        record,
+                        cause::EXPOSED_IN_URL,
+                        at,
+                    )?,
+                    _ => {
+                        revoke_retired_row(store, &mut changes, &row, cause::EXPOSED_IN_URL, at)?;
+                    }
+                },
                 TokenState::Revoked => {}
             }
         }

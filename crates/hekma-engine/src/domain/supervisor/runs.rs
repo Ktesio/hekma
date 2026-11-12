@@ -718,7 +718,8 @@ impl Supervisor {
     }
 
     /// Revoke credentials seen in a URL (story 22-1). Returns how many were
-    /// revoked. Only a value that resolves to an ACTIVE credential or a USED
+    /// revoked (a used refresh credential so seen is reuse, which revokes its
+    /// launch's live pair too). Only a value that resolves to an ACTIVE credential or a USED
     /// refresh credential (one read on the registry's read-only connection)
     /// reaches the store writer: unknown or already revoked values cost no
     /// job.
@@ -741,7 +742,14 @@ impl Supervisor {
         }
         let (count, events) = registry.run_job(move |store| {
             let changes = runs::keys::revoke_exposed(store, &hashes, &crate::time::now_rfc3339())?;
-            Ok((changes.credentials.len(), changes))
+            let revoked = changes
+                .credentials
+                .iter()
+                .filter(|event| {
+                    event.change == crate::domain::credential::CredentialChange::Revoked
+                })
+                .count();
+            Ok((revoked, changes))
         })?;
         self.publish_run_events(events);
         Ok(count)

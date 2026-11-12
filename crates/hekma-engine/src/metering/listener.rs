@@ -616,7 +616,7 @@ async fn forward(
         .unwrap_or("");
     let scan = crate::domain::credential::scan_url(target);
     if scan.found {
-        note_exposed(&exposed, scan.tokens);
+        note_exposed(&exposed, scan.tokens, scan.overflow);
         drain_request_body(req.into_body()).await;
         return credential_in_url_response();
     }
@@ -916,12 +916,14 @@ fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
 
 /// Queue `tokens` for revocation, each value once, up to
 /// [`EXPOSED_QUEUE_MAX`]. Past it a token is dropped and counted, for the
-/// reaper's diagnostic (the request is refused either way). A poisoned lock
-/// is recovered: the queue holds plain values, never a half-made change.
-fn note_exposed(exposed: &ExposedQueue, tokens: Vec<crate::domain::SecretString>) {
+/// reaper's diagnostic (the request is refused either way), as are the
+/// `overflow` tokens the URL scan saw past its own cap. A poisoned lock is
+/// recovered: the queue holds plain values, never a half-made change.
+fn note_exposed(exposed: &ExposedQueue, tokens: Vec<crate::domain::SecretString>, overflow: usize) {
     let mut queued = exposed
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    queued.dropped += overflow as u64;
     for token in tokens {
         if queued
             .tokens
@@ -1002,8 +1004,8 @@ mod tests {
         let exposed: ExposedQueue = Arc::new(Mutex::new(ExposedTokens::default()));
         let one = mint(TokenClass::RunKey).unwrap();
         let copy = || crate::domain::SecretString::new(one.secret().expose_secret());
-        note_exposed(&exposed, vec![copy(), copy()]);
-        note_exposed(&exposed, vec![copy()]);
+        note_exposed(&exposed, vec![copy(), copy()], 0);
+        note_exposed(&exposed, vec![copy()], 0);
         assert_eq!(exposed.lock().unwrap().tokens.len(), 1);
         assert_eq!(exposed.lock().unwrap().dropped, 0);
         let more: Vec<_> = (0..EXPOSED_QUEUE_MAX + 4)
@@ -1013,10 +1015,13 @@ mod tests {
                 )
             })
             .collect();
-        note_exposed(&exposed, more);
+        note_exposed(&exposed, more, 0);
+        assert_eq!(exposed.lock().unwrap().dropped, 5);
+        // What the URL scan dropped past its own cap is counted too.
+        note_exposed(&exposed, Vec::new(), 3);
         let queued = exposed.lock().unwrap();
         assert_eq!(queued.tokens.len(), EXPOSED_QUEUE_MAX);
-        assert_eq!(queued.dropped, 5);
+        assert_eq!(queued.dropped, 8);
         assert_eq!(
             queued.tokens[0].expose_secret(),
             one.secret().expose_secret()
