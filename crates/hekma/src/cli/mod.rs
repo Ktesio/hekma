@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod binding;
 pub mod budget;
 pub(crate) mod fanout;
 pub(crate) mod host_client;

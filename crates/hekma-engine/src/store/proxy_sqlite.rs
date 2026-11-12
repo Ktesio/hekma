@@ -252,6 +252,23 @@ impl super::SqliteStore {
             .map_err(backend)
             .map(Option::flatten)
     }
+
+    /// A Run's `(namespace, external id)` identity, when it has one
+    /// (story 23-1: the wire Runs).
+    pub(crate) fn run_identity(
+        &self,
+        run_id: &crate::domain::RunId,
+    ) -> Result<Option<(String, String)>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT binding, external_id FROM run_identities WHERE run_id = ?1 \
+                 ORDER BY created_at LIMIT 1",
+                [run_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)
+    }
 }
 
 /// One stored binding (story 23-1).
