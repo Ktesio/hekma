@@ -232,7 +232,7 @@ development_status:
   23-4-wire-hold-release-reroute-and-reject: ready-for-dev  # reject reuses 19-2's block response
   epic-23-retrospective: optional
   epic-24: backlog  # Operability at Scale (FR-55, FR-59, NFR-4, NFR-9; AD-18, AD-21, AD-23)
-  24-1-one-shim-per-supervised-process: backlog
+  24-1-one-shim-per-supervised-process: ready-for-dev
   24-2-handoff-mode-and-in-place-upgrades: backlog  # flips Handoff Mode to default on acceptance
   24-3-crash-recovery-and-registry-completeness: backlog
   24-4-scale-substrate-and-the-run-scale-benchmark: backlog
