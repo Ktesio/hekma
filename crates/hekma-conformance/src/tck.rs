@@ -6525,7 +6525,10 @@ source = "self-reported"
             71
         );
         assert_eq!(content_length(b"GET / HTTP/1.1\r\nHost: x"), 0);
-        assert_eq!(content_length(b"POST / HTTP/1.1\r\nContent-Length: nope"), 0);
+        assert_eq!(
+            content_length(b"POST / HTTP/1.1\r\nContent-Length: nope"),
+            0
+        );
     }
 
     #[test]
