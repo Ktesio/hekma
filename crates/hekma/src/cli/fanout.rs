@@ -306,6 +306,23 @@ pub(crate) fn confirm(
     ))
 }
 
+/// Whether the selected set acts: one Run, or `--yes`, acts without a
+/// question (stdin untouched); several Runs ask on a terminal, and only a
+/// `y`/`yes` acts.
+pub(crate) fn go_ahead(
+    runs: &[RunRecord],
+    words: &VerbWords,
+    yes: bool,
+    is_terminal: bool,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if runs.len() <= 1 || yes {
+        return Ok(true);
+    }
+    confirm(runs, words, is_terminal, input, out)
+}
+
 fn non_terminal_refusal(count: usize, words: &VerbWords) -> Box<dyn std::error::Error> {
     invalid(format!(
         "the Selector matches {count} Runs and there is no terminal to confirm on — pass --yes \
@@ -375,18 +392,16 @@ pub(crate) fn run_selector(
         ));
         return finish(words, flags, 0, Vec::new(), None, act.render);
     }
-    if runs.len() > 1 && !flags.yes {
-        let confirmed = confirm(
-            &runs,
-            words,
-            terminal,
-            &mut stdin.lock(),
-            &mut std::io::stderr(),
-        )?;
-        if !confirmed {
-            ui::note(format!("Nothing was {}.", words.past));
-            return finish(words, flags, runs.len(), Vec::new(), None, act.render);
-        }
+    if !go_ahead(
+        &runs,
+        words,
+        flags.yes,
+        terminal,
+        &mut stdin.lock(),
+        &mut std::io::stderr(),
+    )? {
+        ui::note(format!("Nothing was {}.", words.past));
+        return finish(words, flags, runs.len(), Vec::new(), None, act.render);
     }
     let mut body = act.body.clone();
     body["set_token"] = json!(token);
@@ -685,6 +700,38 @@ mod tests {
                 .unwrap()
                 .contains("Stop these 2 Runs? [y/N]"));
         }
+    }
+
+    #[test]
+    fn the_interactive_gate_acts_on_yes_declines_otherwise_and_skips_the_question() {
+        let two = vec![record("run_A", Some("a")), record("run_B", Some("b"))];
+        let one = vec![record("run_A", Some("a"))];
+        // Several Runs on a terminal: the listing, the question, the answer.
+        for (answer, acts) in [("y\n", true), ("no\n", false), ("", false)] {
+            let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+            let mut out = Vec::new();
+            assert_eq!(
+                go_ahead(&two, &STOP, false, true, &mut input, &mut out).unwrap(),
+                acts,
+                "{answer:?}"
+            );
+            let shown = String::from_utf8(out).unwrap();
+            assert!(shown.contains("The Selector matches 2 Runs"), "{shown}");
+            assert!(shown.contains("Stop these 2 Runs? [y/N]"), "{shown}");
+        }
+        // --yes, or one Run: no question, stdin never read.
+        for (runs, yes) in [(&two, true), (&one, false)] {
+            let mut input = std::io::Cursor::new(b"n\n".to_vec());
+            let mut out = Vec::new();
+            assert!(go_ahead(runs, &STOP, yes, true, &mut input, &mut out).unwrap());
+            assert_eq!(input.position(), 0);
+            assert!(out.is_empty());
+        }
+        // Several Runs and no terminal: refused, stdin never read.
+        let mut input = std::io::Cursor::new(b"y\n".to_vec());
+        let err = go_ahead(&two, &STOP, false, false, &mut input, &mut Vec::new()).unwrap_err();
+        assert_eq!(crate::exit_code::classify(&*err).code(), 2);
+        assert_eq!(input.position(), 0);
     }
 
     #[test]

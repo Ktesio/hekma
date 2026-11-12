@@ -355,9 +355,25 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
         assert_eq!(json(&run.stdout)["instance"]["state"], "stopped", "{name}");
     }
 
-    // A drain over a set drains each agent with its own bound.
+    // A drain over a set drains each agent with its own bound, and a child
+    // Run inside the set refuses its own cell (its drain acts on calls)
+    // while its agent still drains.
     let run = hekma(&["agent", "start", "fan-b", "--detach"]);
     assert!(run.success, "{}", run.stderr);
+    let run = hekma(&[
+        "run",
+        "open",
+        "--parent",
+        "fan-b",
+        "--label",
+        "team=core",
+        "--json",
+    ]);
+    assert!(run.success, "{}", run.stderr);
+    let drain_child = json(&run.stdout)["run"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let run = hekma(&[
         "agent",
         "drain",
@@ -368,12 +384,28 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
         "--yes",
         "--json",
     ]);
-    assert!(run.success, "{}", run.stderr);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("1 of 2 Runs were not drained"),
+        "{}",
+        run.stderr
+    );
     let doc = json(&run.stdout);
     assert_eq!(doc["verb"], "drain");
-    assert_eq!(doc["matched"], 1, "only the fresh Run is open: {doc}");
-    assert_eq!(doc["results"][0]["outcome"], "drained");
-    assert_eq!(doc["results"][0]["instance"]["state"], "stopped");
+    assert_eq!(doc["matched"], 2, "the fresh Run and its child: {doc}");
+    let results = doc["results"].as_array().unwrap();
+    let drained = results
+        .iter()
+        .find(|r| r["run_id"] != drain_child.as_str())
+        .unwrap();
+    assert_eq!(drained["outcome"], "drained", "{doc}");
+    assert_eq!(drained["instance"]["state"], "stopped", "{doc}");
+    let refused = results
+        .iter()
+        .find(|r| r["run_id"] == drain_child.as_str())
+        .unwrap();
+    assert_eq!(refused["outcome"], "refused", "{doc}");
+    assert_eq!(refused["error"]["code"], "verb-unavailable", "{doc}");
 }
 
 #[test]

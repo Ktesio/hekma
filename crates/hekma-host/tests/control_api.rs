@@ -4549,6 +4549,52 @@ fn seed_listing_state(base: &Path, journal_seed: Option<u64>) {
 }
 
 #[test]
+fn a_selection_past_the_verb_cap_is_refused_whole_never_cut() {
+    // Every OS, no process: 1001 open Runs carry `team=bulk` (seeded as SQL
+    // rows before the serve opens). Selecting them to act on is refused
+    // whole — `400 too-many-runs` — and mints no set.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    drop(hekma_engine::Engine::open(Some(base.clone())).unwrap());
+    {
+        let mut conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        for index in 0..=hekma_engine::MAX_SELECTED_RUNS {
+            let run_id = format!("run-{index}-1");
+            tx.execute(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, created_at, updated_at) \
+                 VALUES (?1, 'observed', 0, 'active', '', 0, 't', 't')",
+                [&run_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO run_labels (run_id, key, value, source, origin) \
+                 VALUES (?1, 'team', 'bulk', 'bound', 'config')",
+                [&run_id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let server = serve_guarded(base, None);
+    let addr = server.addr();
+    let client = client();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team=bulk"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(&mut response);
+    assert_eq!(body["error"]["code"], "too-many-runs", "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+    server.stop();
+}
+
+#[test]
 fn the_runs_route_defaults_to_the_documented_page_of_fifty() {
     // No `limit`: the documented default page (50), the same first page and
     // cursor `hekma ps` prints — not the 1000-row maximum.
