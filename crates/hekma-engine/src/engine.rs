@@ -3678,6 +3678,108 @@ mod tests {
     }
 
     #[test]
+    fn an_embedder_drives_the_whole_run_key_lifecycle_through_the_blocking_facade() {
+        // Story 22-1, the embedder's path (no host): the Operator opens a
+        // child with credentials; its Run Key opens, tightens and closes
+        // beneath it; the listing shows metadata only; a refresh rotates
+        // once; revoke-keys cascades; and the revoked keys are refused.
+        use crate::domain::{
+            ChildRunRequest, PresentedState, RunActor, RunLimitChange, RunLimits, RunParent,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        drop(Engine::open(Some(tmp.path().to_path_buf())).unwrap());
+        rusqlite::Connection::open(tmp.path().join("state.db"))
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, created_at, updated_at) \
+                 VALUES ('run_ROOT', 'announced', 0, 'active', '', 0, 't', 't');",
+            )
+            .unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        let under = |parent: &str| {
+            let mut request = ChildRunRequest::under(RunParent::Run(RunId::from_wire(parent)));
+            request.issue_credentials = true;
+            request
+        };
+        let child = facade
+            .open_child_run_as(RunActor::Operator, under("run_ROOT"))
+            .unwrap();
+        let child_id = child.view.record.run_id.to_string();
+        let issued = child.credentials.expect("issued once");
+        let caller = engine
+            .authenticate(issued.run_key().expose_secret())
+            .expect("the key is indexed")
+            .actor();
+        let grandchild = facade
+            .open_child_run_as(caller.clone(), under(&child_id))
+            .unwrap();
+        let gc_id = grandchild.view.record.run_id.to_string();
+        // Tighten-only on its own subtree.
+        let tighten = RunLimitChange {
+            set: RunLimits {
+                token_per_run: Some(5_000),
+                ..RunLimits::default()
+            },
+            clear: Vec::new(),
+        };
+        let mut results = facade
+            .set_run_limits_as(vec![gc_id.clone()], tighten, caller.clone(), false)
+            .unwrap();
+        assert!(results.pop().unwrap().1.is_ok());
+        let closed = facade.close_run_as(caller.clone(), &gc_id).unwrap();
+        assert!(closed.record.is_ended());
+        // The listing is metadata only.
+        let keys = facade.run_keys(&child_id).unwrap();
+        assert_eq!(keys.len(), 2);
+        let listed = format!("{keys:?}");
+        assert!(
+            !listed.contains(issued.run_key().expose_secret()),
+            "{listed}"
+        );
+        // A refresh rotates once; the old key is refused from then on.
+        let rotated = facade
+            .refresh_credentials(issued.refresh_credential())
+            .unwrap();
+        assert!(engine
+            .authenticate(issued.run_key().expose_secret())
+            .is_none());
+        assert_eq!(
+            facade
+                .credential_state(issued.run_key().expose_secret())
+                .unwrap(),
+            PresentedState::Revoked
+        );
+        assert!(matches!(
+            facade
+                .credential_state(issued.refresh_credential().expose_secret())
+                .unwrap(),
+            PresentedState::Used(_)
+        ));
+        // revoke-keys cascades, and a request authenticated just before it
+        // is refused inside its own job.
+        let rotated_caller = engine
+            .authenticate(rotated.run_key().expose_secret())
+            .expect("the rotated key is indexed")
+            .actor();
+        let outcome = facade.revoke_run_keys(&child_id, true).unwrap();
+        assert!(!outcome.revoked.is_empty());
+        assert!(engine
+            .authenticate(rotated.run_key().expose_secret())
+            .is_none());
+        assert!(matches!(
+            facade.close_run_as(rotated_caller, &child_id),
+            Err(RunError::CredentialRevoked)
+        ));
+        let _ = caller;
+        assert!(matches!(
+            facade.run_keys("run_missing"),
+            Err(RunError::NotFound { .. })
+        ));
+    }
+
+    #[test]
     fn unresolvable_credentials_never_take_an_engine_lock_or_a_writer_job() {
         // Story 22-1 (the security review's M1): a credential that does not
         // resolve costs reads only. A flood of token-shaped values that were

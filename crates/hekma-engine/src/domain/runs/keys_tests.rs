@@ -906,6 +906,89 @@ fn each_launch_has_its_own_key_revoked_when_its_process_exits() {
 }
 
 #[test]
+fn a_launch_with_a_mapped_refresh_credential_issues_a_supervised_pair_its_exit_revokes() {
+    // An Adapter that maps `run.refresh_key` gets a refresh credential with
+    // the launch's key: both carry the launch generation, only the key is
+    // indexed, the refresh credential resolves as supervised (so the host
+    // refuses it beyond loopback), and the exit revokes both.
+    let w = world();
+    let run = w.root.clone();
+    let key = mint(TokenClass::RunKey).unwrap();
+    let refresh = mint(TokenClass::Refresh).unwrap();
+    let (key_stub, refresh_stub) = (key.stub(), refresh.stub());
+    let publisher = std::sync::Arc::clone(w.registry.run_publisher());
+    let r = run.clone();
+    w.registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::RunStore as _;
+            let name = InstanceName::new(INSTANCE).unwrap();
+            let generation = ctx.store().bump_launch_generation(&name)?;
+            let changes = ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: key_stub,
+                    refresh: Some(refresh_stub),
+                },
+                "t",
+            )?;
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    assert!(w.authenticate(key.secret()).unwrap().supervised);
+    assert!(w.authenticate(refresh.secret()).is_none(), "never indexed");
+    match crate::domain::registry_keys::presented_state(&w.registry.store, refresh.secret())
+        .unwrap()
+    {
+        crate::domain::PresentedState::Active(matched) => {
+            assert!(matched.supervised);
+            assert_eq!(matched.class, TokenClass::Refresh);
+        }
+        other => panic!("the refresh credential is active: {other:?}"),
+    }
+    let rows = w
+        .registry
+        .store
+        .snapshot(|store| store.run_tokens(&run))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.launch_generation == Some(1)));
+    assert!(rows[0].paired_hash.unwrap().ct_eq(&rows[1].hash));
+    transition(
+        &w,
+        crate::domain::LifecycleState::Failed,
+        RunFate::Relaunching,
+    );
+    assert_eq!(w.token_state(key.secret()), TokenState::Revoked);
+    assert_eq!(w.token_state(refresh.secret()), TokenState::Revoked);
+    // An issue for a Run that is gone writes nothing.
+    let stub = mint(TokenClass::RunKey).unwrap().stub();
+    let publisher = std::sync::Arc::clone(w.registry.run_publisher());
+    let missing = w
+        .registry
+        .writer
+        .call(move |ctx| {
+            let changes = ops::issue_launch(
+                ctx.store(),
+                &RunId::from_wire("run_gone"),
+                9,
+                LaunchCredentials {
+                    key: stub,
+                    refresh: None,
+                },
+                "t",
+            )?;
+            let empty = changes.credentials.is_empty() && changes.keys.is_empty();
+            ops::commit(ctx, &publisher, changes)?;
+            Ok(empty)
+        })
+        .unwrap();
+    assert!(missing);
+}
+
+#[test]
 fn a_relaunch_revokes_every_earlier_generation_even_when_its_exit_was_never_recorded() {
     // The exit's revocation is the first line; the launch record is the
     // second: a new generation is issued only after every earlier one of

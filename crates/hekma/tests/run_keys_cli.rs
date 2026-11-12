@@ -338,3 +338,53 @@ fn open_prints_the_pair_once_only_with_print_key_and_revoke_keys_refuses_them_at
         assert_no_sentinel(state_dir, secret);
     }
 }
+
+#[test]
+fn a_retried_external_id_prints_no_key_and_revoke_keys_names_a_missing_run() {
+    let ctx = TestContext::new();
+    let state = TestContext::new();
+    let state_dir = state.project_dir.as_path();
+    seed(state_dir);
+    let _host = HostGuard(state_dir);
+    let open = || {
+        run_hekma_agent(
+            &[
+                "run",
+                "open",
+                "--parent",
+                "run_01JZ6Q9G3S8V2X7K4M1N5P0R2T",
+                "--external-id",
+                "job-42",
+                "--print-key",
+            ],
+            &ctx.project_dir,
+            state_dir,
+        )
+    };
+    let first = open();
+    assert!(first.success, "{}", first.stderr);
+    assert!(first.stdout.contains("hk_run_"));
+    // The retry returns the same Run; its credentials were shown once and
+    // cannot be shown again — said on stderr, no key anywhere.
+    let again = open();
+    assert!(again.success, "{}", again.stderr);
+    assert!(!again.stdout.contains("hk_run_") && !again.stderr.contains("hk_run_"));
+    assert!(
+        again.stderr.contains("No credentials were issued"),
+        "{}",
+        again.stderr
+    );
+    // revoke-keys of a Run that does not exist is the not-found class.
+    let missing = run_hekma_agent(
+        &["run", "revoke-keys", "run_missing"],
+        &ctx.project_dir,
+        state_dir,
+    );
+    assert!(!missing.success);
+    assert_eq!(missing.code, Some(3), "{}", missing.stderr);
+    assert!(
+        missing.stderr.contains("hekma run show"),
+        "{}",
+        missing.stderr
+    );
+}
