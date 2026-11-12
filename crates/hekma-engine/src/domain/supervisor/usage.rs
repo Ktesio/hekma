@@ -658,7 +658,9 @@ impl Supervisor {
     /// Revoke the credentials an observed instance's listener refused in a
     /// URL (story 22-1, R1.12) — through the same resolved-only path as the
     /// Control API ([`Self::revoke_exposed`]). Best-effort: a store failure is
-    /// surfaced as a diagnostic, and the refusal already stood.
+    /// surfaced as a diagnostic, and the refusal already stood. Tokens the
+    /// listener had to drop (its queue was full) are counted and surfaced as
+    /// a diagnostic too: they were refused but not revoked.
     pub(super) fn drain_exposed_for(&mut self, registry: &Registry, name: &InstanceName) {
         let Some(listener) = self
             .running
@@ -667,10 +669,22 @@ impl Supervisor {
         else {
             return;
         };
-        let tokens: Vec<crate::domain::SecretString> = match listener.exposed().lock() {
-            Ok(mut queued) => queued.drain(..).collect(),
-            Err(_) => return,
-        };
+        let queued = std::mem::take(
+            &mut *listener
+                .exposed()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let (tokens, dropped) = (queued.tokens, queued.dropped);
+        if dropped > 0 {
+            self.emit_diagnostic(&format!(
+                "{}: the metering listener refused {dropped} more credential(s) in URLs than it \
+                 can hold for revocation (at most {} between two reaper passes); those were not \
+                 revoked — if one may be the Run's, revoke its keys with `hekma run revoke-keys`",
+                name.as_str(),
+                crate::metering::listener::EXPOSED_QUEUE_MAX,
+            ));
+        }
         if tokens.is_empty() {
             return;
         }

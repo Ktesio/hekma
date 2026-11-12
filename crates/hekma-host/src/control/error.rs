@@ -176,6 +176,19 @@ impl ApiError {
         error
     }
 
+    /// Story 22-1: the engine could not check a presented credential (a
+    /// store failure before authentication). Static: an unauthenticated
+    /// client never sees the store's text, which goes to the Operator's
+    /// diagnostic instead.
+    pub(crate) fn credential_check_failed() -> Self {
+        let mut error = Self::new(
+            ApiErrorKind::Internal,
+            "the presented credential could not be checked; try again later",
+        );
+        error.code = Some("store");
+        error
+    }
+
     /// Story 22-1: a credential in a URL (static — never echoes it).
     pub(crate) fn credential_in_url() -> Self {
         let mut error = Self::new(

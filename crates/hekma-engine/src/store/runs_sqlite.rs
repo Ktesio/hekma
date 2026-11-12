@@ -1424,7 +1424,22 @@ impl RunRecords for SqliteStore {
         &self,
         roots: &[crate::domain::credential::TokenHash],
     ) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
-        super::tokens_sqlite::active_issued_under(self.conn(), roots)
+        super::tokens_sqlite::issued_under(
+            self.conn(),
+            roots,
+            crate::domain::credential::TokenState::Active,
+        )
+    }
+
+    fn retired_issued_under(
+        &self,
+        roots: &[crate::domain::credential::TokenHash],
+    ) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::issued_under(
+            self.conn(),
+            roots,
+            crate::domain::credential::TokenState::Retired,
+        )
     }
 
     fn active_key_rows(&self) -> Result<Vec<crate::ports::TokenRow>, StoreError> {

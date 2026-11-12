@@ -213,8 +213,17 @@ pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64, u64)>>>;
 /// active credential — the same resolved-only path as the Control API, so a
 /// URL full of token-shaped noise never costs a write. Bounded at
 /// [`EXPOSED_QUEUE_MAX`]: past it a token is dropped (the request is still
-/// refused), so a flood cannot grow memory.
-pub(crate) type ExposedQueue = Arc<Mutex<Vec<crate::domain::SecretString>>>;
+/// refused) and COUNTED, so a flood cannot grow memory and the reaper's next
+/// drain raises a diagnostic for what it could not revoke.
+pub(crate) type ExposedQueue = Arc<Mutex<ExposedTokens>>;
+
+/// What an [`ExposedQueue`] holds between two reaper drains: the distinct
+/// complete tokens queued, and how many were dropped because it was full.
+#[derive(Default)]
+pub(crate) struct ExposedTokens {
+    pub(crate) tokens: Vec<crate::domain::SecretString>,
+    pub(crate) dropped: u64,
+}
 
 /// The most exposed tokens the listener holds between two reaper drains.
 pub(crate) const EXPOSED_QUEUE_MAX: usize = 64;
@@ -412,7 +421,7 @@ impl ObservedListener {
 
         let base_url = format!("http://{local_addr}");
         let queue: ObservedQueue = Arc::new(Mutex::new(VecDeque::new()));
-        let exposed: ExposedQueue = Arc::new(Mutex::new(Vec::new()));
+        let exposed: ExposedQueue = Arc::new(Mutex::new(ExposedTokens::default()));
 
         // Spawn the accept loop on the engine runtime. It is aborted on drop
         // (teardown at the terminal transition — bounded to the Run).
@@ -905,16 +914,27 @@ fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
     format!("{base}{path_and_query}").parse::<hyper::Uri>().ok()
 }
 
-/// Queue `tokens` for revocation, up to [`EXPOSED_QUEUE_MAX`] (a poisoned
-/// lock or a full queue drops them: the request is refused either way).
+/// Queue `tokens` for revocation, each value once, up to
+/// [`EXPOSED_QUEUE_MAX`]. Past it a token is dropped and counted, for the
+/// reaper's diagnostic (the request is refused either way). A poisoned lock
+/// is recovered: the queue holds plain values, never a half-made change.
 fn note_exposed(exposed: &ExposedQueue, tokens: Vec<crate::domain::SecretString>) {
-    if let Ok(mut queued) = exposed.lock() {
-        for token in tokens {
-            if queued.len() >= EXPOSED_QUEUE_MAX {
-                break;
-            }
-            queued.push(token);
+    let mut queued = exposed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for token in tokens {
+        if queued
+            .tokens
+            .iter()
+            .any(|seen| seen.expose_secret() == token.expose_secret())
+        {
+            continue;
         }
+        if queued.tokens.len() >= EXPOSED_QUEUE_MAX {
+            queued.dropped += 1;
+            continue;
+        }
+        queued.tokens.push(token);
     }
 }
 
@@ -971,6 +991,36 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime")
+    }
+
+    /// Review 2, L5: the exposed-token queue holds each value once, up to
+    /// its bound, and COUNTS what it drops past it (the reaper's diagnostic
+    /// reads the count) — it never loses one silently.
+    #[test]
+    fn the_exposed_queue_dedups_and_counts_what_it_drops() {
+        use crate::domain::credential::{mint, TokenClass};
+        let exposed: ExposedQueue = Arc::new(Mutex::new(ExposedTokens::default()));
+        let one = mint(TokenClass::RunKey).unwrap();
+        let copy = || crate::domain::SecretString::new(one.secret().expose_secret());
+        note_exposed(&exposed, vec![copy(), copy()]);
+        note_exposed(&exposed, vec![copy()]);
+        assert_eq!(exposed.lock().unwrap().tokens.len(), 1);
+        assert_eq!(exposed.lock().unwrap().dropped, 0);
+        let more: Vec<_> = (0..EXPOSED_QUEUE_MAX + 4)
+            .map(|_| {
+                crate::domain::SecretString::new(
+                    mint(TokenClass::Refresh).unwrap().secret().expose_secret(),
+                )
+            })
+            .collect();
+        note_exposed(&exposed, more);
+        let queued = exposed.lock().unwrap();
+        assert_eq!(queued.tokens.len(), EXPOSED_QUEUE_MAX);
+        assert_eq!(queued.dropped, 5);
+        assert_eq!(
+            queued.tokens[0].expose_secret(),
+            one.secret().expose_secret()
+        );
     }
 
     #[test]

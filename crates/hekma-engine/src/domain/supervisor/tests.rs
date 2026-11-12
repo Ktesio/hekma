@@ -11106,6 +11106,114 @@ fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
     assert!(!indexed(&registry));
 }
 
+/// Story 22-1 (security review 2, L3): the in-process children an exit's
+/// cascade ends lose their credentials in the transition's OWN transaction,
+/// as the process-owning Run's do — never only inside the projection's
+/// savepoint, which absorbs a failure. The projection is sabotaged with a
+/// SQL trigger on the `runs` row; the exit still commits, and the child's
+/// key (handed to the exited process) is revoked with it.
+#[test]
+fn an_exit_revokes_its_in_process_childrens_keys_even_when_the_projection_fails() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::domain::runs::ops::{self, LaunchCredentials, RunFate, SupervisedRun};
+    use crate::ports::{RunRecords as _, RunStore as _};
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("exits").unwrap();
+    let run = crate::domain::RunId::mint();
+    let stub = mint(TokenClass::RunKey).unwrap().stub();
+    let publisher = std::sync::Arc::clone(registry.run_publisher());
+    let (n, r) = (name.clone(), run.clone());
+    registry
+        .writer()
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'exits', 'mock', 'running', '/h', 't', 't')",
+            );
+            let supervised = SupervisedRun {
+                instance: n.clone(),
+                run_id: r.clone(),
+                wire_path: false,
+                labels: Vec::new(),
+                fresh: true,
+                inputs: None,
+            };
+            let generation = ctx.store().bump_launch_generation(&n)?;
+            let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
+            changes.extend(ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: stub,
+                    refresh: None,
+                },
+                "t",
+            )?);
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    // An in-process child of the process-owning Run, with credentials.
+    let sup = Supervisor::new();
+    let mut request =
+        crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(run.clone()));
+    request.issue_credentials = true;
+    let opened = sup
+        .open_child_run_as(&registry, crate::domain::RunActor::Operator, request)
+        .unwrap();
+    let child = opened.view.record.run_id.clone();
+    let issued = opened.credentials.unwrap();
+    let row = |secret: &crate::domain::SecretString| {
+        let hash = hash_presented(secret);
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(row(issued.run_key()).state, TokenState::Active);
+    // The sabotage: every write to a Run row aborts, so the projection (and
+    // its cascade) rolls back.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_run_projection BEFORE UPDATE ON runs \
+             BEGIN SELECT RAISE(ABORT, 'injected projection fault'); END;",
+        )
+        .unwrap();
+    }
+    let crash = TransitionEvent::new(
+        "exits",
+        LifecycleState::Running,
+        LifecycleState::Failed,
+        TransitionCause::crashed("exit code 3"),
+        crate::time::now_rfc3339(),
+    );
+    let committed = super::commit::commit_transition(
+        &registry,
+        &name,
+        super::commit::StateWrite::Plain,
+        &crash,
+        RunFate::Terminal,
+    )
+    .unwrap();
+    assert!(committed.projection_failed.is_some());
+    assert_eq!(state_of(&registry, "exits"), LifecycleState::Failed);
+    // The child's Run did not end (its projection rolled back) …
+    assert!(!registry.run_record(&child).unwrap().unwrap().is_ended());
+    // … but its credentials left service with the exit.
+    for secret in [issued.run_key(), issued.refresh_credential()] {
+        let row = row(secret);
+        assert_eq!(row.state, TokenState::Revoked);
+        assert_eq!(row.revoke_cause.as_deref(), Some("run-ended"));
+    }
+    assert!(!registry
+        .run_snapshot()
+        .keys
+        .contains_key(&hash_presented(issued.run_key())));
+}
+
 /// Story 22-1 (the security review's L3): a credential an agent sends in a
 /// URL to its metering listener is refused there AND revoked by the reaper,
 /// through the same resolved-only path as the Control API — an unknown
@@ -11210,6 +11318,37 @@ fn a_token_the_metering_listener_saw_in_a_url_is_revoked_by_the_reaper() {
     assert!(causes
         .iter()
         .all(|cause| cause.as_deref() == Some("exposed-in-url")));
+    // Review 2, L5: past the listener's bound, a token is dropped — and the
+    // next drain says so, instead of losing it silently.
+    let captured = install_capture_sink(&mut sup);
+    let per_request = crate::domain::credential::URL_SCAN_MAX_TOKENS;
+    let max = crate::metering::listener::EXPOSED_QUEUE_MAX;
+    let requests = max / per_request + 1;
+    for _ in 0..requests {
+        let path: String = (0..per_request)
+            .map(|_| {
+                format!(
+                    "/{}",
+                    mint(TokenClass::RunKey).unwrap().secret().expose_secret()
+                )
+            })
+            .collect();
+        assert_eq!(fence_http_call(&base, "GET", &path, "").0, 400);
+    }
+    sup.drain_observed_all(&registry);
+    let text = sink_text(&captured);
+    let dropped = requests * per_request - max;
+    assert!(
+        text.contains(&format!(
+            "urlkey: the metering listener refused {dropped} more credential(s)"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("hk_run_"), "{text}");
+    // Drained: the next pass has nothing to report.
+    captured.lock().unwrap().clear();
+    sup.drain_observed_all(&registry);
+    assert!(captured.lock().unwrap().is_empty());
     sup.stop(&registry, "urlkey", Some(Duration::from_secs(5)))
         .unwrap();
 }

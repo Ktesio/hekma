@@ -183,6 +183,10 @@ pub(crate) struct AuthDiagnostics {
 struct DiagnosticsInner {
     counts: BTreeMap<&'static str, u64>,
     last: Option<Instant>,
+    /// Presentations the engine could not check (a store failure), and when
+    /// that was last reported.
+    check_failures: u64,
+    last_check_failure: Option<Instant>,
 }
 
 impl AuthDiagnostics {
@@ -195,6 +199,8 @@ impl AuthDiagnostics {
             inner: Arc::new(Mutex::new(DiagnosticsInner {
                 counts: BTreeMap::new(),
                 last: None,
+                check_failures: 0,
+                last_check_failure: None,
             })),
             notifier: notifier.map(Arc::new),
             interval,
@@ -236,6 +242,33 @@ impl AuthDiagnostics {
         );
         inner.counts.clear();
         inner.last = Some(Instant::now());
+        drop(inner);
+        if let Some(notifier) = &self.notifier {
+            notifier.note(&line);
+        }
+        Some(line)
+    }
+
+    /// Count one presentation the engine could not check (`detail` is the
+    /// store's error text, for the Operator's diagnostic only — never a
+    /// client's body); emit the line when the interval has passed. Returns
+    /// the line emitted, if any (for tests).
+    pub(crate) fn check_failed(&self, detail: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.check_failures += 1;
+        let due = inner
+            .last_check_failure
+            .is_none_or(|last| last.elapsed() >= self.interval);
+        if !due {
+            return None;
+        }
+        let line = format!(
+            "the Control API could not check {} credential presentation(s) since the last \
+             report and answered 500: {detail}",
+            inner.check_failures
+        );
+        inner.check_failures = 0;
+        inner.last_check_failure = Some(Instant::now());
         drop(inner);
         if let Some(notifier) = &self.notifier {
             notifier.note(&line);
@@ -422,7 +455,13 @@ async fn authorize(
             state.auth_diagnostics.unresolved(Some(presented));
             return Err(ApiError::unauthorized());
         }
-        Err(err) => return Err(err.into()),
+        // The engine could not check it (a store failure). The client is
+        // unauthenticated: it gets a static 500, and the store's text goes
+        // to the Operator's diagnostic only.
+        Err(err) => {
+            state.auth_diagnostics.check_failed(&err.to_string());
+            return Err(ApiError::credential_check_failed());
+        }
     };
     let gated = gate(matched, state.loopback, family).map(|authority| match authority {
         // A refresh credential rides to the refresh job as its value (the

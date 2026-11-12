@@ -705,6 +705,44 @@ fn unresolved_presentations_produce_one_diagnostic_and_no_token_in_any_log() {
     assert!(!text.contains("wrong-secret"), "{text}");
 }
 
+/// Review 2, L4: a store failure while an unauthenticated presentation is
+/// checked answers a static 500 — the store's text (which can name a table
+/// or a path) goes to the Operator's diagnostic, never to the client.
+#[test]
+fn a_store_failure_on_the_unauthenticated_path_answers_a_static_500() {
+    let state = seeded_state();
+    let server = Server::start(state.path().to_path_buf());
+    let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    // The credential reader's next lookup fails: its table is gone.
+    conn.execute_batch("ALTER TABLE tokens RENAME TO tokens_away")
+        .unwrap();
+    let unknown = format!("hk_run_{}", "S".repeat(52));
+    let answer = call("GET", &server.url("/v0/fleet"), &unknown, None);
+    conn.execute_batch("ALTER TABLE tokens_away RENAME TO tokens")
+        .unwrap();
+    assert_eq!(answer.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(answer.code(), "store", "{}", answer.body);
+    assert_eq!(
+        answer.json()["error"]["message"],
+        "the presented credential could not be checked; try again later",
+        "{}",
+        answer.body
+    );
+    for leak in ["tokens", "no such table", "state.db", &unknown] {
+        assert!(!answer.body.contains(leak), "{leak}: {}", answer.body);
+    }
+    let text = server.sink.text();
+    assert!(
+        text.lines().any(
+            |line| line.contains("could not check 1 credential presentation(s)")
+                && line.contains("tokens")
+        ),
+        "{text}"
+    );
+    assert!(!text.contains(&unknown), "{text}");
+}
+
 #[test]
 fn credential_events_reach_sse_through_the_selector_and_carry_no_token() {
     use std::io::BufRead;
