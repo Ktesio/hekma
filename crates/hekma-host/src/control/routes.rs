@@ -1632,28 +1632,6 @@ pub(crate) async fn runs_limits(
     }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_committed_verb_whose_read_back_fails_is_still_an_act() {
-        let document = acted(
-            "run_A",
-            Err(ApiError::new(
-                super::super::error::ApiErrorKind::Internal,
-                "the Fleet read failed".to_string(),
-            )),
-            None,
-        );
-        assert_eq!(document.run_id, "run_A");
-        assert!(document.instance.is_none());
-        let wire = serde_json::to_value(&document).unwrap();
-        assert!(wire.get("instance").is_none(), "{wire}");
-        assert!(wire.get("error").is_none(), "{wire}");
-    }
-}
-
 // ---- Story 23-1: the endpoint bindings and the metering proxy ----
 
 /// `GET /v0/bindings?after=&limit=` (Operator bearer only) — the keyset
@@ -1803,19 +1781,7 @@ pub(crate) async fn binding_credential_issue(
     Path(name): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<dto::BindingCredentialDocument>> {
-    let request: dto::BindingCredentialRequest = if body.iter().all(u8::is_ascii_whitespace) {
-        dto::BindingCredentialRequest::default()
-    } else {
-        serde_json::from_slice(&body)
-            .map_err(|err| ApiError::invalid_body(format!("invalid credential body: {err}")))?
-    };
-    let class =
-        hekma_engine::BindingCredentialClass::from_wire(&request.class).ok_or_else(|| {
-            ApiError::invalid_body(format!(
-                "unknown credential class `{}` (announce or proxy-access)",
-                request.class
-            ))
-        })?;
+    let class = credential_class(&body)?;
     let issued = state.engine.issue_binding_credential(&name, class).await?;
     Ok(Json(dto::BindingCredentialDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
@@ -1838,21 +1804,27 @@ pub(crate) async fn binding_credential_revoke(
     Path(name): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<StatusCode> {
+    let class = credential_class(&body)?;
+    state.engine.revoke_binding_credential(&name, class).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Parse a credential route's body, `{"class":"announce"|"proxy-access"}`,
+/// into its class. A blank body names no class, so it is refused the same
+/// way as an unknown one.
+fn credential_class(body: &[u8]) -> ApiResult<hekma_engine::BindingCredentialClass> {
     let request: dto::BindingCredentialRequest = if body.iter().all(u8::is_ascii_whitespace) {
         dto::BindingCredentialRequest::default()
     } else {
-        serde_json::from_slice(&body)
+        serde_json::from_slice(body)
             .map_err(|err| ApiError::invalid_body(format!("invalid credential body: {err}")))?
     };
-    let class =
-        hekma_engine::BindingCredentialClass::from_wire(&request.class).ok_or_else(|| {
-            ApiError::invalid_body(format!(
-                "unknown credential class `{}` (announce or proxy-access)",
-                request.class
-            ))
-        })?;
-    state.engine.revoke_binding_credential(&name, class).await?;
-    Ok(StatusCode::NO_CONTENT)
+    hekma_engine::BindingCredentialClass::from_wire(&request.class).ok_or_else(|| {
+        ApiError::invalid_body(format!(
+            "unknown credential class `{}` (announce or proxy-access)",
+            request.class
+        ))
+    })
 }
 
 /// `GET /v0/bindings/{name}/credentials` (Operator bearer only) — the
@@ -1882,4 +1854,26 @@ pub(crate) async fn proxy_show(
         port: info.as_ref().map(|info| info.port),
         error,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_committed_verb_whose_read_back_fails_is_still_an_act() {
+        let document = acted(
+            "run_A",
+            Err(ApiError::new(
+                super::super::error::ApiErrorKind::Internal,
+                "the Fleet read failed".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(document.run_id, "run_A");
+        assert!(document.instance.is_none());
+        let wire = serde_json::to_value(&document).unwrap();
+        assert!(wire.get("instance").is_none(), "{wire}");
+        assert!(wire.get("error").is_none(), "{wire}");
+    }
 }

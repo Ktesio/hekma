@@ -213,12 +213,6 @@ impl BindingTable {
     pub(crate) fn by_name(&self, name: &str) -> Option<&Arc<BindingEntry>> {
         self.entries.iter().find(|entry| entry.name == name)
     }
-
-    /// Every binding.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn entries(&self) -> &[Arc<BindingEntry>] {
-        &self.entries
-    }
 }
 
 /// One non-ended Run as the data path sees it.
@@ -703,5 +697,40 @@ mod tests {
                 .as_str(),
             "new"
         );
+    }
+
+    fn hash(n: u32) -> TokenHash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        TokenHash::from_bytes(bytes)
+    }
+
+    #[test]
+    fn a_revoked_key_is_told_apart_for_24_hours_then_forgotten() {
+        let start = std::time::Instant::now();
+        let mut set = RevokedSet::default();
+        set.insert(hash(1), start);
+        set.insert(hash(1), start); // a repeat is one entry, not two
+        assert_eq!(set.len(), 1);
+        let day = std::time::Duration::from_secs(RECENTLY_REVOKED_SECS);
+        set.insert(hash(2), start + day);
+        assert!(set.contains(&hash(1)), "exactly 24 hours is still recent");
+        set.insert(hash(3), start + day + std::time::Duration::from_secs(1));
+        assert!(!set.contains(&hash(1)), "past 24 hours it is unknown again");
+        assert!(set.contains(&hash(2)) && set.contains(&hash(3)));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn the_revoked_set_keeps_at_most_its_bound_oldest_out() {
+        let now = std::time::Instant::now();
+        let mut set = RevokedSet::default();
+        let max = u32::try_from(RECENTLY_REVOKED_MAX).unwrap();
+        for n in 0..=max {
+            set.insert(hash(n), now);
+        }
+        assert_eq!(set.len(), RECENTLY_REVOKED_MAX);
+        assert!(!set.contains(&hash(0)), "the oldest is evicted first");
+        assert!(set.contains(&hash(1)) && set.contains(&hash(max)));
     }
 }

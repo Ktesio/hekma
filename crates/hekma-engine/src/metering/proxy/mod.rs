@@ -190,12 +190,6 @@ impl MeteringProxy {
         &self.info
     }
 
-    /// The shared call state (tests read its counters and seams).
-    #[cfg(test)]
-    pub(crate) fn shared(&self) -> &Arc<forward::ProxyShared> {
-        &self.shared
-    }
-
     /// Stop gracefully: stop accepting, let in-flight calls finish within
     /// `grace`, abort the rest (recorded `shutdown`), then close the record
     /// pump so the store writer can close.

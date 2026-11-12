@@ -288,7 +288,7 @@ fn router(state: ApiState) -> Router {
         )
         .route(
             "/v0/bindings/{name}/credentials",
-            get(routes::binding_credentials),
+            get(routes::binding_credentials).post(routes::binding_credential_issue),
         )
         .route(
             "/v0/bindings/{name}/credentials/revoke",
