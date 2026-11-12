@@ -2059,18 +2059,15 @@ impl Supervisor {
             })
             .collect();
         // A decision recorded by an earlier open stands until its Run ends.
-        match registry.reader().legacy_run() {
-            Ok(Some(run)) => {
-                let still_open = registry.run_publisher().current().run(&run).is_some();
-                if still_open {
-                    registry.run_publisher().publish_legacy_root(Some(run));
-                    return;
-                }
-                let _ = registry
-                    .writer()
-                    .call(move |ctx| ctx.store().set_legacy_run(None));
+        if let Ok(Some(run)) = registry.reader().legacy_run() {
+            let still_open = registry.run_publisher().current().run(&run).is_some();
+            if still_open {
+                registry.run_publisher().publish_legacy_root(Some(run));
+                return;
             }
-            _ => {}
+            let _ = registry
+                .writer()
+                .call(move |ctx| ctx.store().set_legacy_run(None));
         }
         let names = |candidates: &[&(InstanceName, RunId)]| -> String {
             candidates

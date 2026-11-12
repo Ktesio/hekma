@@ -875,7 +875,7 @@ impl Registry {
                     other => crate::ports::StoreError::Backend(other.to_string()),
                 })
             })
-            .map_err(|store| crate::domain::runs::bindings::BindingError::Store(store))
+            .map_err(crate::domain::runs::bindings::BindingError::Store)
     }
 
     /// Story 23-1 (cross-process freshness): the reaper tick's foreign-commit

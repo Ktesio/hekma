@@ -132,10 +132,7 @@ fn submit_close(
     let sent = handle.submit_then(
         move |ctx| {
             #[cfg(test)]
-            if fail
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-                .is_ok()
-            {
+            if take_one(&fail) {
                 return Err(StoreError::Backend(
                     "test seam: the close job fails".to_string(),
                 ));
@@ -172,6 +169,21 @@ fn submit_close(
     }
 }
 
+/// cfg(test) seam: take one from a countdown, `false` once it reaches zero.
+/// A `compare_exchange_weak` loop rather than `fetch_update`, which newer
+/// toolchains deprecate and whose successor is newer than the MSRV.
+#[cfg(test)]
+fn take_one(counter: &AtomicU64) -> bool {
+    let mut current = counter.load(Ordering::Acquire);
+    while let Some(next) = current.checked_sub(1) {
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +195,8 @@ mod tests {
         assert!(a.starts_with("call_"));
         assert_eq!(a.len(), 31);
         assert_ne!(a, b);
-        assert!(a[5..].bytes().all(|byte| CROCKFORD.contains(&byte)));
+        assert!(a[5..]
+            .bytes()
+            .all(|byte| crate::domain::CROCKFORD.contains(&byte)));
     }
 }

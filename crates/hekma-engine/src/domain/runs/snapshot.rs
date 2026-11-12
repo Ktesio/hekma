@@ -208,7 +208,8 @@ impl BindingTable {
             .find_map(|entry| entry.strip(path).map(|rest| (entry, rest)))
     }
 
-    /// The binding named `name`.
+    /// The binding named `name` (the tests' lookup).
+    #[cfg(test)]
     pub(crate) fn by_name(&self, name: &str) -> Option<&Arc<BindingEntry>> {
         self.entries.iter().find(|entry| entry.name == name)
     }

@@ -172,10 +172,8 @@ pub(crate) fn re_arm(
                 // Per-reason fence clear: only the raised reasons clear; the
                 // fence stays up while any other latched `block` reason
                 // holds (amendment 2).
-                if action == BreachAction::Block {
-                    if !report.fence_cleared.contains(&key) {
-                        report.fence_cleared.push(key);
-                    }
+                if action == BreachAction::Block && !report.fence_cleared.contains(&key) {
+                    report.fence_cleared.push(key);
                 }
             } else {
                 any_latch_left = true;

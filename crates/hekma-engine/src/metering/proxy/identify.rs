@@ -87,8 +87,11 @@ pub(crate) enum Attribution {
     },
 }
 
-/// The outcome of identification.
+/// The outcome of identification. Built once per proxied call, on the hot
+/// path, so the size difference is accepted rather than boxing the common
+/// variant (one heap allocation per call).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Identified {
     Call {
         target: Target,

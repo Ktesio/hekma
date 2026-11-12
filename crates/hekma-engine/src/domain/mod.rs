@@ -52,6 +52,8 @@ mod supervisor;
 mod transition;
 mod usage;
 pub(crate) use usage::mint_ulid;
+#[cfg(test)]
+pub(crate) use usage::CROCKFORD;
 
 pub use budget::{
     BreachAction, BreachDecision, BreachScope, BudgetEvaluator, ParseBreachActionError, TokenBudget,

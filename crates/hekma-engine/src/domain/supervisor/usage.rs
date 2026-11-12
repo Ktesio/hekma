@@ -652,6 +652,7 @@ impl Supervisor {
             match item {
                 pipeline::InboxItem::RunEvents(events) => self.publish_run_events(events),
                 pipeline::InboxItem::Proxied(commit) => {
+                    let commit = *commit;
                     let (update, append) = commit.update;
                     self.note_outbox_append(&append);
                     self.publish(append.seq, EngineEvent::UsageUpdate(update));

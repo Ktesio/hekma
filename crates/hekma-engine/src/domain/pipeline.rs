@@ -626,7 +626,7 @@ pub(crate) struct EvaluationInbox {
 #[derive(Debug)]
 pub(crate) enum InboxItem {
     /// A committed proxied close's usage and evaluation.
-    Proxied(ProxiedCommit),
+    Proxied(Box<ProxiedCommit>),
     /// Run events a proxy job committed (a wire Run's `created`).
     RunEvents(Vec<runs::ops::CommittedRunEvent>),
 }
@@ -645,7 +645,7 @@ impl EvaluationInbox {
     /// Push one committed evaluation (a post-commit hook).
     pub(crate) fn push(&self, commit: ProxiedCommit) {
         let tx = self.tx.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = tx.send(InboxItem::Proxied(commit));
+        let _ = tx.send(InboxItem::Proxied(Box::new(commit)));
     }
 
     /// Push the Run events a proxy job committed.

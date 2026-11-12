@@ -57,6 +57,10 @@ pub(crate) struct RefusalCounters {
     pub capped_hints: AtomicU64,
 }
 
+/// One pending Run creation per identity: concurrent first calls share it.
+pub(crate) type PendingCreations =
+    std::sync::Mutex<std::collections::HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
+
 /// Everything a call reads, shared by every connection.
 pub(crate) struct ProxyShared {
     pub snapshot: Arc<SnapshotPublisher>,
@@ -75,8 +79,7 @@ pub(crate) struct ProxyShared {
     pub owner: Option<ProcessFingerprint>,
     pub stopping: Arc<AtomicBool>,
     /// One pending creation per identity (concurrent first calls share it).
-    pub pending:
-        std::sync::Mutex<std::collections::HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+    pub pending: PendingCreations,
     pub diagnostics: Arc<dyn Fn(String) + Send + Sync>,
     /// The minute of the last pre-identification refusal note.
     pub last_note_minute: AtomicU64,

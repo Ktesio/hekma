@@ -814,10 +814,9 @@ impl Engine {
             .lock()
             .expect("registry mutex poisoned")
             .run_binding(op)
-            .map(|outcome| {
+            .inspect(|outcome| {
                 let supervisor = inner.supervisor.lock().expect("supervisor mutex poisoned");
                 supervisor.publish_run_events(outcome.events.clone());
-                outcome
             })
     }
 
