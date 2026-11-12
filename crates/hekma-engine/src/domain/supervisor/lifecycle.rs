@@ -293,12 +293,10 @@ impl Supervisor {
                                 sentinel_lines_seen: false,
                                 is_acp,
                                 capture_mode: None,
-                                observed_park: None,
                                 launch_generation: registry
                                     .launch_generation(&name)
                                     .unwrap_or_default(),
-                                observed_listener: None,
-                                observed_source: None,
+                                observed_route: false,
                                 stop_unconfirmed: false,
                                 adopted: true,
                                 acp: None,
@@ -465,13 +463,10 @@ impl Supervisor {
         // blocks the stop. Story 14-3 (T3): an acp instance's stderr sentinel
         // channel drains here too, under the same terminal rule (its own cursor).
         self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
-        // Drain any final ENGINE-OBSERVED usage still queued before the listener is
-        // torn down (story 3-4): a completion the proxy parsed just before the stop
-        // must land, not be lost when the `Supervised` (and its listener) is dropped
-        // below. TERMINAL mode (story 12-4): a commit failure here announces the
-        // loss — there is no next pass — and any parked buffer dies with the
-        // instance.
-        self.drain_observed_for(registry, &name, DrainMode::Terminal);
+        // Story 23-1: engine-observed usage commits in the store writer's
+        // proxied close job (no queue to drain); the committed evaluations
+        // already in the inbox publish before the stop tears the Run down.
+        self.drain_proxy_inbox(registry);
         // Story 14-1: surface any queued acp notices before the transport
         // tears down with the handle (malformed lines, permission denials,
         // usage updates — surfaced, never lost silently to the stop).

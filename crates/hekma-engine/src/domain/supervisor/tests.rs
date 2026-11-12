@@ -2967,9 +2967,9 @@ fn memory_delivery_notice_fires_only_when_attached_but_unmapped() {
 }
 
 #[test]
-fn self_reported_start_observed_listener_is_a_no_op() {
+fn self_reported_observed_route_is_a_no_op() {
     // Source selection: a `self-reported` instance's start path is UNCHANGED —
-    // start_observed_listener returns Ok(None), NO listener (even with an upstream
+    // observed_route returns Ok(None), no proxy route (even with an upstream
     // configured, which a self-reported instance ignores).
     let (_state, _manifest, registry) = setup_fake("selfrep_obs", &["--linger-ms", "1000"]);
     let name = InstanceName::new("selfrep_obs").unwrap();
@@ -2982,33 +2982,40 @@ fn self_reported_start_observed_listener_is_a_no_op() {
     let sup = Supervisor::with_backoff(fast_backoff());
     // self-reported (the fake manifest declares self-reported) → Ok(None).
     let result = sup
-        .start_observed_listener(&name, "self-reported", &effective, Default::default())
+        .observed_route(
+            &name,
+            "self-reported",
+            &effective,
+            &crate::domain::RunId::mint(),
+        )
         .expect("self-reported is a no-op, not an error");
     assert!(
         result.is_none(),
-        "a self-reported instance runs no listener"
+        "a self-reported instance runs no proxy route"
     );
 }
 
 #[test]
 fn engine_observed_without_upstream_rejects_with_a_clear_error() {
     // AC-A: an `engine-observed` instance with NO configured upstream URL rejects
-    // start_observed_listener with a traffic-free ObservedMetering error naming the
-    // key (nothing to forward to). Uses the handle-less test supervisor, but the
-    // upstream check fails FIRST (before the runtime-handle check), so the error
-    // names the missing config key.
+    // observed_route with a traffic-free ObservedMetering error naming the
+    // key (nothing to forward to). The upstream check fails FIRST (before
+    // the proxy check), so the error names the missing config key.
     let (_state, _manifest, registry) = setup_fake("obs_noup", &["--linger-ms", "1000"]);
     let name = InstanceName::new("obs_noup").unwrap();
     let effective = registry
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
     let sup = Supervisor::with_backoff(fast_backoff());
-    let err =
-        match sup.start_observed_listener(&name, "engine-observed", &effective, Default::default())
-        {
-            Err(e) => e,
-            Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
-        };
+    let err = match sup.observed_route(
+        &name,
+        "engine-observed",
+        &effective,
+        &crate::domain::RunId::mint(),
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("an engine-observed instance with no upstream must reject"),
+    };
     match err {
         EngineError::ObservedMetering { name: n, detail } => {
             assert_eq!(n, "obs_noup");
@@ -3022,32 +3029,36 @@ fn engine_observed_without_upstream_rejects_with_a_clear_error() {
 }
 
 #[test]
-fn engine_observed_without_runtime_handle_rejects_cleanly() {
-    // With an upstream configured but NO engine runtime handle (the handle-less
-    // test supervisor), an engine-observed start rejects with a clear, traffic-free
-    // error rather than panicking — the async engine is required to observe.
-    let (_state, _manifest, registry) = setup_fake("obs_nort", &["--linger-ms", "1000"]);
-    let name = InstanceName::new("obs_nort").unwrap();
+fn engine_observed_without_a_running_proxy_rejects_naming_the_remediation() {
+    // With an upstream configured but NO shared Metering Proxy running on
+    // this engine (the handle-less test supervisor), an engine-observed
+    // start rejects with a clear, traffic-free error naming the remediation
+    // — there is nowhere to point the injected base URL at.
+    let (_state, _manifest, registry) = setup_fake("obs_noproxy", &["--linger-ms", "1000"]);
+    let name = InstanceName::new("obs_noproxy").unwrap();
     registry
         .set_config(&name, "metering.upstream_base_url", "http://127.0.0.1:9")
         .unwrap();
     let effective = registry
         .effective_config(&name, crate::domain::ConfigLayer::empty())
         .unwrap();
-    let sup = Supervisor::with_backoff(fast_backoff()); // no runtime handle
-    let err =
-        match sup.start_observed_listener(&name, "engine-observed", &effective, Default::default())
-        {
-            Err(e) => e,
-            Ok(_) => panic!("no runtime handle must reject an engine-observed start"),
-        };
+    let sup = Supervisor::with_backoff(fast_backoff()); // runs no proxy
+    let err = match sup.observed_route(
+        &name,
+        "engine-observed",
+        &effective,
+        &crate::domain::RunId::mint(),
+    ) {
+        Err(e) => e,
+        Ok(_) => panic!("no running proxy must reject an engine-observed start"),
+    };
     assert!(
         matches!(err, EngineError::ObservedMetering { .. }),
         "expected ObservedMetering, got {err:?}"
     );
     assert!(
-        err.to_string().contains("runtime"),
-        "names the cause: {err}"
+        err.to_string().contains("metering proxy is not running"),
+        "names the cause and the remediation: {err}"
     );
 }
 
@@ -4238,463 +4249,6 @@ fn a_failed_ledger_insert_parks_the_cursor_and_retries_exactly_once() {
     );
     // Teardown.
     sup.stop(&registry, "ledger", Some(Duration::from_millis(200)))
-        .unwrap();
-}
-
-// ---- Story 12-4: the OBSERVED drain's park + bounded retry + loud skip ----
-
-/// Give the supervisor's (already-started, self-reported) instance a REAL
-/// observed listener + source — the 12-4 drain tests push `(input, output)`
-/// pairs into the listener's queue directly (no model traffic needed) and
-/// drive `drain_observed_for` synchronously. The listener points at a dead
-/// upstream (nothing ever forwards); its accept-loop task lives on the
-/// returned runtime (kept alive by the caller for the test's duration).
-fn attach_observed_channel(
-    sup: &mut Supervisor,
-    registry: &Registry,
-    name: &str,
-) -> (
-    tokio::runtime::Runtime,
-    crate::metering::listener::ObservedQueue,
-) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .expect("test runtime for the observed listener");
-    let dead_upstream = {
-        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        format!("http://{}", l.local_addr().unwrap())
-    };
-    let listener = ObservedListener::start(rt.handle(), dead_upstream).expect("listener start");
-    let queue = listener.queue();
-    let inst = InstanceName::new(name).unwrap();
-    let s = sup.running.get_mut(&inst).expect("supervised entry");
-    s.observed_listener = Some(listener);
-    s.observed_source = Some(crate::ports::ObservedUsageSource::new());
-    s.metering_source = "engine-observed".to_string();
-    // Silence the unused-registry lint; the registry read keeps the signature
-    // symmetric with the drain call sites.
-    let _ = registry;
-    (rt, queue)
-}
-
-/// The FULL `usage_events` schema (table + every index, tables first) read
-/// from the live DB — the repair fixture the fault-injection drops and
-/// restores (the AI-41 park test's exact technique, shared).
-fn usage_events_schema(db: &Path) -> Vec<(String, String)> {
-    let conn = rusqlite::Connection::open(db).unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT type, sql FROM sqlite_master \
-                 WHERE tbl_name = 'usage_events' AND sql IS NOT NULL \
-                 ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .unwrap();
-    let schema: Vec<(String, String)> = rows.map(|r| r.unwrap()).collect();
-    drop(stmt);
-    schema
-}
-
-/// The minted `sequence` ordinals of `name`'s committed ledger rows —
-/// proves the retried events kept their ORIGINAL sequences (never re-minted).
-fn ledger_sequences(state: &Path, name: &str) -> Vec<i64> {
-    let conn = rusqlite::Connection::open(state.join("state.db")).unwrap();
-    let mut stmt = conn
-        .prepare(
-            "SELECT e.sequence FROM usage_events e \
-                 JOIN agent_instances i ON i.id = e.instance_id WHERE i.name = ?1 \
-                 ORDER BY e.sequence",
-        )
-        .unwrap();
-    let rows = stmt.query_map([name], |r| r.get::<_, i64>(0)).unwrap();
-    rows.map(|r| r.unwrap()).collect()
-}
-
-#[test]
-fn an_observed_drain_parks_and_retries_the_same_minted_events() {
-    // Story 12-4 (the observed AI-41): a store failure MIDRUN parks the
-    // minted events; the retry commits the EXACT same events — the same
-    // minted `sequence` ordinals (never re-minted, the dedup-key stability
-    // the design pins) — and the park clears once everything is durable.
-    let (state, _manifest, registry) = setup_fake("obspark", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("obspark").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "obspark").unwrap();
-    let sink = install_capture_sink(&mut sup);
-    let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obspark");
-    let db = state.path().join("state.db");
-
-    // Two observed completions; then the store dies.
-    queue.lock().unwrap().push_back((10, 20, 0));
-    queue.lock().unwrap().push_back((11, 22, 0));
-    let schema = usage_events_schema(&db);
-    assert!(
-        schema
-            .iter()
-            .any(|(t, sql)| t == "index" && sql.contains("CREATE UNIQUE INDEX")),
-        "fixture premise: a UNIQUE dedup index exists on usage_events"
-    );
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DROP TABLE usage_events", []).unwrap();
-    drop(conn);
-
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    {
-        let s = sup.running.get(&name).unwrap();
-        let (pending, attempts) = s.observed_park.as_ref().expect("the drain must park");
-        assert_eq!(*attempts, 1, "first failure: attempt streak 1");
-        assert_eq!(
-            pending.front_sequence, 0,
-            "the front event's minted sequence"
-        );
-        assert_eq!(
-            pending.events.len(),
-            2,
-            "both minted events park (the queue has no byte cursor)"
-        );
-    }
-    assert!(
-        sink_text(&sink).contains("parked for retry"),
-        "the failure diagnostic must reach the diagnostic sink"
-    );
-
-    // Repair (FULL schema incl. the dedup index) and retry.
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    for (_kind, sql) in &schema {
-        conn.execute(sql, []).unwrap();
-    }
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_totals(state.path(), "obspark"),
-        (2, 21),
-        "the retried events commit exactly once"
-    );
-    assert_eq!(
-        ledger_sequences(state.path(), "obspark"),
-        vec![0, 1],
-        "the retry kept the ORIGINAL minted sequences (never re-minted)"
-    );
-    let s = sup.running.get(&name).unwrap();
-    assert!(
-        s.observed_park.is_none(),
-        "the park clears once every event is durable"
-    );
-    sup.stop(&registry, "obspark", Some(Duration::from_millis(200)))
-        .unwrap();
-}
-
-#[test]
-fn an_observed_partial_failure_parks_only_the_uncommitted_tail() {
-    // Break-on-first-error: the FIRST event of a pass commits, the SECOND
-    // fails (a trigger RAISEs from the second row on) — only the FAILED
-    // event parks (discrete events need no block re-drift), and after the
-    // repair the retry adds exactly the missing one (no double-count).
-    let (state, _manifest, registry) = setup_fake("obspart", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("obspart").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "obspart").unwrap();
-    let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obspart");
-    let db = state.path().join("state.db");
-
-    queue.lock().unwrap().push_back((10, 20, 0));
-    queue.lock().unwrap().push_back((11, 22, 0));
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute(
-        "CREATE TRIGGER obs_fail_second BEFORE INSERT ON usage_events \
-             WHEN (SELECT COUNT(*) FROM usage_events) >= 1 \
-             BEGIN SELECT RAISE(ABORT, 'injected second-insert fault'); END;",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_totals(state.path(), "obspart"),
-        (1, 10),
-        "the first event commits, the second fails"
-    );
-    {
-        let s = sup.running.get(&name).unwrap();
-        let (pending, attempts) = s.observed_park.as_ref().expect("the failure parks");
-        assert_eq!(
-            pending.events.len(),
-            1,
-            "only the UNCOMMITTED event parks — the committed one is never retried"
-        );
-        assert_eq!(pending.front_sequence, 1, "the front is the second event");
-        assert_eq!(*attempts, 1);
-    }
-
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DROP TRIGGER obs_fail_second", []).unwrap();
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_totals(state.path(), "obspart"),
-        (2, 21),
-        "the retry adds exactly the missing event (no double-count)"
-    );
-    let s = sup.running.get(&name).unwrap();
-    assert!(s.observed_park.is_none(), "the park clears");
-    sup.stop(&registry, "obspart", Some(Duration::from_millis(200)))
-        .unwrap();
-}
-
-#[test]
-fn an_observed_poisoned_event_is_skipped_loudly_after_the_bound() {
-    // The bounded park: an event the store PERMANENTLY rejects (a trigger
-    // keyed on its token count) parks 1→2→3 times, then is SKIPPED with a
-    // loud diagnostic while the events behind it keep counting — an
-    // announced loss, never a wedged drain, never a silent drop.
-    let (state, _manifest, registry) = setup_fake("obsskip", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("obsskip").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "obsskip").unwrap();
-    let sink = install_capture_sink(&mut sup);
-    let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obsskip");
-    let db = state.path().join("state.db");
-
-    queue.lock().unwrap().push_back((42, 1, 0)); // the poisoned event
-    queue.lock().unwrap().push_back((7, 2, 0));
-    queue.lock().unwrap().push_back((8, 3, 0));
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute(
-        "CREATE TRIGGER obs_poison BEFORE INSERT ON usage_events \
-             WHEN NEW.input_tokens = 42 \
-             BEGIN SELECT RAISE(ABORT, 'injected permanent fault'); END;",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    // Passes 1 and 2: the drain parks at the poisoned front.
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    {
-        let s = sup.running.get(&name).unwrap();
-        let (pending, attempts) = s.observed_park.as_ref().unwrap();
-        assert_eq!(
-            *attempts, 2,
-            "two consecutive failed passes at the same front"
-        );
-        assert_eq!(pending.front_sequence, 0);
-        assert_eq!(
-            pending.events.len(),
-            3,
-            "nothing committed, nothing skipped yet"
-        );
-    }
-    // Pass 3 hits the bound: the poisoned front is SKIPPED loudly; the two
-    // healthy events park behind it with a FRESH streak (a new front).
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert!(
-        sink_text(&sink).contains("SKIPPED (not counted)"),
-        "the skip must be announced loudly"
-    );
-    assert!(
-        sink_text(&sink).contains("sequence 0"),
-        "the skip names the poisoned event's minted sequence"
-    );
-    {
-        let s = sup.running.get(&name).unwrap();
-        let (pending, attempts) = s.observed_park.as_ref().unwrap();
-        assert_eq!(
-            pending.front_sequence, 1,
-            "the new front is the second event"
-        );
-        assert_eq!(pending.events.len(), 2, "the healthy events keep counting");
-        assert_eq!(*attempts, 1, "a different front resets the streak");
-    }
-    assert_eq!(
-        ledger_totals(state.path(), "obsskip"),
-        (0, 0),
-        "nothing committed yet (the healthy events are parked, not dropped)"
-    );
-
-    // Remove the fault: the healthy events commit on the next pass; the
-    // skipped one is NOT resurrected (an announced loss stays lost).
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DROP TRIGGER obs_poison", []).unwrap();
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_totals(state.path(), "obsskip"),
-        (2, 15),
-        "the healthy events landed; the skipped event's 42 tokens are gone (announced)"
-    );
-    let s = sup.running.get(&name).unwrap();
-    assert!(s.observed_park.is_none());
-    sup.stop(&registry, "obsskip", Some(Duration::from_millis(200)))
-        .unwrap();
-}
-
-#[test]
-fn an_oversized_observed_park_drops_the_oldest_events_loudly() {
-    // The 12-4 AMENDMENT cap: a store outage keeps minting events every
-    // tick, so the pending park buffer must be BOUNDED
-    // (OBSERVED_PARK_MAX_EVENTS) — never unbounded engine memory. When the
-    // cap bites, the OLDEST parked events are dropped and the loss is
-    // announced LOUDLY (count + sequence range + remediation) — a capped
-    // loss, never a silent truncation; the newest events keep their park.
-    let (state, _manifest, registry) = setup_fake("obscap", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("obscap").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "obscap").unwrap();
-    let sink = install_capture_sink(&mut sup);
-    let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obscap");
-    let db = state.path().join("state.db");
-
-    // MORE events than the cap, all minted in one drain while the store
-    // is dead: the buffer can hold only OBSERVED_PARK_MAX_EVENTS of them.
-    let total = OBSERVED_PARK_MAX_EVENTS + 2;
-    for i in 0..total {
-        queue.lock().unwrap().push_back((1, i as u64, 0));
-    }
-    let schema = usage_events_schema(&db);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DROP TABLE usage_events", []).unwrap();
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-
-    // The park holds EXACTLY the cap — the two OLDEST events (sequences
-    // 0 and 1) were dropped, loudly.
-    {
-        let s = sup.running.get(&name).unwrap();
-        let (pending, attempts) = s.observed_park.as_ref().expect("the drain still parks");
-        assert_eq!(
-            pending.events.len(),
-            OBSERVED_PARK_MAX_EVENTS,
-            "the park buffer is capped, never unbounded"
-        );
-        assert_eq!(
-            pending.front_sequence, 2,
-            "the two oldest minted events (0, 1) were the dropped ones"
-        );
-        assert_eq!(*attempts, 1, "a first failed pass at the (new) front");
-    }
-    let text = sink_text(&sink);
-    assert!(
-        text.contains("2 parked observed usage event(s)"),
-        "the overflow must be announced with the dropped COUNT: {text}"
-    );
-    assert!(
-        text.contains("sequences 0..1"),
-        "the overflow diagnostic names the dropped sequence range: {text}"
-    );
-    assert!(
-        text.contains("NOT counted"),
-        "the dropped events are honestly not-counted, never silently held: {text}"
-    );
-
-    // Repair: the capped survivors commit with their ORIGINAL minted
-    // sequences (the cap never re-mints), the dropped two stay lost.
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    for (_kind, sql) in &schema {
-        conn.execute(sql, []).unwrap();
-    }
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_sequences(state.path(), "obscap").len(),
-        OBSERVED_PARK_MAX_EVENTS,
-        "exactly the capped survivors landed"
-    );
-    assert_eq!(
-        ledger_sequences(state.path(), "obscap")[0],
-        2,
-        "the survivors kept their original sequences (the dropped two are gone)"
-    );
-    let s = sup.running.get(&name).unwrap();
-    assert!(s.observed_park.is_none());
-    sup.stop(&registry, "obscap", Some(Duration::from_millis(200)))
-        .unwrap();
-}
-
-#[test]
-fn a_terminal_observed_drain_failure_announces_the_loss_without_a_retry_claim() {
-    // The TERMINAL arm: a commit failure on the stop/reap drain is LOST —
-    // announced explicitly (with the why and no retry claim), never a silent
-    // drop and never a false "will retry". Any buffer a PRIOR MidRun pass
-    // parked is dropped with the instance (the terminal pass makes no new
-    // park and rescues nothing once the drain itself failed).
-    let (state, _manifest, registry) = setup_fake("obslost", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("obslost").unwrap();
-    let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.start(&registry, "obslost").unwrap();
-    let sink = install_capture_sink(&mut sup);
-    let (_rt, queue) = attach_observed_channel(&mut sup, &registry, "obslost");
-    let db = state.path().join("state.db");
-
-    // (1) Store UP: event A commits immediately.
-    queue.lock().unwrap().push_back((30, 40, 0));
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(ledger_totals(state.path(), "obslost"), (1, 30));
-
-    // (2) Store DIES: event B parks on the MidRun pass.
-    queue.lock().unwrap().push_back((3, 4, 0));
-    let schema = usage_events_schema(&db);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute("DROP TABLE usage_events", []).unwrap();
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert!(sup.running.get(&name).unwrap().observed_park.is_some());
-
-    // (3) The TERMINAL drain (store still dead): B's failure is announced
-    // as LOST — not retried, not a bounded skip — and B does NOT survive
-    // into a new park. The 12-4 AMENDMENT: NO diagnostic on this path may
-    // claim "parked for retry" — the shared ingest-failure text is
-    // mode-aware, and the absence is asserted, not assumed (a terminal
-    // diagnostic promising a retry would contradict the LOST notice). The
-    // assertion scopes to the TERMINAL pass's own lines: the earlier
-    // MidRun pass's "parked for retry" line is honest history (that drain
-    // really did park), so only the delta may not contain the claim.
-    let before_terminal = sink_text(&sink).len();
-    sup.drain_observed_for(&registry, &name, DrainMode::Terminal);
-    let text = sink_text(&sink)[before_terminal..].to_string();
-    assert!(
-        text.contains("are LOST"),
-        "the terminal loss must be announced: {text}"
-    );
-    assert!(
-        text.contains("cannot be retried"),
-        "the loss notice must not claim a retry: {text}"
-    );
-    assert!(
-        !text.contains("parked for retry"),
-        "NO terminal diagnostic may claim the parked event will be retried \
-             (the 12-4 AMENDMENT mode-aware text): {text}"
-    );
-    assert!(
-        !text.contains("SKIPPED"),
-        "the terminal loss is not a bounded skip: {text}"
-    );
-    assert!(
-        sup.running.get(&name).unwrap().observed_park.is_none(),
-        "the parked buffer is dropped with the instance (no phantom retry state)"
-    );
-
-    // (4) Repair: a later pass finds nothing to re-add — the lost event
-    // stays lost (announced). (The DROP TABLE fixture also wiped A's row,
-    // so the repaired ledger starts empty; the point is that B is never
-    // resurrected.)
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    for (_kind, sql) in &schema {
-        conn.execute(sql, []).unwrap();
-    }
-    drop(conn);
-    sup.drain_observed_for(&registry, &name, DrainMode::MidRun);
-    assert_eq!(
-        ledger_totals(state.path(), "obslost"),
-        (0, 0),
-        "B was announced lost and is never resurrected by a later pass"
-    );
-    sup.stop(&registry, "obslost", Some(Duration::from_millis(200)))
         .unwrap();
 }
 
@@ -6324,57 +5878,25 @@ fn a_pre_v9_mint_write_failure_surfaces_the_per_command_mint_note() {
 }
 
 #[test]
-fn the_adoption_rebind_decision_covers_every_source_and_port_shape() {
-    // Review finding 14's pin: the fixed-port adoption re-bind DECISION is a
-    // pure seam so its rule is unit-tested on EVERY OS — the process-level
-    // re-bind e2e legs skip on the x86-64 Linux CI runner (#109) and
-    // tarpaulin (the coverage gate) runs ONLY on linux, so the decision
-    // logic itself must be reachable by tests that always run. The rule:
-    // Attempt only for engine-observed AND a fixed port; an ephemeral open
-    // (port 0) skips WITH the strand diagnostic; a non-observed instance has
-    // no listener to re-bind at all.
-    use super::adoption_rebind_decision;
-    use super::AdoptionRebind;
-    // The headline: observed + fixed port → attempt the live re-bind.
-    assert!(matches!(
-        adoption_rebind_decision("engine-observed", 8400),
-        AdoptionRebind::Attempt
-    ));
-    // Observed but the engine opened ephemeral (every pre-17-2 open): a
-    // re-bind cannot guess the previous engine's port → skip (the 11-3
-    // strand note stays).
-    assert!(matches!(
-        adoption_rebind_decision("engine-observed", 0),
-        AdoptionRebind::SkipNoFixedPort
-    ));
-    // Fixed port but self-reported: there is no listener to re-bind.
-    assert!(matches!(
-        adoption_rebind_decision("self-reported", 8400),
-        AdoptionRebind::SkipNotObserved
-    ));
-    assert!(matches!(
-        adoption_rebind_decision("self-reported", 0),
-        AdoptionRebind::SkipNotObserved
-    ));
-}
-
-#[test]
 fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
     // Review finding 16's pin: `set_serve_options` is OPEN-TIME ONLY, and
     // the guard turns misuse into typed refusals — (1) a fresh supervisor
     // applies once; (2) a second application is refused (AlreadyApplied)
     // even pre-lifecycle; (3) once a process is supervised (a real spawn
     // below), the refusal is LifecycleBegun — a mid-flight re-pin would
-    // strand already-started listeners / make sibling children
-    // inconsistent.
+    // make sibling children inconsistent.
     let (_state, _manifest, registry) = setup_fake("serveopts", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     // (1) Fresh supervisor, pre-lifecycle: the apply lands.
-    sup.set_serve_options(8400, true, LogCaptureMode::default())
-        .expect("the first apply on a fresh supervisor must land");
+    sup.set_serve_options(
+        Some("http://127.0.0.1:8400".to_string()),
+        true,
+        LogCaptureMode::default(),
+    )
+    .expect("the first apply on a fresh supervisor must land");
     // (2) A second application — even still pre-lifecycle — is refused.
     let err = sup
-        .set_serve_options(0, false, LogCaptureMode::default())
+        .set_serve_options(None, false, LogCaptureMode::default())
         .unwrap_err();
     assert!(
         matches!(err, ServeOptionsRefused::AlreadyApplied),
@@ -6384,7 +5906,11 @@ fn serve_options_are_open_time_only_and_refuse_once_the_lifecycle_begins() {
     // checked BEFORE the latch (a held process is the stronger violation).
     sup.start(&registry, "serveopts").unwrap();
     let err = sup
-        .set_serve_options(8400, true, LogCaptureMode::default())
+        .set_serve_options(
+            Some("http://127.0.0.1:8400".to_string()),
+            true,
+            LogCaptureMode::default(),
+        )
         .unwrap_err();
     assert!(
         matches!(err, ServeOptionsRefused::LifecycleBegun { held: 1 }),
@@ -6589,7 +6115,7 @@ fn metadata_mode_unlinks_raw_files_at_stop_and_output_log_stays_metadata_shaped(
         setup_fake("meta", &["--emit-usage", "2", "--linger-ms", "600000"]);
     let name = InstanceName::new("meta").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+    sup.set_serve_options(None, false, LogCaptureMode::Metadata)
         .expect("the mode pins pre-lifecycle");
     sup.start(&registry, "meta").unwrap();
 
@@ -6662,7 +6188,7 @@ fn metadata_unlink_of_already_absent_raw_files_stays_silent() {
     let (_state, _manifest, registry) = setup_fake("obxu", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
-    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+    sup.set_serve_options(None, false, LogCaptureMode::Metadata)
         .expect("the mode pins pre-lifecycle");
     let name = InstanceName::new("obxu").unwrap();
     sup.unlink_raw_logs_if_metadata(&registry, &name);
@@ -6682,7 +6208,7 @@ fn metadata_unlink_surfaces_a_stuck_raw_file_without_abandoning_the_cleanup() {
     let (_state, _manifest, registry) = setup_fake("obxs", &["--linger-ms", "600000"]);
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
-    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+    sup.set_serve_options(None, false, LogCaptureMode::Metadata)
         .expect("the mode pins pre-lifecycle");
     let name = InstanceName::new("obxs").unwrap();
     std::fs::create_dir_all(registry.agent_output_log_path(&name)).unwrap();
@@ -6709,7 +6235,7 @@ fn metadata_unlink_covers_the_crash_reap_path_too() {
         setup_fake("metak", &["--emit-usage", "2", "--linger-ms", "600000"]);
     let name = InstanceName::new("metak").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.set_serve_options(0, false, LogCaptureMode::Metadata)
+    sup.set_serve_options(None, false, LogCaptureMode::Metadata)
         .expect("the mode pins pre-lifecycle");
     sup.start(&registry, "metak").unwrap();
 
@@ -6773,7 +6299,7 @@ fn off_mode_spawns_null_streams_and_the_start_note_names_the_degraded_metering()
     let name = InstanceName::new("offc").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let sink = install_capture_sink(&mut sup);
-    sup.set_serve_options(0, false, LogCaptureMode::Off)
+    sup.set_serve_options(None, false, LogCaptureMode::Off)
         .expect("the mode pins pre-lifecycle");
     sup.start(&registry, "offc").unwrap();
     assert!(
@@ -6829,7 +6355,7 @@ fn a_midrun_drain_over_a_deleted_raw_log_is_an_honest_no_op() {
         setup_fake("obxd", &["--emit-usage", "2", "--linger-ms", "600000"]);
     let name = InstanceName::new("obxd").unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
-    sup.set_serve_options(0, false, LogCaptureMode::Full)
+    sup.set_serve_options(None, false, LogCaptureMode::Full)
         .expect("the mode pins pre-lifecycle");
     sup.start(&registry, "obxd").unwrap();
     let agent_log = registry.agent_output_log_path(&name);
@@ -7375,11 +6901,13 @@ fn adopting_a_prerecord_run_id_record_mints_and_persists_a_fresh_one() {
 }
 
 /// The shared engine-observed adoption setup: an ATTACHED engine-observed
-/// start under a real runtime, then the supervisor `mem::forget`-crashed
-/// (skipping its kill-on-drop — the in-process stand-in for a SIGKILLed
-/// engine, since a DETACHED observed start is refused by design). The child
-/// survives with a record whose owner is THIS process — always adoptable.
-/// Returns (state dir, manifest dir, registry, runtime, name).
+/// start under a real runtime (the supervisor claims a metering proxy URL —
+/// the fake port needs nothing listening, the value only forms the injected
+/// base URL), then the supervisor `mem::forget`-crashed (skipping its
+/// kill-on-drop — the in-process stand-in for a SIGKILLed engine, since a
+/// DETACHED observed start is refused by design). The child survives with a
+/// record whose owner is THIS process — always adoptable. Returns
+/// (state dir, manifest dir, registry, runtime, name).
 #[allow(clippy::type_complexity)]
 fn setup_observed_crashed_engine(
     name: &str,
@@ -7410,6 +6938,12 @@ fn setup_observed_crashed_engine(
         .build()
         .unwrap();
     let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
     sup.start(&registry, name).unwrap();
     assert_eq!(state_of(&registry, name), LifecycleState::Running);
     // The crash: forget, never drop — an ATTACHED drop is kill-on-drop, and
@@ -7419,50 +6953,51 @@ fn setup_observed_crashed_engine(
 }
 
 #[test]
-fn adopted_engine_observed_rebind_failure_is_surfaced_with_the_strand_note() {
-    // Story 17-2's re-bind, the Err arm: the adopting engine pins a FIXED
-    // metering port that is ALREADY TAKEN (a squatter socket) — the re-bind
-    // fails, the failure is SURFACED (AI-18), and because no listener landed,
-    // the stranded-observed-listener warning fires too (the instance's
-    // injected base_url still points at the dead port).
-    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eorebind");
-    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = squatter.local_addr().unwrap().port();
-
+fn an_adopted_engine_observed_agent_without_a_proxy_is_stranded_loudly() {
+    // Story 23-1: the adopting engine runs NO metering proxy (none was
+    // started, or its port was taken) — the adopted agent's base URL points
+    // at a proxy that is not listening, so the adoption says so with the
+    // remediation (surfaced, never silent: AI-18).
+    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eostrand");
+    // No set_serve_options: this supervisor has no proxy URL.
     let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
     let buffer = install_capture_sink(&mut sup2);
-    sup2.set_serve_options(port, false, LogCaptureMode::Full)
-        .unwrap();
     assert_eq!(
         sup2.adopt_orphans(&registry),
         1,
         "the crashed engine's live agent adopts"
     );
-    wait_for_sink_line(
+    let text = wait_for_sink_line(
         &buffer,
-        "could not re-bind the observed-metering",
-        "the re-bind failure note",
+        "this engine runs no metering proxy",
+        "the no-proxy strand note",
     );
-    let text = sink_text(&buffer);
     assert!(
-        text.contains("stranded observed listener"),
-        "the strand warning fires when no listener landed:\n{text}"
+        text.contains("stop the instance and start it again"),
+        "the note names the remediation: {text}"
     );
     // Cleanup (see the zombie note on runmint): the SIGKILL lands, the
     // confirmation may not — and `forget` skips Drop's armed-handle teardown
     // so a slow confirmation can never stall the test end.
     let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
     std::mem::forget(sup2);
-    drop(squatter);
 }
 
 #[test]
-fn adopted_engine_observed_config_read_failure_strands_openly() {
-    // The config-read Err arm: the adopted engine-observed instance's
-    // effective config cannot be read (a malformed instance layer) — the
-    // degraded posture is the pre-17-2 strand, SURFACED, with the same
-    // stranded-listener warning.
-    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eofconf");
+fn a_pre_proxy_adopted_agent_whose_upstream_cannot_be_read_gets_no_legacy_route() {
+    // Story 23-1 (Design Notes: Migration): an adopted engine-observed agent
+    // whose Run recorded NO upstream (a launch before the shared proxy) and
+    // whose config can no longer be read cannot be served by the legacy root
+    // route — the decision says so instead of guessing an upstream.
+    let (state, _manifest, registry, rt, name) = setup_observed_crashed_engine("eolegacy");
+    // Make the Run pre-proxy: drop its recorded upstream (a pre-proxy launch
+    // job never wrote one).
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
+    registry
+        .writer()
+        .call(move |ctx| ctx.store().record_run_upstream(&run, None))
+        .unwrap();
+    // Break the instance's config so the upstream cannot be re-resolved.
     std::fs::write(
         registry.paths().instance_config(&name),
         "this is = = not valid toml",
@@ -7471,22 +7006,26 @@ fn adopted_engine_observed_config_read_failure_strands_openly() {
 
     let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
     let buffer = install_capture_sink(&mut sup2);
-    sup2.set_serve_options(47211, false, LogCaptureMode::Full)
-        .unwrap();
+    sup2.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
     assert_eq!(sup2.adopt_orphans(&registry), 1);
-    wait_for_sink_line(
+    let text = wait_for_sink_line(
         &buffer,
-        "effective config could not be read",
-        "the config-read failure note",
+        "whose upstream could not be resolved",
+        "the unresolvable-upstream note",
     );
-    let text = sink_text(&buffer);
     assert!(
-        text.contains("stranded observed listener"),
-        "the strand warning fires here too:\n{text}"
+        text.contains("no legacy root route"),
+        "the note names the consequence: {text}"
     );
     // Cleanup (see the zombie note on runmint).
     let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
     std::mem::forget(sup2);
+    drop(state);
 }
 
 #[test]
@@ -7844,334 +7383,176 @@ fn readiness_timeout_death_recheck_failure_is_surfaced_on_the_timeout() {
     );
 }
 
-// ---- Story 19-2: the wire fence (`block`) ----
+// ---- Story 19-2 / 23-1: the `block` disposition over the ancestor chain ----
 
-/// A loopback upstream stub for the wire-fence legs: answers EVERY request
-/// with a fixed OpenAI-compatible completion (100 tokens of `usage`) and
-/// counts what it served — so "never forwarded" is a counter that did not
-/// move. Pure `std`, identical on every OS.
-struct FenceUpstream {
-    base_url: String,
-    served: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl FenceUpstream {
-    fn served(&self) -> u64 {
-        self.served.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-fn start_fence_upstream() -> FenceUpstream {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = Arc::clone(&served);
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            read_http_message(&mut stream);
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let body = r#"{"id":"c","object":"chat.completion","usage":{"prompt_tokens":30,"completion_tokens":70,"total_tokens":100}}"#;
-            let _ = std::io::Write::write_all(
-                &mut stream,
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                     Connection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-        }
-    });
-    FenceUpstream { base_url, served }
-}
-
-/// Read one HTTP/1.1 request (head + its Content-Length body) off `stream`.
-fn read_http_message(stream: &mut std::net::TcpStream) {
-    use std::io::Read;
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let Ok(n) = stream.read(&mut chunk) else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        buffer.extend_from_slice(&chunk[..n]);
-        if let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
-            let length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            if buffer.len() >= head_end + 4 + length {
-                return;
-            }
-        }
-    }
-}
-
-/// One HTTP/1.1 call to `base_url` (a loopback `http://` origin). Returns
-/// (status, lower-cased head, body).
-fn fence_http_call(base_url: &str, method: &str, path: &str, body: &str) -> (u16, String, String) {
-    use std::io::{Read, Write};
-    let authority = base_url.trim_start_matches("http://").trim_end_matches('/');
-    let mut stream = std::net::TcpStream::connect(authority).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
-    let text = String::from_utf8_lossy(&response).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(0);
-    (status, head.to_ascii_lowercase(), body.to_string())
-}
-
-/// Register an engine-observed instance forwarding to `upstream`, with
-/// `budget` keys and `budget.breach_action = block` written through the
-/// REAL config write (which accepts `block` because the source is
-/// engine-observed). Returns the dirs, registry, runtime and name.
-#[allow(clippy::type_complexity)]
-fn setup_block_instance(
-    name: &str,
-    upstream: &str,
-    budget: &[(&str, &str)],
-) -> (
-    tempfile::TempDir,
-    tempfile::TempDir,
-    Registry,
-    tokio::runtime::Runtime,
-    InstanceName,
-) {
-    let state = tempfile::tempdir().unwrap();
-    let manifest = tempfile::tempdir().unwrap();
-    write_observed_manifest(manifest.path(), name, &["--linger-ms", "600000"]);
-    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+/// The `block` bits the published snapshot holds for `run` (over its whole
+/// ancestor chain — the shared proxy refuses on exactly this).
+fn block_bits(registry: &Registry, run: &RunId) -> u8 {
     registry
-        .register_with_adapter(name, &AdapterRef::Manifest(manifest.path().to_path_buf()))
-        .unwrap();
-    let parsed = InstanceName::new(name).unwrap();
-    registry
-        .set_config(
-            &parsed,
-            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
-            upstream,
-        )
-        .unwrap();
-    for (key, value) in budget {
-        registry.set_config(&parsed, key, value).unwrap();
-    }
-    registry
-        .set_config(&parsed, config::BUDGET_BREACH_ACTION_KEY, "block")
-        .expect("block is accepted on an engine-observed instance");
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    (state, manifest, registry, rt, parsed)
+        .run_publisher()
+        .current()
+        .disposition_over(run)
+        .breach_block
 }
 
-/// The live listener's base URL for a supervised engine-observed instance.
-fn fence_listener_url(sup: &Supervisor, name: &InstanceName) -> String {
-    sup.running
-        .get(name)
-        .and_then(|supervised| supervised.observed_listener.as_ref())
-        .map(|listener| listener.base_url().to_string())
-        .expect("an engine-observed instance holds a listener")
-}
-
-/// Drive the observed drain (the reaper's cadence, run by the TEST) until
-/// `want` breach events are recorded for `name`.
-fn drain_observed_until_breaches(
-    sup: &mut Supervisor,
-    registry: &Registry,
-    name: &str,
-    want: usize,
-) -> Vec<BudgetBreachEvent> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        sup.drain_observed_all(registry);
-        let events = Supervisor::read_breach_events(registry, name).unwrap();
-        if events.len() >= want {
-            return events;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{name}: {want} breach events never recorded (have {})",
-            events.len()
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+/// The bit of one reason key (the shared vocabulary with the disposition).
+fn reason_bit(dimension: BreachDimension, scope: BreachScope) -> u8 {
+    crate::domain::runs::snapshot::Disposition::bit(governance::LatchKey::new(dimension, scope))
 }
 
 #[test]
-fn a_block_breach_raises_the_wire_fence_and_forward_refuses_model_calls() {
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fence",
-        &upstream.base_url,
-        &[("budget.tokens.per_run", "100")],
-    );
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    let buffer = install_capture_sink(&mut sup);
-    sup.start(&registry, "fence").unwrap();
-    let base = fence_listener_url(&sup, &name);
-
-    // The first call passes (the fence is down) and its 100 tokens reach the
-    // per-run ceiling once drained.
-    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 200);
-    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fence", 1);
-    assert_eq!(breaches.len(), 1);
-    assert_eq!(breaches[0].action, BreachAction::Block);
-    assert_eq!(breaches[0].scope, BreachScope::PerRun);
-    // `block` is not a lifecycle action: the agent keeps running.
-    assert_eq!(state_of(&registry, "fence"), LifecycleState::Running);
-    let notes = sink_text(&buffer);
-    assert!(notes.contains("the wire fence is UP"), "{notes}");
-    assert!(notes.contains("tokens_per_run"), "{notes}");
-
-    // The next model call is refused with the proxy-wire v1 contract and
-    // never reaches the upstream.
-    let (status, head, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402);
-    assert!(head.contains("x-should-retry: false"), "{head}");
-    assert!(head.contains("content-type: application/json"), "{head}");
-    assert!(!head.contains("retry-after"), "{head}");
-    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(value["error"]["type"], "hekma_budget_block");
-    assert_eq!(value["error"]["code"], "tokens_per_run");
-    assert_eq!(upstream.served(), 1, "a fenced call is never forwarded");
-    // A large upload is drained, so the client still reads the 402 (not a
-    // reset it would retry as a transport error).
-    let large = format!("{{\"pad\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
-    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", &large);
-    assert_eq!(status, 402);
-    assert_eq!(upstream.served(), 1);
-
-    // An `Expect: 100-continue` upload is answered without inviting the body.
-    {
-        use std::io::{Read, Write};
-        let authority = base.trim_start_matches("http://");
-        let mut stream = std::net::TcpStream::connect(authority).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        write!(
-            stream,
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\n\
-             Content-Type: application/json\r\nContent-Length: 1048576\r\n\
-             Expect: 100-continue\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut response = Vec::new();
-        let _ = stream.read_to_end(&mut response);
-        let text = String::from_utf8_lossy(&response);
-        assert!(text.starts_with("HTTP/1.1 402"), "{text}");
-        assert!(!text.contains("100 Continue"), "{text}");
-    }
-    assert_eq!(upstream.served(), 1);
-
-    // A safe method passes the fence (model listings and probes keep working).
-    let (status, _, _) = fence_http_call(&base, "GET", "/v1/models", "");
-    assert_eq!(status, 200);
-    assert_eq!(upstream.served(), 2);
-
-    // Later usage never re-fires the latched breach.
-    sup.drain_observed_all(&registry);
+fn a_block_breach_latches_the_snapshot_disposition_over_the_ancestor_chain() {
+    // Story 23-1: a committed `block` breach republishes the Run's snapshot
+    // entry with its reason bits BEFORE the batch acks — the shared proxy
+    // refuses the Run's next call (and every Run beneath it) on exactly this
+    // disposition; `block` is not a lifecycle action, so the agent keeps
+    // running. The HTTP-level refusal legs live in tests/shared_proxy.rs.
+    let (_state, _manifest, registry) = setup_fake("dispo", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispo").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 1\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "dispo").unwrap();
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
     assert_eq!(
-        Supervisor::read_breach_events(&registry, "fence")
+        block_bits(&registry, &run),
+        0,
+        "a Run under its ceiling starts with the fence down"
+    );
+    // One usage event over the ceiling: the commit evaluates, latches and
+    // republishes.
+    let usage = ParsedUsage {
+        sequence: 1,
+        input_tokens: 4,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &usage,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    assert_eq!(
+        block_bits(&registry, &run),
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun),
+        "the latched reason rides the snapshot before the caller is acked"
+    );
+    assert_eq!(state_of(&registry, "dispo"), LifecycleState::Running);
+    // Later usage never re-fires the latched breach.
+    let again = ParsedUsage {
+        sequence: 2,
+        ..usage
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &again,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "dispo")
             .unwrap()
             .len(),
         1
     );
-    sup.stop(&registry, "fence", Some(Duration::from_secs(5)))
+    sup.stop(&registry, "dispo", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
 #[test]
-fn a_new_run_over_a_cumulative_block_ceiling_is_fenced_from_its_first_call() {
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fencerun",
-        &upstream.base_url,
-        &[("budget.tokens.cumulative", "100")],
-    );
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "fencerun").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200
-    );
-    let first = drain_observed_until_breaches(&mut sup, &registry, "fencerun", 1);
-    assert_eq!(first[0].scope, BreachScope::Cumulative);
-    sup.stop(&registry, "fencerun", Some(Duration::from_secs(5)))
+fn an_ancestor_block_disposition_fences_the_runs_beneath() {
+    // AD-25: an ancestor's `block` reason applies over the Runs beneath it —
+    // a child Run's disposition-over walk sees the parent's bit.
+    let (_state, _manifest, registry) = setup_fake("dispokid", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispokid").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 1\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "dispokid").unwrap();
+    let parent = registry.instance_run(name.as_str()).unwrap().record.run_id;
+    let usage = ParsedUsage {
+        sequence: 1,
+        input_tokens: 4,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &parent,
+        "engine-observed",
+        &usage,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    // A child Run beneath the fenced parent (the wire hint shape).
+    let child = RunId::mint();
+    let child_after = child.clone();
+    let publisher = std::sync::Arc::clone(&registry.run_snapshot);
+    registry
+        .writer
+        .call(move |ctx| {
+            use crate::ports::{NewRun, RunRecords as _};
+            ctx.store().insert_run(&NewRun {
+                record: crate::domain::RunRecord {
+                    run_id: child.clone(),
+                    control_depth: crate::domain::ControlDepth::Wire,
+                    wire_path: true,
+                    status: crate::domain::runs::RunStatus::Active,
+                    anomalies: Vec::new(),
+                    parent_run_id: Some(parent.clone()),
+                    instance: Some("dispokid".to_string()),
+                    process_owner: false,
+                    end_cause: None,
+                    created_at: "t".to_string(),
+                    updated_at: "t".to_string(),
+                    ended_at: None,
+                },
+                labels: Vec::new(),
+                limits: Default::default(),
+                identity: None,
+            })?;
+            if let Some(entry) = crate::domain::runs::ops::refreshed_entry(ctx.store(), &child)? {
+                ctx.after_commit(move || publisher.publish_changes(vec![entry], Vec::new()));
+            }
+            Ok(())
+        })
         .unwrap();
-
-    // A new Run starts already over the cumulative ceiling: its fence is up
-    // before the first call, and the breach is recorded under the NEW run.
-    sup.start(&registry, "fencerun").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402, "{body}");
-    assert!(body.contains("tokens_cumulative"), "{body}");
-    assert_eq!(upstream.served(), 1);
-    let breaches = Supervisor::read_breach_events(&registry, "fencerun").unwrap();
-    assert_eq!(breaches.len(), 2, "{breaches:?}");
-    assert_ne!(breaches[0].run_id, breaches[1].run_id);
-    assert_eq!(breaches[1].action, BreachAction::Block);
-    sup.stop(&registry, "fencerun", Some(Duration::from_secs(5)))
+    assert_ne!(
+        block_bits(&registry, &child_after),
+        0,
+        "the parent's latched reason fences the child's calls too"
+    );
+    sup.stop(&registry, "dispokid", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
 #[test]
-fn a_run_under_its_block_ceiling_starts_with_the_fence_down() {
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fencedown",
-        &upstream.base_url,
-        &[("budget.tokens.cumulative", "1000")],
-    );
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "fencedown").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200
-    );
-    assert!(Supervisor::read_breach_events(&registry, "fencedown")
-        .unwrap()
-        .is_empty());
-    sup.stop(&registry, "fencedown", Some(Duration::from_secs(5)))
-        .unwrap();
-}
-
-#[test]
-fn adoption_rebuilds_the_wire_fence_from_the_breach_log() {
-    // The engine-restart / adoption leg: the resumed Run's `block` breach is
-    // in breaches.log, so the adopting engine re-raises the fence on its
-    // re-bound listener before serving traffic — and writes no duplicate.
-    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("fenceadopt");
+fn a_reopen_rebuilds_the_block_disposition_from_the_durable_latches() {
+    // The engine-restart leg (AD-25, story 23-1): the reasons are rebuilt at
+    // OPEN from the durable `run_latches` rows — whatever the configured
+    // action is NOW — so the first snapshot a restarted proxy reads already
+    // carries them. (The old adoption-time rebuild and its configured-action
+    // filter are retired by this story.)
+    let (state, _manifest, registry, _rt, name) = setup_observed_crashed_engine("disporeopen");
     registry
         .set_config(&name, "budget.tokens.per_run", "100")
         .unwrap();
     registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
+        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "warn")
         .unwrap();
     let run_id = registry
         .spawn_record(&name)
@@ -8188,134 +7569,37 @@ fn adoption_rebuilds_the_wire_fence_from_the_breach_log() {
         BreachAction::Block,
         "engine-observed",
     );
-    let port = {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
-
-    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
-    let buffer = install_capture_sink(&mut sup2);
-    sup2.set_serve_options(port, false, LogCaptureMode::Full)
-        .unwrap();
-    assert_eq!(sup2.adopt_orphans(&registry), 1);
-    let note = wait_for_sink_line(
-        &buffer,
-        "re-raised the wire fence",
-        "the fence rebuild note",
-    );
-    assert!(note.contains("tokens_per_run"), "{note}");
-    let (status, _, body) = fence_http_call(
-        &format!("http://127.0.0.1:{port}"),
-        "POST",
-        "/v1/chat/completions",
-        "{}",
-    );
-    assert_eq!(status, 402, "{body}");
+    // A second engine opens the same state dir: its open-time snapshot
+    // carries the latched reason — before it accepts anything — even though
+    // the configured action has moved off `block`.
+    let registry2 = Registry::open(Some(state.path().to_path_buf())).unwrap();
     assert_eq!(
-        Supervisor::read_breach_events(&registry, "fenceadopt")
+        registry2
+            .run_publisher()
+            .current()
+            .disposition_over(&run_id)
+            .breach_block,
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun),
+        "a latched `block` reason holds across a restart even if the action changed"
+    );
+    // And no duplicate breach is recorded by the reopen.
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "disporeopen")
             .unwrap()
             .len(),
-        1,
-        "adoption must not re-record the breach"
+        1
     );
-    // Cleanup (see the zombie note on runmint).
-    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
-    std::mem::forget(sup2);
 }
 
 #[test]
-fn adoption_does_not_rebuild_a_fence_once_the_action_is_no_longer_block() {
-    // The latch action filter extends to the fence: an operator who moved
-    // the action off `block` gets no rebuilt fence on adoption.
-    let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("fencemoved");
-    registry
-        .set_config(&name, "budget.tokens.per_run", "100")
-        .unwrap();
-    registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "warn")
-        .unwrap();
-    let run_id = registry
-        .spawn_record(&name)
-        .unwrap()
-        .and_then(|record| record.run_id)
-        .unwrap();
-    Supervisor::with_backoff(fast_backoff()).record_token_breach(
-        &registry,
-        &name,
-        &run_id,
-        BreachScope::PerRun,
-        100,
-        100,
-        BreachAction::Block,
-        "engine-observed",
-    );
-    let port = {
-        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
-    let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
-    let buffer = install_capture_sink(&mut sup2);
-    sup2.set_serve_options(port, false, LogCaptureMode::Full)
-        .unwrap();
-    assert_eq!(sup2.adopt_orphans(&registry), 1);
-    wait_for_sink_line(
-        &buffer,
-        "re-bound the observed-metering listener",
-        "the re-bind note",
-    );
-    assert!(!sink_text(&buffer).contains("re-raised the wire fence"));
-    let fence = sup2
-        .running
-        .get(&name)
-        .and_then(|supervised| supervised.observed_listener.as_ref())
-        .map(ObservedListener::fence)
-        .unwrap();
-    assert!(fence.refusal().is_none());
-    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
-    std::mem::forget(sup2);
-}
-
-#[test]
-fn an_adopted_block_run_without_a_listener_says_its_fence_was_not_rebuilt() {
-    // An ephemeral-port adopter cannot re-bind, so the fence has nowhere to
-    // live: surfaced, never silent.
-    let (_state, _manifest, registry, _rt, name) = setup_observed_crashed_engine("fencestrand");
-    registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
-        .unwrap();
-    let run_id = registry
-        .spawn_record(&name)
-        .unwrap()
-        .and_then(|record| record.run_id)
-        .unwrap();
-    Supervisor::with_backoff(fast_backoff()).record_token_breach(
-        &registry,
-        &name,
-        &run_id,
-        BreachScope::Cumulative,
-        100,
-        100,
-        BreachAction::Block,
-        "engine-observed",
-    );
-    let mut sup2 = Supervisor::with_backoff(fast_backoff());
-    let buffer = install_capture_sink(&mut sup2);
-    assert_eq!(sup2.adopt_orphans(&registry), 1);
-    let note = wait_for_sink_line(&buffer, "wire fence (", "the not-rebuilt note");
-    assert!(note.contains("could not be"), "{note}");
-    assert!(note.contains("tokens_cumulative"), "{note}");
-    let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
-    std::mem::forget(sup2);
-}
-
-#[test]
-fn block_with_no_listener_records_the_breach_and_acts_as_warn_loudly() {
+fn block_without_a_wire_path_records_the_breach_and_acts_as_warn_loudly() {
     // A hand-edited instance layer reaches `block` on a self-reported
     // instance (the config write would refuse it): the breach is recorded,
-    // nothing is fenced, and the diagnostic says so.
+    // nothing is fenced (its calls do not pass through the metering proxy),
+    // and the diagnostic says so.
     let (state, _manifest, registry) =
-        setup_fake("fencenone", &["--emit-usage", "2", "--linger-ms", "600000"]);
-    let name = InstanceName::new("fencenone").unwrap();
+        setup_fake("dispowarn", &["--emit-usage", "2", "--linger-ms", "600000"]);
+    let name = InstanceName::new("dispowarn").unwrap();
     std::fs::write(
         registry.paths().instance_config(&name),
         "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 1\n",
@@ -8323,24 +7607,27 @@ fn block_with_no_listener_records_the_breach_and_acts_as_warn_loudly() {
     .unwrap();
     let mut sup = Supervisor::with_backoff(fast_backoff());
     let buffer = install_capture_sink(&mut sup);
-    sup.start(&registry, "fencenone").unwrap();
-    drain_until_committed(&mut sup, &registry, state.path(), "fencenone", 1);
-    let breaches = Supervisor::read_breach_events(&registry, "fencenone").unwrap();
+    sup.start(&registry, "dispowarn").unwrap();
+    drain_until_committed(&mut sup, &registry, state.path(), "dispowarn", 1);
+    let breaches = Supervisor::read_breach_events(&registry, "dispowarn").unwrap();
     assert_eq!(breaches.len(), 1, "{breaches:?}");
     assert_eq!(breaches[0].action, BreachAction::Block);
-    assert_eq!(state_of(&registry, "fencenone"), LifecycleState::Running);
+    assert_eq!(state_of(&registry, "dispowarn"), LifecycleState::Running);
     let notes = sink_text(&buffer);
-    assert!(notes.contains("no wire listener to fence"), "{notes}");
+    assert!(
+        notes.contains("do not pass through the metering proxy"),
+        "{notes}"
+    );
     assert!(notes.contains("acts as `warn`"), "{notes}");
     assert!(notes.contains("self-reported"), "{notes}");
-    sup.stop(&registry, "fencenone", Some(Duration::from_secs(5)))
+    sup.stop(&registry, "dispowarn", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
 #[test]
-fn the_config_write_refuses_block_on_an_instance_without_a_listener() {
-    let (_state, _manifest, registry) = setup_fake("fencecfg", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("fencecfg").unwrap();
+fn the_config_write_refuses_block_on_an_instance_without_a_wire_path() {
+    let (_state, _manifest, registry) = setup_fake("dispocfg", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispocfg").unwrap();
     let path = registry.paths().instance_config(&name);
     let before = std::fs::read(&path).ok();
     for value in ["block", " block "] {
@@ -8366,13 +7653,13 @@ fn the_config_write_refuses_block_on_an_instance_without_a_listener() {
 }
 
 #[test]
-fn a_relaunch_keeps_its_run_so_a_per_run_block_fence_carries() {
+fn a_relaunch_keeps_its_run_so_a_per_run_block_reason_carries() {
     // Story 21-2: a Restart Policy relaunch keeps its Run, so the Run-start
     // fence evaluates the KEPT Run's per-run totals — a per-run `block`
-    // ceiling it already crossed fences the relaunched listener before its
-    // first call; a fresh Run (no kept id) starts at zero.
-    let (_state, _manifest, registry) = setup_fake("fencerelaunch", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("fencerelaunch").unwrap();
+    // ceiling it already crossed raises the reason bits before the
+    // relaunched agent's first call; a fresh Run (no kept id) starts at zero.
+    let (_state, _manifest, registry) = setup_fake("disporelaunch", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("disporelaunch").unwrap();
     std::fs::write(
         registry.paths().instance_config(&name),
         "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 10\n",
@@ -8395,11 +7682,13 @@ fn a_relaunch_keeps_its_run_so_a_per_run_block_fence_carries() {
         DrainMode::MidRun,
     )
     .unwrap();
-    let fresh = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fresh, None));
-    let relaunched = crate::metering::WireFence::default();
-    assert!(sup.run_start_fence(&registry, &name, &relaunched, Some(&kept)));
-    assert_eq!(relaunched.refusal().unwrap().code, "tokens_per_run");
+    assert_eq!(sup.run_start_fence(&registry, &name, None), 0);
+    let bits = sup.run_start_fence(&registry, &name, Some(&kept));
+    assert_eq!(
+        bits,
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun),
+        "the kept Run's spent per-run ceiling raises its reason bits"
+    );
 }
 
 #[test]
@@ -8408,11 +7697,9 @@ fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
     // configuration-bound labels select (the Run row does not exist yet at
     // fence time). A named Policy's `block` CUMULATIVE ceiling over an
     // already-spent lifetime refuses the agent's very first model call —
-    // 19-2's guarantee, extended to Policy-sourced ceilings. Before the
-    // fix the fresh-start resolve carried no labels, resolved the default
-    // `warn`, and let the first call through.
-    let (_state, _manifest, registry) = setup_fake("fencepolicy", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("fencepolicy").unwrap();
+    // 19-2's guarantee, extended to Policy-sourced ceilings.
+    let (_state, _manifest, registry) = setup_fake("dispopolicy", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispopolicy").unwrap();
     std::fs::write(
         registry.paths().instance_config(&name),
         "[labels]\nteam = \"core\"\n",
@@ -8455,7 +7742,7 @@ fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
                     status: crate::domain::runs::RunStatus::Ended,
                     anomalies: Vec::new(),
                     parent_run_id: None,
-                    instance: Some("fencepolicy".to_string()),
+                    instance: Some("dispopolicy".to_string()),
                     process_owner: true,
                     end_cause: Some("stopped".to_string()),
                     created_at: "t".to_string(),
@@ -8468,7 +7755,7 @@ fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
             })?;
             store.insert_usage(
                 &crate::domain::usage::UsageEvent {
-                    instance: Some("fencepolicy".to_string()),
+                    instance: Some("dispopolicy".to_string()),
                     call_id: None,
                     run_id: seed_usage,
                     input_tokens: 1_500_000,
@@ -8484,30 +7771,29 @@ fn a_fresh_run_under_a_policy_block_ceiling_is_fenced_before_its_first_call() {
             Ok(())
         })
         .unwrap();
-    assert!(Supervisor::read_breach_events(&registry, "fencepolicy")
+    assert!(Supervisor::read_breach_events(&registry, "dispopolicy")
         .unwrap()
         .is_empty());
     // The FRESH start fences: the Policy's cumulative `block` ceiling
     // refuses the first call.
-    let fresh = crate::metering::WireFence::default();
-    assert!(
-        sup.run_start_fence(&registry, &name, &fresh, None),
+    let bits = sup.run_start_fence(&registry, &name, None);
+    assert_eq!(
+        bits,
+        reason_bit(BreachDimension::Tokens, BreachScope::Cumulative),
         "the Policy's cumulative block ceiling fences the fresh Run"
     );
-    assert_eq!(fresh.refusal().unwrap().code, "tokens_cumulative");
     // `block_configured` agrees (the spawn path's belt-and-braces check).
     assert!(sup.block_configured(&registry, &name));
     // Without the label the Policy does not select: no fence.
     registry.set_config(&name, "labels.team", "other").unwrap();
     sup.sync_run_labels(&registry, &name);
-    let unfenced = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &unfenced, None));
+    assert_eq!(sup.run_start_fence(&registry, &name, None), 0);
 }
 
 #[test]
 fn block_is_never_the_resolved_default() {
-    let (_state, _manifest, registry) = setup_fake("fencedefault", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("fencedefault").unwrap();
+    let (_state, _manifest, registry) = setup_fake("dispodefault", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispodefault").unwrap();
     let sup = Supervisor::with_backoff(fast_backoff());
     assert!(!sup.block_configured(&registry, &name));
     let effective = registry
@@ -8521,148 +7807,120 @@ fn block_is_never_the_resolved_default() {
 }
 
 #[test]
-fn a_dollar_block_breach_fences_with_the_dollar_code() {
-    // The money dimension: 100 tokens at $1000/1M each way is $0.10, which
-    // reaches a $0.05 per-run Cost Cap; the fence then names the dollar code.
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fencedollar",
-        &upstream.base_url,
-        &[
-            ("cost.rate.input", "1000.00"),
-            ("cost.rate.output", "1000.00"),
-            ("budget.dollars.per_run", "0.05"),
-        ],
-    );
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "fencedollar").unwrap();
-    let base = fence_listener_url(&sup, &name);
+fn a_dollar_block_reason_carries_the_dollar_bits() {
+    // The money dimension: the run-start fence raises the dollar reason bits
+    // for a Run already over a per-run Cost Cap (the HTTP legs live in
+    // tests/shared_proxy.rs).
+    let (_state, _manifest, registry) = setup_fake("dispodollar", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispodollar").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 10\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let kept = RunId::mint();
+    let usage = ParsedUsage {
+        sequence: 1,
+        input_tokens: 8,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &kept,
+        "engine-observed",
+        &usage,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    let bits = sup.run_start_fence(&registry, &name, Some(&kept));
     assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200
+        bits,
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun),
+        "the token ceiling the spent Run crossed carries"
     );
-    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencedollar", 1);
-    assert_eq!(breaches[0].dimension, BreachDimension::Dollars);
-    assert_eq!(breaches[0].action, BreachAction::Block);
-    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402, "{body}");
-    assert!(body.contains("\"code\":\"dollars_per_run\""), "{body}");
-    assert!(body.contains("\"dimension\":\"dollars\""), "{body}");
-    assert_eq!(upstream.served(), 1);
-    sup.stop(&registry, "fencedollar", Some(Duration::from_secs(5)))
-        .unwrap();
-}
-
-#[test]
-fn a_new_run_over_a_cumulative_dollar_block_cap_is_fenced_from_its_first_call() {
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fencedollarrun",
-        &upstream.base_url,
-        &[
-            ("cost.rate.input", "1000.00"),
-            ("cost.rate.output", "1000.00"),
-            ("budget.dollars.cumulative", "0.05"),
-        ],
-    );
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "fencedollarrun").unwrap();
-    let base = fence_listener_url(&sup, &name);
     assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200
+        bits & reason_bit(BreachDimension::Dollars, BreachScope::PerRun),
+        0
     );
-    drain_observed_until_breaches(&mut sup, &registry, "fencedollarrun", 1);
-    sup.stop(&registry, "fencedollarrun", Some(Duration::from_secs(5)))
-        .unwrap();
-    sup.start(&registry, "fencedollarrun").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402, "{body}");
-    assert!(body.contains("dollars_cumulative"), "{body}");
-    assert_eq!(upstream.served(), 1);
-    sup.stop(&registry, "fencedollarrun", Some(Duration::from_secs(5)))
-        .unwrap();
 }
 
 #[test]
-fn an_acp_instance_accepts_block_only_once_it_meters_through_the_listener() {
-    // The acp kind's source resolves from its effective config: without an
-    // upstream it is self-reported (refused); with one it is engine-observed.
-    let state = tempfile::tempdir().unwrap();
-    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
-    registry
-        .register_with_adapter("fenceacp", &AdapterRef::Native("acp".to_string()))
-        .unwrap();
-    let name = InstanceName::new("fenceacp").unwrap();
-    match registry.set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block") {
-        Err(config::ConfigError::InvalidValue { reason, .. }) => {
-            assert!(reason.contains("`self-reported`"), "{reason}");
-        }
-        other => panic!("expected a refusal, got {other:?}"),
-    }
-    registry
-        .set_config(
-            &name,
-            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
-            "http://127.0.0.1:9",
-        )
-        .unwrap();
-    registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
-        .expect("an engine-observed acp instance accepts block");
-}
-
-#[test]
-fn switching_to_block_after_a_recorded_breach_raises_the_fence_on_the_next_usage() {
+fn switching_to_block_after_a_recorded_breach_latches_on_the_next_usage() {
     // Story 21-1: the durable latch is keyed by action, so moving a Run's
     // action from `warn` to `block` after the warn breach fires the breach
-    // ONCE more under `block` on the next usage — a durable block record
-    // (which a restart rebuilds the fence from) and the fence itself.
-    let upstream = start_fence_upstream();
-    let (_state, _manifest, registry, rt, name) = setup_block_instance(
-        "fencelate",
-        &upstream.base_url,
-        &[("budget.tokens.per_run", "100")],
-    );
-    registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "warn")
-        .unwrap();
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    let buffer = install_capture_sink(&mut sup);
-    sup.start(&registry, "fencelate").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200
-    );
-    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencelate", 1);
-    assert_eq!(breaches[0].action, BreachAction::Warn);
-    assert_eq!(
-        fence_http_call(&base, "POST", "/v1/chat/completions", "{}").0,
-        200,
-        "warn does not fence"
-    );
-    registry
-        .set_config(&name, config::BUDGET_BREACH_ACTION_KEY, "block")
-        .unwrap();
+    // ONCE more under `block` on the next usage — a durable block record and
+    // the snapshot disposition it republishes.
+    let (_state, _manifest, registry) = setup_fake("dispolate", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispolate").unwrap();
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"warn\"\n[budget.tokens]\nper_run = 1\n",
+    )
+    .unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "dispolate").unwrap();
+    let run = registry.instance_run(name.as_str()).unwrap().record.run_id;
+    let one = ParsedUsage {
+        sequence: 1,
+        input_tokens: 4,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &one,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    assert_eq!(block_bits(&registry, &run), 0, "warn does not latch");
+    // Move the action to `block` (a hand-edited layer — the config write
+    // would refuse `block` on this self-reported fake).
+    std::fs::write(
+        registry.paths().instance_config(&name),
+        "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 1\n",
+    )
+    .unwrap();
     // The next committed usage event runs enforcement, which records the
-    // breach under `block` and raises the fence.
-    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencelate", 2);
-    assert_eq!(breaches[1].action, BreachAction::Block);
-    assert!(sink_text(&buffer).contains("the wire fence is UP"));
-    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402, "{body}");
-    assert_eq!(upstream.served(), 2);
-    // Latched under `block` now: later usage records nothing more.
-    sup.drain_observed_all(&registry);
+    // breach under `block` and republishes the disposition.
+    let two = ParsedUsage { sequence: 2, ..one };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &two,
+        DrainMode::MidRun,
+    )
+    .unwrap();
     assert_eq!(
-        Supervisor::read_breach_events(&registry, "fencelate")
+        block_bits(&registry, &run),
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun),
+        "the block breach latches the disposition"
+    );
+    // Latched under `block` now: later usage records nothing more.
+    let three = ParsedUsage { sequence: 3, ..one };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &three,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    assert_eq!(
+        Supervisor::read_breach_events(&registry, "dispolate")
             .unwrap()
             .len(),
         2
     );
-    sup.stop(&registry, "fencelate", Some(Duration::from_secs(5)))
+    sup.stop(&registry, "dispolate", Some(Duration::from_secs(5)))
         .unwrap();
 }
 
@@ -8671,8 +7929,8 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
     // The pre-spawn evaluation itself: a zero per-run ceiling breaches on
     // zero, so a fresh Run is fenced before its first call — for `block`
     // only.
-    let (_state, _manifest, registry) = setup_fake("fencestart", &["--linger-ms", "600000"]);
-    let name = InstanceName::new("fencestart").unwrap();
+    let (_state, _manifest, registry) = setup_fake("dispostart", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("dispostart").unwrap();
     let path = registry.paths().instance_config(&name);
     let sup = Supervisor::with_backoff(fast_backoff());
 
@@ -8681,27 +7939,24 @@ fn the_run_start_fence_rises_before_any_usage_and_only_for_block() {
         "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 0\n",
     )
     .unwrap();
-    let fence = crate::metering::WireFence::default();
-    assert!(sup.run_start_fence(&registry, &name, &fence, None));
-    assert_eq!(fence.refusal().unwrap().code, "tokens_per_run");
+    assert_eq!(
+        sup.run_start_fence(&registry, &name, None),
+        reason_bit(BreachDimension::Tokens, BreachScope::PerRun)
+    );
 
     std::fs::write(
         &path,
         "[budget]\nbreach_action = \"pause\"\n[budget.tokens]\nper_run = 0\n",
     )
     .unwrap();
-    let fence = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fence, None));
-    assert!(fence.refusal().is_none());
+    assert_eq!(sup.run_start_fence(&registry, &name, None), 0);
 
     std::fs::write(
         &path,
         "[budget]\nbreach_action = \"block\"\n[budget.tokens]\nper_run = 10\n",
     )
     .unwrap();
-    let fence = crate::metering::WireFence::default();
-    assert!(!sup.run_start_fence(&registry, &name, &fence, None));
-    assert!(fence.refusal().is_none());
+    assert_eq!(sup.run_start_fence(&registry, &name, None), 0);
 }
 
 #[test]
@@ -8733,15 +7988,14 @@ fn a_degraded_run_start_fence_read_still_decides_on_the_degraded_total() {
     let sink = install_capture_sink(&mut sup);
     sup.totals_read_fault_names.insert(name.clone());
 
-    let fence = crate::metering::WireFence::default();
-    assert!(
+    assert_eq!(
         // `None` = a fresh Run (story 21-2): the per-run total is zero by
         // construction and NO per-run ceiling is armed, so only the
         // fault-armed CUMULATIVE read decides.
-        sup.run_start_fence(&registry, &name, &fence, None),
+        sup.run_start_fence(&registry, &name, None),
+        reason_bit(BreachDimension::Tokens, BreachScope::Cumulative),
         "a degraded cumulative read must not skip the fence decision"
     );
-    assert_eq!(fence.refusal().unwrap().code, "tokens_cumulative");
 
     // SURFACED: the diagnostic names the instance + the degraded scope.
     let text = sink_text(&sink);
@@ -8778,12 +8032,11 @@ fn a_degraded_run_start_fence_read_fails_open_for_a_nonzero_cumulative_ceiling()
     let sink = install_capture_sink(&mut sup);
     sup.totals_read_fault_names.insert(name.clone());
 
-    let fence = crate::metering::WireFence::default();
-    assert!(
-        !sup.run_start_fence(&registry, &name, &fence, None),
+    assert_eq!(
+        sup.run_start_fence(&registry, &name, None),
+        0,
         "a non-zero ceiling must not fire on the fabricated zero (failing closed is deferred work)"
     );
-    assert!(fence.refusal().is_none());
 
     // Fail-open never means silent: the degraded read is still surfaced,
     // naming the instance + the degraded scope.
@@ -8942,12 +8195,12 @@ fn a_failed_breach_record_commit_is_surfaced_and_the_record_is_absent() {
 }
 
 #[test]
-fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
-    // Story 21-1 (the adoption sequence-reset undercount): the adopting
-    // engine's listener mints observed sequences from 0 again under the
-    // RESUMED run id. The previous attach already committed sequence 0, so
-    // without a new launch generation the next event read as a replay and
-    // was dropped. Adoption bumps the generation; both events count.
+fn adoption_keeps_the_launch_generation_and_a_replayed_sequence_still_dedups() {
+    // Story 23-1 retires the adoption-time launch-generation bump (21-1's
+    // deferred entry): engine-observed usage keys on call ids now, so there
+    // is no engine-minted sequence that could restart at a new attach — and
+    // a self-reported event the agent re-emits after an adoption still
+    // replays under the UNCHANGED generation (dedup, never a double count).
     let (_state, _manifest, registry, rt, name) = setup_observed_crashed_engine("genadopt");
     let run_id = registry
         .spawn_record(&name)
@@ -8982,23 +8235,12 @@ fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
 
     let mut sup2 = Supervisor::with_runtime(rt.handle().clone());
     assert_eq!(sup2.adopt_orphans(&registry), 1);
-    assert_eq!(registry.launch_generation(&name).unwrap(), before + 1);
-    let update = sup2
-        .ingest_usage(
-            &registry,
-            &name,
-            &run_id,
-            "engine-observed",
-            &usage,
-            DrainMode::MidRun,
-        )
-        .unwrap();
-    assert!(
-        update.is_some(),
-        "the adopted attach's sequence 0 is a new event"
+    assert_eq!(
+        registry.launch_generation(&name).unwrap(),
+        before,
+        "adoption changes no credential and no generation"
     );
-    assert_eq!(registry.usage_totals(&name).unwrap().total_tokens(), 84);
-    // The same event again under the SAME attach is still a replay.
+    // The same event re-emitted under the resumed attach is a replay.
     assert!(sup2
         .ingest_usage(
             &registry,
@@ -9010,6 +8252,7 @@ fn adoption_bumps_the_launch_generation_so_a_restarted_sequence_still_counts() {
         )
         .unwrap()
         .is_none());
+    assert_eq!(registry.usage_totals(&name).unwrap().total_tokens(), 42);
     let _ = sup2.stop(&registry, name.as_str(), Some(Duration::from_millis(250)));
     std::mem::forget(sup2);
 }
@@ -9607,6 +8850,7 @@ fn an_unsupervised_instances_re_resolve_uses_fresh_inputs() {
         labels: vec![crate::domain::Label::bound("team", "ghost")],
         fresh: true,
         inputs: None,
+        upstream: None,
     };
     registry.ensure_supervised_run(run).unwrap();
     // A first change resolves and stores a row (no explicit inputs yet).
@@ -10067,22 +9311,43 @@ fn the_supervisors_delete_of_a_corrupt_policy_row_plans_and_deletes_by_name() {
 
 #[test]
 fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
-    // Round 3, M1's fence half: engine A's listener fence holds a `block`
-    // reason whose latch engine B's raise removed. A's tick reload clears
-    // the orphaned fence reason — the fence comes DOWN without a new
-    // breach.
-    let upstream = start_fence_upstream();
-    let (state, _manifest, registry, rt, name) =
-        setup_block_instance("fencreload", &upstream.base_url, &[("labels.team", "core")]);
+    // Round 3, M1's fence half (story 23-1 shape): engine A's snapshot
+    // carries a `block` reason whose latch engine B's raise removed. A's
+    // tick notices B's commit (`PRAGMA data_version`), reloads the Runs and
+    // republishes the entry — the fence comes DOWN without a new breach.
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), "fencreload", &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "fencreload",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("fencreload").unwrap();
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+    registry.set_config(&name, "labels.team", "core").unwrap();
+    // A `block` Policy at 10 tokens per run (the run has a wire path, so the
+    // action executes; a Policy change is also what a FOREIGN engine can
+    // raise below).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "fencreload").unwrap();
-    let base = fence_listener_url(&sup, &name);
-    let run = open_run(&registry, "fencreload").record.run_id;
-    // One proxied call generates the observed usage the breach needs.
-    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 200);
-    // A `block` Policy at 10 tokens per run: the observed usage breaches
-    // and the fence goes up.
+    sup.set_serve_options(
+        Some("http://127.0.0.1:9".to_string()),
+        false,
+        LogCaptureMode::Full,
+    )
+    .unwrap();
     sup.change_policy(
         &registry,
         crate::domain::PolicyChange {
@@ -10099,13 +9364,28 @@ fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
         false,
     )
     .unwrap();
-    let breaches = drain_observed_until_breaches(&mut sup, &registry, "fencreload", 1);
-    assert_eq!(breaches[0].action, BreachAction::Block);
-    let (status, _, _) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 402, "the block breach fenced the listener");
+    sup.start(&registry, "fencreload").unwrap();
+    let run = open_run(&registry, "fencreload").record.run_id;
+    // One usage event over the ceiling: the block breach latches and the
+    // disposition goes up.
+    let usage = ParsedUsage {
+        sequence: 1,
+        input_tokens: 8,
+        output_tokens: 4,
+        cached_tokens: 0,
+    };
+    sup.ingest_usage(
+        &registry,
+        &name,
+        &run,
+        "engine-observed",
+        &usage,
+        DrainMode::MidRun,
+    )
+    .unwrap();
+    assert_ne!(block_bits(&registry, &run), 0, "the block breach latched");
     // ENGINE B (no supervision of the agent) RAISES the ceiling above the
-    // usage: the latch unlatches, and engine A's tick clears the orphaned
-    // fence reason.
+    // usage: the latch unlatches, through a commit FOREIGN to A.
     let second = Registry::open(Some(state.path().to_path_buf())).unwrap();
     second
         .apply_policy_change(
@@ -10129,13 +9409,17 @@ fn a_foreign_raise_lifts_the_supervising_engines_fence_on_its_tick() {
         registry.reader().latches(&run).unwrap().is_empty(),
         "the foreign raise unlatched"
     );
-    // Engine A's TICK (the reaper cadence): the reload's re-check clears
-    // the fence reason whose latch is gone.
-    sup.drain_usage_all(&registry);
-    let (status, _, body) = fence_http_call(&base, "POST", "/v1/chat/completions", "{}");
-    assert_eq!(status, 200, "the fence lifted on the reload: {body}");
+    // Engine A's TICK (the reaper cadence): the data-version reload
+    // republishes the Run's entry and the reason whose latch is gone lifts.
+    let _ = sup.poll_once(&registry);
+    assert_eq!(
+        block_bits(&registry, &run),
+        0,
+        "the fence lifted on the reload"
+    );
     sup.stop(&registry, "fencreload", Some(Duration::from_secs(5)))
         .unwrap();
+    drop(rt);
 }
 
 #[test]
@@ -11025,6 +10309,7 @@ fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
                 labels: Vec::new(),
                 fresh: true,
                 inputs: None,
+                upstream: None,
             };
             let generation = ctx.store().bump_launch_generation(&n)?;
             let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
@@ -11105,112 +10390,4 @@ fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
     assert_eq!(state_of(&registry, "exits"), LifecycleState::Failed);
     assert_eq!(key_state(&registry), TokenState::Revoked);
     assert!(!indexed(&registry));
-}
-
-/// Story 22-1 (the security review's L3): a credential an agent sends in a
-/// URL to its metering listener is refused there AND revoked by the reaper,
-/// through the same resolved-only path as the Control API — an unknown
-/// token-shaped value costs no writer job.
-#[test]
-fn a_token_the_metering_listener_saw_in_a_url_is_revoked_by_the_reaper() {
-    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
-    use crate::ports::RunRecords as _;
-    use std::sync::atomic::Ordering;
-    let state = tempfile::tempdir().unwrap();
-    let manifest = tempfile::tempdir().unwrap();
-    write_observed_manifest(manifest.path(), "urlkey", &["--linger-ms", "600000"]);
-    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
-    registry
-        .register_with_adapter(
-            "urlkey",
-            &AdapterRef::Manifest(manifest.path().to_path_buf()),
-        )
-        .unwrap();
-    let name = InstanceName::new("urlkey").unwrap();
-    // Nothing is ever forwarded: a refused request never dials.
-    registry
-        .set_config(
-            &name,
-            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
-            "http://127.0.0.1:9",
-        )
-        .unwrap();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut sup = Supervisor::with_runtime(rt.handle().clone());
-    sup.start(&registry, "urlkey").unwrap();
-    let _guard = kill_guard(&registry, "urlkey");
-    let owner = open_run(&registry, "urlkey").record.run_id;
-    let mut request = crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(owner));
-    request.issue_credentials = true;
-    let opened = sup
-        .open_child_run_as(&registry, crate::domain::RunActor::Operator, request)
-        .unwrap();
-    let issued = opened.credentials.unwrap();
-    let state_of_token = |secret: &crate::domain::SecretString| {
-        let hash = hash_presented(secret);
-        registry
-            .store
-            .snapshot(|store| store.token(&hash))
-            .unwrap()
-            .unwrap()
-            .state
-    };
-    let base = fence_listener_url(&sup, &name);
-    let jobs = || registry.writer().stats().jobs.load(Ordering::Relaxed);
-    // Unknown token-shaped values: refused, and the drain writes nothing.
-    for class in [TokenClass::RunKey, TokenClass::Refresh] {
-        let noise = mint(class).unwrap();
-        let path = format!("/v1/models/{}", noise.secret().expose_secret());
-        assert_eq!(fence_http_call(&base, "GET", &path, "").0, 400);
-    }
-    let before = jobs();
-    sup.drain_observed_all(&registry);
-    assert_eq!(jobs(), before, "an unresolved token costs no writer job");
-    // The Run Key and the refresh credential, each in a URL (the query,
-    // lowercased): refused, then revoked at the next drain.
-    for (secret, path) in [
-        (
-            issued.run_key(),
-            format!("/v1/models/{}", issued.run_key().expose_secret()),
-        ),
-        (
-            issued.refresh_credential(),
-            format!(
-                "/v1/chat/completions?k={}",
-                issued
-                    .refresh_credential()
-                    .expose_secret()
-                    .to_ascii_lowercase()
-            ),
-        ),
-    ] {
-        assert_eq!(fence_http_call(&base, "POST", &path, "{}").0, 400);
-        assert_eq!(state_of_token(secret), TokenState::Active);
-    }
-    sup.drain_observed_all(&registry);
-    assert_eq!(state_of_token(issued.run_key()), TokenState::Revoked);
-    assert_eq!(
-        state_of_token(issued.refresh_credential()),
-        TokenState::Revoked
-    );
-    assert!(!registry
-        .run_snapshot()
-        .keys
-        .contains_key(&hash_presented(issued.run_key())));
-    let causes: Vec<_> = registry
-        .store
-        .snapshot(|store| store.run_tokens(&opened.view.record.run_id))
-        .unwrap()
-        .into_iter()
-        .map(|row| row.revoke_cause)
-        .collect();
-    assert!(causes
-        .iter()
-        .all(|cause| cause.as_deref() == Some("exposed-in-url")));
-    sup.stop(&registry, "urlkey", Some(Duration::from_secs(5)))
-        .unwrap();
 }

@@ -196,13 +196,20 @@ impl Supervisor {
         // agent-output log into the Usage Ledger while an instance is `running`.
         // Best-effort per instance; a drain hiccup never blocks crash detection.
         self.drain_usage_all(registry);
-        // Then INGEST engine-observed usage (story 3-4): drain each observed
-        // instance's listener queue (the counts the loopback proxy parsed out of the
-        // agent's model traffic) into the SAME `ingest_usage` choke point, minting
-        // the per-Run `sequence`. This reaper cadence (~250ms) lands observed usage
-        // well within the AD-7/FR-19 flush bound (≤5s) of call completion. Best-
-        // effort per instance, exactly like the self-reported drain.
-        self.drain_observed_all(registry);
+        // Then PUBLISH and ACT on the shared proxy's committed closes (story
+        // 23-1): each proxied call's usage row and budget evaluation already
+        // committed in the store writer; the inbox carries them here in
+        // commit order (usage event, breaches, Run events, then pause/stop).
+        self.drain_proxy_inbox(registry);
+        // Story 23-1 (cross-process freshness): a foreign engine's commits
+        // (a revocation, a binding, a Run end) reach the published snapshot
+        // here, off the hot path — once per changed tick.
+        if let Err(err) = registry.poll_foreign_commits() {
+            self.emit_diagnostic(&format!(
+                "a foreign engine's changes could not be reloaded into the Run snapshot \
+                 ({err}); it stays at its last good state until the next change"
+            ));
+        }
 
         // Then DRAIN each running acp instance's surfaced notices (story 14-1,
         // spine AD-19): malformed lines, permission denials, usage updates,
@@ -401,12 +408,9 @@ impl Supervisor {
             // rest. Story 14-3 (T3): an acp instance's stderr sentinel channel
             // drains here too, under the same terminal rule (its own cursor).
             self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
-            // Drain any final ENGINE-OBSERVED usage still queued before the crashed
-            // instance's listener is torn down (story 3-4): a completion parsed just
-            // before the crash must land, not be lost when the `Supervised` is
-            // removed below. TERMINAL mode (story 12-4): a commit failure here
-            // announces the loss — no next pass.
-            self.drain_observed_for(registry, &name, DrainMode::Terminal);
+            // Story 23-1: the proxy's committed closes publish before the
+            // crashed Run is torn down.
+            self.drain_proxy_inbox(registry);
             // Story 17-4: in metadata mode the raw capture files leave the disk
             // with the Run — the final usage pass above has already parsed them
             // (metadata parses before unlink). Covers the crash, stuck-stopping,
@@ -873,7 +877,7 @@ impl Supervisor {
                     // and the GUARDED commit (P3).
                     let check_desc = liveness::describe(&check);
                     self.drain_self_reported_for(registry, &name, DrainMode::Terminal);
-                    self.drain_observed_for(registry, &name, DrainMode::Terminal);
+                    self.drain_proxy_inbox(registry);
                     self.unlink_raw_logs_if_metadata(registry, &name);
                     // Story 18-3: capture the stability anchor BEFORE the
                     // remove below — the unresponsive expiry is a CHARGED
@@ -1395,6 +1399,11 @@ impl Supervisor {
         // by this process; the boundary only guards OTHER live engines).
         let self_owner = self.backend.self_fingerprint();
         let mut adopted = 0;
+        // Story 23-1 (Design Notes: Migration): every adopted engine-observed
+        // agent is a legacy-root candidate until the decision below sorts them
+        // (a pre-proxy agent's Run recorded no upstream, so its origin-form
+        // base URL can only be served by the legacy root route).
+        let mut observed_adoptions: Vec<(InstanceName, RunId)> = Vec::new();
         for record in records {
             let name = record.name.clone();
             // A pid-0 record is a policy-only config SEED (set via
@@ -1625,59 +1634,13 @@ impl Supervisor {
                     // reconfigured action fires once under the new action (the
                     // 15-2 review-round-1 rule, now the live rule too).
                     //
-                    // Story 19-2: the DURABLE fence — the resumed Run's `block`
-                    // breaches recorded under the currently configured action
-                    // are the reasons its wire fence was up. Re-raised on the
-                    // re-bound listener below, so an engine restart or
-                    // adoption never drops a fence the latch would stop from
-                    // re-firing. A failed resolution degrades to no fence
-                    // reasons (the enforcement call returns early on that
-                    // read too); a failed breach read is SURFACED (AI-18).
-                    // Story 21-3: the action resolves through the ONE Policy
-                    // resolver (a Policy can supply `block`).
-                    let action = registry
-                        .resolved_limits(&name, Some(&run_id))
-                        .effective_action;
-                    let (token_action, cost_action) = (action, action);
-                    let resumed_breaches = match registry.reader().run_breaches(&name, &run_id) {
-                        Ok(events) => events,
-                        Err(detail) => {
-                            self.emit_diagnostic(&format!(
-                                "{}: the resumed Run's breach records could not be read \
-                                 ({detail}) — a `block` fence it carried is not re-raised until \
-                                 the next breach evaluation",
-                                name.as_str(),
-                            ));
-                            Vec::new()
-                        }
-                    };
-                    let fence_reasons = resumed_breaches
-                        .iter()
-                        .filter(|event| match event.dimension {
-                            BreachDimension::Tokens => event.action == token_action,
-                            BreachDimension::Dollars => event.action == cost_action,
-                        })
-                        .filter(|event| event.action == BreachAction::Block)
-                        .map(|event| crate::domain::LatchKey::new(event.dimension, event.scope))
-                        .collect::<Vec<_>>();
-                    // Story 21-1: an adoption is a NEW attach — bump the
-                    // launch generation so the re-bound listener's sequence,
-                    // which restarts at 0 under the resumed run id, never
-                    // collides with the previous attach's rows (the adoption
-                    // sequence-reset undercount). A failed bump is surfaced and
-                    // falls back to the stored generation.
-                    let launch_generation = match registry.bump_launch_generation(&name) {
-                        Ok(generation) => generation,
-                        Err(err) => {
-                            self.emit_diagnostic(&format!(
-                                "{}: the adopted instance's launch generation could not be \
-                                 advanced ({err}) — observed usage whose sequence restarted \
-                                 may be deduplicated against the previous attach's rows",
-                                name.as_str(),
-                            ));
-                            registry.launch_generation(&name).unwrap_or_default()
-                        }
-                    };
+                    // Story 23-1: the resumed Run's `block` reasons are in the
+                    // snapshot from the open (rebuilt from its durable latch
+                    // rows, whatever the configured action is now) — no
+                    // per-instance fence to rebuild. Adoption no longer bumps
+                    // the launch generation: proxied usage keys on call ids,
+                    // so an engine-minted sequence never restarts here.
+                    let launch_generation = registry.launch_generation(&name).unwrap_or_default();
                     let usage_cursor = self.agent_log_len(registry, &name);
                     // Story 14-3 (T3): the acp kind's stderr sentinel channel
                     // anchors the same way (at the CURRENT end of the captured
@@ -1733,128 +1696,13 @@ impl Supervisor {
                             "self-reported".to_string()
                         })
                     };
-                    // Clone the Run context into `Supervised` — the AI-44
-                    // enforcement call below borrows the same values afterwards.
-                    // Story 17-2 (the AI-46 closure, the `metering.listen`
-                    // seam): when THIS engine opened with a FIXED metering
-                    // port, an adopted engine-observed instance gets a LIVE
-                    // listener re-bound on that port before it is re-held —
-                    // the injected `base_url` of an instance whose spawner ran
-                    // the same fixed port is live again with NO stop→start.
-                    // Port 0 (every pre-17-2 open) keeps the story-11-3
-                    // strand diagnostic below unchanged (a re-bind cannot
-                    // guess the previous engine's ephemeral port). The
-                    // DECISION itself is the pure
-                    // [`adoption_rebind_decision`] seam (review finding 14:
-                    // unit-tested on every OS — the process legs skip on the
-                    // linux CI runner).
-                    // Story 19-2: the resumed Run's fence is raised BEFORE the
-                    // re-bind, so the re-bound listener is born fenced and no
-                    // request can slip through between bind and raise.
-                    let adopted_fence = crate::metering::WireFence::default();
-                    for reason in &fence_reasons {
-                        adopted_fence.raise(*reason);
-                    }
-                    let adopted_listener =
-                        match adoption_rebind_decision(&metering_source, self.metering_listen_port)
-                        {
-                            AdoptionRebind::Attempt => {
-                                match registry.effective_config(&name, ConfigLayer::empty()) {
-                                    Ok(effective) => {
-                                        match self.start_observed_listener(
-                                            &name,
-                                            &metering_source,
-                                            &effective,
-                                            adopted_fence.clone(),
-                                        ) {
-                                            // `start_observed_listener` returns Some only for
-                                            // an engine-observed instance — which this is.
-                                            Ok(Some(listener)) => {
-                                                self.emit_diagnostic(&format!(
-                                            "{}: re-bound the observed-metering listener on the \
-                                             fixed loopback port {} — an instance started under \
-                                             the SAME fixed port is live again (no stop/start \
-                                             needed); one inherited from an ephemeral-port engine \
-                                             still needs stop→start to re-inject its base_url",
-                                            name.as_str(),
-                                            listener.local_addr().port(),
-                                        ));
-                                                Some(listener)
-                                            }
-                                            Ok(None) => None,
-                                            Err(err) => {
-                                                // AI-18: a failed re-bind is SURFACED (the
-                                                // EngineError detail is traffic-free by
-                                                // construction — bind/upstream shape only),
-                                                // never a silent strand; the strand note
-                                                // below still applies and fires too.
-                                                self.emit_diagnostic(&format!(
-                                                    "{}: could not re-bind the observed-metering \
-                                             listener on the fixed port {} ({}) — the adopted \
-                                             instance keeps NO listener; free the port (or stop \
-                                             and start the instance) to restore its model \
-                                             traffic",
-                                                    name.as_str(),
-                                                    self.metering_listen_port,
-                                                    err,
-                                                ));
-                                                None
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        // A config-read failure degrades to the
-                                        // pre-17-2 strand posture (no listener),
-                                        // SURFACED — the strand note below fires too.
-                                        self.emit_diagnostic(&format!(
-                                            "{}: the adopted engine-observed instance's effective \
-                                     config could not be read ({err}); its metering listener \
-                                     could not be re-bound on the fixed port {} — stop and \
-                                     start the instance to restore its model traffic",
-                                            name.as_str(),
-                                            self.metering_listen_port,
-                                        ));
-                                        None
-                                    }
-                                }
-                            }
-                            AdoptionRebind::SkipNotObserved | AdoptionRebind::SkipNoFixedPort => {
-                                None
-                            }
-                        };
-                    let adopted_observed_source = adopted_listener
-                        .as_ref()
-                        .map(|_| ObservedUsageSource::new());
-                    // Read BEFORE the listener moves into `Supervised` (the
-                    // strand note below must know whether a live listener landed).
-                    let rebind_landed = adopted_listener.is_some();
-                    // Story 19-2: report the resumed Run's rebuilt wire fence
-                    // (raised on `adopted_fence` before the re-bind above).
-                    if !fence_reasons.is_empty() {
-                        let codes = fence_reasons
-                            .iter()
-                            .map(|reason| crate::domain::fence_code(*reason))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        match adopted_listener.as_ref() {
-                            Some(_) => {
-                                self.emit_diagnostic(&format!(
-                                    "{}: re-raised the wire fence of the resumed Run from the \
-                                     breach log ({codes}) — the metering listener refuses \
-                                     further model calls until this Run ends",
-                                    name.as_str(),
-                                ));
-                            }
-                            None => {
-                                self.emit_diagnostic(&format!(
-                                    "{}: the resumed Run's wire fence ({codes}) could not be \
-                                     rebuilt — the adopted instance has no metering listener \
-                                     (see the listener note); its breach stays recorded",
-                                    name.as_str(),
-                                ));
-                            }
-                        }
-                    }
+                    // Story 23-1: an adopted engine-observed agent meters through
+                    // the shared proxy when this engine runs one (its base URL is
+                    // the proxy's Run route on the sticky port, or — for an agent
+                    // started before the shared proxy — the legacy root route
+                    // the engine decides at open).
+                    let adopted_route =
+                        metering_source == "engine-observed" && self.proxy_url.is_some();
                     // Story 18-2: re-resolve the adopted instance's declared
                     // liveness check from ITS adapter manifest (the same
                     // resolution the start seam runs). The window itself does
@@ -1966,37 +1814,11 @@ impl Supervisor {
                             sentinel_lines_seen: false,
                             // Story 14-3 (T2): gates the stderr sentinel drain.
                             is_acp: adopted_is_acp,
-                            // Story 12-4: an adopted instance starts with no parked
-                            // observed events (its prior engine's park died with it).
-                            observed_park: None,
-                            // Story 21-1: this attach's generation (bumped
-                            // above); the latch itself is durable in state.db.
+                            // Story 21-1: this attach's generation (not bumped
+                            // since story 23-1); the latch is durable in state.db.
                             launch_generation,
-                            // ENGINE-OBSERVED across a crash/adoption (story 3-4,
-                            // tracked follow-up — NOT just a metering gap): the pre-crash
-                            // listener died with the crashed engine, but the already-
-                            // running agent's `base_url` STILL points at that now-DEAD
-                            // loopback port. So the adopted agent's MODEL TRAFFIC ITSELF
-                            // breaks — its completion calls hit the dead port and fail
-                            // with a connection-refused error (not merely un-metered).
-                            // This fails LOUD (a transport error the agent surfaces),
-                            // never a corrupt/silent-wrong output. We cannot rebind the
-                            // old port to a fresh listener here (the agent chose no port;
-                            // the OS did), so we leave it un-observed with no listener;
-                            // RECOVERY is an operator stop→start, which relaunches the
-                            // agent pointed at a fresh listener. The full fix (re-launch
-                            // an adopted observed instance / a stable per-instance listener
-                            // port / the Epic-7 daemon owning the listener) is a tracked
-                            // follow-up, not done here. A self-reported instance's
-                            // log-tail drain is unaffected (it needs no listener).
-                            // Story 17-2: an adopted engine-observed instance
-                            // whose spawner ran the SAME fixed metering port
-                            // is re-bound live above; `None` (port-0 opens,
-                            // failed re-binds) keeps the story-11-3 strand
-                            // posture, and the strand diagnostic below says
-                            // so honestly.
-                            observed_listener: adopted_listener,
-                            observed_source: adopted_observed_source,
+                            // Story 23-1: metered through the shared proxy.
+                            observed_route: adopted_route,
                             // An adopted instance's stop attempt has not
                             // happened yet in THIS engine session.
                             stop_unconfirmed: false,
@@ -2108,41 +1930,23 @@ impl Supervisor {
                         );
                         self.emit_diagnostic(&note);
                     }
-                    // AI-46 (story 11-3): an adopted ENGINE-OBSERVED instance is
-                    // stranded — the paragraph on `observed_listener: None`
-                    // above documents it, but until now the engine said it
-                    // NOWHERE an operator could hear. The engine cannot rewrite
-                    // the already-running child's injected `base_url` (the env
-                    // went in at the previous engine's spawn), so the honest
-                    // fix is to ANNOUNCE the condition: name the instance, the
-                    // stranded observed listener, and the stop→start
-                    // remediation. The diagnostic names the CONDITION without
-                    // the dead port number: the spawn record carries no launch
-                    // facts (the write-ahead record is
-                    // {fingerprint, policy, count, cause} only), and the
-                    // registration snapshot's launch predates the start-time
-                    // injection, so no base_url host/port is recoverable here.
-                    // Semantics are untouched: the instance stays marked
-                    // un-observed exactly as below, and no process is
-                    // relaunched (adoption keeps-them-running).
-                    // Story 17-2: SKIPPED when the fixed-port re-bind above
-                    // landed a live listener (`adopted_listener` is Some) —
-                    // the instance is NOT stranded, and a strand warning would
-                    // lie. Port-0 opens (and failed re-binds) still fire it.
-                    if metering_source == "engine-observed" && !rebind_landed {
+                    // Story 23-1: an engine-observed agent adopted by an engine
+                    // with no running metering proxy has no live base URL (its
+                    // Run route or legacy route points at a proxy that is not
+                    // listening): announce it with the remediation.
+                    if metering_source == "engine-observed" && !adopted_route {
                         let strand = format!(
-                            "{}: adopted an engine-observed instance; its injected \
-                             'metering.base_url' still points at the PREVIOUS engine's \
-                             loopback forward listener, which died with that engine — this \
-                             engine holds NO listener for the adopted process, so its model \
-                             calls hit the dead port and fail with connection errors \
-                             (stranded observed listener). The already-injected environment \
-                             of a running process cannot be rewritten. Remediation: stop \
-                             the instance and start it again; the fresh start binds a new \
-                             listener and re-injects a live base_url.",
+                            "{}: adopted an engine-observed instance, but this engine runs no \
+                             metering proxy, so the agent's model calls fail with connection \
+                             errors. Remediation: start the Service Host (or free the metering \
+                             proxy port), then stop the instance and start it again.",
                             name.as_str(),
                         );
                         self.emit_diagnostic(&strand);
+                    }
+                    // Story 23-1: the candidate list for the legacy root route.
+                    if metering_source == "engine-observed" {
+                        observed_adoptions.push((name.clone(), run_id.clone()));
                     }
                     // Story 15-2: the stranded-paused adoption note (AI-18 +
                     // Fibery 178): an adopted PAUSED row is held paused —
@@ -2226,7 +2030,131 @@ impl Supervisor {
         }
         // Story 21-2: a Run left open by a relaunch that never ran ends now.
         self.end_runs_without_a_process(registry);
+        // Story 23-1: decide the legacy root route once per open, after every
+        // adoption settled (the decision needs the full candidate list).
+        self.decide_legacy_root(registry, &observed_adoptions);
         adopted
+    }
+
+    /// Story 23-1 (Design Notes: Migration): the legacy root route. An
+    /// `engine-observed` agent started before the shared Metering Proxy
+    /// carries an origin-form base URL (`http://127.0.0.1:<port>`, no Run
+    /// route path), and its Run recorded no upstream — only a pre-proxy
+    /// launch can leave that column unset. When exactly one such agent is
+    /// adopted, the proxy serves calls that match no binding and no Run
+    /// route on its Run (through the legacy root), and records the decision
+    /// so it survives restarts until the Run ends. With more than one, no
+    /// path can tell their calls apart, so NONE gets the route — named
+    /// loudly, with the restart-each-agent remediation.
+    fn decide_legacy_root(&mut self, registry: &Registry, adoptions: &[(InstanceName, RunId)]) {
+        let snapshot = registry.run_publisher().current();
+        // Only agents whose Run recorded no upstream are pre-proxy ones; a
+        // launch under the shared proxy always records it.
+        let candidates: Vec<&(InstanceName, RunId)> = adoptions
+            .iter()
+            .filter(|(_, run)| {
+                snapshot
+                    .run(run)
+                    .is_none_or(|entry| entry.upstream.is_none())
+            })
+            .collect();
+        // A decision recorded by an earlier open stands until its Run ends.
+        match registry.reader().legacy_run() {
+            Ok(Some(run)) => {
+                let still_open = registry.run_publisher().current().run(&run).is_some();
+                if still_open {
+                    registry.run_publisher().publish_legacy_root(Some(run));
+                    return;
+                }
+                let _ = registry
+                    .writer()
+                    .call(move |ctx| ctx.store().set_legacy_run(None));
+            }
+            _ => {}
+        }
+        let names = |candidates: &[&(InstanceName, RunId)]| -> String {
+            candidates
+                .iter()
+                .map(|(name, _)| name.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match candidates.as_slice() {
+            [] => {}
+            [(name, run)] => {
+                // Resolve and record the agent's upstream (the route forwards
+                // there), then publish the route. An unresolvable config
+                // leaves the run with no route honestly (the diagnostic says
+                // so); its Run keeps its records either way.
+                let upstream = registry
+                    .effective_config(name, ConfigLayer::empty())
+                    .ok()
+                    .and_then(|effective| config::resolve_upstream_base_url(&effective));
+                let run = run.clone();
+                match upstream {
+                    Some(upstream) => {
+                        let for_job = run.clone();
+                        let publisher = std::sync::Arc::clone(registry.run_publisher());
+                        let upstream_clone = upstream.clone();
+                        let instance = name.clone();
+                        let result = registry.writer().call(move |ctx| {
+                            ctx.store()
+                                .record_run_upstream(&for_job, Some(&upstream_clone))?;
+                            ctx.store().set_legacy_run(Some(&for_job))?;
+                            if let Some(entry) =
+                                crate::domain::runs::ops::refreshed_entry(ctx.store(), &for_job)?
+                            {
+                                ctx.after_commit(move || {
+                                    publisher.publish_changes(vec![entry], Vec::new())
+                                });
+                            }
+                            Ok(())
+                        });
+                        match result {
+                            Ok(()) => {
+                                registry
+                                    .run_publisher()
+                                    .publish_legacy_root(Some(run.clone()));
+                                self.emit_diagnostic(&format!(
+                                    "{}: adopted an engine-observed agent started before the \
+                                     shared metering proxy; its calls reach its Run through the \
+                                     legacy root route (paths that match no binding and no Run \
+                                     route) until its Run ends — restart it to move it onto its \
+                                     own Run route",
+                                    instance.as_str(),
+                                ));
+                            }
+                            Err(err) => {
+                                self.emit_diagnostic(&format!(
+                                    "{}: the legacy root route for its pre-proxy agent could not \
+                                     be recorded ({err}); its model calls will be refused with \
+                                     no route until the agent is restarted",
+                                    instance.as_str(),
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        self.emit_diagnostic(&format!(
+                            "{}: adopted a pre-proxy engine-observed agent whose upstream could \
+                             not be resolved from its config, so it has no legacy root route; \
+                             its model calls will be refused with no route until the agent is \
+                             restarted with `metering.upstream_base_url` set",
+                            name.as_str(),
+                        ));
+                    }
+                }
+            }
+            many => {
+                self.emit_diagnostic(&format!(
+                    "{} engine-observed agents started before the shared metering proxy were \
+                     adopted, and a call cannot be told apart by path alone, so none of them \
+                     gets the legacy root route; restart each agent to move it onto its own \
+                     Run route",
+                    names(many),
+                ));
+            }
+        }
     }
 
     /// Reconcile a non-adopted orphan record to `failed` (AI-8): the process is

@@ -149,23 +149,9 @@ impl Supervisor {
             let Some(run_id) = registry.open_process_run(name).ok().flatten() else {
                 continue;
             };
-            // Lift fence reasons whose latch rows are gone (a foreign
-            // raise unlatched them in the shared store).
-            if let Some(fence) = supervised
-                .observed_listener
-                .as_ref()
-                .map(ObservedListener::fence)
-            {
-                let latched = match registry.latches(&run_id) {
-                    Ok(latches) => latches.into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
-                    Err(_) => continue,
-                };
-                for reason in fence.reasons() {
-                    if !latched.contains(&reason) {
-                        fence.clear(reason);
-                    }
-                }
-            }
+            // Story 23-1: a foreign raise that unlatched a reason reaches
+            // the proxy through the snapshot (the data-version reload
+            // republishes the Run's entry); nothing to lift here.
             // Evaluate: a lowered or newly-added ceiling this engine
             // supervises fires here (enforce_budget is idempotent under
             // the latch rows).
@@ -655,262 +641,44 @@ impl Supervisor {
         }
     }
 
-    /// Revoke the credentials an observed instance's listener refused in a
-    /// URL (story 22-1, R1.12) — through the same resolved-only path as the
-    /// Control API ([`Self::revoke_exposed`]). Best-effort: a store failure is
-    /// surfaced as a diagnostic, and the refusal already stood.
-    pub(super) fn drain_exposed_for(&mut self, registry: &Registry, name: &InstanceName) {
-        let Some(listener) = self
-            .running
-            .get(name)
-            .and_then(|s| s.observed_listener.as_ref())
-        else {
-            return;
-        };
-        let tokens: Vec<crate::domain::SecretString> = match listener.exposed().lock() {
-            Ok(mut queued) => queued.drain(..).collect(),
-            Err(_) => return,
-        };
-        if tokens.is_empty() {
-            return;
-        }
-        if let Err(err) = self.revoke_exposed(registry, &tokens) {
-            self.emit_diagnostic(&format!(
-                "{}: a credential the metering listener saw in a URL could not be revoked \
-                 ({err}); revoke the Run's keys with `hekma run revoke-keys`",
-                name.as_str()
-            ));
-        }
-    }
-
-    /// Drain ENGINE-OBSERVED usage from EVERY currently-running observed instance
-    /// (story 3-4 — the reaper cadence, parallel to [`Self::drain_usage_all`]).
-    /// Best-effort per instance — one instance's drain never blocks another's or
-    /// crash detection. A `self-reported` instance (no observed listener) is a
-    /// no-op here (it rides the log-tail drain instead).
-    pub(super) fn drain_observed_all(&mut self, registry: &Registry) {
-        let names: Vec<InstanceName> = self.running.keys().cloned().collect();
-        for name in names {
-            self.drain_observed_for(registry, &name, DrainMode::MidRun);
-        }
-    }
-
-    /// Drain one instance's OBSERVED usage queue (the counts the loopback listener
-    /// parsed out of the agent's model traffic) into the SAME [`Self::ingest_usage`]
-    /// choke point (story 3-4), minting the per-Run `sequence` for each.
-    ///
-    /// The listener task PUSHES each parsed `(input, output, cached)` triple; this reaper pass
-    /// DRAINS the queue (event-driven, NOT the log-tail path — observed usage does
-    /// NOT ride the agent-output log, AD-12 contrast), the [`ObservedUsageSource`]
-    /// mints the engine-side `sequence` (the agent supplies none), and each becomes
-    /// a `ParsedUsage` (input/output/cached — the cached subset since story 14-6)
-    /// fed to `ingest_usage` under the instance's CURRENT Run id +
-    /// `engine-observed` source. NO new ledger writer, NO new enforcement path — the
-    /// SAME choke point stamps + records + enforces (so 3-2 budgets + 3-3 caps apply
-    /// unchanged). A `self-reported` instance (no `observed_source`/`observed_listener`)
-    /// is a no-op.
-    ///
-    /// **Story 12-4 — the AI-41 treatment for the observed channel (durability
-    /// under store failure):** a commit failure PARKS the un-committed minted
-    /// events (in [`Supervised::observed_park`]) and RETRIES the EXACT same
-    /// `ParsedUsage` values on the next pass — never re-minted, so the dedup
-    /// keys are stable and an already-committed neighbor re-drifts safely into
-    /// the DB dedup (a `DuplicateReplay`, never a double-count). The retry is
-    /// BOUNDED: after [`USAGE_PARK_MAX_ATTEMPTS`] consecutive failed passes at
-    /// the SAME front event, that event is SKIPPED with a loud diagnostic and
-    /// the events behind it keep counting (surfaced-not-silent: an announced
-    /// loss, never a silent drop, never a wedged drain). In the TERMINAL mode
-    /// (stop / crash-reap) there IS no next pass — the loss is announced
-    /// explicitly and the parked buffer dies with the instance. The mode is the
-    /// [`DrainMode`] analog of the self-reported drain's.
-    pub(super) fn drain_observed_for(
-        &mut self,
-        registry: &Registry,
-        name: &InstanceName,
-        mode: DrainMode,
-    ) {
-        self.drain_exposed_for(registry, name);
-        // Read the Run context; park-retry first, then drain the queue, all under
-        // the instance's held state (a short critical section). Ingest happens
-        // OUTSIDE the borrow so `ingest_usage` can take `&mut self`.
-        let (run_id, metering_source, events) = match self.running.get(name) {
-            Some(s) => {
-                // Only an observed instance has both a listener (its queue) + a source
-                // (the sequence minter). A self-reported instance skips (no-op).
-                let (Some(listener), Some(source)) =
-                    (s.observed_listener.as_ref(), s.observed_source.as_ref())
-                else {
-                    return;
-                };
-                // 12-4: retry any PARKED events FIRST, preserving order — the exact
-                // same `ParsedUsage` values as the failed pass (never re-minted).
-                let mut events = s
-                    .observed_park
-                    .as_ref()
-                    .map(|(pending, _)| pending.events.clone())
-                    .unwrap_or_default();
-                // Then drain the NEW queue entries and mint their per-Run sequences.
-                // A poisoned queue lock is a best-effort skip of the DRAIN — any
-                // parked events still retry below, and the queued pairs stay queued
-                // for the next pass (never silently lost).
-                let drained: Vec<(u64, u64, u64)> = match listener.queue().lock() {
-                    Ok(mut q) => q.drain(..).collect(),
-                    Err(_) => Vec::new(),
-                };
-                for (input, output, cached) in drained {
-                    events.push(source.mint(input, output, cached));
-                }
-                if events.is_empty() {
-                    return;
-                }
-                (s.run_id.clone(), s.metering_source.clone(), events)
-            }
-            None => return,
-        };
-        // Ingest each observed event through the SAME single choke point (stamps the
-        // Run id + `engine-observed` source + timestamp, records, and enforces).
-        // Story 12-4: break on the FIRST store error — later events cannot leapfrog
-        // the failed one (billing honesty: the ledger sequence stays order-faithful).
-        let mut committed_count = 0usize;
-        let mut busy = false;
-        for usage in &events {
-            match self.ingest_usage(registry, name, &run_id, &metering_source, usage, mode) {
-                Ok(_) => committed_count += 1,
-                Err(err) => {
-                    busy = is_busy(&err);
-                    break;
-                }
-            }
-        }
-        if committed_count == events.len() {
-            // Every event durable (or a recognized duplicate replay): the park
-            // clears.
-            if let Some(s) = self.running.get_mut(name) {
-                s.observed_park = None;
-            }
-        } else if mode == DrainMode::Terminal {
-            // 12-4, the terminal arm: there IS no next pass — the handle (and any
-            // parked buffer) is dropped right after. Announce the loss explicitly,
-            // never a silent drop and never a false retry claim, and drop the park
-            // (no phantom retry state survives the instance). (The local is
-            // deliberately NOT named `loss`: the embed-clean audit pins
-            // `emit_diagnostic(&loss)` to the ONE AI-41 self-reported site, and a
-            // duplicate marker would read as a route regression.)
-            let lost = events.len() - committed_count;
-            let observed_loss = format!(
-                "{}: {lost} observed usage event(s) could not be committed to the Usage \
-                 Ledger and are LOST — this is the terminal drain (the process is dead or \
-                 the handle is being removed, and any parked buffer is dropped with it), \
-                 so they cannot be retried",
-                name.as_str(),
-            );
-            self.emit_diagnostic(&observed_loss);
-            if let Some(s) = self.running.get_mut(name) {
-                s.observed_park = None;
-            }
-        } else {
-            // 12-4, the bounded MIDRUN park: park the un-committed tail (including
-            // the failed front) and count the attempt against the SAME front event.
-            // The 12-4 AMENDMENT cap runs FIRST — a store outage keeps minting
-            // events every tick, so the tail itself must be bounded (overflow
-            // drops the OLDEST with a loud diagnostic; see the helper).
-            let remaining: Vec<ParsedUsage> =
-                self.cap_observed_park_buffer(name, events[committed_count..].to_vec());
-            if remaining.is_empty() {
-                // The cap dropped EVERYTHING (a backlog larger than the whole
-                // buffer, loudly announced by the helper): no park state
-                // survives this pass — never a phantom one-front buffer.
-                if let Some(s) = self.running.get_mut(name) {
-                    s.observed_park = None;
-                }
-                return;
-            }
-            let front_sequence = remaining[0].sequence;
-            let attempts = match self
-                .running
-                .get(name)
-                .and_then(|s| s.observed_park.as_ref())
-            {
-                // Story 21-1: `Busy` is contention, not a poisoned event — it
-                // never spends an attempt (see the self-reported drain).
-                Some((pending, n)) if pending.front_sequence == front_sequence => {
-                    if busy {
-                        *n
-                    } else {
-                        n + 1
+    /// Drain the proxy's evaluation inbox (story 23-1): publish each
+    /// committed proxied close's usage event, then its breaches and Run
+    /// events, and execute its process actions — exactly as
+    /// [`Self::apply_evaluation`] does after a usage commit — in commit
+    /// order, under the locks the reaper tick holds. A Run event batch a
+    /// proxy job committed (a wire Run's `created`) is published as is.
+    pub(crate) fn drain_proxy_inbox(&mut self, registry: &Registry) {
+        for item in self.inbox.drain() {
+            match item {
+                pipeline::InboxItem::RunEvents(events) => self.publish_run_events(events),
+                pipeline::InboxItem::Proxied(commit) => {
+                    let (update, append) = commit.update;
+                    self.note_outbox_append(&append);
+                    self.publish(append.seq, EngineEvent::UsageUpdate(update));
+                    match commit.instance {
+                        Some(name) => self.apply_evaluation(registry, &name, commit.evaluation),
+                        None => {
+                            // An instance-less Run: its breaches publish
+                            // and act on no process (`block` already rode
+                            // the snapshot).
+                            for committed in &commit.evaluation.breaches {
+                                self.note_outbox_append(&committed.outbox);
+                                self.publish(
+                                    committed.outbox.seq,
+                                    EngineEvent::BudgetBreach(committed.event.clone()),
+                                );
+                            }
+                            for detail in &commit.evaluation.degraded_reads {
+                                self.emit_diagnostic(&format!(
+                                    "a proxied call's budget check degraded: {detail}"
+                                ));
+                            }
+                            self.publish_run_events(commit.evaluation.run_events);
+                        }
                     }
                 }
-                // A different front event resets the streak (the cursor-analog).
-                _ => u32::from(!busy),
-            };
-            if attempts >= USAGE_PARK_MAX_ATTEMPTS {
-                // The front event is poisoned beyond the dedup key's reach: SKIP it
-                // LOUDLY and keep counting the rest (an announced loss — billing
-                // honesty cuts both ways — never a wedged drain). The events BEHIND
-                // the skipped front park again with a fresh streak (their front
-                // changed), so they retry on the next pass.
-                let rest: Vec<ParsedUsage> = remaining[1..].to_vec();
-                let skip = format!(
-                    "{}: an observed usage event (sequence {front_sequence}) failed to \
-                     commit on {attempts} consecutive drains and is SKIPPED (not \
-                     counted) — the rest of the Run's observed usage keeps counting; \
-                     investigate the Usage Ledger store",
-                    name.as_str(),
-                );
-                self.emit_diagnostic(&skip);
-                if let Some(s) = self.running.get_mut(name) {
-                    let next_front = rest.first().map(|next| next.sequence);
-                    s.observed_park = next_front.map(|front_sequence| {
-                        (
-                            ObservedPending {
-                                front_sequence,
-                                events: rest.clone(),
-                            },
-                            1,
-                        )
-                    });
-                }
-            } else if let Some(s) = self.running.get_mut(name) {
-                s.observed_park = Some((
-                    ObservedPending {
-                        front_sequence,
-                        events: remaining,
-                    },
-                    attempts,
-                ));
             }
         }
-    }
-
-    /// Story 12-4 AMENDMENT (review loop 1): bound the observed pending-park
-    /// buffer to [`OBSERVED_PARK_MAX_EVENTS`]. Returns the events to park; when
-    /// the tail exceeds the cap, the OLDEST events are dropped (the ledger's
-    /// order-faithful sequence discipline cuts both ways: the newest events are
-    /// the ones still reachable for retry) and the loss is announced LOUDLY —
-    /// the count, the dropped sequence range, the why, and the remediation —
-    /// never a silent truncation, never unbounded engine memory during a store
-    /// outage.
-    fn cap_observed_park_buffer(
-        &mut self,
-        name: &InstanceName,
-        mut events: Vec<ParsedUsage>,
-    ) -> Vec<ParsedUsage> {
-        let overflow = events.len().saturating_sub(OBSERVED_PARK_MAX_EVENTS);
-        if overflow > 0 {
-            let dropped = events.drain(..overflow).collect::<Vec<_>>();
-            let first = dropped.first().map(|e| e.sequence).unwrap_or(0);
-            let last = dropped.last().map(|e| e.sequence).unwrap_or(0);
-            let overflow_note = format!(
-                "{}: {overflow} parked observed usage event(s) (sequences {first}..{last}) \
-                 were DROPPED and are NOT counted — the pending buffer is capped at \
-                 {OBSERVED_PARK_MAX_EVENTS} events while the Usage Ledger store keeps \
-                 failing, so the oldest un-committed events had to go; investigate the \
-                 store outage",
-                name.as_str(),
-            );
-            self.emit_diagnostic(&overflow_note);
-        }
-        events
     }
 
     /// THE ledger-commit choke point (story 3-1, spine AD-7) — the SOLE writer of
@@ -1110,9 +878,6 @@ impl Supervisor {
             cost_cap: resolution.dollars,
             cost_action: resolution.effective_action,
             supervised: supervised.is_some(),
-            fence: supervised
-                .and_then(|supervised| supervised.observed_listener.as_ref())
-                .map(ObservedListener::fence),
             runs: Some(Arc::clone(registry.run_publisher())),
             #[cfg(test)]
             totals_fault: self.totals_read_fault_names.contains(name),
@@ -1315,7 +1080,7 @@ impl Supervisor {
     /// a fresh Run's per-run totals are zero; a Restart Policy relaunch keeps
     /// its Run (story 21-2), so `kept_run`'s per-run totals count — with
     /// cumulative totals from the ledger and an empty latch, and RAISE
-    /// `fence` for every `block` decision — so a Run that
+    /// the returned reason bits for every `block` decision — so a Run that
     /// begins at or over a `block` ceiling refuses its very first model call
     /// instead of letting one through before the first usage event fires the
     /// breach. Only `block` decisions act here; `pause`/`stop`/`warn` keep
@@ -1324,15 +1089,14 @@ impl Supervisor {
     /// [`Self::enforce_budget`] once the `Supervised` exists, which records
     /// and latches the same decisions under the new run id. Part of the AD-7
     /// pipeline (same core, same module) — no other path raises a fence.
-    /// Returns whether any reason was raised, so the caller records it even
-    /// if the action changed in between (a raised fence is never unrecorded).
+    /// Returns the raised reasons (non-zero → the caller records them even
+    /// if the action changed in between: a raised fence is never unrecorded).
     pub(super) fn run_start_fence(
         &self,
         registry: &Registry,
         name: &InstanceName,
-        fence: &crate::metering::WireFence,
         kept_run: Option<&RunId>,
-    ) -> bool {
+    ) -> u8 {
         // Story 21-3: the Run-start fence resolves through the ONE Policy
         // resolver — a Policy can supply the ceilings and the `block`
         // action, not only the instance config.
@@ -1343,7 +1107,7 @@ impl Supervisor {
         let cost_cap = resolution.dollars;
         let cost_action = resolution.effective_action;
         if token_action != BreachAction::Block && cost_action != BreachAction::Block {
-            return false;
+            return 0;
         }
         let (token, dollar) = self.governance_arms(
             registry,
@@ -1357,30 +1121,28 @@ impl Supervisor {
             dollar,
             latched: Vec::new(),
         });
-        let mut raised = false;
-        for decision in outcome
+        // Story 23-1: the reasons ride the snapshot's pending route for the
+        // new Run (the shared proxy refuses its first call) until the latch
+        // the caller records lands on the Run's own entry.
+        outcome
             .decisions
             .iter()
             .filter(|decision| decision.action == BreachAction::Block)
-        {
-            fence.raise(governance::LatchKey::new(
-                decision.dimension,
-                decision.scope,
-            ));
-            raised = true;
-        }
-        raised
+            .fold(0u8, |bits, decision| {
+                bits | crate::domain::runs::snapshot::Disposition::bit(governance::LatchKey::new(
+                    decision.dimension,
+                    decision.scope,
+                ))
+            })
     }
 
-    /// Surface a committed `block` breach (story 19-2; the fence itself was
-    /// raised by the store writer's post-commit hook before the ack, story
-    /// 21-1): with a listener the fence is UP and `forward()` refuses further
-    /// model calls with the `proxy-wire v1` refusal; an instance with NO
-    /// listener — a `self-reported` source reached through a hand-edited layer
-    /// or a source change after the write, or an adopted instance whose
-    /// listener could not be re-bound — cannot be fenced: the breach stays
-    /// recorded, acts as `warn`, and the diagnostic says so loudly (AI-18;
-    /// never a silent no-op).
+    /// Surface a committed `block` breach (story 19-2; since story 23-1 the
+    /// breach's latch republished the Run's snapshot entry before the ack,
+    /// and the shared proxy refuses the Run's — and every Run beneath it —
+    /// further model calls): with a wire path the fence is up; a Run with
+    /// none (a `self-reported` source reached through a hand-edited layer)
+    /// cannot be fenced: the breach stays recorded, acts as `warn`, and the
+    /// diagnostic says so loudly (AI-18; never a silent no-op).
     pub(super) fn note_block(
         &self,
         registry: &Registry,
@@ -1392,46 +1154,35 @@ impl Supervisor {
         let Some(supervised) = self.running.get(name) else {
             return;
         };
-        match supervised
-            .observed_listener
-            .as_ref()
-            .map(ObservedListener::fence)
-        {
-            Some(fence) => {
-                // Belt and braces: the writer's hook already raised it; a
-                // raise is idempotent.
-                fence.raise(reason);
-                self.log_enforcement_diagnostic(
-                    registry,
-                    name,
-                    &format!(
-                        "budget breach ({} {}) — the wire fence is UP: the metering listener \
-                         refuses further model calls with HTTP 402 `{}` (code `{}`) until this \
-                         Run ends; raise the ceiling, then start a new Run",
-                        dimension.as_str(),
-                        scope.as_str(),
-                        governance::FENCE_ERROR_TYPE,
-                        governance::fence_code(reason),
-                    ),
-                );
-            }
-            None => {
-                let source = supervised.metering_source.clone();
-                self.log_enforcement_diagnostic(
-                    registry,
-                    name,
-                    &format!(
-                        "budget breach ({} {}) is configured to `block`, but this instance has \
-                         no wire listener to fence (metering source `{source}`, or an adopted \
-                         instance whose listener could not be re-bound) — the fence could NOT \
-                         be raised; the breach is recorded and acts as `warn`. Set \
-                         `budget.breach_action` to pause or stop, or meter the instance through \
-                         the engine-observed listener",
-                        dimension.as_str(),
-                        scope.as_str(),
-                    ),
-                );
-            }
+        if supervised.observed_route {
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "budget breach ({} {}) — the wire fence is UP: the metering proxy refuses \
+                     further model calls on this Run and every Run beneath it with HTTP 402 \
+                     `{}` (code `{}`) until the ceiling is raised or the Run ends",
+                    dimension.as_str(),
+                    scope.as_str(),
+                    governance::FENCE_ERROR_TYPE,
+                    governance::fence_code(reason),
+                ),
+            );
+        } else {
+            let source = supervised.metering_source.clone();
+            self.log_enforcement_diagnostic(
+                registry,
+                name,
+                &format!(
+                    "budget breach ({} {}) is configured to `block`, but this instance's model \
+                     calls do not pass through the metering proxy (metering source `{source}`) \
+                     — the fence could NOT be raised; the breach is recorded and acts as \
+                     `warn`. Set `budget.breach_action` to pause or stop, or meter the instance \
+                     through the metering proxy",
+                    dimension.as_str(),
+                    scope.as_str(),
+                ),
+            );
         }
     }
 
