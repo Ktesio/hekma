@@ -109,7 +109,9 @@ Unrecognised presentations are counted, never logged: the host writes at most
 one diagnostic line a minute with the counts by class prefix, and no value.
 An engine-issued credential is recognised from an in-memory index or one
 read-only database lookup before anything is locked or written, so a flood of
-made-up tokens costs reads only and never delays the engine's own writes.
+made-up tokens costs reads only and never delays the engine's own writes. If
+that lookup itself fails, the request answers `500` with code `store` and a
+fixed message; the cause goes to the host's diagnostics, never to the client.
 A credential in a path or query is refused before authentication (see
 [Never in a URL](#never-in-a-url)). No handler runs for an unauthenticated request,
 and no secret VALUE ever enters a response, a log line, or an SSE frame — the
@@ -284,7 +286,9 @@ too-many-children`); the operator bearer is not capped. A supervised agent's
 key, and its refresh credential, are refused (`401 unauthorized`) on a
 `--listen` listener that is not loopback; a listener bound to `0.0.0.0`
 counts as beyond loopback, whatever address a request arrives from. Every Run Key request re-checks the key inside its own write, so a
-request that arrives just after a revocation is refused and changes nothing.
+request that arrives just after a revocation is refused and changes nothing,
+whatever it names: a child open whose parent does not resolve, or that
+retries an `external_id`, is refused too.
 
 ```text
 POST /v0/runs/refresh                    Authorization: Bearer hk_ref_…
@@ -295,9 +299,13 @@ GET  /v0/runs/{id}/keys                                      (operator bearer)
 `POST /v0/runs/refresh` trades the presented refresh credential for a new
 pair once (`{"schema_version":1,"run_id":…,"credentials":{…}}`); the old Run
 Key is refused from the next request on. A used refresh credential presented
-again revokes the Run's current pair and every used refresh credential of the
+again revokes the current pair of its own launch (for a Run opened over the
+Control API, the Run's current pair) and every used refresh credential of the
 Run, raises the `credential-reuse` Anomaly and answers `401
-credential-revoked`. `revoke-keys` revokes the Run's active credentials and its
+credential-revoked`. A later launch's key is never revoked by an earlier
+launch's credential. A used refresh credential also leaves service wherever
+the credentials it belonged to do: at its launch's exit, at its Run's end,
+under a `revoke-keys` cascade, and when it is seen in a URL. `revoke-keys` revokes the Run's active credentials and its
 used refresh credentials, so none of them can trigger a reuse later, and, unless `"cascade": false`, every credential issued under any
 credential the Run held; it answers `{"schema_version":1,"run_id":…,
 "cascade":true,"revoked":[{"run_id":…,"class":"run-key","token_id":…,
@@ -311,12 +319,15 @@ revocation cause — never a value or a hash.
 
 A request whose path or query carries an `hk_run_`, `hk_ref_` or `hk_ann_`
 token, raw or percent-encoded, answers `400 credential-in-url` with a static
-body before it is authenticated, and a complete active token so exposed is
-revoked (cause `exposed-in-url`). A token-shaped value that was never issued,
-or is already revoked, is refused and changes nothing. The per-agent metering
-listener applies the same rule: it answers a typed `hekma_credential_in_url`
-error, forwards nothing, and the engine revokes the exposed credential within
-a moment (on its next poll, about a quarter of a second).
+body before it is authenticated, and a complete active token, or a used
+refresh credential, so exposed is revoked (cause `exposed-in-url`). A
+token-shaped value that was never issued, or is already revoked, is refused
+and changes nothing. The per-agent metering listener applies the same rule: it
+answers a typed `hekma_credential_in_url` error, forwards nothing, and the
+engine revokes the exposed credential within a moment (on its next poll,
+about a quarter of a second). Between two polls the listener holds at most 64
+distinct exposed values; past that it still refuses the request, and the next
+poll writes a diagnostic saying how many it could not revoke.
 
 ### The Run listing
 
