@@ -19,6 +19,7 @@
 //! Run and Policy tables of stories 21.2 and 21.3 settle its surface.
 
 use super::StoreError;
+use crate::domain::credential::{TokenClass, TokenHash, TokenState};
 use crate::domain::runs::policy::{PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy};
 use crate::domain::{
     BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, Label, LabelSource, LatchKey,
@@ -419,4 +420,58 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// upgrade) gets an `ended` placeholder, end cause `unregistered`, so the
     /// latch's reference holds and the usage commit never fails on it.
     fn ensure_run_row(&self, run_id: &RunId, instance: &InstanceName) -> Result<(), StoreError>;
+
+    // Story 22-1: the credential port (`tokens`, schema v17). A hash leaves
+    // the store layer only as a [`TokenHash`] (for the snapshot); every read
+    // a surface renders is metadata.
+
+    /// Insert one token row.
+    fn insert_token(&self, token: &TokenRow) -> Result<(), StoreError>;
+
+    /// The row for one hash — the in-transaction validity read every
+    /// Caller-authorized job makes.
+    fn token(&self, hash: &TokenHash) -> Result<Option<TokenRow>, StoreError>;
+
+    /// Move one token to `state` (`retired` or `revoked`) at `at`, with its
+    /// cause. Only an `active` row moves; returns whether it did.
+    fn set_token_state(
+        &self,
+        hash: &TokenHash,
+        state: TokenState,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// A Run's active tokens, oldest first.
+    fn active_tokens(&self, run_id: &RunId) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every token of a Run, any state, oldest first (the metadata listing
+    /// and the cascade's roots).
+    fn run_tokens(&self, run_id: &RunId) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every ACTIVE token whose `issued_by` chain starts at one of `roots`
+    /// (the cascade walk: recursive over `issued_by_hash`), oldest first.
+    fn active_issued_under(&self, roots: &[TokenHash]) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every active Run Key and announce credential of a non-ended Run (the
+    /// snapshot's key index at open).
+    fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;
+}
+
+/// One stored credential (story 22-1, `tokens`): its hash and metadata,
+/// never its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TokenRow {
+    pub hash: TokenHash,
+    pub token_id: String,
+    pub class: TokenClass,
+    pub run_id: RunId,
+    pub launch_generation: Option<u64>,
+    pub paired_hash: Option<TokenHash>,
+    pub issued_by_hash: Option<TokenHash>,
+    pub custody_eligible: bool,
+    pub state: TokenState,
+    pub issued_at: String,
+    pub revoked_at: Option<String>,
+    pub revoke_cause: Option<String>,
 }

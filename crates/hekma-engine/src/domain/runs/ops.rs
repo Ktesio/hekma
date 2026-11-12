@@ -34,6 +34,11 @@ pub(crate) struct RunChanges {
     /// Diagnostics the operation surfaced (a fail-closed resolution note):
     /// the caller emits them on the engine's diagnostic surface.
     pub notes: Vec<String>,
+    /// Story 22-1: the credential events the operation caused (one per
+    /// token per change), appended to the outbox after the Run events.
+    pub credentials: Vec<crate::domain::credential::CredentialEvent>,
+    /// Story 22-1: the key-index changes, published with the Run entries.
+    pub keys: Vec<super::snapshot::KeyChange>,
     /// Test-only: the Runs whose Policy hook ran in this operation.
     #[cfg(test)]
     pub policy_resolved: Vec<RunId>,
@@ -44,6 +49,8 @@ impl RunChanges {
         self.events.extend(other.events);
         self.entries.extend(other.entries);
         self.notes.extend(other.notes);
+        self.credentials.extend(other.credentials);
+        self.keys.extend(other.keys);
         #[cfg(test)]
         self.policy_resolved.extend(other.policy_resolved);
     }
@@ -59,8 +66,9 @@ pub(crate) enum RunFate {
     Terminal,
 }
 
-/// A Run event + its outbox position, as committed.
-pub(crate) type CommittedRunEvent = (RunEvent, OutboxAppend);
+/// A Run-registry event (a Run event, or since story 22-1 a credential
+/// event) + its outbox position, as committed.
+pub(crate) type CommittedRunEvent = (EngineEvent, OutboxAppend);
 
 /// Append `changes`' events to the outbox and register the snapshot
 /// publish after commit. Returns the events in commit order for the caller
@@ -70,17 +78,22 @@ pub(crate) fn commit(
     publisher: &Arc<SnapshotPublisher>,
     changes: RunChanges,
 ) -> Result<Vec<CommittedRunEvent>, StoreError> {
-    let mut committed = Vec::with_capacity(changes.events.len());
-    for event in changes.events {
-        let append = ctx
-            .store()
-            .append_outbox(&EngineEvent::Run(event.clone()), OUTBOX_MAX_BYTES)?;
+    let mut committed = Vec::with_capacity(changes.events.len() + changes.credentials.len());
+    let events = changes.events.into_iter().map(EngineEvent::Run).chain(
+        changes
+            .credentials
+            .into_iter()
+            .map(|event| EngineEvent::Credential(Box::new(event))),
+    );
+    for event in events {
+        let append = ctx.store().append_outbox(&event, OUTBOX_MAX_BYTES)?;
         committed.push((event, append));
     }
-    if !changes.entries.is_empty() {
+    if !changes.entries.is_empty() || !changes.keys.is_empty() {
         let publisher = Arc::clone(publisher);
         let entries = changes.entries;
-        ctx.after_commit(move || publisher.publish(entries));
+        let keys = changes.keys;
+        ctx.after_commit(move || publisher.publish_changes(entries, keys));
     }
     Ok(committed)
 }
@@ -118,6 +131,7 @@ fn note<S: RunRecords + ?Sized>(
             .limits
             .map(|_| Box::new(prior.after_limits.unwrap_or(limits))),
         prior_limits: prior.limits.map(Box::new),
+        limits_layer: prior.layer.map(str::to_string),
         cause,
         policies: resolution
             .as_ref()
@@ -146,6 +160,8 @@ struct Prior {
     /// The changed layer after, on `limits-changed` (else the Run's
     /// Operator/Host layer as read back).
     after_limits: Option<super::RunLimits>,
+    /// Which layer the limits describe, on `limits-changed` (story 22-1).
+    layer: Option<&'static str>,
 }
 
 /// The bound subset of `labels` (what a Run event carries).
@@ -159,8 +175,9 @@ fn bound_only(labels: &[Label]) -> Vec<Label> {
 
 /// Move `record` to `status` with `anomalies`, saving it and noting the
 /// event (`ended`, `status-changed` or `anomalies-changed`). Nothing when
-/// neither changed.
-fn move_to<S: RunRecords + ?Sized>(
+/// neither changed. Story 22-1: a move to `ended` revokes the Run's
+/// remaining active credentials in the same job (`run-ended`).
+pub(crate) fn move_to<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
     mut record: RunRecord,
@@ -194,6 +211,9 @@ fn move_to<S: RunRecords + ?Sized>(
         ..Prior::default()
     };
     note(store, changes, &record, kind, prior, cause)?;
+    if kind == RunEventKind::Ended {
+        super::keys::on_run_ended(store, changes, &record.run_id, at)?;
+    }
     Ok(Some(record))
 }
 
@@ -303,6 +323,12 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
     };
     let from = run.status;
     let owner = run.run_id.clone();
+    // Story 22-1 (P1): `failed` and `stopped` record a confirmed exit, so
+    // the launch's credentials are revoked here — before any relaunch
+    // spawns its next generation.
+    if matches!(new_state, LifecycleState::Failed | LifecycleState::Stopped) {
+        super::keys::on_process_exited(store, &mut changes, &owner, at)?;
+    }
     move_to(store, &mut changes, run, status, anomalies, end_cause, at)?;
     cascade(
         store,
@@ -333,6 +359,62 @@ pub(crate) struct SupervisedRun {
     /// Run); a fresh Run with `None` resolves with no explicit instance
     /// limits.
     pub inputs: Option<super::policy::ResolveInputs>,
+}
+
+/// A supervised launch's credentials (story 22-1), value-free: the Run Key
+/// and, when the Adapter maps one, its refresh credential.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LaunchCredentials {
+    pub key: crate::domain::credential::TokenStub,
+    pub refresh: Option<crate::domain::credential::TokenStub>,
+}
+
+/// Issue a supervised launch's credentials on its Run (story 22-1, P1): in
+/// the launch-record job, with the launch's generation, custody-eligible,
+/// issued by the engine. A token exists in state.db only if its launch was
+/// recorded.
+pub(crate) fn issue_launch<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+    generation: u64,
+    credentials: LaunchCredentials,
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(changes);
+    };
+    match credentials.refresh {
+        Some(refresh) => super::keys::issue_pair(
+            store,
+            &mut changes,
+            &record,
+            credentials.key,
+            refresh,
+            Some(generation),
+            None,
+            "engine",
+            true,
+            None,
+            at,
+        )?,
+        None => super::keys::issue(
+            store,
+            &mut changes,
+            &record,
+            super::keys::Issue {
+                token: credentials.key,
+                launch_generation: Some(generation),
+                paired: None,
+                issued_by_hash: None,
+                issuer: "engine".to_string(),
+                custody_eligible: true,
+                prior_token_id: None,
+            },
+            at,
+        )?,
+    }
+    Ok(changes)
 }
 
 /// Create the supervised Run (fresh start), or keep it (relaunch, adoption):
@@ -589,6 +671,7 @@ fn write_labels<S: RunRecords + ?Sized>(
 /// the actor as the cause. The change is the Run's latest update: the row
 /// is saved here with `updated_at = at`, and the event carries that `at`
 /// (the audit time of a money change, not the Run's last earlier write).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
     store: &S,
     changes: &mut RunChanges,
@@ -596,6 +679,7 @@ pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
     prior: super::RunLimits,
     after: super::RunLimits,
     actor: &str,
+    layer: &'static str,
     at: &str,
 ) -> Result<(), StoreError> {
     let mut record = record.clone();
@@ -609,6 +693,7 @@ pub(crate) fn note_limits_changed<S: RunRecords + ?Sized>(
         Prior {
             limits: Some(prior),
             after_limits: Some(after),
+            layer: Some(layer),
             ..Prior::default()
         },
         Some(actor.to_string()),

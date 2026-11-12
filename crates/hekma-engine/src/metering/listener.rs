@@ -568,6 +568,18 @@ async fn forward(
     queue: ObservedQueue,
     fence: WireFence,
 ) -> Response<Full<Bytes>> {
+    // Story 22-1 (R1.12, a `proxy-wire v1` addition): a credential in the
+    // path or query is refused BEFORE any upstream dial — the typed,
+    // non-retryable 400, the body drained and never echoed.
+    let target = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("");
+    if crate::domain::credential::scan_url(target).found {
+        drain_request_body(req.into_body()).await;
+        return credential_in_url_response();
+    }
     if !is_fence_exempt(req.method()) {
         if let Some(refusal) = fence.refusal() {
             // An `Expect: 100-continue` client has not sent its body yet:
@@ -625,10 +637,17 @@ async fn forward(
     // frames the known length itself.
     if let Some(headers) = builder.headers_mut() {
         for (name, value) in parts.headers.iter() {
-            if name == hyper::header::HOST || is_hop_by_hop(name) {
+            // Story 22-1: the Run Key identification header never reaches
+            // the provider (custody's full strip set lands with custody).
+            if name == hyper::header::HOST || is_hop_by_hop(name) || name == RUN_KEY_HEADER {
                 continue;
             }
-            headers.append(name, value.clone());
+            let mut value = value.clone();
+            if name == hyper::header::AUTHORIZATION || name == hyper::header::PROXY_AUTHORIZATION {
+                // A credential header value is sensitive from here on.
+                value.set_sensitive(true);
+            }
+            headers.append(name, value);
         }
     }
     let Ok(outbound) = builder.body(Full::new(req_bytes)) else {
@@ -853,6 +872,34 @@ fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
         return None;
     }
     format!("{base}{path_and_query}").parse::<hyper::Uri>().ok()
+}
+
+/// The Run Key identification header (spine AD-26): stripped before any
+/// request is forwarded.
+const RUN_KEY_HEADER: &str = "x-hekma-run-key";
+
+/// The `proxy-wire v1` refusal for a credential in a URL (story 22-1): a
+/// static body that echoes nothing, `x-should-retry: false`.
+fn credential_in_url_response() -> Response<Full<Bytes>> {
+    let body = format!(
+        "{{\"type\":\"error\",\"error\":{{\"type\":\"hekma_credential_in_url\",\
+         \"code\":\"credential_in_url\",\"message\":\"Credentials never go in a URL; send \
+         them in a header. This request was not forwarded.\",\"param\":null,\
+         \"proxy_wire\":\"{wire}\"}}}}",
+        wire = crate::domain::PROXY_WIRE_VERSION,
+    );
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = hyper::StatusCode::BAD_REQUEST;
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        hyper::header::HeaderName::from_static("x-should-retry"),
+        hyper::header::HeaderValue::from_static("false"),
+    );
+    response
 }
 
 /// An honest `502 Bad Gateway` with a STATIC body (no request/response traffic, no
@@ -1417,6 +1464,82 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_credential_in_the_url_is_refused_and_never_reaches_the_upstream() {
+        // Story 22-1 (R1.12): the upstream fake asserts no request arrived.
+        let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let token = format!("hk_run_{}", "A".repeat(52));
+        for target in [
+            format!("/v1/models/{token}"),
+            format!("/v1/chat/completions?key={}", token.replace('_', "%5F")),
+            format!("/v1/models?k={}", &token.to_ascii_lowercase()[..20]),
+        ] {
+            let req = format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let auth = authority.clone();
+            let resp = std::thread::spawn(move || raw_request(&auth, &req))
+                .join()
+                .unwrap();
+            let text = String::from_utf8_lossy(&resp);
+            assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+            assert!(text.contains("hekma_credential_in_url"), "{text}");
+            assert!(text.contains("\"proxy_wire\":\"v1\""), "{text}");
+            assert!(
+                text.to_ascii_lowercase().contains("x-should-retry: false"),
+                "{text}"
+            );
+            assert!(
+                !text.to_ascii_uppercase().contains(&"A".repeat(30)),
+                "no echo"
+            );
+        }
+        assert!(
+            matches!(upstream.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "the upstream received a request"
+        );
+        // The body is the documented static shape.
+        let body = credential_in_url_response();
+        assert_eq!(body.status(), hyper::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_run_key_header_is_stripped_before_forwarding() {
+        // Story 22-1: `x-hekma-run-key` never reaches the provider; the
+        // agent's own Authorization still does.
+        let response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(response);
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer sk-agent\r\nX-Hekma-Run-Key: hk_run_SENTINEL\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        let auth = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth, &req))
+            .join()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"));
+        let seen = upstream_join.join().unwrap().to_ascii_lowercase();
+        assert!(!seen.contains("x-hekma-run-key"), "{seen}");
+        assert!(!seen.contains("sentinel"), "{seen}");
+        assert!(seen.contains("authorization: bearer sk-agent"), "{seen}");
     }
 
     #[test]

@@ -322,7 +322,9 @@ impl Registry {
         let mut notes = notes;
         if let Err(err) = writer.call(move |ctx| {
             let entries = crate::domain::runs::ops::open_entries(ctx.store())?;
-            ctx.after_commit(move || publisher.publish(entries));
+            // Story 22-1: the key index loads with the Runs.
+            let keys = crate::domain::runs::keys::open_keys(ctx.store())?;
+            ctx.after_commit(move || publisher.publish_changes(entries, keys));
             Ok(())
         }) {
             notes.push(format!(
@@ -438,6 +440,8 @@ impl Registry {
                     })
             }
             EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => None,
+            // Story 22-1: a credential event's subject is its Run.
+            EngineEvent::Credential(event) => Some(event.run_id.clone()),
         }
     }
 
@@ -1451,6 +1455,7 @@ impl Registry {
         &self,
         record: &SpawnRecord,
         run: crate::domain::runs::ops::SupervisedRun,
+        credentials: Option<crate::domain::runs::ops::LaunchCredentials>,
     ) -> Result<(u64, Vec<crate::domain::runs::ops::CommittedRunEvent>), RegistryError> {
         // Story 21-2: the Run is created (fresh start) or kept (relaunch) in
         // the same job as the record, so the durable Run identity and the
@@ -1460,11 +1465,19 @@ impl Registry {
         Ok(self.writer.call(move |ctx| {
             ctx.store().upsert_spawn_record(&record)?;
             let generation = ctx.store().bump_launch_generation(&record.name)?;
-            let changes = crate::domain::runs::ops::ensure_supervised(
-                ctx.store(),
-                &run,
-                &crate::time::now_rfc3339(),
-            )?;
+            let at = crate::time::now_rfc3339();
+            let mut changes = crate::domain::runs::ops::ensure_supervised(ctx.store(), &run, &at)?;
+            // Story 22-1: the launch's Run Key commits with its record and
+            // its new generation, published with the Run entry.
+            if let Some(credentials) = credentials {
+                changes.extend(crate::domain::runs::ops::issue_launch(
+                    ctx.store(),
+                    &run.run_id,
+                    generation,
+                    credentials,
+                    &at,
+                )?);
+            }
             let events = crate::domain::runs::ops::commit(ctx, &publisher, changes)?;
             Ok((generation, events))
         })?)

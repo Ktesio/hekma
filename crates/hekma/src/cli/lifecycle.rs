@@ -93,33 +93,9 @@ fn body_and_bound(verb: RunLifecycleVerb, args: &LifecycleArgs) -> (Value, Durat
     }
 }
 
-/// A target in the LEGACY run-id shape (`run-<digits>-<digits>`) is also a
-/// valid agent name: when an agent of that name is registered, it is the
-/// agent, so its verb keeps its unchanged instance route. A ULID run id is
-/// never an agent name (names are lowercase), so it is never looked up.
-fn prefer_agent(target: Target) -> Target {
-    match target {
-        Target::Run(raw)
-            if !hekma_engine::RunId::from_wire(&raw).is_ulid() && is_registered_agent(&raw) =>
-        {
-            Target::Instance(raw)
-        }
-        other => other,
-    }
-}
-
-/// Whether an agent named `name` is registered (a read-only look; no
-/// state directory or no such agent is `false`).
-fn is_registered_agent(name: &str) -> bool {
-    open_read_only_engine().is_ok_and(|engine| engine.blocking().fleet_entry(name).is_ok())
-}
-
 /// `hekma agent stop|pause|resume|drain <TARGET|--selector SEL>`.
 pub fn run(verb: RunLifecycleVerb, args: LifecycleArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let target = prefer_agent(Target::parse(
-        args.target.as_deref(),
-        args.selector.as_deref(),
-    )?);
+    let target = Target::parse(args.target.as_deref(), args.selector.as_deref())?.prefer_agent();
     let flags = FanoutFlags {
         dry_run: args.dry_run,
         yes: args.yes,

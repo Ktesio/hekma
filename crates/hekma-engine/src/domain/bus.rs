@@ -135,6 +135,11 @@ pub enum EngineEvent {
     /// which instances were kept on `pause`, and whether each one's config
     /// was written.
     BreachDefaultUpgraded(super::runs::policy::BreachDefaultUpgradedEvent),
+    /// A credential change (story 22-1): issued, rotated, revoked or
+    /// reuse-detected — committed with its outbox row in the job that made
+    /// the change. Carries a token id, never a token or a hash. Boxed for the
+    /// same ring-size reason as `Policy`.
+    Credential(Box<super::credential::CredentialEvent>),
 }
 
 /// The in-supervisor handle to the event bus: a cloneable pair of

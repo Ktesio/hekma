@@ -3275,6 +3275,16 @@ pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
             ),
         }
         .into(),
+        // Story 22-1: no Run Key could be issued (the OS random source
+        // failed): nothing was spawned and nothing changed.
+        EngineError::CredentialUnavailable { name, .. } => AgentLaunchFailed {
+            message: format!(
+                "The operating system's random source failed, so no Run Key was issued and the \
+                 agent '{name}' was not started. Nothing changed; check the system's random \
+                 source and try again."
+            ),
+        }
+        .into(),
         // AC3: pause is UNSUPPORTED on this OS — fail fast QUOTING the declaration
         // (the level + OS) and pointing at `hekma agent show`. No state changed.
         EngineError::CapabilityUnsupported {

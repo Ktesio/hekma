@@ -1805,7 +1805,7 @@ impl Supervisor {
     ) {
         for (event, append) in events {
             self.note_outbox_append(&append);
-            self.publish(append.seq, EngineEvent::Run(event));
+            self.publish(append.seq, event);
         }
     }
 
@@ -2104,11 +2104,34 @@ impl Default for Supervisor {
 ///
 /// [`METERING_BASE_URL_KEY`]: crate::domain::METERING_BASE_URL_KEY
 /// [`MEMORY_DIR_KEY`]: crate::domain::MEMORY_DIR_KEY
+#[cfg(test)]
 fn invocation_overrides(base_url: Option<&str>, memory_dir: Option<&Path>) -> Option<ConfigLayer> {
-    if base_url.is_none() && memory_dir.is_none() {
+    invocation_overrides_with_keys(base_url, memory_dir, &[])
+}
+
+/// [`invocation_overrides`] plus the reserved credential leaves (story
+/// 22-1): each `(dotted key, marker)` lands as a nested leaf whose VALUE is
+/// only the marker (`run-key:<token id>`) — the cleartext travels in the
+/// per-launch secrets map, never in a config layer.
+fn invocation_overrides_with_keys(
+    base_url: Option<&str>,
+    memory_dir: Option<&Path>,
+    run_keys: &[(&str, String)],
+) -> Option<ConfigLayer> {
+    if base_url.is_none() && memory_dir.is_none() && run_keys.is_empty() {
         return None;
     }
     let mut table = toml::value::Table::new();
+    for (key, marker) in run_keys {
+        if let Some((section, leaf)) = key.split_once('.') {
+            let entry = table
+                .entry(section.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+            if let toml::Value::Table(inner) = entry {
+                inner.insert(leaf.to_string(), toml::Value::String(marker.clone()));
+            }
+        }
+    }
     if let Some(url) = base_url {
         // A DOTTED key (`metering.base_url`) is a nested table in TOML; build the
         // nested shape so `resolve` flattens it to the dotted leaf the mapping targets.
@@ -2457,6 +2480,22 @@ fn snapshot_to_engine(err: super::error::RegistryError) -> EngineError {
 /// [`snapshot_to_engine`]). The [`SecretError`] message names the `NAME` + the
 /// resolvers tried (or the `chmod 600` remediation) but NEVER a resolved value, so
 /// mapping it into [`EngineError::Secret`]'s `detail` cannot leak a secret (AC-B).
+/// Map a credential mint failure (story 22-1: the OS random source failed)
+/// into the typed start refusal.
+fn credential_to_engine(
+    name: &InstanceName,
+    err: crate::domain::credential::CredentialError,
+) -> EngineError {
+    match err {
+        crate::domain::credential::CredentialError::RandomSourceFailed { detail } => {
+            EngineError::CredentialUnavailable {
+                name: name.as_str().to_string(),
+                detail,
+            }
+        }
+    }
+}
+
 fn secret_to_engine(name: &InstanceName, err: crate::ports::SecretError) -> EngineError {
     EngineError::Secret {
         name: name.as_str().to_string(),

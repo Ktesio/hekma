@@ -64,6 +64,29 @@ fn an_agent_named_like_a_legacy_run_id_is_still_the_agent() {
     // A legacy-shaped id no agent owns is still read as a run id.
     let run = hekma(&["agent", "stop", "run-3-4", "--dry-run"]);
     assert_eq!(run.code, Some(3), "{}", run.stderr);
+    // Story 22-1 (the 21-6 review's N6): the real (flag-less) route keeps
+    // the agent too — `pause` on a registered, not-running agent is the
+    // agent route's own refusal, never a Run lookup.
+    let run = hekma(&["agent", "pause", "run-1-2"]);
+    assert_eq!(run.code, Some(4), "{}", run.stderr);
+    assert!(!run.stderr.contains("no Run has the id"), "{}", run.stderr);
+    // `budget` and `label` resolve the agent the same way.
+    for args in [
+        vec!["budget", "show", "run-1-2"],
+        vec!["budget", "set", "run-1-2", "--tokens-per-run", "100"],
+        vec!["label", "set", "run-1-2", "team=core"],
+    ] {
+        let run = hekma(&args);
+        assert_eq!(run.code, Some(4), "{args:?}: {}", run.stderr);
+        assert!(
+            run.stderr
+                .contains("Agent Instance `run-1-2` has no open Run"),
+            "{args:?}: {}",
+            run.stderr
+        );
+    }
+    let run = hekma(&["budget", "show", "run-3-4"]);
+    assert_eq!(run.code, Some(3), "{}", run.stderr);
 }
 
 #[test]

@@ -1021,6 +1021,25 @@ impl RunRecords for SqliteStore {
                     .then_some(i64::from(limits.breach_action.is_some())),
             ),
         ];
+        // The oldest ceiling row of this layer as it stood BEFORE the write
+        // (its action, source and time): the 21-2 child-open shape's
+        // provenance for an action no action row recorded yet.
+        let prior_ceiling: Option<(String, String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT action, source, set_at FROM run_limits \
+                 WHERE run_id = ?1 AND scope <> ?2 AND dimension IN (?3, ?4) \
+                 ORDER BY set_at, dimension, scope LIMIT 1",
+                rusqlite::params![
+                    run_id.as_str(),
+                    ACTION_SCOPE,
+                    slot_dimension(slot, "tokens"),
+                    slot_dimension(slot, "dollars"),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(backend)?;
         for (dimension, scope, value) in wanted {
             let dimension = slot_dimension(slot, dimension);
             let existing: Option<(i64, String)> = self
@@ -1068,7 +1087,22 @@ impl RunRecords for SqliteStore {
                             .map_err(backend)?;
                     }
                 }
-                (Some(value), _) => {
+                (Some(value), existing) => {
+                    // Story 22-1 (the 21-6 review's N4): the FIRST action row
+                    // of a layer written in the 21-2 child-open shape (the
+                    // action carried on its ceiling rows, no action row)
+                    // keeps the provenance of those rows when the action is
+                    // unchanged — the next writer of some other limit did
+                    // not set it.
+                    let inherited = (scope == ACTION_SCOPE && existing.is_none())
+                        .then_some(())
+                        .and(prior_ceiling.as_ref())
+                        .filter(|(stored_action, _, _)| stored_action == action.as_str())
+                        .map(|(_, source, at)| (source.clone(), at.clone()));
+                    let (row_source, row_at) = match &inherited {
+                        Some((source, at)) => (source.as_str(), at.as_str()),
+                        None => (source, at),
+                    };
                     self.conn()
                         .execute(
                             "INSERT INTO run_limits (run_id, dimension, scope, limit_value, \
@@ -1082,8 +1116,8 @@ impl RunRecords for SqliteStore {
                                 scope,
                                 value,
                                 action.as_str(),
-                                source,
-                                at
+                                row_source,
+                                row_at
                             ],
                         )
                         .map_err(backend)?;
@@ -1346,6 +1380,46 @@ impl RunRecords for SqliteStore {
             )
             .map_err(backend)?;
         Ok(())
+    }
+
+    fn insert_token(&self, token: &crate::ports::TokenRow) -> Result<(), StoreError> {
+        super::tokens_sqlite::insert_token(self.conn(), token)
+    }
+
+    fn token(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+    ) -> Result<Option<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::token(self.conn(), hash)
+    }
+
+    fn set_token_state(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+        state: crate::domain::credential::TokenState,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError> {
+        super::tokens_sqlite::set_token_state(self.conn(), hash, state, at, cause)
+    }
+
+    fn active_tokens(&self, run_id: &RunId) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_tokens(self.conn(), run_id)
+    }
+
+    fn run_tokens(&self, run_id: &RunId) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::run_tokens(self.conn(), run_id)
+    }
+
+    fn active_issued_under(
+        &self,
+        roots: &[crate::domain::credential::TokenHash],
+    ) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_issued_under(self.conn(), roots)
+    }
+
+    fn active_key_rows(&self) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
+        super::tokens_sqlite::active_key_rows(self.conn())
     }
 }
 

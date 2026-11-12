@@ -6447,9 +6447,10 @@ fn transitions_land_in_the_outbox_with_monotonic_seqs() {
         assert!(
             matches!(
                 entry.event,
-                EngineEvent::Transition(_) | EngineEvent::Run(_)
+                EngineEvent::Transition(_) | EngineEvent::Run(_) | EngineEvent::Credential(_)
             ),
-            "start/stop commit transitions and their Run events: {entry:?}"
+            "start/stop commit transitions, their Run events and (story 22-1) the \
+             launch's credential events: {entry:?}"
         );
     }
     // At least the starting→(running/failed)→stopping→stopped sequence.
@@ -10801,4 +10802,189 @@ fn a_config_write_raise_re_arms_a_live_runs_latch_and_a_lowering_fires_at_once()
         .anomalies
         .contains(&crate::domain::runs::Anomaly::Breach));
     let _ = sup.stop(&registry, "cfgrearm", Some(Duration::from_secs(5)));
+}
+
+// ---- Story 22-1: a supervised launch's Run Key ----
+
+#[test]
+fn a_failing_random_source_refuses_a_supervised_start_with_nothing_spawned_or_written() {
+    // Every OS: the mint precedes every state change, so nothing spawns.
+    let (_state, _manifest, registry) = setup_fake("nokey", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let outbox_before = outbox_entries(&registry).len();
+    crate::domain::credential::tests::fail_rng(true);
+    let refused = sup.start(&registry, "nokey");
+    crate::domain::credential::tests::fail_rng(false);
+    let err = refused.unwrap_err();
+    assert!(
+        matches!(err, EngineError::CredentialUnavailable { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("random source failed"), "{err}");
+    assert_eq!(state_of(&registry, "nokey"), LifecycleState::Registered);
+    assert!(registry
+        .spawn_record(&InstanceName::new("nokey").unwrap())
+        .unwrap()
+        .is_none());
+    assert_eq!(outbox_entries(&registry).len(), outbox_before);
+    assert!(registry.run_snapshot().keys.is_empty());
+    assert!(registry.run_snapshot().runs.is_empty());
+}
+
+#[test]
+fn a_supervised_start_delivers_its_run_key_in_the_environment_only_unix() {
+    if crate::OsId::current() == crate::OsId::Windows {
+        // No live child off Unix; issuance is proven at the job level.
+        return;
+    }
+    let dump = tempfile::tempdir().unwrap();
+    let dump_path = dump.path().join("env.txt");
+    let marker_path = dump.path().join("ready.marker");
+    let (_state, _manifest, registry) = setup_fake_with_config(
+        "keyed",
+        &[
+            "--linger-ms",
+            "600000",
+            "--dump",
+            dump_path.to_str().unwrap(),
+            "--marker",
+            marker_path.to_str().unwrap(),
+        ],
+        "[config.\"run.key\"]\nenv = \"MY_AGENT_KEY\"\n",
+    );
+    let name = InstanceName::new("keyed").unwrap();
+    // A hand-set reserved value in the config file is stripped at start.
+    let config = registry.paths().instance_config(&name);
+    std::fs::write(&config, "[run]\nkey = \"hk_run_HANDSET\"\n").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "keyed").unwrap();
+    let _guard = kill_guard(&registry, "keyed");
+    wait_for_marker(&marker_path);
+    let dumped = wait_for_dump(&dump_path);
+    let key = dumped
+        .lines()
+        .find_map(|line| line.strip_prefix("env=HEKMA_RUN_KEY="))
+        .expect("HEKMA_RUN_KEY delivered")
+        .to_string();
+    assert!(key.starts_with("hk_run_") && key.len() == 59, "{key}");
+    // The Adapter's own `env` mapping receives the same key.
+    assert!(dumped
+        .lines()
+        .any(|line| line == format!("env=MY_AGENT_KEY={key}")));
+    // Never on the argv, never the hand-set value.
+    assert!(!dumped
+        .lines()
+        .filter(|line| line.starts_with("arg="))
+        .any(|line| line.contains("hk_run_")));
+    assert!(!dumped.contains("hk_run_HANDSET"));
+    // It is that Run's Run Key once the launch committed.
+    let hash = crate::domain::credential::TokenHash::of(&key);
+    let snapshot = registry.run_snapshot();
+    let entry = snapshot.key(&hash).expect("indexed");
+    let owner = snapshot.owner_of("keyed").unwrap();
+    assert_eq!(entry.run_id, owner.record.run_id);
+    assert_eq!(entry.launch_generation, Some(1));
+    // effective-config.json and the Agent Home carry no token.
+    let effective =
+        std::fs::read_to_string(registry.paths().effective_config_snapshot(&name)).unwrap();
+    assert!(
+        !effective.contains(&key) && !effective.contains("run.key"),
+        "{effective}"
+    );
+    let home = registry.agent_home(&name);
+    let mut stack = vec![home];
+    while let Some(dir) = stack.pop() {
+        for item in std::fs::read_dir(&dir).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read(&path) {
+                assert!(
+                    !text.windows(key.len()).any(|w| w == key.as_bytes()),
+                    "{} carries the key",
+                    path.display()
+                );
+            }
+        }
+    }
+    // The spawn record carries no token either.
+    let record = registry.spawn_record(&name).unwrap().unwrap();
+    assert!(!format!("{record:?}").contains(&key));
+    // A stop records the exit: the key leaves the index.
+    let _ = sup.stop(&registry, "keyed", Some(Duration::from_secs(5)));
+    assert!(registry.run_snapshot().key(&hash).is_none());
+}
+
+#[test]
+fn the_launch_specs_debug_redacts_the_environment() {
+    let spec = SpawnSpec {
+        exec: "agent".to_string(),
+        args: vec!["--flag".to_string()],
+        env: std::collections::BTreeMap::from([(
+            "HEKMA_RUN_KEY".to_string(),
+            "hk_run_SENTINELSENTINEL".to_string(),
+        )]),
+        working_dir: std::path::PathBuf::from("/h"),
+        log_file: None,
+        attributed_log_path: None,
+        stderr_log_file: None,
+        instance_name: "a".to_string(),
+        pipe_stdin: false,
+        detach: false,
+        pipe_stdout: false,
+        inherit_env: true,
+        capture_mode: LogCaptureMode::default(),
+    };
+    let rendered = format!("{spec:?}");
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
+    assert!(rendered.contains("HEKMA_RUN_KEY") && rendered.contains("[REDACTED]"));
+    let launch = crate::adapter::StartLaunch {
+        exec: "agent".to_string(),
+        args: Vec::new(),
+        env: spec.env.clone(),
+    };
+    let rendered = format!("{launch:?}");
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
+}
+
+#[test]
+fn a_flag_or_file_mapping_of_a_credential_key_is_refused_at_registration() {
+    for (key, target) in [
+        ("run.key", "flag = \"--key\""),
+        ("run.key", "file = { path = \"k.toml\", key = \"k\" }"),
+        ("run.refresh_key", "flag = \"--refresh\""),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_fake_manifest_with_config(
+            manifest.path(),
+            "credmap",
+            &["--linger-ms", "1"],
+            &format!("[config.\"{key}\"]\n{target}\n"),
+        );
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = registry
+            .register_with_adapter(
+                "credmap",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(key), "{text}");
+        assert!(text.contains("environment variable"), "{text}");
+    }
+}
+
+#[test]
+fn the_reserved_credential_keys_cannot_be_written() {
+    let (_state, _manifest, registry) = setup_fake("nowrite", &["--linger-ms", "1"]);
+    let name = InstanceName::new("nowrite").unwrap();
+    for key in ["run.key", "run.refresh_key"] {
+        let err = registry
+            .set_config(&name, key, "hk_run_SENTINELSENTINELSENTINEL")
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(key) && text.contains("reserved"), "{text}");
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
 }

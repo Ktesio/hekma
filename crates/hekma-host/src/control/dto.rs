@@ -512,6 +512,99 @@ pub(crate) struct RunOpenRequest {
     pub breach_action: Option<String>,
     /// An id under which a retried open returns the same Run.
     pub external_id: Option<String>,
+    /// Story 22-1: whether to issue the child's Run Key and refresh
+    /// credential (default `true`); they come back once in the 201.
+    pub issue_credentials: Option<bool>,
+}
+
+/// `POST /v0/runs`'s 201 (story 22-1): the Run, and — when issued — its
+/// credentials, shown this once.
+#[derive(Serialize)]
+pub(crate) struct RunOpenedDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run: hekma_engine::RunView,
+    /// Its Run Key and refresh credential (absent when not issued).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<CredentialsDocument>,
+}
+
+/// One issued Run Key + refresh credential pair, on the wire ONCE (the 201
+/// of a child open, the 200 of a refresh). The cleartext crosses into a
+/// serializable value here and nowhere else (story 22-1: one greppable
+/// `expose_secret` site); `Debug` shows the token ids only.
+#[derive(Serialize)]
+pub(crate) struct CredentialsDocument {
+    /// The Run Key (`hk_run_…`).
+    pub run_key: String,
+    /// The refresh credential (`hk_ref_…`).
+    pub refresh_credential: String,
+    /// The Run Key's token id.
+    pub token_id: String,
+    /// The refresh credential's token id.
+    pub refresh_token_id: String,
+}
+
+impl From<&hekma_engine::IssuedCredentials> for CredentialsDocument {
+    fn from(issued: &hekma_engine::IssuedCredentials) -> Self {
+        CredentialsDocument {
+            run_key: issued.run_key().expose_secret().to_string(),
+            refresh_credential: issued.refresh_credential().expose_secret().to_string(),
+            token_id: issued.token_id(),
+            refresh_token_id: issued.refresh_token_id(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CredentialsDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialsDocument")
+            .field("token_id", &self.token_id)
+            .field("refresh_token_id", &self.refresh_token_id)
+            .finish()
+    }
+}
+
+/// `POST /v0/runs/refresh`'s 200 (story 22-1): the new pair, once.
+#[derive(Serialize)]
+pub(crate) struct RefreshDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run the credentials belong to.
+    pub run_id: hekma_engine::RunId,
+    /// The new Run Key and refresh credential.
+    pub credentials: CredentialsDocument,
+}
+
+/// `POST /v0/runs/{id}/revoke-keys` (story 22-1). An empty body cascades.
+#[derive(Deserialize, Default)]
+pub(crate) struct RevokeKeysRequest {
+    /// Revoke the credentials issued under the Run's own too (default
+    /// `true`).
+    pub cascade: Option<bool>,
+}
+
+/// `POST /v0/runs/{id}/revoke-keys`'s answer (story 22-1).
+#[derive(Serialize)]
+pub(crate) struct RevokeKeysDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// What was revoked (token ids, never a token).
+    #[serde(flatten)]
+    pub outcome: hekma_engine::RevokeOutcome,
+}
+
+/// `GET /v0/runs/{id}/keys` (story 22-1): a Run's credential metadata.
+#[derive(Serialize)]
+pub(crate) struct RunKeysDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: hekma_engine::RunId,
+    /// Every credential it was issued, oldest first: token ids, classes,
+    /// states — never a token or a hash.
+    pub keys: Vec<hekma_engine::CredentialSummary>,
 }
 
 /// `GET /v0/runs/{id}/labels` (story 21-9): one Run's labels, bound and
