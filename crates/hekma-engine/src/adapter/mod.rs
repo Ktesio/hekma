@@ -2626,43 +2626,28 @@ max_age_ms = 5000
         // with ManifestUnreadable echoing the path and the io detail —
         // never a panic, never a silently-defaulted plan. The errno text
         // itself is platform-worded (Windows says "cannot find the file"),
-        // so the pin is the stable raw code, not the prose. The absent
+        // so the pin is the stable raw code, not the prose — with the
+        // closing paren, so a bare `os error 2` substring could not also
+        // match neighbor codes like os error 21 (EISDIR). The absent
         // file sits DIRECTLY under the temp dir: a missing PARENT would
         // surface Windows' path-not-found (os error 3) instead, and the
         // raw code would stop being cross-OS stable.
         let tmp = TempDir::new().unwrap();
         let absent = tmp.path().join(MANIFEST_FILE);
-        let err = resolve_readiness_probe("demo", Some(&absent)).unwrap_err();
-        match &err {
-            LaunchResolveError::ManifestUnreadable { path, detail } => {
-                assert_eq!(path, &absent.to_string_lossy());
-                assert!(detail.contains("os error 2"), "detail: {detail}");
+        for label in ["readiness", "liveness", "exit-codes", "drain"] {
+            let err = match label {
+                "readiness" => resolve_readiness_probe("demo", Some(&absent)).unwrap_err(),
+                "liveness" => resolve_liveness_check("demo", Some(&absent)).unwrap_err(),
+                "exit-codes" => resolve_exit_codes("demo", Some(&absent)).unwrap_err(),
+                _ => resolve_drain_plan("demo", Some(&absent)).unwrap_err(),
+            };
+            match &err {
+                LaunchResolveError::ManifestUnreadable { path, detail } => {
+                    assert_eq!(path, &absent.to_string_lossy(), "{label}");
+                    assert!(detail.contains("(os error 2)"), "{label}: detail: {detail}");
+                }
+                other => panic!("{label}: expected ManifestUnreadable, got {other}"),
             }
-            other => panic!("expected ManifestUnreadable, got {other}"),
-        }
-        let err = resolve_liveness_check("demo", Some(&absent)).unwrap_err();
-        match &err {
-            LaunchResolveError::ManifestUnreadable { path, detail } => {
-                assert_eq!(path, &absent.to_string_lossy());
-                assert!(detail.contains("os error 2"), "detail: {detail}");
-            }
-            other => panic!("expected ManifestUnreadable, got {other}"),
-        }
-        let err = resolve_exit_codes("demo", Some(&absent)).unwrap_err();
-        match &err {
-            LaunchResolveError::ManifestUnreadable { path, detail } => {
-                assert_eq!(path, &absent.to_string_lossy());
-                assert!(detail.contains("os error 2"), "detail: {detail}");
-            }
-            other => panic!("expected ManifestUnreadable, got {other}"),
-        }
-        let err = resolve_drain_plan("demo", Some(&absent)).unwrap_err();
-        match &err {
-            LaunchResolveError::ManifestUnreadable { path, detail } => {
-                assert_eq!(path, &absent.to_string_lossy());
-                assert!(detail.contains("os error 2"), "detail: {detail}");
-            }
-            other => panic!("expected ManifestUnreadable, got {other}"),
         }
     }
 
@@ -2713,6 +2698,7 @@ max_age_ms = 5000
                 assert!(detail.contains("timeout_ms"), "{detail}");
                 assert!(detail.contains("[drain]"), "{detail}");
                 assert!(detail.contains("out of range"), "{detail}");
+                assert!(detail.contains("1..=600_000"), "{detail}");
             }
             other => panic!("expected InvalidDrain, got {other}"),
         }
