@@ -336,7 +336,7 @@ mod bench {
             },
             generation: 1,
             eval: EvalInput {
-                name: name(instance),
+                name: Some(name(instance)),
                 run_id: RunId::from_wire(run),
                 metering_source: "self-reported".to_string(),
                 token_budget: TokenBudget {

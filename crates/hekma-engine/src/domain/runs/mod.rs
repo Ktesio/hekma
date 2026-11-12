@@ -40,6 +40,7 @@ pub(crate) mod policy;
 pub mod selector;
 pub(crate) mod snapshot;
 pub mod verbs;
+pub(crate) mod wire;
 
 pub use labels::{validate_label_key, validate_label_value, LabelChange, LabelOutcome};
 pub use limits::{

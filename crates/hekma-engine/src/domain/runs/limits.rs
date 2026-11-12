@@ -256,7 +256,7 @@ pub(crate) fn re_arm(
             || (resolution.rate.is_some() && resolution.dollars.per_run.is_some()));
     if armed {
         let input = EvalInput {
-            name: instance.clone(),
+            name: Some(instance.clone()),
             run_id: run.run_id.clone(),
             // A missing context (the instance not supervised here) is the
             // honest `unknown`, never a fabricated empty source.

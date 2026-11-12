@@ -525,6 +525,21 @@ impl super::SqliteStore {
             .collect())
     }
 
+    /// Drop an identity row whose Run ended (a new Run takes it).
+    pub(crate) fn release_identity(
+        &self,
+        namespace: &str,
+        external: &str,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "DELETE FROM run_identities WHERE binding = ?1 AND external_id = ?2",
+                [namespace, external],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     /// How many open Runs carry an identity in `namespace` (the breadth
     /// cap's count for a binding's splits).
     pub(crate) fn open_identities_in(&self, namespace: &str) -> Result<u64, StoreError> {

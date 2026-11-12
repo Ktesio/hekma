@@ -1101,7 +1101,7 @@ impl Supervisor {
         let resolution = registry.resolved_limits(name, None);
         let supervised = self.running.get(name);
         pipeline::EvalInput {
-            name: name.clone(),
+            name: Some(name.clone()),
             run_id: run_id.clone(),
             metering_source: metering_source.to_string(),
             token_budget: resolution.tokens,

@@ -149,6 +149,24 @@ fn note<S: RunRecords + ?Sized>(
     Ok(())
 }
 
+/// Note a just-inserted Run's `created` event and entry (story 23-1: the
+/// wire-Run job).
+pub(crate) fn note_created<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    record: &RunRecord,
+    cause: Option<String>,
+) -> Result<(), StoreError> {
+    note(
+        store,
+        changes,
+        record,
+        RunEventKind::Created,
+        Prior::default(),
+        cause,
+    )
+}
+
 /// A fresh snapshot entry for `run_id` with no event (story 23-1: a job
 /// that changed only a latch — a `block` breach on a Run already carrying
 /// its `breach` Anomaly, a re-arm — republishes the disposition). `None`
@@ -960,6 +978,11 @@ pub(crate) fn action_refusal(
     wire_path: bool,
 ) -> Option<String> {
     if action == BreachAction::Warn {
+        return None;
+    }
+    // Story 23-1: `block` executes at any depth with a wire path (the shared
+    // proxy fences the Run and everything beneath it).
+    if action == BreachAction::Block && wire_path {
         return None;
     }
     let cell = super::verb_cell(super::RunVerb::BreachActionPauseStopBlock, depth, wire_path);
