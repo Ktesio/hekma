@@ -270,7 +270,7 @@ One interaction with detach is worth knowing — **what happens to a paused deta
 | Argument / flag | Meaning |
 |---|---|
 | `<name>` | An agent: today's command, unchanged |
-| `<run-id>` | A Run: on the Run that owns an agent's process the verb is the agent's own; any other Run is refused, naming its depth |
+| `<run-id>` | A Run: on the Run that owns an agent's process the verb is the agent's own; any other Run is refused, naming its depth. A registered agent whose name has an older run id's shape (`run-<digits>-<digits>`) is read as that agent |
 | `--selector key=value[,key=value...]` | Every open Run carrying all these labels, bound or caller (at most 1000) |
 | `--dry-run` | Show each Run's planned outcome (`would-stop`, or the refusal and its code); change nothing and start no Service Host |
 | `--yes` | Do not ask before acting on several Runs |
