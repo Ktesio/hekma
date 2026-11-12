@@ -140,6 +140,12 @@ pub use domain::{
     RunUsage, RunVerb, RunView, Selector, SelectorScope, VerbCell, HOST_IDENTITY_BINDING,
     MAX_RUN_NESTING, MAX_SELECTED_RUNS, RUN_EVENT_SCHEMA_VERSION, RUN_VERBS,
 };
+// Story 21-6: Selectors on every verb and `hekma budget` — the Run-grain
+// lifecycle verbs, Run-level limits as one actor, and the budget read.
+pub use domain::{
+    LimitActor, LimitsDirection, RunLifecycleVerb, RunLimitChange, RunLimitField, RunLimitsOutcome,
+    RunLimitsResults, RunLimitsView, RunVerbError,
+};
 // Story 21-5: the Run listing — `hekma ps` and `GET /v0/runs`'s read model.
 pub use domain::{
     decode_cursor, encode_cursor, ended_run_cutoff, LatchedBreach, ListRunsQuery, ListingCounts,
@@ -168,11 +174,12 @@ pub use shutdown::{drain_plan, DrainOutcome, StopResult};
 // `proxy-wire v1` refusal constants join it.
 pub use domain::{
     canonical_json, checksum_file_content, decide, decide_chain, fence_code, fence_refusal,
-    generate, governance_vectors_checksum, run_derivation, Case, ChainCase, CoverTag, DecisionCase,
-    DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal, GovernanceDecision,
-    GovernanceInput, GovernanceOutcome, LatchKey, Provenance, RowPricing, TokenArm,
-    VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER, FENCE_REFUSAL_STATUS,
-    GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
+    generate, governance_vectors_checksum, re_armed_keys, rearm, run_derivation, Case, ChainCase,
+    CoverTag, DecisionCase, DerivationCase, DerivationSpec, DollarArm, FenceCase, FenceRefusal,
+    GovernanceDecision, GovernanceInput, GovernanceOutcome, LatchKey, LatchedReason, LevelArms,
+    LevelTotals, Provenance, RearmCase, RearmInput, RearmOutcome, RearmTrigger, RowPricing,
+    TokenArm, VectorsDocument, ALL_COVERS, FENCE_ERROR_TYPE, FENCE_REASON_ORDER,
+    FENCE_REFUSAL_STATUS, GOVERNANCE_VECTORS_ARTIFACT_ID, GOVERNANCE_VECTORS_ARTIFACT_PATH,
     GOVERNANCE_VECTORS_SCHEMA_VERSION, GOVERNANCE_VECTORS_VERSION, PROXY_WIRE_VERSION,
 };
 /// The governance conformance vectors artifact, embedded verbatim at build

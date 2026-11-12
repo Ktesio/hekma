@@ -2445,20 +2445,31 @@ fn adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption() {
     assert!(pid_alive(pid));
     let run = record_run_id(state.path(), "away").expect("the record carries the Run id");
 
-    // Engine 2 (no budget yet): adopt + resume; arm the ceiling AFTERWARD.
+    // Engine 2 (no budget yet): adopt + resume, then release it.
     let engine = Engine::open(Some(state.path().to_path_buf())).unwrap();
     let facade = engine.blocking();
     assert!(
         facade.budget_breach_events("away").unwrap().is_empty(),
         "no breach exists yet (the budget was never armed)"
     );
-    facade
-        .set_config("away", "budget.tokens.cumulative", "15")
-        .unwrap();
-    facade
-        .set_config("away", "budget.breach_action", "pause")
-        .unwrap();
+    let config = engine
+        .agent_home(&hekma_engine::InstanceName::new("away").unwrap())
+        .join(hekma_engine::paths::INSTANCE_CONFIG_FILE);
     drop(engine);
+    // Arm the ceiling while NO engine supervises the agent — a hand edit of
+    // the instance config between hosts. (Since story 21-6 a `config set`
+    // through a supervising engine breaches AT ONCE on a ceiling at or
+    // below the usage, so the un-recorded crossing this leg proves can only
+    // arise when no engine evaluated the write.)
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    assert!(!existing.contains("[budget"), "{existing}");
+    std::fs::write(
+        &config,
+        format!(
+            "{existing}\n[budget]\nbreach_action = \"pause\"\n\n[budget.tokens]\ncumulative = 15\n"
+        ),
+    )
+    .unwrap();
 
     // Engine 3: adopt → re-evaluate → the crash-gap breach FIRES, under the
     // RESUMED Run id, with the (default) pause action.

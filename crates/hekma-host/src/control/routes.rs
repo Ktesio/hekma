@@ -745,6 +745,7 @@ pub(crate) async fn run_open(
                 token_per_run: request.token_budget,
                 dollar_per_run_micros,
                 breach_action,
+                ..RunLimits::default()
             },
             external_id: request.external_id,
         })
@@ -960,4 +961,612 @@ pub(crate) async fn policy_delete(
         return Ok(Json(policy_change_document(outcome, true)).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Selector sets, the Run-grain verbs and Run-level limits.
+// ---------------------------------------------------------------------------
+
+/// A `window_secs` value inside the host's stop-window bounds, or the
+/// request refusal.
+fn checked_window(window_secs: Option<u64>) -> ApiResult<Option<Duration>> {
+    match window_secs {
+        None => Ok(None),
+        Some(secs) => {
+            if !(crate::MIN_STOP_WINDOW_SECS..=crate::MAX_STOP_WINDOW_SECS).contains(&secs) {
+                return Err(ApiError::invalid_body(format!(
+                    "window_secs must be a whole number of seconds from {} to {}",
+                    crate::MIN_STOP_WINDOW_SECS,
+                    crate::MAX_STOP_WINDOW_SECS
+                )));
+            }
+            Ok(Some(Duration::from_secs(secs)))
+        }
+    }
+}
+
+/// A `timeout_ms` value inside the drain bound, or the request refusal.
+fn checked_drain_bound(timeout_ms: Option<u64>) -> ApiResult<Option<Duration>> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(ms) if ms == 0 || ms > 600_000 => Err(ApiError::invalid_body(
+            "timeout_ms must be a whole number of milliseconds from 1 to 600000".to_string(),
+        )),
+        Some(ms) => Ok(Some(Duration::from_millis(ms))),
+    }
+}
+
+/// An optional JSON body: absent (zero bytes) is the default, a present one
+/// must parse.
+fn optional_body<T: serde::de::DeserializeOwned + Default>(
+    body: &Bytes,
+    shape: &str,
+) -> ApiResult<T> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body).map_err(|err| {
+        ApiError::invalid_body(format!(
+            "the body must be a JSON object like {shape}, or no body at all: {err}"
+        ))
+    })
+}
+
+/// `POST /v0/runs/select` — resolve a Selector into a set to act on (story
+/// 21-6, AD-20's set token): every non-ended Run carrying all its terms,
+/// at most `MAX_SELECTED_RUNS` (more is `400 too-many-runs`, never cut).
+/// The answer's token is single-use, bound to this credential and expires
+/// after 10 minutes; a set-form verb acts on exactly the listed Runs.
+pub(crate) async fn runs_select(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SelectRequest>,
+) -> ApiResult<Json<dto::SelectDocument>> {
+    let selector = hekma_engine::Selector::parse(&request.selector)
+        .map_err(|reason| ApiError::invalid_body(format!("selector: {reason}")))?;
+    let runs = state.engine.select_run_summaries(&selector).await?;
+    let minted = state
+        .sets
+        .mint(
+            credential.0,
+            runs.iter()
+                .map(|run| run.record.run_id.to_string())
+                .collect(),
+        )
+        .map_err(|reason| {
+            ApiError::new(
+                super::error::ApiErrorKind::Internal,
+                format!("could not mint a set token: {reason}"),
+            )
+        })?;
+    Ok(Json(dto::SelectDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        token: minted.token,
+        matched: runs.len(),
+        runs,
+        expires_at: minted.expires_at,
+    }))
+}
+
+/// One Run-grain lifecycle verb on one Run (the per-Run routes and each
+/// member of a set act share it).
+async fn act_one(
+    state: &ApiState,
+    verb: hekma_engine::RunLifecycleVerb,
+    run_id: &str,
+    window: Option<Duration>,
+    bound: Option<Duration>,
+) -> ApiResult<dto::RunActDocument> {
+    use hekma_engine::RunLifecycleVerb as Verb;
+    let (instance, drain) = match verb {
+        Verb::Stop => (state.engine.stop_run(run_id, window).await?, None),
+        Verb::Pause => (state.engine.pause_run(run_id).await?, None),
+        Verb::Resume => (state.engine.resume_run(run_id).await?, None),
+        Verb::Drain => {
+            let report = state.engine.drain_run(run_id, bound).await?;
+            (report.instance, Some(report.outcome))
+        }
+    };
+    let read_back = state
+        .engine
+        .fleet_entry(instance.name.as_str())
+        .await
+        .map_err(ApiError::from);
+    Ok(acted(
+        run_id,
+        read_back,
+        drain.map(|outcome| (outcome.completed, outcome.waited_ms)),
+    ))
+}
+
+/// The answer for a verb that COMMITTED on `run_id`: its Fleet row read
+/// back, when the read succeeded. A failed read-back drops only the row —
+/// the Run acted, so it is never reported as refused.
+fn acted(
+    run_id: &str,
+    read_back: ApiResult<hekma_engine::FleetEntry>,
+    drain: Option<(bool, u64)>,
+) -> dto::RunActDocument {
+    dto::RunActDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        run_id: run_id.to_string(),
+        instance: read_back.ok(),
+        completed: drain.map(|(completed, _)| completed),
+        waited_ms: drain.map(|(_, waited_ms)| waited_ms),
+    }
+}
+
+/// `POST /v0/runs/{id}/stop` — stop the instance whose process the Run
+/// owns (optional `{"window_secs": n}`); a child Run, an ended Run and any
+/// depth the verb × depth table does not serve are refused (`409`).
+pub(crate) async fn run_stop(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<dto::RunActDocument>> {
+    let request: dto::StopRequest = optional_body(&body, "{\"window_secs\":30}")?;
+    let window = checked_window(request.window_secs)?;
+    Ok(Json(
+        act_one(
+            &state,
+            hekma_engine::RunLifecycleVerb::Stop,
+            &run_id,
+            window,
+            None,
+        )
+        .await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/pause`.
+pub(crate) async fn run_pause(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunActDocument>> {
+    Ok(Json(
+        act_one(
+            &state,
+            hekma_engine::RunLifecycleVerb::Pause,
+            &run_id,
+            None,
+            None,
+        )
+        .await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/resume`.
+pub(crate) async fn run_resume(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunActDocument>> {
+    Ok(Json(
+        act_one(
+            &state,
+            hekma_engine::RunLifecycleVerb::Resume,
+            &run_id,
+            None,
+            None,
+        )
+        .await?,
+    ))
+}
+
+/// `POST /v0/runs/{id}/drain` (optional `{"timeout_ms": n}`).
+pub(crate) async fn run_drain(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<Json<dto::RunActDocument>> {
+    let request: dto::DrainRequest = optional_body(&body, "{\"timeout_ms\":1500}")?;
+    let bound = checked_drain_bound(request.timeout_ms)?;
+    Ok(Json(
+        act_one(
+            &state,
+            hekma_engine::RunLifecycleVerb::Drain,
+            &run_id,
+            None,
+            bound,
+        )
+        .await?,
+    ))
+}
+
+/// Build the engine change from the limit fields (no engine needed).
+fn limit_change(patch: &dto::RunLimitsPatch) -> ApiResult<hekma_engine::RunLimitChange> {
+    let dollars = |field: &str, raw: &Option<String>| {
+        raw.as_deref()
+            .map(hekma_engine::parse_dollars_to_micros)
+            .transpose()
+            .map_err(|reason| ApiError::invalid_body(format!("{field}: {reason}")))
+    };
+    let breach_action = patch
+        .breach_action
+        .as_deref()
+        .map(str::parse::<BreachAction>)
+        .transpose()
+        .map_err(|err| ApiError::invalid_body(format!("breach_action: {err}")))?;
+    let mut clear = Vec::with_capacity(patch.clear.len());
+    for raw in &patch.clear {
+        let field = hekma_engine::RunLimitField::from_wire(raw).ok_or_else(|| {
+            ApiError::invalid_body(format!(
+                "clear: `{raw}` is not a limit — use tokens-per-run, tokens-cumulative, \
+                 dollars-per-run, dollars-cumulative or breach-action"
+            ))
+        })?;
+        if !clear.contains(&field) {
+            clear.push(field);
+        }
+    }
+    let change = hekma_engine::RunLimitChange {
+        set: RunLimits {
+            token_per_run: patch.tokens_per_run,
+            dollar_per_run_micros: dollars("dollars_per_run", &patch.dollars_per_run)?,
+            token_cumulative: patch.tokens_cumulative,
+            dollar_cumulative_micros: dollars("dollars_cumulative", &patch.dollars_cumulative)?,
+            breach_action,
+        },
+        clear,
+    };
+    change.validate()?;
+    Ok(change)
+}
+
+/// `GET /v0/runs/{id}/limits` — one Run's budget read: the limits set on
+/// the Run, the resolved limits with their sources, the subtree and
+/// cumulative usage, the headroom and the latches.
+pub(crate) async fn run_limits_get(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+) -> ApiResult<Json<dto::RunLimitsDocument>> {
+    let view = state.engine.run_limits_view(&run_id).await?;
+    Ok(Json(dto::RunLimitsDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        view,
+    }))
+}
+
+/// `PATCH /v0/runs/{id}/limits` — set or clear limits on one Run as the
+/// Operator (this bearer is the Operator's; the Caller credential classes
+/// that may only tighten arrive with their own surfaces). A limit set here
+/// belongs to the Run (`run_scoped: true`). Refusals: `404 run-not-found`,
+/// `409 run-ended`, `400 scope-unavailable` / `action-unavailable` /
+/// `invalid-request`.
+pub(crate) async fn run_limits_patch(
+    State(state): State<ApiState>,
+    Path(run_id): Path<String>,
+    ApiJson(request): ApiJson<dto::RunLimitsPatch>,
+) -> ApiResult<Json<dto::RunLimitsChangeDocument>> {
+    let change = limit_change(&request)?;
+    let mut results = state
+        .engine
+        .set_run_limits(
+            vec![run_id],
+            change,
+            hekma_engine::LimitActor::Operator,
+            request.dry_run,
+        )
+        .await?;
+    let (_, outcome) = results.pop().ok_or_else(|| {
+        ApiError::new(
+            super::error::ApiErrorKind::Internal,
+            "the budget job answered no Run",
+        )
+    })?;
+    Ok(Json(dto::RunLimitsChangeDocument {
+        schema_version: dto::CONTROL_API_SCHEMA_VERSION,
+        outcome: outcome?,
+    }))
+}
+
+/// Consume a set token for this request's credential.
+fn consume_set(
+    state: &ApiState,
+    credential: super::auth::Credential,
+    token: &str,
+) -> ApiResult<Vec<String>> {
+    state
+        .sets
+        .consume(token, credential.0)
+        .map_err(ApiError::set_token)
+}
+
+/// A refused Run's result row.
+fn refused(run_id: String, error: ApiError) -> dto::ActResult {
+    dto::ActResult {
+        run_id,
+        outcome: "refused".to_string(),
+        error: Some(error.error_object()),
+        ..dto::ActResult::default()
+    }
+}
+
+/// The past tense a lifecycle verb's result carries.
+fn past_tense(verb: hekma_engine::RunLifecycleVerb) -> &'static str {
+    use hekma_engine::RunLifecycleVerb as Verb;
+    match verb {
+        Verb::Stop => "stopped",
+        Verb::Pause => "paused",
+        Verb::Resume => "resumed",
+        Verb::Drain => "drained",
+    }
+}
+
+/// A set-form lifecycle verb: consume the token, act on EXACTLY the listed
+/// Runs — the per-Run calls issued concurrently and joined (the engine
+/// serializes the ladders under its locks, so a set's worst case is the sum
+/// of the windows) — and answer one result per Run, in set order. A Run
+/// that ended since the select is that Run's `run-ended` refusal; the rest
+/// act.
+async fn set_act(
+    state: ApiState,
+    credential: super::auth::Credential,
+    verb: hekma_engine::RunLifecycleVerb,
+    request: dto::SetActRequest,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    use hekma_engine::RunLifecycleVerb as Verb;
+    let window = match verb {
+        Verb::Stop => checked_window(request.window_secs)?,
+        _ if request.window_secs.is_some() => {
+            return Err(ApiError::invalid_body(format!(
+                "window_secs applies to stop only, not {}",
+                verb.as_str()
+            )))
+        }
+        _ => None,
+    };
+    let bound = match verb {
+        Verb::Drain => checked_drain_bound(request.timeout_ms)?,
+        _ if request.timeout_ms.is_some() => {
+            return Err(ApiError::invalid_body(format!(
+                "timeout_ms applies to drain only, not {}",
+                verb.as_str()
+            )))
+        }
+        _ => None,
+    };
+    let run_ids = consume_set(&state, credential, &request.set_token)?;
+    // Every Run's own refusal is decided FIRST, against the set as it
+    // stands when the act begins — so a child is answered from its own
+    // cell, never from what its parent's concurrent stop then did to it.
+    let mut planned = Vec::with_capacity(run_ids.len());
+    for run_id in &run_ids {
+        planned.push(state.engine.plan_run_verb(run_id, verb).await.err());
+    }
+    let mut tasks = Vec::with_capacity(run_ids.len());
+    for (run_id, refusal) in run_ids.iter().cloned().zip(planned) {
+        let state = state.clone();
+        tasks.push(tokio::spawn(async move {
+            let acted = match refusal {
+                Some(refusal) => Err(ApiError::from(refusal)),
+                None => act_one(&state, verb, &run_id, window, bound).await,
+            };
+            (run_id, acted)
+        }));
+    }
+    let mut results = Vec::with_capacity(tasks.len());
+    for (task, run_id) in tasks.into_iter().zip(run_ids.iter()) {
+        results.push(match task.await {
+            Ok((run_id, Ok(document))) => dto::ActResult {
+                run_id,
+                outcome: past_tense(verb).to_string(),
+                instance: document.instance,
+                completed: document.completed,
+                waited_ms: document.waited_ms,
+                ..dto::ActResult::default()
+            },
+            Ok((run_id, Err(error))) => refused(run_id, error),
+            Err(join) => refused(
+                run_id.clone(),
+                ApiError::new(
+                    super::error::ApiErrorKind::Internal,
+                    format!("the act on this Run did not complete: {join}"),
+                ),
+            ),
+        });
+    }
+    Ok(Json(dto::ActResultsDocument {
+        schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
+        verb: verb.as_str(),
+        matched: results.len(),
+        results,
+    }))
+}
+
+/// `POST /v0/runs/stop` — stop every Run of a selected set (`{"set_token":
+/// …, "window_secs"?: n}`).
+pub(crate) async fn runs_stop(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetActRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_act(
+        state,
+        credential,
+        hekma_engine::RunLifecycleVerb::Stop,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/pause` — pause every Run of a selected set.
+pub(crate) async fn runs_pause(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetActRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_act(
+        state,
+        credential,
+        hekma_engine::RunLifecycleVerb::Pause,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/resume` — resume every Run of a selected set.
+pub(crate) async fn runs_resume(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetActRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_act(
+        state,
+        credential,
+        hekma_engine::RunLifecycleVerb::Resume,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/drain` — drain every Run of a selected set, each with its
+/// own bound (`{"set_token": …, "timeout_ms"?: n}`).
+pub(crate) async fn runs_drain(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetActRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    set_act(
+        state,
+        credential,
+        hekma_engine::RunLifecycleVerb::Drain,
+        request,
+    )
+    .await
+}
+
+/// `POST /v0/runs/close` — close every child Run of a selected set (a Run
+/// that owns a process is that Run's `owns-process` refusal).
+pub(crate) async fn runs_close(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetActRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    if request.window_secs.is_some() || request.timeout_ms.is_some() {
+        return Err(ApiError::invalid_body(
+            "close takes only the set_token".to_string(),
+        ));
+    }
+    let run_ids = consume_set(&state, credential, &request.set_token)?;
+    let mut results = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        results.push(match state.engine.close_run(&run_id).await {
+            Ok(view) => dto::ActResult {
+                run_id,
+                outcome: "closed".to_string(),
+                run: Some(view),
+                ..dto::ActResult::default()
+            },
+            Err(error) => refused(run_id, error.into()),
+        });
+    }
+    Ok(Json(dto::ActResultsDocument {
+        schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
+        verb: "close",
+        matched: results.len(),
+        results,
+    }))
+}
+
+/// `PATCH /v0/runs/labels` — bind and unbind labels on every Run of a
+/// selected set as the Operator (`{"set_token": …, "set": {…},
+/// "remove": […]}`), one result per Run.
+pub(crate) async fn runs_labels_patch(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetLabelsRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    let change = LabelChange {
+        set: request.set,
+        remove: request.remove,
+    };
+    change.validate()?;
+    let run_ids = consume_set(&state, credential, &request.set_token)?;
+    let mut results = Vec::with_capacity(run_ids.len());
+    for run_id in run_ids {
+        results.push(
+            match state.engine.label_run(&run_id, change.clone(), false).await {
+                Ok(outcome) => dto::ActResult {
+                    run_id,
+                    outcome: if outcome.changed {
+                        "labeled"
+                    } else {
+                        "unchanged"
+                    }
+                    .to_string(),
+                    labels: Some(outcome.labels),
+                    prior_labels: Some(outcome.prior_labels),
+                    ..dto::ActResult::default()
+                },
+                Err(error) => refused(run_id, error.into()),
+            },
+        );
+    }
+    Ok(Json(dto::ActResultsDocument {
+        schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
+        verb: "label",
+        matched: results.len(),
+        results,
+    }))
+}
+
+/// `POST /v0/runs/limits` — set or clear limits on every Run of a selected
+/// set as the Operator, one result per Run (the outcome names the
+/// direction: `raised`, `lowered`, `cleared`, `set`, `unchanged`).
+pub(crate) async fn runs_limits(
+    State(state): State<ApiState>,
+    axum::Extension(credential): axum::Extension<super::auth::Credential>,
+    ApiJson(request): ApiJson<dto::SetLimitsRequest>,
+) -> ApiResult<Json<dto::ActResultsDocument>> {
+    let (token, patch) = request.into_parts();
+    let change = limit_change(&patch)?;
+    let run_ids = consume_set(&state, credential, &token)?;
+    let answered = state
+        .engine
+        .set_run_limits(run_ids, change, hekma_engine::LimitActor::Operator, false)
+        .await?;
+    let results: Vec<dto::ActResult> = answered
+        .into_iter()
+        .map(|(run_id, outcome)| match outcome {
+            Ok(outcome) => dto::ActResult {
+                run_id: run_id.to_string(),
+                outcome: outcome.direction.as_str().to_string(),
+                limits: Some(outcome),
+                ..dto::ActResult::default()
+            },
+            Err(error) => refused(run_id.to_string(), error.into()),
+        })
+        .collect();
+    Ok(Json(dto::ActResultsDocument {
+        schema_version: dto::ACT_RESULTS_SCHEMA_VERSION,
+        dry_run: false,
+        verb: "budget",
+        matched: results.len(),
+        results,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_committed_verb_whose_read_back_fails_is_still_an_act() {
+        let document = acted(
+            "run_A",
+            Err(ApiError::new(
+                super::super::error::ApiErrorKind::Internal,
+                "the Fleet read failed".to_string(),
+            )),
+            None,
+        );
+        assert_eq!(document.run_id, "run_A");
+        assert!(document.instance.is_none());
+        let wire = serde_json::to_value(&document).unwrap();
+        assert!(wire.get("instance").is_none(), "{wire}");
+        assert!(wire.get("error").is_none(), "{wire}");
+    }
 }

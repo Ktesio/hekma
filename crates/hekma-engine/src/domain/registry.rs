@@ -619,6 +619,23 @@ impl Registry {
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
     }
 
+    /// [`Self::select_runs`] with each Run assembled as its listing row
+    /// (story 21-6's `POST /v0/runs/select` answer): the same capped act
+    /// set, read in ONE snapshot so the rows and the set agree.
+    pub(crate) fn select_run_summaries(
+        &self,
+        selector: &crate::domain::Selector,
+    ) -> Result<Vec<crate::domain::runs::RunSummary>, crate::domain::RunError> {
+        self.store.snapshot(|store| {
+            let records = match crate::domain::runs::ops::select(store, selector) {
+                Ok(records) => records,
+                Err(err) => return Ok(Err(err)),
+            };
+            Ok(crate::domain::runs::listing::assemble(store, records)
+                .map_err(crate::domain::RunError::Store))
+        })?
+    }
+
     /// The Run listing (story 21-5): one exception-first (or all-inside-the-
     /// window) keyset page plus its counts, with each row's labels, stored
     /// resolution, usage, latches and headroom assembled as bounded point
