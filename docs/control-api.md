@@ -160,6 +160,17 @@ masked, exactly as the CLI displays it).
 | `POST` | `/v0/policies` | Create a Policy: `{"name", "selector", "tokens_per_run"?, "tokens_cumulative"?, "dollars_per_run_micros"?, "dollars_cumulative_micros"?, "breach_action"?, "rate"?}` — answers the matched and fallback counts | 201 + `Location: /v0/policies/{name}` |
 | `PATCH` | `/v0/policies/{name}` | Change a Policy: `{"selector"?, "set": {limits}, "clear": […], "rates": {"set": {model: rate}, "remove": [models]}, "dry_run": bool}` | 200 + the Policy after (or as planned) |
 | `DELETE` | `/v0/policies/{name}` | Delete a Policy; its matched Runs re-resolve under what remains (`default` is refused) | 204 |
+| `GET` | `/v0/bindings?after=&limit=` | Every endpoint binding, by name (`limit` default 100, at most 256; `after` is the previous page's last name; the answer carries `next_after`) | 200 |
+| `POST` | `/v0/bindings` | Create a binding: `{"name", "prefix", "upstream", "labels"?: [["key","value"], …], "custodied_key"?: "secret:NAME"}` | 201 + `Location: /v0/bindings/{name}` + the binding |
+| `GET` | `/v0/bindings/{name}` | One binding: its prefix, upstream, labels, custodied-key reference and routes | 200 |
+| `PATCH` | `/v0/bindings/{name}` | Change a binding: `{"prefix"?, "upstream"?, "labels"?, "custodied_key"?}` (`labels` replaces the set; `"custodied_key": null` removes the reference) | 200 + the binding |
+| `DELETE` | `/v0/bindings/{name}` | Delete a binding; its Run and split Runs end with cause `binding-removed` | 204 |
+| `PUT` | `/v0/bindings/{name}/routes/{route}` | Add or replace a reroute route: `{"name", "upstream", "custodied_key"?}` (stored now, used when reroute ships) | 200 + the binding |
+| `DELETE` | `/v0/bindings/{name}/routes/{route}` | Remove a reroute route | 200 + the binding |
+| `POST` | `/v0/bindings/{name}/credentials` | Issue the binding's `{"class": "announce"\|"proxy-access"}` credential, revoking the previous one of that class. The token is in this answer only | 200 + `{"class", "token_id", "token", "note"}` |
+| `POST` | `/v0/bindings/{name}/credentials/revoke` | Revoke the binding's active credential of `{"class"}` | 204 |
+| `GET` | `/v0/bindings/{name}/credentials` | The binding's credentials: token ids, classes and states, never a value | 200 |
+| `GET` | `/v0/proxy` | Where the metering proxy listens (`running`, `url`, `port`), or why it is not running (`error`) | 200 |
 
 The identity-bearing reads return the engine's own documents — the same wire
 shapes (and schema versions) the CLI already renders. A `POST` lifecycle verb
@@ -172,6 +183,24 @@ where the instance is removed again before the read-back runs, the `201` +
 the `Location`. A `PUT .../config` is serialized per host (write + read-back
 under one lock), so a response's read-back always reflects the value ITS
 request wrote; `GET`s stay unsynchronized snapshots.
+
+## Endpoint bindings and the metering proxy
+
+The `/v0/bindings` family and `/v0/proxy` are for the Operator bearer only; every other credential class gets `403 forbidden` there. An endpoint binding routes a client Hekma did not start through the [metering proxy](metering-proxy.md): calls on its path prefix forward to its upstream and are charged to Runs carrying its labels. Each change is one `binding` event (`created`, `changed`, `deleted`, `route-added`, `route-removed`, `credential-issued` or `credential-revoked`), committed with its outbox row and published on `GET /v0/events`.
+
+A refusal carries an `error.code`:
+
+| Code | Status | When |
+|---|---|---|
+| `binding-invalid` | 400 | A field fails its rule; the message names the field |
+| `binding-not-found` | 404 | No binding has the name |
+| `binding-route-not-found` | 404 | The binding has no route with the name |
+| `binding-exists` | 409 | A binding already has the name |
+| `binding-prefix-taken` | 409 | Another binding has the prefix |
+| `binding-limit` | 409 | 256 bindings, or 16 routes on one binding, already exist |
+| `binding-legacy-route` | 409 | A `/` binding while an upgraded agent holds the legacy root route |
+
+The binding credentials are issued and listed now. Nothing accepts either class yet; the answer's `note` says so.
 
 ## Runs
 

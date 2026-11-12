@@ -511,7 +511,7 @@ hekma run close run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
 | `--json` | Print the Run as `{"schema_version": 1, "run": {…}}` |
 
 `show` prints the Run's CONTROL depth (`supervised (no wire)` when its calls
-skip the metering listener), status, Anomalies, parent, instance, labels with
+skip the metering proxy), status, Anomalies, parent, instance, labels with
 their source (`bound, config`, `bound, label-verb` or `caller`), limits, subtree usage and open children. A child's usage counts
 on every ancestor, and every ancestor's ceilings apply to it. `close` ends a
 child Run (closing an ended one changes nothing); a Run that owns an agent's
@@ -577,7 +577,7 @@ not listed, and `--all` adds every Run inside the window. Rows are ordered
 by run id, newest first, and the cursor pages without duplicates. The
 columns: **RUN** (the agent's name on process-owning rows, the run id on
 child Runs), **CONTROL** (the depth; `supervised (no wire)` for an agent
-whose model calls skip the metering listener), **STATUS**, **ANOMALIES**
+whose model calls skip the metering proxy), **STATUS**, **ANOMALIES**
 (the `breach` Anomaly with each latched Breach Action — `breach[block]`),
 **LABELS** (a caller label is suffixed `(caller)`), **Usage** (the Run's
 subtree tokens and derived dollars — an estimate; a dollar figure appears
@@ -695,7 +695,37 @@ the Run has ended or the label cannot be removed, `2` for a malformed label
 or Selector, a Selector matching more than 1000 Runs, or several matches with
 no terminal and no `--yes`.
 
-## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
+## `hekma binding create|list|show|set|delete` / `route add|remove` / `credential issue|revoke|list`
+
+Manage **endpoint bindings**, the routes the [metering proxy](metering-proxy.md) uses for clients Hekma did not start. A binding says: calls arriving on this path prefix forward to this upstream, and are charged to Runs that carry these labels. Reads open the state directory read-only and start nothing. Each change is one call to the local Service Host and one `binding` event.
+
+```bash
+hekma binding create openai --prefix /openai --upstream https://api.openai.com/v1 --label team=core
+hekma binding list [--after <name>] [--limit <n>] [--json]
+hekma binding show openai [--json]
+hekma binding set openai --label team=platform
+hekma binding set openai --clear-labels
+hekma binding delete openai
+hekma binding route add openai backup --upstream https://backup.example.com/v1
+hekma binding route remove openai backup
+hekma binding credential issue openai --class proxy-access
+hekma binding credential revoke openai --class proxy-access
+hekma binding credential list openai [--json]
+```
+
+- `create <name> --prefix <prefix> --upstream <url> [--label k=v]... [--custodied-key secret:NAME] [--json]`:
+  - The prefix is `/` plus segments of letters, digits and `._~-`, at most 128 characters, unique, and never under `/_hekma`. `/` alone catches every call no other binding matches.
+  - The upstream is `http://` or `https://`, with no user info, query or fragment.
+  - The custodied key is stored as a `secret:NAME` reference only. It is inert until key custody ships, and `create` says so.
+- `show` prints the **client base URL**: the proxy's address plus the prefix, for example `http://127.0.0.1:8400/openai`. Point the client's base URL there. Before any host has served the state directory, no port is recorded yet, and `show` says so.
+- `set` changes the prefix, the upstream, the labels (`--label` replaces the whole set; `--clear-labels` removes them) or the custodied-key reference (`--clear-custodied-key` removes it). A prefix or upstream change keeps the binding's Runs. A label change updates its open Runs.
+- `delete` ends the binding's Run and its split Runs with cause `binding-removed`. Further calls on its prefix get `404 hekma_no_route`.
+- `route add|remove` manages up to 16 **reroute routes** per binding. They are stored and checked now, and used when reroute ships.
+- `credential issue --class announce|proxy-access` prints the binding's credential once, on stdout, with a note on stderr: `hk_ann_…` for announce, `hk_pxy_…` for proxy-access. Only its hash is stored. Issuing again revokes the previous credential of that class. `revoke` works per class, and `list` shows token ids and states, never a value. **Nothing accepts either credential yet**; the releases that add announce and the proxy beyond loopback will.
+
+There are at most 256 bindings. A refusal names the field or the clash: a bad prefix, upstream or reference, a duplicate name or prefix, or a `/` binding while an upgraded agent holds the legacy route. A refusal exits `2`, and a missing binding or route exits `3`. The same operations are on the Control API under [`/v0/bindings`](control-api.md), for the Operator bearer only.
+
+## `hekma serve [--stop-window <secs>] [--metering-listen <port>] [--no-identity-headers] [--listen <addr> --bearer-secret <name> [--tls-cert <pem> --tls-key <pem>]] [--state-dir <dir>] [--log-capture <mode>] [--otlp-endpoint <url> [--otlp-headers <k=v,...>] [--otlp-flush-interval <secs>]]`
 
 Run the long-running **Service Host**: one process that owns a state directory for its whole lifetime — it adopts every live agent at open, holds the single-writer host lock, and waits. On SIGTERM (or Ctrl+C / SIGINT) it stops every RUNNING agent through the bounded graceful ladder, surfaces each per-instance outcome, and only then exits. While it runs, stdout stays silent — the command's "result" is the long-running process itself, and everything of operator consequence is a `[hekma] `-prefixed diagnostic line on **stderr** (host startup naming the state root, the signal receipt, each per-instance stop outcome, shutdown complete), interleaved with the engine's own diagnostics on the same stream.
 
@@ -713,7 +743,8 @@ hekma serve --otlp-endpoint http://127.0.0.1:4318 --otlp-headers authorization=s
 Every serve — explicit or auto-started by a `hekma agent` write — binds a **loopback local endpoint** for the CLI and records it in `<state-dir>/control.json` (owner-only; removed at shutdown); a `local control endpoint on <addr>` notice names it. While a host serves the directory, every `hekma agent` write goes through it (see [How the CLI reaches the Service Host](#how-the-cli-reaches-the-service-host)). If an auto-started host already holds the directory, an explicit `hekma serve` there is refused like any second host — stop that host's agents and let it idle out (or end its process; `control.json` names the pid), then start yours.
 
 - `--stop-window <secs>` — the graceful stop window, in whole seconds, each running agent gets to exit on before the stop ladder escalates to a forced kill (default `30`, the same default as `hekma agent stop`; bounded `1..=86400` — `0` and out-of-range values are refused as a usage error, on this flag and on every other serve surface).
-- `--metering-listen <port>` — a fixed loopback port for every `engine-observed` instance's metering listener for this host's lifetime (default `0` = OS-ephemeral). With a fixed port, a host restart re-binds the SAME port, so a detached `engine-observed` instance adopted by the new host keeps its injected `base_url` live — without it, an adopted observed instance is stranded (its listener died with the starting command) and the adoption says so. A port that is already in use **refuses the start** with a typed diagnostic naming the port — the host never silently hops to another port. Port `0` keeps the pre-serve ephemeral behavior.
+- `--metering-listen <port>` — the loopback port of the host's **metering proxy**, the one listener every metered model call goes through (see [The metering proxy](metering-proxy.md)). Without it the host uses the port recorded for this state directory, or lets the OS pick one the first time and records it, so a restart binds the same port and adopted agents keep a live base URL. A port that is already in use never makes the host move to another: the host keeps serving the Control API, names the port and why in a diagnostic (and in `GET /v0/proxy`), and refuses `engine-observed` starts until you free the port or pass another.
+- `--no-identity-headers` — stop adding the outbound identity headers. By default every call the metering proxy forwards carries `x-hekma-run-id` and `x-hekma-labels` (the Run's id and labels) to the model provider; with this flag neither is sent.
 - `--listen <addr>` / `--bearer-secret <name>` — expose the **Control API** (v0, unstable) on an operator address too: an HTTP/JSON surface over the hosted fleet — registration, lifecycle, config, budgets and usage, input, memory, live SSE events — guarded by the resolved bearer token. Both flags or neither (a half-configured API is a usage error); the secret NAME resolves like every Hekma secret (env var, then the state root's `secrets.toml`), and an unresolvable name — or a secret that resolved to an EMPTY value — refuses the startup before anything binds. Operator tooling for a trusted operator — not a multi-tenant service. See [the Control API reference](control-api.md).
 - `--tls-cert <pem>` / `--tls-key <pem>` — serve `--listen` over HTTPS with this PEM certificate chain and private key (both or neither; they need `--listen`). **Required for a non-loopback `--listen`**: `--listen 0.0.0.0:8477` without them is refused with exit code `2` before anything binds or opens, and so is an unreadable PEM file or a key that does not match the certificate (the error names the path). The local endpoint never uses TLS.
 - `--state-dir <dir>` — serve this state directory instead of the resolved default (`HEKMA_STATE_DIR`/`KTESIO_STATE_DIR`, else the platform data dir; same resolution order as every other command).
@@ -769,7 +800,7 @@ Set these with `hekma agent config set <name> <key> <value>`.
 | `model` | string | Model name or identifier passed to the agent through its declared config mapping (if any; the builtin `mock` maps it to the `MODEL` env var, `hermes` does not map it) |
 | `budget.tokens.per_run` | integer | Per-run token ceiling |
 | `budget.tokens.cumulative` | integer | Cumulative token ceiling |
-| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering listener refuses further model calls (engine-observed instances only — see below) |
+| `budget.breach_action` | `pause` \| `stop` \| `warn` \| `block` | Action on any budget/cap breach (default `pause`). `warn` records the breach event only — it performs no lifecycle transition. `block` keeps the agent running but its metering proxy refuses further model calls (engine-observed instances only — see below) |
 | `cost.rate.input` | dollar string (e.g. `3.00`) | Input price per 1M tokens |
 | `cost.rate.output` | dollar string | Output price per 1M tokens |
 | `cost.rate.cached` | dollar string | Cached-token price per 1M tokens (optional; unset prices cached tokens at the input rate) |
@@ -789,7 +820,7 @@ When a token ceiling or dollar Cost Cap is crossed, the recorded breach names it
 
 ### The wire fence: `block`
 
-`block` is for engine-observed instances. On a breach, the metering listener refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends, or as soon as the matching ceiling is raised above the totals on the live Run — with `hekma budget set`, an agent `budget.*` configuration write or a Policy change — reason by reason: a fence still holding another latched `block` reason stays up. A Run that starts or relaunches at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance without the listener (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
+`block` is for any Run whose model calls go through the [metering proxy](metering-proxy.md): a supervised `engine-observed` agent, and the Runs of endpoint bindings and their child and split Runs. On a breach, the proxy refuses every further model call with HTTP `402` and a `hekma_budget_block` error that common SDKs do not retry. The agent process keeps running, and its state does not change. `GET`, `HEAD` and `OPTIONS` requests still pass. The fence lifts when the Run ends, or as soon as the matching ceiling is raised above the totals on the live Run — with `hekma budget set`, an agent `budget.*` configuration write or a Policy change — reason by reason: a fence still holding another latched `block` reason stays up. A Run that starts or relaunches at or over a `block` ceiling is fenced before its first call. `config set ... budget.breach_action block` is refused on an instance whose calls skip the proxy (for example a `self-reported` one), naming its metering source. `block` is never a default, and it is cooperative: an agent that calls its provider directly is not fenced. The refusal's exact shape (`proxy-wire v1`) and the full rules are in [Hosting: the wire fence](hosting.md#the-wire-fence-block-refuses-further-model-calls).
 
 ## Global Behavior
 

@@ -86,7 +86,17 @@ A Run that ends revokes its own keys; its child Runs that outlive it keep theirs
 
 ### Never in a URL
 
-Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. The per-agent metering listener applies the same rule: it answers a typed `hekma_credential_in_url` error, forwards nothing upstream, and the exposed credential is revoked a moment later. Only a credential Hekma issued and still honours is revoked; anything else in the URL is just refused. The listener also strips any `x-hekma-run-key` header before forwarding a call to the provider.
+Credentials go in the `Authorization` header. A request whose path or query carries one, raw or percent-encoded, is refused with `400 credential-in-url` before it is authenticated, and the exposed credential is revoked: it has reached someone's access log. Only a credential Hekma issued and still honours is revoked; anything else in the URL is just refused. The [metering proxy](metering-proxy.md) refuses a credential in a URL too, with a typed `400 hekma_credential_in_url`, and forwards nothing. It does not revoke the credential, because anyone on loopback could have sent that request, and revoking would let any local process cancel any Run's key.
+
+### On the wire
+
+The [metering proxy](metering-proxy.md) reads a Run Key sent in `x-hekma-run-key` on every call, and charges the call to the key's Run:
+- An unknown key gets `401 hekma_unknown_credential`.
+- A key revoked in the last 24 hours gets `401 hekma_credential_revoked`, from its very next call.
+- On a supervised agent's Run route, the key's Run must be that Run or beneath it, else the call gets `403 hekma_run_out_of_scope`. This is how a helper inside an agent charges its own child Run.
+- A key never chooses where a call goes: the upstream is the route's or the binding's.
+
+Until key custody ships, the provider key still travels with the call, so a Run Key in the API-key slot (`authorization` or `x-api-key`) is refused with `400 hekma_custody_unavailable` rather than forwarded to the provider. Send the provider key in `authorization` and the Run Key in `x-hekma-run-key`. Every `x-hekma-*` header is removed before the call is forwarded.
 
 ### External ids
 
@@ -112,9 +122,9 @@ A **Scent-Check Mode**, set per [Policy](policies.md), will decide what happens 
 
 The default Policy starts at `off`, and `enforce` is never a default. Only `off` is accepted today. The mode governs identity only and never changes what a [Breach Action](https://hekma.ktesio.dev/docs/concepts/#breach-action) does. A caller cannot lower it.
 
-### The shared proxy reading Run Keys
+### Held calls
 
-A shared Metering Proxy will read the Run Key on each call, find the Run, apply its Policy and forward, refusing a revoked key from its next call. Calls held at the proxy will be re-checked when they are released.
+When wire hold ships, calls held at the proxy will be re-checked when they are released, so a key revoked while a call waits is refused then.
 
 ### Bypass detection
 

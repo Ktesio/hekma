@@ -169,11 +169,14 @@ metering it announces.
 
 ## The meter is cooperative — the container is not a fence
 
-Engine-observed metering works inside the container as it does on a machine:
-the metering listener is loopback-only, the agent and the host share the
-container's network namespace, so the injected `base_url` resolves — and
-`--metering-listen <port>` pins the port so an adopted instance's injected
-address survives a host restart.
+Engine-observed metering works inside the container as it does on a machine.
+The host's [metering proxy](metering-proxy.md) is loopback-only, and the agent
+and the host share the container's network namespace, so the injected
+`base_url` (`<proxy url>/_hekma/runs/<run id>`) resolves. The proxy's port is
+recorded in the state directory, so it stays the same across host restarts
+(`--metering-listen <port>` pins it), and an adopted agent's injected address
+stays live. Clients Hekma did not start reach the same proxy through an
+[endpoint binding](metering-proxy.md#endpoint-bindings).
 
 That loopback assumption has a sharp edge for **sidecars**: an agent in a
 second container or pod cannot reach the injected `127.0.0.1` — it points
@@ -194,10 +197,11 @@ is in [the metering design essay](design/metering-agents-you-dont-control.md).
 
 ## The wire fence: `block` refuses further model calls
 
-`budget.breach_action = block` makes the metering listener refuse an
-engine-observed agent's model calls once a ceiling is reached. Unlike `pause` and
+`budget.breach_action = block` makes the [metering proxy](metering-proxy.md)
+refuse a Run's model calls once a ceiling is reached: an engine-observed agent's,
+and those of every Run whose calls go through the proxy, at any depth. Unlike `pause` and
 `stop`, it does not change the agent's lifecycle state. The process keeps running,
-and every further model call through the listener gets a typed refusal that
+and every further model call through the proxy gets a typed refusal that
 common SDKs do not retry. The breach is recorded like any other (the breach event
 carries `"action": "block"`), and the engine log notes that the fence is up.
 
@@ -209,8 +213,8 @@ hekma agent config set my-agent budget.breach_action block
 The rules:
 
 - **It is never a default.** `block` applies only where you set it.
-- **It needs the listener.** `block` is refused at `config set` on an instance
-  that does not meter through the engine-observed listener (a `self-reported`
+- **It needs the proxy.** `block` is refused at `config set` on an instance
+  whose calls do not go through the metering proxy (a `self-reported`
   instance), and the error names the instance's metering source. If `block`
   reaches such an instance some other way, for example through a hand-edited
   config file, a breach is recorded, acts as `warn`, and the engine log says
@@ -225,14 +229,18 @@ The rules:
   (usually the cumulative one), the fence is up before its first call.
 - **A relaunch keeps the fence.** A Restart Policy relaunch continues the same
   Run, so its per-run totals keep counting and a per-run `block` fence is up
-  again on the relaunched listener before its first call.
-- **Restarts and adoption keep it.** A host that restarts and adopts the
-  instance on the same `--metering-listen` port rebuilds the fence from the
-  breach log before serving traffic.
+  again before the relaunched process's first call.
+- **Restarts and adoption keep it.** A host that restarts rebuilds every
+  latched `block` from the store before the proxy serves a call, and the fence
+  holds until a raise or reset re-arms it, even if the configured action
+  changed meanwhile.
+- **It covers the Runs beneath.** A Run's call is refused while the Run or any
+  Run above it holds a latched `block`, so a breach on a parent fences the
+  child Runs its agent opens.
 - **Safe methods pass.** `GET`, `HEAD` and `OPTIONS` requests (model listings,
   probes) are forwarded. They carry no billable completion.
 - **It is cooperative.** The fence refuses calls that go through the
-  listener. An agent that calls the provider directly is not fenced. Your own
+  proxy. An agent that calls the provider directly is not fenced. Your own
   choke point stays the enforcement of record.
 
 ### The refusal (`proxy-wire v1`)
@@ -370,9 +378,12 @@ docker logs hekma   # the per-instance drain outcomes, on stderr
 
 `--metering-listen` is absent from the recipe on purpose: in the ENTRYPOINT
 shape the agents are children of the container, so a host restart IS a
-container restart — there is no surviving observed agent to re-adopt, and the
-fixed-port re-bind pin only earns its keep in shapes where agents outlive the
-host process.
+container restart, with no surviving observed agent to re-adopt. The proxy's
+port is recorded in the state directory anyway. Pin it with
+`--metering-listen` when a client in the same container that Hekma did not
+start, reaching the proxy through an endpoint binding, needs a fixed address.
+The proxy listens on `127.0.0.1` only, so a sidecar or a published container
+port cannot reach it.
 
 If the grace is cut short instead, the metadata-mode crash window above is the
 honest description of what remains on the volume — and the next container that
