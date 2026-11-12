@@ -77,7 +77,7 @@ pub use tck::{
 // home, parameterized over the cargo target subdir hop — story 10-1); the
 // crate-root path every suite already imports stays stable.
 pub use test_support::{
-    exit_helper_subprocess, fake_acp_agent_bin, fake_agent_bin, helper_profile_env,
+    exit_helper_subprocess, fake_acp_agent_bin, fake_agent_bin, helper_profile_env, workspace_bin,
 };
 // The uncaptured skip-note helper (story 16-1) gets the same crate-root
 // stability: the smokes' call sites read `hekma_conformance::note_uncaptured`.

@@ -765,6 +765,14 @@ pub fn fake_agent_bin() -> PathBuf {
     fake_agent_bin_in(BinDir::TestDeps)
 }
 
+/// Locate any `hekma-conformance` `[[bin]]` (such as `hermes_shim`) for an
+/// integration test, building it on demand when absent: the same resolution
+/// as [`fake_agent_bin`], so every layout Cargo runs tests from (`deps/`, or
+/// Cargo 1.100's `build/<package>/<hash>/out/`) resolves to the profile dir.
+pub fn workspace_bin(name: &str) -> PathBuf {
+    helper_bin_in(BinDir::TestDeps, name)
+}
+
 /// The manifest wire key for the host OS (the `[capabilities.*]` entries are
 /// keyed `linux`/`macos`/`windows` — the engine's `OsId` wire form). Runtime
 /// data (matches the engine's `OsId::current()` mapping), not conditional
