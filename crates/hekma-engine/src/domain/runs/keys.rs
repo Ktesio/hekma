@@ -559,6 +559,18 @@ pub(crate) fn open_keys<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<KeyChan
             },
         ));
     }
+    // Story 23-1: the recently-revoked set — Run Keys revoked in the last
+    // 24 hours, newest first, bounded — so the proxy tells a revoked key
+    // apart from an unknown one across a restart.
+    let since = crate::time::format_rfc3339(
+        crate::time::now_unix_secs()
+            .saturating_sub(super::snapshot::RECENTLY_REVOKED_SECS),
+    );
+    let mut revoked = store
+        .recently_revoked_keys(&since, super::snapshot::RECENTLY_REVOKED_MAX)?;
+    // Oldest first into the set, so the bound evicts the oldest.
+    revoked.reverse();
+    keys.extend(revoked.into_iter().map(KeyChange::Revoked));
     Ok(keys)
 }
 

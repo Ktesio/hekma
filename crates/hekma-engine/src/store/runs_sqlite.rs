@@ -1430,6 +1430,57 @@ impl RunRecords for SqliteStore {
     fn active_key_rows(&self) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
         super::tokens_sqlite::active_key_rows(self.conn())
     }
+
+    fn recently_revoked_keys(
+        &self,
+        since: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::credential::TokenHash>, StoreError> {
+        let mut stmt = self
+            .conn()
+            .prepare(
+                "SELECT token_hash FROM tokens WHERE class = 'run' AND state = 'revoked' \
+                 AND revoked_at >= ?1 ORDER BY revoked_at DESC LIMIT ?2",
+            )
+            .map_err(backend)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![since, limit.min(i64::MAX as usize) as i64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(backend)?;
+        let mut hashes = Vec::new();
+        for row in rows {
+            if let Ok(bytes) = <[u8; 32]>::try_from(row.map_err(backend)?) {
+                hashes.push(crate::domain::credential::TokenHash::from_bytes(bytes));
+            }
+        }
+        Ok(hashes)
+    }
+
+    fn entry_extras(
+        &self,
+        run_id: &RunId,
+    ) -> Result<crate::domain::runs::snapshot::EntryExtras, StoreError> {
+        use crate::ports::RunStore;
+        let latches = self.latches(run_id)?;
+        let upstream = self.run_upstream(run_id)?;
+        let identity = self
+            .conn()
+            .query_row(
+                "SELECT binding, external_id FROM run_identities WHERE run_id = ?1 \
+                 ORDER BY created_at LIMIT 1",
+                [run_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(backend)?;
+        Ok(crate::domain::runs::snapshot::EntryExtras {
+            disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
+            upstream: upstream.map(std::sync::Arc::from),
+            identity,
+        })
+    }
 }
 
 /// The ancestors of `run_id` (nearest first) with their hosting instance

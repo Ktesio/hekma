@@ -144,8 +144,32 @@ fn note<S: RunRecords + ?Sized>(
         &labels,
         limits,
         resolution.as_ref(),
+        store.entry_extras(&record.run_id)?,
     ));
     Ok(())
+}
+
+/// A fresh snapshot entry for `run_id` with no event (story 23-1: a job
+/// that changed only a latch — a `block` breach on a Run already carrying
+/// its `breach` Anomaly, a re-arm — republishes the disposition). `None`
+/// for a Run with no row.
+pub(crate) fn refreshed_entry<S: RunRecords + ?Sized>(
+    store: &S,
+    run_id: &RunId,
+) -> Result<Option<RunEntry>, StoreError> {
+    let Some(record) = store.run_record(run_id)? else {
+        return Ok(None);
+    };
+    let labels = store.run_labels(run_id)?;
+    let limits = store.run_limits(run_id)?;
+    let resolution = store.run_policy(run_id)?.map(|row| row.resolution);
+    Ok(Some(super::snapshot::entry_of(
+        &record,
+        &labels,
+        limits,
+        resolution.as_ref(),
+        store.entry_extras(run_id)?,
+    )))
 }
 
 #[derive(Default)]
@@ -1158,6 +1182,7 @@ pub(crate) fn open_entries<S: RunRecords + ?Sized>(store: &S) -> Result<Vec<RunE
                 &labels,
                 limits,
                 resolution.as_ref(),
+                store.entry_extras(&record.run_id)?,
             ))
         })
         .collect()

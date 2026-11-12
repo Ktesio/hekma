@@ -465,6 +465,19 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// Every active Run Key and announce credential of a non-ended Run (the
     /// snapshot's key index at open).
     fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// The Run Keys revoked at or after `since` (RFC 3339), newest first,
+    /// at most `limit` (story 23-1: the recently-revoked set at open).
+    fn recently_revoked_keys(&self, since: &str, limit: usize)
+        -> Result<Vec<TokenHash>, StoreError>;
+
+    /// What a Run's snapshot entry carries beyond its row (story 23-1):
+    /// the disposition from its latch rows, its recorded upstream and its
+    /// identity.
+    fn entry_extras(
+        &self,
+        run_id: &RunId,
+    ) -> Result<crate::domain::runs::snapshot::EntryExtras, StoreError>;
 }
 
 /// One stored credential (story 22-1, `tokens`): its hash and metadata,

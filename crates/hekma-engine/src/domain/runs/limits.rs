@@ -195,6 +195,16 @@ pub(crate) fn re_arm(
                     .map_err(RunError::Store)?,
             );
         }
+        // Story 23-1: the snapshot entry's disposition follows the latch
+        // rows — a lifted `block` reason stops refusing at the proxy in
+        // the same commit, per reason.
+        if !report.unlatched.is_empty() {
+            if let Some(entry) =
+                ops::refreshed_entry(store, &run.run_id).map_err(RunError::Store)?
+            {
+                changes.entries.push(entry);
+            }
+        }
     }
 
     // ---- the breach-at-once half (lowered to at-or-below the usage),

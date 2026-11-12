@@ -233,6 +233,13 @@ pub(crate) fn evaluate(
             let changes = runs::ops::mark_breach(store, &level.run_id, &now)?;
             run_changes.events.extend(changes.events);
             run_changes.entries.extend(changes.entries);
+            // Story 23-1: the entry carries the Run's disposition (its
+            // `block` and latched reasons) — republish it even when the
+            // `breach` Anomaly was already set, so the proxy refuses the
+            // next call before this batch acks.
+            if let Some(entry) = runs::ops::refreshed_entry(store, &level.run_id)? {
+                run_changes.entries.push(entry);
+            }
         }
     }
     evaluation.run_changes = run_changes;
