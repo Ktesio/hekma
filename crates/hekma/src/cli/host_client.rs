@@ -357,8 +357,8 @@ impl HostClient {
         if let (ureq::Error::Timeout(ureq::Timeout::Global), Some(bound)) = (&err, self.bound) {
             return CallError::Unavailable(format!(
                 "the local Service Host (pid {}) did not answer within {}s, so this command \
-                 stopped waiting; the acts may still be committing — check each Run with: \
-                 hekma run show <run-id>",
+                 stopped waiting; the acts may still be committing — check the Runs with: \
+                 hekma ps --all",
                 self.pid,
                 bound.as_secs()
             ));

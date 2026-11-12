@@ -212,7 +212,9 @@ fn router(state: ApiState) -> Router {
             put(routes::restart_policy_put),
         )
         // Runs (story 21-2): open a child Run, read a Run, close a child.
-        .route("/v0/runs", post(routes::run_open))
+        // Story 21-5: the listing (`GET /v0/runs`) — the same document
+        // `hekma ps --json` prints.
+        .route("/v0/runs", get(routes::runs_list).post(routes::run_open))
         .route("/v0/runs/{id}", get(routes::run_show))
         .route("/v0/runs/{id}/close", post(routes::run_close))
         // Story 21-6: the Run-grain lifecycle verbs, Run-level limits, and
@@ -284,6 +286,76 @@ fn router(state: ApiState) -> Router {
 /// (the cooperative close), so this is generous headroom for the rest — one
 /// second is plenty for loopback reads.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Test-only construction of an [`ApiState`] over a read-only engine on a
+/// fresh temp state dir, with its shutdown SENDER so a test can fire the
+/// cooperative close (the streams watch THIS channel; a separate
+/// `watch::channel` in the test would never be observed).
+///
+/// The engine (and its runtime) are LEAKED, never dropped: these tests run
+/// inside `#[tokio::test]`'s async context, where dropping a runtime
+/// panics ("blocking is not allowed"), and the state's own temp root rides
+/// `TempDir::into_path` for the same reason. Four seams, one process — the
+/// leak is bounded and test-only.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn quiet_api_state() -> (ApiState, watch::Sender<bool>) {
+        // Build on a plain thread: a blocking context for the engine's own
+        // runtime construction, however the test is driven.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::TempDir::new().expect("a temp state root");
+            let engine = hekma_engine::Engine::open_read_only(Some(root.path().to_path_buf()))
+                .expect("a read-only engine");
+            let engine = std::sync::Arc::new(engine);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let state = ApiState {
+                engine: std::sync::Arc::clone(&engine),
+                resolver: CredentialResolver::new([("quiet", CredentialClass::OperatorBearer)]),
+                config_write: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                shutdown: shutdown_rx,
+                activity: Activity::new(),
+                notes: NoteTap::keeping_startup_notes(),
+                log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
+            };
+            // Leak the engine (never dropped) and the temp root.
+            std::mem::forget(engine);
+            std::mem::forget(root);
+            let _ = tx.send((state, shutdown_tx));
+        });
+        rx.recv().expect("the quiet state")
+    }
+
+    /// Like [`quiet_api_state`] over a WRITABLE engine (story 21-5's SSE
+    /// seam tests commit events through it). Leaked the same way.
+    pub(crate) fn writable_api_state() -> (ApiState, watch::Sender<bool>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let root = tempfile::TempDir::new().expect("a temp state root");
+            let engine = hekma_engine::Engine::open(Some(root.path().to_path_buf()))
+                .expect("a writable engine");
+            let engine = std::sync::Arc::new(engine);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let state = ApiState {
+                engine: std::sync::Arc::clone(&engine),
+                resolver: CredentialResolver::new([("quiet", CredentialClass::OperatorBearer)]),
+                config_write: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                shutdown: shutdown_rx,
+                activity: Activity::new(),
+                notes: NoteTap::keeping_startup_notes(),
+                log_capture: hekma_engine::LogCaptureMode::Full,
+                sets: sets::SetStore::new(None),
+            };
+            std::mem::forget(engine);
+            std::mem::forget(root);
+            let _ = tx.send((state, shutdown_tx));
+        });
+        rx.recv().expect("the writable state")
+    }
+}
 
 /// One listener the API serves on (story 21-4).
 pub(crate) enum ListenerSpec {

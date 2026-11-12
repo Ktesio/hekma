@@ -72,7 +72,7 @@ fn budget_refusals_map_to_the_documented_exit_codes() {
             "1001",
         ],
         vec!["budget", "set"],
-        vec!["budget", "show"],
+        vec!["budget", "show", "--cursor", "not-a-cursor"],
     ] {
         let run = hekma(&args);
         assert_eq!(run.code, Some(2), "{args:?}: {}", run.stderr);
@@ -81,6 +81,10 @@ fn budget_refusals_map_to_the_documented_exit_codes() {
     let run = hekma(&["budget", "show", "--selector", "team=nobody", "--json"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(json(&run.stdout)["items"], serde_json::json!([]));
+    // No target lists every Run (the listing read): none here, a note.
+    let run = hekma(&["budget", "show"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("No Run to show"), "{}", run.stderr);
     let run = hekma(&[
         "budget",
         "set",

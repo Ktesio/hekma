@@ -847,8 +847,10 @@ pub(crate) struct SelectDocument {
     /// The set token (`hkset_…`): single-use, bound to this credential,
     /// expiring at `expires_at`. Present it in a set-form verb's BODY.
     pub token: String,
-    /// The matched Runs, ordered by run id.
-    pub runs: Vec<hekma_engine::RunRecord>,
+    /// The matched Runs, ordered by run id, each as its listing row (the
+    /// `GET /v0/runs` item: the Run's fields plus labels, usage, latches
+    /// and headroom).
+    pub runs: Vec<hekma_engine::RunSummary>,
     /// How many Runs matched.
     pub matched: usize,
     /// When the token expires (RFC 3339 UTC).

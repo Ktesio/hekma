@@ -137,6 +137,7 @@ masked, exactly as the CLI displays it).
 | `GET` | `/v0/export` | The global outbox pull (below): ONE bounded batch of committed events in ONE global order, ack-cursor-resumable | 200 |
 | `POST` | `/v0/export/ack` | Advance the durable export ack cursor: `{"seq": N}` — monotonic and idempotent, the cursor as persisted comes back | 200 |
 | `POST` | `/v0/runs` | Open a child Run (below): exactly one of `parent_run_id` or `parent_instance`, plus optional `labels`, `token_budget`, `dollar_cap`, `breach_action` and `external_id` | 201 + `Location: /v0/runs/{id}` + the Run |
+| `GET` | `/v0/runs` | The Run listing (below): `?selector=&view=exceptions\|all&limit=&cursor=` — the same document `hekma ps --json` prints | 200 |
 | `GET` | `/v0/runs/{id}` | One Run: its row, labels, limits, subtree usage and open children | 200 |
 | `POST` | `/v0/runs/{id}/close` | Close a child Run (idempotent; a Run that owns an agent's process is a 409 — stop the instance) | 200 + the Run |
 | `GET` | `/v0/runs/{id}/labels` | One Run's labels, bound and caller, each with its `source` and (bound) `origin` | 200 |
@@ -220,6 +221,40 @@ Run refusals carry a stable `error.code` beside the `kind`:
 | `label-bound` | 409 | A caller label names a key already bound on the Run |
 | `instance-not-found` | 404 | No agent has the name given as a label target |
 
+### The Run listing
+
+`GET /v0/runs` is `hekma ps`'s read — every filter, Selector and page
+parameter of the CLI has its equivalent here. Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `view` | `exceptions` (the default) or `all` |
+| `selector` | `key=value[,key=value…]` — bound and caller labels alike |
+| `limit` | Page size, default 50, at most 1000; `0` means the maximum, above the cap it clamps |
+| `cursor` | The opaque cursor a previous page's `next_cursor` printed |
+
+The answer is `{"schema_version": 1, "view", "selector", "items",
+"next_cursor", "counts"}` — `items` byte-shape-equal to the CLI's `--json`
+items. Each item flattens the Run's row (`run_id`, `control_depth`,
+`wire_path`, `status`, `anomalies`, `instance`, timestamps, …) and adds
+`labels` (each with `source` and bound `origin`), the subtree `usage`, the
+instance `cumulative_usage` on process-owning rows only (absent on child
+rows — a shared pot is not a per-Run figure), `latched` breaches as
+`[{dimension, scope, action}]`, a `budget` headroom block against the
+Run's **resolved** limits (the `BudgetView` field names plus the per-limit
+`sources` and the `effective_action` after the depth fallback; dollar
+figures only where a Rate prices them — an unpriced cap shows the
+`unpriced-model` Anomaly instead), and `kept_on_pause` where the
+breach-default upgrade holds the agent on `pause`. `counts` carries
+`listed` (what the active view matches) and `healthy_open`. `next_cursor`
+is `null` exactly when the read is exhausted — a final page that is exactly
+full carries none. The cursor names only the last Run read, so send the next
+page's request with the same `view`, `selector` and `limit`.
+
+Malformed parameters are typed `400`s with their own `error.code`:
+`invalid-selector`, `invalid-cursor` (a cursor this listing never minted —
+including one from a future format), `invalid-limit` and `invalid-view`.
+
 ### Bound labels
 
 `PATCH /v0/runs/{id}/labels` binds and unbinds labels on one Run with the
@@ -302,7 +337,9 @@ POST /v0/runs/stop
 ```
 
 The selection matches every non-ended Run carrying all the Selector's terms,
-bound or caller, at most 1000 (`400 too-many-runs` beyond — never cut).
+bound or caller, at most 1000 (`400 too-many-runs` beyond — never cut). Each
+entry in `runs` is the Run's listing row, the same item `GET /v0/runs` serves
+(the Run's fields plus its labels, usage, latches and headroom).
 Listing Runs is a different, paged read; a set to act on never pages. The
 token rides the request BODY, never a URL (URLs land in logs). It is 256
 random bits, stored by the host only as a hash, bound to the credential that
@@ -425,14 +462,46 @@ connected client; each event rides one `data:` frame whose payload is the
 engine's own kind-tagged JSON (`{"kind":"transition",…}`,
 `{"kind":"budget_breach",…}`, `{"kind":"usage_update",…}`, and
 `{"kind":"run",…}` for a Run created, ended or changed) — never re-shaped.
-A client that falls behind the bus gets an in-stream
-`{"kind":"lagged","skipped":N}` frame naming the gap and the stream continues
-at the current tail (the skipped events stay readable in the durable logs —
-the cursor pull is the lossless heal; lag is surfaced, never silent). The
-stream ends when the engine is gone **or the API shuts down** — a client sees
-the connection close and can reconnect; the engine is unaffected. (The end
-fires even if the shutdown already fired before the stream's first poll — a
-late subscriber is never left hanging.)
+Every event frame also carries `id: <seq>` — the event's position in the
+global outbox, the same `seq` `GET /v0/export` serves. A client that falls
+behind the bus gets an in-stream `{"kind":"lagged","skipped":N}` frame
+naming the gap and the stream continues at the current tail (the skipped
+events stay readable in the durable logs — the cursor pull is the lossless
+heal; lag is surfaced, never silent; the `lagged` frame carries no `id` —
+it is a gap, not an event). The stream ends when the engine is gone **or
+the API shuts down** — a client sees the connection close and can
+reconnect; the engine is unaffected. (The end fires even if the shutdown
+already fired before the stream's first poll — a late subscriber is never
+left hanging.)
+
+**Resume — `Last-Event-ID: <seq>`.** A reconnect that presents the last id
+it saw is validated BEFORE streaming: a seq below the outbox's retained
+floor answers `409 cursor-below-retention`, one past the committed tail
+`409 cursor-past-tail` (typed, never clamped — the export contract's
+rule). The server subscribes to the live bus first, then replays the
+outbox rows with `seq > N` through the active Selector filter, reading
+them in bounded batches as the client drains them (a long backlog is never
+held in memory at once), and hands over to live delivery dropping live
+seqs the replay already read — no duplicate, no gap at the seam. If a
+later replay batch can no longer be read (the outbox's floor moved past it
+mid-replay), the stream sends one `{"kind":"replay-error",…}` frame (no
+`id`) and closes; reconnecting with the last id received then gets the
+typed `409`. Without `Last-Event-ID` nothing is replayed or deduplicated:
+every live event is delivered as published.
+
+**Filter — `?selector=key=value[,…]`.** With a Selector only events whose
+subject Run currently carries every term (bound or caller labels alike)
+are delivered: Run events by their run id, usage and breach events by
+theirs, a transition by its instance's process-owning Run (the newest
+one, so the `stopped` transition that follows a Run's end still matches). Events
+that name no Run (`policy`, `breach-default-upgraded`) are delivered only
+without a Selector. The filter reads the subject Run's CURRENT labels —
+the in-memory snapshot first, one read-only store read when the Run has
+ended (ended Runs keep matching until compaction). Honest limitation, by
+design: labels-at-event-time is not stored anywhere, so the filter cannot
+see it. A failed filter read surfaces a `{"kind":"filter-error",…}` frame
+(no id) and drops that one event — surfaced, never a silent skip. A
+malformed `selector` is the `400 invalid-selector` envelope.
 
 **Durable — `GET /v0/instances/{name}/events?cursor=…`.** The engine's
 `resync` batch for one instance, verbatim: family-major, cursor-lossless, read

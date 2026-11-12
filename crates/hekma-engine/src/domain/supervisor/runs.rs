@@ -451,9 +451,10 @@ impl Supervisor {
                     // instance name is not even parseable — say so, never
                     // a silent drop.
                     self.note_outbox_append(&breach.outbox);
-                    self.publish(crate::domain::EngineEvent::BudgetBreach(
-                        breach.event.clone(),
-                    ));
+                    self.publish(
+                        breach.outbox.seq,
+                        crate::domain::EngineEvent::BudgetBreach(breach.event.clone()),
+                    );
                     self.emit_diagnostic(&format!(
                         "{what} fired a breach on `{instance}`, which is not a valid agent name \
                          ({err}); the breach is recorded but its action was not executed"
@@ -463,9 +464,10 @@ impl Supervisor {
             };
             self.mirror_breach(registry, &name, &breach.event);
             self.note_outbox_append(&breach.outbox);
-            self.publish(crate::domain::EngineEvent::BudgetBreach(
-                breach.event.clone(),
-            ));
+            self.publish(
+                breach.outbox.seq,
+                crate::domain::EngineEvent::BudgetBreach(breach.event.clone()),
+            );
             match actions.iter_mut().find(|(at, _)| *at == name) {
                 Some((_, list)) => list.push(breach),
                 None => actions.push((name, vec![breach])),
@@ -473,7 +475,10 @@ impl Supervisor {
         }
         for (event, outbox) in policy_events {
             self.note_outbox_append(&outbox);
-            self.publish(crate::domain::EngineEvent::Policy(Box::new(event)));
+            self.publish(
+                outbox.seq,
+                crate::domain::EngineEvent::Policy(Box::new(event)),
+            );
         }
         self.publish_run_events(run_events);
         // Then the process actions (only for instances this engine

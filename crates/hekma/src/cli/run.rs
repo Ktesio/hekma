@@ -253,6 +253,8 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         RunError::NestingTooDeep { .. }
         | RunError::ActionUnavailable { .. }
         | RunError::TooManyRuns { .. }
+        // Story 21-5: a listing cursor that is not the codec's form.
+        | RunError::InvalidCursor { .. }
         | RunError::Invalid { .. } => RunInvalid { message }.into(),
         RunError::NoOpenRun { .. }
         | RunError::ParentEnded { .. }

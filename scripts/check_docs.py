@@ -144,6 +144,7 @@ KT_COMMANDS = {
     "label",
     "policy",
     "budget",
+    "ps",
     "serve",
 }
 # `hekma run` owns its own subcommand tree (crates/hekma/src/lib.rs `RunCommands`).

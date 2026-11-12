@@ -695,9 +695,12 @@ fn a_pending_upgrade_row_holds_pause_across_the_window_and_finishes_once() {
     let events = registry.take_open_events();
     let upgraded: Vec<&BreachDefaultUpgradedEvent> = events
         .iter()
-        .filter_map(|event| match event {
-            EngineEvent::BreachDefaultUpgraded(event) => Some(event),
-            _ => None,
+        .filter_map(|(seq, event)| {
+            let _ = seq;
+            match event {
+                EngineEvent::BreachDefaultUpgraded(event) => Some(event),
+                _ => None,
+            }
         })
         .collect();
     assert_eq!(upgraded.len(), 1, "{events:?}");
@@ -716,10 +719,10 @@ fn a_pending_upgrade_row_holds_pause_across_the_window_and_finishes_once() {
     drop(registry);
     let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     assert!(
-        !registry
-            .take_open_events()
-            .iter()
-            .any(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_))),
+        !registry.take_open_events().iter().any(|(seq, event)| {
+            let _ = seq;
+            matches!(event, EngineEvent::BreachDefaultUpgraded(_))
+        }),
         "exactly one upgrade event across all opens"
     );
     // An explicit action write clears the marker (the note ends).
@@ -795,7 +798,10 @@ fn the_upgrade_finish_claims_its_rows_and_a_concurrent_open_emits_one_event() {
     let events = registry.take_open_events();
     let upgraded = events
         .iter()
-        .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+        .filter(|(seq, event)| {
+            let _ = seq;
+            matches!(event, EngineEvent::BreachDefaultUpgraded(_))
+        })
         .count();
     assert_eq!(upgraded, 1, "{events:?}");
 }
@@ -817,7 +823,10 @@ fn the_upgrade_finish_emits_no_event_when_the_job_claimed_nothing() {
     assert_eq!(
         first
             .iter()
-            .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .filter(|(seq, event)| {
+                let _ = seq;
+                matches!(event, EngineEvent::BreachDefaultUpgraded(_))
+            })
             .count(),
         1
     );
@@ -837,7 +846,10 @@ fn the_upgrade_finish_emits_no_event_when_the_job_claimed_nothing() {
     assert_eq!(
         second_events
             .iter()
-            .filter(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_)))
+            .filter(|(seq, event)| {
+                let _ = seq;
+                matches!(event, EngineEvent::BreachDefaultUpgraded(_))
+            })
             .count(),
         1,
         "the claiming engine emits exactly one: {second_events:?}"
@@ -893,9 +905,12 @@ fn an_undecodable_pending_name_closes_unwritten_instead_of_wedging_every_open() 
     let events = registry.take_open_events();
     let upgraded = events
         .iter()
-        .filter_map(|event| match event {
-            EngineEvent::BreachDefaultUpgraded(event) => Some(event),
-            _ => None,
+        .filter_map(|(seq, event)| {
+            let _ = seq;
+            match event {
+                EngineEvent::BreachDefaultUpgraded(event) => Some(event),
+                _ => None,
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(upgraded.len(), 1, "the close emits one event: {events:?}");
@@ -905,10 +920,10 @@ fn an_undecodable_pending_name_closes_unwritten_instead_of_wedging_every_open() 
     drop(registry);
     let mut registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
     assert!(
-        !registry
-            .take_open_events()
-            .iter()
-            .any(|event| matches!(event, EngineEvent::BreachDefaultUpgraded(_))),
+        !registry.take_open_events().iter().any(|(seq, event)| {
+            let _ = seq;
+            matches!(event, EngineEvent::BreachDefaultUpgraded(_))
+        }),
         "the closed row never re-fires"
     );
 }
@@ -977,11 +992,14 @@ fn an_unwritable_config_keeps_pause_through_the_marker() {
     let mut registry = registry;
     let events = registry.take_open_events();
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            EngineEvent::BreachDefaultUpgraded(event)
-                if !event.instances.is_empty() && !event.instances[0].config_written
-        )),
+        events.iter().any(|(seq, event)| {
+            let _ = seq;
+            matches!(
+                event,
+                EngineEvent::BreachDefaultUpgraded(event)
+                    if !event.instances.is_empty() && !event.instances[0].config_written
+            )
+        }),
         "the event names the unwritten instance: {events:?}"
     );
 }

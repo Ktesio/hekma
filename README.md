@@ -44,7 +44,7 @@ None of this is in 0.11.0 yet. Each item links to its docs page, which is tagged
 
 | | Stage | |
 |---|---|---|
-| **Runs** | in development | Every supervised agent, and the work a Host opens inside one, becomes a Run with an id, labels, a status and a Control Depth; Runs Hekma did not start follow (planned). `hekma ps` lists them exception-first, and Selectors let every verb act on `flow=claims,env=prod` instead of one agent at a time. [Runs](https://hekma.ktesio.dev/docs/runs/) |
+| **Runs** | in development | Every supervised agent, and the work a Host opens inside one, becomes a Run with an id, labels, a status and a Control Depth; Runs Hekma did not start follow (planned). `hekma ps` lists them exception-first (on main), and Selectors let every verb act on `flow=claims,env=prod` instead of one agent at a time. [Runs](https://hekma.ktesio.dev/docs/runs/) |
 | **Policies** | in development | Standing limits matched by label, with `warn` as the default breach action; the opt-in `block` fence (on main per agent) applies to them too. [Policies](https://hekma.ktesio.dev/docs/policies/) |
 | **Always-on host** | in development | `hekma serve` (on main) supervises all the time, and the CLI starts a local one on demand, so agents outlive your terminal. [Run Hekma as a service](https://hekma.ktesio.dev/docs/hosting/) |
 | **Run Keys** | planned | A per-Run key in the agent's API-key slot; the real provider key never leaves Hekma, and a call around the proxy is flagged. [Run Keys](https://hekma.ktesio.dev/docs/run-keys/) |
@@ -120,7 +120,7 @@ Letting an agent loose in CI? The [Agents in GitHub Actions](https://hekma.ktesi
 | `hekma agent remove` | Remove an agent |
 | `hekma self-update` | Update Hekma through the channel you installed it with |
 
-Coming with Runs and Policies: `hekma run`, `hekma label`, `hekma policy` and `hekma budget` (limits on one Run), with `--selector` on `stop`, `pause`, `resume`, `drain` and `run close`, are on the main branch for the next release; `hekma ps` is in development.
+Coming with Runs and Policies: `hekma run`, `hekma label`, `hekma ps`, `hekma policy` and `hekma budget` (limits on one Run), with `--selector` on `stop`, `pause`, `resume`, `drain` and `run close`, are on the main branch for the next release.
 
 The [CLI reference](https://hekma.ktesio.dev/docs/commands/) has every flag, the [exit codes](https://hekma.ktesio.dev/docs/exit-codes/) and the [JSON documents](https://hekma.ktesio.dev/docs/json-output/).
 

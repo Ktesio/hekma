@@ -448,7 +448,12 @@ pub(crate) fn select_on_host(
     .map_err(|err| Refusal::from_routed(err).diagnostic)?;
     let document = answer.value.unwrap_or(Value::Null);
     let token = document["token"].as_str().map(str::to_string);
-    let runs: Option<Vec<RunRecord>> = serde_json::from_value(document["runs"].clone()).ok();
+    // Each Run is its listing row (`RunSummary`); the record is what the
+    // confirmation lists and the act addresses.
+    let runs: Option<Vec<RunRecord>> =
+        serde_json::from_value::<Vec<hekma_engine::RunSummary>>(document["runs"].clone())
+            .ok()
+            .map(|runs| runs.into_iter().map(|run| run.record).collect());
     match (token, runs) {
         (Some(token), Some(runs)) => Ok((token, runs)),
         _ => Err(crate::error::AgentIo {

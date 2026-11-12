@@ -183,13 +183,46 @@ Details:
   or below the usage breaches at once. Cumulative ceilings go on an agent's
   own Run only. The target is a run id, an agent (its open Run), or
   --selector key=value[,key=value...]; with a Selector, set confirms like
-  every set-taking verb and show pages with --limit and --cursor.
+  every set-taking verb. show with a Selector, or with no target at all,
+  lists the Runs as hekma ps --all does (every open Run and those ended in
+  the last 7 days), paged with --limit and --cursor.
 
 Examples:
   hekma budget show my-agent
+  hekma budget show --selector team=core --limit 20
   hekma budget set my-agent --tokens-per-run 500000
   hekma budget set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --dollars-per-run 3.00 --breach-action pause
   hekma budget set --selector team=core --clear tokens-per-run --yes";
+const PS_AFTER_HELP: &str = "\
+Details:
+  The Runs that need you, newest first. The default view lists a Run iff it
+  carries an Anomaly (an ended Run only inside the 7-day ended-Run window)
+  or a held, silent or stale status; healthy open Runs are counted in the
+  footer, not listed. --all lists every Run inside the window. The CONTROL
+  column shows the Control Depth (supervised (no wire) for an agent whose
+  model calls skip the metering listener); the RUN column shows the agent's
+  name on process-owning rows and the run id on child Runs. ANOMALIES shows
+  the breach Anomaly with each latched Breach Action (breach[block]) beside
+  the others; LABELS marks caller labels. USAGE is the Run's subtree tokens
+  and derived dollars (an estimate); HEADROOM is what remains against the
+  Run's resolved ceilings, naming the Policy that set them and, on
+  process-owning rows, the cumulative token headroom. Both dollar figures
+  are estimates and appear only where a Rate prices them.
+
+  --selector key=value[,key=value...] filters by label (bound or caller
+  alike) in either view. --limit N pages (default 50, at most 1000; 0 means
+  the maximum); when another page exists the footer prints the exact
+  --cursor value that continues the listing. The table follows the
+  terminal width; --json carries every figure whole. A read-only read: no
+  host is started and nothing is written. Exit codes: 2 an invalid
+  selector, cursor or limit; 1 a store failure; 0 otherwise — an empty
+  listing included.
+
+Examples:
+  hekma ps
+  hekma ps --selector team=core,env=prod
+  hekma ps --all --limit 100
+  hekma ps --cursor dnVuXzFfMDEx --json";
 
 #[derive(Parser)]
 #[command(
@@ -244,6 +277,29 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: PolicyCommands,
+    },
+    /// List the Runs that need you, newest first
+    #[command(
+        about = "List the Runs that need you, newest first",
+        after_help = PS_AFTER_HELP
+    )]
+    Ps {
+        /// Only Runs carrying all these labels (key=value[,key=value...])
+        #[arg(long, value_name = "SELECTOR")]
+        selector: Option<String>,
+        /// List every Run inside the ended-Run window, not just the
+        /// exceptions
+        #[arg(long)]
+        all: bool,
+        /// Page size (default 50, at most 1000; 0 means the maximum)
+        #[arg(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Continue after a previous page's cursor
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Print the listing as one JSON document
+        #[arg(long)]
+        json: bool,
     },
     /// Serve a state directory as a long-running host
     #[command(
@@ -573,17 +629,17 @@ struct SetFlags {
 enum BudgetCommands {
     /// Show a Run's limits: each ceiling and where it comes from, usage, headroom and latches
     Show {
-        /// A run id or an agent (its open Run), unless --selector is given
-        #[arg(value_name = "TARGET", required_unless_present = "selector")]
+        /// A run id or an agent (its open Run); without one, every Run is listed
+        #[arg(value_name = "TARGET")]
         target: Option<String>,
-        /// Show every open Run carrying all these labels (key=value[,key=value...])
+        /// Show every Run carrying all these labels (key=value[,key=value...])
         #[arg(long, value_name = "SELECTOR", conflicts_with = "target")]
         selector: Option<String>,
-        /// How many Runs to show per page with --selector (default 50, at most 1000)
+        /// How many Runs to show per page when listing (default 50, at most 1000)
         #[arg(long, value_name = "N")]
         limit: Option<usize>,
-        /// Continue after this run id (the cursor a previous page printed)
-        #[arg(long, value_name = "RUN_ID")]
+        /// Continue a listing where a previous page stopped (the cursor it printed)
+        #[arg(long, value_name = "CURSOR")]
         cursor: Option<String>,
         /// Print the limits as JSON
         #[arg(long)]
@@ -1090,6 +1146,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 json,
             }),
         },
+        Some(Commands::Ps {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }) => cli::ps::run(cli::ps::PsArgs {
+            selector,
+            all,
+            limit,
+            cursor,
+            json,
+        }),
         Some(Commands::Label { command }) => {
             let (verb, args, selector, dry_run, yes, json) = match command {
                 LabelCommands::Set {

@@ -14,12 +14,167 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use super::sqlite::{backend, SqliteStore};
+use crate::domain::runs::listing::{ListingCounts, ListingView};
 use crate::domain::runs::policy::{PolicyRecord, RunPolicy, ScentCheckMode, DEFAULT_POLICY_NAME};
 use crate::domain::{
     Anomaly, BreachAction, ControlDepth, InstanceName, Label, LabelOrigin, LabelSource, Micros,
     Rate, RunId, RunLimits, RunRecord, RunStatus, Selector,
 };
 use crate::ports::{NewRun, PolicyRecords, RunRecords, StoreError};
+
+/// One listing statement and the parameters it binds, in order (story
+/// 21-5). The production reads and the `EXPLAIN QUERY PLAN` pins build
+/// their SQL through the SAME constructors below, so the plan gate pins
+/// the statements that actually run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ListingStatement {
+    /// The SQL text (numbered `?N` parameters).
+    pub sql: String,
+    /// The values `?1`, `?2`, … bind, in order.
+    pub params: Vec<String>,
+}
+
+/// The view arms' `run_id` selection (the v16 partial indexes' shape, story
+/// 21-5): two disjoint arms whose WHERE clauses name the partial predicates
+/// verbatim, merged `UNION ALL`, newest run id first. `?1` is the window
+/// cutoff; `?2` (when `after`) is the cursor's run id; the Selector's terms
+/// bind after them.
+///
+/// The keyset AND the Selector sit INSIDE each arm, ahead of the page
+/// `LIMIT`: the page is the newest `limit` rows that match the view AND
+/// the Selector. (Filtering after the limit returned the newest `limit`
+/// view rows intersected with the Selector — short pages that ended the
+/// read early whenever newer Runs did not match.)
+pub(super) fn listing_arms(
+    view: ListingView,
+    selector: Option<&Selector>,
+    after: Option<&str>,
+    cutoff: &str,
+    limit: Option<usize>,
+) -> ListingStatement {
+    let mut params = vec![cutoff.to_string()];
+    let keyset = match after {
+        Some(after) => {
+            params.push(after.to_string());
+            " AND run_id < ?2"
+        }
+        None => "",
+    };
+    let filter = match selector {
+        Some(selector) => {
+            let (arms, mut selector_params) = selector_arms_sql(selector, params.len() + 1);
+            params.append(&mut selector_params);
+            format!(" AND run_id IN ({arms})")
+        }
+        None => String::new(),
+    };
+    let page = limit
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    let sql = match view {
+        ListingView::Exceptions => format!(
+            "SELECT run_id FROM runs WHERE status <> 'ended' \
+             AND (anomalies <> '' OR status IN ('held','silent','stale')){keyset}{filter} \
+             UNION ALL SELECT run_id FROM runs INDEXED BY idx_runs_ended_at \
+             WHERE status = 'ended' AND ended_at >= ?1 AND anomalies <> ''{keyset}{filter} \
+             ORDER BY run_id DESC{page}"
+        ),
+        ListingView::All => format!(
+            "SELECT run_id FROM runs WHERE status <> 'ended'{keyset}{filter} \
+             UNION ALL SELECT run_id FROM runs INDEXED BY idx_runs_ended_at \
+             WHERE status = 'ended' AND ended_at >= ?1{keyset}{filter} \
+             ORDER BY run_id DESC{page}"
+        ),
+    };
+    ListingStatement { sql, params }
+}
+
+/// The page read's WHERE/ORDER tail (story 21-5): the arms capped at
+/// `fetch` rows (the caller asks for one more than the page so it can tell
+/// a full final page from a page with more behind it), then the outer row
+/// read by primary key, newest first.
+pub(super) fn listing_page_tail(
+    view: ListingView,
+    selector: Option<&Selector>,
+    after: Option<&str>,
+    cutoff: &str,
+    fetch: usize,
+) -> ListingStatement {
+    let arms = listing_arms(view, selector, after, cutoff, Some(fetch));
+    ListingStatement {
+        sql: format!("WHERE r.run_id IN ({}) ORDER BY r.run_id DESC", arms.sql),
+        params: arms.params,
+    }
+}
+
+/// The listed count (story 21-5): every row the view's arms select under
+/// the Selector — the same arms the page reads, unlimited.
+pub(super) fn listing_listed_count(
+    view: ListingView,
+    selector: Option<&Selector>,
+    cutoff: &str,
+) -> ListingStatement {
+    let arms = listing_arms(view, selector, None, cutoff, None);
+    ListingStatement {
+        sql: format!("SELECT COUNT(*) FROM runs WHERE run_id IN ({})", arms.sql),
+        params: arms.params,
+    }
+}
+
+/// The healthy-open count (story 21-5). It rides `idx_runs_open`: its
+/// `status <> 'ended'` conjunct names the partial predicate verbatim
+/// (`active` implies it; the explicit conjunct is what makes the index
+/// usable).
+pub(super) fn listing_healthy_count(selector: Option<&Selector>) -> ListingStatement {
+    let mut sql = "SELECT COUNT(*) FROM runs WHERE status <> 'ended' AND status = 'active' \
+                   AND anomalies = ''"
+        .to_string();
+    let mut params = Vec::new();
+    if let Some(selector) = selector {
+        let (arms, selector_params) = selector_arms_sql(selector, 1);
+        sql.push_str(&format!(" AND run_id IN ({arms})"));
+        params = selector_params;
+    }
+    ListingStatement { sql, params }
+}
+
+/// The Selector arms' `run_id` selection (the 21-9 `select_runs` shape,
+/// minus its status filter and limit — the view predicate composes beside
+/// it): the first term drives `idx_run_labels_kv`, every other probes the
+/// `run_labels` primary key. Parameters are NUMBERED from `first` (so the
+/// clause can repeat inside both view arms and bind once). Returns the SQL
+/// and the parameters it binds.
+pub(super) fn selector_arms_sql(selector: &Selector, first: usize) -> (String, Vec<String>) {
+    let terms = selector.terms();
+    let Some(((first_key, first_value), rest)) = terms.split_first() else {
+        // Unreachable (a Selector always carries a term); an impossible arm
+        // keeps the composition total anyway.
+        return ("SELECT NULL AS run_id WHERE 0".to_string(), Vec::new());
+    };
+    let mut next = first;
+    let mut placeholder = || {
+        let text = format!("?{next}");
+        next += 1;
+        text
+    };
+    let mut sql = format!(
+        "SELECT l0.run_id FROM run_labels l0 WHERE l0.key = {} AND l0.value = {}",
+        placeholder(),
+        placeholder()
+    );
+    let mut params = vec![first_key.clone(), first_value.clone()];
+    for (key, value) in rest {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM run_labels lx WHERE lx.run_id = l0.run_id \
+             AND lx.key = {} AND lx.value = {})",
+            placeholder(),
+            placeholder()
+        ));
+        params.push(key.clone());
+        params.push(value.clone());
+    }
+    (sql, params)
+}
 
 /// Schema v13 DDL (story 21-2): the Run registry's tables.
 ///
@@ -355,6 +510,54 @@ pub(super) fn migrate_v15(
     }
 }
 
+/// Schema v16 (story 21-5): the Run listing's three partial indexes.
+///
+/// * `idx_runs_open` serves the `all` view's open arm and the open/healthy
+///   counts.
+/// * `idx_runs_exception` serves the exceptions view's arms.
+/// * `idx_runs_ended_at` bounds the ended-inside-window arm by the window
+///   (the exception index alone would walk every historical anomalous row).
+///
+/// Additive DDL only, one crash-atomic step like every step before it.
+const SCHEMA_V16: &str = "\
+CREATE INDEX idx_runs_open ON runs(run_id) WHERE status <> 'ended';
+CREATE INDEX idx_runs_exception ON runs(run_id)
+    WHERE anomalies <> '' OR status IN ('held','silent','stale');
+CREATE INDEX idx_runs_ended_at ON runs(ended_at) WHERE status = 'ended';
+";
+
+/// Run the v16 step (DDL + stamp) in one `BEGIN IMMEDIATE`, stepping aside
+/// when another process finished it while this one waited.
+pub(super) fn migrate_v16(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(backend)?;
+    let body = || -> Result<bool, StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(backend)?;
+        if version >= 16 {
+            return Ok(false);
+        }
+        conn.execute_batch(SCHEMA_V16).map_err(backend)?;
+        conn.execute_batch("PRAGMA user_version = 16")
+            .map_err(backend)?;
+        Ok(true)
+    };
+    match body() {
+        Ok(true) => conn.execute_batch("COMMIT").map_err(|err| {
+            let _ = conn.execute_batch("ROLLBACK");
+            backend(err)
+        }),
+        Ok(false) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// Reads an instance's persisted config layers for the FR-21 upgrade
 /// (story 21-3): the merged explicit limits and model key the real
 /// resolution would produce from the engine-default const, the kind-default
@@ -594,6 +797,31 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// The bench seeding's rollup write (story 21-5, `#[doc(hidden)]`
+    /// engine surface): one `usage_rollup_run` row, exactly the shape the
+    /// usage pipeline's fold would leave.
+    pub(crate) fn seed_rollup_for_perf(
+        &self,
+        instance: &InstanceName,
+        run_id: &RunId,
+        tokens: u64,
+    ) -> Result<(), StoreError> {
+        let instance_id: i64 = self
+            .instance_id(instance)?
+            .ok_or_else(|| StoreError::NotFound {
+                name: instance.as_str().to_string(),
+            })?;
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO usage_rollup_run (instance_id, run_id, events, \
+                 input_tokens, output_tokens, cached_tokens, cached_unknown, cost_micros) \
+                 VALUES (?1, ?2, 1, ?3, 0, 0, 0, 0)",
+                rusqlite::params![instance_id, run_id.as_str(), tokens as i64],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     fn records(
         &self,
         sql_tail: &str,
@@ -828,6 +1056,15 @@ impl RunRecords for SqliteStore {
             .pop())
     }
 
+    fn latest_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError> {
+        Ok(self
+            .records(
+                "WHERE i.name = ?1 AND r.process_owner = 1 ORDER BY r.run_id DESC LIMIT 1",
+                [instance.as_str()],
+            )?
+            .pop())
+    }
+
     fn open_in_process_descendants(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError> {
         self.records(
             "WHERE r.run_id IN (\
@@ -977,6 +1214,59 @@ impl RunRecords for SqliteStore {
 
     fn open_runs(&self) -> Result<Vec<RunRecord>, StoreError> {
         self.records("WHERE r.status <> 'ended' ORDER BY r.run_id", [])
+    }
+
+    fn list_runs(
+        &self,
+        view: ListingView,
+        selector: Option<&Selector>,
+        after: Option<&str>,
+        limit: usize,
+        cutoff: &str,
+    ) -> Result<(Vec<RunRecord>, Option<String>), StoreError> {
+        // The view arms read the v16 partial indexes (each arm's WHERE names
+        // an index predicate verbatim) with the keyset and the Selector
+        // inside each arm; the outer row read probes the runs primary key
+        // per id. `run_id` DESC is newest-first (ULID ids encode creation
+        // time; legacy `run-…` ids sort below every `run_…` id and land
+        // last). One row past the page is fetched: a cursor rides only when
+        // that row exists, so a final page that is exactly full ends the
+        // read (`None`) instead of pointing at an empty page.
+        let statement = listing_page_tail(view, selector, after, cutoff, limit.saturating_add(1));
+        let mut rows =
+            self.records(&statement.sql, rusqlite::params_from_iter(statement.params))?;
+        let next = if rows.len() > limit {
+            rows.truncate(limit);
+            rows.last().map(|record| record.run_id.as_str().to_string())
+        } else {
+            None
+        };
+        Ok((rows, next))
+    }
+
+    fn listing_counts(
+        &self,
+        view: ListingView,
+        selector: Option<&Selector>,
+        cutoff: &str,
+    ) -> Result<ListingCounts, StoreError> {
+        let count = |statement: ListingStatement| -> Result<u64, StoreError> {
+            let n: i64 = self
+                .conn()
+                .query_row(
+                    &statement.sql,
+                    rusqlite::params_from_iter(statement.params),
+                    |row| row.get(0),
+                )
+                .map_err(backend)?;
+            Ok(n.max(0) as u64)
+        };
+        let listed = count(listing_listed_count(view, selector, cutoff))?;
+        let healthy = count(listing_healthy_count(selector))?;
+        Ok(ListingCounts {
+            listed,
+            healthy_open: healthy,
+        })
     }
 
     fn ensure_run_row(&self, run_id: &RunId, instance: &InstanceName) -> Result<(), StoreError> {

@@ -2,8 +2,9 @@
 //! FR-60).
 //!
 //! `show` reads a Run's resolved limits (each with its source), its usage,
-//! headroom and latches — read-only, no host starts; over a Selector it
-//! pages (`--limit`, `--cursor`). `set` writes limits ON THE RUN: a limit
+//! headroom and latches — read-only, no host starts; over a Selector (or
+//! with no target, over every Run) it pages the Run listing (`--limit`,
+//! `--cursor`). `set` writes limits ON THE RUN: a limit
 //! set here outranks the agent's configuration and every Policy for that
 //! limit, and it BELONGS TO THE RUN — it ends with the Run, and a new start
 //! opens a new Run without it. Limits every future Run should carry belong
@@ -17,9 +18,9 @@
 //! the read-only engine and starts no host.
 
 use hekma_engine::{
-    render_dollars_bare, BreachAction, Engine, LatchKey, LimitActor, LimitSource, Micros,
-    PolicyResolution, RunLimitChange, RunLimitField, RunLimits, RunLimitsOutcome, RunLimitsView,
-    RunRecord, MAX_SELECTED_RUNS,
+    render_dollars_bare, BreachAction, Engine, LatchKey, LimitActor, LimitSource, ListRunsQuery,
+    ListingView, Micros, PolicyResolution, RunLimitChange, RunLimitField, RunLimits,
+    RunLimitsOutcome, RunLimitsView, RunRecord, MAX_SELECTED_RUNS,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -387,42 +388,62 @@ struct ShowDocument<'a> {
 }
 
 /// `hekma budget show [<TARGET>|--selector SEL] [--limit] [--cursor] [--json]`.
+///
+/// One Run by id or agent name; otherwise a listing read: with a Selector,
+/// the Runs it matches, and with neither, every Run — both paged through
+/// the Run listing (`hekma ps --all`'s view: every open Run plus the Runs
+/// that ended inside the ended-Run window), so no read loads the whole Run
+/// set.
 pub fn show(args: ShowArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let target = Target::parse(args.target.as_deref(), args.selector.as_deref())?;
+    let target = match (args.target.as_deref(), args.selector.as_deref()) {
+        (None, None) => None,
+        (target, selector) => Some(Target::parse(target, selector)?),
+    };
     let limit = args.limit.unwrap_or(DEFAULT_PAGE);
     if limit == 0 || limit > MAX_SELECTED_RUNS {
         return Err(invalid(format!(
             "--limit must be from 1 to {MAX_SELECTED_RUNS}"
         )));
     }
-    if args.cursor.is_some() && !matches!(target, Target::Selector(_)) {
+    let single = target
+        .as_ref()
+        .filter(|target| !matches!(target, Target::Selector(_)));
+    if args.cursor.is_some() && single.is_some() {
         return Err(invalid(
-            "--cursor pages a --selector read; a single Run has one page".to_string(),
+            "--cursor pages a listing read (a --selector, or no target); a single Run has one \
+             page"
+                .to_string(),
         ));
     }
     let engine = open_read_only_engine()?;
     let facade = engine.blocking();
-    let (ids, next_cursor) = match &target {
-        Target::Selector(selector) => {
-            let mut ids: Vec<String> = facade
-                .select_runs(selector)
-                .map_err(|err| run_error_class(&err, err.to_string()))?
-                .into_iter()
-                .map(|run| run.run_id.to_string())
-                .collect();
-            ids.sort();
-            if let Some(cursor) = &args.cursor {
-                ids.retain(|id| id.as_str() > cursor.as_str());
-            }
-            let more = ids.len() > limit;
-            ids.truncate(limit);
-            let next = more.then(|| ids.last().cloned()).flatten();
-            if ids.is_empty() && args.cursor.is_none() {
-                ui::note(format!("No open Run matches `{selector}`."));
-            }
-            (ids, next)
+    let (ids, next_cursor) = if let Some(single) = single {
+        (vec![target_run(&engine, single)?], None)
+    } else {
+        let selector = match &target {
+            Some(Target::Selector(selector)) => Some(selector.clone()),
+            _ => None,
+        };
+        let listing = facade
+            .list_runs(ListRunsQuery {
+                view: ListingView::All,
+                selector: selector.clone(),
+                after: args.cursor.clone(),
+                limit,
+            })
+            .map_err(|err| run_error_class(&err, err.to_string()))?;
+        let ids: Vec<String> = listing
+            .items
+            .iter()
+            .map(|run| run.record.run_id.to_string())
+            .collect();
+        if ids.is_empty() && args.cursor.is_none() {
+            ui::note(match &selector {
+                Some(selector) => format!("No Run matches `{selector}`."),
+                None => "No Run to show.".to_string(),
+            });
         }
-        single => (vec![target_run(&engine, single)?], None),
+        (ids, listing.next_cursor)
     };
     let mut views = Vec::with_capacity(ids.len());
     for id in &ids {

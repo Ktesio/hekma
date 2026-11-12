@@ -72,9 +72,9 @@ use crate::domain::{
     TransitionEvent,
 };
 use crate::domain::{
-    ChildRunRequest, LabelChange, LabelOutcome, LimitActor, PolicyChange, PolicyOutcome,
-    PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsView, RunRecord,
-    RunVerbError, RunView, Selector,
+    ChildRunRequest, Label, LabelChange, LabelOutcome, LimitActor, ListRunsQuery, PolicyChange,
+    PolicyOutcome, PolicyRecord, RunError, RunId, RunLifecycleVerb, RunLimitChange, RunLimitsView,
+    RunListing, RunRecord, RunSummary, RunVerbError, RunView, Selector,
 };
 use crate::ports::{LogCaptureMode, SpawnRecord};
 use crate::shutdown::DrainOutcome;
@@ -272,6 +272,11 @@ struct EngineInner {
     /// [`Engine::subscribe`] hands out receivers without ever contending on
     /// the supervisor lock. Both clones share one broadcast channel.
     events: EventBus,
+    /// The registry's published Run snapshot, held OUTSIDE the registry
+    /// mutex (story 21-5): the SSE Selector filter resolves a snapshot-
+    /// resident subject Run's labels lock-free, so a filtered stream never
+    /// contends with supervision on the registry lock per event.
+    run_snapshot: Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -539,11 +544,13 @@ impl Engine {
             supervisor.emit_open_note(&note);
         }
         let events = supervisor.event_bus();
+        let run_snapshot = Arc::clone(registry.run_publisher());
         let inner = Arc::new(EngineInner {
             read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
+            run_snapshot,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -557,8 +564,8 @@ impl Engine {
             // Run events, the FR-21 upgrade's one event) on the bus — they
             // are already durable in the outbox; this makes them live too
             // for any subscriber seated before the engine was handed out.
-            for event in registry.take_open_events() {
-                supervisor.publish(event);
+            for (seq, event) in registry.take_open_events() {
+                supervisor.publish(seq, event);
             }
         }
 
@@ -597,11 +604,13 @@ impl Engine {
         let rt = Self::build_runtime()?;
         let supervisor = Supervisor::with_runtime(rt.handle().clone());
         let events = supervisor.event_bus();
+        let run_snapshot = Arc::clone(registry.run_publisher());
         let inner = Arc::new(EngineInner {
             read_only: true,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
+            run_snapshot,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -756,6 +765,18 @@ impl Engine {
     /// blocking `recv` bridged through the engine runtime).
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// The SEQUENCED subscription (story 21-5): `(outbox seq, EngineEvent)`
+    /// pairs in commit order — the SSE path's stream, whose frames carry
+    /// the seq as their `id:` so a reconnect can replay the outbox from
+    /// `Last-Event-ID` and hand over to live delivery with seq-dedup at
+    /// the seam. Same contract as [`Engine::subscribe`] (bounded at
+    /// [`EVENT_BUS_CAPACITY`], `Lagged` on overrun); the seq comes from the
+    /// store writer's ack, so it is the durable outbox position of the
+    /// event — what `export_events` serves.
+    pub fn subscribe_sequenced(&self) -> broadcast::Receiver<(u64, EngineEvent)> {
+        self.inner.events.subscribe_sequenced()
     }
 
     /// The engine-computed Agent Home path for `name` (display helper).
@@ -1873,6 +1894,26 @@ impl Engine {
         .await
     }
 
+    /// [`Engine::select_runs`] with each matched Run assembled as its
+    /// listing row ([`RunSummary`]: labels, subtree usage, latches and
+    /// headroom) — the act set `POST /v0/runs/select` answers (story 21-6).
+    /// The same cap ([`RunError::TooManyRuns`]); reads only.
+    pub async fn select_run_summaries(
+        &self,
+        selector: &Selector,
+    ) -> Result<Vec<RunSummary>, RunError> {
+        let inner = Arc::clone(&self.inner);
+        let selector = selector.clone();
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .select_run_summaries(&selector)
+        })
+        .await
+    }
+
     /// Whether `verb` would act on Run `run_id` (story 21-6): the Run's
     /// row when the verb maps to its instance's verb, else the per-Run
     /// refusal ([`RunError::RunEnded`], [`RunError::VerbUnavailable`]) the
@@ -2035,6 +2076,88 @@ impl Engine {
                 .lock()
                 .expect("registry mutex poisoned")
                 .run_limits_view(&run_id)
+        })
+        .await
+    }
+
+    /// The Run listing (story 21-5, PRD FR-50): one exception-first (or
+    /// `--all`, inside-the-ended-Run-window) keyset page, newest run id
+    /// first, with each row's CONTROL depth, Run Status, Anomalies with
+    /// their latched breach actions, labels with source and origin, usage
+    /// (subtree always; the instance cumulative on process-owning rows),
+    /// and headroom against the Run's RESOLVED limits with each limit's
+    /// source. A Listing Selectors PAGES past [`crate::MAX_SELECTED_RUNS`]
+    /// (the verb cap stays verb-only). A cursor that is not the codec's
+    /// form is the typed `invalid-cursor` refusal. Reads only (registry
+    /// lock, read-only connection) — this is `hekma ps`'s read.
+    pub async fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .list_runs(&query)
+        })
+        .await
+    }
+
+    /// Seed bench Run rows under one instance (story 21-5's perf harness,
+    /// `#[doc(hidden)]`): written directly through the store writer — no
+    /// events, no snapshot publish, no processes. NOT a supported
+    /// embedding surface; the `perf-budgets` example is the only caller.
+    #[doc(hidden)]
+    pub async fn seed_runs_for_perf(
+        &self,
+        instance: &str,
+        rows: Vec<crate::domain::runs::PerfRunRow>,
+    ) -> Result<(), RunError> {
+        let instance = instance.to_string();
+        let inner = Arc::clone(&self.inner);
+        self.run_blocking(move || {
+            inner
+                .registry
+                .lock()
+                .expect("registry mutex poisoned")
+                .seed_perf_rows(&instance, &rows)
+        })
+        .await
+    }
+
+    /// The subject Run of `event` and the labels it carries NOW (story
+    /// 21-5): the SSE Selector filter's one read per filtered event —
+    /// snapshot first (no SQL), one read-only store read when the Run is
+    /// absent from it (ended Runs keep matching until compaction).
+    /// `Ok(None)` when the event names no Run (`policy`,
+    /// `breach_default_upgraded`) or the named Run has no row — both are
+    /// dropped under an active Selector and delivered without one.
+    /// Honest limitation, by design: the filter sees CURRENT labels, not
+    /// labels-at-event-time (nothing stores the latter).
+    pub async fn event_subject_labels(
+        &self,
+        event: &EngineEvent,
+    ) -> Result<Option<Vec<Label>>, RunError> {
+        // The fast path: the published snapshot, read lock-free and without
+        // a blocking-pool hop — an open subject Run (the common case) never
+        // touches the registry mutex the supervisor's poll needs.
+        match crate::domain::runs::snapshot::subject_labels(
+            &self.inner.run_snapshot.current(),
+            event,
+        ) {
+            crate::domain::runs::snapshot::SubjectLabels::Found(labels) => return Ok(Some(labels)),
+            crate::domain::runs::snapshot::SubjectLabels::NoSubject => return Ok(None),
+            crate::domain::runs::snapshot::SubjectLabels::NotInSnapshot => {}
+        }
+        let inner = Arc::clone(&self.inner);
+        let event = event.clone();
+        self.run_blocking(move || {
+            let registry = inner.registry.lock().expect("registry mutex poisoned");
+            let Some(run_id) = registry.event_subject_run(&event) else {
+                return Ok(None);
+            };
+            registry
+                .run_current_labels(&run_id)
+                .map_err(RunError::Store)
         })
         .await
     }
@@ -2913,6 +3036,13 @@ impl Blocking<'_> {
         self.engine.rt.block_on(self.engine.select_runs(selector))
     }
 
+    /// Blocking twin of [`Engine::select_run_summaries`].
+    pub fn select_run_summaries(&self, selector: &Selector) -> Result<Vec<RunSummary>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.select_run_summaries(selector))
+    }
+
     /// Blocking twin of [`Engine::plan_run_verb`].
     pub fn plan_run_verb(
         &self,
@@ -2972,6 +3102,35 @@ impl Blocking<'_> {
     /// Blocking twin of [`Engine::run_limits_view`].
     pub fn run_limits_view(&self, run_id: &str) -> Result<RunLimitsView, RunError> {
         self.engine.rt.block_on(self.engine.run_limits_view(run_id))
+    }
+
+    /// Blocking twin of [`Engine::seed_runs_for_perf`] (the perf harness's
+    /// `#[doc(hidden)]` seeding seam).
+    #[doc(hidden)]
+    pub fn seed_runs_for_perf(
+        &self,
+        instance: &str,
+        rows: Vec<crate::domain::runs::PerfRunRow>,
+    ) -> Result<(), RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.seed_runs_for_perf(instance, rows))
+    }
+
+    /// Blocking twin of [`Engine::list_runs`] — `hekma ps`'s read.
+    pub fn list_runs(&self, query: ListRunsQuery) -> Result<RunListing, RunError> {
+        self.engine.rt.block_on(self.engine.list_runs(query))
+    }
+
+    /// Blocking twin of [`Engine::event_subject_labels`] — the SSE
+    /// Selector filter's read for sync consumers.
+    pub fn event_subject_labels(
+        &self,
+        event: &EngineEvent,
+    ) -> Result<Option<Vec<Label>>, RunError> {
+        self.engine
+            .rt
+            .block_on(self.engine.event_subject_labels(event))
     }
 
     /// Blocking twin of [`Engine::policies`].
@@ -3120,6 +3279,73 @@ mod tests {
     use super::*;
     use crate::domain::NameError;
     use crate::ports::StoreError;
+
+    #[test]
+    fn the_sse_filter_resolves_an_open_run_without_the_registry_lock() {
+        // An open Run lives in the published snapshot: the Selector filter's
+        // label read answers from it lock-free — even while the registry
+        // mutex (the one the supervisor's poll needs) is held elsewhere.
+        let tmp = tempfile::TempDir::new().unwrap();
+        drop(Engine::open(Some(tmp.path().to_path_buf())).unwrap());
+        {
+            let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
+            conn.execute_batch(
+                "INSERT INTO agent_instances (name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES ('demo', 'mock', 'running', '/h', 't', 't'); \
+                 INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 instance_id, process_owner, created_at, updated_at) SELECT 'run_S', \
+                 'supervised', 0, 'active', '', id, 0, 't', 't' FROM agent_instances \
+                 WHERE name = 'demo'; \
+                 INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+                 ('run_S', 'team', 'core', 'bound', 'config');",
+            )
+            .unwrap();
+        }
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let event = EngineEvent::BudgetBreach(crate::domain::BudgetBreachEvent::new(
+            "demo",
+            "run_S",
+            crate::domain::BreachScope::PerRun,
+            1,
+            1,
+            crate::domain::BreachAction::Warn,
+            "self-reported",
+            "t",
+        ));
+        let guard = engine.inner.registry.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            let event = &event;
+            scope.spawn(move || {
+                let _ = tx.send(engine.blocking().event_subject_labels(event));
+            });
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(guard);
+            let labels = answer
+                .expect("answered while the registry lock was held")
+                .unwrap()
+                .expect("the open Run's labels");
+            assert!(labels.contains(&Label::bound("team", "core")), "{labels:?}");
+        });
+        // An event naming no Run answers None on the same fast path.
+        let policy = EngineEvent::Policy(Box::new(crate::domain::runs::PolicyEvent {
+            schema_version: crate::domain::runs::POLICY_EVENT_SCHEMA_VERSION,
+            kind: crate::domain::runs::PolicyEventKind::Created,
+            name: "p".to_string(),
+            selector: None,
+            limits: None,
+            prior_limits: None,
+            rates: Default::default(),
+            matched: 0,
+            fallbacks: 0,
+            at: "t".to_string(),
+        }));
+        assert_eq!(
+            engine.blocking().event_subject_labels(&policy).unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn config_facade_round_trip_and_invalid_name_arms() {

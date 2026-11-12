@@ -86,19 +86,19 @@ pub(crate) struct FleetResolutionFacts {
 
 impl Registry {
     /// Drain the events the open produced (the initial sweep's Run events,
-    /// the upgrade event), for the engine to publish on the bus once it
-    /// exists. They are already durable in the outbox.
-    pub(crate) fn take_open_events(&mut self) -> Vec<EngineEvent> {
+    /// the upgrade event) with their outbox seqs, for the engine to publish
+    /// on the bus once it exists. They are already durable in the outbox.
+    pub(crate) fn take_open_events(&mut self) -> Vec<(u64, EngineEvent)> {
         std::mem::take(&mut *self.open_events.lock().expect("open-events mutex poisoned"))
     }
 
-    /// Note an event to publish at open (already durable through the
-    /// outbox).
-    pub(crate) fn note_open_event(&self, event: EngineEvent) {
+    /// Note an event (with its outbox seq) to publish at open (already
+    /// durable through the outbox).
+    pub(crate) fn note_open_event(&self, seq: u64, event: EngineEvent) {
         self.open_events
             .lock()
             .expect("open-events mutex poisoned")
-            .push(event);
+            .push((seq, event));
     }
 
     /// Load the policy cache from the store (at writer open, after the
@@ -1260,8 +1260,8 @@ impl Registry {
             Ok(Some((event, append)))
         });
         match result {
-            Ok(Some((event, _append))) => {
-                self.note_open_event(EngineEvent::BreachDefaultUpgraded(event));
+            Ok(Some((event, append))) => {
+                self.note_open_event(append.seq, EngineEvent::BreachDefaultUpgraded(event));
             }
             Ok(None) => {
                 // Another open finished the list first (the concurrent
@@ -1375,8 +1375,8 @@ impl Registry {
         });
         match result {
             Ok(committed) => {
-                for (event, _append) in committed {
-                    self.note_open_event(EngineEvent::Run(event));
+                for (event, append) in committed {
+                    self.note_open_event(append.seq, EngineEvent::Run(event));
                 }
             }
             Err(err) => self.push_open_note(format!(
