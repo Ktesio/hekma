@@ -3343,6 +3343,169 @@ mod tests {
     }
 
     #[test]
+    fn the_run_verb_and_limit_facades_map_refuse_and_plan_per_run() {
+        // Story 21-6: the Run-grain verbs and the budget job through the
+        // async + blocking facade, over a supervised Run seeded through the
+        // registry (the builtin `mock` cannot start a process).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let facade = engine.blocking();
+        facade.register("demo", "mock").unwrap();
+        let owner = RunId::mint();
+        {
+            let registry = engine.inner.registry.lock().unwrap();
+            registry
+                .ensure_supervised_run(crate::domain::runs::ops::SupervisedRun {
+                    instance: InstanceName::new("demo").unwrap(),
+                    run_id: owner.clone(),
+                    wire_path: false,
+                    labels: Vec::new(),
+                    fresh: true,
+                    inputs: None,
+                })
+                .unwrap();
+        }
+        let child = facade
+            .open_child_run(ChildRunRequest::under(crate::domain::RunParent::Run(
+                owner.clone(),
+            )))
+            .unwrap()
+            .record
+            .run_id;
+        // The owner maps to the instance's verb (which refuses here: the
+        // registered mock is not running — an ENGINE error, decoded as such).
+        assert_eq!(
+            facade
+                .plan_run_verb(owner.as_str(), RunLifecycleVerb::Stop)
+                .unwrap()
+                .instance
+                .as_deref(),
+            Some("demo")
+        );
+        for result in [
+            facade.stop_run(owner.as_str(), None).map(|_| ()),
+            facade.pause_run(owner.as_str()).map(|_| ()),
+            facade.resume_run(owner.as_str()).map(|_| ()),
+            facade.drain_run(owner.as_str(), None).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(RunVerbError::Engine(_))), "{result:?}");
+        }
+        // The child is refused per Run, naming its depth.
+        for result in [
+            facade.stop_run(child.as_str(), None).map(|_| ()),
+            facade.pause_run(child.as_str()).map(|_| ()),
+            facade.resume_run(child.as_str()).map(|_| ()),
+            facade.drain_run(child.as_str(), None).map(|_| ()),
+        ] {
+            match result {
+                Err(RunVerbError::Run(err)) => assert_eq!(err.code(), "verb-unavailable"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            facade
+                .plan_run_verb(child.as_str(), RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "verb-unavailable"
+        );
+        assert_eq!(
+            facade
+                .plan_run_verb("run_none", RunLifecycleVerb::Pause)
+                .unwrap_err()
+                .code(),
+            "run-not-found"
+        );
+        assert!(matches!(
+            facade.stop_run("run_none", None),
+            Err(RunVerbError::Run(RunError::NotFound { .. }))
+        ));
+        // The budget job: a dry run plans, a write commits, a child's
+        // cumulative ceiling is that Run's refusal.
+        let change = RunLimitChange {
+            set: crate::domain::RunLimits {
+                token_per_run: Some(5_000),
+                ..Default::default()
+            },
+            clear: Vec::new(),
+        };
+        let planned = facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                change.clone(),
+                LimitActor::Operator,
+                true,
+            )
+            .unwrap();
+        assert!(planned[0].1.as_ref().unwrap().dry_run);
+        assert_eq!(
+            facade.run_limits_view(owner.as_str()).unwrap().limits,
+            crate::domain::RunLimits::default()
+        );
+        let results = facade
+            .set_run_limits(
+                vec![owner.to_string(), child.to_string()],
+                RunLimitChange {
+                    set: crate::domain::RunLimits {
+                        token_per_run: Some(5_000),
+                        token_cumulative: Some(9_000),
+                        ..Default::default()
+                    },
+                    clear: Vec::new(),
+                },
+                LimitActor::Operator,
+                false,
+            )
+            .unwrap();
+        assert!(results[0].1.is_ok());
+        assert_eq!(
+            results[1].1.as_ref().unwrap_err().code(),
+            "scope-unavailable"
+        );
+        let view = facade.run_limits_view(owner.as_str()).unwrap();
+        assert_eq!(view.limits.token_cumulative, Some(9_000));
+        assert_eq!(view.resolution.sources.tokens_cumulative, crate::domain::LimitSource::Run);
+        // A config write runs the re-arm pass (nothing latched here) and
+        // leaves the Run-level limit on top.
+        facade
+            .set_config("demo", "budget.tokens.per_run", "100")
+            .unwrap();
+        assert_eq!(
+            facade
+                .run_limits_view(owner.as_str())
+                .unwrap()
+                .resolution
+                .tokens
+                .per_run,
+            Some(5_000)
+        );
+        // A malformed change is refused whole.
+        assert!(facade
+            .set_run_limits(
+                vec![owner.to_string()],
+                RunLimitChange::default(),
+                LimitActor::Operator,
+                false
+            )
+            .is_err());
+        // A read-only engine plans but refuses every write.
+        drop(facade);
+        drop(engine);
+        let read_only = Engine::open_read_only(Some(tmp.path().to_path_buf())).unwrap();
+        let ro = read_only.blocking();
+        assert!(ro
+            .set_run_limits(vec![owner.to_string()], change.clone(), LimitActor::Operator, true)
+            .is_ok());
+        assert!(ro
+            .set_run_limits(vec![owner.to_string()], change, LimitActor::Operator, false)
+            .is_err());
+        assert!(matches!(
+            ro.stop_run(owner.as_str(), None),
+            Err(RunVerbError::Run(RunError::Store(_)))
+        ));
+    }
+
+    #[test]
     fn the_label_facade_binds_selects_and_publishes_one_committed_event() {
         // Story 21-9: the async + blocking label verb end to end, over a
         // supervised Run seeded through the registry (the builtin `mock`

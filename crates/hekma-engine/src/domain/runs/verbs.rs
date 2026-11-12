@@ -410,6 +410,86 @@ mod tests {
         );
     }
 
+    fn record(process_owner: bool, status: super::super::RunStatus) -> super::super::RunRecord {
+        super::super::RunRecord {
+            run_id: crate::domain::usage::RunId::from_wire("run_X"),
+            control_depth: if process_owner {
+                ControlDepth::Supervised
+            } else {
+                ControlDepth::Announced
+            },
+            wire_path: true,
+            status,
+            anomalies: Vec::new(),
+            parent_run_id: (!process_owner)
+                .then(|| crate::domain::usage::RunId::from_wire("run_P")),
+            instance: Some("agent".to_string()),
+            process_owner,
+            end_cause: None,
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn a_run_verb_maps_to_its_instance_or_answers_its_cell_per_run() {
+        use super::super::RunStatus;
+        for verb in RunLifecycleVerb::ALL {
+            assert_eq!(RunLifecycleVerb::from_wire(verb.as_str()), Some(verb));
+            // The process-owning Run: the instance's own verb.
+            assert_eq!(
+                run_verb_target(verb, &record(true, RunStatus::Active)).unwrap(),
+                "agent"
+            );
+            // An ended Run: `run-ended`.
+            assert_eq!(
+                run_verb_target(verb, &record(true, RunStatus::Ended))
+                    .unwrap_err()
+                    .code(),
+                "run-ended"
+            );
+            // A child: refused per Run, naming its depth and the calls.
+            let err = run_verb_target(verb, &record(false, RunStatus::Active)).unwrap_err();
+            assert_eq!(err.code(), "verb-unavailable");
+            let text = err.to_string();
+            assert!(text.contains("announced") && text.contains("model calls"), "{text}");
+            assert!(text.contains("hekma run close run_X"), "{text}");
+        }
+        assert_eq!(RunLifecycleVerb::from_wire("start"), None);
+        assert_eq!(RunLifecycleVerb::Drain.table_row(), RunVerb::Stop);
+        // A held child's resume names the parent that holds it.
+        let err = run_verb_target(RunLifecycleVerb::Resume, &record(false, RunStatus::Held))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("parent Run `run_P`") && err.contains("parent-paused"), "{err}");
+        assert!(err.contains("hekma agent resume agent"), "{err}");
+        // A process-owning Run without an agent is a typed refusal.
+        let mut orphan = record(true, RunStatus::Active);
+        orphan.instance = None;
+        assert_eq!(
+            run_verb_target(RunLifecycleVerb::Stop, &orphan)
+                .unwrap_err()
+                .code(),
+            "invalid-request"
+        );
+        let mut hostless = record(false, RunStatus::Held);
+        hostless.instance = None;
+        hostless.parent_run_id = None;
+        let err = run_verb_target(RunLifecycleVerb::Resume, &hostless)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resume its parent"), "{err}");
+        assert!(run_verb_target(RunLifecycleVerb::Stop, &{
+            let mut child = record(false, RunStatus::Active);
+            child.instance = None;
+            child
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("the agent that hosts it"));
+    }
+
     #[test]
     fn wire_forms_are_kebab_case() {
         assert_eq!(
