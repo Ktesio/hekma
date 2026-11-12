@@ -955,6 +955,13 @@ impl Engine {
                 ),
                 Err(_) => None,
             };
+            // Story 21-3 (the perf-budgets ratchet): ONE batched read of
+            // every instance's Policy-resolution facts (the open
+            // process-owning Runs' rows, labels and limits, and the
+            // kept-on-pause markers), in the same AI-16 shape as the spawn
+            // records above. A failed batch (`None`) falls back to each
+            // row's own read, so it degrades one row at a time.
+            let resolution_facts = registry.fleet_resolution_facts();
             let entries = instances
                 .into_iter()
                 .map(|instance| {
@@ -962,6 +969,7 @@ impl Engine {
                         &registry,
                         &supervisor,
                         records.as_ref(),
+                        resolution_facts.as_ref(),
                         instance,
                         inner.read_only,
                     )
@@ -1005,6 +1013,7 @@ impl Engine {
                 &registry,
                 &supervisor,
                 Some(&records),
+                None,
                 instance,
                 inner.read_only,
             ))
@@ -1022,6 +1031,7 @@ impl Engine {
         registry: &Registry,
         supervisor: &Supervisor,
         records: Option<&HashMap<InstanceName, SpawnRecord>>,
+        resolution_facts: Option<&crate::domain::registry_policy::FleetResolutionFacts>,
         instance: AgentInstance,
         read_only: bool,
     ) -> FleetEntry {
@@ -1146,10 +1156,11 @@ impl Engine {
         let effective_opt = registry
             .effective_config(&instance.name, crate::domain::ConfigLayer::empty())
             .ok();
-        let (resolution, breach_default_upgraded) = registry.resolved_limits_and_kept(
+        let (resolution, breach_default_upgraded) = registry.resolved_limits_from_batch(
             &instance.name,
             current_run_id.as_ref(),
             effective_opt.as_ref(),
+            resolution_facts,
         );
         let rate = resolution.rate;
         let cost_cap = resolution.dollars;

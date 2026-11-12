@@ -372,7 +372,7 @@ impl Supervisor {
         }
         for (event, outbox) in applied.events {
             self.note_outbox_append(&outbox);
-            self.publish(crate::domain::EngineEvent::Policy(event));
+            self.publish(crate::domain::EngineEvent::Policy(Box::new(event)));
         }
         self.publish_run_events(applied.run_events);
         // Then the process actions (only for instances this engine
