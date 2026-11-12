@@ -2686,7 +2686,8 @@
       },
       "input": {
         "arms": {
-          "dollars_cumulative_micros": 500000
+          "dollars_per_run_micros": 500000,
+          "dollars_cumulative_micros": 2000000
         },
         "action": "pause",
         "priced": false,
@@ -2696,10 +2697,26 @@
           "run_cost_micros": 900000,
           "cumulative_cost_micros": 1500000
         },
-        "latched": []
+        "latched": [
+          {
+            "reason": {
+              "dimension": "dollars",
+              "scope": "cumulative"
+            },
+            "action": "pause"
+          }
+        ]
       },
       "expected": {
-        "unlatched": [],
+        "unlatched": [
+          {
+            "reason": {
+              "dimension": "dollars",
+              "scope": "cumulative"
+            },
+            "action": "pause"
+          }
+        ],
         "fence_cleared": [],
         "fired": [],
         "latched_after": [],

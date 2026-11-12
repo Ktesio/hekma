@@ -891,8 +891,9 @@ pub enum Case {
     Rearm(RearmCase),
 }
 
-/// What moved the ceiling a `rearm` case re-arms against (story 21-6). The
-/// expected outcome never depends on it: the three triggers run ONE rule.
+/// What moved the ceiling a `rearm` case re-arms against (story 21-6):
+/// context, not an input — the rule never reads it, so the expected
+/// outcome never depends on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RearmTrigger {
@@ -1998,7 +1999,6 @@ fn policy_decision_cases() -> Vec<Case> {
     ]
 }
 
-/// The bound-label pairs of a resolution input.
 /// The `rearm` cases (story 21-6, vectors 1.4.0), in fixed canonical
 /// order. Each case's `expected` is computed by [`rearm`] itself.
 fn rearm_cases() -> Vec<Case> {
@@ -2138,6 +2138,9 @@ fn rearm_cases() -> Vec<Case> {
                 latched: vec![latched(tokens_per_run, BreachAction::Warn)],
             },
         ),
+        // Unpriced: the cumulative cap latched earlier (when a Rate still
+        // priced it) is raised above its total and re-arms; the per-run
+        // cap lowered below its total cannot fire — no Rate prices it.
         rearm_case(
             "rearm-unpriced-dollar-cap-re-arms-but-cannot-fire",
             RearmTrigger::RunLimits,
@@ -2147,17 +2150,21 @@ fn rearm_cases() -> Vec<Case> {
             },
             RearmInput {
                 arms: LevelArms {
-                    dollars_cumulative_micros: Some(500_000),
+                    dollars_per_run_micros: Some(500_000),
+                    dollars_cumulative_micros: Some(2_000_000),
                     ..LevelArms::default()
                 },
                 action: BreachAction::Pause,
                 priced: false,
                 totals,
-                latched: Vec::new(),
+                latched: vec![latched(dollars_cumulative, BreachAction::Pause)],
             },
         ),
-        // The identity across the three raise triggers (FR-44's
-        // portability point): the SAME input, the SAME outcome.
+        // The trigger is context, not an input: a consumer re-deriving
+        // these cases must not branch on it (the SAME input under all
+        // three triggers carries the SAME expected outcome). That the
+        // engine's three store paths feed the rule the same input is pinned
+        // by the engine's own tests, not by these cases.
         rearm_case(
             "rearm-same-outcome-from-a-policy-change",
             RearmTrigger::PolicyChange,
@@ -2192,6 +2199,7 @@ fn rearm_case(id: &str, trigger: RearmTrigger, arms_before: LevelArms, input: Re
     })
 }
 
+/// The bound-label pairs of a resolution input.
 fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()

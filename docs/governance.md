@@ -145,8 +145,12 @@ Six case kinds exist:
   latches and fence reasons after, and whether the Run's `breach` Anomaly
   holds. `trigger` names what moved the ceiling — a Policy change
   (`policy-change`), a limit set on the Run (`run-limits`) or an agent
-  configuration write (`config-write`); the expected outcome never depends on
-  it, and three cases pin the same input under all three.
+  configuration write (`config-write`). It is context, not an input: the rule
+  never reads it, so the expected outcome never depends on it, and three
+  cases carry the same input under all three so a consumer that branched on
+  it would fail. These cases pin the rule, not the engine's three paths to
+  it; that each path hands the rule the same input is the engine's own
+  tested contract.
 
 A later minor version may add a case kind, as 1.1.0 added `fence`, 1.2.0
 added `chain`, 1.3.0 added `policy` and 1.4.0 added `rearm`. See the
