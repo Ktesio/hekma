@@ -2,7 +2,7 @@
 title: 'Selectors on every verb and hekma budget'
 type: 'feature'
 created: '2026-11-09'
-status: 'in-progress'
+status: 'review'
 review_loop_iteration: 0
 baseline_commit: 'cf4ec27d552587d2fad968800ecac5595309b84e'
 context:
@@ -151,3 +151,4 @@ Each is a public-contract choice taken under the delegated brief; the recommenda
   8. **`RunEvent.limits`/`prior_limits` are boxed** (`Option<Box<RunLimits>>`, the plain object on the wire): two inline `RunLimits` made `EngineEvent::Run` the oversized variant (clippy `large_enum_variant`).
   9. **Vectors:** `RearmCase { id, covers, trigger, arms_before, input, expected }` (`trigger` ∈ `policy-change`/`run-limits`/`config-write`, never read by the rule); 10 cases appended (raise above, exactly-at keeps, per-reason one-of-two, both raised, lowered fires, cleared releases, a new action re-fires once, unpriced cap, and the same per-reason input under all three triggers); a test pins the 53 shipped 1.3.0 cases' bytes by SHA-256. docs/governance.md's version table had 1.3.0 as 40-48; it was 40-53 (corrected).
   10. **Test seam:** `ServeOptions::set_token_ttl_override` (`#[doc(hidden)]`, `Duration::ZERO` expires every token at once) for the HTTP expiry test without sleeping; TTL, eviction and lazy expiry are unit-tested with an injected clock.
+- 2026-11-12 — gates and primary self-review (AI-55 pass one). First full run: one real regression — `adoption::adopting_an_over_budget_run_with_no_recorded_breach_fires_at_adoption` staged its un-recorded crossing with `config set` through a supervising engine, which since this story breaches AT ONCE (the shared re-arm pass); the leg now arms the budget by a hand edit between hosts (the only remaining way to an un-recorded crossing). Two flakes: `racing_first_writes_converge_on_one_auto_started_host` (pre-existing, passed on retry) and 21-3's `a_child_latch_re_arms_…` (two run ids minted in one millisecond sort at random — fixed in the test). Self-review fixes: ceilings above `i64::MAX` are refused (stored clamped, they would read back different); the budget verb's Selector rows carry the Run-scoped note (`SetAct.decorate`); coverage tests for the job's edges, one-Run CLI targets, close and limits over a set. Changed-line coverage vs e3a047a: 93.87% → 96.80% (3964/4095). Status review; the independent adversarial pass is the orchestrator's.
