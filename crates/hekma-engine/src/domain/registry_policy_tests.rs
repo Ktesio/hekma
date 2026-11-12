@@ -1890,8 +1890,15 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
     // `breach` Anomaly — stick for the rest of the Run.
     let seeded = seed(1_000);
     let name = InstanceName::new("money").unwrap();
-    // A child Run bound team=core with its own usage of 60.
-    let child = RunId::mint();
+    // A child Run bound team=core with its own usage of 60. Its id must
+    // sort AFTER the owner's (the change job visits Runs in run-id order,
+    // and this seed's owner has no stored resolution to arm the process
+    // level when the child comes first): two ids minted in the same
+    // millisecond order at random, which made this test flake.
+    let mut child = RunId::mint();
+    while child.as_str() <= seeded.run.as_str() {
+        child = RunId::mint();
+    }
     let child_record = RunRecord {
         run_id: child.clone(),
         control_depth: ControlDepth::Announced,

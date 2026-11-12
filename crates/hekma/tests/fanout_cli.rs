@@ -237,7 +237,11 @@ fn a_selector_stops_the_agents_and_refuses_the_child_per_run_unix() {
     assert_eq!(run.stdout.lines().last(), Some("paused"), "{}", run.stdout);
     assert!(run.stdout.contains("Paused Run"), "{}", run.stdout);
     let run = hekma(&["run", "show", &fan_b_owner, "--json"]);
-    assert_eq!(json(&run.stdout)["run"]["status"], "held", "the Run goes held");
+    assert_eq!(
+        json(&run.stdout)["run"]["status"],
+        "held",
+        "the Run goes held"
+    );
     // A child held by its paused parent: resume names the parent.
     let run = hekma(&["agent", "resume", &fan_b_child]);
     assert_eq!(run.code, Some(4), "{}", run.stderr);

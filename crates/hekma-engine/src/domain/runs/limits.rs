@@ -411,6 +411,18 @@ impl RunLimitChange {
                 )));
             }
         }
+        // The store keeps a ceiling as a signed 64-bit integer: a larger
+        // one would be stored clamped and read back different from what
+        // was planned, so it is refused instead (no money value is ever
+        // silently changed).
+        for (field, value) in [
+            ("tokens-per-run", self.set.token_per_run),
+            ("tokens-cumulative", self.set.token_cumulative),
+        ] {
+            if value.is_some_and(|value| value > i64::MAX as u64) {
+                return Err(invalid(format!("`{field}` must be at most {}", i64::MAX)));
+            }
+        }
         Ok(())
     }
 

@@ -710,6 +710,11 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
         .unwrap_err()
         .to_string()
         .contains("both set and cleared"));
+    let huge = limits(RunLimits {
+        token_cumulative: Some(u64::MAX),
+        ..RunLimits::default()
+    });
+    assert!(huge.validate().unwrap_err().to_string().contains("at most"));
     // An unreadable configuration refuses (fail closed, never "nothing set").
     let err = seeded
         .registry
