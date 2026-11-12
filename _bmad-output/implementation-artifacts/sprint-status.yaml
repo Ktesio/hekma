@@ -222,7 +222,7 @@ development_status:
   22-1-run-keys-minting-hashing-refresh-and-revocation: in-progress  # 2026-11-12 spec approved (orchestrator; O1-O7 built on the security review's recommended options, Islam's rulings pending). Build started on ktesio/22-1-run-keys at 45f7151 (main + 21-3 + 21-5 + 21-6 merged in): Run Key per launch, hash-only `tokens` (schema v17), refresh with reuse detection, cascade revocation, route-family authority matrix; hekma-engine stays 0.12.0. 2026-11-12 built: all gates green (2530 tests), primary self-review done, 22/22 mutation checks killed, the 21-6 round-2 N1-N7 folded in; coverage skipped (disk under 9 GB); awaiting the independent adversarial security pass and Islam's O1-O7 rulings
   22-2-the-run-key-in-the-api-key-slot-key-custody-by-default: ready-for-dev  # security review before docs say supported
   22-3-scent-check-modes: ready-for-dev  # decides PRD Q9
-  22-4-bypass-detection-in-the-shim: backlog  # after 24-1
+  22-4-bypass-detection-in-the-shim: ready-for-dev  # after 24-1
   22-5-an-authenticated-proxy-beyond-loopback: backlog
   epic-22-retrospective: optional
   epic-23: backlog  # Attach and Wire Control (FR-51, FR-52, FR-56; AD-26, AD-28)
