@@ -45,10 +45,15 @@ impl std::io::Write for SharedSink {
 fn write_secrets_file(base: &Path) {
     let path = base.join(hekma_engine::paths::SECRETS_FILE);
     std::fs::write(&path, format!("{BEARER_NAME} = \"{BEARER_VALUE}\"\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The resolver refuses a group/other-readable secrets file; a runtime
+    // OS branch (no OS-conditional cfg outside the backends).
+    if std::env::consts::OS != "windows" {
+        let status = std::process::Command::new("chmod")
+            .arg("600")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
 
