@@ -321,22 +321,75 @@ fn a_caller_acts_only_within_its_own_subtree() {
         .unwrap();
     assert_eq!(again.view.record.run_id, first.view.record.run_id);
     assert!(again.credentials.is_none(), "display once");
-    let sibling_caller = w.caller(&{
-        let mut sib = ChildRunRequest::under(RunParent::Run(sibling.clone()));
-        sib.issue_credentials = true;
-        let opened = w
-            .supervisor
-            .open_child_run_as(&w.registry, RunActor::Operator, sib)
-            .unwrap();
-        crate::domain::SecretString::new(opened.credentials.unwrap().run_key().expose_secret())
-    });
-    let mut stolen = request;
-    stolen.parent = RunParent::Run(sibling.clone());
-    let refused = w
+    let mut sib = ChildRunRequest::under(RunParent::Run(sibling.clone()));
+    sib.issue_credentials = true;
+    let sib = w
         .supervisor
-        .open_child_run_as(&w.registry, sibling_caller, stolen)
-        .unwrap_err();
-    assert_eq!(refused.code(), "run-out-of-scope");
+        .open_child_run_as(&w.registry, RunActor::Operator, sib)
+        .unwrap();
+    let sib_run = sib.view.record.run_id.clone();
+    let sibling_caller = w.caller(sib.credentials.as_ref().unwrap().run_key());
+    // Another Run's key using the same external id gets its own child: the
+    // id lives in each opening Run's namespace.
+    let mut other = request;
+    other.parent = RunParent::Run(sib_run.clone());
+    let theirs = w
+        .supervisor
+        .open_child_run_as(&w.registry, sibling_caller, other)
+        .unwrap();
+    assert_ne!(theirs.view.record.run_id, first.view.record.run_id);
+    assert_eq!(theirs.view.record.parent_run_id.as_ref(), Some(&sib_run));
+}
+
+#[test]
+fn a_callers_external_ids_never_capture_or_reveal_an_operator_or_host_run() {
+    let w = world();
+    let (child, credentials) = w.operator_child();
+    let caller = w.caller(credentials.run_key());
+    let with_id = |parent: &RunId, external: &str| {
+        let mut request = ChildRunRequest::under(RunParent::Run(parent.clone()));
+        request.external_id = Some(external.to_string());
+        request
+    };
+    // A Run Key squats an id it guesses the Host will use…
+    let squat = w
+        .supervisor
+        .open_child_run_as(&w.registry, caller.clone(), with_id(&child, "ci-job-4711"))
+        .unwrap();
+    // …and the Host's later open with that id gets its OWN Run, where it
+    // asked for it — never the Caller's Run in the Caller's subtree.
+    for actor in [RunActor::Host, RunActor::Operator] {
+        let hosts = w
+            .supervisor
+            .open_child_run_as(&w.registry, actor, with_id(&w.root, "ci-job-4711"))
+            .unwrap();
+        assert_ne!(hosts.view.record.run_id, squat.view.record.run_id);
+        assert_eq!(hosts.view.record.parent_run_id.as_ref(), Some(&w.root));
+    }
+    // The Host's retry is idempotent within its own binding.
+    let first = w
+        .supervisor
+        .open_child_run_as(&w.registry, RunActor::Host, with_id(&w.root, "job-77"))
+        .unwrap();
+    let again = w
+        .supervisor
+        .open_child_run_as(&w.registry, RunActor::Operator, with_id(&w.root, "job-77"))
+        .unwrap();
+    assert_eq!(again.view.record.run_id, first.view.record.run_id);
+    // A Caller presenting the Host's id neither gets that Run nor a refusal
+    // naming it: it opens a fresh child of its own.
+    let probe = w
+        .supervisor
+        .open_child_run_as(&w.registry, caller.clone(), with_id(&child, "job-77"))
+        .unwrap();
+    assert_ne!(probe.view.record.run_id, first.view.record.run_id);
+    assert_eq!(probe.view.record.parent_run_id.as_ref(), Some(&child));
+    // And the Caller's own retry still returns its own Run.
+    let retry = w
+        .supervisor
+        .open_child_run_as(&w.registry, caller, with_id(&child, "ci-job-4711"))
+        .unwrap();
+    assert_eq!(retry.view.record.run_id, squat.view.record.run_id);
 }
 
 #[test]
@@ -553,6 +606,60 @@ fn a_refresh_rotates_once_and_a_reused_refresh_credential_revokes_the_pair() {
 }
 
 #[test]
+fn a_used_refresh_credential_is_no_kill_switch_once_reuse_is_detected_or_acknowledged() {
+    let w = world();
+    let refresh = |presented: &crate::domain::SecretString| {
+        w.supervisor.refresh_credentials(&w.registry, presented)
+    };
+    // The Operator's acknowledgement retires every used credential: an old
+    // one presented later is a plain refusal — no reuse, no Anomaly, no
+    // revocation of the Run's current pair.
+    let (child, first) = w.operator_child();
+    let second = refresh(first.refresh_credential()).unwrap();
+    w.supervisor
+        .revoke_run_keys(&w.registry, &child, false)
+        .unwrap();
+    assert_eq!(
+        w.token_state(first.refresh_credential()),
+        TokenState::Revoked
+    );
+    let quiet = w.credential_events().len();
+    assert_eq!(
+        refresh(first.refresh_credential()).unwrap_err().code(),
+        "credential-revoked"
+    );
+    assert!(!w.run(&child).anomalies.contains(&Anomaly::CredentialReuse));
+    assert_eq!(w.credential_events().len(), quiet);
+    let _ = second;
+
+    // Reuse detection itself retires the whole used chain: after the
+    // Operator acknowledges, NO older credential re-triggers it.
+    let (other, one) = w.operator_child();
+    let two = refresh(one.refresh_credential()).unwrap();
+    let three = refresh(two.refresh_credential()).unwrap();
+    assert_eq!(
+        refresh(one.refresh_credential()).unwrap_err().code(),
+        "credential-revoked"
+    );
+    assert!(w.run(&other).anomalies.contains(&Anomaly::CredentialReuse));
+    assert_eq!(w.token_state(three.run_key()), TokenState::Revoked);
+    for used in [one.refresh_credential(), two.refresh_credential()] {
+        assert_eq!(w.token_state(used), TokenState::Revoked);
+    }
+    let outcome = w
+        .supervisor
+        .revoke_run_keys(&w.registry, &other, true)
+        .unwrap();
+    assert!(outcome.reuse_cleared);
+    let quiet = w.credential_events().len();
+    for used in [one.refresh_credential(), two.refresh_credential()] {
+        assert_eq!(refresh(used).unwrap_err().code(), "credential-revoked");
+    }
+    assert!(!w.run(&other).anomalies.contains(&Anomaly::CredentialReuse));
+    assert_eq!(w.credential_events().len(), quiet, "no reuse, no change");
+}
+
+#[test]
 fn revoke_keys_cascades_to_credentials_issued_under_the_run_by_default() {
     let w = world();
     let (child, credentials) = w.operator_child();
@@ -717,14 +824,18 @@ fn transition(w: &World, state: crate::domain::LifecycleState, fate: RunFate) {
     w.registry
         .writer
         .call(move |ctx| {
-            let changes = ops::project_transition(
+            // As the transition job runs it: the exit's revocations first, in
+            // the job's own transaction, then the projection.
+            let name = InstanceName::new(INSTANCE).unwrap();
+            let mut changes = ops::revoke_on_exit(ctx.store(), &name, state, fate, "t")?;
+            changes.extend(ops::project_transition(
                 ctx.store(),
-                &InstanceName::new(INSTANCE).unwrap(),
+                &name,
                 state,
                 fate,
                 "crashed",
                 "t",
-            )?;
+            )?);
             ops::commit(ctx, &publisher, changes)
         })
         .unwrap();
@@ -791,6 +902,48 @@ fn each_launch_has_its_own_key_revoked_when_its_process_exits() {
     transition(&w, LifecycleState::Stopped, RunFate::Terminal);
     assert!(w.run(&run).is_ended());
     assert!(w.authenticate(third.secret()).is_none());
+    assert!(w.registry.run_snapshot().keys.is_empty());
+}
+
+#[test]
+fn a_relaunch_revokes_every_earlier_generation_even_when_its_exit_was_never_recorded() {
+    // The exit's revocation is the first line; the launch record is the
+    // second: a new generation is issued only after every earlier one of
+    // the Run is out of service.
+    let w = world();
+    let run = w.root.clone();
+    let first = launch(&w, &run, false);
+    // No exit transition is recorded for the first launch.
+    let second = launch(&w, &run, false);
+    assert!(w.authenticate(first.secret()).is_none());
+    assert_eq!(w.token_state(first.secret()), TokenState::Revoked);
+    assert!(w.authenticate(second.secret()).is_some());
+    let revoked: Vec<_> = w
+        .credential_events()
+        .into_iter()
+        .filter(|e| e.change == CredentialChange::Revoked)
+        .collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].launch_generation, Some(1));
+    assert_eq!(revoked[0].cause.as_deref(), Some("process-exited"));
+}
+
+#[test]
+fn removing_an_instance_drops_its_runs_keys_from_the_index() {
+    // `hekma rm --force` deletes the instance with its Runs and their
+    // credential rows: the published key index must not keep honouring
+    // those keys (a snapshot-only reader would).
+    let w = world();
+    let run = w.root.clone();
+    let key = launch(&w, &run, false);
+    let (_, child) = w.operator_child();
+    assert!(w.authenticate(key.secret()).is_some());
+    assert!(w.authenticate(child.run_key()).is_some());
+    w.registry
+        .remove(INSTANCE, crate::domain::RemoveDisposition::Retain, true)
+        .unwrap();
+    assert!(w.authenticate(key.secret()).is_none());
+    assert!(w.authenticate(child.run_key()).is_none());
     assert!(w.registry.run_snapshot().keys.is_empty());
 }
 

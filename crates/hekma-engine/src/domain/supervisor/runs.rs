@@ -718,16 +718,26 @@ impl Supervisor {
     }
 
     /// Revoke credentials seen in a URL (story 22-1). Returns how many were
-    /// revoked.
+    /// revoked. Only a value that resolves to an ACTIVE credential (one read
+    /// on the registry's read-only connection) reaches the store writer:
+    /// unknown or already revoked values cost no job.
     pub(crate) fn revoke_exposed(
         &self,
         registry: &Registry,
         presented: &[crate::domain::SecretString],
     ) -> Result<usize, RunError> {
-        let hashes: Vec<_> = presented
-            .iter()
-            .map(crate::domain::credential::hash_presented)
-            .collect();
+        let mut hashes = Vec::new();
+        for secret in presented {
+            if matches!(
+                crate::domain::registry_keys::presented_state(&registry.store, secret)?,
+                crate::domain::PresentedState::Active(_)
+            ) {
+                hashes.push(crate::domain::credential::hash_presented(secret));
+            }
+        }
+        if hashes.is_empty() {
+            return Ok(0);
+        }
         let (count, events) = registry.run_job(move |store| {
             let changes = runs::keys::revoke_exposed(store, &hashes, &crate::time::now_rfc3339())?;
             Ok((changes.credentials.len(), changes))

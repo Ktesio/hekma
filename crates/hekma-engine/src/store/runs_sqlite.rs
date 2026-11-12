@@ -1403,6 +1403,15 @@ impl RunRecords for SqliteStore {
         super::tokens_sqlite::set_token_state(self.conn(), hash, state, at, cause)
     }
 
+    fn revoke_retired(
+        &self,
+        hash: &crate::domain::credential::TokenHash,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError> {
+        super::tokens_sqlite::revoke_retired(self.conn(), hash, at, cause)
+    }
+
     fn active_tokens(&self, run_id: &RunId) -> Result<Vec<crate::ports::TokenRow>, StoreError> {
         super::tokens_sqlite::active_tokens(self.conn(), run_id)
     }

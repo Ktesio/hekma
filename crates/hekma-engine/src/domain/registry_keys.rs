@@ -37,28 +37,50 @@ impl Registry {
             .collect())
     }
 
-    /// What a presented credential is, read from the store.
-    pub(crate) fn credential_state(
+    /// A second read-only connection to this registry's state.db, for the
+    /// credential lookups an unauthenticated request can cause (story 22-1):
+    /// the engine holds it beside — never behind — the registry mutex, so an
+    /// unresolvable presentation never queues behind supervision and never
+    /// reaches the store writer.
+    pub(crate) fn open_credential_reader(
         &self,
-        presented: &SecretString,
-    ) -> Result<PresentedState, RunError> {
-        let hash = hash_presented(presented);
-        Ok(self.store.snapshot(|store| store.token(&hash))?.map_or(
-            PresentedState::Unknown,
-            |row| match row.state {
-                TokenState::Active if row.hash.ct_eq(&hash) => {
-                    PresentedState::Active(CredentialMatch {
-                        class: row.class,
-                        run_id: row.run_id,
-                        token_id: row.token_id,
-                        supervised: row.launch_generation.is_some()
-                            && row.class != TokenClass::Announce,
-                        hash: row.hash,
-                    })
-                }
-                TokenState::Active => PresentedState::Unknown,
-                TokenState::Retired | TokenState::Revoked => PresentedState::Revoked,
-            },
-        ))
+        read_only: bool,
+    ) -> Result<crate::store::SqliteStore, crate::ports::StoreError> {
+        let db = self.paths.state_db();
+        if !read_only {
+            crate::store::SqliteStore::open_read_only(&db)
+        } else if db.exists() {
+            crate::store::SqliteStore::open_existing_read_only(&db)
+        } else {
+            crate::store::SqliteStore::open_empty_read_only()
+        }
     }
+}
+
+/// What a presented credential is, read from `store` (a read-only
+/// connection): unknown, revoked, a used refresh credential, or active.
+pub(crate) fn presented_state(
+    store: &crate::store::SqliteStore,
+    presented: &SecretString,
+) -> Result<PresentedState, RunError> {
+    let hash = hash_presented(presented);
+    Ok(store
+        .snapshot(|store| store.token(&hash))?
+        .map_or(PresentedState::Unknown, |row| {
+            if !row.hash.ct_eq(&hash) {
+                return PresentedState::Unknown;
+            }
+            let matched = CredentialMatch {
+                class: row.class,
+                run_id: row.run_id,
+                token_id: row.token_id,
+                supervised: row.launch_generation.is_some() && row.class != TokenClass::Announce,
+                hash: row.hash,
+            };
+            match row.state {
+                TokenState::Active => PresentedState::Active(matched),
+                TokenState::Retired => PresentedState::Used(matched),
+                TokenState::Revoked => PresentedState::Revoked,
+            }
+        }))
 }

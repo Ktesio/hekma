@@ -162,6 +162,30 @@ fn a_url_scan_finds_tokens_raw_encoded_and_in_any_case() {
     // A truncated token is still refused, but names no complete token.
     assert_eq!(found(&format!("/v0/runs/{}", &text[..20])), (true, false));
     assert_eq!(found("/v0/runs/HK_REF_ABCDEFGH"), (true, false));
+    // A real token behind a prefix-shaped decoy is still found, whole: a
+    // short body, a one-character body, and a token run straight into
+    // another (the first body ends in `HK`, the start of the next prefix).
+    for (case, decoyed) in [
+        format!("/v0/runs/hk_run_{text}"),
+        format!("/v0/runs/hk_run_X{text}"),
+        format!("/v0/runs/HK_REF_hk_ann_{text}"),
+        format!("/v0/runs/{text}{text}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // The case number, never the token, names a failure.
+        assert_eq!(found(&decoyed), (true, true), "decoy case {case}");
+    }
+    let other = mint(TokenClass::Refresh).unwrap();
+    let both = scan_url(&format!(
+        "/v0/runs/{text}{}",
+        other.secret().expose_secret()
+    ));
+    assert!(both
+        .tokens
+        .iter()
+        .any(|token| hash_presented(token).ct_eq(&other.hash())));
     // Ordinary paths are not caught.
     assert_eq!(found("/v0/runs/run_01J"), (false, false));
     assert_eq!(found("/v0/instances/hk_run_"), (false, false));

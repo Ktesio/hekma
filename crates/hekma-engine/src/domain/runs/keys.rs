@@ -210,6 +210,37 @@ pub(crate) fn revoke<S: RunRecords + ?Sized>(
     )
 }
 
+/// Revoke every used (`retired`) refresh credential of `run_id`: once the
+/// Run's reuse has been detected or acknowledged, an old refresh credential
+/// presented again is a plain `credential-revoked` with no side effect —
+/// never a fresh reuse that revokes the Run's current pair. One `revoked`
+/// event per row moved.
+pub(crate) fn revoke_used<S: RunRecords + ?Sized>(
+    store: &S,
+    changes: &mut RunChanges,
+    run_id: &RunId,
+    cause: &str,
+    at: &str,
+) -> Result<(), StoreError> {
+    for row in store.run_tokens(run_id)? {
+        if row.state == TokenState::Retired && store.revoke_retired(&row.hash, at, cause)? {
+            changes.credentials.push(CredentialEvent {
+                schema_version: CREDENTIAL_EVENT_SCHEMA_VERSION,
+                change: CredentialChange::Revoked,
+                class: row.class,
+                token_id: row.token_id.clone(),
+                run_id: row.run_id.clone(),
+                launch_generation: row.launch_generation,
+                issued_by: None,
+                prior_token_id: None,
+                cause: Some(cause.to_string()),
+                at: at.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Revoke every active token of `run_id` that `which` selects; returns the
 /// rows revoked.
 pub(crate) fn revoke_run_tokens<S: RunRecords + ?Sized>(
@@ -361,6 +392,9 @@ pub(crate) fn refresh<S: RunRecords + ?Sized>(
                 cause::REFRESH_REUSE,
                 at,
             )?;
+            // The used credentials leave for good: presenting this one (or an
+            // older one) again is a plain refusal, not a second reuse.
+            revoke_used(store, &mut changes, &row.run_id, cause::REFRESH_REUSE, at)?;
             if !record.is_ended() && !record.anomalies.contains(&Anomaly::CredentialReuse) {
                 let mut anomalies = record.anomalies.clone();
                 anomalies.push(Anomaly::CredentialReuse);
@@ -444,6 +478,10 @@ pub(crate) fn revoke_keys<S: RunRecords + ?Sized>(
             cascaded: false,
         });
     }
+    // The Operator's acknowledgement: no used refresh credential of the Run
+    // can trigger a reuse afterwards (they were out of service already, so
+    // the report lists only what was active).
+    revoke_used(store, &mut changes, run_id, cause::OPERATOR, at)?;
     if cascade {
         // The roots are EVERY credential the Run held, whatever its state
         // now: a child opened with a key the Run has since rotated is still
@@ -577,7 +615,15 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
     };
     let minted = run_id.clone();
     let caller_inputs = inputs.clone();
-    let (opened, mut changes) = super::ops::open_child(store, request, run_id, inputs, at)?;
+    // A Caller's external ids are its own Run's namespace: a retry by the
+    // same Run's keys returns the same child, and no Run Key can capture or
+    // probe an id the Operator, a Host or another Run's keys will use.
+    let binding = match actor {
+        RunActor::Caller { run_id: root, .. } => caller_identity_binding(root),
+        RunActor::Operator | RunActor::Host => super::HOST_IDENTITY_BINDING.to_string(),
+    };
+    let (opened, mut changes) =
+        super::ops::open_child_bound(store, request, run_id, inputs, &binding, at)?;
     // A Caller's open-time ceilings are the Caller's OWN layer (FR-60: a
     // Caller only tightens), never the Run's Operator/Host layer, which
     // outranks every Policy: `open_child` validated and wrote them as the
@@ -605,14 +651,9 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
         )?);
     }
     if opened != minted {
-        // A retried external id: the existing Run, no new credentials.
-        if let RunActor::Caller { run_id: root, .. } = actor {
-            if !within(store, root, &opened)? {
-                return Err(RunError::RunOutOfScope {
-                    run_id: opened.as_str().to_string(),
-                });
-            }
-        }
+        // A retried external id: the existing Run, no new credentials. Under
+        // a Caller's own binding it is a child a key of the same Run opened
+        // beneath that Run (Runs never re-parent), so it is in scope.
         return Ok(((opened, false), changes));
     }
     let Some((key, refresh)) = credentials else {
@@ -640,6 +681,13 @@ pub(crate) fn open_child_as<S: RunRecords + crate::ports::RunStore + ?Sized>(
         at,
     )?;
     Ok(((opened, true), changes))
+}
+
+/// The identity binding a Caller's external ids resolve under: one
+/// namespace per Run whose key opens (`caller:<run id>`), apart from the
+/// Operator's and Hosts' `host` binding.
+pub(crate) fn caller_identity_binding(root: &RunId) -> String {
+    format!("caller:{}", root.as_str())
 }
 
 /// Close a child Run as `actor` (story 22-1): a Caller may close only within

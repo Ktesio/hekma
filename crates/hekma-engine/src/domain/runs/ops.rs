@@ -323,12 +323,10 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
     };
     let from = run.status;
     let owner = run.run_id.clone();
-    // Story 22-1 (P1): `failed` and `stopped` record a confirmed exit, so
-    // the launch's credentials are revoked here — before any relaunch
-    // spawns its next generation.
-    if matches!(new_state, LifecycleState::Failed | LifecycleState::Stopped) {
-        super::keys::on_process_exited(store, &mut changes, &owner, at)?;
-    }
+    // Story 22-1: the credentials an exit takes out of service are revoked
+    // by [`revoke_on_exit`], in the transition's own transaction — never in
+    // this projection, which a caller may run in a savepoint that absorbs
+    // failures.
     move_to(store, &mut changes, run, status, anomalies, end_cause, at)?;
     cascade(
         store,
@@ -339,6 +337,37 @@ pub(crate) fn project_transition<S: RunRecords + ?Sized>(
         new_state == LifecycleState::Stopped,
         at,
     )?;
+    Ok(changes)
+}
+
+/// The credentials a lifecycle transition takes out of service (story 22-1,
+/// P1): `failed` and `stopped` record a confirmed exit, so the instance's
+/// open process-owning Run loses every launch-issued credential
+/// (`process-exited`) — before any relaunch spawns its next generation —
+/// and, when the edge ends the Run (`stopped`, or a terminal `failed`),
+/// every remaining one (`run-ended`). The caller commits these in the
+/// transition's OWN transaction, outside any failure-absorbing savepoint:
+/// a revocation that cannot be written fails the transition, so an exit is
+/// never recorded with its key still honoured.
+pub(crate) fn revoke_on_exit<S: RunRecords + ?Sized>(
+    store: &S,
+    instance: &InstanceName,
+    new_state: LifecycleState,
+    fate: RunFate,
+    at: &str,
+) -> Result<RunChanges, StoreError> {
+    let mut changes = RunChanges::default();
+    if !matches!(new_state, LifecycleState::Failed | LifecycleState::Stopped) {
+        return Ok(changes);
+    }
+    let Some(run) = store.open_process_run(instance)? else {
+        return Ok(changes);
+    };
+    super::keys::on_process_exited(store, &mut changes, &run.run_id, at)?;
+    let ends = new_state == LifecycleState::Stopped || fate == RunFate::Terminal;
+    if ends {
+        super::keys::on_run_ended(store, &mut changes, &run.run_id, at)?;
+    }
     Ok(changes)
 }
 
@@ -384,6 +413,21 @@ pub(crate) fn issue_launch<S: RunRecords + ?Sized>(
     let Some(record) = store.run_record(run_id)? else {
         return Ok(changes);
     };
+    // One live generation at a time, by construction: whatever an earlier
+    // launch of this Run still holds is revoked before the new generation
+    // is issued (its exit should already have revoked it — this holds even
+    // when that exit was never recorded).
+    super::keys::revoke_run_tokens(
+        store,
+        &mut changes,
+        run_id,
+        |row| {
+            row.launch_generation
+                .is_some_and(|older| older < generation)
+        },
+        super::keys::cause::PROCESS_EXITED,
+        at,
+    )?;
     match credentials.refresh {
         Some(refresh) => super::keys::issue_pair(
             store,
@@ -894,9 +938,23 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
     inputs: Option<super::policy::ResolveInputs>,
     at: &str,
 ) -> Result<(RunId, RunChanges), RunError> {
+    open_child_bound(store, request, run_id, inputs, HOST_IDENTITY_BINDING, at)
+}
+
+/// [`open_child`] with the external id resolved under `binding` (story
+/// 22-1: a Caller's external ids live in its own namespace, so a Run Key can
+/// never claim — or probe — an id the Operator or a Host will use).
+pub(crate) fn open_child_bound<S: RunRecords + RunStore + ?Sized>(
+    store: &S,
+    request: &ChildRunRequest,
+    run_id: RunId,
+    inputs: Option<super::policy::ResolveInputs>,
+    binding: &str,
+    at: &str,
+) -> Result<(RunId, RunChanges), RunError> {
     let mut changes = RunChanges::default();
     if let Some(external) = &request.external_id {
-        if let Some(existing) = store.identity_run(HOST_IDENTITY_BINDING, external)? {
+        if let Some(existing) = store.identity_run(binding, external)? {
             return Ok((existing, changes));
         }
     }
@@ -994,7 +1052,7 @@ pub(crate) fn open_child<S: RunRecords + RunStore + ?Sized>(
         identity: request
             .external_id
             .clone()
-            .map(|external| (HOST_IDENTITY_BINDING.to_string(), external)),
+            .map(|external| (binding.to_string(), external)),
     })?;
     note(
         store,

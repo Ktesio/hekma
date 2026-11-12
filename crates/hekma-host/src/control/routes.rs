@@ -740,7 +740,7 @@ pub(crate) async fn run_open(
     let opened = state
         .engine
         .open_child_run_as(
-            authority.actor(),
+            authority.actor()?,
             ChildRunRequest {
                 parent,
                 labels: request.labels.into_iter().collect(),
@@ -802,7 +802,7 @@ pub(crate) async fn run_close(
 ) -> ApiResult<Json<dto::RunDocument>> {
     let view = state
         .engine
-        .close_run_as(authority.actor(), &run_id)
+        .close_run_as(authority.actor()?, &run_id)
         .await?;
     Ok(Json(dto::RunDocument {
         schema_version: dto::CONTROL_API_SCHEMA_VERSION,
@@ -1328,7 +1328,7 @@ pub(crate) async fn run_limits_patch(
     // the job).
     let mut results = state
         .engine
-        .set_run_limits_as(vec![run_id], change, authority.actor(), request.dry_run)
+        .set_run_limits_as(vec![run_id], change, authority.actor()?, request.dry_run)
         .await?;
     let (_, outcome) = results.pop().ok_or_else(|| {
         ApiError::new(

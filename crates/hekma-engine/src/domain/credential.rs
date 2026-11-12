@@ -386,7 +386,11 @@ pub fn scan_url_text(text: &str) -> UrlScan {
                     .push(SecretString::new(format!("{}{body}", class.prefix())));
             }
         }
-        index = body_start + body_len.max(1).min(bytes.len() - body_start);
+        // Advance ONE byte, never past the body: a prefix can begin inside
+        // what was just read (`hk_run_hk_run_…`, or a body ending in `HK`
+        // that starts `hk_run_…`), and skipping it would let a real token
+        // through behind a decoy.
+        index += 1;
     }
     scan
 }
@@ -519,9 +523,12 @@ impl CredentialMatch {
 pub enum PresentedState {
     /// Nothing was ever issued with this value.
     Unknown,
-    /// It was issued and is no longer honoured (revoked, or a used refresh
-    /// credential).
+    /// It was issued and is no longer honoured (revoked).
     Revoked,
+    /// A refresh credential that was already traded once (`retired`):
+    /// presenting it again is reuse, which the refresh job acts on. Every
+    /// other route treats it as revoked.
+    Used(CredentialMatch),
     /// An active credential the snapshot does not index (a refresh
     /// credential, or a key whose Run is held elsewhere).
     Active(CredentialMatch),

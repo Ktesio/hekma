@@ -10992,3 +10992,224 @@ fn the_reserved_credential_keys_cannot_be_written() {
         assert!(!text.contains("SENTINEL"), "{text}");
     }
 }
+
+/// Story 22-1 (the security review's M3): a process exit's credential
+/// revocation never fails open. The revocation is sabotaged with a SQL
+/// trigger on the `tokens` row; the exit transition must then fail as a
+/// whole — never commit `failed` with the launch's key still honoured.
+#[test]
+fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::domain::runs::ops::{self, LaunchCredentials, RunFate, SupervisedRun};
+    use crate::ports::{RunRecords as _, RunStore as _};
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("exits").unwrap();
+    let run = crate::domain::RunId::mint();
+    let key = mint(TokenClass::RunKey).unwrap();
+    let stub = key.stub();
+    let publisher = std::sync::Arc::clone(registry.run_publisher());
+    let (n, r) = (name.clone(), run.clone());
+    registry
+        .writer()
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'exits', 'mock', 'running', '/h', 't', 't')",
+            );
+            let supervised = SupervisedRun {
+                instance: n.clone(),
+                run_id: r.clone(),
+                wire_path: false,
+                labels: Vec::new(),
+                fresh: true,
+                inputs: None,
+            };
+            let generation = ctx.store().bump_launch_generation(&n)?;
+            let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
+            changes.extend(ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: stub,
+                    refresh: None,
+                },
+                "t",
+            )?);
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    let hash = hash_presented(key.secret());
+    let key_state = |registry: &Registry| {
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    let indexed = |registry: &Registry| registry.run_snapshot().keys.contains_key(&hash);
+    assert!(indexed(&registry));
+    // The sabotage: every write to a token row aborts.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_token_revoke BEFORE UPDATE ON tokens \
+             BEGIN SELECT RAISE(ABORT, 'injected revoke fault'); END;",
+        )
+        .unwrap();
+    }
+    let crash = TransitionEvent::new(
+        "exits",
+        LifecycleState::Running,
+        LifecycleState::Failed,
+        TransitionCause::crashed("exit code 3"),
+        crate::time::now_rfc3339(),
+    );
+    for fate in [RunFate::Relaunching, RunFate::Terminal] {
+        let result = super::commit::commit_transition(
+            &registry,
+            &name,
+            super::commit::StateWrite::Plain,
+            &crash,
+            fate,
+        );
+        assert!(
+            result.is_err(),
+            "the exit must not commit around a failed revocation"
+        );
+        // Nothing of the exit landed: the instance is still `running`, and
+        // its key is still the one honoured — consistently, in the store
+        // and the index — until the exit can be recorded with it revoked.
+        assert_eq!(state_of(&registry, "exits"), LifecycleState::Running);
+        assert_eq!(key_state(&registry), TokenState::Active);
+        assert!(indexed(&registry));
+    }
+    // With the fault gone, the same exit records and revokes together.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER block_token_revoke")
+            .unwrap();
+    }
+    let committed = super::commit::commit_transition(
+        &registry,
+        &name,
+        super::commit::StateWrite::Plain,
+        &crash,
+        RunFate::Relaunching,
+    )
+    .unwrap();
+    assert!(committed.projection_failed.is_none());
+    assert_eq!(state_of(&registry, "exits"), LifecycleState::Failed);
+    assert_eq!(key_state(&registry), TokenState::Revoked);
+    assert!(!indexed(&registry));
+}
+
+/// Story 22-1 (the security review's L3): a credential an agent sends in a
+/// URL to its metering listener is refused there AND revoked by the reaper,
+/// through the same resolved-only path as the Control API — an unknown
+/// token-shaped value costs no writer job.
+#[test]
+fn a_token_the_metering_listener_saw_in_a_url_is_revoked_by_the_reaper() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::ports::RunRecords as _;
+    use std::sync::atomic::Ordering;
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), "urlkey", &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "urlkey",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("urlkey").unwrap();
+    // Nothing is ever forwarded: a refused request never dials.
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "urlkey").unwrap();
+    let _guard = kill_guard(&registry, "urlkey");
+    let owner = open_run(&registry, "urlkey").record.run_id;
+    let mut request = crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(owner));
+    request.issue_credentials = true;
+    let opened = sup
+        .open_child_run_as(&registry, crate::domain::RunActor::Operator, request)
+        .unwrap();
+    let issued = opened.credentials.unwrap();
+    let state_of_token = |secret: &crate::domain::SecretString| {
+        let hash = hash_presented(secret);
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    let base = fence_listener_url(&sup, &name);
+    let jobs = || registry.writer().stats().jobs.load(Ordering::Relaxed);
+    // Unknown token-shaped values: refused, and the drain writes nothing.
+    for class in [TokenClass::RunKey, TokenClass::Refresh] {
+        let noise = mint(class).unwrap();
+        let path = format!("/v1/models/{}", noise.secret().expose_secret());
+        assert_eq!(fence_http_call(&base, "GET", &path, "").0, 400);
+    }
+    let before = jobs();
+    sup.drain_observed_all(&registry);
+    assert_eq!(jobs(), before, "an unresolved token costs no writer job");
+    // The Run Key and the refresh credential, each in a URL (the query,
+    // lowercased): refused, then revoked at the next drain.
+    for (secret, path) in [
+        (
+            issued.run_key(),
+            format!("/v1/models/{}", issued.run_key().expose_secret()),
+        ),
+        (
+            issued.refresh_credential(),
+            format!(
+                "/v1/chat/completions?k={}",
+                issued
+                    .refresh_credential()
+                    .expose_secret()
+                    .to_ascii_lowercase()
+            ),
+        ),
+    ] {
+        assert_eq!(fence_http_call(&base, "POST", &path, "{}").0, 400);
+        assert_eq!(state_of_token(secret), TokenState::Active);
+    }
+    sup.drain_observed_all(&registry);
+    assert_eq!(state_of_token(issued.run_key()), TokenState::Revoked);
+    assert_eq!(
+        state_of_token(issued.refresh_credential()),
+        TokenState::Revoked
+    );
+    assert!(!registry
+        .run_snapshot()
+        .keys
+        .contains_key(&hash_presented(issued.run_key())));
+    let causes: Vec<_> = registry
+        .store
+        .snapshot(|store| store.run_tokens(&opened.view.record.run_id))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.revoke_cause)
+        .collect();
+    assert!(causes
+        .iter()
+        .all(|cause| cause.as_deref() == Some("exposed-in-url")));
+    sup.stop(&registry, "urlkey", Some(Duration::from_secs(5)))
+        .unwrap();
+}

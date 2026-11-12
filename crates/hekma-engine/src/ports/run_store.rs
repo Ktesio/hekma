@@ -442,6 +442,11 @@ pub(crate) trait RunRecords: PolicyRecords {
         cause: &str,
     ) -> Result<bool, StoreError>;
 
+    /// Move one `retired` token (a used refresh credential) to `revoked`
+    /// at `at`, with its cause: once revoked, presenting it again is a plain
+    /// refusal, never reuse. Returns whether it moved.
+    fn revoke_retired(&self, hash: &TokenHash, at: &str, cause: &str) -> Result<bool, StoreError>;
+
     /// A Run's active tokens, oldest first.
     fn active_tokens(&self, run_id: &RunId) -> Result<Vec<TokenRow>, StoreError>;
 

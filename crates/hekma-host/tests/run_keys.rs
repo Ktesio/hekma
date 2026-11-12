@@ -68,14 +68,26 @@ struct Server {
 
 impl Server {
     fn start(base: PathBuf) -> Self {
+        Self::start_on(base, "127.0.0.1:0", None)
+    }
+
+    /// A host whose operator listener binds `listen`, with TLS when given
+    /// `(cert, key)` (beyond loopback the Control API requires it).
+    fn start_on(base: PathBuf, listen: &str, tls: Option<(PathBuf, PathBuf)>) -> Self {
         write_secrets_file(&base);
+        let (tls_cert, tls_key) = match tls {
+            Some((cert, key)) => (Some(cert), Some(key)),
+            None => (None, None),
+        };
         let sink = SharedSink::new();
         let diagnostics: hekma_engine::DiagnosticSink =
             Arc::new(Mutex::new(Box::new(sink.clone())));
         let options = hekma_host::ServeOptions {
             state_base: Some(base),
-            control_listen: Some("127.0.0.1:0".parse().unwrap()),
+            control_listen: Some(listen.parse().unwrap()),
             bearer_secret: Some(BEARER_NAME.to_string()),
+            tls_cert,
+            tls_key,
             metering_listen_port: 0,
             stop_window: Some(2),
             log_capture: hekma_engine::LogCaptureMode::Full,
@@ -213,6 +225,102 @@ fn operator_open(server: &Server, parent: &str) -> (String, String, String) {
             .unwrap()
             .to_string(),
     )
+}
+
+/// The SHA-256 of `token`, as the `tokens` row's BLOB literal.
+fn token_hash_literal(token: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02X}")).collect();
+    format!("X'{hex}'")
+}
+
+#[test]
+fn a_supervised_launchs_credentials_are_refused_on_a_listener_beyond_loopback() {
+    // The real listener wiring (P5): the operator's `--listen` bound to
+    // 0.0.0.0 is NOT loopback — even when the request happens to arrive from
+    // 127.0.0.1 — so a supervised launch's Run Key AND its refresh
+    // credential are answered as unrecognised there, and honoured on the
+    // local (loopback) endpoint. Seeded as rows: no process.
+    let state = seeded_state();
+    let key = format!("hk_run_{}", "7".repeat(52));
+    let refresh = format!("hk_ref_{}", "8".repeat(52));
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        for (token, class) in [(&key, "run"), (&refresh, "refresh")] {
+            conn.execute_batch(&format!(
+                "INSERT INTO tokens (token_hash, token_id, class, run_id, launch_generation, \
+                 custody_eligible, state, issued_at) VALUES ({}, 'seeded', '{class}', \
+                 'run_ROOT', 1, 1, 'active', 't');",
+                token_hash_literal(token)
+            ))
+            .unwrap();
+        }
+    }
+    let pems = tempfile::tempdir().unwrap();
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".into(), "localhost".into()]).unwrap();
+    let (cert, pem_key) = (pems.path().join("cert.pem"), pems.path().join("key.pem"));
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&pem_key, certified.signing_key.serialize_pem()).unwrap();
+    let server = Server::start_on(
+        state.path().to_path_buf(),
+        "0.0.0.0:0",
+        Some((cert, pem_key)),
+    );
+    let port = server.addr.rsplit(':').next().unwrap().to_string();
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::new_with_certs(&[
+            ureq::tls::Certificate::from_der(certified.cert.der()).to_owned(),
+        ]))
+        .build();
+    let https: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .tls_config(tls)
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .into();
+    let remote = |method: &str, path: &str, bearer: &str, body: serde_json::Value| {
+        let request = ureq::http::Request::builder()
+            .method(method)
+            .uri(format!("https://127.0.0.1:{port}{path}"))
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .unwrap();
+        let mut response = https.run(request).unwrap();
+        Answer {
+            status: response.status(),
+            body: response.body_mut().read_to_string().unwrap_or_default(),
+        }
+    };
+    let open_body = serde_json::json!({ "parent_run_id": "run_ROOT" });
+    // Beyond loopback: both unrecognised, and nothing is consumed.
+    let answer = remote("POST", "/v0/runs/refresh", &refresh, serde_json::json!({}));
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{}", answer.body);
+    assert_eq!(answer.code(), "unauthorized");
+    let answer = remote("POST", "/v0/runs", &key, open_body.clone());
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED, "{}", answer.body);
+    assert_eq!(answer.code(), "unauthorized");
+    // The operator bearer is served on that listener (it is up).
+    let answer = remote("POST", "/v0/runs", BEARER_VALUE, open_body.clone());
+    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
+    // The local endpoint is loopback: the same credentials are honoured.
+    let local = hekma_host::read_discovery(state.path()).unwrap().addr;
+    let answer = call(
+        "POST",
+        &format!("http://{local}/v0/runs"),
+        &key,
+        Some(open_body),
+    );
+    assert_eq!(answer.status, StatusCode::CREATED, "{}", answer.body);
+    let answer = call(
+        "POST",
+        &format!("http://{local}/v0/runs/refresh"),
+        &refresh,
+        None,
+    );
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    drop(server);
 }
 
 #[test]

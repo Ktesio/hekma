@@ -277,6 +277,12 @@ struct EngineInner {
     /// resident subject Run's labels lock-free, so a filtered stream never
     /// contends with supervision on the registry lock per event.
     run_snapshot: Arc<crate::domain::runs::snapshot::SnapshotPublisher>,
+    /// Story 22-1: a read-only connection for the credential lookups an
+    /// UNAUTHENTICATED request can cause (a snapshot miss, a refresh
+    /// presentation, a token seen in a URL). Held OUTSIDE the registry and
+    /// supervisor mutexes, and never a writer job: only a credential that
+    /// resolves here goes on to take those locks or the store writer.
+    credential_reader: Mutex<crate::store::SqliteStore>,
 }
 
 /// Open-time options for the long-running Host (story 17-2) — the additive,
@@ -545,12 +551,14 @@ impl Engine {
         }
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
+        let credential_reader = Mutex::new(registry.open_credential_reader(false)?);
         let inner = Arc::new(EngineInner {
             read_only: false,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
             run_snapshot,
+            credential_reader,
         });
 
         // (1) Orphan adoption on open (AC-B / AI-7 / AI-8). Reconcile BEFORE the
@@ -605,12 +613,14 @@ impl Engine {
         let supervisor = Supervisor::with_runtime(rt.handle().clone());
         let events = supervisor.event_bus();
         let run_snapshot = Arc::clone(registry.run_publisher());
+        let credential_reader = Mutex::new(registry.open_credential_reader(true)?);
         let inner = Arc::new(EngineInner {
             read_only: true,
             registry: Mutex::new(registry),
             supervisor: Mutex::new(supervisor),
             events,
             run_snapshot,
+            credential_reader,
         });
         Ok(Self {
             rt: Arc::new(rt),
@@ -2087,24 +2097,38 @@ impl Engine {
         })
     }
 
-    /// What a presented credential the snapshot did not recognise is (story
-    /// 22-1): one read-only store read — unknown, revoked (or a used refresh
-    /// credential), or active (a refresh credential, which the snapshot
-    /// never indexes). A presentation that is not token-shaped is unknown.
+    /// What a presented credential is (story 22-1): the lock-free snapshot
+    /// first, then ONE read on the engine's credential reader — unknown,
+    /// revoked, a used refresh credential, or active (a refresh credential,
+    /// which the snapshot never indexes). Never takes the registry or
+    /// supervisor mutex and never submits a writer job, so a flood of
+    /// unrecognised presentations cannot queue behind (or ahead of)
+    /// supervision. A presentation that is not token-shaped is unknown.
     pub async fn credential_state(
         &self,
         presented: &str,
     ) -> Result<crate::domain::PresentedState, RunError> {
+        if let Some(matched) = self.authenticate(presented) {
+            return Ok(crate::domain::PresentedState::Active(matched));
+        }
         let Some((_, secret)) = crate::domain::parse_presented(presented) else {
             return Ok(crate::domain::PresentedState::Unknown);
         };
+        self.read_presented_state(secret).await
+    }
+
+    /// One credential-reader lookup (no registry or supervisor lock).
+    async fn read_presented_state(
+        &self,
+        secret: crate::domain::SecretString,
+    ) -> Result<crate::domain::PresentedState, RunError> {
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
-            inner
-                .registry
+            let reader = inner
+                .credential_reader
                 .lock()
-                .expect("registry mutex poisoned")
-                .credential_state(&secret)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::domain::registry_keys::presented_state(&reader, &secret)
         })
         .await
     }
@@ -2182,8 +2206,21 @@ impl Engine {
         &self,
         presented: &crate::domain::SecretString,
     ) -> Result<crate::domain::IssuedCredentials, RunError> {
+        use crate::domain::{PresentedState, SecretString, TokenClass};
         self.refuse_if_read_only().map_err(RunError::Store)?;
-        let presented = crate::domain::SecretString::new(presented.expose_secret());
+        // Resolve first, on the credential reader: only a refresh credential
+        // that was issued and not revoked goes on to mint, take the engine's
+        // locks and the store writer (the job re-reads the row and decides).
+        match self
+            .read_presented_state(SecretString::new(presented.expose_secret()))
+            .await?
+        {
+            PresentedState::Active(matched) | PresentedState::Used(matched)
+                if matched.class == TokenClass::Refresh => {}
+            PresentedState::Revoked => return Err(RunError::CredentialRevoked),
+            _ => return Err(RunError::CredentialUnknown),
+        }
+        let presented = SecretString::new(presented.expose_secret());
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
@@ -2216,12 +2253,33 @@ impl Engine {
 
     /// Revoke credentials seen in a URL (story 22-1): an active one among
     /// `presented` is revoked (`exposed-in-url`) — it has reached an access
-    /// log. Returns how many were revoked.
+    /// log. Returns how many were revoked. Each value is resolved first —
+    /// the lock-free snapshot, then the credential reader — and only one that
+    /// resolves to an active credential takes the engine's locks and a writer
+    /// job: a URL full of token-shaped noise costs reads, never a write.
     pub async fn revoke_exposed(
         &self,
         presented: Vec<crate::domain::SecretString>,
     ) -> Result<usize, RunError> {
         self.refuse_if_read_only().map_err(RunError::Store)?;
+        let mut resolved = Vec::new();
+        for secret in presented {
+            if self.authenticate(secret.expose_secret()).is_some()
+                || matches!(
+                    self.read_presented_state(crate::domain::SecretString::new(
+                        secret.expose_secret()
+                    ))
+                    .await?,
+                    crate::domain::PresentedState::Active(_)
+                )
+            {
+                resolved.push(secret);
+            }
+        }
+        if resolved.is_empty() {
+            return Ok(0);
+        }
+        let presented = resolved;
         let inner = Arc::clone(&self.inner);
         self.run_blocking(move || {
             let registry = inner.registry.lock().expect("registry mutex poisoned");
@@ -3617,6 +3675,78 @@ mod tests {
             engine.blocking().event_subject_labels(&policy).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn unresolvable_credentials_never_take_an_engine_lock_or_a_writer_job() {
+        // Story 22-1 (the security review's M1): a credential that does not
+        // resolve costs reads only. A flood of token-shaped values that were
+        // never issued — Run Keys on any route, refresh credentials on the
+        // refresh route, tokens in a URL — is answered while another thread
+        // HOLDS the registry and supervisor mutexes, and the store writer
+        // runs no job for any of it.
+        use crate::domain::credential::{mint, TokenClass};
+        use crate::domain::SecretString;
+        use std::sync::atomic::Ordering;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let engine = Engine::open(Some(tmp.path().to_path_buf())).unwrap();
+        let registry = engine.inner.registry.lock().unwrap();
+        let supervisor = engine.inner.supervisor.lock().unwrap();
+        // Let anything already in flight land before counting.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let jobs = |registry: &Registry| registry.writer().stats().jobs.load(Ordering::Relaxed);
+        let before = jobs(&registry);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let engine = &engine;
+            scope.spawn(move || {
+                let facade = engine.blocking();
+                let token = |class| mint(class).unwrap().secret().expose_secret().to_string();
+                for _ in 0..100 {
+                    for class in [
+                        TokenClass::RunKey,
+                        TokenClass::Refresh,
+                        TokenClass::Announce,
+                    ] {
+                        assert_eq!(
+                            facade.credential_state(&token(class)).unwrap(),
+                            crate::domain::PresentedState::Unknown
+                        );
+                    }
+                    let refresh = SecretString::new(token(TokenClass::Refresh));
+                    assert!(matches!(
+                        facade.refresh_credentials(&refresh),
+                        Err(RunError::CredentialUnknown)
+                    ));
+                    // A Run Key presented on the refresh route is not a
+                    // refresh credential either.
+                    let key = SecretString::new(token(TokenClass::RunKey));
+                    assert!(matches!(
+                        facade.refresh_credentials(&key),
+                        Err(RunError::CredentialUnknown)
+                    ));
+                    let exposed = [
+                        TokenClass::RunKey,
+                        TokenClass::Refresh,
+                        TokenClass::Announce,
+                    ]
+                    .map(|class| SecretString::new(token(class)))
+                    .into_iter()
+                    .collect();
+                    assert_eq!(facade.revoke_exposed(exposed).unwrap(), 0);
+                }
+                let _ = tx.send(());
+            });
+            let answered = rx.recv_timeout(std::time::Duration::from_secs(20));
+            let after = jobs(&registry);
+            drop(supervisor);
+            drop(registry);
+            answered.expect("every unresolvable presentation answered while both locks were held");
+            assert_eq!(
+                after, before,
+                "no writer job ran for an unresolvable credential"
+            );
+        });
     }
 
     #[test]

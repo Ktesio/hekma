@@ -141,6 +141,12 @@ impl ApiError {
         self.kind == ApiErrorKind::Unauthorized
     }
 
+    /// Whether this is the credential-class refusal (`403 forbidden`).
+    #[cfg(test)]
+    pub(crate) fn is_forbidden(&self) -> bool {
+        self.code == Some("forbidden")
+    }
+
     /// Attach the encoded engine error (the `From` impls' builder).
     fn with_engine_error(mut self, encoded: serde_json::Value) -> Self {
         self.engine_error = Some(encoded);

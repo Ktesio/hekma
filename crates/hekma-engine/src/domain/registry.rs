@@ -1109,9 +1109,26 @@ impl Registry {
             });
         }
 
-        // Always delete the row first.
+        // Always delete the row first. Story 22-1: its Runs' credential rows
+        // go with it (the foreign keys cascade), so their keys leave the
+        // published key index in the same commit — a removed instance's key
+        // is never honoured by a snapshot-only reader.
         let row = name.clone();
-        self.write(move |store| store.delete_instance(&row))?;
+        let publisher = std::sync::Arc::clone(&self.run_snapshot);
+        self.writer.call(move |ctx| {
+            use crate::ports::RunRecords as _;
+            let store = ctx.store();
+            let mut gone = Vec::new();
+            for key in store.active_key_rows()? {
+                let owner = store.run_record(&key.run_id)?.and_then(|run| run.instance);
+                if owner.as_deref() == Some(row.as_str()) {
+                    gone.push(crate::domain::runs::snapshot::KeyChange::Remove(key.hash));
+                }
+            }
+            store.delete_instance(&row)?;
+            ctx.after_commit(move || publisher.publish_changes(Vec::new(), gone));
+            Ok(())
+        })?;
 
         // Then handle the Agent Home per disposition.
         if disposition == RemoveDisposition::Delete {

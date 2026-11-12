@@ -212,6 +212,22 @@ pub(super) fn set_token_state(
     Ok(changed > 0)
 }
 
+pub(super) fn revoke_retired(
+    conn: &Connection,
+    hash: &TokenHash,
+    at: &str,
+    cause: &str,
+) -> Result<bool, StoreError> {
+    let changed = conn
+        .prepare_cached(
+            "UPDATE tokens SET state = 'revoked', revoked_at = ?2, revoke_cause = ?3 \
+             WHERE token_hash = ?1 AND state = 'retired'",
+        )
+        .and_then(|mut stmt| stmt.execute(rusqlite::params![&hash.as_bytes()[..], at, cause]))
+        .map_err(backend)?;
+    Ok(changed > 0)
+}
+
 pub(super) fn active_tokens(
     conn: &Connection,
     run_id: &RunId,

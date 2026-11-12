@@ -157,11 +157,15 @@ pub(crate) enum Authority {
 }
 
 impl Authority {
-    /// The engine actor this authority acts as.
-    pub(crate) fn actor(&self) -> hekma_engine::RunActor {
+    /// The engine actor this authority acts as: the Operator, or a Run
+    /// Key's Caller. A refresh credential acts as no one — it only trades
+    /// itself on the refresh route — so it has no actor, and a handler that
+    /// needs one refuses it (`403 forbidden`).
+    pub(crate) fn actor(&self) -> Result<hekma_engine::RunActor, ApiError> {
         match self {
-            Authority::Operator | Authority::Refresh(_) => hekma_engine::RunActor::Operator,
-            Authority::Caller(matched) => matched.actor(),
+            Authority::Operator => Ok(hekma_engine::RunActor::Operator),
+            Authority::Caller(matched) => Ok(matched.actor()),
+            Authority::Refresh(_) => Err(ApiError::forbidden()),
         }
     }
 }
@@ -379,7 +383,7 @@ async fn authorize(
     presented: Option<&str>,
     family: RouteFamily,
 ) -> Result<Authority, ApiError> {
-    let Some((class, secret)) = presented.and_then(hekma_engine::parse_presented) else {
+    let Some((_, secret)) = presented.and_then(hekma_engine::parse_presented) else {
         return match state.resolver.resolve(presented) {
             Some(class) if class.allows(family) => Ok(Authority::Operator),
             Some(_) => Err(ApiError::forbidden()),
@@ -390,31 +394,44 @@ async fn authorize(
         };
     };
     let presented = presented.unwrap_or_default();
-    if class == TokenClass::Refresh && family == RouteFamily::RunRefresh {
-        return Ok(Authority::Refresh(Arc::new(secret)));
-    }
-    let matched = match state.engine.authenticate(presented) {
-        Some(matched) => matched,
-        None => match state.engine.credential_state(presented).await {
-            Ok(PresentedState::Active(matched)) => matched,
-            Ok(PresentedState::Revoked) => return Err(ApiError::credential_revoked()),
-            Ok(PresentedState::Unknown) => {
-                // An operator secret that happens to have a token's shape
-                // still resolves as the operator bearer.
-                if let Some(class) = state.resolver.resolve(Some(presented)) {
-                    return if class.allows(family) {
-                        Ok(Authority::Operator)
-                    } else {
-                        Err(ApiError::forbidden())
-                    };
-                }
-                state.auth_diagnostics.unresolved(Some(presented));
-                return Err(ApiError::unauthorized());
+    // Resolve before anything is locked or written: the lock-free snapshot,
+    // then one read on the engine's credential reader. Only a credential
+    // that resolves goes further.
+    let matched = match state.engine.credential_state(presented).await {
+        Ok(PresentedState::Active(matched)) => matched,
+        // A used refresh credential presented on the refresh route is reuse:
+        // the refresh job acts on it. Anywhere else it is simply revoked.
+        Ok(PresentedState::Used(matched))
+            if matched.class == TokenClass::Refresh && family == RouteFamily::RunRefresh =>
+        {
+            matched
+        }
+        Ok(PresentedState::Used(_) | PresentedState::Revoked) => {
+            return Err(ApiError::credential_revoked())
+        }
+        Ok(PresentedState::Unknown) => {
+            // An operator secret that happens to have a token's shape still
+            // resolves as the operator bearer.
+            if let Some(class) = state.resolver.resolve(Some(presented)) {
+                return if class.allows(family) {
+                    Ok(Authority::Operator)
+                } else {
+                    Err(ApiError::forbidden())
+                };
             }
-            Err(err) => return Err(err.into()),
-        },
+            state.auth_diagnostics.unresolved(Some(presented));
+            return Err(ApiError::unauthorized());
+        }
+        Err(err) => return Err(err.into()),
     };
-    let gated = gate(matched, state.loopback, family);
+    let gated = gate(matched, state.loopback, family).map(|authority| match authority {
+        // A refresh credential rides to the refresh job as its value (the
+        // job re-reads the row; refresh credentials are never indexed).
+        Authority::Caller(matched) if matched.class == TokenClass::Refresh => {
+            Authority::Refresh(Arc::new(secret))
+        }
+        other => other,
+    });
     if gated.as_ref().is_err_and(ApiError::is_unauthorized) {
         state.auth_diagnostics.unresolved(Some(presented));
     }
@@ -603,12 +620,30 @@ mod tests {
         let authority = Authority::Caller(matched(TokenClass::RunKey, false));
         assert!(matches!(
             authority.actor(),
-            hekma_engine::RunActor::Caller { .. }
+            Ok(hekma_engine::RunActor::Caller { .. })
         ));
         assert_eq!(
-            Authority::Operator.actor(),
+            Authority::Operator.actor().unwrap(),
             hekma_engine::RunActor::Operator
         );
+        // A refresh credential acts as no one: never the Operator.
+        let refresh = Authority::Refresh(Arc::new(SecretString::new("hk_ref_x")));
+        assert!(refresh.actor().unwrap_err().is_forbidden());
+        // A supervised launch's refresh credential follows the same
+        // loopback-only rule as its Run Key.
+        assert!(gate(
+            matched(TokenClass::Refresh, true),
+            true,
+            RouteFamily::RunRefresh
+        )
+        .is_ok());
+        assert!(gate(
+            matched(TokenClass::Refresh, true),
+            false,
+            RouteFamily::RunRefresh
+        )
+        .unwrap_err()
+        .is_unauthorized());
     }
 
     #[test]

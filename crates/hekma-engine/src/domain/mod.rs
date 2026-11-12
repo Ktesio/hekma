@@ -36,7 +36,7 @@ pub(crate) mod probe_kinds;
 /// supervisor's start path is the only caller.
 pub(crate) mod readiness;
 mod registry;
-mod registry_keys;
+pub(crate) mod registry_keys;
 pub(crate) mod registry_limits;
 #[cfg(test)]
 mod registry_limits_tests;

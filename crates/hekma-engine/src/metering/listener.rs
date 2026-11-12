@@ -207,6 +207,18 @@ const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
 /// NEVER a body, header, or key (the no-leak invariant).
 pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64, u64)>>>;
 
+/// The credentials a request carried in its URL (story 22-1, R1.12): the
+/// listener refuses the request and queues each COMPLETE token it saw here;
+/// the reaper drains the queue and revokes the ones that resolve to an
+/// active credential — the same resolved-only path as the Control API, so a
+/// URL full of token-shaped noise never costs a write. Bounded at
+/// [`EXPOSED_QUEUE_MAX`]: past it a token is dropped (the request is still
+/// refused), so a flood cannot grow memory.
+pub(crate) type ExposedQueue = Arc<Mutex<Vec<crate::domain::SecretString>>>;
+
+/// The most exposed tokens the listener holds between two reaper drains.
+pub(crate) const EXPOSED_QUEUE_MAX: usize = 64;
+
 /// Why the loopback forward listener could not START (story 3-4). `thiserror`
 /// only (no `miette` in the lib — conventions). Every variant carries ONLY a
 /// static op label + a transport-shaped detail — NEVER a request/response body, a
@@ -280,6 +292,9 @@ pub struct ObservedListener {
     /// `block` breach, checked lock-free by `forward()` on every request.
     /// Born down with the listener, so every reason clears with the Run.
     fence: WireFence,
+    /// Story 22-1: complete tokens seen in a refused request's URL, for the
+    /// reaper to revoke.
+    exposed: ExposedQueue,
 }
 
 impl ObservedListener {
@@ -397,6 +412,7 @@ impl ObservedListener {
 
         let base_url = format!("http://{local_addr}");
         let queue: ObservedQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let exposed: ExposedQueue = Arc::new(Mutex::new(Vec::new()));
 
         // Spawn the accept loop on the engine runtime. It is aborted on drop
         // (teardown at the terminal transition — bounded to the Run).
@@ -407,6 +423,7 @@ impl ObservedListener {
             task_queue,
             forward_client(tls),
             fence.clone(),
+            Arc::clone(&exposed),
         ));
 
         Ok(ObservedListener {
@@ -415,6 +432,7 @@ impl ObservedListener {
             task: task.abort_handle(),
             queue,
             fence,
+            exposed,
         })
     }
 
@@ -444,6 +462,12 @@ impl ObservedListener {
     /// `block` breach; `forward()` refuses while it is up. Cloned `Arc`.
     pub(crate) fn fence(&self) -> WireFence {
         self.fence.clone()
+    }
+
+    /// The tokens refused requests carried in their URLs (story 22-1),
+    /// drained by the reaper. Cloned `Arc`.
+    pub(crate) fn exposed(&self) -> ExposedQueue {
+        Arc::clone(&self.exposed)
     }
 }
 
@@ -491,6 +515,7 @@ async fn accept_loop(
     queue: ObservedQueue,
     client: ForwardClient,
     fence: WireFence,
+    exposed: ExposedQueue,
 ) {
     // One shared forward client (connection pooling to the upstream). The
     // legacy client is the lean hyper-util outbound leg; it carries a
@@ -512,6 +537,7 @@ async fn accept_loop(
         let conn_client = client.clone();
         let conn_queue = Arc::clone(&queue);
         let conn_fence = fence.clone();
+        let conn_exposed = Arc::clone(&exposed);
         // Serve each connection on its own task so a slow agent connection does not
         // block accepting the next one. The service forwards every request upstream.
         tokio::spawn(async move {
@@ -520,9 +546,10 @@ async fn accept_loop(
                 let client = conn_client.clone();
                 let queue = Arc::clone(&conn_queue);
                 let fence = conn_fence.clone();
+                let exposed = Arc::clone(&conn_exposed);
                 async move {
                     Ok::<_, std::convert::Infallible>(
-                        forward(req, upstream, client, queue, fence).await,
+                        forward(req, upstream, client, queue, fence, exposed).await,
                     )
                 }
             });
@@ -567,16 +594,20 @@ async fn forward(
     client: ForwardClient,
     queue: ObservedQueue,
     fence: WireFence,
+    exposed: ExposedQueue,
 ) -> Response<Full<Bytes>> {
     // Story 22-1 (R1.12, a `proxy-wire v1` addition): a credential in the
     // path or query is refused BEFORE any upstream dial — the typed,
-    // non-retryable 400, the body drained and never echoed.
+    // non-retryable 400, the body drained and never echoed. A complete
+    // token so exposed is queued for the reaper to revoke.
     let target = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("");
-    if crate::domain::credential::scan_url(target).found {
+    let scan = crate::domain::credential::scan_url(target);
+    if scan.found {
+        note_exposed(&exposed, scan.tokens);
         drain_request_body(req.into_body()).await;
         return credential_in_url_response();
     }
@@ -872,6 +903,19 @@ fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
         return None;
     }
     format!("{base}{path_and_query}").parse::<hyper::Uri>().ok()
+}
+
+/// Queue `tokens` for revocation, up to [`EXPOSED_QUEUE_MAX`] (a poisoned
+/// lock or a full queue drops them: the request is refused either way).
+fn note_exposed(exposed: &ExposedQueue, tokens: Vec<crate::domain::SecretString>) {
+    if let Ok(mut queued) = exposed.lock() {
+        for token in tokens {
+            if queued.len() >= EXPOSED_QUEUE_MAX {
+                break;
+            }
+            queued.push(token);
+        }
+    }
 }
 
 /// The Run Key identification header (spine AD-26): stripped before any
