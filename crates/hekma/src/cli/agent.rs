@@ -2096,7 +2096,7 @@ fn follow_exit_note(name: &str, state: LifecycleState) -> String {
 /// uses — no `Engine::pause` signature change). A read-back failure is swallowed:
 /// it must never turn a successful pause into a CLI error (the state already
 /// changed and the machine-readable qualifier is already in the event log).
-fn note_if_best_effort(name: &str, op: &str) {
+pub(crate) fn note_if_best_effort(name: &str, op: &str) {
     let Ok(engine) = open_read_only_engine() else {
         return;
     };
@@ -2990,10 +2990,35 @@ impl RoutedError {
 /// (the host had just exited) finds or starts the owner again and retries
 /// once — a refused connection never applied anything.
 pub(crate) fn route(method: &str, path: &str, body: Option<Value>) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, None)
+}
+
+/// [`route`] with the call bounded overall by `bound` (story 21-6: a set
+/// act's bounded wait — past it the command reports that it lost patience
+/// and the acts may still be committing, never a hang).
+pub(crate) fn route_bounded(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: std::time::Duration,
+) -> Result<Routed, RoutedError> {
+    route_with(method, path, body, Some(bound))
+}
+
+fn route_with(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    bound: Option<std::time::Duration>,
+) -> Result<Routed, RoutedError> {
     let root = state_root().map_err(RoutedError::Diagnostic)?;
     let mut retried = false;
     loop {
         let client = HostClient::connect(&root).map_err(RoutedError::Call)?;
+        let client = match bound {
+            Some(bound) => client.bounded(bound),
+            None => client,
+        };
         match client.call(method, path, body.as_ref()) {
             Ok(value) => {
                 return Ok(Routed {
@@ -3213,7 +3238,7 @@ fn map_error(err: RegistryError) -> Box<dyn std::error::Error> {
 /// (AC4) and the launch-failed diagnostic (AC2) get their own codes; the shared
 /// registry-shaped variants (NotFound / InvalidName / Store) reuse the existing
 /// agent diagnostics for a consistent surface.
-fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
+pub(crate) fn map_engine_error(err: EngineError) -> Box<dyn std::error::Error> {
     match err {
         EngineError::NotFound { name } => AgentNotFound {
             message: format!(

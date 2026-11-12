@@ -106,6 +106,10 @@ pub(crate) struct HostClient {
     /// The hekma build that wrote `control.json`.
     hekma_version: String,
     state_root: PathBuf,
+    /// The overall bound on each call (story 21-6: a set act's bounded
+    /// wait); `None` = unbounded (a single `stop` may hold its request for
+    /// the whole ladder).
+    bound: Option<Duration>,
 }
 
 /// The `ureq` agent every call uses: status codes are answers (never
@@ -256,7 +260,17 @@ impl HostClient {
             pid: discovery.pid,
             hekma_version: discovery.hekma_version,
             state_root: state_root.to_path_buf(),
+            bound: None,
         })
+    }
+
+    /// The same client with every call bounded by `bound` overall (story
+    /// 21-6: a set act waits at most this long, then reports that it lost
+    /// patience — never a hang).
+    pub(crate) fn bounded(mut self, bound: Duration) -> Self {
+        self.agent = agent(Some(bound));
+        self.bound = Some(bound);
+        self
     }
 
     /// One Control API call. `Ok(Some(json))` for a 2xx with a body,
@@ -340,6 +354,15 @@ impl HostClient {
     }
 
     fn transport_error(&self, err: ureq::Error) -> CallError {
+        if let (ureq::Error::Timeout(ureq::Timeout::Global), Some(bound)) = (&err, self.bound) {
+            return CallError::Unavailable(format!(
+                "the local Service Host (pid {}) did not answer within {}s, so this command \
+                 stopped waiting; the acts may still be committing — check each Run with: \
+                 hekma run show <run-id>",
+                self.pid,
+                bound.as_secs()
+            ));
+        }
         let not_sent = never_sent(&err);
         let message = format!(
             "the local Service Host (pid {}) stopped answering: {err}; see {}",

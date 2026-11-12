@@ -188,6 +188,27 @@ impl ApiError {
             || detail.contains(Self::OUTBOX_PAST_TAIL_SENTENCE)
     }
 
+    /// A set-token refusal (story 21-6): `set-token-not-found` 404,
+    /// `set-token-expired` / `set-token-used` 409, `set-token-foreign` 403.
+    /// The message never echoes the token.
+    pub(crate) fn set_token(err: super::sets::SetTokenError) -> Self {
+        use super::sets::SetTokenError;
+        let kind = match err {
+            SetTokenError::NotFound => ApiErrorKind::NotFound,
+            SetTokenError::Expired | SetTokenError::Used => ApiErrorKind::Conflict,
+            SetTokenError::Foreign => ApiErrorKind::Forbidden,
+        };
+        let mut error = Self::new(kind, err.message());
+        error.code = Some(err.code());
+        error
+    }
+
+    /// The `error` object this error renders (story 21-6: one Run's
+    /// refusal inside a set-form verb's per-Run results).
+    pub(crate) fn error_object(&self) -> serde_json::Value {
+        serde_json::to_value(self.body_json().error).unwrap_or(serde_json::Value::Null)
+    }
+
     /// The versioned body this error renders — the serialization seam
     /// [`IntoResponse`] writes, unit-testable without an HTTP round-trip.
     fn body_json(&self) -> ErrorBody {
@@ -321,19 +342,34 @@ impl From<RunError> for ApiError {
             | RunError::RunEnded { .. }
             | RunError::LabelFromConfig { .. }
             | RunError::LabelNotBound { .. }
-            | RunError::LabelBound { .. } => ApiErrorKind::Conflict,
+            | RunError::LabelBound { .. }
+            // Story 21-6: the Run's depth does not serve the verb yet.
+            | RunError::VerbUnavailable { .. } => ApiErrorKind::Conflict,
+            // Story 21-6: a Caller may only tighten (an authority refusal).
+            RunError::RaiseForbidden { .. } => ApiErrorKind::Forbidden,
             // The request itself cannot be honored.
             RunError::NestingTooDeep { .. }
             | RunError::ActionUnavailable { .. }
             | RunError::TooManyRuns { .. }
             // Story 21-3: a Scent-Check Mode before Scent-Check ships.
             | RunError::ScentUnavailable { .. }
+            // Story 21-6: a limit scope the Run cannot carry.
+            | RunError::ScopeUnavailable { .. }
             | RunError::Invalid { .. } => ApiErrorKind::InvalidBody,
             RunError::Store(_) => ApiErrorKind::Internal,
         };
         let mut error = Self::new(kind, message);
         error.code = Some(err.code());
         error
+    }
+}
+
+impl From<hekma_engine::RunVerbError> for ApiError {
+    fn from(err: hekma_engine::RunVerbError) -> Self {
+        match err {
+            hekma_engine::RunVerbError::Run(err) => err.into(),
+            hekma_engine::RunVerbError::Engine(err) => err.into(),
+        }
     }
 }
 

@@ -820,3 +820,229 @@ pub(crate) struct PolicyChangeDocument {
     pub notes: Vec<String>,
     pub dry_run: bool,
 }
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Selector sets, the Run-grain verbs and Run-level limits.
+// ---------------------------------------------------------------------------
+
+/// The act-results family's schema version (the per-Run results every
+/// set-form verb answers, and the CLI's `--json` document for every verb).
+pub(crate) const ACT_RESULTS_SCHEMA_VERSION: u32 = 1;
+
+/// `POST /v0/runs/select` — resolve a Selector into a set to act on.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectRequest {
+    /// `key=value[,key=value…]` — every non-ended Run carrying all the
+    /// terms (bound or Caller labels).
+    pub selector: String,
+}
+
+/// The `POST /v0/runs/select` answer: the set token and the exact Runs a
+/// set-form verb will act on.
+#[derive(Serialize)]
+pub(crate) struct SelectDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The set token (`hkset_…`): single-use, bound to this credential,
+    /// expiring at `expires_at`. Present it in a set-form verb's BODY.
+    pub token: String,
+    /// The matched Runs, ordered by run id.
+    pub runs: Vec<hekma_engine::RunRecord>,
+    /// How many Runs matched.
+    pub matched: usize,
+    /// When the token expires (RFC 3339 UTC).
+    pub expires_at: String,
+}
+
+/// The body of a set-form verb (`POST /v0/runs/stop|pause|resume|drain|close`)
+/// — the set token, plus the verb's own optional bound.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetActRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// `stop` only: the graceful window in whole seconds.
+    #[serde(default)]
+    pub window_secs: Option<u64>,
+    /// `drain` only: the drain bound in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// `PATCH /v0/runs/labels` — bind and unbind labels on a selected set.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetLabelsRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// `key: value` labels to bind.
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Keys to unbind.
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `PATCH /v0/runs/{id}/limits` — one Run's limits: ceilings to set
+/// (dollars as decimal strings, `"3.00"`), the Breach Action, the limits
+/// to clear (`tokens-per-run`, `tokens-cumulative`, `dollars-per-run`,
+/// `dollars-cumulative`, `breach-action`). An unknown key is refused — a
+/// typo on a money field must never be silently dropped.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RunLimitsPatch {
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling (a process-owning Run only).
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run dollar cap, `"3.00"`.
+    #[serde(default)]
+    pub dollars_per_run: Option<String>,
+    /// A cumulative dollar cap, `"3.00"` (a process-owning Run only).
+    #[serde(default)]
+    pub dollars_cumulative: Option<String>,
+    /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
+    #[serde(default)]
+    pub breach_action: Option<String>,
+    /// Limits to clear.
+    #[serde(default)]
+    pub clear: Vec<String>,
+    /// Plan only: answer with the planned outcome, write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST /v0/runs/limits` — limits on a selected set (the
+/// [`RunLimitsPatch`] fields, with the set token instead of a dry run).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetLimitsRequest {
+    /// The token `POST /v0/runs/select` answered.
+    pub set_token: String,
+    /// A per-run token ceiling.
+    #[serde(default)]
+    pub tokens_per_run: Option<u64>,
+    /// A cumulative token ceiling (a process-owning Run only).
+    #[serde(default)]
+    pub tokens_cumulative: Option<u64>,
+    /// A per-run dollar cap, `"3.00"`.
+    #[serde(default)]
+    pub dollars_per_run: Option<String>,
+    /// A cumulative dollar cap, `"3.00"` (a process-owning Run only).
+    #[serde(default)]
+    pub dollars_cumulative: Option<String>,
+    /// The Run's Breach Action (`warn`, `pause`, `stop`, `block`).
+    #[serde(default)]
+    pub breach_action: Option<String>,
+    /// Limits to clear.
+    #[serde(default)]
+    pub clear: Vec<String>,
+}
+
+impl SetLimitsRequest {
+    /// The change fields, as the per-Run patch carries them.
+    pub(crate) fn into_parts(self) -> (String, RunLimitsPatch) {
+        (
+            self.set_token,
+            RunLimitsPatch {
+                tokens_per_run: self.tokens_per_run,
+                tokens_cumulative: self.tokens_cumulative,
+                dollars_per_run: self.dollars_per_run,
+                dollars_cumulative: self.dollars_cumulative,
+                breach_action: self.breach_action,
+                clear: self.clear,
+                dry_run: false,
+            },
+        )
+    }
+}
+
+/// One Run-grain verb's answer (`POST /v0/runs/{id}/stop|pause|resume|drain`):
+/// the Run, the instance it acted on, and (drain) the composite's outcome.
+#[derive(Serialize)]
+pub(crate) struct RunActDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The Run.
+    pub run_id: String,
+    /// The instance's Fleet row after the verb.
+    pub instance: hekma_engine::FleetEntry,
+    /// `drain` only: whether the bounded wait completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<bool>,
+    /// `drain` only: the measured bounded phase, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+}
+
+/// `GET /v0/runs/{id}/limits` — one Run's budget read.
+#[derive(Serialize)]
+pub(crate) struct RunLimitsDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The read.
+    #[serde(flatten)]
+    pub view: hekma_engine::RunLimitsView,
+}
+
+/// `PATCH /v0/runs/{id}/limits` — the outcome on one Run.
+#[derive(Serialize)]
+pub(crate) struct RunLimitsChangeDocument {
+    /// [`CONTROL_API_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The outcome.
+    #[serde(flatten)]
+    pub outcome: hekma_engine::RunLimitsOutcome,
+}
+
+/// One Run's result in a set-form verb's answer.
+#[derive(Serialize, Default)]
+pub(crate) struct ActResult {
+    /// The Run.
+    pub run_id: String,
+    /// The verb's past tense (`stopped`, `paused`, `resumed`, `drained`,
+    /// `closed`, `labeled`, a limits direction), `unchanged`, or `refused`.
+    pub outcome: String,
+    /// The instance's Fleet row after a lifecycle verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<hekma_engine::FleetEntry>,
+    /// `drain` only: whether the bounded wait completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<bool>,
+    /// `drain` only: the measured bounded phase, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waited_ms: Option<u64>,
+    /// `close` only: the Run after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<hekma_engine::RunView>,
+    /// `labels` only: the labels after.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<hekma_engine::Label>>,
+    /// `labels` only: the labels before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_labels: Option<Vec<hekma_engine::Label>>,
+    /// `limits` only: the budget job's outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<hekma_engine::RunLimitsOutcome>,
+    /// A refusal: the error envelope's `error` object (`kind`, `code`,
+    /// `message`, and `engine_error` when the instance verb failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// A set-form verb's answer: one result per Run of the set, in set order.
+#[derive(Serialize)]
+pub(crate) struct ActResultsDocument {
+    /// [`ACT_RESULTS_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The verb (`stop`, `pause`, `resume`, `drain`, `close`, `label`,
+    /// `limits`).
+    pub verb: &'static str,
+    /// How many Runs the set held.
+    pub matched: usize,
+    /// One result per Run.
+    pub results: Vec<ActResult>,
+}

@@ -136,11 +136,13 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         // Story 21-3: the default Policy's reserved shape is an Operator
         // refusal (2); a Scent-Check Mode before Scent-Check ships (2).
         "policy-default" | "scent-unavailable" => RunInvalid { message }.into(),
-        "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs" => {
-            RunInvalid { message }.into()
-        }
+        "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs"
+        // Story 21-6.
+        | "scope-unavailable" => RunInvalid { message }.into(),
         "no-open-run" | "parent-ended" | "owns-process" | "run-ended" | "label-from-config"
-        | "label-not-bound" | "label-bound" => RunInvalidState { message }.into(),
+        | "label-not-bound" | "label-bound"
+        // Story 21-6.
+        | "verb-unavailable" | "raise-forbidden" => RunInvalidState { message }.into(),
         _ => AgentStore { message }.into(),
     }
 }
@@ -258,7 +260,13 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         | RunError::RunEnded { .. }
         | RunError::LabelFromConfig { .. }
         | RunError::LabelNotBound { .. }
-        | RunError::LabelBound { .. } => RunInvalidState { message }.into(),
+        | RunError::LabelBound { .. }
+        // Story 21-6: the Run's depth does not serve the verb yet, and a
+        // Caller may only tighten (the Run's state forbids the change).
+        | RunError::VerbUnavailable { .. }
+        | RunError::RaiseForbidden { .. } => RunInvalidState { message }.into(),
+        // Story 21-6: a limit scope the Run cannot carry (the request).
+        RunError::ScopeUnavailable { .. } => RunInvalid { message }.into(),
         RunError::Store(_) => AgentStore { message }.into(),
     }
 }
