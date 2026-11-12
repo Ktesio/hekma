@@ -9,25 +9,18 @@
 //! the spine reserves that YIELDS [`UsageEvent`] fields from a running instance.
 //! It is named [`UsageSource`] precisely so it does not shadow that enum.
 //!
-//! ## Two impls behind one port: self-reported (AC6) + engine-observed (story 3-4)
+//! ## One log-tail impl + the proxied path (story 23-1)
 //!
-//! The FIRST impl is [`SelfReportedUsageSource`]: it parses the `KTESIO_USAGE
-//! {json}` stdout-sentinel-line convention out of the per-instance agent-output
-//! log the engine already captures (AD-12), turning each well-formed line into a
-//! [`ParsedUsage`]. A malformed line is a diagnostic (skipped, never a crash,
-//! never on `kt` stdout).
+//! The impl behind the port is [`SelfReportedUsageSource`]: it parses the
+//! `KTESIO_USAGE {json}` stdout-sentinel-line convention out of the
+//! per-instance agent-output log the engine already captures (AD-12), turning
+//! each well-formed line into a [`ParsedUsage`]. A malformed line is a
+//! diagnostic (skipped, never a crash, never on `kt` stdout).
 //!
-//! The SECOND impl is [`ObservedUsageSource`] (story 3-4): the `engine-observed`
-//! source, fed by the loopback forward listener (`crate::metering`). It differs
-//! from self-reported in its DRIVE MODEL — self-reported is a log-tail DRAIN
-//! cadence, engine-observed is EVENT-DRIVEN: the listener parses the OpenAI
-//! `usage` object out of each completion response and pushes the counts to a queue
-//! the supervisor's reaper drains, and [`ObservedUsageSource`] MINTS the per-Run
-//! `sequence` for each (the agent supplies none — it does not know it is being
-//! observed). So the observed source does NOT implement the log-tail
-//! [`UsageSource::drain`]; it is a thin engine-side minter that yields the SAME
-//! [`ParsedUsage`] the self-reported channel yields (the crux: downstream of the
-//! choke point the two are byte-identical except the `engine-observed` tag).
+//! An `engine-observed` instance's calls no longer ride this port at all
+//! (story 23-1): the shared Metering Proxy meters each call by its call id
+//! through the proxied-close job in the store writer, so there is no queue,
+//! no engine-minted sequence and no reaper drain for observed usage.
 //!
 //! Either way the engine-stamped fields (Run id, instance, metering source,
 //! timestamp) are filled by the commit choke point, NOT here — a source yields
@@ -150,15 +143,11 @@ pub fn parse_usage_block(block: &str) -> Vec<ParsedUsage> {
 /// OUTPUT (the self-reported log-tail drive model).
 ///
 /// The impl behind this method is [`SelfReportedUsageSource`] (self-reported over
-/// the AD-12 stdout capture). The SECOND source, [`ObservedUsageSource`] (story
-/// 3-4, `engine-observed`), does NOT ride this method — it is EVENT-DRIVEN from
-/// the loopback listener (there is no captured-output text to drain; the counts
-/// arrive already parsed from the model traffic), so it mints its [`ParsedUsage`]
-/// directly (see [`ObservedUsageSource::mint`]). Both yield the SAME
-/// [`ParsedUsage`] into the SAME commit choke point; the port NEVER writes the
-/// ledger and never mints a Run id — the commit choke point stamps the rest
-/// (instance, Run id, metering source, timestamp) and records it (the AD-7
-/// single-writer invariant).
+/// the AD-12 stdout capture). Proxied calls (story 23-1) do NOT ride this method
+/// — each one's usage commits through the proxied-close job in the store writer,
+/// keyed on its call id, so the port NEVER writes the ledger and never mints a
+/// Run id — the commit choke point stamps the rest (instance, Run id, metering
+/// source, timestamp) and records it (the AD-7 single-writer invariant).
 pub trait UsageSource {
     /// Extract every well-formed usage measurement from a block of captured agent
     /// output (the newly-read tail of the per-instance agent-output log). Malformed
@@ -186,85 +175,6 @@ impl SelfReportedUsageSource {
 impl UsageSource for SelfReportedUsageSource {
     fn drain(&self, captured_output: &str) -> Vec<ParsedUsage> {
         parse_usage_block(captured_output)
-    }
-}
-
-/// The `engine-observed` ingestion source (spine AD-7 v1 / FR-19 engine-observed
-/// half, story 3-4) — the SECOND impl beside [`SelfReportedUsageSource`].
-///
-/// Where self-reported parses agent-emitted stdout lines, engine-observed derives
-/// usage from the agent's MODEL TRAFFIC through the loopback forward listener
-/// (`crate::metering`), which parses the OpenAI-compatible `usage` object out of
-/// each completion response. It is EVENT-DRIVEN, not a log-tail drainer, so it
-/// does NOT implement [`UsageSource::drain`] — instead the listener pushes each
-/// parsed `(input, output)` pair to a queue the supervisor's reaper drains, and
-/// this source [`mint`](Self::mint)s the per-Run [`ParsedUsage`].
-///
-/// ## The engine-minted `sequence` (the crux difference from self-reported)
-///
-/// A self-reporting agent stamps its own per-Run `sequence` (the replay-dedup
-/// ordinal). An OBSERVED completion has no agent-stamped ordinal — the agent does
-/// not know it is being observed — so the ENGINE mints it: a per-Run MONOTONIC
-/// counter, incremented once per observed completion, so the `UNIQUE(instance_id,
-/// run_id, sequence)` dedup index (story 3-1) still holds. The counter lives on
-/// this source, which is held per-instance for the Run; a fresh Run gets a fresh
-/// source (counter reset to 0), mirroring how the self-reported cursor + breach
-/// latch reset per Run.
-///
-/// RETRY-DEDUP POSTURE (recorded limit): each forwarded call is a DISTINCT
-/// observed event and gets its own ordinal, so the counter guarantees uniqueness
-/// within a Run (no double-count from the ENGINE side). Unlike the self-reported
-/// channel — where the agent RE-STAMPS the same `sequence` on a re-delivered batch
-/// so the DB recognizes the replay — a provider-side retry the agent makes is a
-/// SEPARATE HTTP call through the proxy, so it is observed as a separate event
-/// (the proxy cannot know two calls are semantically the same request). This is
-/// the accepted v1 limit: the counter prevents ENGINE double-counting; it does not
-/// de-duplicate an agent's own provider retries (those are genuinely distinct
-/// calls the agent chose to make, and each consumed real tokens).
-#[derive(Debug)]
-pub struct ObservedUsageSource {
-    /// The per-Run monotonic `sequence` counter (the engine-minted replay-dedup
-    /// ordinal). Starts at 0; a fresh Run builds a fresh source, so it resets.
-    /// `AtomicU64` so a single `&self` mint is cheap + the source needs no `&mut`.
-    next_sequence: std::sync::atomic::AtomicU64,
-}
-
-impl ObservedUsageSource {
-    /// Construct a fresh observed source with the `sequence` counter at 0 (built at
-    /// each `starting` transition for an `engine-observed` instance, so the ordinal
-    /// resets per Run — the AD-7 Run boundary).
-    pub fn new() -> Self {
-        Self {
-            next_sequence: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    /// Mint the next per-Run [`ParsedUsage`] for one observed completion (story
-    /// 3-4): stamp the next monotonic `sequence` onto the parsed token counts. The
-    /// engine-stamped fields (instance, Run id, metering source, timestamp) are
-    /// still filled by the commit choke point via [`assemble_usage_event`] — this
-    /// yields exactly the same AGENT-half shape the self-reported parser yields, so
-    /// the two sources are indistinguishable downstream of the choke point (except
-    /// the `engine-observed` tag the commit stamps). `input`/`output` map from the
-    /// OpenAI `prompt_tokens`/`completion_tokens` the listener parsed; `cached`
-    /// (story 14-6) is the cached SUBSET of `input` under the INPUT-INCLUSIVE
-    /// invariant (the parse layer enforces `cached <= input`).
-    pub fn mint(&self, input: u64, output: u64, cached: u64) -> ParsedUsage {
-        let sequence = self
-            .next_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ParsedUsage {
-            sequence,
-            input_tokens: input,
-            output_tokens: output,
-            cached_tokens: cached,
-        }
-    }
-}
-
-impl Default for ObservedUsageSource {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -463,56 +373,6 @@ mod tests {
             "{cached_line}"
         );
         assert_eq!(parse_usage_line(&cached_line), Some(cached));
-    }
-
-    #[test]
-    fn observed_source_mints_mapped_fields_with_a_monotonic_per_run_sequence() {
-        // Story 3-4 (Task 3): the observed source stamps the OpenAI-parsed counts
-        // (prompt→input, completion→output) onto a per-Run monotonic `sequence`
-        // starting at 0, incrementing once per observed completion.
-        let source = ObservedUsageSource::new();
-        let first = source.mint(128, 512, 100);
-        assert_eq!(
-            first,
-            ParsedUsage {
-                sequence: 0,
-                input_tokens: 128,
-                output_tokens: 512,
-                cached_tokens: 100,
-            }
-        );
-        let second = source.mint(7, 3, 0);
-        assert_eq!(second.sequence, 1, "sequence increments per observed event");
-        assert_eq!(second.input_tokens, 7);
-        assert_eq!(second.output_tokens, 3);
-        assert_eq!(second.cached_tokens, 0, "a cache miss mints known-zero");
-        let third = source.mint(0, 0, 0);
-        assert_eq!(third.sequence, 2);
-    }
-
-    #[test]
-    fn observed_sequences_are_unique_within_a_run_and_reset_per_run() {
-        // The engine-minted ordinal must be UNIQUE within a Run (the dedup index),
-        // and a FRESH source (a new Run) resets to 0 — mirroring the per-Run cursor.
-        let run1 = ObservedUsageSource::new();
-        let seqs: Vec<u64> = (0..100).map(|_| run1.mint(1, 1, 0).sequence).collect();
-        let mut sorted = seqs.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            seqs.len(),
-            "all sequences unique within a Run"
-        );
-        assert_eq!(seqs[0], 0);
-        assert_eq!(seqs[99], 99);
-        // A new Run's source starts fresh at 0 (the per-Run reset).
-        let run2 = ObservedUsageSource::new();
-        assert_eq!(
-            run2.mint(5, 5, 0).sequence,
-            0,
-            "a fresh Run resets the ordinal"
-        );
     }
 
     #[test]

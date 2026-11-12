@@ -10,7 +10,6 @@ use super::registry_policy::InstanceContext;
 use super::*;
 use crate::domain::runs::ResolveInputs;
 use crate::domain::BudgetBreachEvent;
-use crate::metering::WireFence;
 use crate::ports::RunStore as _;
 
 /// One seeded fleet: an instance (id 1), its open process-owning Run with
@@ -93,7 +92,6 @@ fn contexts() -> HashMap<String, InstanceContext> {
     HashMap::from([(
         "money".to_string(),
         InstanceContext {
-            fence: None,
             metering_source: "self-reported".to_string(),
             supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
@@ -184,6 +182,22 @@ fn change(registry: &Registry, name: &str, selector: &str, set: PolicyLimits) ->
 fn breaches(registry: &Registry, run: &RunId) -> Vec<BudgetBreachEvent> {
     let name = InstanceName::new("money").unwrap();
     registry.reader().run_breaches(&name, run).unwrap()
+}
+
+
+/// The `block` reason codes the published snapshot holds for `run` (the
+/// shared proxy refuses on exactly this).
+fn block_codes(seeded: &Seeded, run: &RunId) -> Vec<&'static str> {
+    let bits = seeded
+        .registry
+        .run_publisher()
+        .current()
+        .disposition_over(run)
+        .breach_block;
+    crate::domain::runs::snapshot::Disposition::reasons(bits)
+        .into_iter()
+        .map(crate::domain::governance::fence_code)
+        .collect()
 }
 
 #[test]
@@ -330,12 +344,10 @@ fn the_fence_clears_per_reason_only() {
     // raising ONLY the token ceiling keeps the fence up on the dollar
     // reason; raising both unfences (amendment 2).
     let seeded = seed_at(500_000, 500_000); // 1M tokens = $1.00 at $1/$1 per 1M.
-    let fence = WireFence::default();
     let mut contexts = contexts();
     contexts.insert(
         "money".to_string(),
         InstanceContext {
-            fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
             supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
@@ -384,11 +396,11 @@ fn the_fence_clears_per_reason_only() {
             "both `block` reasons latched"
         );
     }
-    assert!(fence.refusal().is_some(), "both reasons latched: fenced");
-    assert_eq!(
-        fence.refusal().unwrap().code,
-        "tokens_per_run",
-        "the canonical first reason"
+    assert!(!block_codes(&seeded, &seeded.run).is_empty(), "both reasons latched: fenced");
+    assert!(
+        block_codes(&seeded, &seeded.run).contains(&"tokens_per_run"),
+        "both reasons ride the disposition: {:?}",
+        block_codes(&seeded, &seeded.run)
     );
 
     // Raise ONLY the token ceiling above the usage (1M tokens): the token
@@ -401,13 +413,9 @@ fn the_fence_clears_per_reason_only() {
         &contexts,
     );
     assert!(
-        fence.refusal().is_some(),
-        "the dollar reason still holds the fence"
-    );
-    assert_eq!(
-        fence.refusal().unwrap().code,
-        "dollars_cumulative",
-        "the remaining reason names itself"
+        block_codes(&seeded, &seeded.run).contains(&"dollars_cumulative"),
+        "the dollar reason still holds the fence: {:?}",
+        block_codes(&seeded, &seeded.run)
     );
 
     // Raise both: the fence comes down.
@@ -421,7 +429,7 @@ fn the_fence_clears_per_reason_only() {
         },
         &contexts,
     );
-    assert!(fence.refusal().is_none(), "every reason re-armed: unfenced");
+    assert!(block_codes(&seeded, &seeded.run).is_empty(), "every reason re-armed: unfenced");
 }
 
 #[test]
@@ -487,7 +495,6 @@ fn an_unreadable_instance_config_skips_the_runs_money_half_fail_closed() {
     contexts.insert(
         "money".to_string(),
         InstanceContext {
-            fence: None,
             metering_source: "self-reported".to_string(),
             supervised: true,
             inputs: Some(Err("the configuration could not be read".to_string())),
@@ -1032,12 +1039,10 @@ fn a_multi_run_instance_never_re_arms_a_cumulative_ceiling_on_the_run_totals() {
     // sit (the pre-fix re-arm compared every scope against the Run's own
     // totals and cleared all of them).
     let seeded = seed_multi_run(1_000_000, 10_000_000);
-    let fence = WireFence::default();
     let mut contexts = contexts();
     contexts.insert(
         "money".to_string(),
         InstanceContext {
-            fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
             supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
@@ -1069,7 +1074,10 @@ fn a_multi_run_instance_never_re_arms_a_cumulative_ceiling_on_the_run_totals() {
     let events = breaches(&seeded.registry, &seeded.run);
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].scope, crate::domain::BreachScope::Cumulative);
-    assert!(fence.refusal().is_some(), "the cumulative block fences");
+    assert!(
+        !block_codes(&seeded, &seeded.run).is_empty(),
+        "the cumulative block fences"
+    );
     // The PUBLISHED snapshot entry carries the breach Anomaly: the money
     // half's entries commit AFTER the pre-breach resolution entry, so the
     // freshest entry wins (the pre-fix order let the pre-breach entry
@@ -1116,7 +1124,7 @@ fn a_multi_run_instance_never_re_arms_a_cumulative_ceiling_on_the_run_totals() {
         "the cumulative latch holds: {latched:?}"
     );
     assert!(
-        fence.refusal().is_some(),
+        !block_codes(&seeded, &seeded.run).is_empty(),
         "still fenced: still over the cap"
     );
     let view = seeded.registry.run_view(&seeded.run).unwrap();
@@ -1135,12 +1143,10 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
     // and a latch under a ceiling that no longer exists must not hold the
     // Run (or a `block` fence) for the rest of its life.
     let seeded = seed(1_000);
-    let fence = WireFence::default();
     let mut contexts = contexts();
     contexts.insert(
         "money".to_string(),
         InstanceContext {
-            fence: Some(fence.clone()),
             metering_source: "engine-observed".to_string(),
             supervised: true,
             inputs: Some(Ok(ResolveInputs::default())),
@@ -1174,7 +1180,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
         contexts.clone(),
     );
     assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 1);
-    assert!(fence.refusal().is_some(), "latched under block: fenced");
+    assert!(!block_codes(&seeded, &seeded.run).is_empty(), "latched under block: fenced");
 
     // --clear tokens-per-run: the latch, the Anomaly and the fence reason
     // all clear.
@@ -1194,7 +1200,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
             .is_empty(),
         "the cleared ceiling re-arms its latch"
     );
-    assert!(fence.refusal().is_none(), "the fence reason cleared");
+    assert!(block_codes(&seeded, &seeded.run).is_empty(), "the fence reason cleared");
     let view = seeded.registry.run_view(&seeded.run).unwrap();
     assert!(
         !view
@@ -1250,7 +1256,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
         contexts.clone(),
     );
     assert_eq!(breaches(&seeded.registry, &seeded.run).len(), 2);
-    assert!(fence.refusal().is_some());
+    assert!(!block_codes(&seeded, &seeded.run).is_empty());
     let existing = seeded.registry.policy("cap").unwrap().unwrap();
     seeded
         .registry
@@ -1265,7 +1271,7 @@ fn clearing_or_deleting_the_ceiling_re_arms_the_latch_anomaly_and_fence() {
             .is_empty(),
         "the delete re-arms every latch the Policy held"
     );
-    assert!(fence.refusal().is_none(), "unfenced after the delete");
+    assert!(block_codes(&seeded, &seeded.run).is_empty(), "unfenced after the delete");
 }
 
 #[test]
@@ -2000,7 +2006,6 @@ fn a_child_latch_re_arms_when_its_level_no_longer_enforces_the_ceiling() {
     fresh.insert(
         "money".to_string(),
         InstanceContext {
-            fence: None,
             metering_source: "self-reported".to_string(),
             supervised: true,
             inputs: Some(Ok(crate::domain::config::explicit_limits(

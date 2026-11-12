@@ -100,8 +100,9 @@ ALTER TABLE breach_events_v18 RENAME TO breach_events;
 CREATE INDEX idx_breach_events_instance ON breach_events(instance_id, id);
 CREATE INDEX idx_breach_events_run ON breach_events(run_id);
 CREATE TABLE IF NOT EXISTS proxy_state (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    port INTEGER
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    port       INTEGER,
+    legacy_run TEXT
 );
 ";
 
@@ -180,8 +181,47 @@ impl super::SqliteStore {
         Ok(())
     }
 
+    /// The database's current change counter as this reader sees it
+    /// (story 23-1: `PRAGMA data_version` — it advances when ANY other
+    /// connection commits, so the reaper tick can notice a foreign
+    /// engine's writes without reading a single row).
+    pub(crate) fn data_version(&self) -> Result<i64, StoreError> {
+        self.conn()
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(backend)
+    }
+
+    /// The Run the legacy root route serves (story 23-1's migration rule):
+    /// the one pre-proxy `engine-observed` Run an earlier open decided, until
+    /// its Run ends. `None` when no legacy route is active.
+    pub(crate) fn legacy_run(&self) -> Result<Option<crate::domain::RunId>, StoreError> {
+        let run: Option<Option<String>> = self
+            .conn()
+            .query_row("SELECT legacy_run FROM proxy_state WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(backend)?;
+        Ok(run.flatten().map(crate::domain::RunId::from_wire))
+    }
+
+    /// Record (or clear) the legacy root route's Run (a writer job).
+    pub(crate) fn set_legacy_run(
+        &self,
+        run: Option<&crate::domain::RunId>,
+    ) -> Result<(), StoreError> {
+        self.conn()
+            .execute(
+                "INSERT INTO proxy_state (id, legacy_run) VALUES (1, ?1) \
+                 ON CONFLICT(id) DO UPDATE SET legacy_run = excluded.legacy_run",
+                [run.map(|run| run.as_str().to_string())],
+            )
+            .map_err(backend)?;
+        Ok(())
+    }
+
     /// Record a process-owning Run's upstream (its launch job).
-    pub(crate) fn set_run_upstream(
+    pub(crate) fn record_run_upstream(
         &self,
         run_id: &crate::domain::RunId,
         upstream: Option<&str>,

@@ -182,16 +182,11 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
             };
             let run = RunId::from_wire(id);
             // The route's upstream is its process-owning Run's (a child's
-            // route reads up the chain to the Run that recorded one).
-            let upstream = snapshot
-                .chain(&run)
-                .iter()
-                .find_map(|entry| entry.upstream.clone());
-            match (snapshot.run(&run), upstream) {
-                (Some(_), Some(upstream)) => {
-                    (Route::Run(run), upstream, rest.to_string(), Via::RunRoute)
-                }
-                _ => return Identified::Refused(Refusal::NoRoute),
+            // route reads up the chain to the Run that recorded one), or the
+            // pending route's before the launch job commits.
+            match snapshot.route_upstream(&run) {
+                Some(upstream) => (Route::Run(run), upstream, rest.to_string(), Via::RunRoute),
+                None => return Identified::Refused(Refusal::NoRoute),
             }
         } else if facts.path == "/_hekma" || facts.path.starts_with("/_hekma/") {
             return Identified::Refused(Refusal::NoRoute);
@@ -207,11 +202,7 @@ pub(crate) fn identify(snapshot: &RunSnapshot, facts: &CallFacts<'_>) -> Identif
                 Via::Binding(binding.name.clone()),
             )
         } else if let Some(legacy) = snapshot.legacy_root.clone() {
-            let upstream = snapshot
-                .chain(&legacy)
-                .iter()
-                .find_map(|entry| entry.upstream.clone());
-            match upstream {
+            match snapshot.route_upstream(&legacy) {
                 Some(upstream) => (
                     Route::Run(legacy),
                     upstream,

@@ -50,21 +50,6 @@ pub(crate) fn default_tls_config() -> Arc<rustls::ClientConfig> {
     )
 }
 
-/// Build the outbound forward client for a given TLS config (story 12-3 test
-/// seam): `https_or_http()` makes ONE connector handle BOTH upstream schemes,
-/// so a test can point the listener at an `https://` upstream with a
-/// self-signed-root-trusting config and prove the full composition (TLS +
-/// streaming + metering) while production always calls through
-/// [`default_tls_config`].
-pub(crate) fn forward_client(tls: Arc<rustls::ClientConfig>) -> ForwardClient {
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config((*tls).clone())
-        .https_or_http()
-        .enable_http1()
-        .build();
-    Client::builder(TokioExecutor::new()).build(https)
-}
-
 /// The MAXIMUM size (bytes) of a single request OR response body this transparent
 /// proxy will BUFFER before failing the relay cleanly (story 3-4 hardening).
 ///
@@ -220,12 +205,6 @@ pub(crate) fn inject_include_usage(
     }
 }
 
-/// Is `name` an RFC 7230 §6.1 hop-by-hop header (which a proxy must not forward)?
-/// Matched against [`HOP_BY_HOP_HEADERS`] (case-insensitive via `HeaderName`).
-pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
-    HOP_BY_HOP_HEADERS.iter().any(|h| h == name)
-}
-
 /// Remove every hop-by-hop header from `headers` in place. Also honors the
 /// `Connection: <token>` list per RFC 7230 §6.1: any header NAMED in a `Connection`
 /// header value is itself connection-specific and stripped too, before `Connection`
@@ -250,9 +229,9 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-/// The shared proxy's forward client: [`forward_client`] with a 10 s
-/// upstream connect timeout (story 23-1) and no redirect following (the
-/// legacy client never follows one — an upstream `3xx` is relayed).
+/// The shared proxy's forward client: a 10 s upstream connect timeout
+/// (story 23-1) and no redirect following (the client never follows one —
+/// an upstream `3xx` is relayed).
 pub(crate) fn proxy_client(tls: Arc<rustls::ClientConfig>) -> ForwardClient {
     let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
     http.enforce_http(false);
