@@ -467,6 +467,13 @@ jobs:
             ps -eo pid,stat,args 2>/dev/null | grep -E "nextest|fake_agent|fake_acp_agent|hermes_shim|hekma" | grep -v grep || echo "(none)"
           } | tee "$RUNNER_TEMP/wedge-postmortem.txt"
       - name: Upload wedge post-mortem artifact
+        # Diagnostics-only rider: nothing downstream gates on this
+        # artifact, so the upload itself must not red an otherwise-green
+        # job (2026-11-11: the artifact service degraded — HTML error
+        # pages after 5 retries — and put red rows on green test legs).
+        # always() still ships the post-mortem when the service is
+        # healthy; the job's verdict comes from the enforcement steps.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -699,6 +706,10 @@ jobs:
         # exactly when the record matters most. Story 17-1: ONE artifact
         # carries BOTH report files (the default run's and the serve run's);
         # story 21-5 adds the ps run's as the third.
+        # Diagnostics-only rider (same 2026-11-11 artifact-service
+        # degradation): a failed upload must not red a green perf leg —
+        # the ratchet verdicts live in the run steps above.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -2114,6 +2125,10 @@ jobs:
         # themselves — header-declared size vs actual bytes answers WHO wrote
         # an incomplete profile, which the logs cannot (the panicking job's
         # runner discards them otherwise).
+        # Diagnostics-only rider (same 2026-11-11 artifact-service
+        # degradation): the 95% gate above enforces; a failed upload
+        # must not red a green coverage leg.
+        continue-on-error: true
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -1252,6 +1252,73 @@ class ReleaseDocsTests(unittest.TestCase):
             "gates its ratchet against it)",
         )
 
+    def test_diagnostic_artifact_uploads_carry_continue_on_error_enforcement_does_not(
+        self,
+    ) -> None:
+        """The three artifact-UPLOAD steps in ci.yml are diagnostics-only
+        riders — nothing downstream gates on them — so an artifact-service
+        failure (2026-11-11: HTML error pages after 5 retries) must not
+        red an otherwise-green job. Every ENFORCEMENT step still fails
+        the job. Pinned three ways: (1) step-level continue-on-error
+        appears on EXACTLY the three known upload steps across the whole
+        file (the spread guard — silently relaxing an enforcement step,
+        or adding a job-level continuation, fails here); (2) each upload
+        step keeps if: always() and the pinned upload-artifact action;
+        (3) the named enforcement steps carry NO continue-on-error."""
+        ci = (release_docs.ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        import re as _re
+
+        uploads = [
+            "Upload wedge post-mortem artifact",
+            "Upload the measured report (artifact)",
+            "Upload the coverage measurement (diagnostics)",
+        ]
+        enforcement = [
+            "Run tests (nextest)",
+            "Run doctests",
+            "Run the perf harness",
+            "Run the serve-shape scenario",
+            "Enforce coverage",
+        ]
+
+        def step_slice(title: str) -> str:
+            rest = ci[ci.index(f"- name: {title}") + 1 :]
+            nxt = _re.search(r"\n      - name: ", rest)
+            return rest[: nxt.start()] if nxt else rest
+
+        # (1) The spread guard: every continue-on-error key in the file
+        # must belong to one of the three diagnostics uploads. Each hit
+        # is attributed to its nearest preceding step name; a job-level
+        # hit lands on an unrelated (or absent) step name and mismatches
+        # the exact set — flagged here instead of silently allowed.
+        attributed = []
+        for hit in _re.finditer(r"^[ \t]+continue-on-error:", ci, _re.MULTILINE):
+            owner = None
+            for nm in _re.finditer(
+                r"^      - name: (.+)$", ci[: hit.start()], _re.MULTILINE
+            ):
+                owner = nm.group(1).strip()
+            attributed.append(owner if owner else "<no preceding step name>")
+        self.assertEqual(
+            sorted(attributed),
+            sorted(uploads),
+            "continue-on-error must stay diagnostics-uploads-only; found on: "
+            f"{attributed}",
+        )
+        # (2) Each upload rides along on both axes: continue-on-error
+        # (its own failure is not the job's) and always() (a red run's
+        # evidence still ships while the service is healthy).
+        for title in uploads:
+            block = step_slice(title)
+            self.assertIn("continue-on-error: true", block, title)
+            self.assertIn("if: always()", block, title)
+            self.assertIn("actions/upload-artifact@", block, title)
+        # (3) Enforcement must keep failing the job.
+        for title in enforcement:
+            self.assertNotIn("continue-on-error", step_slice(title), title)
+
     def test_publish_flags_match_the_post_v070_release_state(self) -> None:
         """Publish-day state (go recorded 2026-09-09, release issue #176):
         the three library crates are PUBLISHED (no publish=false) and
