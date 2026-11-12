@@ -306,3 +306,49 @@ fn the_sequenced_bus_carries_the_outbox_seq_of_committed_events() {
     };
     assert_eq!(bare, event, "the plain ring carries the same event");
 }
+
+#[test]
+fn a_transition_after_its_owner_run_ended_still_resolves_its_subject() {
+    // A `stopped` transition publishes after the owner Run's end commits,
+    // so the snapshot no longer holds the owner: the filter resolves the
+    // instance's newest owner Run, ended or not, and a Selector still sees
+    // the transition an operator most wants.
+    let base = TempDir::new().unwrap();
+    drop(seeded_engine(&base));
+    {
+        let conn = rusqlite::Connection::open(base.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at, ended_at) SELECT \
+             'run_OLD', 'supervised', 0, 'ended', '', id, 1, 't', 't', 't' \
+             FROM agent_instances WHERE name = 'demo'; \
+             INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+             instance_id, process_owner, created_at, updated_at, ended_at) SELECT \
+             'run_OWN', 'supervised', 0, 'ended', '', id, 1, 't', 't', 't' \
+             FROM agent_instances WHERE name = 'demo'; \
+             INSERT INTO run_labels (run_id, key, value, source, origin) VALUES \
+             ('run_OWN', 'team', 'core', 'bound', 'config');",
+        )
+        .unwrap();
+    }
+    let engine = Engine::open(Some(base.path().to_path_buf())).unwrap();
+    let stopped = EngineEvent::Transition(TransitionEvent::new(
+        "demo",
+        LifecycleState::Stopping,
+        LifecycleState::Stopped,
+        TransitionCause::Command {
+            command: "stop".to_string(),
+        },
+        "t",
+    ));
+    let labels = engine
+        .blocking()
+        .event_subject_labels(&stopped)
+        .unwrap()
+        .expect("the newest owner Run, though it has ended");
+    assert_eq!(
+        labels,
+        vec![Label::bound("team", "core")],
+        "run_OWN, not run_OLD"
+    );
+}

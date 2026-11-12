@@ -294,6 +294,14 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// The instance's open process-owning Run.
     fn open_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError>;
 
+    /// The instance's NEWEST process-owning Run, ended or not (story 21-5):
+    /// the subject of a transition published after its owner Run's end
+    /// committed (a `stopped` or `failed` transition), so a Selector-
+    /// filtered event stream still sees it. ULID ids sort by creation, and
+    /// at most one owner is open, so the open owner is the newest when it
+    /// exists.
+    fn latest_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError>;
+
     /// The non-ended descendants of a Run hosted in the same process (same
     /// instance, not process owners), oldest first.
     fn open_in_process_descendants(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;

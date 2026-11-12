@@ -922,6 +922,15 @@ impl RunRecords for SqliteStore {
             .pop())
     }
 
+    fn latest_process_run(&self, instance: &InstanceName) -> Result<Option<RunRecord>, StoreError> {
+        Ok(self
+            .records(
+                "WHERE i.name = ?1 AND r.process_owner = 1 ORDER BY r.run_id DESC LIMIT 1",
+                [instance.as_str()],
+            )?
+            .pop())
+    }
+
     fn open_in_process_descendants(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError> {
         self.records(
             "WHERE r.run_id IN (\

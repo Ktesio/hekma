@@ -427,14 +427,17 @@ impl Registry {
                     .map(|entry| entry.record.run_id.clone())
                     .or_else(|| {
                         // Not in the snapshot (a fresh engine, or the Run
-                        // just ended): the read-only store read.
+                        // just ended — a `stopped`/`failed` transition
+                        // publishes after its owner Run's end commits): the
+                        // read-only store read of the instance's NEWEST
+                        // owner Run, ended or not.
                         InstanceName::new(&transition.instance)
                             .ok()
                             .and_then(|name| {
                                 self.store
                                     .snapshot(|store| {
                                         use crate::ports::RunRecords as _;
-                                        store.open_process_run(&name)
+                                        store.latest_process_run(&name)
                                     })
                                     .ok()
                                     .flatten()
