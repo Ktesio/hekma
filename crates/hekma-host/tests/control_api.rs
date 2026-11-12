@@ -997,13 +997,17 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
     // leg): the idle file never lands, so an empty-form drain on the
     // MANIFEST tier burns the declared 800ms and reports the timed-out
     // shape. This is the leg that distinguishes the tiers: the asserted
-    // band below (700..5000ms) is reachable ONLY by the 800ms manifest
-    // bound timing out. The fixture's self-exit is parked at 6000ms —
+    // band below (700..2500ms) is reachable ONLY by the 800ms manifest
+    // bound timing out. The fixture's self-exit is parked at 3000ms —
     // PAST that ceiling — so if the empty forms regressed to the route's
-    // 30s default, the child's own exit ends the wait at ~6000ms and the
+    // 30s default, the child's own exit ends the wait at ~3000ms and the
     // leg fails the ceiling fast instead of hanging for the full window
     // (the completed-shape legs above pass under any bound above ~500ms,
-    // so they cannot see the difference on their own).
+    // so they cannot see the difference on their own). The same short
+    // exit keeps the Windows stop that follows this drain (~3s — the
+    // graceful step there only waits, no signal to lean on) far inside
+    // the suite client's 10s response timeout, the sibling pattern the
+    // 1200ms-exit fixtures below use for the same reason.
     let _stalled_fixture = registered_drain_fake_agent(
         &base,
         "stalleddrain",
@@ -1011,7 +1015,7 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
             "--linger-ms",
             "600000",
             "--exit-on-pause",
-            "6000:pause.sentinel",
+            "3000:pause.sentinel",
         ],
         "timeout_ms = 800\nidle_file = \"never.sentinel\"",
     );
@@ -1136,7 +1140,7 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
     // file never lands, so the `{}` drain burns the manifest's declared
     // 800ms and reports the timed-out shape inside a band ONLY that bound
     // can produce. If the empty forms resolved to the route's 30s default
-    // instead of the manifest tier, the child's own 6000ms self-exit
+    // instead of the manifest tier, the child's own 3000ms self-exit
     // would end the wait past the ceiling below and fail it — the
     // completed-shape legs above cannot see that difference on their own.
     let mut response = client
@@ -1157,7 +1161,7 @@ fn the_drain_route_rejects_a_non_object_body_and_reads_the_empty_forms_as_the_ma
         "the stalled empty-form drain genuinely burned toward its 800ms manifest bound (waited {waited}ms)"
     );
     assert!(
-        waited < 5000,
+        waited < 2500,
         "the stalled empty-form drain ran on the MANIFEST tier, not the 30s default (waited {waited}ms)"
     );
 
