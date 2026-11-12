@@ -655,6 +655,34 @@ impl Supervisor {
         }
     }
 
+    /// Revoke the credentials an observed instance's listener refused in a
+    /// URL (story 22-1, R1.12) — through the same resolved-only path as the
+    /// Control API ([`Self::revoke_exposed`]). Best-effort: a store failure is
+    /// surfaced as a diagnostic, and the refusal already stood.
+    pub(super) fn drain_exposed_for(&mut self, registry: &Registry, name: &InstanceName) {
+        let Some(listener) = self
+            .running
+            .get(name)
+            .and_then(|s| s.observed_listener.as_ref())
+        else {
+            return;
+        };
+        let tokens: Vec<crate::domain::SecretString> = match listener.exposed().lock() {
+            Ok(mut queued) => queued.drain(..).collect(),
+            Err(_) => return,
+        };
+        if tokens.is_empty() {
+            return;
+        }
+        if let Err(err) = self.revoke_exposed(registry, &tokens) {
+            self.emit_diagnostic(&format!(
+                "{}: a credential the metering listener saw in a URL could not be revoked \
+                 ({err}); revoke the Run's keys with `hekma run revoke-keys`",
+                name.as_str()
+            ));
+        }
+    }
+
     /// Drain ENGINE-OBSERVED usage from EVERY currently-running observed instance
     /// (story 3-4 — the reaper cadence, parallel to [`Self::drain_usage_all`]).
     /// Best-effort per instance — one instance's drain never blocks another's or
@@ -701,6 +729,7 @@ impl Supervisor {
         name: &InstanceName,
         mode: DrainMode,
     ) {
+        self.drain_exposed_for(registry, name);
         // Read the Run context; park-retry first, then drain the queue, all under
         // the instance's held state (a short critical section). Ingest happens
         // OUTSIDE the borrow so `ingest_usage` can take `&mut self`.

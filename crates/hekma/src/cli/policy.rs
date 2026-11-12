@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use hekma_engine::{
-    parse_dollars_to_micros, BreachAction, PolicyChange, PolicyLimits, PolicyOutcome, PolicyRecord,
-    Rate, RunError, Selector,
+    parse_dollars_to_micros, render_dollars_bare, BreachAction, Micros, PolicyChange, PolicyLimits,
+    PolicyOutcome, PolicyRecord, Rate, RunError, Selector,
 };
 use serde_json::{json, Value};
 
@@ -199,6 +199,12 @@ fn engine_error(err: RunError) -> Box<dyn std::error::Error> {
     run_error_class(&err, message)
 }
 
+/// A micro-dollar amount as `$X.XX`, through the engine's one currency
+/// module (callers carry the estimate qualifier: `est.` or `(estimated)`).
+fn render_micros(micros: u64) -> String {
+    render_dollars_bare(Micros(i64::try_from(micros).unwrap_or(i64::MAX)))
+}
+
 fn limits_summary(limits: &PolicyLimits) -> String {
     let mut parts = Vec::new();
     if let Some(tokens) = limits.tokens_per_run {
@@ -208,22 +214,19 @@ fn limits_summary(limits: &PolicyLimits) -> String {
         parts.push(format!("tokens cumulative {tokens}"));
     }
     if let Some(micros) = limits.dollars_per_run_micros {
-        parts.push(format!("est. ${:.2}/run", micros as f64 / 1_000_000.0));
+        parts.push(format!("est. {}/run", render_micros(micros)));
     }
     if let Some(micros) = limits.dollars_cumulative_micros {
-        parts.push(format!(
-            "est. ${:.2} cumulative",
-            micros as f64 / 1_000_000.0
-        ));
+        parts.push(format!("est. {} cumulative", render_micros(micros)));
     }
     if let Some(action) = limits.breach_action {
         parts.push(format!("on breach {}", action_str(action)));
     }
     if let Some(rate) = limits.rate {
         parts.push(format!(
-            "rate ${:.2}/${:.2} per 1M in/out",
-            rate.input_micros_per_1m as f64 / 1_000_000.0,
-            rate.output_micros_per_1m as f64 / 1_000_000.0
+            "rate {}/{} per 1M in/out",
+            render_micros(rate.input_micros_per_1m),
+            render_micros(rate.output_micros_per_1m)
         ));
     }
     if parts.is_empty() {
@@ -291,9 +294,9 @@ pub fn show(name: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", policy_line(&policy));
     for (model, rate) in &policy.rates {
         println!(
-            "  rate for {model}: ${:.2} in / ${:.2} out per 1M tokens (estimated)",
-            rate.input_micros_per_1m as f64 / 1_000_000.0,
-            rate.output_micros_per_1m as f64 / 1_000_000.0
+            "  rate for {model}: {} in / {} out per 1M tokens (estimated)",
+            render_micros(rate.input_micros_per_1m),
+            render_micros(rate.output_micros_per_1m)
         );
     }
     Ok(())

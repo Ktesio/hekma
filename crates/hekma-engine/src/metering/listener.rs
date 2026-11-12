@@ -207,6 +207,18 @@ const HOP_BY_HOP_HEADERS: &[HeaderName] = &[
 /// NEVER a body, header, or key (the no-leak invariant).
 pub type ObservedQueue = Arc<Mutex<VecDeque<(u64, u64, u64)>>>;
 
+/// The credentials a request carried in its URL (story 22-1, R1.12): the
+/// listener refuses the request and queues each COMPLETE token it saw here;
+/// the reaper drains the queue and revokes the ones that resolve to an
+/// active credential — the same resolved-only path as the Control API, so a
+/// URL full of token-shaped noise never costs a write. Bounded at
+/// [`EXPOSED_QUEUE_MAX`]: past it a token is dropped (the request is still
+/// refused), so a flood cannot grow memory.
+pub(crate) type ExposedQueue = Arc<Mutex<Vec<crate::domain::SecretString>>>;
+
+/// The most exposed tokens the listener holds between two reaper drains.
+pub(crate) const EXPOSED_QUEUE_MAX: usize = 64;
+
 /// Why the loopback forward listener could not START (story 3-4). `thiserror`
 /// only (no `miette` in the lib — conventions). Every variant carries ONLY a
 /// static op label + a transport-shaped detail — NEVER a request/response body, a
@@ -280,6 +292,9 @@ pub struct ObservedListener {
     /// `block` breach, checked lock-free by `forward()` on every request.
     /// Born down with the listener, so every reason clears with the Run.
     fence: WireFence,
+    /// Story 22-1: complete tokens seen in a refused request's URL, for the
+    /// reaper to revoke.
+    exposed: ExposedQueue,
 }
 
 impl ObservedListener {
@@ -397,6 +412,7 @@ impl ObservedListener {
 
         let base_url = format!("http://{local_addr}");
         let queue: ObservedQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let exposed: ExposedQueue = Arc::new(Mutex::new(Vec::new()));
 
         // Spawn the accept loop on the engine runtime. It is aborted on drop
         // (teardown at the terminal transition — bounded to the Run).
@@ -407,6 +423,7 @@ impl ObservedListener {
             task_queue,
             forward_client(tls),
             fence.clone(),
+            Arc::clone(&exposed),
         ));
 
         Ok(ObservedListener {
@@ -415,6 +432,7 @@ impl ObservedListener {
             task: task.abort_handle(),
             queue,
             fence,
+            exposed,
         })
     }
 
@@ -444,6 +462,12 @@ impl ObservedListener {
     /// `block` breach; `forward()` refuses while it is up. Cloned `Arc`.
     pub(crate) fn fence(&self) -> WireFence {
         self.fence.clone()
+    }
+
+    /// The tokens refused requests carried in their URLs (story 22-1),
+    /// drained by the reaper. Cloned `Arc`.
+    pub(crate) fn exposed(&self) -> ExposedQueue {
+        Arc::clone(&self.exposed)
     }
 }
 
@@ -491,6 +515,7 @@ async fn accept_loop(
     queue: ObservedQueue,
     client: ForwardClient,
     fence: WireFence,
+    exposed: ExposedQueue,
 ) {
     // One shared forward client (connection pooling to the upstream). The
     // legacy client is the lean hyper-util outbound leg; it carries a
@@ -512,6 +537,7 @@ async fn accept_loop(
         let conn_client = client.clone();
         let conn_queue = Arc::clone(&queue);
         let conn_fence = fence.clone();
+        let conn_exposed = Arc::clone(&exposed);
         // Serve each connection on its own task so a slow agent connection does not
         // block accepting the next one. The service forwards every request upstream.
         tokio::spawn(async move {
@@ -520,9 +546,10 @@ async fn accept_loop(
                 let client = conn_client.clone();
                 let queue = Arc::clone(&conn_queue);
                 let fence = conn_fence.clone();
+                let exposed = Arc::clone(&conn_exposed);
                 async move {
                     Ok::<_, std::convert::Infallible>(
-                        forward(req, upstream, client, queue, fence).await,
+                        forward(req, upstream, client, queue, fence, exposed).await,
                     )
                 }
             });
@@ -567,7 +594,23 @@ async fn forward(
     client: ForwardClient,
     queue: ObservedQueue,
     fence: WireFence,
+    exposed: ExposedQueue,
 ) -> Response<Full<Bytes>> {
+    // Story 22-1 (R1.12, a `proxy-wire v1` addition): a credential in the
+    // path or query is refused BEFORE any upstream dial — the typed,
+    // non-retryable 400, the body drained and never echoed. A complete
+    // token so exposed is queued for the reaper to revoke.
+    let target = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("");
+    let scan = crate::domain::credential::scan_url(target);
+    if scan.found {
+        note_exposed(&exposed, scan.tokens);
+        drain_request_body(req.into_body()).await;
+        return credential_in_url_response();
+    }
     if !is_fence_exempt(req.method()) {
         if let Some(refusal) = fence.refusal() {
             // An `Expect: 100-continue` client has not sent its body yet:
@@ -625,10 +668,17 @@ async fn forward(
     // frames the known length itself.
     if let Some(headers) = builder.headers_mut() {
         for (name, value) in parts.headers.iter() {
-            if name == hyper::header::HOST || is_hop_by_hop(name) {
+            // Story 22-1: the Run Key identification header never reaches
+            // the provider (custody's full strip set lands with custody).
+            if name == hyper::header::HOST || is_hop_by_hop(name) || name == RUN_KEY_HEADER {
                 continue;
             }
-            headers.append(name, value.clone());
+            let mut value = value.clone();
+            if name == hyper::header::AUTHORIZATION || name == hyper::header::PROXY_AUTHORIZATION {
+                // A credential header value is sensitive from here on.
+                value.set_sensitive(true);
+            }
+            headers.append(name, value);
         }
     }
     let Ok(outbound) = builder.body(Full::new(req_bytes)) else {
@@ -853,6 +903,47 @@ fn build_upstream_uri(upstream: &str, uri: &hyper::Uri) -> Option<hyper::Uri> {
         return None;
     }
     format!("{base}{path_and_query}").parse::<hyper::Uri>().ok()
+}
+
+/// Queue `tokens` for revocation, up to [`EXPOSED_QUEUE_MAX`] (a poisoned
+/// lock or a full queue drops them: the request is refused either way).
+fn note_exposed(exposed: &ExposedQueue, tokens: Vec<crate::domain::SecretString>) {
+    if let Ok(mut queued) = exposed.lock() {
+        for token in tokens {
+            if queued.len() >= EXPOSED_QUEUE_MAX {
+                break;
+            }
+            queued.push(token);
+        }
+    }
+}
+
+/// The Run Key identification header (spine AD-26): stripped before any
+/// request is forwarded.
+const RUN_KEY_HEADER: &str = "x-hekma-run-key";
+
+/// The `proxy-wire v1` refusal for a credential in a URL (story 22-1): a
+/// static body that echoes nothing, `x-should-retry: false`.
+fn credential_in_url_response() -> Response<Full<Bytes>> {
+    let body = format!(
+        "{{\"type\":\"error\",\"error\":{{\"type\":\"hekma_credential_in_url\",\
+         \"code\":\"credential_in_url\",\"message\":\"Credentials never go in a URL; send \
+         them in a header. This request was not forwarded.\",\"param\":null,\
+         \"proxy_wire\":\"{wire}\"}}}}",
+        wire = crate::domain::PROXY_WIRE_VERSION,
+    );
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = hyper::StatusCode::BAD_REQUEST;
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        hyper::header::HeaderName::from_static("x-should-retry"),
+        hyper::header::HeaderValue::from_static("false"),
+    );
+    response
 }
 
 /// An honest `502 Bad Gateway` with a STATIC body (no request/response traffic, no
@@ -1417,6 +1508,82 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_credential_in_the_url_is_refused_and_never_reaches_the_upstream() {
+        // Story 22-1 (R1.12): the upstream fake asserts no request arrived.
+        let upstream = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let token = format!("hk_run_{}", "A".repeat(52));
+        for target in [
+            format!("/v1/models/{token}"),
+            format!("/v1/chat/completions?key={}", token.replace('_', "%5F")),
+            format!("/v1/models?k={}", &token.to_ascii_lowercase()[..20]),
+        ] {
+            let req = format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let auth = authority.clone();
+            let resp = std::thread::spawn(move || raw_request(&auth, &req))
+                .join()
+                .unwrap();
+            let text = String::from_utf8_lossy(&resp);
+            assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+            assert!(text.contains("hekma_credential_in_url"), "{text}");
+            assert!(text.contains("\"proxy_wire\":\"v1\""), "{text}");
+            assert!(
+                text.to_ascii_lowercase().contains("x-should-retry: false"),
+                "{text}"
+            );
+            assert!(
+                !text.to_ascii_uppercase().contains(&"A".repeat(30)),
+                "no echo"
+            );
+        }
+        assert!(
+            matches!(upstream.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "the upstream received a request"
+        );
+        // The body is the documented static shape.
+        let body = credential_in_url_response();
+        assert_eq!(body.status(), hyper::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_run_key_header_is_stripped_before_forwarding() {
+        // Story 22-1: `x-hekma-run-key` never reaches the provider; the
+        // agent's own Authorization still does.
+        let response: &'static [u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (upstream_url, upstream_join) = spawn_oneshot_upstream(response);
+        let rt = test_runtime();
+        let listener = ObservedListener::start(rt.handle(), upstream_url).unwrap();
+        let authority = listener
+            .base_url()
+            .strip_prefix("http://")
+            .unwrap()
+            .to_string();
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer sk-agent\r\nX-Hekma-Run-Key: hk_run_SENTINEL\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        let auth = authority.clone();
+        let resp = std::thread::spawn(move || raw_request(&auth, &req))
+            .join()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200"));
+        let seen = upstream_join.join().unwrap().to_ascii_lowercase();
+        assert!(!seen.contains("x-hekma-run-key"), "{seen}");
+        assert!(!seen.contains("sentinel"), "{seen}");
+        assert!(seen.contains("authorization: bearer sk-agent"), "{seen}");
     }
 
     #[test]

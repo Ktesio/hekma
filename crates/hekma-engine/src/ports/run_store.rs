@@ -19,6 +19,7 @@
 //! Run and Policy tables of stories 21.2 and 21.3 settle its surface.
 
 use super::StoreError;
+use crate::domain::credential::{TokenClass, TokenHash, TokenState};
 use crate::domain::runs::policy::{PolicyRecord, PolicyResolution, ResolveInputs, RunPolicy};
 use crate::domain::{
     BreachAction, BudgetBreachEvent, EngineEvent, InstanceName, Label, LabelSource, LatchKey,
@@ -254,6 +255,23 @@ pub(crate) trait PolicyRecords {
     /// and whether its instance is kept on `pause` by the upgrade (the
     /// pipeline's live per-event resolution).
     fn run_resolution_facts(&self, run_id: &RunId) -> Result<Option<ResolutionFacts>, StoreError>;
+
+    /// Every open process-owning Run's resolution facts plus every
+    /// instance kept on `pause` by the upgrade, in a fixed handful of
+    /// queries (the Fleet read's batch: one pass for the whole Fleet, not
+    /// one per row). Each entry equals what [`Self::run_resolution_facts`]
+    /// reads for that Run.
+    fn open_owner_resolution_facts(&self) -> Result<OpenOwnerFacts, StoreError>;
+}
+
+/// The Fleet read's batched resolution facts (story 21-3's perf pass):
+/// what [`PolicyRecords::open_owner_resolution_facts`] reads.
+pub(crate) struct OpenOwnerFacts {
+    /// Every open process-owning Run's facts (at most one per instance,
+    /// the partial unique index), each as `run_resolution_facts` reads it.
+    pub runs: Vec<ResolutionFacts>,
+    /// The names of every instance kept on `pause` by the upgrade.
+    pub kept: std::collections::HashSet<String>,
 }
 
 /// One Run's resolution facts (story 21-3): everything the live per-event
@@ -266,10 +284,24 @@ pub(crate) struct ResolutionFacts {
     pub record: RunRecord,
     /// Its labels, sorted by key.
     pub labels: Vec<Label>,
-    /// The limits set directly on it.
+    /// The limits set directly on it (the Operator/Host layer).
     pub limits: RunLimits,
+    /// The limits a Caller set on it (their own layer: they apply only
+    /// where tighter than the resolved value).
+    pub caller_limits: RunLimits,
     /// Its instance is kept on `pause` by the FR-21 upgrade.
     pub kept_on_pause: bool,
+}
+
+/// Which layer of a Run's own limits a write replaces (story 21-6): the
+/// Operator/Host layer outranks configuration and Policies; the Caller
+/// layer applies only where it is tighter than everything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LimitSlot {
+    /// Set by an Operator or a Host.
+    Run,
+    /// Set by a Caller.
+    Caller,
 }
 
 /// The Run registry's storage (story 21-2, AD-25): the Run rows, their labels,
@@ -285,8 +317,28 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// A Run's labels, sorted by key.
     fn run_labels(&self, run_id: &RunId) -> Result<Vec<Label>, StoreError>;
 
-    /// The limits set directly on a Run.
+    /// The limits set directly on a Run (the Operator/Host layer).
     fn run_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError>;
+
+    /// The limits a Caller set on a Run (story 21-6: their own layer, kept
+    /// apart so they apply only while tighter than the resolved value).
+    fn run_caller_limits(&self, run_id: &RunId) -> Result<RunLimits, StoreError>;
+
+    /// Replace one layer of a Run's `run_limits` (story 21-6, the budget
+    /// job): `limits` becomes that layer's whole set, plus the action row
+    /// that decides the layer's Breach Action (set or explicitly unset). A
+    /// row whose value does not change keeps its `source` and `set_at`;
+    /// a new or changed row is written with `source` (the actor) and `at`.
+    /// An empty `limits` deletes the layer's rows. The other layer is never
+    /// touched.
+    fn replace_run_limits(
+        &self,
+        run_id: &RunId,
+        slot: LimitSlot,
+        limits: &RunLimits,
+        source: &str,
+        at: &str,
+    ) -> Result<(), StoreError>;
 
     /// The Run and its ancestors, the Run first.
     fn run_chain(&self, run_id: &RunId) -> Result<Vec<RunRecord>, StoreError>;
@@ -368,4 +420,63 @@ pub(crate) trait RunRecords: PolicyRecords {
     /// upgrade) gets an `ended` placeholder, end cause `unregistered`, so the
     /// latch's reference holds and the usage commit never fails on it.
     fn ensure_run_row(&self, run_id: &RunId, instance: &InstanceName) -> Result<(), StoreError>;
+
+    // Story 22-1: the credential port (`tokens`, schema v17). A hash leaves
+    // the store layer only as a [`TokenHash`] (for the snapshot); every read
+    // a surface renders is metadata.
+
+    /// Insert one token row.
+    fn insert_token(&self, token: &TokenRow) -> Result<(), StoreError>;
+
+    /// The row for one hash — the in-transaction validity read every
+    /// Caller-authorized job makes.
+    fn token(&self, hash: &TokenHash) -> Result<Option<TokenRow>, StoreError>;
+
+    /// Move one token to `state` (`retired` or `revoked`) at `at`, with its
+    /// cause. Only an `active` row moves; returns whether it did.
+    fn set_token_state(
+        &self,
+        hash: &TokenHash,
+        state: TokenState,
+        at: &str,
+        cause: &str,
+    ) -> Result<bool, StoreError>;
+
+    /// Move one `retired` token (a used refresh credential) to `revoked`
+    /// at `at`, with its cause: once revoked, presenting it again is a plain
+    /// refusal, never reuse. Returns whether it moved.
+    fn revoke_retired(&self, hash: &TokenHash, at: &str, cause: &str) -> Result<bool, StoreError>;
+
+    /// A Run's active tokens, oldest first.
+    fn active_tokens(&self, run_id: &RunId) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every token of a Run, any state, oldest first (the metadata listing
+    /// and the cascade's roots).
+    fn run_tokens(&self, run_id: &RunId) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every ACTIVE token whose `issued_by` chain starts at one of `roots`
+    /// (the cascade walk: recursive over `issued_by_hash`), oldest first.
+    fn active_issued_under(&self, roots: &[TokenHash]) -> Result<Vec<TokenRow>, StoreError>;
+
+    /// Every active Run Key and announce credential of a non-ended Run (the
+    /// snapshot's key index at open).
+    fn active_key_rows(&self) -> Result<Vec<TokenRow>, StoreError>;
+}
+
+/// One stored credential (story 22-1, `tokens`): its hash and metadata,
+/// never its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TokenRow {
+    pub hash: TokenHash,
+    pub token_id: String,
+    pub class: TokenClass,
+    pub run_id: RunId,
+    pub launch_generation: Option<u64>,
+    pub paired_hash: Option<TokenHash>,
+    pub issued_by_hash: Option<TokenHash>,
+    pub custody_eligible: bool,
+    pub state: TokenState,
+    pub issued_at: String,
+    pub revoked_at: Option<String>,
+    pub revoke_cause: Option<String>,
 }

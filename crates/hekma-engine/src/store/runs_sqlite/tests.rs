@@ -74,6 +74,7 @@ fn a_run_round_trips_with_its_labels_limits_and_identity() {
                 token_per_run: Some(100),
                 dollar_per_run_micros: Some(Micros(5)),
                 breach_action: Some(BreachAction::Warn),
+                ..RunLimits::default()
             },
             identity: Some(("host".to_string(), "job-1".to_string())),
         })
@@ -688,7 +689,7 @@ fn the_v16_step_adds_the_three_listing_indexes() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 16, "the listing indexes are the v16 step");
+    const { assert!(SCHEMA_VERSION >= 16, "the listing indexes are the v16 step") };
     let mut stmt = store
         .conn()
         .prepare(
@@ -1212,7 +1213,8 @@ fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
         .conn()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    // The v16 step ran (and every later one: v17 is additive).
+    assert_eq!(version, SCHEMA_VERSION);
     for index in ["idx_runs_open", "idx_runs_exception", "idx_runs_ended_at"] {
         let present: i64 = reopened
             .conn()
@@ -1316,4 +1318,89 @@ fn the_view_sql_matches_the_specification_predicates_row_by_row() {
         .unwrap();
     assert_eq!(counts.healthy_open, expected_healthy);
     assert_eq!(counts.listed, expected_all.len() as u64);
+}
+
+#[test]
+fn the_v17_step_adds_the_tokens_table_and_its_three_indexes() {
+    // Story 22-1: `tokens` with its CHECKs and the three indexes.
+    let (_tmp, store) = store();
+    assert_eq!(SCHEMA_VERSION, 17, "tokens is the v17 step");
+    for (kind, name) in [
+        ("table", "tokens"),
+        ("index", "idx_tokens_run"),
+        ("index", "idx_tokens_active"),
+        ("index", "idx_tokens_issued_by"),
+    ] {
+        let present: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{name}");
+    }
+    // A hash of the wrong length and an unknown class or state are refused.
+    store
+        .conn()
+        .execute_batch(
+            "INSERT INTO runs (run_id, control_depth, status, created_at, updated_at) \
+         VALUES ('run_T', 'announced', 'active', 't', 't')",
+        )
+        .unwrap();
+    for (hash, class, state) in [
+        ("x'00'", "'run'", "'active'"),
+        ("zeroblob(32)", "'bogus'", "'active'"),
+        ("zeroblob(32)", "'run'", "'bogus'"),
+    ] {
+        let refused = store.conn().execute_batch(&format!(
+            "INSERT INTO tokens (token_hash, token_id, class, run_id, state, issued_at) \
+             VALUES ({hash}, 'id', {class}, 'run_T', {state}, 't')"
+        ));
+        assert!(refused.is_err(), "{hash} {class} {state}");
+    }
+}
+
+#[test]
+fn a_v16_state_dir_migrates_to_v17_and_a_live_run_keeps_running_without_a_key() {
+    // Story 22-1: rebuild the v16 shape (v17 adds only `tokens` and its
+    // indexes): drop them and stamp 16, with a live supervised Run; reopen
+    // — the v17 step runs, stamps 17, and the Run is untouched with no
+    // credential (no backfill).
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("state.db");
+    {
+        let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'a', 'mock', 'running', '/h', 't', 't'); \
+                 INSERT INTO runs (run_id, control_depth, status, instance_id, process_owner, \
+                 created_at, updated_at) VALUES ('run_LIVE', 'supervised', 'active', 1, 1, \
+                 't', 't'); \
+                 DROP INDEX idx_tokens_run; DROP INDEX idx_tokens_active; \
+                 DROP INDEX idx_tokens_issued_by; DROP TABLE tokens; \
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+    }
+    let reopened = SqliteStore::open(&db).unwrap();
+    let version: i64 = reopened
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 17);
+    let run = RunId::from_wire("run_LIVE");
+    assert_eq!(
+        reopened.run_record(&run).unwrap().unwrap().status,
+        RunStatus::Active
+    );
+    assert!(reopened.run_tokens(&run).unwrap().is_empty(), "no backfill");
+    assert!(reopened.active_key_rows().unwrap().is_empty());
+    // Reopening at v17 runs nothing again (idempotent).
+    drop(reopened);
+    let again = SqliteStore::open(&db).unwrap();
+    assert!(again.run_tokens(&run).unwrap().is_empty());
 }

@@ -234,6 +234,132 @@ pub fn verb_cell(verb: RunVerb, depth: ControlDepth, wire_path: bool) -> VerbCel
     }
 }
 
+/// A lifecycle verb addressed to a Run (story 21-6, PRD FR-50): mapped to
+/// the instance verb on a process-owning Run, answered from the verb ×
+/// depth table on any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunLifecycleVerb {
+    /// `stop`.
+    Stop,
+    /// `pause`.
+    Pause,
+    /// `resume`.
+    Resume,
+    /// `drain` (pause, a bounded wait, then stop).
+    Drain,
+}
+
+impl RunLifecycleVerb {
+    /// Every verb.
+    pub const ALL: [RunLifecycleVerb; 4] = [
+        RunLifecycleVerb::Stop,
+        RunLifecycleVerb::Pause,
+        RunLifecycleVerb::Resume,
+        RunLifecycleVerb::Drain,
+    ];
+
+    /// The stable wire form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunLifecycleVerb::Stop => "stop",
+            RunLifecycleVerb::Pause => "pause",
+            RunLifecycleVerb::Resume => "resume",
+            RunLifecycleVerb::Drain => "drain",
+        }
+    }
+
+    /// Parse the wire form.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|verb| verb.as_str() == raw)
+    }
+
+    /// The FR-49 table row the verb is answered from (a drain ends in a
+    /// stop, so it is served where `stop` is).
+    pub fn table_row(&self) -> RunVerb {
+        match self {
+            RunLifecycleVerb::Stop | RunLifecycleVerb::Drain => RunVerb::Stop,
+            RunLifecycleVerb::Pause | RunLifecycleVerb::Resume => RunVerb::PauseResume,
+        }
+    }
+}
+
+/// Whether `verb` acts on `record`, and on which instance (story 21-6):
+/// `Ok(instance)` when the Run owns its instance's supervised process and
+/// the table serves the cell (the instance verb then runs with today's
+/// semantics); otherwise the per-Run refusal — an ended Run, a child held by
+/// its parent (`resume`), or the cell's own refusal naming the depth (or
+/// the Metering Source). No cell is flipped here: a child Run's lifecycle
+/// verbs act on its calls, which arrive with wire hold.
+pub(crate) fn run_verb_target(
+    verb: RunLifecycleVerb,
+    record: &super::RunRecord,
+) -> Result<String, super::RunError> {
+    let run_id = record.run_id.as_str().to_string();
+    if record.is_ended() {
+        return Err(super::RunError::RunEnded { run_id });
+    }
+    let depth = record.control_depth.display_with_wire(record.wire_path);
+    let cell = verb_cell(verb.table_row(), record.control_depth, record.wire_path);
+    if record.process_owner && cell.available {
+        return record
+            .instance
+            .clone()
+            .ok_or_else(|| super::RunError::Invalid {
+                field: "run".to_string(),
+                reason: format!("Run `{run_id}` owns a process but names no agent"),
+            });
+    }
+    let host = record
+        .instance
+        .as_deref()
+        .map(|instance| {
+            format!(
+                "the agent that hosts it (`hekma agent {} {instance}`)",
+                verb.as_str()
+            )
+        })
+        .unwrap_or_else(|| "the agent that hosts it".to_string());
+    let reason = if verb == RunLifecycleVerb::Resume
+        && record.status == super::RunStatus::Held
+        && !record.process_owner
+    {
+        let parent = record
+            .parent_run_id
+            .as_ref()
+            .map(|parent| format!("`{parent}`"))
+            .unwrap_or_else(|| "Run".to_string());
+        format!(
+            "it is held because its parent Run {parent} is paused (parent-paused) — resume {}",
+            record
+                .instance
+                .as_deref()
+                .map(|instance| format!(
+                    "the agent that hosts it (`hekma agent resume {instance}`)"
+                ))
+                .unwrap_or_else(|| "its parent".to_string())
+        )
+    } else {
+        format!(
+            "on a {depth} Run, {} acts on its model calls ({}), which is not available until \
+             wire hold lands — {} {host}, or end the Run with `hekma run close {run_id}`",
+            verb.as_str(),
+            cell.note,
+            match verb {
+                RunLifecycleVerb::Stop | RunLifecycleVerb::Drain => "stop",
+                RunLifecycleVerb::Pause => "pause",
+                RunLifecycleVerb::Resume => "resume",
+            },
+        )
+    };
+    Err(super::RunError::VerbUnavailable {
+        run_id,
+        verb: verb.as_str().to_string(),
+        depth,
+        reason,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +408,92 @@ mod tests {
             )
             .available
         );
+    }
+
+    fn record(process_owner: bool, status: super::super::RunStatus) -> super::super::RunRecord {
+        super::super::RunRecord {
+            run_id: crate::domain::usage::RunId::from_wire("run_X"),
+            control_depth: if process_owner {
+                ControlDepth::Supervised
+            } else {
+                ControlDepth::Announced
+            },
+            wire_path: true,
+            status,
+            anomalies: Vec::new(),
+            parent_run_id: (!process_owner)
+                .then(|| crate::domain::usage::RunId::from_wire("run_P")),
+            instance: Some("agent".to_string()),
+            process_owner,
+            end_cause: None,
+            created_at: "t".to_string(),
+            updated_at: "t".to_string(),
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn a_run_verb_maps_to_its_instance_or_answers_its_cell_per_run() {
+        use super::super::RunStatus;
+        for verb in RunLifecycleVerb::ALL {
+            assert_eq!(RunLifecycleVerb::from_wire(verb.as_str()), Some(verb));
+            // The process-owning Run: the instance's own verb.
+            assert_eq!(
+                run_verb_target(verb, &record(true, RunStatus::Active)).unwrap(),
+                "agent"
+            );
+            // An ended Run: `run-ended`.
+            assert_eq!(
+                run_verb_target(verb, &record(true, RunStatus::Ended))
+                    .unwrap_err()
+                    .code(),
+                "run-ended"
+            );
+            // A child: refused per Run, naming its depth and the calls.
+            let err = run_verb_target(verb, &record(false, RunStatus::Active)).unwrap_err();
+            assert_eq!(err.code(), "verb-unavailable");
+            let text = err.to_string();
+            assert!(
+                text.contains("announced") && text.contains("model calls"),
+                "{text}"
+            );
+            assert!(text.contains("hekma run close run_X"), "{text}");
+        }
+        assert_eq!(RunLifecycleVerb::from_wire("start"), None);
+        assert_eq!(RunLifecycleVerb::Drain.table_row(), RunVerb::Stop);
+        // A held child's resume names the parent that holds it.
+        let err = run_verb_target(RunLifecycleVerb::Resume, &record(false, RunStatus::Held))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("parent Run `run_P`") && err.contains("parent-paused"),
+            "{err}"
+        );
+        assert!(err.contains("hekma agent resume agent"), "{err}");
+        // A process-owning Run without an agent is a typed refusal.
+        let mut orphan = record(true, RunStatus::Active);
+        orphan.instance = None;
+        assert_eq!(
+            run_verb_target(RunLifecycleVerb::Stop, &orphan)
+                .unwrap_err()
+                .code(),
+            "invalid-request"
+        );
+        let mut hostless = record(false, RunStatus::Held);
+        hostless.instance = None;
+        hostless.parent_run_id = None;
+        let err = run_verb_target(RunLifecycleVerb::Resume, &hostless)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("resume its parent"), "{err}");
+        assert!(run_verb_target(RunLifecycleVerb::Stop, &{
+            let mut child = record(false, RunStatus::Active);
+            child.instance = None;
+            child
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("the agent that hosts it"));
     }
 
     #[test]

@@ -6447,9 +6447,10 @@ fn transitions_land_in_the_outbox_with_monotonic_seqs() {
         assert!(
             matches!(
                 entry.event,
-                EngineEvent::Transition(_) | EngineEvent::Run(_)
+                EngineEvent::Transition(_) | EngineEvent::Run(_) | EngineEvent::Credential(_)
             ),
-            "start/stop commit transitions and their Run events: {entry:?}"
+            "start/stop commit transitions, their Run events and (story 22-1) the \
+             launch's credential events: {entry:?}"
         );
     }
     // At least the starting→(running/failed)→stopping→stopped sequence.
@@ -10634,4 +10635,581 @@ fn engine_open_ends_a_run_whose_relaunch_never_ran() {
     assert_eq!(ended.record.anomalies, vec![crate::domain::Anomaly::Failed]);
     // The relaunch running after all reopens the same Run.
     let _ = name;
+}
+
+// ---------------------------------------------------------------------------
+// Story 21-6: Run-level limits through the Supervisor (the budget job's
+// process actions, the config-write re-arm) and the Run-grain verbs.
+// ---------------------------------------------------------------------------
+
+/// Kills a spawned agent by pid when dropped, so a failed assertion never
+/// leaves a long-lingering `fake_agent` behind.
+struct KillOnDrop(u32);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        // A runtime OS branch, not `#[cfg]`: OS-conditional cfg is
+        // reserved to the backends (the boundary gate).
+        let pid = self.0.to_string();
+        let _ = if std::env::consts::OS == "windows" {
+            std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid])
+                .status()
+        } else {
+            std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status()
+        };
+    }
+}
+
+fn kill_guard(registry: &Registry, name: &str) -> KillOnDrop {
+    let name = InstanceName::new(name).unwrap();
+    KillOnDrop(
+        registry
+            .spawn_record(&name)
+            .ok()
+            .flatten()
+            .map(|record| record.fingerprint.pid)
+            .unwrap_or(0),
+    )
+}
+
+#[test]
+fn a_run_limit_lowered_below_usage_executes_its_breach_action_on_the_live_agent() {
+    let (_state, _manifest, registry) = setup_fake("rlimit", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("rlimit").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "rlimit").unwrap();
+    let _guard = kill_guard(&registry, "rlimit");
+    let owner = open_run(&registry, "rlimit").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &owner,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 600,
+            output_tokens: 400,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // A dry run plans the breach and changes nothing.
+    let change = crate::domain::RunLimitChange {
+        set: crate::domain::RunLimits {
+            token_per_run: Some(500),
+            breach_action: Some(BreachAction::Stop),
+            ..Default::default()
+        },
+        clear: Vec::new(),
+    };
+    let planned = sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &change,
+            crate::domain::LimitActor::Operator,
+            true,
+        )
+        .unwrap();
+    assert_eq!(planned[0].1.as_ref().unwrap().fired.len(), 1);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Running
+    );
+    // The write fires AT ONCE and the Supervisor executes `stop` (D2).
+    let results = sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &change,
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .unwrap();
+    let outcome = results[0].1.as_ref().unwrap();
+    assert_eq!(outcome.direction, crate::domain::LimitsDirection::Lowered);
+    assert_eq!(outcome.fired.len(), 1);
+    assert_eq!(
+        registry.lookup(&name).unwrap().state,
+        LifecycleState::Stopped
+    );
+    // A malformed change is refused whole; an unknown Run is that Run's
+    // refusal, the rest answered.
+    assert!(sup
+        .set_run_limits(
+            &registry,
+            std::slice::from_ref(&owner),
+            &crate::domain::RunLimitChange::default(),
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .is_err());
+    let results = sup
+        .set_run_limits(
+            &registry,
+            &[RunId::mint(), owner.clone()],
+            &change,
+            crate::domain::LimitActor::Operator,
+            false,
+        )
+        .unwrap();
+    assert_eq!(results[0].1.as_ref().unwrap_err().code(), "run-not-found");
+    assert_eq!(results[1].1.as_ref().unwrap_err().code(), "run-ended");
+}
+
+#[test]
+fn a_config_write_raise_re_arms_a_live_runs_latch_and_a_lowering_fires_at_once() {
+    let (_state, _manifest, registry) = setup_fake("cfgrearm", &["--linger-ms", "600000"]);
+    let name = InstanceName::new("cfgrearm").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "cfgrearm").unwrap();
+    let _guard = kill_guard(&registry, "cfgrearm");
+    let owner = open_run(&registry, "cfgrearm").record.run_id;
+    sup.commit_run_usage(
+        &registry,
+        &name,
+        &owner,
+        &ParsedUsage {
+            sequence: 1,
+            input_tokens: 500,
+            output_tokens: 500,
+            cached_tokens: 0,
+        },
+    )
+    .unwrap();
+    // A `warn` ceiling written BELOW the usage breaches at the write itself
+    // (no further usage event).
+    registry
+        .set_config(&name, "budget.breach_action", "warn")
+        .unwrap();
+    registry
+        .set_config(&name, "budget.tokens.per_run", "800")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    let latched = registry.latches(&owner).unwrap();
+    assert_eq!(latched.len(), 1, "fired at the write: {latched:?}");
+    // Raised above the usage: the latch re-arms at the write.
+    registry
+        .set_config(&name, "budget.tokens.per_run", "5000")
+        .unwrap();
+    sup.sync_run_policy(&registry, &name);
+    assert!(registry.latches(&owner).unwrap().is_empty(), "re-armed");
+    assert!(!registry
+        .run_view(&owner)
+        .unwrap()
+        .record
+        .anomalies
+        .contains(&crate::domain::runs::Anomaly::Breach));
+    let _ = sup.stop(&registry, "cfgrearm", Some(Duration::from_secs(5)));
+}
+
+// ---- Story 22-1: a supervised launch's Run Key ----
+
+#[test]
+fn a_failing_random_source_refuses_a_supervised_start_with_nothing_spawned_or_written() {
+    // Every OS: the mint precedes every state change, so nothing spawns.
+    let (_state, _manifest, registry) = setup_fake("nokey", &["--linger-ms", "600000"]);
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    let outbox_before = outbox_entries(&registry).len();
+    crate::domain::credential::tests::fail_rng(true);
+    let refused = sup.start(&registry, "nokey");
+    crate::domain::credential::tests::fail_rng(false);
+    let err = refused.unwrap_err();
+    assert!(
+        matches!(err, EngineError::CredentialUnavailable { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("random source failed"), "{err}");
+    assert_eq!(state_of(&registry, "nokey"), LifecycleState::Registered);
+    assert!(registry
+        .spawn_record(&InstanceName::new("nokey").unwrap())
+        .unwrap()
+        .is_none());
+    assert_eq!(outbox_entries(&registry).len(), outbox_before);
+    assert!(registry.run_snapshot().keys.is_empty());
+    assert!(registry.run_snapshot().runs.is_empty());
+}
+
+#[test]
+fn a_supervised_start_delivers_its_run_key_in_the_environment_only_unix() {
+    if crate::OsId::current() == crate::OsId::Windows {
+        // No live child off Unix; issuance is proven at the job level.
+        return;
+    }
+    let dump = tempfile::tempdir().unwrap();
+    let dump_path = dump.path().join("env.txt");
+    let marker_path = dump.path().join("ready.marker");
+    let (_state, _manifest, registry) = setup_fake_with_config(
+        "keyed",
+        &[
+            "--linger-ms",
+            "600000",
+            "--dump",
+            dump_path.to_str().unwrap(),
+            "--marker",
+            marker_path.to_str().unwrap(),
+        ],
+        "[config.\"run.key\"]\nenv = \"MY_AGENT_KEY\"\n",
+    );
+    let name = InstanceName::new("keyed").unwrap();
+    // A hand-set reserved value in the config file is stripped at start.
+    let config = registry.paths().instance_config(&name);
+    std::fs::write(&config, "[run]\nkey = \"hk_run_HANDSET\"\n").unwrap();
+    let mut sup = Supervisor::with_backoff(fast_backoff());
+    sup.start(&registry, "keyed").unwrap();
+    let _guard = kill_guard(&registry, "keyed");
+    wait_for_marker(&marker_path);
+    let dumped = wait_for_dump(&dump_path);
+    let key = dumped
+        .lines()
+        .find_map(|line| line.strip_prefix("env=HEKMA_RUN_KEY="))
+        .expect("HEKMA_RUN_KEY delivered")
+        .to_string();
+    assert!(key.starts_with("hk_run_") && key.len() == 59, "{key}");
+    // The Adapter's own `env` mapping receives the same key.
+    assert!(dumped
+        .lines()
+        .any(|line| line == format!("env=MY_AGENT_KEY={key}")));
+    // Never on the argv, never the hand-set value.
+    assert!(!dumped
+        .lines()
+        .filter(|line| line.starts_with("arg="))
+        .any(|line| line.contains("hk_run_")));
+    assert!(!dumped.contains("hk_run_HANDSET"));
+    // It is that Run's Run Key once the launch committed.
+    let hash = crate::domain::credential::TokenHash::of(&key);
+    let snapshot = registry.run_snapshot();
+    let entry = snapshot.key(&hash).expect("indexed");
+    let owner = snapshot.owner_of("keyed").unwrap();
+    assert_eq!(entry.run_id, owner.record.run_id);
+    assert_eq!(entry.launch_generation, Some(1));
+    // effective-config.json and the Agent Home carry no token.
+    let effective =
+        std::fs::read_to_string(registry.paths().effective_config_snapshot(&name)).unwrap();
+    assert!(
+        !effective.contains(&key) && !effective.contains("run.key"),
+        "{effective}"
+    );
+    let home = registry.agent_home(&name);
+    let mut stack = vec![home];
+    while let Some(dir) = stack.pop() {
+        for item in std::fs::read_dir(&dir).unwrap() {
+            let path = item.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(text) = std::fs::read(&path) {
+                assert!(
+                    !text.windows(key.len()).any(|w| w == key.as_bytes()),
+                    "{} carries the key",
+                    path.display()
+                );
+            }
+        }
+    }
+    // The spawn record carries no token either.
+    let record = registry.spawn_record(&name).unwrap().unwrap();
+    assert!(!format!("{record:?}").contains(&key));
+    // A stop records the exit: the key leaves the index.
+    let _ = sup.stop(&registry, "keyed", Some(Duration::from_secs(5)));
+    assert!(registry.run_snapshot().key(&hash).is_none());
+}
+
+#[test]
+fn the_launch_specs_debug_redacts_the_environment() {
+    let spec = SpawnSpec {
+        exec: "agent".to_string(),
+        args: vec!["--flag".to_string()],
+        env: std::collections::BTreeMap::from([(
+            "HEKMA_RUN_KEY".to_string(),
+            "hk_run_SENTINELSENTINEL".to_string(),
+        )]),
+        working_dir: std::path::PathBuf::from("/h"),
+        log_file: None,
+        attributed_log_path: None,
+        stderr_log_file: None,
+        instance_name: "a".to_string(),
+        pipe_stdin: false,
+        detach: false,
+        pipe_stdout: false,
+        inherit_env: true,
+        capture_mode: LogCaptureMode::default(),
+    };
+    let rendered = format!("{spec:?}");
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
+    assert!(rendered.contains("HEKMA_RUN_KEY") && rendered.contains("[REDACTED]"));
+    let launch = crate::adapter::StartLaunch {
+        exec: "agent".to_string(),
+        args: Vec::new(),
+        env: spec.env.clone(),
+    };
+    let rendered = format!("{launch:?}");
+    assert!(!rendered.contains("SENTINEL"), "{rendered}");
+}
+
+#[test]
+fn a_flag_or_file_mapping_of_a_credential_key_is_refused_at_registration() {
+    for (key, target) in [
+        ("run.key", "flag = \"--key\""),
+        ("run.key", "file = { path = \"k.toml\", key = \"k\" }"),
+        ("run.refresh_key", "flag = \"--refresh\""),
+    ] {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = tempfile::tempdir().unwrap();
+        write_fake_manifest_with_config(
+            manifest.path(),
+            "credmap",
+            &["--linger-ms", "1"],
+            &format!("[config.\"{key}\"]\n{target}\n"),
+        );
+        let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+        let err = registry
+            .register_with_adapter(
+                "credmap",
+                &AdapterRef::Manifest(manifest.path().to_path_buf()),
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(key), "{text}");
+        assert!(text.contains("environment variable"), "{text}");
+    }
+}
+
+#[test]
+fn the_reserved_credential_keys_cannot_be_written() {
+    let (_state, _manifest, registry) = setup_fake("nowrite", &["--linger-ms", "1"]);
+    let name = InstanceName::new("nowrite").unwrap();
+    for key in ["run.key", "run.refresh_key"] {
+        let err = registry
+            .set_config(&name, key, "hk_run_SENTINELSENTINELSENTINEL")
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(key) && text.contains("reserved"), "{text}");
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
+}
+
+/// Story 22-1 (the security review's M3): a process exit's credential
+/// revocation never fails open. The revocation is sabotaged with a SQL
+/// trigger on the `tokens` row; the exit transition must then fail as a
+/// whole — never commit `failed` with the launch's key still honoured.
+#[test]
+fn an_exit_whose_key_revocation_cannot_be_written_is_not_recorded() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::domain::runs::ops::{self, LaunchCredentials, RunFate, SupervisedRun};
+    use crate::ports::{RunRecords as _, RunStore as _};
+    let state = tempfile::tempdir().unwrap();
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    let name = InstanceName::new("exits").unwrap();
+    let run = crate::domain::RunId::mint();
+    let key = mint(TokenClass::RunKey).unwrap();
+    let stub = key.stub();
+    let publisher = std::sync::Arc::clone(registry.run_publisher());
+    let (n, r) = (name.clone(), run.clone());
+    registry
+        .writer()
+        .call(move |ctx| {
+            ctx.store().execute_batch_for_test(
+                "INSERT INTO agent_instances (id, name, kind, state, agent_home, created_at, \
+                 updated_at) VALUES (1, 'exits', 'mock', 'running', '/h', 't', 't')",
+            );
+            let supervised = SupervisedRun {
+                instance: n.clone(),
+                run_id: r.clone(),
+                wire_path: false,
+                labels: Vec::new(),
+                fresh: true,
+                inputs: None,
+            };
+            let generation = ctx.store().bump_launch_generation(&n)?;
+            let mut changes = ops::ensure_supervised(ctx.store(), &supervised, "t")?;
+            changes.extend(ops::issue_launch(
+                ctx.store(),
+                &r,
+                generation,
+                LaunchCredentials {
+                    key: stub,
+                    refresh: None,
+                },
+                "t",
+            )?);
+            ops::commit(ctx, &publisher, changes)
+        })
+        .unwrap();
+    let hash = hash_presented(key.secret());
+    let key_state = |registry: &Registry| {
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    let indexed = |registry: &Registry| registry.run_snapshot().keys.contains_key(&hash);
+    assert!(indexed(&registry));
+    // The sabotage: every write to a token row aborts.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_token_revoke BEFORE UPDATE ON tokens \
+             BEGIN SELECT RAISE(ABORT, 'injected revoke fault'); END;",
+        )
+        .unwrap();
+    }
+    let crash = TransitionEvent::new(
+        "exits",
+        LifecycleState::Running,
+        LifecycleState::Failed,
+        TransitionCause::crashed("exit code 3"),
+        crate::time::now_rfc3339(),
+    );
+    for fate in [RunFate::Relaunching, RunFate::Terminal] {
+        let result = super::commit::commit_transition(
+            &registry,
+            &name,
+            super::commit::StateWrite::Plain,
+            &crash,
+            fate,
+        );
+        assert!(
+            result.is_err(),
+            "the exit must not commit around a failed revocation"
+        );
+        // Nothing of the exit landed: the instance is still `running`, and
+        // its key is still the one honoured — consistently, in the store
+        // and the index — until the exit can be recorded with it revoked.
+        assert_eq!(state_of(&registry, "exits"), LifecycleState::Running);
+        assert_eq!(key_state(&registry), TokenState::Active);
+        assert!(indexed(&registry));
+    }
+    // With the fault gone, the same exit records and revokes together.
+    {
+        let conn = rusqlite::Connection::open(state.path().join("state.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER block_token_revoke")
+            .unwrap();
+    }
+    let committed = super::commit::commit_transition(
+        &registry,
+        &name,
+        super::commit::StateWrite::Plain,
+        &crash,
+        RunFate::Relaunching,
+    )
+    .unwrap();
+    assert!(committed.projection_failed.is_none());
+    assert_eq!(state_of(&registry, "exits"), LifecycleState::Failed);
+    assert_eq!(key_state(&registry), TokenState::Revoked);
+    assert!(!indexed(&registry));
+}
+
+/// Story 22-1 (the security review's L3): a credential an agent sends in a
+/// URL to its metering listener is refused there AND revoked by the reaper,
+/// through the same resolved-only path as the Control API — an unknown
+/// token-shaped value costs no writer job.
+#[test]
+fn a_token_the_metering_listener_saw_in_a_url_is_revoked_by_the_reaper() {
+    use crate::domain::credential::{hash_presented, mint, TokenClass, TokenState};
+    use crate::ports::RunRecords as _;
+    use std::sync::atomic::Ordering;
+    let state = tempfile::tempdir().unwrap();
+    let manifest = tempfile::tempdir().unwrap();
+    write_observed_manifest(manifest.path(), "urlkey", &["--linger-ms", "600000"]);
+    let registry = Registry::open(Some(state.path().to_path_buf())).unwrap();
+    registry
+        .register_with_adapter(
+            "urlkey",
+            &AdapterRef::Manifest(manifest.path().to_path_buf()),
+        )
+        .unwrap();
+    let name = InstanceName::new("urlkey").unwrap();
+    // Nothing is ever forwarded: a refused request never dials.
+    registry
+        .set_config(
+            &name,
+            crate::domain::METERING_UPSTREAM_BASE_URL_KEY,
+            "http://127.0.0.1:9",
+        )
+        .unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sup = Supervisor::with_runtime(rt.handle().clone());
+    sup.start(&registry, "urlkey").unwrap();
+    let _guard = kill_guard(&registry, "urlkey");
+    let owner = open_run(&registry, "urlkey").record.run_id;
+    let mut request = crate::domain::ChildRunRequest::under(crate::domain::RunParent::Run(owner));
+    request.issue_credentials = true;
+    let opened = sup
+        .open_child_run_as(&registry, crate::domain::RunActor::Operator, request)
+        .unwrap();
+    let issued = opened.credentials.unwrap();
+    let state_of_token = |secret: &crate::domain::SecretString| {
+        let hash = hash_presented(secret);
+        registry
+            .store
+            .snapshot(|store| store.token(&hash))
+            .unwrap()
+            .unwrap()
+            .state
+    };
+    let base = fence_listener_url(&sup, &name);
+    let jobs = || registry.writer().stats().jobs.load(Ordering::Relaxed);
+    // Unknown token-shaped values: refused, and the drain writes nothing.
+    for class in [TokenClass::RunKey, TokenClass::Refresh] {
+        let noise = mint(class).unwrap();
+        let path = format!("/v1/models/{}", noise.secret().expose_secret());
+        assert_eq!(fence_http_call(&base, "GET", &path, "").0, 400);
+    }
+    let before = jobs();
+    sup.drain_observed_all(&registry);
+    assert_eq!(jobs(), before, "an unresolved token costs no writer job");
+    // The Run Key and the refresh credential, each in a URL (the query,
+    // lowercased): refused, then revoked at the next drain.
+    for (secret, path) in [
+        (
+            issued.run_key(),
+            format!("/v1/models/{}", issued.run_key().expose_secret()),
+        ),
+        (
+            issued.refresh_credential(),
+            format!(
+                "/v1/chat/completions?k={}",
+                issued
+                    .refresh_credential()
+                    .expose_secret()
+                    .to_ascii_lowercase()
+            ),
+        ),
+    ] {
+        assert_eq!(fence_http_call(&base, "POST", &path, "{}").0, 400);
+        assert_eq!(state_of_token(secret), TokenState::Active);
+    }
+    sup.drain_observed_all(&registry);
+    assert_eq!(state_of_token(issued.run_key()), TokenState::Revoked);
+    assert_eq!(
+        state_of_token(issued.refresh_credential()),
+        TokenState::Revoked
+    );
+    assert!(!registry
+        .run_snapshot()
+        .keys
+        .contains_key(&hash_presented(issued.run_key())));
+    let causes: Vec<_> = registry
+        .store
+        .snapshot(|store| store.run_tokens(&opened.view.record.run_id))
+        .unwrap()
+        .into_iter()
+        .map(|row| row.revoke_cause)
+        .collect();
+    assert!(causes
+        .iter()
+        .all(|cause| cause.as_deref() == Some("exposed-in-url")));
+    sup.stop(&registry, "urlkey", Some(Duration::from_secs(5)))
+        .unwrap();
 }

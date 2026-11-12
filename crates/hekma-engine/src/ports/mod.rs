@@ -20,7 +20,7 @@
 mod memory_backing;
 mod process_backend;
 mod run_store;
-pub(crate) use run_store::{PolicyRecords, ResolutionFacts};
+pub(crate) use run_store::{LimitSlot, OpenOwnerFacts, PolicyRecords, ResolutionFacts};
 mod secret_resolver;
 mod state_store;
 mod usage_source;
@@ -36,7 +36,8 @@ pub use process_backend::{
     StdinState, StopOutcome, KILL_CONFIRM_TIMEOUT, STDIN_WRITE_TIMEOUT,
 };
 pub(crate) use run_store::{
-    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunRecords, RunStore, PAGE_MAX,
+    clamp_page, NewRun, OutboxAppend, OutboxBounds, Page, Rollup, RunRecords, RunStore, TokenRow,
+    PAGE_MAX,
 };
 pub use secret_resolver::{
     file_permissions_error, mode_is_owner_only, CompositeSecretResolver, EnvSecretResolver,

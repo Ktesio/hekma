@@ -120,6 +120,12 @@ fn assert_payload_validates(event: &EngineEvent) {
         EngineEvent::BreachDefaultUpgraded(e) => {
             assert_eq!(e.schema_version, hekma_engine::POLICY_EVENT_SCHEMA_VERSION)
         }
+        EngineEvent::Credential(e) => {
+            assert_eq!(
+                e.schema_version,
+                hekma_engine::CREDENTIAL_EVENT_SCHEMA_VERSION
+            )
+        }
     }
 }
 

@@ -38,6 +38,7 @@ pub struct OpenArgs {
     pub dollar_cap: Option<String>,
     pub breach_action: Option<String>,
     pub external_id: Option<String>,
+    pub print_key: bool,
     pub json: bool,
 }
 
@@ -67,8 +68,192 @@ pub fn open(args: OpenArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(external) = &args.external_id {
         body["external_id"] = json!(external);
     }
-    let view = routed_run(route("POST", "/v0/runs", Some(body)))?;
-    render(&view, args.json, "opened")
+    // Story 22-1: credentials are issued only when asked for — a CLI that
+    // printed them by default would leave them in terminal scrollback and
+    // CI logs.
+    body["issue_credentials"] = json!(args.print_key);
+    let routed = route("POST", "/v0/runs", Some(body));
+    let credentials = routed
+        .as_ref()
+        .ok()
+        .and_then(|routed| routed.value.as_ref())
+        .and_then(|document| document.get("credentials"))
+        .cloned();
+    let view = routed_run(routed)?;
+    if !args.print_key {
+        return render(&view, args.json, "opened");
+    }
+    let Some(credentials) = credentials else {
+        // A retried --external-id returns the existing Run: its credentials
+        // were shown when it opened and cannot be shown again.
+        render(&view, args.json, "opened")?;
+        ui::note(
+            "No credentials were issued: the Run already existed under this external id, and its \
+             credentials are shown only when it opens.",
+        );
+        return Ok(());
+    };
+    if args.json {
+        let document = json!({
+            "schema_version": RUN_DOCUMENT_SCHEMA_VERSION,
+            "run": view,
+            "credentials": credentials,
+        });
+        println!("{}", serde_json::to_string_pretty(&document)?);
+    } else {
+        print!("{}", render_text(&view, "opened"));
+        let field = |name: &str| credentials.get(name).and_then(Value::as_str).unwrap_or("");
+        println!("run key: {}", field("run_key"));
+        println!("refresh credential: {}", field("refresh_credential"));
+    }
+    ui::note(
+        "These credentials are shown once and are not stored. Keep them somewhere safe; \
+         `hekma run revoke-keys` revokes them.",
+    );
+    Ok(())
+}
+
+/// The `--json` document of `hekma run keys`.
+#[derive(Serialize)]
+struct KeysDocument<'a> {
+    schema_version: u32,
+    run_id: &'a str,
+    keys: &'a [hekma_engine::CredentialSummary],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+}
+
+/// What `hekma run keys` says for a live supervised Run with no key.
+const BEFORE_RUN_KEYS: &str = "This Run started before Run Keys; it gets one at its next launch.";
+
+/// `hekma run keys <run-id>` — a Run's credentials, read-only: token ids,
+/// classes, states and causes, never a key. Starts nothing.
+pub fn keys(run_id: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = open_read_only_engine()?;
+    let blocking = engine.blocking();
+    let keys = blocking.run_keys(run_id).map_err(map_run_error)?;
+    let view = blocking.run(run_id).map_err(map_run_error)?;
+    let note = (keys.is_empty() && view.record.process_owner && !view.record.is_ended())
+        .then_some(BEFORE_RUN_KEYS);
+    if json {
+        let document = KeysDocument {
+            schema_version: RUN_DOCUMENT_SCHEMA_VERSION,
+            run_id,
+            keys: &keys,
+            note,
+        };
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    print!("{}", render_keys(run_id, &keys, note));
+    Ok(())
+}
+
+/// The human rendering of a Run's credentials.
+fn render_keys(
+    run_id: &str,
+    keys: &[hekma_engine::CredentialSummary],
+    note: Option<&str>,
+) -> String {
+    let mut out = format!("Run {run_id}: {} credential(s)\n", keys.len());
+    if let Some(note) = note {
+        out.push_str(note);
+        out.push('\n');
+    }
+    if keys.is_empty() {
+        return out;
+    }
+    out.push_str(&format!(
+        "{:<14}{:<10}{:<9}{:<5}{:<14}{:<26}{}\n",
+        "TOKEN ID", "CLASS", "STATE", "GEN", "ISSUED BY", "ISSUED", "CAUSE"
+    ));
+    for key in keys {
+        out.push_str(&format!(
+            "{:<14}{:<10}{:<9}{:<5}{:<14}{:<26}{}\n",
+            key.token_id,
+            key.class.as_str(),
+            key.state.as_str(),
+            key.launch_generation
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+            key.issued_by.as_deref().unwrap_or("—"),
+            key.issued_at,
+            key.revoke_cause.as_deref().unwrap_or("—"),
+        ));
+    }
+    out
+}
+
+/// `hekma run revoke-keys <run-id> [--no-cascade]` — revoke a Run's
+/// credentials (routed through the Service Host: the revocation is
+/// committed and published before the host answers).
+pub fn revoke_keys(
+    run_id: &str,
+    cascade: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let routed = match route(
+        "POST",
+        &format!("/v0/runs/{}/revoke-keys", segment(run_id)),
+        Some(json!({ "cascade": cascade })),
+    ) {
+        Ok(routed) => routed,
+        Err(RoutedError::Call(CallError::Coded { code, message })) => {
+            return Err(map_run_code(&code, message))
+        }
+        Err(err) => return Err(err.into_diagnostic()),
+    };
+    let Some(document) = routed.value else {
+        return Err(AgentIo {
+            message: format!(
+                "The local Service Host (pid {}) applied the revocation but sent no report; \
+                 check it with: hekma run keys {run_id}",
+                routed.host_pid
+            ),
+        }
+        .into());
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+    print!("{}", render_revoked(run_id, &document));
+    Ok(())
+}
+
+/// The human rendering of a revocation report.
+fn render_revoked(run_id: &str, document: &Value) -> String {
+    let rows = document
+        .get("revoked")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let cascaded = |row: &Value| row.get("cascaded").and_then(Value::as_bool) == Some(true);
+    let own = rows.iter().filter(|row| !cascaded(row)).count();
+    let under = rows.len() - own;
+    let mut out = ui::success_text(format!(
+        "Revoked {own} credential(s) for {run_id} and {under} under its child Runs; calls \
+         presenting them are refused from now on."
+    ));
+    out.push('\n');
+    let text = |row: &Value, field: &str| {
+        row.get(field)
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    for row in &rows {
+        out.push_str(&format!(
+            "  {}  {}  {}\n",
+            text(row, "run_id"),
+            text(row, "class"),
+            text(row, "token_id")
+        ));
+    }
+    if document.get("reuse_cleared").and_then(Value::as_bool) == Some(true) {
+        out.push_str("The Run's credential-reuse Anomaly is cleared.\n");
+    }
+    out
 }
 
 /// `hekma run close <run-id>` — close a child Run.
@@ -136,11 +321,17 @@ pub(crate) fn map_run_code(code: &str, message: String) -> Box<dyn std::error::E
         // Story 21-3: the default Policy's reserved shape is an Operator
         // refusal (2); a Scent-Check Mode before Scent-Check ships (2).
         "policy-default" | "scent-unavailable" => RunInvalid { message }.into(),
-        "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs" => {
+        "nesting-too-deep" | "action-unavailable" | "invalid-request" | "too-many-runs"
+        // Story 21-6.
+        | "scope-unavailable"
+        // Story 22-1.
+        | "run-out-of-scope" | "credential-revoked" | "unauthorized" | "too-many-children" => {
             RunInvalid { message }.into()
         }
         "no-open-run" | "parent-ended" | "owns-process" | "run-ended" | "label-from-config"
-        | "label-not-bound" | "label-bound" => RunInvalidState { message }.into(),
+        | "label-not-bound" | "label-bound"
+        // Story 21-6.
+        | "verb-unavailable" | "raise-forbidden" => RunInvalidState { message }.into(),
         _ => AgentStore { message }.into(),
     }
 }
@@ -192,8 +383,10 @@ fn open_request(args: &OpenArgs) -> Result<ChildRunRequest, Box<dyn std::error::
             token_per_run: args.token_budget,
             dollar_per_run_micros,
             breach_action,
+            ..RunLimits::default()
         },
         external_id: args.external_id.clone(),
+        issue_credentials: args.print_key,
     })
 }
 
@@ -259,7 +452,21 @@ pub(crate) fn run_error_class(err: &RunError, message: String) -> Box<dyn std::e
         | RunError::RunEnded { .. }
         | RunError::LabelFromConfig { .. }
         | RunError::LabelNotBound { .. }
-        | RunError::LabelBound { .. } => RunInvalidState { message }.into(),
+        | RunError::LabelBound { .. }
+        // Story 21-6: the Run's depth does not serve the verb yet, and a
+        // Caller may only tighten (the Run's state forbids the change).
+        | RunError::VerbUnavailable { .. }
+        | RunError::RaiseForbidden { .. } => RunInvalidState { message }.into(),
+        // Story 21-6: a limit scope the Run cannot carry (the request).
+        RunError::ScopeUnavailable { .. } => RunInvalid { message }.into(),
+        // Story 22-1: a credential refusal or the Caller breadth cap is a
+        // request that cannot be honored (2); no credential could be issued
+        // (the random source failed) is a system failure (1).
+        RunError::RunOutOfScope { .. }
+        | RunError::CredentialRevoked
+        | RunError::CredentialUnknown
+        | RunError::TooManyChildren { .. } => RunInvalid { message }.into(),
+        RunError::CredentialUnavailable { .. } => AgentStore { message }.into(),
         RunError::Store(_) => AgentStore { message }.into(),
     }
 }
@@ -372,6 +579,7 @@ mod tests {
             dollar_cap: Some("1.50".to_string()),
             breach_action: Some("warn".to_string()),
             external_id: Some("job-1".to_string()),
+            print_key: false,
             json: false,
         }
     }

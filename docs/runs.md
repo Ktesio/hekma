@@ -1,11 +1,11 @@
 ---
 title: "Runs, Control Depth, ps and top"
-description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs, child Runs, hekma label and hekma ps are on main; Selectors on every other verb and hekma top are in development."
+description: "Every agent workload as a Run with an id, labels, a status and a Control Depth: supervised Runs, child Runs, hekma label, hekma ps, Selectors on the lifecycle verbs and hekma budget are on main; hekma top is in development."
 ---
 
 # Runs, Control Depth, ps and top
 
-> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run`, `hekma label` and `hekma ps` are on main and ship in the next release. Selectors on every other verb, `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
+> **Partly on main.** Runs for supervised agents, child Runs, labels from configuration, `hekma run`, `hekma label`, `hekma ps`, Selectors on the lifecycle verbs and `hekma budget` are on main and ship in the next release. `hekma top` and Runs Hekma did not start are still being built, and their names, commands and defaults may change before they ship. See [Status and roadmap](https://hekma.ktesio.dev/docs/status/#roadmap).
 
 > This page mirrors [hekma.ktesio.dev/docs/runs/](https://hekma.ktesio.dev/docs/runs/), where it is kept current.
 
@@ -38,7 +38,7 @@ hekma label remove --selector team=core tier --yes
 
 A label set this way is bound to the Run and records its origin, `label-verb`. Per key it outranks the agent's `labels` configuration (origin `config`) and any label the Run set about itself, so a later `labels.*` write, a crash relaunch or a restart of Hekma never overwrites it. Labels belong to the Run: a relaunch keeps them, and a new `start` opens a new Run without them. `hekma label remove` takes back a label set this way; if the configuration binds the same key, its value returns in the same change. A label that comes from configuration is changed with `hekma agent config set` (or overridden on the Run with `hekma label set`), and a label the Run set about itself cannot be removed here. Removing an absent key changes nothing, and a Run that has ended is refused. Each change is one `labels-changed` Run event naming the bound labels before and after.
 
-`--selector key=value[,key=value…]` matches every open Run carrying all those labels, bound or caller. When it matches more than one Run, the set is listed and you are asked to confirm; `--yes` skips the question, and without a terminal the command is refused unless `--yes` is given, so a script never hangs. `--dry-run` lists each Run's planned change and writes nothing. Each Run reports its own result (`labeled`, `unchanged`, `would label`, or why it was refused), a refusal does not stop the others, and the exit code is the first failure's: `3` no such Run, `4` refused by the Run's state or labels, `2` an invalid request. A Selector that matches no Run is a success with a note; one that matches more than 1000 Runs is refused. `--json` prints `{schema_version, dry_run, matched, results}`. The same verb is on the [Control API](control-api.md#bound-labels) as `PATCH /v0/runs/{id}/labels`.
+`--selector key=value[,key=value…]` matches every open Run carrying all those labels, bound or caller. When it matches more than one Run, the set is listed and you are asked to confirm; `--yes` skips the question, and without a terminal the command is refused unless `--yes` is given, so a script never hangs. `--dry-run` lists each Run's planned change and writes nothing. Each Run reports its own result (`labeled`, `unchanged`, `would label`, or why it was refused), a refusal does not stop the others, and the exit code is the first failure's: `3` no such Run, `4` refused by the Run's state or labels, `2` an invalid request. A Selector that matches no Run is a success with a note; one that matches more than 1000 Runs is refused. `--json` prints the one results document every set-taking verb shares, `{schema_version, verb, dry_run, matched, results}` with `verb` `label`. The same verb is on the [Control API](control-api.md#bound-labels) as `PATCH /v0/runs/{id}/labels`, and over a selected set as one `PATCH /v0/runs/labels`.
 
 A Caller cannot set a key that is already bound: a caller label on a bound key is refused (`label-bound`).
 
@@ -68,6 +68,32 @@ Each row carries the CONTROL depth (`supervised (no wire)` for an agent whose mo
 
 `--selector` matches bound and caller labels alike in either view, and a listing pages past the 1000-Run cap the label verb carries (a listing never loads the whole Run set). `--limit` defaults to 50 and serves at most 1000 (`0` means the maximum; above the cap it clamps with a note). A read-only read: `hekma ps` opens the state database read-only, never starts a host, creates nothing, and exits `0` with a note when nothing needs attention (the footer's counts still print). Exit `2` is an invalid selector, cursor or limit; `1` a store failure.
 
+<a id="verbs-at-scale"></a>**Verbs at scale: Selectors on the lifecycle verbs.** `hekma agent stop`, `pause`, `resume` and `drain`, and `hekma run close`, take an agent, a run id, or `--selector`:
+
+```bash
+hekma agent pause run_01JZ6Q9G3S8V2X7K4M1N5P0R2T
+hekma agent stop --selector team=core --dry-run
+hekma agent stop --selector team=core --yes --json
+hekma run close --selector task=review --yes
+```
+
+On the Run that owns an agent's supervised process, the verb is the agent's own: the same stop ladder, the same drain bound, the same notes (pausing a run id pauses its agent, and the Run goes `held`). Any other Run answers from the verb table below: before Hekma can hold or reject one Run's calls, `stop`, `pause`, `resume` and `drain` on a child Run are refused, naming its depth, and a child held because its parent is paused is refused naming the parent. A Run is never skipped silently: every Run the Selector matched gets its own result (`stopped`, `paused`, `would-stop`, or `refused` with the reason), a refusal never stops the others, and the exit code is the first failure's class with the count in its message. The set is listed and confirmed as for `hekma label`: only when it holds more than one Run, only on a terminal (a pipe is refused unless `--yes` is given, and stdin is never read). `--dry-run` plans each Run from its status and depth, writes nothing and starts no Service Host. `--json` prints the shared results document. `start` and `send` take no Selector: a Selector matches open Runs, so there is nothing to start, and `send` carries text to one agent's input.
+
+A Selector act runs on exactly the set you saw: the CLI asks the Service Host to select the Runs (`POST /v0/runs/select`), which answers with a **set token**, and acts with one call that carries it. A Run that ended between the selection and the act is that Run's `run-ended` refusal; the rest act. Slow verbs run their windows one after another, so a set's worst case is the sum of its windows; the CLI waits at most 10 seconds plus each Run's bound (capped at 10 minutes) and then says it stopped waiting while the acts may still be committing.
+
+<a id="run-limits"></a>**Limits on a Run (`hekma budget`).** `hekma budget show` reads a Run's limits: each ceiling with where it comes from (`run`, `instance`, `policy:<name>`, `default`), its usage, the headroom, the Breach Action and any latched breach. `hekma budget set` writes limits on the Run itself:
+
+```bash
+hekma budget show my-agent
+hekma budget set my-agent --tokens-per-run 500000
+hekma budget set run_01JZ6Q9G3S8V2X7K4M1N5P0R2T --dollars-per-run 3.00 --breach-action pause
+hekma budget set --selector team=core --clear tokens-per-run --yes
+```
+
+A limit set on a Run outranks the agent's `budget.*` configuration and every Policy for that limit. It **belongs to the Run**, like a label set with `hekma label`: a crash relaunch keeps it, it ends with the Run, and a new `start` opens a new Run without it, so every result says it is Run-scoped (`run_scoped` and a note in `--json`). For limits every future Run should carry, set the agent's `budget.*` configuration or a [Policy](policies.md). Cumulative ceilings go on an agent's own Run only (they count the agent's lifetime usage); a child Run takes per-run ceilings. A raised ceiling above the usage re-arms its breach at once and lifts a matching `block` fence; one lowered to or below the usage breaches at once and applies the Breach Action, with no wait for the next model call. `--clear` hands a limit back to the next layer, which may raise or lower it. A limit a Caller sets is kept apart and applies only while it is tighter than the one the Operator, the Host or a Policy sets. Each change is one `limits-changed` Run event naming the Run's limits before and after. Over a Selector, `set` confirms like every set-taking verb; `show` with a Selector, or with no target, lists Runs as `hekma ps --all` does and pages with `--limit` and `--cursor`.
+
+<a id="run-keys"></a>**Every Run has a Run Key.** Each supervised launch gets its own [Run Key](run-keys.md) in `HEKMA_RUN_KEY`, and a child Run opened over the Control API gets its own Run Key and refresh credential once. A Run Key acts as its Run's Caller: it may open child Runs beneath its Run, close them and tighten their limits, and nothing else. Keys are stored as hashes, revoked when their process exits, when their Run ends, or with `hekma run revoke-keys`; `hekma run keys` lists them by token id. A used refresh credential presented again raises the `credential-reuse` Anomaly.
+
 ## What is coming
 
 A **Run** is one unit of agent work with a stable run id, a Control Depth, labels, budgets and a Run Status, whether or not Hekma started its process: a supervised agent, a child Run inside a Host or framework flow, or a client Hekma found.
@@ -76,7 +102,9 @@ A **Run** is one unit of agent work with a stable run id, a Control Depth, label
 |---|---|
 | Runs for supervised agents, run ids, labels from configuration, parent and child Runs, `hekma label` with `--selector`, `--dry-run` and `--yes` | On main |
 | `hekma ps`, Selectors on listings | On main |
-| Selectors and `--dry-run` on every other verb | In development |
+| Run Keys: a key per launch, child Run credentials, refresh, revocation | On main |
+| Selectors, `--dry-run` and `--yes` on `stop`, `pause`, `resume`, `drain` and `run close`; `hekma budget` | On main |
+| Hold, release, reroute and reject on a set | In development |
 | `hekma top` | Planned |
 | Runs Hekma did not start (depths `wire`, `announced`, `observed`) | Planned |
 
@@ -107,7 +135,7 @@ by name, or the default Policy) — plus the `depth-fallback` and
 
 **Parent Runs.** Runs are flat unless one names a parent (on main, as above). A verb on a parent will reach its children only through a Selector, except that stopping or pausing the Run that owns a supervised process also stops or pauses the child Runs inside it.
 
-A **Selector** (`key=value,…`) names a set of Runs on any listing or verb, as it already does for `hekma label` and `hekma ps`. When it matches more than one Run on a verb, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it. Listing Selectors page past the 1000-Run cap the verbs keep.
+A **Selector** (`key=value,…`) names a set of Runs on any listing or verb, as it already does for `hekma label`, `hekma ps`, `hekma budget` and the lifecycle verbs. When it matches more than one Run on a verb, the verb shows the set and asks you to confirm (`--yes` skips this); `--dry-run` only shows it. Listing Selectors page past the 1000-Run cap the verbs keep.
 
 **`hekma top`** will show each Run's status, depth, tokens per second, burn rate and budget left, live. Hotkeys will pause, stop, hold, raise a limit and attach, confirming as the matching command does. It can watch a remote `hekma serve`; the `/v0/events` stream's Selector filter and resume (see the [Control API](control-api.md)) are the seam it builds on.
 

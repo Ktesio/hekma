@@ -36,15 +36,22 @@ Hekma resolves each limit on its own, in this order:
 | Source | Rule |
 |---|---|
 | A malformed `breach_action` anywhere | Fails closed to `pause` with a diagnostic — before every other source, a Run's own action included. Only the action fails closed: the ceilings, the Rate and the model an agent set explicitly still apply. |
-| Explicit limits on a Run, then on an agent | Set by the Operator, in any configuration layer. They outrank every Policy. |
+| Explicit limits on a Run, then on an agent | A limit set on the Run itself with [`hekma budget set`](runs.md#run-limits) comes first, then the agent's configuration (any layer). Both outrank every Policy. |
 | Matching Policies | The most specific Selector wins; a tie goes to the tightest value. |
 | The default Policy | Fills whatever is still unset. |
 
 Selector A is more specific than B when A's terms are a strict superset of B's; Selectors that cannot be compared tie. From loosest to tightest, Breach Actions run `warn` < `pause` < `stop` < `block`. A tie between two ceilings goes to the lower one.
 
-`hekma run show <run-id> --json` names where each of its Run's limits came
-from: the Run itself, the agent's configuration, a Policy by name, or the
-default Policy.
+`hekma budget show <run-id>` and `hekma run show <run-id> --json` name where
+each of its Run's limits came from: the Run itself, the agent's
+configuration, a Policy by name, or the default Policy.
+
+**Which one to use.** A limit set with `hekma budget set` belongs to one Run:
+it ends with the Run, and the agent's next `start` opens a new Run without it
+— the tool for "give this Run more room" or "rein this one in now". Limits
+every future Run of an agent should carry go in its `budget.*`
+configuration; standing rules for a whole class of Runs, now and later, are
+Policies.
 
 ## The default Policy
 
@@ -67,7 +74,7 @@ A Rate comes from the agent's own `cost.rate.*` keys first, then a matching Poli
 
 ## Changes apply at once
 
-A Policy change applies to every matched open Run immediately. Lowering a ceiling to or below a Run's usage breaches it now; raising one above the usage re-arms its breach latch, so the next crossing fires again, and lifts the `block` fence for that ceiling on a live Run. Clearing a ceiling or deleting the Policy re-arms too — a latch never outlives the ceiling that fired it. Changing a Policy's Selector re-resolves the Runs both the old and the new Selector match, so the Runs only the old one governed loosen as well. Deleting a Policy re-resolves the Runs it governed under what remains.
+A Policy change applies to every matched open Run immediately — the same rule `hekma budget set` and an agent's `budget.*` configuration write apply. Lowering a ceiling to or below a Run's usage breaches it now; raising one above the usage re-arms its breach latch, so the next crossing fires again, and lifts the `block` fence for that ceiling on a live Run. Clearing a ceiling or deleting the Policy re-arms too — a latch never outlives the ceiling that fired it. Changing a Policy's Selector re-resolves the Runs both the old and the new Selector match, so the Runs only the old one governed loosen as well. Deleting a Policy re-resolves the Runs it governed under what remains.
 
 An unknown `--clear` field is refused (exit 2 on the CLI, `400` on the API): a typo would otherwise report success while clearing nothing.
 
@@ -77,7 +84,7 @@ Each Run has a **Control Depth**, how far Hekma controls it. Where a Policy's Br
 
 ## `block`, the wire fence
 
-`block` is never a default. On a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error. The fence lifts when the Run ends, or when a Policy raises the ceiling above the Run's usage. An agent that bypasses the listener bypasses the fence too.
+`block` is never a default. On a breach, the agent's metering listener refuses further model calls with HTTP 402 and a typed, non-retryable error. The fence lifts when the Run ends, or when the ceiling is raised above the Run's usage — by a Policy change, `hekma budget set` or an agent configuration write — reason by reason. An agent that bypasses the listener bypasses the fence too.
 
 ## Not yet
 

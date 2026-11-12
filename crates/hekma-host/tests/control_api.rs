@@ -252,6 +252,21 @@ fn every_route(addr: &str) -> Vec<(&'static str, String)> {
         // Story 21-9: the bound-label routes.
         ("GET", format!("http://{addr}/v0/runs/run_ghost/labels")),
         ("PATCH", format!("http://{addr}/v0/runs/run_ghost/labels")),
+        // Story 21-6: the Run-grain verbs, Run limits and Selector sets.
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/stop")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/pause")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/resume")),
+        ("POST", format!("http://{addr}/v0/runs/run_ghost/drain")),
+        ("GET", format!("http://{addr}/v0/runs/run_ghost/limits")),
+        ("PATCH", format!("http://{addr}/v0/runs/run_ghost/limits")),
+        ("POST", format!("http://{addr}/v0/runs/select")),
+        ("POST", format!("http://{addr}/v0/runs/stop")),
+        ("POST", format!("http://{addr}/v0/runs/pause")),
+        ("POST", format!("http://{addr}/v0/runs/resume")),
+        ("POST", format!("http://{addr}/v0/runs/drain")),
+        ("POST", format!("http://{addr}/v0/runs/close")),
+        ("PATCH", format!("http://{addr}/v0/runs/labels")),
+        ("POST", format!("http://{addr}/v0/runs/limits")),
     ]
 }
 
@@ -385,6 +400,17 @@ fn every_route_401s_without_a_bearer_and_a_wrong_bearer_and_reaches_its_handler_
         // body carries no `seq` — the Json extractor's 422 is the
         // handler-reached answer (auth passed, the request shape was wrong).
         let ack_wrong_body = method == "POST" && url.ends_with("/v0/export/ack");
+        // Story 21-6: the set routes and the limits PATCH deny unknown
+        // fields, so this loop's bodies (no `set_token`; a label change on
+        // a limits route) are the extractor's 422 — the handler-reached
+        // answer.
+        let set_wrong_body = [
+            "select", "stop", "pause", "resume", "drain", "close", "labels", "limits",
+        ]
+        .iter()
+        .any(|route| url.ends_with(&format!("/v0/runs/{route}")))
+            || (method == "PATCH" && url.ends_with("/run_ghost/limits"));
+        let ack_wrong_body = ack_wrong_body || set_wrong_body;
         // The Run open POST reached its handler: the register-shaped body
         // names no parent, so the exactly-one-parent rule answers 400.
         let run_open = method == "POST" && url.ends_with("/v0/runs");
@@ -3909,6 +3935,534 @@ fn the_policy_routes_serve_crud_with_typed_refusals_on_every_os() {
 }
 
 // ---------------------------------------------------------------------------
+// Story 21-6: Selector sets and set tokens, the Run-grain verbs, Run limits.
+// ---------------------------------------------------------------------------
+
+/// Stops the serve thread (draining its agents) when dropped, so a failed
+/// assertion never leaves a host or a lingering agent behind.
+struct StopOnDrop(Option<ServeHandle>);
+
+impl StopOnDrop {
+    fn addr(&self) -> String {
+        self.0.as_ref().expect("serving").addr.clone()
+    }
+
+    fn stop(mut self) {
+        if let Some(server) = self.0.take() {
+            server.stop().unwrap();
+        }
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            let _ = server.stop();
+        }
+    }
+}
+
+fn serve_guarded(base: PathBuf, ttl: Option<Duration>) -> StopOnDrop {
+    let (sink, _diagnostics) = SharedSink::new();
+    if ttl.is_none() {
+        return StopOnDrop(Some(spawn_serve_with_api(base, sink)));
+    }
+    write_secrets_file(&base);
+    let mut server = spawn_serve(hekma_host::ServeOptions {
+        state_base: Some(base.clone()),
+        control_listen: Some("127.0.0.1:0".parse().unwrap()),
+        bearer_secret: Some(BEARER_NAME.to_string()),
+        stop_window: Some(2),
+        diagnostics: Some(diagnostic_sink_of(&sink)),
+        set_token_ttl_override: ttl,
+        ..Default::default()
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(addr) = sink
+            .text()
+            .lines()
+            .find_map(|line| line.split("control api listening on ").nth(1))
+            .map(|rest| rest.split(" (").next().unwrap().to_string())
+        {
+            server.addr = addr;
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{}", sink.text());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    StopOnDrop(Some(server))
+}
+
+/// A JSON call with `bearer`.
+fn call_as(
+    client: &ureq::Agent,
+    bearer: &str,
+    method: &str,
+    url: &str,
+    body: &str,
+) -> ureq::http::Response<ureq::Body> {
+    let auth = format!("Bearer {bearer}");
+    let request = match method {
+        "POST" => client.post(url),
+        "PATCH" => client.patch(url),
+        other => panic!("unsupported {other}"),
+    };
+    request
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .unwrap_or_else(|err| panic!("{method} {url}: {err}"))
+}
+
+#[test]
+fn set_tokens_are_single_use_credential_bound_expiring_and_forgotten_by_a_restart() {
+    // Every OS, no agent process: an empty set still mints a token whose
+    // whole lifecycle is observable.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let server = serve_guarded(base.clone(), None);
+    let addr = server.addr();
+    let client = client();
+    let local_token = hekma_host::read_discovery(&base).unwrap().token;
+    let select = |bearer: &str| {
+        let mut response = call_as(
+            &client,
+            bearer,
+            "POST",
+            &format!("http://{addr}/v0/runs/select"),
+            r#"{"selector": "team=core"}"#,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(&mut response)
+    };
+    let act = |bearer: &str, path: &str, body: String| {
+        let mut response = call_as(
+            &client,
+            bearer,
+            if path == "labels" { "PATCH" } else { "POST" },
+            &format!("http://{addr}/v0/runs/{path}"),
+            &body,
+        );
+        let status = response.status().as_u16();
+        (status, json_body(&mut response))
+    };
+    let document = select(BEARER_VALUE);
+    let token = document["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("hkset_"), "{token}");
+    assert_eq!(document["matched"], 0);
+    assert_eq!(document["runs"], serde_json::json!([]));
+    assert!(document["expires_at"].as_str().unwrap().ends_with('Z'));
+    // Another credential cannot use it (and does not consume it).
+    let (status, body) = act(
+        &local_token,
+        "stop",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "set-token-foreign");
+    // The creator acts once …
+    let (status, body) = act(
+        BEARER_VALUE,
+        "stop",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["verb"], "stop");
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["matched"], 0);
+    // … and only once.
+    let (status, body) = act(
+        BEARER_VALUE,
+        "pause",
+        format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"]["code"], "set-token-used");
+    assert!(
+        !body.to_string().contains(&token),
+        "a refusal never echoes the token"
+    );
+    // An unknown token; the body's shape per verb.
+    let (status, body) = act(
+        BEARER_VALUE,
+        "resume",
+        r#"{"set_token": "hkset_nope"}"#.into(),
+    );
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (404, Some("set-token-not-found"))
+    );
+    for (path, body) in [
+        ("pause", r#"{"set_token": "x", "window_secs": 5}"#),
+        ("stop", r#"{"set_token": "x", "timeout_ms": 5}"#),
+        ("stop", r#"{"set_token": "x", "window_secs": 0}"#),
+        ("drain", r#"{"set_token": "x", "timeout_ms": 0}"#),
+        ("close", r#"{"set_token": "x", "window_secs": 5}"#),
+        ("labels", r#"{"set_token": "x", "set": {"Team": "core"}}"#),
+        ("limits", r#"{"set_token": "x"}"#),
+        ("limits", r#"{"set_token": "x", "clear": ["rate"]}"#),
+        ("limits", r#"{"set_token": "x", "dollars_per_run": "-1"}"#),
+        (
+            "limits",
+            r#"{"set_token": "x", "breach_action": "explode"}"#,
+        ),
+    ] {
+        let (status, response) = act(BEARER_VALUE, path, body.to_string());
+        assert_eq!(status, 400, "{path} {body}: {response}");
+    }
+    for (path, body) in [
+        ("stop", r#"{}"#),
+        ("stop", r#"{"set_token": "x", "verbose": true}"#),
+        ("limits", r#"{"set_token": "x", "token_per_run": 5}"#),
+    ] {
+        let (status, response) = act(BEARER_VALUE, path, body.to_string());
+        assert_eq!(status, 422, "{path} {body}: {response}");
+    }
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    drop(json_body(&mut response));
+    // Every set route consumes: labels, limits and close each once.
+    for (path, body) in [
+        ("labels", r#""set": {"team": "core"}"#),
+        ("limits", r#""tokens_per_run": 5"#),
+        ("close", ""),
+        ("drain", r#""timeout_ms": 1500"#),
+    ] {
+        let token = select(BEARER_VALUE)["token"].as_str().unwrap().to_string();
+        let comma = if body.is_empty() { "" } else { ", " };
+        let payload = format!(r#"{{"set_token": "{token}"{comma}{body}}}"#);
+        let (status, response) = act(BEARER_VALUE, path, payload.clone());
+        assert_eq!(status, 200, "{path}: {response}");
+        let (status, _) = act(BEARER_VALUE, path, payload);
+        assert_eq!(status, 409, "{path}: used");
+    }
+    // The per-Run routes on an unknown Run are 404s.
+    for (method, path, body) in [
+        ("POST", "run_ghost/stop", ""),
+        ("POST", "run_ghost/pause", ""),
+        ("POST", "run_ghost/resume", ""),
+        ("POST", "run_ghost/drain", ""),
+        ("PATCH", "run_ghost/limits", r#"{"tokens_per_run": 5}"#),
+    ] {
+        let (status, response) = {
+            let mut response = call_as(
+                &client,
+                BEARER_VALUE,
+                method,
+                &format!("http://{addr}/v0/runs/{path}"),
+                body,
+            );
+            (response.status().as_u16(), json_body(&mut response))
+        };
+        assert_eq!(status, 404, "{path}: {response}");
+        assert_eq!(response["error"]["code"], "run-not-found");
+    }
+    let mut response = get_ok(&client, &addr, "/v0/runs/run_ghost/limits");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    drop(json_body(&mut response));
+    // A token minted before a restart is forgotten (re-select).
+    let stale = select(BEARER_VALUE)["token"].as_str().unwrap().to_string();
+    server.stop();
+    let server = serve_guarded(base.clone(), None);
+    let addr = server.addr();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/stop"),
+        &format!(r#"{{"set_token": "{stale}"}}"#),
+    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "set-token-not-found"
+    );
+    server.stop();
+    // After its lifetime a token is expired (a zero lifetime: no sleeping).
+    let server = serve_guarded(base, Some(Duration::ZERO));
+    let addr = server.addr();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team=core"}"#,
+    );
+    let token = json_body(&mut response)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/stop"),
+        &format!(r#"{{"set_token": "{token}"}}"#),
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(&mut response)["error"]["code"],
+        "set-token-expired"
+    );
+    server.stop();
+}
+
+#[test]
+fn a_selected_set_acts_per_run_with_the_child_refused_and_limits_scoped_to_the_run() {
+    if hekma_engine::OsId::current() == hekma_engine::OsId::Windows {
+        // The manifest fake agent is the POSIX shape (see the lifecycle test).
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    let _manifest = registered_fake_agent(&base, "setter");
+    let server = serve_guarded(base, None);
+    let addr = server.addr();
+    let client = ladder_client();
+    let json = |method: &str, path: &str, body: serde_json::Value| {
+        let mut response = call(&client, method, &format!("http://{addr}{path}"), Some(body));
+        let status = response.status().as_u16();
+        (status, json_body(&mut response))
+    };
+    let (status, _) = json(
+        "PUT",
+        "/v0/instances/setter/config",
+        serde_json::json!({"key": "labels.team", "value": "core"}),
+    );
+    assert_eq!(status, 200);
+    let mut response = call(
+        &client,
+        "POST",
+        &format!("http://{addr}/v0/instances/setter/start"),
+        None,
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(json_body(&mut response));
+    let (status, child) = json(
+        "POST",
+        "/v0/runs",
+        serde_json::json!({"parent_instance": "setter", "labels": {"team": "core"}}),
+    );
+    assert_eq!(status, 201, "{child}");
+    let child = child["run"]["run_id"].as_str().unwrap().to_string();
+
+    // Select: the owner and the child.
+    let select = || {
+        let (status, document) = json(
+            "POST",
+            "/v0/runs/select",
+            serde_json::json!({"selector": "team=core"}),
+        );
+        assert_eq!(status, 200, "{document}");
+        document
+    };
+    let document = select();
+    assert_eq!(document["matched"], 2, "{document}");
+    // Each selected Run is its listing row (the `GET /v0/runs` item): the
+    // Run's own fields flattened, plus its labels and usage.
+    for run in document["runs"].as_array().unwrap() {
+        assert!(run["run_id"].is_string(), "{run}");
+        assert!(
+            run["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|label| label["key"] == "team" && label["value"] == "core"),
+            "{run}"
+        );
+        assert!(run["usage"]["input_tokens"].is_u64(), "{run}");
+    }
+    let owner = document["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["process_owner"] == true)
+        .unwrap()["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Run limits: Run-scoped; a child's cumulative ceiling is refused.
+    let (status, outcome) = json(
+        "PATCH",
+        &format!("/v0/runs/{owner}/limits"),
+        serde_json::json!({"tokens_cumulative": 1_000_000, "dollars_per_run": "3.00"}),
+    );
+    assert_eq!(status, 200, "{outcome}");
+    assert_eq!(outcome["run_scoped"], true);
+    assert_eq!(outcome["resolution"]["sources"]["tokens_cumulative"], "run");
+    let (status, refused) = json(
+        "PATCH",
+        &format!("/v0/runs/{child}/limits"),
+        serde_json::json!({"tokens_cumulative": 5}),
+    );
+    assert_eq!(
+        (status, refused["error"]["code"].as_str()),
+        (400, Some("scope-unavailable"))
+    );
+    let (status, planned) = json(
+        "PATCH",
+        &format!("/v0/runs/{owner}/limits"),
+        serde_json::json!({"clear": ["tokens-cumulative"], "dry_run": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(planned["dry_run"], true);
+    assert_eq!(planned["direction"], "cleared");
+    let mut response = get_ok(&client, &addr, &format!("/v0/runs/{owner}/limits"));
+    let view = json_body(&mut response);
+    assert_eq!(
+        view["limits"]["token_cumulative"], 1_000_000,
+        "the dry run wrote nothing"
+    );
+
+    // Limits over the set: one result per Run.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/limits",
+        serde_json::json!({"set_token": token, "tokens_per_run": 5_000_000}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "budget", "the CLI's verb name");
+    assert_eq!(results["dry_run"], false);
+    assert_eq!(results["matched"], 2);
+    for row in results["results"].as_array().unwrap() {
+        assert_eq!(row["limits"]["run_scoped"], true, "{row}");
+    }
+    // A cumulative ceiling over the set: the owner takes it, the child is
+    // its own refusal.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/limits",
+        serde_json::json!({"set_token": token, "tokens_cumulative": 9_000_000}),
+    );
+    assert_eq!(status, 200, "{results}");
+    let rows = results["results"].as_array().unwrap();
+    let child_row = rows
+        .iter()
+        .find(|row| row["run_id"] == child.as_str())
+        .unwrap();
+    assert_eq!(child_row["error"]["code"], "scope-unavailable", "{results}");
+    // Close over a set: a closable child closes, the owner is refused.
+    let (status, extra) = json(
+        "POST",
+        "/v0/runs",
+        serde_json::json!({"parent_instance": "setter", "labels": {"task": "x"}}),
+    );
+    assert_eq!(status, 201, "{extra}");
+    let (status, document) = json(
+        "POST",
+        "/v0/runs/select",
+        serde_json::json!({"selector": "task=x"}),
+    );
+    assert_eq!(status, 200);
+    let token = document["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/close",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "close");
+    assert_eq!(results["results"][0]["outcome"], "closed");
+    assert_eq!(results["results"][0]["run"]["status"], "ended");
+
+    // Labels over the set: one PATCH.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "PATCH",
+        "/v0/runs/labels",
+        serde_json::json!({"set_token": token, "set": {"tier": "gold"}}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert_eq!(results["verb"], "label");
+    assert!(results["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["outcome"] == "labeled"));
+
+    // Pause over the set: the owner pauses; the child is refused from its
+    // own cell (its lifecycle acts on calls), never skipped.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/pause",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 200, "{results}");
+    let rows = results["results"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["run_id"] == id).unwrap().clone();
+    assert_eq!(row(&owner)["outcome"], "paused");
+    assert_eq!(row(&owner)["instance"]["state"], "paused");
+    assert_eq!(row(&child)["outcome"], "refused");
+    assert_eq!(row(&child)["error"]["code"], "verb-unavailable");
+    assert!(row(&child)["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("announced"));
+    // The token is spent.
+    let (status, _) = json(
+        "POST",
+        "/v0/runs/resume",
+        serde_json::json!({"set_token": token}),
+    );
+    assert_eq!(status, 409);
+    // The held child's resume names its parent; the owner resumes per Run.
+    let (status, refused) = json(
+        "POST",
+        &format!("/v0/runs/{child}/resume"),
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 409, "{refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("parent-paused"));
+    let (status, resumed) = json(
+        "POST",
+        &format!("/v0/runs/{owner}/resume"),
+        serde_json::json!({}),
+    );
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(resumed["instance"]["state"], "running");
+
+    // A set whose Runs end between select and act: per-Run `run-ended`.
+    let token = select()["token"].as_str().unwrap().to_string();
+    let (status, stopped) = json(
+        "POST",
+        &format!("/v0/runs/{owner}/stop"),
+        serde_json::json!({"window_secs": 2}),
+    );
+    assert_eq!(status, 200, "{stopped}");
+    assert_eq!(stopped["instance"]["state"], "stopped");
+    let (status, results) = json(
+        "POST",
+        "/v0/runs/stop",
+        serde_json::json!({"set_token": token, "window_secs": 2}),
+    );
+    assert_eq!(status, 200, "{results}");
+    assert!(
+        results["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["error"]["code"] == "run-ended"),
+        "{results}"
+    );
+    assert_eq!(select()["matched"], 0, "every Run ended");
+    server.stop();
+}
+
+// ---------------------------------------------------------------------------
 // The Run listing + the SSE ids / Selector / resume (story 21-5).
 // ---------------------------------------------------------------------------
 
@@ -3992,6 +4546,52 @@ fn seed_listing_state(base: &Path, journal_seed: Option<u64>) {
         let engine = hekma_engine::Engine::open(Some(base.to_path_buf())).unwrap();
         let _ = engine.blocking().policies();
     }
+}
+
+#[test]
+fn a_selection_past_the_verb_cap_is_refused_whole_never_cut() {
+    // Every OS, no process: 1001 open Runs carry `team=bulk` (seeded as SQL
+    // rows before the serve opens). Selecting them to act on is refused
+    // whole — `400 too-many-runs` — and mints no set.
+    let state = tempfile::tempdir().unwrap();
+    let base = state.path().to_path_buf();
+    drop(hekma_engine::Engine::open(Some(base.clone())).unwrap());
+    {
+        let mut conn = rusqlite::Connection::open(base.join("state.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        for index in 0..=hekma_engine::MAX_SELECTED_RUNS {
+            let run_id = format!("run-{index}-1");
+            tx.execute(
+                "INSERT INTO runs (run_id, control_depth, wire_path, status, anomalies, \
+                 process_owner, created_at, updated_at) \
+                 VALUES (?1, 'observed', 0, 'active', '', 0, 't', 't')",
+                [&run_id],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO run_labels (run_id, key, value, source, origin) \
+                 VALUES (?1, 'team', 'bulk', 'bound', 'config')",
+                [&run_id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let server = serve_guarded(base, None);
+    let addr = server.addr();
+    let client = client();
+    let mut response = call_as(
+        &client,
+        BEARER_VALUE,
+        "POST",
+        &format!("http://{addr}/v0/runs/select"),
+        r#"{"selector": "team=bulk"}"#,
+    );
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(&mut response);
+    assert_eq!(body["error"]["code"], "too-many-runs", "{body}");
+    assert!(body.get("token").is_none(), "{body}");
+    server.stop();
 }
 
 #[test]
