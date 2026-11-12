@@ -1469,16 +1469,7 @@ impl RunRecords for SqliteStore {
         use crate::ports::RunStore;
         let latches = self.latches(run_id)?;
         let upstream = self.run_upstream(run_id)?;
-        let identity = self
-            .conn()
-            .query_row(
-                "SELECT binding, external_id FROM run_identities WHERE run_id = ?1 \
-                 ORDER BY created_at LIMIT 1",
-                [run_id.as_str()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(backend)?;
+        let identity = self.run_identity(run_id)?;
         Ok(crate::domain::runs::snapshot::EntryExtras {
             disposition: crate::domain::runs::snapshot::Disposition::of_latches(&latches),
             upstream: upstream.map(std::sync::Arc::from),

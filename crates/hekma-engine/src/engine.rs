@@ -760,6 +760,21 @@ impl Engine {
             .map(|proxy| proxy.info().clone())
     }
 
+    /// The metering proxy port RECORDED for this state directory (story
+    /// 23-1) — the sticky address a client points at even when this engine
+    /// (a read-only CLI, say) runs no proxy itself. `None` before any host
+    /// recorded one.
+    pub fn recorded_metering_port(&self) -> Option<u16> {
+        self.inner
+            .registry
+            .lock()
+            .expect("registry mutex poisoned")
+            .reader()
+            .proxy_port()
+            .ok()
+            .flatten()
+    }
+
     /// Why the shared Metering Proxy is not running, when it was enabled
     /// and could not start (story 23-1).
     pub fn metering_proxy_error(&self) -> Option<String> {
@@ -3376,6 +3391,32 @@ impl Blocking<'_> {
     /// Blocking [`Engine::list`].
     pub fn list(&self) -> Result<Vec<AgentInstance>, RegistryError> {
         self.engine.rt.block_on(self.engine.list())
+    }
+
+    /// Blocking [`Engine::binding`] (story 23-1).
+    pub fn binding(&self, name: &str) -> Result<Option<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.binding(name))
+    }
+
+    /// Blocking [`Engine::bindings`] (story 23-1).
+    pub fn bindings(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Binding>, BindingError> {
+        self.engine.rt.block_on(self.engine.bindings(after, limit))
+    }
+
+    /// Blocking [`Engine::binding_credentials`] (story 23-1).
+    pub fn binding_credentials(&self, name: &str) -> Result<Vec<BindingCredential>, BindingError> {
+        self.engine
+            .rt
+            .block_on(self.engine.binding_credentials(name))
+    }
+
+    /// Blocking [`Engine::recorded_metering_port`] (story 23-1).
+    pub fn recorded_metering_port(&self) -> Option<u16> {
+        self.engine.recorded_metering_port()
     }
 
     /// Blocking [`Engine::fleet`] (story 1-7, FR-4). The Fleet as serializable

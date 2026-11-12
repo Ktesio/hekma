@@ -691,8 +691,11 @@ impl Registry {
                 Ok(records) => records,
                 Err(err) => return Ok(Err(err)),
             };
-            Ok(crate::domain::runs::listing::assemble(store, records)
-                .map_err(crate::domain::RunError::Store))
+            let legacy = store.legacy_run().ok().flatten();
+            Ok(
+                crate::domain::runs::listing::assemble(store, records, legacy)
+                    .map_err(crate::domain::RunError::Store),
+            )
         })?
     }
 
@@ -719,7 +722,8 @@ impl Registry {
                     limit,
                     &cutoff,
                 )?;
-                let items = listing::assemble(store, records)?;
+                let legacy = store.legacy_run().ok().flatten();
+                let items = listing::assemble(store, records, legacy)?;
                 let counts = store.listing_counts(query.view, query.selector.as_ref(), &cutoff)?;
                 Ok(crate::domain::runs::RunListing {
                     items,

@@ -326,7 +326,7 @@ fn a_wire_child_accepts_block_and_refuses_hold_actions_until_they_exist() {
     // Run's own calls (the snapshot disposition over the ancestor chain).
     let mut blocked = ChildRunRequest::under(RunParent::Run(owner.clone()));
     blocked.limits.breach_action = Some(BreachAction::Block);
-    let (id, changes) = ops::open_child(&store, &blocked, RunId::mint(), None, AT).unwrap();
+    let (_id, changes) = ops::open_child(&store, &blocked, RunId::mint(), None, AT).unwrap();
     assert_eq!(changes.events[0].change, RunEventKind::Created);
     let mut request = ChildRunRequest::under(RunParent::Run(owner.clone()));
     request.limits.breach_action = Some(BreachAction::Warn);
@@ -1251,7 +1251,7 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
             "2026-11-02T00:00:00Z",
         )
         .unwrap();
-    let items = listing::assemble(&store, rows).unwrap();
+    let items = listing::assemble(&store, rows, None).unwrap();
     assert_eq!(
         items.len(),
         1,
@@ -1292,7 +1292,7 @@ fn the_listing_assembles_each_row_from_its_stored_facts() {
     let (rows, _) = store
         .list_runs(ListingView::All, None, None, 50, "2026-11-02T00:00:00Z")
         .unwrap();
-    let items = listing::assemble(&store, rows).unwrap();
+    let items = listing::assemble(&store, rows, None).unwrap();
     let child_row = items
         .iter()
         .find(|row| row.record.run_id == child_id)
