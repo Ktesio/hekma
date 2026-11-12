@@ -315,7 +315,12 @@ reason on the live Run; one lowered to or below the usage breaches at once
 and applies the Breach Action before the answer. `dry_run` plans and writes
 nothing. An unknown field is refused (`422`), so a typo on a money field is
 never silently dropped. This bearer is the Operator's; a Caller — a later
-credential class — may only tighten (`403 raise-forbidden`).
+credential class — may only tighten (`403 raise-forbidden`), and its limits
+are kept apart from the Operator's: each applies only while it is tighter
+than the limit the Operator, the Host or a Policy sets, so a later
+tightening below it wins again (the resolution then names the source
+`caller` where the Caller's limit is the one that applies, and the read
+carries them as `caller_limits`).
 
 ### Selector sets
 

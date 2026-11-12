@@ -470,11 +470,12 @@ impl Registry {
                 Vec::new(),
             ),
         };
-        let (depth, wire_path, run_limits, bound_labels) = match facts {
+        let (depth, wire_path, run_limits, caller, bound_labels) = match facts {
             Some(facts) => (
                 facts.record.control_depth,
                 facts.record.wire_path,
                 facts.limits,
+                facts.caller_limits,
                 facts
                     .labels
                     .iter()
@@ -485,6 +486,7 @@ impl Registry {
             None => (
                 ControlDepth::Supervised,
                 true,
+                Default::default(),
                 Default::default(),
                 config_labels
                     .iter()
@@ -515,7 +517,7 @@ impl Registry {
             bound_labels,
             run_limits,
             inputs,
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.as_ref().clone(),
         });
@@ -836,9 +838,10 @@ impl Registry {
             Ok((
                 store.run_labels(&record.run_id)?,
                 store.run_limits(&record.run_id)?,
+                store.run_caller_limits(&record.run_id)?,
             ))
         });
-        let (labels, run_limits) = facts.unwrap_or_default();
+        let (labels, run_limits, caller) = facts.unwrap_or_default();
         let inputs = record
             .instance
             .as_deref()
@@ -863,7 +866,7 @@ impl Registry {
                 .collect(),
             run_limits,
             inputs,
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.to_vec(),
         })
@@ -1497,6 +1500,9 @@ fn re_resolve_matched(
             .unwrap_or(false);
         let labels = store.run_labels(&run.run_id).map_err(RunError::Store)?;
         let run_limits = store.run_limits(&run.run_id).map_err(RunError::Store)?;
+        let caller = store
+            .run_caller_limits(&run.run_id)
+            .map_err(RunError::Store)?;
         let resolution = policy::resolve(&policy::ResolutionInput {
             depth: run.control_depth,
             wire_path: run.wire_path,
@@ -1507,7 +1513,7 @@ fn re_resolve_matched(
                 .collect(),
             run_limits,
             inputs: inputs.clone(),
-            caller_limits: PolicyLimits::default(),
+            caller_limits: policy::caller_policy_limits(&caller),
             kept_on_pause: kept,
             policies: policies.clone(),
         });

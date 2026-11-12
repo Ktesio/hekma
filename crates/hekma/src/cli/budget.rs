@@ -477,6 +477,7 @@ pub fn show(args: ShowArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn source_text(source: &LimitSource) -> String {
     match source {
         LimitSource::Run => "run".to_string(),
+        LimitSource::Caller => "caller".to_string(),
         LimitSource::Instance => "instance".to_string(),
         LimitSource::Policy(name) => format!("policy:{name}"),
         LimitSource::Default => "default".to_string(),
@@ -591,6 +592,13 @@ fn render_view(view: &RunLimitsView) -> String {
         "set on this Run",
         limits_text(&view.limits)
     ));
+    if view.caller_limits.is_set() {
+        out.push_str(&format!(
+            "  {:<18} {} (applies only where tighter)\n",
+            "set by the Caller",
+            limits_text(&view.caller_limits)
+        ));
+    }
     for note in &view.notes {
         out.push_str(&format!("  note: {note}\n"));
     }
@@ -749,6 +757,7 @@ mod tests {
             source_text(&LimitSource::Policy("team".into())),
             "policy:team"
         );
+        assert_eq!(source_text(&LimitSource::Caller), "caller");
         for source in [
             LimitSource::Instance,
             LimitSource::Default,

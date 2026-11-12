@@ -111,7 +111,9 @@ impl Registry {
                 };
                 let at = now_rfc3339();
                 let run_limits = store.run_limits(&open.run_id)?;
-                let resolution = limits::resolve_with(store, &open, &run_limits, &inputs)?;
+                let caller_limits = store.run_caller_limits(&open.run_id)?;
+                let resolution =
+                    limits::resolve_with(store, &open, &run_limits, &caller_limits, &inputs)?;
                 let mut changes = RunChanges::default();
                 changes.extend(crate::domain::runs::policy::resolve_and_store(
                     store,

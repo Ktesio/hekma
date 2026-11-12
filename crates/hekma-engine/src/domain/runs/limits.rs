@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ops::{self, RunChanges};
-use super::policy::{self, PolicyLimits, ResolveInputs};
+use super::policy::{self, ResolveInputs};
 use super::{LimitSource, PolicyResolution, RunError, RunLimits, RunRecord};
 use crate::domain::budget::BreachAction;
 use crate::domain::cost::Micros;
@@ -423,6 +423,17 @@ impl RunLimitChange {
                 return Err(invalid(format!("`{field}` must be at most {}", i64::MAX)));
             }
         }
+        // A dollar cap below zero is no cap anyone meant: refused here,
+        // through every surface, rather than stored as a $0 cap that fires
+        // at once.
+        for (field, value) in [
+            ("dollars-per-run", self.set.dollar_per_run_micros),
+            ("dollars-cumulative", self.set.dollar_cumulative_micros),
+        ] {
+            if value.is_some_and(|value| value.get() < 0) {
+                return Err(invalid(format!("`{field}` must not be negative")));
+            }
+        }
         Ok(())
     }
 
@@ -546,10 +557,14 @@ pub type RunLimitsResults = Vec<(
 pub struct RunLimitsView {
     /// The Run's row.
     pub run: RunRecord,
-    /// The limits set on the Run itself (`run_limits`).
+    /// The limits set on the Run itself by an Operator or a Host.
     pub limits: RunLimits,
-    /// The resolved limits, each with its source (`run`, `instance`,
-    /// `policy`, `default`, `unset`).
+    /// The limits a Caller set on the Run (they apply only where tighter
+    /// than every other layer; the resolution names them `caller`).
+    #[serde(default, skip_serializing_if = "unset_limits")]
+    pub caller_limits: RunLimits,
+    /// The resolved limits, each with its source (`run`, `caller`,
+    /// `instance`, `policy`, `default`, `unset`).
     pub resolution: PolicyResolution,
     /// The Run's subtree usage.
     pub usage: super::RunUsage,
@@ -570,11 +585,19 @@ pub struct RunLimitsView {
     pub notes: Vec<String>,
 }
 
+/// Serde's skip test for an unset layer.
+fn unset_limits(limits: &RunLimits) -> bool {
+    !limits.is_set()
+}
+
 /// The planned change on one Run — the shared half of the dry run and the
 /// write (one computation, so a dry run plans exactly what the write does
 /// before it executes).
 pub(crate) struct LimitsPlan {
     pub record: RunRecord,
+    /// The layer the actor writes (a Caller's own; else the Run's).
+    pub slot: crate::ports::LimitSlot,
+    /// That layer before and after.
     pub prior_limits: RunLimits,
     pub limits: RunLimits,
     pub resolution: PolicyResolution,
@@ -633,12 +656,58 @@ fn movement(
     (looser, tighter)
 }
 
-/// The Run's resolution with `limits` as its own limits (the pure resolver
-/// over the store's facts and the caller's inputs).
+/// The first limit a Caller's `change` asks to loosen against what applies
+/// now (`before`, the effective resolution): a ceiling set above the
+/// effective one, an action looser than the
+/// effective one, or a clear of a limit that applies. A Caller's limit
+/// lives in its own layer, so the effective movement alone cannot see a
+/// request that the other layers happen to outrank.
+fn caller_loosens(change: &RunLimitChange, before: &PolicyResolution) -> Option<&'static str> {
+    let (ceilings, action) = effective(before);
+    let micros = |value: Micros| value.get().max(0) as u64;
+    let asked = [
+        change.set.token_per_run,
+        change.set.token_cumulative,
+        change.set.dollar_per_run_micros.map(micros),
+        change.set.dollar_cumulative_micros.map(micros),
+    ];
+    for index in 0..4 {
+        if let Some(value) = asked[index] {
+            if ceilings[index].is_some_and(|applies| value > applies) {
+                return Some(EFFECTIVE_NAMES[index]);
+            }
+        }
+    }
+    if change
+        .set
+        .breach_action
+        .is_some_and(|asked| policy::action_tightness(asked) < action)
+    {
+        return Some("breach-action");
+    }
+    for field in &change.clear {
+        let applies = match field {
+            RunLimitField::TokensPerRun => ceilings[0].is_some(),
+            RunLimitField::TokensCumulative => ceilings[1].is_some(),
+            RunLimitField::DollarsPerRun => ceilings[2].is_some(),
+            RunLimitField::DollarsCumulative => ceilings[3].is_some(),
+            RunLimitField::BreachAction => action > policy::action_tightness(BreachAction::Warn),
+        };
+        if applies {
+            return Some(field.as_str());
+        }
+    }
+    None
+}
+
+/// The Run's resolution with `limits` as its own (Operator/Host) limits and
+/// `caller` as its Caller layer (the pure resolver over the store's facts
+/// and the caller's inputs).
 pub(crate) fn resolve_with<S: RunRecords + ?Sized>(
     store: &S,
     record: &RunRecord,
     limits: &RunLimits,
+    caller: &RunLimits,
     inputs: &ResolveInputs,
 ) -> Result<PolicyResolution, RunError> {
     let labels = store.run_labels(&record.run_id)?;
@@ -658,7 +727,7 @@ pub(crate) fn resolve_with<S: RunRecords + ?Sized>(
             .collect(),
         run_limits: *limits,
         inputs: inputs.clone(),
-        caller_limits: PolicyLimits::default(),
+        caller_limits: policy::caller_policy_limits(caller),
         kept_on_pause: kept,
         policies: store.policies()?,
     }))
@@ -710,7 +779,11 @@ fn level_action(
     ) {
         return resolution.effective_action;
     }
-    let action = limits.action();
+    let action = if resolution.sources.breach_action == LimitSource::Caller {
+        resolution.action
+    } else {
+        limits.action()
+    };
     if ops::action_refusal(action, record.control_depth, record.wire_path).is_some() {
         BreachAction::Warn
     } else {
@@ -782,18 +855,38 @@ pub(crate) fn plan_limits(
             });
         }
     }
-    let prior_limits = store.run_limits(run_id)?;
+    // A Caller writes its OWN layer (applied only where tighter than every
+    // other layer, so a later Operator, Host or Policy tightening wins); an
+    // Operator or Host writes the Run's layer. The other layer is read, so
+    // both resolutions see the whole Run.
+    let slot = if actor == LimitActor::Caller {
+        crate::ports::LimitSlot::Caller
+    } else {
+        crate::ports::LimitSlot::Run
+    };
+    let run_layer = store.run_limits(run_id)?;
+    let caller_layer = store.run_caller_limits(run_id)?;
+    let prior_limits = match slot {
+        crate::ports::LimitSlot::Run => run_layer,
+        crate::ports::LimitSlot::Caller => caller_layer,
+    };
     let limits = change.merged_over(&prior_limits);
+    let (run_after, caller_after) = match slot {
+        crate::ports::LimitSlot::Run => (limits, caller_layer),
+        crate::ports::LimitSlot::Caller => (run_layer, limits),
+    };
     let inputs = inputs_for(store, &record, context)?;
-    let prior_resolution = resolve_with(store, &record, &prior_limits, &inputs)?;
-    let resolution = resolve_with(store, &record, &limits, &inputs)?;
+    let prior_resolution = resolve_with(store, &record, &run_layer, &caller_layer, &inputs)?;
+    let resolution = resolve_with(store, &record, &run_after, &caller_after, &inputs)?;
     let (looser, tighter) = movement(&prior_resolution, &resolution);
-    // The authority rule (FR-60 / FR-53): a Caller may only tighten.
+    // The authority rule (FR-60 / FR-53): a Caller may only tighten — no
+    // value above what applies now, no looser action, no clear of a limit
+    // that applies, and no loosening of the effective limits.
     if actor == LimitActor::Caller {
-        if let Some(limit) = looser.first() {
+        if let Some(limit) = caller_loosens(change, &prior_resolution).or(looser.first().copied()) {
             return Err(RunError::RaiseForbidden {
                 run_id: run_id.as_str().to_string(),
-                limit: (*limit).to_string(),
+                limit: limit.to_string(),
             });
         }
     }
@@ -820,7 +913,7 @@ pub(crate) fn plan_limits(
                 .collect();
             governance::rearm(&governance::RearmInput {
                 arms: level_arms(&record, &resolution),
-                action: level_action(&record, &resolution, &limits),
+                action: level_action(&record, &resolution, &run_after),
                 priced: resolution.rate.is_some(),
                 totals,
                 latched,
@@ -830,6 +923,7 @@ pub(crate) fn plan_limits(
     };
     Ok(LimitsPlan {
         record,
+        slot,
         prior_limits,
         limits,
         resolution,
@@ -915,7 +1009,7 @@ pub(crate) fn apply_limits(
     if plan.direction == LimitsDirection::Unchanged {
         return Ok((outcome, changes, breaches));
     }
-    store.replace_run_limits(run_id, &plan.limits, actor.as_str(), at)?;
+    store.replace_run_limits(run_id, plan.slot, &plan.limits, actor.as_str(), at)?;
     changes.extend(policy::resolve_and_store(
         store,
         &plan.record,
@@ -931,6 +1025,7 @@ pub(crate) fn apply_limits(
         &mut changes,
         &record,
         plan.prior_limits,
+        plan.limits,
         actor.as_str(),
         at,
     )?;
@@ -1003,7 +1098,8 @@ pub(crate) fn limits_view(
             .map(|row| row.inputs)
             .unwrap_or_default(),
     };
-    let resolution = resolve_with(store, &record, &limits, &inputs)?;
+    let caller_limits = store.run_caller_limits(run_id)?;
+    let resolution = resolve_with(store, &record, &limits, &caller_limits, &inputs)?;
     let view = ops::view(store, run_id)?;
     let (cumulative_usage, cumulative_tokens, cumulative_cost) =
         match record.instance.as_deref().map(InstanceName::new) {
@@ -1059,6 +1155,7 @@ pub(crate) fn limits_view(
     Ok(RunLimitsView {
         run: record,
         limits,
+        caller_limits,
         resolution,
         usage: view.usage,
         cumulative_usage,

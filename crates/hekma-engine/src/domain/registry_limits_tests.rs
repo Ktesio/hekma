@@ -398,6 +398,23 @@ fn a_raise_lifts_the_matching_fence_reason_per_reason_and_the_other_holds() {
     );
     assert_eq!(changed[0].limits.as_deref(), Some(&both));
     assert_eq!(changed[0].cause.as_deref(), Some("operator"));
+    // Each event is stamped with its change's own time (the Run was
+    // created at `t`), and the Run's `updated_at` moved with it.
+    for event in &changed {
+        assert_ne!(event.at, "t", "{event:?}");
+    }
+    assert!(changed[0].at <= changed[2].at, "{changed:?}");
+    assert_eq!(
+        seeded
+            .registry
+            .reader()
+            .run_record(&seeded.run)
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        changed[2].at,
+        "the Run's updated_at is the last change's time"
+    );
     assert_eq!(
         changed[2].limits.as_ref().unwrap().dollar_cumulative_micros,
         Some(Micros(9_000_000))
@@ -556,7 +573,8 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
         seeded.registry.reader().run_limits(&seeded.run).unwrap(),
         start
     );
-    // Tightening is allowed for a Caller.
+    // Tightening is allowed for a Caller: its own layer, the Operator's
+    // row untouched.
     let outcome = caller(limits(RunLimits {
         token_per_run: Some(500),
         breach_action: Some(BreachAction::Stop),
@@ -564,7 +582,26 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
     }))
     .unwrap();
     assert_eq!(outcome.direction, LimitsDirection::Lowered);
-    // An Operator and a Host may raise.
+    assert_eq!(outcome.resolution.tokens.per_run, Some(500));
+    assert_eq!(
+        outcome.resolution.sources.tokens_per_run,
+        LimitSource::Caller
+    );
+    assert_eq!(outcome.resolution.action, BreachAction::Stop);
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        start
+    );
+    // Asking for MORE than applies now is still a raise, even though the
+    // Caller's own layer had no token ceiling.
+    let err = caller(limits(RunLimits {
+        token_per_run: Some(800),
+        ..RunLimits::default()
+    }))
+    .unwrap_err();
+    assert_eq!(err.code(), "raise-forbidden", "{err}");
+    // An Operator and a Host may raise their layer; the Caller's tighter
+    // 500 keeps applying while it is tighter.
     for (actor, ceiling) in [(LimitActor::Operator, 9_000), (LimitActor::Host, 10_000)] {
         let outcome = set(
             &seeded.registry,
@@ -577,14 +614,239 @@ fn a_caller_may_only_tighten_and_an_operator_or_host_may_raise() {
             context(None, PolicyLimits::default()),
         )
         .unwrap();
-        assert_eq!(outcome.direction, LimitsDirection::Raised, "{actor:?}");
+        assert_eq!(outcome.limits.token_per_run, Some(ceiling), "{actor:?}");
+        assert_eq!(outcome.resolution.tokens.per_run, Some(500), "{actor:?}");
     }
-    // The rows carry the actor as their source.
-    let source: String = seeded.registry.reader().query_string_for_test(&format!(
-        "SELECT source FROM run_limits WHERE run_id = '{}' AND dimension = 'tokens'",
+    // Once the Caller clears its own limit (a raise: refused) … it stays.
+    let err = caller(RunLimitChange {
+        set: RunLimits::default(),
+        clear: vec![RunLimitField::TokensPerRun],
+    })
+    .unwrap_err();
+    assert_eq!(err.code(), "raise-forbidden", "{err}");
+    // An Operator lowering its own layer below the Caller's wins again.
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(400),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(outcome.resolution.tokens.per_run, Some(400));
+    assert_eq!(outcome.resolution.sources.tokens_per_run, LimitSource::Run);
+    // The rows carry the actor that set them as their source.
+    let source = |dimension: &str| -> String {
+        seeded.registry.reader().query_string_for_test(&format!(
+            "SELECT source FROM run_limits WHERE run_id = '{}' AND dimension = '{dimension}'",
+            seeded.run
+        ))
+    };
+    assert_eq!(source("tokens"), "operator");
+    assert_eq!(source("caller.tokens"), "caller");
+}
+
+#[test]
+fn a_caller_limit_applies_only_while_tighter_than_a_later_operator_or_policy_limit() {
+    let seeded = seed_with(50, 50, true);
+    let policy = |tokens: u64| {
+        let existing = seeded.registry.policy("cap").unwrap();
+        seeded
+            .registry
+            .apply_policy_change(
+                existing,
+                PolicyChange {
+                    name: "cap".to_string(),
+                    selector: Some("team=core".parse().unwrap()),
+                    set: PolicyLimits {
+                        tokens_per_run: Some(tokens),
+                        ..PolicyLimits::default()
+                    },
+                    clear: Vec::new(),
+                    rates: BTreeMap::new(),
+                },
+                std::collections::HashMap::from([(
+                    INSTANCE.to_string(),
+                    context(None, PolicyLimits::default()),
+                )]),
+            )
+            .unwrap();
+    };
+    let resolved = || {
+        let resolution = seeded
+            .registry
+            .run_view(&seeded.run)
+            .unwrap()
+            .policy
+            .unwrap();
+        (
+            resolution.tokens.per_run,
+            resolution.sources.tokens_per_run.clone(),
+        )
+    };
+    policy(1_000);
+    assert_eq!(
+        resolved(),
+        (Some(1_000), LimitSource::Policy("cap".to_string()))
+    );
+    // A Caller tightens to 900 under the Policy's 1000.
+    let outcome = set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(900),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(outcome.direction, LimitsDirection::Lowered);
+    assert_eq!(resolved(), (Some(900), LimitSource::Caller));
+    // The Operator lowers the Policy to 500: the Policy's 500 applies, not
+    // the Caller's looser 900.
+    policy(500);
+    assert_eq!(
+        resolved(),
+        (Some(500), LimitSource::Policy("cap".to_string()))
+    );
+    // Raised back above the Caller's limit, the Caller's 900 applies again.
+    policy(2_000);
+    assert_eq!(resolved(), (Some(900), LimitSource::Caller));
+    // The Caller's limit never landed in the Run's own (Operator/Host)
+    // layer, and the budget read names both.
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        RunLimits::default()
+    );
+    let view = seeded.registry.run_limits_view(&seeded.run).unwrap();
+    assert_eq!(view.caller_limits.token_per_run, Some(900));
+    assert_eq!(view.resolution.sources.tokens_per_run, LimitSource::Caller);
+}
+
+#[test]
+fn a_caller_limit_on_a_child_run_arms_the_childs_own_level() {
+    let seeded = seed_with(50, 50, true);
+    let child = add_child(&seeded, true);
+    let usage_child = child.clone();
+    seeded
+        .registry
+        .writer
+        .call(move |ctx| {
+            ctx.store().insert_usage(
+                &crate::domain::usage::UsageEvent {
+                    instance: INSTANCE.to_string(),
+                    run_id: usage_child,
+                    input_tokens: 30,
+                    output_tokens: 30,
+                    cached_tokens: Some(0),
+                    metering_source: "self-reported".to_string(),
+                    sequence: 2,
+                    occurred_at: "t".to_string(),
+                },
+                Some(Rate::new(1_000_000, 1_000_000)),
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The owner's stored resolution arms the process level (well above
+    // the usage).
+    set(
+        &seeded.registry,
+        &seeded.run,
+        limits(RunLimits {
+            token_per_run: Some(1_000_000),
+            ..RunLimits::default()
+        }),
+        LimitActor::Operator,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    // A Caller tightens the child to 10 tokens per run — below its 60: the
+    // child's own level arms from the Caller's layer and fires at once.
+    let outcome = set(
+        &seeded.registry,
+        &child,
+        limits(RunLimits {
+            token_per_run: Some(10),
+            ..RunLimits::default()
+        }),
+        LimitActor::Caller,
+        context(None, PolicyLimits::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.resolution.sources.tokens_per_run,
+        LimitSource::Caller
+    );
+    assert_eq!(outcome.fired.len(), 1, "{:?}", outcome.fired);
+    assert_eq!(outcome.fired[0].limit, 10);
+    assert_eq!(breaches(&seeded.registry, &child).len(), 1);
+    assert!(seeded.registry.reader().run_limits(&child).unwrap() == RunLimits::default());
+}
+
+#[test]
+fn a_write_keeps_the_source_of_every_row_it_does_not_change() {
+    let seeded = seed_with(50, 50, true);
+    let write = |set_limits: RunLimits, actor: LimitActor| {
+        set(
+            &seeded.registry,
+            &seeded.run,
+            limits(set_limits),
+            actor,
+            context(None, PolicyLimits::default()),
+        )
+        .unwrap()
+    };
+    write(
+        RunLimits {
+            token_per_run: Some(1_000),
+            ..RunLimits::default()
+        },
+        LimitActor::Operator,
+    );
+    // A Host adds a dollar cap and an action: the Operator's token row
+    // keeps its source and time.
+    let row = |dimension: &str| -> String {
+        seeded.registry.reader().query_string_for_test(&format!(
+            "SELECT source || ' ' || set_at FROM run_limits WHERE run_id = '{}' \
+             AND dimension = '{dimension}'",
+            seeded.run
+        ))
+    };
+    let tokens_before = row("tokens");
+    assert!(tokens_before.starts_with("operator "), "{tokens_before}");
+    write(
+        RunLimits {
+            dollar_per_run_micros: Some(Micros(2_000_000)),
+            breach_action: Some(BreachAction::Pause),
+            ..RunLimits::default()
+        },
+        LimitActor::Host,
+    );
+    assert_eq!(row("tokens"), tokens_before);
+    assert!(row("dollars").starts_with("host "), "{}", row("dollars"));
+    assert!(row("action").starts_with("host "), "{}", row("action"));
+    // The action change still reaches the ceiling rows' action column
+    // (the 21-2 fallback shape), without re-stamping them.
+    let action: String = seeded.registry.reader().query_string_for_test(&format!(
+        "SELECT action FROM run_limits WHERE run_id = '{}' AND dimension = 'tokens'",
         seeded.run
     ));
-    assert_eq!(source, "host");
+    assert_eq!(action, "pause");
+    assert_eq!(
+        seeded.registry.reader().run_limits(&seeded.run).unwrap(),
+        RunLimits {
+            token_per_run: Some(1_000),
+            dollar_per_run_micros: Some(Micros(2_000_000)),
+            breach_action: Some(BreachAction::Pause),
+            ..RunLimits::default()
+        }
+    );
 }
 
 #[test]
@@ -715,6 +977,23 @@ fn scopes_actions_and_ended_runs_are_refused_per_run() {
         ..RunLimits::default()
     });
     assert!(huge.validate().unwrap_err().to_string().contains("at most"));
+    // A negative dollar cap is refused, never stored as a $0 cap that
+    // fires at once (the CLI and the API parse dollars without a sign;
+    // this is the engine's own guard for embedders).
+    for negative in [
+        RunLimits {
+            dollar_per_run_micros: Some(Micros(-1)),
+            ..RunLimits::default()
+        },
+        RunLimits {
+            dollar_cumulative_micros: Some(Micros(-5_000_000)),
+            ..RunLimits::default()
+        },
+    ] {
+        let err = limits(negative).validate().unwrap_err();
+        assert_eq!(err.code(), "invalid-request", "{err}");
+        assert!(err.to_string().contains("must not be negative"), "{err}");
+    }
     // An unreadable configuration refuses (fail closed, never "nothing set").
     let err = seeded
         .registry
