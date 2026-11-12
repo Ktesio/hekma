@@ -539,11 +539,13 @@ fn serve_helper_subprocess() {
 }
 
 #[test]
-fn serve_metering_listen_flag_pins_the_observed_listener() {
-    // Review finding 15's CLI-level pin: `--metering-listen <port>` really
-    // pins the observed-metering listener — an ADOPTED engine-observed
-    // instance is re-bound on THAT port (the note names it) and the port
-    // ANSWERS connects while the host serves.
+fn serve_metering_listen_flag_pins_the_shared_proxy_port() {
+    // Review finding 15's CLI-level pin, moved to the shared Metering Proxy
+    // (story 23-1): `--metering-listen <port>` names the proxy's port — the
+    // started notice names THAT port and it ANSWERS connects while the host
+    // serves. The adopted engine-observed agent was launched under the
+    // shared proxy (its Run recorded its upstream), so it gets no legacy
+    // root route: no per-instance listener is re-bound for it.
     if is_windows() {
         return; // POSIX `kill`-based readiness/signals on the sibling legs.
     }
@@ -604,10 +606,9 @@ env = "OPENAI_BASE_URL"
     drop(probe);
     let (mut serve, drainer) =
         spawn_serve_with(&state_dir, &["--metering-listen", &port.to_string()]);
-    // The host's ADOPTION of the orphaned observed instance re-binds the
-    // listener on the pinned port — wait until the listener ANSWERS (the
+    // The shared proxy binds the pinned port — wait until it ANSWERS (the
     // observable; the stderr pipe is owned by the drainer thread, and the
-    // note is asserted from the drained buffer after shutdown).
+    // notice is asserted from the drained buffer after shutdown).
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -615,7 +616,7 @@ env = "OPENAI_BASE_URL"
         }
         assert!(
             Instant::now() < deadline,
-            "the pinned port never came live (no re-bind)"
+            "the pinned port never came live (the proxy did not bind it)"
         );
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -624,9 +625,17 @@ env = "OPENAI_BASE_URL"
     let stderr = drainer.join().unwrap();
     assert!(
         stderr.contains(&format!(
-            "re-bound the observed-metering listener on the fixed loopback port {port}"
+            "the metering proxy is listening on http://127.0.0.1:{port}."
         )),
-        "the adoption re-bind names the pinned port:\n{stderr}"
+        "the started notice names the pinned port:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("observed: adopted from a previous engine"),
+        "the observed agent was adopted:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("legacy root route") && !stderr.contains("re-bound"),
+        "an agent launched under the shared proxy needs no legacy route:\n{stderr}"
     );
 }
 
