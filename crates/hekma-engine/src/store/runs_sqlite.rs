@@ -532,6 +532,14 @@ impl SqliteStore {
         self.conn().execute_batch(sql).expect("test fixture SQL");
     }
 
+    /// Test-only: one text column of one row.
+    #[cfg(test)]
+    pub(crate) fn query_string_for_test(&self, sql: &str) -> String {
+        self.conn()
+            .query_row(sql, [], |row| row.get::<_, String>(0))
+            .expect("test fixture query")
+    }
+
     /// Run `body` in a named SAVEPOINT of the open batch transaction: its
     /// writes roll back alone on an error (Run bookkeeping that must never
     /// fail the job carrying it).
