@@ -603,3 +603,717 @@ fn corrupt_policy_rows_are_typed_and_fail_the_read_closed() {
         Err(StoreError::CorruptRow { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// The Run listing (story 21-5): schema v16, the keyset pages, the counts.
+// ---------------------------------------------------------------------------
+
+/// The store's schema version (pinned at v16 by the listing's own test).
+use crate::store::sqlite::SCHEMA_VERSION;
+
+/// A record shaped for the listing tests: `ended_at` set when ended, and a
+/// process-owning row only where the partial unique index allows one open
+/// owner per instance.
+fn shaped(id: &str, status: RunStatus, anomalies: &[Anomaly], ended_at: Option<&str>) -> RunRecord {
+    shaped_on(id, "a", status, anomalies, ended_at)
+}
+
+/// [`shaped`] with the instance and the process-owner flag named.
+fn shaped_owner(
+    id: &str,
+    instance: &str,
+    owner: bool,
+    status: RunStatus,
+    anomalies: &[Anomaly],
+    ended_at: Option<&str>,
+) -> RunRecord {
+    let mut record = record(id, None, instance, owner);
+    record.status = status;
+    record.anomalies = anomalies.to_vec();
+    record.ended_at = ended_at.map(str::to_string);
+    record
+}
+
+/// [`shaped`] with the instance named (an open process owner).
+fn shaped_on(
+    id: &str,
+    instance: &str,
+    status: RunStatus,
+    anomalies: &[Anomaly],
+    ended_at: Option<&str>,
+) -> RunRecord {
+    shaped_owner(id, instance, true, status, anomalies, ended_at)
+}
+
+/// The listing fixture from the story's acceptance: a healthy active Run, an
+/// active Run with the `breach` Anomaly, a `held` Run, an ended Run with the
+/// `failed` Anomaly ended 2 days ago, an ended clean Run ended 2 days ago,
+/// and an ended Run with an Anomaly ended 20 days ago. Run ids sort so the
+/// expected order is unambiguous (ULID-shaped ids sort by creation time;
+/// `K` > `J` > `H` > `G` > `F` > `E` sorts newest-first explicitly).
+fn listing_fixture(store: &SqliteStore) {
+    let seeds: Vec<RunRecord> = vec![
+        shaped(
+            "run_E",
+            RunStatus::Ended,
+            &[Anomaly::Failed],
+            Some("2026-10-22T00:00:00Z"),
+        ),
+        shaped("run_F", RunStatus::Ended, &[], Some("2026-11-09T00:00:00Z")),
+        shaped(
+            "run_G",
+            RunStatus::Ended,
+            &[Anomaly::Breach],
+            Some("2026-11-09T01:00:00Z"),
+        ),
+        // A held child of the healthy owner (a parent-paused cascade).
+        shaped_owner("run_H", "a", false, RunStatus::Held, &[], None),
+        shaped_on("run_J", "b", RunStatus::Active, &[Anomaly::Breach], None),
+        shaped_on("run_K", "a", RunStatus::Active, &[], None),
+    ];
+    for seed in seeds {
+        insert(store, seed, Vec::new(), RunLimits::default());
+    }
+}
+
+/// The fixture's window: `now` = 2026-11-11, so the 2-day-old ends sit
+/// inside the 7-day window and the 20-day-old end sits outside it.
+const FIXTURE_CUTOFF: &str = "2026-11-04T00:00:00Z";
+
+#[test]
+fn the_v16_step_adds_the_three_listing_indexes() {
+    let (_tmp, store) = store();
+    let version: i64 = store
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 16, "the listing indexes are the v16 step");
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name LIKE \
+                  'idx_runs_%' ORDER BY name",
+        )
+        .unwrap();
+    let indexes: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let names: Vec<&str> = indexes.iter().map(|(name, _)| name.as_str()).collect();
+    for expected in ["idx_runs_ended_at", "idx_runs_exception", "idx_runs_open"] {
+        assert!(names.contains(&expected), "{names:?}");
+    }
+    // The partial predicates are the v16 shape (the listing's queries name
+    // them verbatim).
+    let sql_of = |name: &str| {
+        indexes
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert!(sql_of("idx_runs_open").contains("status <> 'ended'"));
+    assert!(sql_of("idx_runs_exception").contains("anomalies <> ''"));
+    assert!(sql_of("idx_runs_exception").contains("'held','silent','stale'"));
+    assert!(sql_of("idx_runs_ended_at").contains("status = 'ended'"));
+}
+
+#[test]
+fn the_exceptions_view_lists_loud_rows_and_counts_the_healthy() {
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let (rows, next) = store
+        .list_runs(ListingView::Exceptions, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.run_id.as_str()).collect();
+    // Newest first (run ids sort lexicographically): the breached active
+    // Run, the held child, then the recent failed end. The healthy active
+    // Run is counted, not listed; the clean and the 20-day-old ends stay
+    // out of the exceptions view.
+    assert_eq!(ids, vec!["run_J", "run_H", "run_G"]);
+    assert_eq!(next, None, "everything the view lists fits one page");
+    let counts = store
+        .listing_counts(ListingView::Exceptions, None, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.listed, 3);
+    assert_eq!(counts.healthy_open, 1);
+}
+
+#[test]
+fn the_all_view_adds_the_recent_clean_end_not_the_old_one() {
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let (rows, _) = store
+        .list_runs(ListingView::All, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.run_id.as_str()).collect();
+    assert_eq!(ids, vec!["run_K", "run_J", "run_H", "run_G", "run_F"]);
+    let counts = store
+        .listing_counts(ListingView::All, None, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.listed, 5);
+    assert_eq!(counts.healthy_open, 1);
+}
+
+#[test]
+fn a_silent_or_stale_status_lists_the_moment_a_producer_exists() {
+    let (_tmp, store) = store();
+    insert(
+        &store,
+        shaped_on("run_S", "a", RunStatus::Silent, &[], None),
+        Vec::new(),
+        RunLimits::default(),
+    );
+    insert(
+        &store,
+        shaped_on("run_T", "b", RunStatus::Stale, &[], None),
+        Vec::new(),
+        RunLimits::default(),
+    );
+    let (rows, _) = store
+        .list_runs(ListingView::Exceptions, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.run_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["run_T", "run_S"],
+        "stored statuses, matched as stored"
+    );
+}
+
+#[test]
+fn the_keyset_cursor_pages_disjointly_newest_first_until_exhausted() {
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let (page_one, next) = store
+        .list_runs(ListingView::All, None, None, 2, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(
+        page_one
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_K", "run_J"]
+    );
+    let cursor = next.expect("a full page carries its last key");
+    let (page_two, next) = store
+        .list_runs(ListingView::All, None, Some(&cursor), 2, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(
+        page_two
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_H", "run_G"]
+    );
+    let cursor = next.expect("still full");
+    let (page_three, next) = store
+        .list_runs(ListingView::All, None, Some(&cursor), 2, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(
+        page_three
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_F"]
+    );
+    assert_eq!(next, None, "a short page ends the read");
+    // Disjoint across every page, still newest-first overall.
+    let all: Vec<&str> = page_one
+        .iter()
+        .chain(page_two.iter())
+        .chain(page_three.iter())
+        .map(|r| r.run_id.as_str())
+        .collect();
+    let mut sorted = all.clone();
+    sorted.sort_unstable();
+    sorted.reverse();
+    assert_eq!(all, sorted);
+}
+
+#[test]
+fn a_row_that_changes_between_pages_neither_duplicates_nor_reorders() {
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let (page_one, next) = store
+        .list_runs(ListingView::All, None, None, 2, FIXTURE_CUTOFF)
+        .unwrap();
+    let cursor = next.unwrap();
+    // run_H turns active-healthy between the pages: the keyset is run_id,
+    // so page two still starts below the cursor and the row neither
+    // duplicates nor moves.
+    let mut moved = shaped("run_H", RunStatus::Active, &[], None);
+    use crate::ports::RunRecords as _;
+    store.save_run(&moved).unwrap();
+    moved.status = RunStatus::Active;
+    let (page_two, _) = store
+        .list_runs(ListingView::All, None, Some(&cursor), 2, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(
+        page_two
+            .iter()
+            .map(|r| r.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run_H", "run_G"],
+        "the keyset is stable under a status change"
+    );
+    assert!(page_one.iter().all(|row| !page_two.contains(row)));
+}
+
+#[test]
+fn selectors_match_bound_or_caller_labels_and_compose_with_both_views() {
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let selector: Selector = "team=core".parse().unwrap();
+    // Nothing matches yet.
+    let (rows, _) = store
+        .list_runs(
+            ListingView::Exceptions,
+            Some(&selector),
+            None,
+            50,
+            FIXTURE_CUTOFF,
+        )
+        .unwrap();
+    assert!(rows.is_empty());
+    // A bound label on the held Run and a caller label on the breached one:
+    // both select (FR-49's listing scope — bound and caller).
+    store
+        .set_run_labels(&RunId::from_wire("run_H"), &[Label::bound("team", "core")])
+        .unwrap();
+    store
+        .set_run_labels(
+            &RunId::from_wire("run_J"),
+            &[Label::caller("team", "core"), Label::caller("env", "prod")],
+        )
+        .unwrap();
+    let (rows, _) = store
+        .list_runs(
+            ListingView::Exceptions,
+            Some(&selector),
+            None,
+            50,
+            FIXTURE_CUTOFF,
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run_J", "run_H"]
+    );
+    // Every term must match.
+    let both: Selector = "team=core,env=prod".parse().unwrap();
+    let (rows, _) = store
+        .list_runs(
+            ListingView::Exceptions,
+            Some(&both),
+            None,
+            50,
+            FIXTURE_CUTOFF,
+        )
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run_J"]
+    );
+    // The counts follow the selector.
+    let counts = store
+        .listing_counts(ListingView::Exceptions, Some(&selector), FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.listed, 2);
+    assert_eq!(counts.healthy_open, 0);
+}
+
+#[test]
+fn a_selector_matching_more_than_the_verb_cap_still_pages() {
+    // `select_runs` (verb support) refuses past MAX_SELECTED_RUNS; a LISTING
+    // pages past the cap (FR-50: no read path loads the whole Run set).
+    let (_tmp, store) = store();
+    for index in 0..(crate::domain::MAX_SELECTED_RUNS + 1) {
+        let id = format!("run_A{index:05}");
+        insert(
+            &store,
+            shaped_owner(&id, "a", false, RunStatus::Active, &[], None),
+            vec![Label::bound("team", "core")],
+            RunLimits::default(),
+        );
+    }
+    let selector: Selector = "team=core".parse().unwrap();
+    let mut after: Option<String> = None;
+    let mut listed = 0u64;
+    loop {
+        let (rows, next) = store
+            .list_runs(
+                ListingView::All,
+                Some(&selector),
+                after.as_deref(),
+                400,
+                FIXTURE_CUTOFF,
+            )
+            .unwrap();
+        listed += rows.len() as u64;
+        let Some(cursor) = next else { break };
+        after = Some(cursor);
+    }
+    assert_eq!(listed, crate::domain::MAX_SELECTED_RUNS as u64 + 1);
+    let counts = store
+        .listing_counts(ListingView::All, Some(&selector), FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.listed, crate::domain::MAX_SELECTED_RUNS as u64 + 1);
+    assert_eq!(
+        counts.healthy_open,
+        crate::domain::MAX_SELECTED_RUNS as u64 + 1
+    );
+}
+
+/// Page `view` under `selector` to exhaustion at `limit`, returning every
+/// page's run ids (and asserting the read ends — a bounded loop).
+fn page_to_the_end(
+    store: &SqliteStore,
+    view: ListingView,
+    selector: Option<&Selector>,
+    limit: usize,
+) -> Vec<Vec<String>> {
+    let mut pages = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10_000 {
+        let (rows, next) = store
+            .list_runs(view, selector, after.as_deref(), limit, FIXTURE_CUTOFF)
+            .unwrap();
+        pages.push(
+            rows.iter()
+                .map(|r| r.run_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+        );
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => return pages,
+        }
+    }
+    panic!("the listing never ended");
+}
+
+#[test]
+fn a_selector_pages_every_match_when_the_newest_runs_do_not_match() {
+    // Most of the newest Runs do NOT carry the label (only every third one
+    // does, and the 20 newest carry none): a Selector page must be the
+    // newest `limit` MATCHING rows, never the newest `limit` rows
+    // intersected with the Selector (short pages that end the read early).
+    let (_tmp, store) = store();
+    let mut expected: Vec<String> = Vec::new();
+    for index in 0..120u32 {
+        let id = format!("run_M{index:04}");
+        let matching = index < 100 && index % 3 == 0;
+        let labels = if matching {
+            vec![Label::bound("team", "core")]
+        } else {
+            vec![Label::bound("team", "edge")]
+        };
+        let anomalies: &[Anomaly] = if index % 2 == 0 {
+            &[Anomaly::Breach]
+        } else {
+            &[]
+        };
+        insert(
+            &store,
+            shaped_owner(&id, "a", false, RunStatus::Active, anomalies, None),
+            labels,
+            RunLimits::default(),
+        );
+        if matching {
+            expected.push(id);
+        }
+    }
+    expected.reverse();
+    let selector: Selector = "team=core".parse().unwrap();
+    for (view, want) in [
+        (ListingView::All, expected.clone()),
+        (
+            ListingView::Exceptions,
+            // Even indexes carry the breach: every sixth index matches both.
+            expected
+                .iter()
+                .filter(|id| id[5..].parse::<u32>().unwrap() % 2 == 0)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let pages = page_to_the_end(&store, view, Some(&selector), 4);
+        let listed: Vec<String> = pages.iter().flatten().cloned().collect();
+        assert_eq!(
+            listed,
+            want,
+            "{}: every match exactly once, newest first",
+            view.as_str()
+        );
+        // Every page but the last is full; the last is non-empty (the
+        // cursor ends exactly at exhaustion).
+        let (last, full) = pages.split_last().unwrap();
+        assert!(full.iter().all(|page| page.len() == 4), "{pages:?}");
+        assert!(!last.is_empty() && last.len() <= 4, "{pages:?}");
+        let counts = store
+            .listing_counts(view, Some(&selector), FIXTURE_CUTOFF)
+            .unwrap();
+        assert_eq!(counts.listed, want.len() as u64);
+    }
+}
+
+#[test]
+fn an_exactly_full_final_page_carries_no_cursor() {
+    // Four Runs at `--limit 2`: page two is full AND the last — its
+    // `next_cursor` is null (no hint pointing at an empty third page).
+    let (_tmp, store) = store();
+    for id in ["run_Q1", "run_Q2", "run_Q3", "run_Q4"] {
+        insert(
+            &store,
+            shaped_owner(id, "a", false, RunStatus::Active, &[], None),
+            Vec::new(),
+            RunLimits::default(),
+        );
+    }
+    let pages = page_to_the_end(&store, ListingView::All, None, 2);
+    assert_eq!(
+        pages,
+        vec![
+            vec!["run_Q4".to_string(), "run_Q3".to_string()],
+            vec!["run_Q2".to_string(), "run_Q1".to_string()],
+        ],
+        "two full pages, and the second ends the read"
+    );
+    // One Run per page past the end: the same exact-multiple rule at 1.
+    let pages = page_to_the_end(&store, ListingView::All, None, 1);
+    assert_eq!(pages.len(), 4, "{pages:?}");
+    // A page larger than the set: one page, no cursor.
+    let (rows, next) = store
+        .list_runs(ListingView::All, None, None, 4, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(next, None);
+}
+
+#[test]
+fn an_empty_store_lists_nothing() {
+    let (_tmp, store) = store();
+    for view in [ListingView::Exceptions, ListingView::All] {
+        let (rows, next) = store
+            .list_runs(view, None, None, 50, FIXTURE_CUTOFF)
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(next, None);
+        let counts = store.listing_counts(view, None, FIXTURE_CUTOFF).unwrap();
+        assert_eq!(counts.listed, 0);
+        assert_eq!(counts.healthy_open, 0);
+    }
+}
+
+#[test]
+fn the_listing_queries_read_indexes_only_never_a_table_scan() {
+    // The plans of the statements the store ACTUALLY runs (the same
+    // constructors `list_runs`/`listing_counts` call), in every shape: both
+    // views, with and without a cursor, with and without a Selector.
+    let (_tmp, store) = store();
+    listing_fixture(&store);
+    let selector: Selector = "team=core,env=prod".parse().unwrap();
+    let mut statements: Vec<(String, ListingStatement, bool)> = Vec::new();
+    for view in [ListingView::Exceptions, ListingView::All] {
+        for after in [None, Some("run_z")] {
+            for chosen in [None, Some(&selector)] {
+                let name = format!(
+                    "page {} after={after:?} selector={}",
+                    view.as_str(),
+                    chosen.is_some()
+                );
+                let mut tail = listing_page_tail(view, chosen, after, FIXTURE_CUTOFF, 51);
+                tail.sql = format!("SELECT {RUN_COLUMNS} {RUN_FROM} {}", tail.sql);
+                statements.push((name, tail, true));
+            }
+        }
+        for chosen in [None, Some(&selector)] {
+            statements.push((
+                format!("count {} selector={}", view.as_str(), chosen.is_some()),
+                listing_listed_count(view, chosen, FIXTURE_CUTOFF),
+                true,
+            ));
+        }
+    }
+    for chosen in [None, Some(&selector)] {
+        statements.push((
+            format!("count healthy selector={}", chosen.is_some()),
+            listing_healthy_count(chosen),
+            false,
+        ));
+    }
+    for (name, statement, has_ended_arm) in statements {
+        let mut stmt = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", statement.sql))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(statement.params), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!plan.is_empty(), "{name}: the plan rendered");
+        // The gate: no plan line walks the `runs` table (by its name or the
+        // outer read's `r` alias) except through one of the v16 listing
+        // indexes — a bare `SCAN runs` / `SCAN r`, or a walk of the primary
+        // key's autoindex, reads every Run.
+        for line in &plan {
+            let scans_runs = line == "SCAN runs"
+                || line == "SCAN r"
+                || line.starts_with("SCAN runs ")
+                || line.starts_with("SCAN r ");
+            let through_a_listing_index =
+                ["idx_runs_open", "idx_runs_exception", "idx_runs_ended_at"]
+                    .iter()
+                    .any(|index| line.contains(index));
+            assert!(
+                !scans_runs || through_a_listing_index,
+                "{name} table-scans runs: {line} (full plan: {plan:?})"
+            );
+        }
+        // And every statement with an ended arm reads it through the window
+        // index (the exception index alone would walk every historical
+        // anomalous row).
+        if has_ended_arm {
+            assert!(
+                plan.iter().any(|line| line.contains("idx_runs_ended_at")),
+                "{name}: the ended arm must ride idx_runs_ended_at: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_v15_state_dir_migrates_to_v16_and_the_listing_reads_it() {
+    // Rebuild a genuine v15 shape (v16 adds only the three partial
+    // indexes): drop them and stamp 15, then reopen — the v16 step runs,
+    // stamps 16, and the listing reads the migrated store.
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("state.db");
+    {
+        let store = SqliteStore::open(&db).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "DROP INDEX idx_runs_open; \
+                 DROP INDEX idx_runs_exception; \
+                 DROP INDEX idx_runs_ended_at; \
+                 PRAGMA user_version = 15;",
+            )
+            .unwrap();
+    }
+    let reopened = SqliteStore::open(&db).unwrap();
+    let version: i64 = reopened
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 16);
+    for index in ["idx_runs_open", "idx_runs_exception", "idx_runs_ended_at"] {
+        let present: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1, "{index}");
+    }
+}
+
+#[test]
+fn the_view_sql_matches_the_specification_predicates_row_by_row() {
+    // The pure predicates in `domain/runs/listing.rs` are the views'
+    // specification; the SQL arms (the partial indexes' reads) are the
+    // implementation. Seed EVERY row shape the views distinguish and
+    // cross-check the SQL's answer against the oracle, row by row — a
+    // planner or arm change that drifts from the spec fails here.
+    use crate::domain::runs::listing::{in_all_view, is_exception, is_healthy_open};
+
+    let (_tmp, store) = store();
+    let mut expected_exceptions = Vec::new();
+    let mut expected_all = Vec::new();
+    let mut expected_healthy = 0u64;
+    let shapes: &[(&str, RunStatus, &[Anomaly], Option<&str>)] = &[
+        ("active-clean", RunStatus::Active, &[], None),
+        ("active-breach", RunStatus::Active, &[Anomaly::Breach], None),
+        ("active-failed", RunStatus::Active, &[Anomaly::Failed], None),
+        ("held", RunStatus::Held, &[], None),
+        ("silent", RunStatus::Silent, &[], None),
+        ("stale", RunStatus::Stale, &[], None),
+        (
+            "ended-clean-new",
+            RunStatus::Ended,
+            &[],
+            Some("2026-11-10T00:00:00Z"),
+        ),
+        (
+            "ended-clean-old",
+            RunStatus::Ended,
+            &[],
+            Some("2026-10-01T00:00:00Z"),
+        ),
+        (
+            "ended-failed-new",
+            RunStatus::Ended,
+            &[Anomaly::Failed],
+            Some("2026-11-10T00:00:00Z"),
+        ),
+        (
+            "ended-breach-old",
+            RunStatus::Ended,
+            &[Anomaly::Breach],
+            Some("2026-10-01T00:00:00Z"),
+        ),
+        ("ended-null-at", RunStatus::Ended, &[Anomaly::Failed], None),
+    ];
+    for (index, (label, status, anomalies, ended_at)) in shapes.iter().enumerate() {
+        let id = format!("run_P{index:03}{label}");
+        insert(
+            &store,
+            shaped_owner(&id, "a", false, *status, anomalies, *ended_at),
+            Vec::new(),
+            RunLimits::default(),
+        );
+        let anomalies_text = Anomaly::encode(anomalies);
+        if is_exception(status.as_str(), &anomalies_text, *ended_at, FIXTURE_CUTOFF) {
+            expected_exceptions.push(id.clone());
+        }
+        if in_all_view(status.as_str(), *ended_at, FIXTURE_CUTOFF) {
+            expected_all.push(id.clone());
+        }
+        if is_healthy_open(status.as_str(), &anomalies_text) {
+            expected_healthy += 1;
+        }
+    }
+    let (rows, _) = store
+        .list_runs(ListingView::Exceptions, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let mut listed: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.run_id.as_str().to_string())
+        .collect();
+    listed.sort();
+    expected_exceptions.sort();
+    assert_eq!(listed, expected_exceptions);
+    let (rows, _) = store
+        .list_runs(ListingView::All, None, None, 50, FIXTURE_CUTOFF)
+        .unwrap();
+    let mut listed: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.run_id.as_str().to_string())
+        .collect();
+    listed.sort();
+    expected_all.sort();
+    assert_eq!(listed, expected_all);
+    let counts = store
+        .listing_counts(ListingView::All, None, FIXTURE_CUTOFF)
+        .unwrap();
+    assert_eq!(counts.healthy_open, expected_healthy);
+    assert_eq!(counts.listed, expected_all.len() as u64);
+}

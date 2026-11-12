@@ -62,6 +62,40 @@ A **Run** is one unit of agent work with a stable run id (`run_` + a ULID; ids r
 
 **The Run registry** lives in the engine core beside the supervisor, which keeps only process handles. Run state is durable in `state.db` (`runs`, `run_labels`, `run_limits`, `run_identities`; `run_latches` references `runs`) and has one writer, the store writer: Run operations are writer jobs, a lifecycle transition carries its Run projection inside its own job (Run Status, Anomalies and the cascade to the child Runs in the same process commit with the transition), and the registry takes no lock of its own, so the lock order `Registry → Run registry → Supervisor` holds trivially. Run Status follows the lifecycle (`starting`/`running`/`stopping` → `active`, `paused` → `held`, `stopped` → `ended`; a crash adds the `failed` Anomaly and ends the Run only when the Restart Policy gives up). A Host opens **child Runs** beneath a supervised Run; the budget pipeline evaluates the attributed Run's whole ancestor chain (`governance::decide_chain`: each level on its own subtree totals and latches, deepest first), a child level records `warn`, and only the process-owning level executes a process action. Every Run change emits a versioned Run event on the bus and into the outbox, and after each committed batch that changed a Run the writer publishes an immutable **Run snapshot** of the non-ended Runs (copy-on-write behind one pointer swap) for the data path to read without engine locks. **Bound labels** record their origin in `run_labels.origin` (`config` from the instance's `labels.<key>`, `label-verb` from the Operator's label verb); two pure planners compute a Run's next label set — the verb's (`label-verb` outranks `config`, any bound key outranks a caller's) and a configuration re-sync's (only `config` rows move) — and one store write replaces the set. Every committed bound-label change calls the Policy re-resolution hook inside the same writer job, so a Policy re-resolution commits and publishes with the change. A caller-label write is refused on a bound key, and the store's caller upsert never replaces a bound row.
 
+#### The Run listing (exception-first, keyset-paged)
+
+`hekma ps` and `GET /v0/runs` are one read: `list_runs` over the
+read-only connection. The default **exceptions view** lists a Run iff it
+carries an Anomaly (an ended Run only within a seven-day ended-Run window
+— a read-side bound until compaction lands with its knob) or holds a
+`held`/`silent`/`stale` status (stored statuses, matched as stored and
+never derived at read); `--all` lists everything inside the window, and
+healthy open Runs are counted, not listed. Pages are **keyset on `run_id`
+DESC** (ULID ids encode creation time, so descending is newest-first, and
+the primary key is the index; stable under row updates, immune to
+duplicates when Runs are created mid-pagination). The cursor is opaque —
+`base64url("v1:" + last run id)` — versioned so a future key shape
+refuses as `invalid-cursor` instead of mispaging. Listing Selectors
+compose the label-selector arms beside the view predicate and **page
+past** the 1000-Run verb cap (a listing never loads the whole Run set). Each
+row's detail (labels, stored Policy resolution, subtree rollup, latches,
+and the instance cumulative rollup on process-owning rows only) is
+assembled as bounded primary-key point reads over the page, and the
+headroom block reuses the budget view's field names plus each limit's
+source. The schema's v16 step adds the three partial indexes these reads
+ride — `idx_runs_open` (`WHERE status <> 'ended'`), `idx_runs_exception`
+(`WHERE anomalies <> '' OR status IN ('held','silent','stale')`) and
+`idx_runs_ended_at` (`WHERE status = 'ended'`, bounding the ended arm by
+the window) — and the query plans are pinned by tests: index reads only,
+never a table scan of `runs`.
+
+The `/v0/events` SSE stream frames each event with `id: <outbox seq>`
+(its durable position), filters by the subject Run's current labels
+(snapshot first, one store read when absent), and resumes from
+`Last-Event-ID` by replaying outbox rows past the id and handing over to
+live delivery with seq-dedup at the seam; a cursor below the retained
+floor or past the tail is a typed 409 at connect, never a clamp.
+
 #### The ACP backend and the metering tiers (AD-19)
 
 The builtin `acp` kind (AD-19) makes any Agent Client Protocol v1 agent a Hekma backend: the engine speaks JSON-RPC 2.0 over ndJSON on the child's stdio in the **client** role — `initialize` (protocol version 1, the protocol-default client capabilities: no filesystem, no terminal, no elicitation) → the agent's capabilities → `session/new` — before `start` reports `running`; `send` becomes one bounded `session/prompt` (constant-time; the turn's chunks and final stopReason stream asynchronously into the existing output-log/event machinery); `stop` writes `session/cancel` for an in-flight turn and then runs the ordinary termination ladder; a concurrent second prompt is the typed `AcpTurnInFlight` refusal (exit-code row 4 — the frozen table gained no new number); an incoming `session/request_permission` is answered denied with one surfaced diagnostic. The codec is **hand-rolled over `serde_json`** (already a dependency — no new crates; the official ACP SDK was evaluated and rejected for v1 on churn-vs-protocol-integer grounds, NFR-8), parsing tolerantly: unknown `session/update` variants are counted and surfaced as honest `Unhandled` diagnostics, and a malformed stdout line is skipped + counted, never fatal to the stream. The transport lives in `src/acp/` (`codec`/`client`/`updates`/`connection`) with no OS-conditional code (AD-4 — ndJSON framing is OS-uniform); the reader rides dedicated tasks off the engine mutexes (the AD-17/AD-18 lock discipline), and the child's stdout is piped to the engine only for a non-detached acp spawn (`SpawnSpec.pipe_stdout` — a detached start refuses: the pipe halves would die with the starting command). As a builtin it engages **no adapter-contract negotiation** (the same builtin posture as every other builtin kind — no `contract_version` exchange for the `acp` kind), so the kind's addition touched `hekma-adapter-api`'s public surface not at all. The launch is per-instance operator config (`acp.command`/`acp.args`) resolved at start; sessions persist as an additive nullable spawn-record column (schema v8) and resume at the NEXT START's handshake — `session/load` when the fresh agent advertises `loadSession`, else `session/new` with a surfaced note — because an adopted acp process is not re-piped (there is no OS-portable way to recover a stdio pipe from a bare fingerprint).

@@ -11,7 +11,7 @@ Output discipline: command results go to stdout, while notices and diagnostics g
 
 ## How the CLI reaches the Service Host
 
-One process owns a state directory's data path: the **Service Host** (`hekma serve`). Every `hekma agent` command that **writes** — `register`, `remove`, `start`, `stop`, `pause`, `resume`, `drain`, `send`, `config set`, `memory attach`, `memory detach` — is one call to the host's local Control API endpoint. The command finds the host through `<state-dir>/control.json`; when no host serves the directory, the first write **starts one in the background** (`hekma serve --autostart`, its output appended to `<state-dir>/serve.log`) and waits up to 10 seconds for it. Concurrent commands share that one host. The commands that only **read** — `list`, `show`, `usage`, `logs`, `config get` (including `--reveal`, which resolves secrets in the command itself) and `governance-vectors` — open the state database read-only and never start a host; on a fresh machine `hekma agent list` prints the empty-fleet hint and creates nothing.
+One process owns a state directory's data path: the **Service Host** (`hekma serve`). Every `hekma agent` command that **writes** — `register`, `remove`, `start`, `stop`, `pause`, `resume`, `drain`, `send`, `config set`, `memory attach`, `memory detach` — is one call to the host's local Control API endpoint. The command finds the host through `<state-dir>/control.json`; when no host serves the directory, the first write **starts one in the background** (`hekma serve --autostart`, its output appended to `<state-dir>/serve.log`) and waits up to 10 seconds for it. Concurrent commands share that one host. The commands that only **read** — `list`, `show`, `usage`, `logs`, `config get` (including `--reveal`, which resolves secrets in the command itself), `governance-vectors` and `ps` — open the state database read-only and never start a host; on a fresh machine `hekma agent list` prints the empty-fleet hint and creates nothing.
 
 What this means day to day:
 
@@ -126,7 +126,7 @@ The human table shows name, kind, state, the supervision indicator, restart coun
 
 Both money-bearing columns are headed `Budget (tok, est. $)` and `Usage (tok, est. $)`: the `est. $` estimate qualifier lives in the HEADER because those cells are narrow and truncate — a truncated cell can never strip the label off a real dollar figure, so the cells render their dollar figures bare.
 
-The active Metering Source is deliberately **not** a human-`list` column — the compact table is the ratified 80-column design, and a Metering column there overflows the default width and truncates cells. Read the Metering Source from `hekma agent show` (the detail row), `hekma agent list --json` (the `metering_source` field), or `hekma agent usage`.
+The active Metering Source is deliberately **not** a human-`list` column — the compact table is the ratified 80-column design, and a Metering column there overflows the default width and truncates cells. Read the Metering Source from `hekma agent show` (the detail row), `hekma agent list --json` (the `metering_source` field), or `hekma agent usage`. `hekma agent list` stays the supervised-instance projection; the Run-grain listing is [`hekma ps`](#hekma-ps---selector-sel--all---limit-n---cursor-c---json), and the two sit beside each other unchanged.
 
 `--json` emits a versioned document (`schema_version`, `instances`, `totals`); dollar figures appear only when a Rate is configured (integer micro-dollars in JSON, labeled estimates). Token totals always equal the Usage Ledger exactly — see `hekma agent usage` below.
 
@@ -499,6 +499,51 @@ process is stopped with `hekma agent stop`, never closed. Exit codes: `3` when
 no Run has the id, `4` when the agent has no open Run, the parent has ended or
 the Run owns a process, `2` for a malformed flag, more than 8 levels of
 nesting, or a Breach Action the child cannot execute.
+
+## `hekma ps [--selector <sel>] [--all] [--limit <n>] [--cursor <c>] [--json]`
+
+The Runs that need you, newest first (see [Runs](runs.md)). A read-only
+read: it opens the state database read-only, never starts a host, and on a
+fresh state directory prints the empty note and creates nothing.
+
+```bash
+hekma ps
+hekma ps --selector team=core,env=prod
+hekma ps --all --limit 100 --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--selector key=value[,key=value...]` | Only Runs carrying all these labels, bound or caller |
+| `--all` | List every Run inside the ended-Run window, not just the exceptions |
+| `--limit <n>` | Page size: default 50, at most 1000; `0` means the maximum; above the cap it clamps with a note |
+| `--cursor <c>` | Continue after a previous page (the footer prints the exact command: the same `--all`, `--selector` and `--limit`, plus the cursor) |
+| `--json` | Print `{"schema_version": 1, "view", "selector", "items", "next_cursor", "counts"}` — one document |
+
+The default view is **exception-first**: a Run is listed when it carries an
+Anomaly (an ended Run only within seven days of its end) or a `held`,
+`silent` or `stale` status; healthy open Runs are counted in the footer,
+not listed, and `--all` adds every Run inside the window. Rows are ordered
+by run id, newest first, and the cursor pages without duplicates. The
+columns: **RUN** (the agent's name on process-owning rows, the run id on
+child Runs), **CONTROL** (the depth; `supervised (no wire)` for an agent
+whose model calls skip the metering listener), **STATUS**, **ANOMALIES**
+(the `breach` Anomaly with each latched Breach Action — `breach[block]`),
+**LABELS** (a caller label is suffixed `(caller)`), **Usage** (the Run's
+subtree tokens and derived dollars — an estimate; a dollar figure appears
+only where a Rate prices one) and **Headroom** (what remains against the
+Run's resolved ceilings, naming the Policy that set them, plus the
+cumulative token headroom on process-owning rows). `--json` carries every
+figure whole, each row's labels with source and origin, its latches as
+`latched: [{dimension, scope, action}]`, its resolved limits' sources and
+the effective Breach Action, and the `kept_on_pause` marker where the
+breach-default upgrade holds an agent on `pause`.
+
+An empty page prints a note naming what was asked (the view, the Selector,
+or a cursor past the last Run) and still prints the counts footer.
+
+Exit codes: `2` an invalid selector, cursor or limit; `1` a store failure;
+`0` otherwise — an empty listing included.
 
 ## `hekma label set|remove <run-id|agent|--selector <selector>> <labels>... [--dry-run] [--yes] [--json]`
 

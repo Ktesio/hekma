@@ -729,6 +729,7 @@ dependencies = [
  "hyper-util",
  "rcgen",
  "ring",
+ "rusqlite",
  "rustls",
  "rustls-pki-types",
  "serde",

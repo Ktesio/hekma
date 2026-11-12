@@ -36,6 +36,7 @@ use super::lifecycle::LifecycleState;
 use super::name::InstanceName;
 use super::restart::RestartPolicy;
 use super::secret::SecretString;
+use super::usage::RunId;
 
 /// The engine-owned DEFAULTS layer (spine AD-9 layer 1), story 2-1.
 ///
@@ -273,7 +274,7 @@ pub struct Registry {
     /// Events an open produced (the policy sweep's Run events, the FR-21
     /// upgrade event) for `Engine::open` to publish on the bus; they are
     /// already durable in the outbox.
-    pub(crate) open_events: std::sync::Mutex<Vec<crate::domain::bus::EngineEvent>>,
+    pub(crate) open_events: std::sync::Mutex<Vec<(u64, crate::domain::bus::EngineEvent)>>,
 }
 
 impl Registry {
@@ -397,6 +398,70 @@ impl Registry {
         &self,
     ) -> std::sync::Arc<crate::domain::runs::snapshot::RunSnapshot> {
         self.run_snapshot.current()
+    }
+
+    /// The subject Run of `event`, for the SSE Selector filter (story
+    /// 21-5): Run, Usage and Breach events name their Run directly; a
+    /// Transition belongs to its instance's open process-owning Run (the
+    /// snapshot's owners map, then the store); Policy and
+    /// breach-default-upgrade events name no Run (delivered only without a
+    /// Selector).
+    pub(crate) fn event_subject_run(&self, event: &crate::domain::EngineEvent) -> Option<RunId> {
+        use crate::domain::EngineEvent;
+        match event {
+            EngineEvent::Run(event) => Some(event.run_id.clone()),
+            EngineEvent::UsageUpdate(update) => Some(update.event.run_id.clone()),
+            EngineEvent::BudgetBreach(breach) => Some(RunId::from_wire(breach.run_id.clone())),
+            EngineEvent::Transition(transition) => {
+                let snapshot = self.run_snapshot();
+                snapshot
+                    .owner_of(&transition.instance)
+                    .map(|entry| entry.record.run_id.clone())
+                    .or_else(|| {
+                        // Not in the snapshot (a fresh engine, or the Run
+                        // just ended — a `stopped`/`failed` transition
+                        // publishes after its owner Run's end commits): the
+                        // read-only store read of the instance's NEWEST
+                        // owner Run, ended or not.
+                        InstanceName::new(&transition.instance)
+                            .ok()
+                            .and_then(|name| {
+                                self.store
+                                    .snapshot(|store| {
+                                        use crate::ports::RunRecords as _;
+                                        store.latest_process_run(&name)
+                                    })
+                                    .ok()
+                                    .flatten()
+                                    .map(|record| record.run_id)
+                            })
+                    })
+            }
+            EngineEvent::Policy(_) | EngineEvent::BreachDefaultUpgraded(_) => None,
+        }
+    }
+
+    /// The labels `run_id` carries NOW (story 21-5, the SSE Selector
+    /// filter's read): the published snapshot first (no SQL), one
+    /// read-only store read when the Run is absent from it — ended Runs
+    /// keep matching until compaction. `Ok(None)` when no row exists.
+    pub(crate) fn run_current_labels(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<Vec<crate::domain::Label>>, StoreError> {
+        let snapshot = self.run_snapshot();
+        if let Some(entry) = snapshot.run(run_id) {
+            return Ok(Some(entry.labels.clone()));
+        }
+        self.store.snapshot(
+            |store| -> Result<Option<Vec<crate::domain::Label>>, StoreError> {
+                use crate::ports::RunRecords as _;
+                if store.run_record(run_id)?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(store.run_labels(run_id)?))
+            },
+        )
     }
 
     /// Run a Run-registry operation as one writer job and commit its changes
@@ -552,6 +617,57 @@ impl Registry {
     ) -> Result<Vec<crate::domain::RunRecord>, crate::domain::RunError> {
         self.store
             .snapshot(|store| Ok(crate::domain::runs::ops::select(store, selector)))?
+    }
+
+    /// The Run listing (story 21-5): one exception-first (or all-inside-the-
+    /// window) keyset page plus its counts, with each row's labels, stored
+    /// resolution, usage, latches and headroom assembled as bounded point
+    /// reads. Read on the read-only connection; a bad cursor is the typed
+    /// `invalid-cursor` refusal.
+    pub(crate) fn list_runs(
+        &self,
+        query: &crate::domain::runs::ListRunsQuery,
+    ) -> Result<crate::domain::runs::RunListing, crate::domain::RunError> {
+        use crate::domain::runs::listing;
+        let cutoff = listing::ended_run_cutoff(crate::time::now_unix_secs());
+        let after = query.after_key()?;
+        self.store
+            .snapshot(|store| {
+                use crate::ports::RunRecords as _;
+                let limit = query.clamped_limit();
+                let (records, next_key) = store.list_runs(
+                    query.view,
+                    query.selector.as_ref(),
+                    after.as_deref(),
+                    limit,
+                    &cutoff,
+                )?;
+                let items = listing::assemble(store, records)?;
+                let counts = store.listing_counts(query.view, query.selector.as_ref(), &cutoff)?;
+                Ok(crate::domain::runs::RunListing {
+                    items,
+                    next_cursor: next_key.as_deref().map(crate::domain::runs::encode_cursor),
+                    counts,
+                })
+            })
+            .map_err(crate::domain::RunError::Store)
+    }
+
+    /// Seed bench Run rows under one instance through the store writer
+    /// (story 21-5's perf harness; `#[doc(hidden)]` engine surface is the
+    /// only caller). No events, no snapshot publish.
+    pub(crate) fn seed_perf_rows(
+        &self,
+        instance: &str,
+        rows: &[crate::domain::runs::listing::PerfRunRow],
+    ) -> Result<(), crate::domain::RunError> {
+        let instance = instance.to_string();
+        let rows = rows.to_vec();
+        self.writer
+            .call_weighted(rows.len().max(1), move |ctx| {
+                crate::domain::runs::listing::seed_perf_rows(ctx.store(), &instance, &rows)
+            })
+            .map_err(crate::domain::RunError::Store)
     }
 
     /// Open a READ-ONLY registry (story 21-4): no directory is created, no
